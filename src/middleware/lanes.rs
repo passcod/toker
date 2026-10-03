@@ -301,6 +301,14 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
         if row.kind.is_some() {
             continue;
         }
+        // Lanes are an Anthropic cache concept (plan: wire only the
+        // anthropic path for now): openai-chat rows carry a session id
+        // (opencode sends `x-session-id`) and a tools hash, but their TTL
+        // semantics are undefined — an unrecorded tier reads as the 1-hour
+        // one, which would hold the sleep lock for an hour per request.
+        if row.frontend.as_deref() != Some("anthropic") {
+            continue;
+        }
         let Some(key) = lane_key(row.session_id.as_deref(), row.tools_hash.as_deref()) else {
             continue;
         };
@@ -449,6 +457,9 @@ mod tests {
         row.ts_ms = ts_ms;
         row.session_id = session.map(str::to_owned);
         row.tools_hash = tools.map(str::to_owned);
+        // Real measurement rows always carry the frontend; these lanes are
+        // an anthropic concept (see the filter in `lanes_from_rows`).
+        row.frontend = Some("anthropic".to_owned());
         row
     }
 
@@ -744,6 +755,21 @@ mod tests {
         assert!(
             lanes.is_empty(),
             "a notice cannot seed a lane the API never answered"
+        );
+    }
+
+    #[test]
+    fn openai_rows_grow_no_lanes_even_with_session_and_tools() {
+        // opencode sends `x-session-id` and the openai shape carries a tools
+        // hash, so its rows have both lane-key halves — but the lane TTL is
+        // an anthropic cache concept; an unrecorded tier would read as the
+        // 1-hour one and hold the sleep lock for an hour per request.
+        let mut row = measurement_row(Some("ses-1"), Some("t1"), 1_000);
+        row.frontend = Some("openai_chat".to_owned());
+        let lanes = lanes_from_rows(&[row]);
+        assert!(
+            lanes.is_empty(),
+            "reseed must not build lanes from openai-path rows"
         );
     }
 
