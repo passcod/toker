@@ -117,7 +117,7 @@ Carried over from ctp where marked, new where noted:
 
 ## Storage
 
-SQLite, `$XDG_DATA_HOME/toker/toker.db`, WAL mode:
+SQLite, `$XDG_DATA_HOME/toker/toker.db`, WAL mode. Engine choice: plain **rusqlite** behind a std `Mutex<Connection>`, considered against Turso/libSQL (async SQLite) and rejected — toker's write rate is one row per request (minutes-scale, never throughput-bound, blocking calls are microseconds) and libSQL's advantages (async, remote/replicated modes) are irrelevant to a single-user loopback tool. The `Store` API is encapsulated, so the engine stays swappable if that ever changes.
 
 - **`requests`** — insert-only, one row per request, carrying the ctp row schema verbatim (token buckets, `rateLimits`, shape fields — toolsHash, system hashes/ladders/tail, compaction markers, `usagePresence` — gate provenance, adaptive-rewrite provenance) **plus**: provider/backend, frontend protocol, routing provenance (`requestedModel`/`effectiveModel`/batch `modelMappings`), the raw provider usage JSON verbatim (OpenRouter's `usage.cost`/`cost_details`, serving provider — ledger parity), fidelity-drift rows, and cost in three explicit kinds, never conflated:
   - `billed` — provider-reported (openrouter today)

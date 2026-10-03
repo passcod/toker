@@ -9,9 +9,9 @@
 //!
 //! The lib/bin split exists so each unit can land its full public API before
 //! the next unit wires it in: `pub` items here are the crate's public
-//! surface and stay lint-clean without dead-code suppression. (The scaffold
-//! placeholders predate this and still carry `#[allow(dead_code)]`; their
-//! units drop them as they implement.)
+//! surface and stay lint-clean without dead-code suppression. Scaffold
+//! placeholders that have not been implemented yet are doc-only; their
+//! units replace them wholesale.
 
 pub mod cmds;
 pub mod config;

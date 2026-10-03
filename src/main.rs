@@ -53,11 +53,14 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve => not_implemented("serve"),
+        Command::Serve => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(cmds::serve()),
         Command::Tui => not_implemented("tui"),
         Command::Report => not_implemented("report"),
         Command::Setup => not_implemented("setup"),
-        Command::Status => not_implemented("status"),
+        Command::Status => cmds::status(),
         Command::Import => not_implemented("import"),
         Command::Export => not_implemented("export"),
         Command::WakeArm => cmds::wake_arm(),
