@@ -109,6 +109,38 @@ pub struct GatesConfig {
     /// default) for claude, gfm for Workhorse-style frontends, plain to
     /// degrade.
     pub notice_style: NoticeStyle,
+    /// The cold gate (plan: "Cold gate"; ctp `CTP_COLD`): a session
+    /// resumed after its prompt cache expired would re-read its whole
+    /// prefix as fresh input, so the gate interrupts once per idle spell
+    /// with a notice advising `/compact`. Advisory — it fires once,
+    /// re-arms after another idle spell, and has no override; sending the
+    /// request again IS the override. Needs only idle time + prompt size
+    /// per lane, so it runs on every backend the anthropic frontend
+    /// routes to, not just the meter source.
+    pub cold_enabled: bool,
+    /// The cold gate's quota outlook (ctp `CTP_COLD_QUOTA`): when a notice
+    /// would fire, project the 5-hour window's wall and withhold the
+    /// notice when the window can absorb the re-read — recording a
+    /// `cold-quiet` row so the suppression is visible, never silent.
+    pub cold_outlook: bool,
+    /// Below this a rebuild is too cheap for the interruption to be worth
+    /// it (ctp `CTP_COLD_MIN_TOKENS`, default [`crate::middleware::cold::
+    /// DEFAULT_MIN_TOKENS`]: 175,000, chosen against the log rather than
+    /// picked round).
+    pub cold_min_tokens: u64,
+    /// The idle floor override, in minutes and deliberately fractional
+    /// (ctp `CTP_COLD_IDLE_MIN`): `None` follows the TTL tier the lane
+    /// was last seen writing, which tracks what the client actually does
+    /// rather than pinning an hour here.
+    pub cold_idle_min: Option<f64>,
+    /// The model a cold compaction is rewritten onto (ctp
+    /// `CTP_COMPACT_MODEL`): a family name resolved against what is
+    /// actually in use (`"sonnet"`, the default), an explicit model id,
+    /// or `"off"` to disable the *model change* — a cold lane's cache
+    /// writes are still stripped, which needs no target. Sonnet rather
+    /// than Haiku: Haiku 4.5's window is 200k and the lanes this fires on
+    /// routinely hold three times that.
+    pub compact_model: Option<String>,
 }
 
 impl Default for GatesConfig {
@@ -116,6 +148,11 @@ impl Default for GatesConfig {
         GatesConfig {
             quota_enabled: true,
             notice_style: NoticeStyle::default(),
+            cold_enabled: true,
+            cold_outlook: true,
+            cold_min_tokens: crate::middleware::cold::DEFAULT_MIN_TOKENS,
+            cold_idle_min: None,
+            compact_model: None,
         }
     }
 }
@@ -304,6 +341,14 @@ impl Config {
             gates: GatesConfig {
                 quota_enabled: file.gates.quota_enabled.unwrap_or(true),
                 notice_style: file.gates.notice_style.unwrap_or_default(),
+                cold_enabled: file.gates.cold_enabled.unwrap_or(true),
+                cold_outlook: file.gates.cold_outlook.unwrap_or(true),
+                cold_min_tokens: file
+                    .gates
+                    .cold_min_tokens
+                    .unwrap_or(crate::middleware::cold::DEFAULT_MIN_TOKENS),
+                cold_idle_min: file.gates.cold_idle_min,
+                compact_model: file.gates.compact_model,
             },
         };
 
@@ -353,6 +398,13 @@ impl Config {
                 self.ping_header_name
             );
         }
+        // The cold gate's idle floor is a duration: a negative floor would
+        // fire on every request the moment a lane exists.
+        if let Some(minutes) = self.gates.cold_idle_min
+            && !(minutes.is_finite() && minutes >= 0.0)
+        {
+            bail!("cold_idle_min must be a non-negative number of minutes");
+        }
         // Both anthropic backends are wired regardless of enabled state
         // (routing resolves by name), but the protocol default must name
         // one of them — anything else cannot route anywhere.
@@ -393,6 +445,13 @@ struct FileGates {
     /// Parsed by [`NoticeStyle`]'s case-insensitive deserialiser; an
     /// unknown value fails the load, like a typo'd key would.
     notice_style: Option<NoticeStyle>,
+    cold_enabled: Option<bool>,
+    cold_outlook: Option<bool>,
+    cold_min_tokens: Option<u64>,
+    /// Minutes, fractional (ctp's smoke test needs a floor it can wait
+    /// out).
+    cold_idle_min: Option<f64>,
+    compact_model: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -547,6 +606,14 @@ mod tests {
         // the insight block is claude-only): a change here would change the
         // bytes of every notice overnight.
         assert_eq!(config.gates.notice_style, NoticeStyle::Gfm);
+        // The cold gate's defaults are ctp's: on, outlook on, the 175k
+        // bar chosen against the log, the lane's own TTL tier as the idle
+        // floor, and the sonnet family for the compaction retarget.
+        assert!(config.gates.cold_enabled);
+        assert!(config.gates.cold_outlook);
+        assert_eq!(config.gates.cold_min_tokens, 175_000);
+        assert_eq!(config.gates.cold_idle_min, None);
+        assert_eq!(config.gates.compact_model, None);
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -677,11 +744,51 @@ quota_enabled = false
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
         let config = super::Config::load().expect("phase-1 config parses");
         assert!(config.gates.quota_enabled, "absent block = default = on");
+        assert!(config.gates.cold_enabled, "the cold gate defaults on too");
 
         fs::write(dir.join("toker.toml"), "[gates]\nquota_on = true\n").expect("rewrite config");
         assert!(
             super::Config::load().is_err(),
             "a typo'd gates key must fail to load"
+        );
+    }
+
+    #[test]
+    fn the_cold_gate_block_is_read_and_validated() {
+        let dir = test_dir("gates-cold");
+        let load = |text: &str| {
+            let _guard = env_lock().lock().unwrap();
+            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+            fs::write(dir.join("toker.toml"), text).expect("write config");
+            super::Config::load()
+        };
+
+        // Every knob reads: the toggles, the bar, the fractional idle
+        // floor, and the compact-model spec (family, pin, or "off").
+        let config = load(
+            "[gates]\ncold_enabled = false\ncold_outlook = false\n\
+             cold_min_tokens = 50000\ncold_idle_min = 0.5\n\
+             compact_model = \"claude-sonnet-5\"\n",
+        )
+        .expect("cold gates load");
+        assert!(!config.gates.cold_enabled);
+        assert!(!config.gates.cold_outlook);
+        assert_eq!(config.gates.cold_min_tokens, 50_000);
+        assert_eq!(config.gates.cold_idle_min, Some(0.5));
+        assert_eq!(
+            config.gates.compact_model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        // A negative idle floor is a config error, not a gate that fires
+        // on every request.
+        assert!(
+            load("[gates]\ncold_idle_min = -1\n").is_err(),
+            "a negative idle floor must fail to load"
+        );
+        assert!(
+            load("[gates]\ncold_idle_min = \"soon\"\n").is_err(),
+            "the floor is a number of minutes"
         );
     }
 

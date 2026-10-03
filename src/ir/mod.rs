@@ -114,6 +114,21 @@ impl Request {
     pub fn req_bytes(&self) -> u64 {
         self.req_bytes
     }
+
+    /// Replace the parsed body wholesale: the commit point of an
+    /// all-or-nothing middleware transform (the compaction retarget is the
+    /// first user). The transform is built over a copy and committed only
+    /// on success, so a declined transform never touches the request.
+    ///
+    /// **Invariant 4** is unaffected by construction: `serialise` remains
+    /// a pure function of the value it holds — this only changes which
+    /// value that is, as a deliberate, user-visible, once-per-change event
+    /// (a middleware transform). `req_bytes` keeps the ORIGINAL wire
+    /// length: it is a fact about the wire input, and the ledger's shape
+    /// fields for a transformed request are the pre-transform shape's.
+    pub fn replace_value(&mut self, value: Value) {
+        self.value = value;
+    }
 }
 
 /// `sha256(data)`, truncated to its first 12 hex chars — ctp's `shortHash`.

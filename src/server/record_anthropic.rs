@@ -47,8 +47,9 @@ use serde_json::{Value, json};
 
 use crate::catalog::{CostBuckets, normalise_model_id, price};
 use crate::ir::AnthropicShape;
+use crate::middleware::cold::Outlook;
 use crate::middleware::lanes;
-use crate::middleware::quota::{Grant, Meter};
+use crate::middleware::quota::{Grant, Meter, group};
 use crate::observe::AnthropicCapture;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
@@ -84,6 +85,16 @@ pub(crate) struct AnthropicRecordCtx {
     /// The request carried the ping header: its lane is recorded but
     /// excluded from liveness (plan: Ping tagging).
     pub(crate) ping: bool,
+    /// The compaction retarget's provenance, when it rewrote this request
+    /// (ctp proxy.mjs:1387-1442): the models moved between, and whether
+    /// the transform stripped breakpoints or merged system messages (the
+    /// v1 schema records booleans; the counts ride the log line). A
+    /// same-model strip carries no `downgraded_from` — that model also
+    /// served the request — and only the strip flags say it happened.
+    pub(crate) downgraded_from: Option<String>,
+    pub(crate) downgraded_to: Option<String>,
+    pub(crate) cache_stripped: Option<bool>,
+    pub(crate) system_merged: Option<bool>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -407,14 +418,20 @@ fn measurement_row(
         system_change: None,
         system_ladder: shape.and_then(|s| ladder_json(&s.system_ladder)),
         system_tail: shape.and_then(|s| ladder_json(&s.system_tail)),
-        gate_on: None,
-        cold_on: None,
+        // ctp logs gateOn/coldOn on every row because readers cannot see
+        // the service's env (README: the `?`-assumed-gate fallback); the
+        // armed state of each gate at request time.
+        gate_on: Some(ctx.server.config.gates.quota_enabled),
+        cold_on: Some(ctx.server.config.gates.cold_enabled),
         forced_from: None,
         forced_to: None,
-        downgraded_from: None,
-        downgraded_to: None,
-        cache_stripped: None,
-        system_merged: None,
+        downgraded_from: ctx.downgraded_from.clone(),
+        downgraded_to: ctx.downgraded_to.clone(),
+        // The v1 schema fixed these as booleans, so the row records THAT
+        // the transform happened (ctp records counts; those ride the log
+        // line), and only when it did.
+        cache_stripped: ctx.cache_stripped,
+        system_merged: ctx.system_merged,
         model_mappings: None,
         drift_digest: None,
         status: None,
@@ -486,8 +503,8 @@ fn error_row(
         system_change: None,
         system_ladder: None,
         system_tail: None,
-        gate_on: None,
-        cold_on: None,
+        gate_on: Some(ctx.server.config.gates.quota_enabled),
+        cold_on: Some(ctx.server.config.gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,
@@ -644,8 +661,11 @@ pub(crate) fn record_anthropic_released(
         system_change: None,
         system_ladder: None,
         system_tail: None,
-        gate_on: Some(true),
-        cold_on: None,
+        // The release marker fires regardless of whether the gate is
+        // armed (stripping is unconditional) — the row must not claim the
+        // gate was on when it wasn't.
+        gate_on: Some(server.config.gates.quota_enabled),
+        cold_on: Some(server.config.gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,
@@ -768,8 +788,10 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         system_change: None,
         system_ladder: None,
         system_tail: None,
+        // A block proves the quota gate was armed; the cold gate's state
+        // is the config at request time, like every other row.
         gate_on: Some(true),
-        cold_on: None,
+        cold_on: Some(record.server.config.gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,
@@ -801,6 +823,260 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         session_id
             .and_then(|session| session.get(0..8))
             .unwrap_or("?"),
+    );
+}
+
+/// The cold-notice row (ctp: `kind: "cold"`, proxy.mjs:1342-1362).
+///
+/// The record of a notice the user was interrupted with: the idle spell
+/// measured, the prefix that would be re-read, the message count of the
+/// stopped request (the synthetic turn is appended to the client's
+/// transcript like any other reply, so the next request in this lane
+/// should carry both — recorded so the log can answer whether that held),
+/// the compaction model the notice named, and the quota figures the
+/// decision rested on.
+///
+/// **No `rate_limits`** (ctp parity, and the row shape's rule for
+/// proxy-written kinds): nothing reached upstream, so the only meters
+/// available would be the proxy's own stale copy, and a row carrying
+/// those gets counted as an observation of the API. No usage, never
+/// priced.
+pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
+    let ColdRecord {
+        server,
+        started,
+        path,
+        session_id,
+        backend_id,
+        tools_hash,
+        idle_ms,
+        prompt,
+        req_messages,
+        compact_target,
+        outlook,
+        gate_on,
+    } = record;
+    let outlook = outlook.cloned();
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(RowKind::Cold),
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(format!("anthropic:{backend_id}")),
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages,
+        req_tools: None,
+        tools_hash: tools_hash.map(str::to_owned),
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: Some(gate_on),
+        cold_on: Some(true),
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        // ctp's cold-row fields, in the kind-specific payload column.
+        extra: Some(json!({
+            "idleMs": idle_ms,
+            "lastPrompt": prompt,
+            "reqMessages": req_messages,
+            "compactTarget": compact_target,
+            "quotaExtra": outlook.as_ref().and_then(|o| o.extra),
+            "quotaBound": outlook.as_ref().and_then(|o| o.bound),
+            "quotaMeter": outlook.as_ref().filter(|o| o.known && !o.on_track).and_then(|o| o.meter.map(Meter::as_str)),
+            "util5h": outlook.as_ref().and_then(|o| o.util),
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST {path} → COLD {} idle {} · {} tokens",
+        session_id
+            .and_then(|session| session.get(0..8))
+            .unwrap_or("?"),
+        crate::middleware::cold::human_idle(idle_ms),
+        group(prompt),
+    );
+}
+
+/// The inputs of one cold-notice row (see [`record_anthropic_cold`]).
+pub(crate) struct ColdRecord<'a> {
+    /// The server (for the store).
+    pub(crate) server: &'a Server,
+    /// Request start, for `duration_ms`.
+    pub(crate) started: Instant,
+    /// The frontend path, for the per-request log line.
+    pub(crate) path: &'static str,
+    /// Session identity, read by header name only (invariant 2).
+    pub(crate) session_id: Option<&'a str>,
+    /// The backend the request would have reached.
+    pub(crate) backend_id: &'a str,
+    /// The lane's tools-hash — the cold gate is a per-lane decision.
+    pub(crate) tools_hash: Option<&'a str>,
+    /// How long the lane sat idle before this request.
+    pub(crate) idle_ms: i64,
+    /// The prefix the next request would re-read.
+    pub(crate) prompt: u64,
+    /// The message count of the stopped request.
+    pub(crate) req_messages: Option<i64>,
+    /// The model the notice promised a cheap `/compact` on, when one
+    /// resolved.
+    pub(crate) compact_target: Option<&'a str>,
+    /// The quota outlook the decision rested on, when one was measured.
+    pub(crate) outlook: Option<&'a Outlook>,
+    /// Whether the quota gate is armed (ctp `gateOn: LIMIT_ON` — a view
+    /// reading this row cannot infer the toggle from anywhere else).
+    pub(crate) gate_on: bool,
+}
+
+/// The withheld-notice row (ctp: `kind: "cold-quiet"`, proxy.mjs:1279-1298).
+///
+/// A suppressed notice is a re-read the user never hears about, so it is
+/// recorded — otherwise the notice count simply falls and no view can tell
+/// a quiet fortnight from a gate that stopped working. Absence of
+/// instrumentation must never read as absence of the thing. `at` and
+/// `noticed_at` are untouched (nothing was said, nothing reached
+/// upstream); the lane stays cold, so a later request in the same idle
+/// spell is judged again against meters that may have tightened.
+///
+/// The `util5h` here is the MEASURED figure the decision rested on, from
+/// the burn — never the proxy's last-seen copy of the meters, which would
+/// report the proxy's own staleness as the API's. **No `rate_limits`**,
+/// for the same reason.
+pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
+    let ColdRecord {
+        server,
+        started,
+        path,
+        session_id,
+        backend_id,
+        tools_hash,
+        idle_ms,
+        prompt,
+        outlook,
+        gate_on,
+        ..
+    } = record;
+    let outlook = outlook.cloned();
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(RowKind::ColdQuiet),
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(format!("anthropic:{backend_id}")),
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: tools_hash.map(str::to_owned),
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: Some(gate_on),
+        cold_on: Some(true),
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: Some(json!({
+            "idleMs": idle_ms,
+            "lastPrompt": prompt,
+            "quotaExtra": outlook.as_ref().and_then(|o| o.extra),
+            "quotaBound": outlook.as_ref().and_then(|o| o.bound),
+            "util5h": outlook.as_ref().and_then(|o| o.util),
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST {path} → cold-quiet {} idle {} · {} tokens",
+        session_id
+            .and_then(|session| session.get(0..8))
+            .unwrap_or("?"),
+        crate::middleware::cold::human_idle(idle_ms),
+        group(prompt),
     );
 }
 

@@ -57,7 +57,10 @@ use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::Stream;
 
+use crate::config::GatesConfig;
+use crate::ir::AnthropicShape;
 use crate::ir::{Fidelity, Request as IrRequest, compare};
+use crate::middleware::cold;
 use crate::middleware::lanes;
 use crate::middleware::quota::{
     Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for,
@@ -74,8 +77,9 @@ use super::proxy::{
 };
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
-    AnthropicRecordCtx, BlockedRecord, error_pair, record_anthropic_blocked,
-    record_anthropic_error, record_anthropic_measurement, record_anthropic_released,
+    AnthropicRecordCtx, BlockedRecord, ColdRecord, error_pair, record_anthropic_blocked,
+    record_anthropic_cold, record_anthropic_cold_quiet, record_anthropic_error,
+    record_anthropic_measurement, record_anthropic_released,
 };
 
 /// `POST /v1/messages` — the anthropic usage path, and the quota gate's
@@ -146,6 +150,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // 2.-5. Parse, fidelity-check, route.
     let mut forward = original.clone();
     let mut record = None;
+    // The parsed IR outlives the block below: the compaction retarget —
+    // the only middleware transform that changes model-visible prompt
+    // structure — runs after the gates and rewrites it (ctp re-serialises
+    // its `body` variable for the same reason).
+    let mut parsed: Option<IrRequest> = None;
+    // The request's own shape, kept past the record context (which takes
+    // a clone): the cold gate and the retarget read it, and the row's
+    // shape fields stay the PRE-transform shape's, ctp's ordering.
+    let mut gate_shape: Option<AnthropicShape> = None;
     let mut backend = server.default_anthropic().clone();
     // ctp `clientWants` (proxy.mjs:1047-1054): the client's own model and
     // whether it explicitly asked for a plain JSON Message — both read
@@ -293,9 +306,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             drift,
             backend: backend.clone(),
             betas,
-            shape: Some(shape),
+            shape: Some(shape.clone()),
             ping,
+            downgraded_from: None,
+            downgraded_to: None,
+            cache_stripped: None,
+            system_merged: None,
         });
+        gate_shape = Some(shape);
+        parsed = Some(ir);
     }
 
     // ── the gate decision (after the strip, ctp proxy.mjs:1195) ──
@@ -374,6 +393,247 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
+    // ── the cold-cache notice, after the quota gate (ctp
+    //    proxy.mjs:1246-1377) ──
+    //
+    // If both would fire, the harder stop wins (the quota block returned
+    // above). This one is advisory: it fires once per idle spell and
+    // re-arms, and has no release marker, because sending the request
+    // again IS the override. Like ctp's `COLD_ON && gated` it is not
+    // restricted to the meter-source backend — the cold gate needs only
+    // idle time and prompt size per lane, which the IR always has — and
+    // it is skipped for unparseable bodies, which have neither a shape
+    // nor a lane (the same verdict ctp reaches via its `?`-lane miss).
+    // Every failure below is "a lost notice, never a lost request": a
+    // store error reads as absence and the request forwards.
+    let cold_armed = path == "/v1/messages" && server.config.gates.cold_enabled;
+    let cold_lane_key = gate_shape
+        .as_ref()
+        .and_then(|shape| shape.tools_hash.as_deref())
+        .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
+    let cold_lane = cold_lane_key
+        .as_ref()
+        .and_then(|key| server.store.load_lane(key).ok().flatten());
+    if cold_armed {
+        let gates = &server.config.gates;
+        let now = now_ms();
+        let min_idle_ms = cold_idle_ms(gates);
+        let summarising = gate_shape.as_ref().is_some_and(|shape| shape.summarising);
+        // Twice, deliberately (ctp proxy.mjs:1259-1267): the first call is
+        // the cheap one and decides whether anything would fire at all;
+        // only then is the outlook worth measuring — a weight refit over
+        // the recent ledger is nothing against a request about to be
+        // stopped and far too much for every request.
+        let fired = cold::decide_cold(
+            cold_lane.as_ref(),
+            summarising,
+            gates.cold_min_tokens,
+            min_idle_ms,
+            now,
+            None,
+        );
+        let outlook = match &fired {
+            cold::ColdDecision::Notice { prompt, .. } if gates.cold_outlook => cold::outlook_over(
+                &server.store,
+                client_model.as_deref(),
+                *prompt,
+                gate_armed,
+                now,
+            ),
+            _ => None,
+        };
+        let verdict = if matches!(fired, cold::ColdDecision::Notice { .. }) {
+            cold::decide_cold(
+                cold_lane.as_ref(),
+                summarising,
+                gates.cold_min_tokens,
+                min_idle_ms,
+                now,
+                outlook.as_ref(),
+            )
+        } else {
+            fired
+        };
+        let shape_for_rows = || {
+            gate_shape
+                .as_ref()
+                .and_then(|shape| shape.tools_hash.as_deref())
+        };
+        match verdict {
+            // Quietened: the window is not projected to run out even with
+            // the re-read. Recorded so silence is distinguishable from
+            // breakage; `at` and `noticed_at` are untouched (nothing was
+            // said, nothing reached upstream), so the lane stays cold and
+            // a later request in the same idle spell is judged again
+            // against meters that may have tightened.
+            cold::ColdDecision::Quiet {
+                idle_ms,
+                prompt,
+                outlook,
+            } => {
+                record_anthropic_cold_quiet(ColdRecord {
+                    server: &server,
+                    started,
+                    path,
+                    session_id: session_id.as_deref(),
+                    backend_id: backend.id(),
+                    tools_hash: shape_for_rows(),
+                    idle_ms,
+                    prompt,
+                    outlook: Some(&outlook),
+                    req_messages: None,
+                    compact_target: None,
+                    gate_on: server.config.gates.quota_enabled,
+                });
+            }
+            cold::ColdDecision::Notice {
+                idle_ms,
+                prompt,
+                outlook,
+            } => {
+                // The compact model is resolved, not assumed (ctp
+                // proxy.mjs:1309-1317): the notice names the model a
+                // cheap `/compact` would actually run on, and stays
+                // silent about it when there is none.
+                let compact_on = server
+                    .models
+                    .compaction_target(&compact_spec(gates), prompt)
+                    .ok()
+                    .flatten();
+                let text = cold::ColdBlocking::notice(
+                    idle_ms,
+                    prompt,
+                    compact_on.as_deref(),
+                    outlook.as_ref(),
+                    now,
+                    &jiff::tz::TimeZone::system(),
+                    gates.notice_style,
+                );
+                let rendering = if stream_explicitly_false {
+                    Rendering::Json
+                } else {
+                    Rendering::Sse
+                };
+                let body = Blocking::blocked_turn(&text, client_model.as_deref(), rendering);
+                // The lane remembers it has spoken; `at` does not move —
+                // the compaction the user runs after reading the notice
+                // must still be seen as cold, which is the whole point
+                // of the two clocks.
+                if let Some(key) = &cold_lane_key
+                    && let Err(error) = cold::note_lane_notice(&server.store, key, now)
+                {
+                    tracing::error!(%error, "lane notice mark failed");
+                }
+                record_anthropic_cold(ColdRecord {
+                    server: &server,
+                    started,
+                    path,
+                    session_id: session_id.as_deref(),
+                    backend_id: backend.id(),
+                    tools_hash: shape_for_rows(),
+                    idle_ms,
+                    prompt,
+                    // The message count of the stopped request: the
+                    // synthetic turn is appended to the client's
+                    // transcript, so the next request in this lane should
+                    // carry both.
+                    req_messages: gate_shape
+                        .as_ref()
+                        .and_then(|shape| shape.req_messages)
+                        .map(|messages| messages as i64),
+                    compact_target: compact_on.as_deref(),
+                    outlook: outlook.as_ref(),
+                    gate_on: server.config.gates.quota_enabled,
+                });
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    match rendering {
+                        Rendering::Sse => header::HeaderValue::from_static("text/event-stream"),
+                        Rendering::Json => header::HeaderValue::from_static("application/json"),
+                    },
+                );
+                return build_response(StatusCode::OK, headers, Body::from(body));
+            }
+            cold::ColdDecision::Forward => {}
+        }
+    }
+
+    // ── the compaction retarget (ctp proxy.mjs:1379-1442) ──
+    //
+    // A cold compaction, rewritten onto a cheaper model with its cache
+    // writes removed. Deliberately NOT gated on cold_enabled (ctp gates
+    // this on the path and `isCompaction` alone): the cold licence is the
+    // lane's, not the notice toggle's. Coldness is judged on `at`, which
+    // the notice above does not move — so the compaction the user runs
+    // after reading the notice is still seen as cold. And the notice
+    // above exempted it by the summarising flag, so nothing has
+    // interrupted it: the gate exists to advise this.
+    if path == "/v1/messages"
+        && let Some(ir) = parsed.as_mut()
+        && gate_shape
+            .as_ref()
+            .is_some_and(AnthropicShape::is_compaction)
+    {
+        let gates = &server.config.gates;
+        let now = now_ms();
+        let min_idle_ms = cold_idle_ms(gates);
+        let lane_cold =
+            cold::lane_is_cold(cold_lane.as_ref(), gates.cold_min_tokens, min_idle_ms, now);
+        if lane_cold {
+            // Resolved per request: a family spec follows what is actually
+            // in use, and the size guard needs the prompt this lane is
+            // carrying. `target` is optional — a compaction already on
+            // the cheapest sensible model has no move to make, but a cold
+            // lane still means its cache writes are bought and never
+            // read, so the strip goes ahead without one.
+            let prompt = cold_lane
+                .and_then(|lane| lane.prompt_tokens)
+                .filter(|prompt| *prompt >= 0)
+                .unwrap_or_default() as u64;
+            let target = server
+                .models
+                .compaction_target(&compact_spec(gates), prompt)
+                .ok()
+                .flatten();
+            if let Some(outcome) = cold::retarget_compaction(ir, target.as_deref(), true) {
+                // The transformed serialised body IS the point: the model
+                // region changed and the breakpoints went, so the upstream
+                // sees bytes that never existed on the frontend's wire.
+                // The fidelity compare ran on the pre-transform body, so
+                // this deliberate rewrite can never surface as drift.
+                forward = Bytes::from(ir.serialise());
+                // A same-model strip is not a downgrade, and recording one
+                // would put a model in `downgradedFrom` that also served
+                // the request — only `cacheStripped` says it happened.
+                let downgraded_from = (outcome.to != outcome.from)
+                    .then(|| outcome.from.clone())
+                    .flatten();
+                let downgraded_to = downgraded_from
+                    .is_some()
+                    .then(|| outcome.to.clone())
+                    .flatten();
+                if let Some(ctx) = record.as_mut() {
+                    ctx.downgraded_from = downgraded_from;
+                    ctx.downgraded_to = downgraded_to;
+                    ctx.cache_stripped = (outcome.stripped > 0).then_some(true);
+                    ctx.system_merged = (outcome.merged > 0).then_some(true);
+                }
+                served_model = outcome.to.clone();
+                tracing::info!(
+                    "compact: {} · {} breakpoint(s) dropped · {} system message(s) merged",
+                    match (&outcome.from, &outcome.to) {
+                        (Some(from), Some(to)) if from != to => format!("{from} → {to}"),
+                        (Some(from), _) => from.clone(),
+                        _ => "?".to_owned(),
+                    },
+                    outcome.stripped,
+                    outcome.merged,
+                );
+            }
+        }
+    }
+
     // ── the served-model mark, BEFORE the request goes (ctp
     // proxy.mjs:1544-1551) ──
     //
@@ -442,6 +702,27 @@ fn prior_live(server: &Server, session: &str, meter: &str, now_ms: i64) -> Optio
         .map(|allowance| allowance.reset_value)
         .filter(|reset| reset.saturating_mul(1000) > now_ms)
         .max()
+}
+
+/// The cold gate's idle floor override, in ms (ctp `COLD_IDLE_MS`,
+/// proxy.mjs:125-127: minutes, deliberately fractional — unset follows
+/// the TTL tier the lane was last seen writing). Config validation
+/// already rejects the negative.
+fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
+    gates
+        .cold_idle_min
+        .map(|minutes| (minutes * 60_000.0) as i64)
+}
+
+/// The compaction retarget's model spec (ctp `COMPACT_SPEC`, proxy.mjs:135):
+/// a family name resolved against what is actually in use (the default,
+/// "sonnet" — not Haiku: its window is 200k and the lanes this fires on
+/// routinely hold three times that), an explicit model id, or "off".
+fn compact_spec(gates: &GatesConfig) -> String {
+    gates
+        .compact_model
+        .clone()
+        .unwrap_or_else(|| "sonnet".to_owned())
 }
 
 /// Transparent forwarding (the batch-result paths): routed to the default

@@ -505,8 +505,9 @@ fn sse_event(out: &mut String, event: &str, data: &Value) {
 
 /// Comma-grouped digit rendering (ctp `group`, fmt.mjs:45): deliberately
 /// NOT locale-moving — these figures land in notices whose bytes are
-/// pinned by tests and replayed in history (invariant 4).
-fn group(n: u64) -> String {
+/// pinned by tests and replayed in history (invariant 4). Shared with the
+/// cold gate's notice.
+pub(crate) fn group(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {

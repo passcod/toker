@@ -181,9 +181,22 @@ pub fn active_days_of(entries: &[ModelEntry]) -> usize {
 }
 
 /// The newest model in a family that has proven itself, or `None` (ctp
-/// `newestInFamily`, models.mjs:291-302, without ctp's optional `accept`
-/// hook — the compaction rewrite's price filter, a later unit's).
+/// `newestInFamily`, models.mjs:291-302 — without ctp's optional `accept`
+/// hook; see [`newest_in_family_accepting`]).
 pub fn newest_in_family(entries: &[ModelEntry], family: &str) -> Option<String> {
+    newest_in_family_accepting(entries, family, None)
+}
+
+/// [`newest_in_family`] with ctp's `accept` hook (models.mjs:298): a
+/// caller refuses a candidate it cannot use — the compaction retarget
+/// needs a model it can price, and an unpriced newcomer must fall back to
+/// the newest priced version rather than silently switching the feature
+/// off.
+pub fn newest_in_family_accepting(
+    entries: &[ModelEntry],
+    family: &str,
+    accept: Option<&dyn Fn(&str) -> bool>,
+) -> Option<String> {
     let needed = requirement(active_days_of(entries));
     let mut best: Option<String> = None;
     for entry in entries {
@@ -196,6 +209,11 @@ pub fn newest_in_family(entries: &[ModelEntry], family: &str) -> Option<String> 
         if (days_of(entry).len() as f64) <= needed {
             continue;
         }
+        if let Some(accept) = accept
+            && !accept(&entry.model_id)
+        {
+            continue;
+        }
         if best
             .as_deref()
             .is_none_or(|best| newer_than(&entry.model_id, best))
@@ -204,6 +222,49 @@ pub fn newest_in_family(entries: &[ModelEntry], family: &str) -> Option<String> 
         }
     }
     best
+}
+
+/// Has a model been observed holding a conversation at least `prompt`
+/// tokens? (ctp `fitsContext`, models.mjs:403 — a learned context check:
+/// an unproven model declines, which costs an upgrade where the
+/// alternative costs a failed request at the worst possible moment.)
+/// Absence reads as zero, never a free pass.
+fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> bool {
+    entries
+        .iter()
+        .find(|entry| entry.model_id == model)
+        .and_then(|entry| entry.max_prompt)
+        .unwrap_or(0)
+        >= prompt as i64
+}
+
+/// The model a cold compaction should be rewritten onto, from a spec that
+/// is either a family name (`"sonnet"`), an explicit id
+/// (`"claude-sonnet-5"`), or `"off"` (ctp `compactionTarget`,
+/// models.mjs:498-507). A family is resolved through the same election as
+/// everything else, so the target follows what is actually in use rather
+/// than being pinned to a literal that goes stale the day a newer Sonnet
+/// ships. The price filter is ctp's `accept`: a candidate the table
+/// cannot price is no use to a rewrite that decides "cheaper" from it.
+pub fn compaction_target_of(entries: &[ModelEntry], spec: &str, prompt: u64) -> Option<String> {
+    if spec.is_empty() || spec == "off" {
+        return None;
+    }
+    let f = family_of(spec)?;
+    // A spec carrying a version is an explicit pin; one without is a family.
+    let target = if !f.version.is_empty() {
+        model_identity(spec)
+    } else {
+        newest_in_family_accepting(
+            entries,
+            &f.name,
+            Some(&|model: &str| crate::catalog::pricing::price(model, false, None).is_some()),
+        )
+    }?;
+    if !fits_context(entries, &target, prompt) {
+        return None;
+    }
+    Some(target)
 }
 
 /// The local calendar day of an epoch-millisecond timestamp, `YYYY-MM-DD`
@@ -377,6 +438,20 @@ impl ModelStore {
         Ok(newest_in_family(&entries, family))
     }
 
+    /// The model a cold compaction should be rewritten onto, resolved per
+    /// request against what is actually in use (ctp `compactionTarget`
+    /// over `seen`; see [`compaction_target_of`]). The size guard needs
+    /// the prompt this lane is carrying. A store error propagates; the
+    /// caller loses the target, never the request (invariant 6).
+    pub fn compaction_target(
+        &self,
+        spec: &str,
+        prompt: u64,
+    ) -> crate::store::Result<Option<String>> {
+        let entries = self.store.load_models()?;
+        Ok(compaction_target_of(&entries, spec, prompt))
+    }
+
     /// Every exact identity the store has learned, sorted (for the
     /// control endpoint's "what is known" reply).
     pub fn known_models(&self) -> crate::store::Result<Vec<String>> {
@@ -432,8 +507,8 @@ impl ModelStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        MergeIncoming, MergeOutcome, ModelStore, family_of, local_day, newer_than,
-        newest_in_family, requirement,
+        MergeIncoming, MergeOutcome, ModelStore, compaction_target_of, family_of, local_day,
+        newer_than, newest_in_family, requirement,
     };
     use crate::store::{ModelEntry, RequestRow, Store};
     use jiff::tz::TimeZone;
@@ -944,6 +1019,78 @@ mod tests {
             entry.context_window_json,
             Some(json!({"default": 272_000, "max": 872_000})),
             "a merge never creates or widens a declared capability"
+        );
+    }
+
+    // ── the compaction target (ctp compactionTarget) ──────────────────
+
+    #[test]
+    fn compaction_target_resolves_family_pin_and_context() {
+        // ctp compactionTarget (models.mjs:498-507), over the learned
+        // store: a family name follows what is actually in use, an
+        // explicit id is a pin, "off"/empty is nothing, and an unproven
+        // context window declines — a failed request at the worst moment.
+        let days: Vec<&str> = vec!["2026-09-20", "2026-09-21", "2026-09-22", "2026-09-23"];
+        let entries = vec![
+            entry("claude-sonnet-5", &days, Some(1_000_000)),
+            entry("claude-sonnet-4-6", &days, Some(200_000)),
+        ];
+        // A family spec resolves to the family's elected newest, and the
+        // size guard passes on the model that has actually held the
+        // prompt.
+        assert_eq!(
+            compaction_target_of(&entries, "sonnet", 400_000),
+            Some("claude-sonnet-5".to_owned())
+        );
+        // The same spec at a prompt only the 1M window has held: still
+        // sonnet-5. At a prompt nothing has held: decline.
+        assert_eq!(
+            compaction_target_of(&entries, "sonnet", 900_000),
+            Some("claude-sonnet-5".to_owned())
+        );
+        assert_eq!(compaction_target_of(&entries, "sonnet", 1_200_000), None);
+        // An explicit id is a pin, not an election.
+        assert_eq!(
+            compaction_target_of(&entries, "claude-sonnet-4-6", 150_000),
+            Some("claude-sonnet-4-6".to_owned())
+        );
+        // "off" and "" are nothing (ctp's falsy spec).
+        assert_eq!(compaction_target_of(&entries, "off", 1), None);
+        assert_eq!(compaction_target_of(&entries, "", 1), None);
+        // A family nothing served has no target, and an unknown name has
+        // no family.
+        assert_eq!(compaction_target_of(&entries, "haiku", 1), None);
+        assert_eq!(compaction_target_of(&entries, "gpt-5.6-sol", 1), None);
+
+        // The price filter (ctp's `accept`): a family whose elected
+        // newest cannot be priced is no use to a rewrite that judges
+        // "cheaper" from the price table — it falls back to nothing
+        // rather than switching the feature off on an unpriced candidate.
+        let mixed = vec![
+            entry("gpt-5.6-sol", &days, Some(1_000_000)),
+            entry("claude-sonnet-5", &days, Some(1_000_000)),
+        ];
+        assert_eq!(
+            compaction_target_of(&mixed, "gpt-5.6-sol", 1),
+            None,
+            "the election refuses a candidate it cannot price"
+        );
+
+        // Over the store: the same resolution, loading the entries.
+        let models = models();
+        models
+            .store
+            .upsert_model(&entry("claude-sonnet-5", &days, Some(1_000_000)))
+            .expect("upsert");
+        assert_eq!(
+            models
+                .compaction_target("sonnet", 400_000)
+                .expect("resolve"),
+            Some("claude-sonnet-5".to_owned())
+        );
+        assert_eq!(
+            models.compaction_target("off", 400_000).expect("resolve"),
+            None
         );
     }
 }

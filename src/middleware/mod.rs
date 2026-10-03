@@ -7,19 +7,24 @@
 //! serialises the result. There is no passthrough code path — passthrough is
 //! what the IR produces when nothing transforms it.
 //!
-//! This unit lands the substrate the decision middlewares read:
+//! The decision middlewares, each a faithful ctp port:
 //!
+//! - [`quota`] — the quota gate (ctp limit.mjs): meters → block-or-forward,
+//!   the release marker, the synthetic assistant turn a block is answered
+//!   with;
+//! - [`cold`] — the cold-cache gate and the compaction retarget (ctp
+//!   cold.mjs plus the burn/fit pieces its outlook calls): the
+//!   once-per-idle-spell notice, the quota outlook that can withhold it,
+//!   and the only transform that changes model-visible prompt structure;
 //! - [`lanes`] — the lane table (`sessionId|toolsHash`, ctp docs/internals/
 //!   lanes.md's lane rule) with its TTL stickiness, ping tagging, prune
-//!   policy, and restart reseed;
+//!   policy, and restart reseed — the substrate both gates read;
 //! - [`models`] — the learned model store (days served + maxPrompt, ctp
 //!   models.mjs's family parsing and day-based newest election) and the
 //!   in-memory recently-served map, plus the merge semantics the
 //!   `/_toker/models/merge` control endpoint carries.
-//!
-//! The cold gate and the force-newest rewrite build on these next; nothing
-//! here decides a request yet.
 
+pub mod cold;
 pub mod lanes;
 pub mod models;
 pub mod notice;
