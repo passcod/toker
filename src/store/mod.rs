@@ -1,24 +1,755 @@
 //! SQLite storage: the requests ledger plus state tables.
 //!
-//! Plan: "Storage" — `$XDG_DATA_HOME/toker/toker.db`, WAL mode. `requests` is
-//! insert-only, one row per request, with cost in three explicit kinds never
-//! conflated (billed / estimated / plan-equivalent); state (lanes, learned
-//! models, allowances, pings, last-meters) lives in tables. No content is
-//! ever stored (invariant 1).
+//! Plan: "Storage" — [`default_db_path`] resolves to
+//! `$XDG_DATA_HOME/toker/toker.db` (fallback `~/.local/share/toker/toker.db`),
+//! and [`Store::open`] accepts any path so config and tests can override it.
+//! The database runs in WAL mode with a 5 s busy timeout, so the TUI, the
+//! daemon, and `toker export` can all hold the file while the daemon writes.
+//!
+//! - `requests` is insert-only, one row per request, cost in three explicit
+//!   kinds never conflated ([`CostKind`]); see the `ledger` submodule.
+//! - State (lanes, learned models, allowances, pings, last meters, meta)
+//!   lives in read-modify-write tables; see the `state` submodule.
+//! - No content is ever stored (invariant 1): digests, counts, lengths only.
+//! - Absence ≠ zero (invariant 3): every non-key column is nullable and the
+//!   row model uses `Option` throughout — `None` round-trips as NULL, never
+//!   as `0` or `""`.
+//!
+//! Concurrency: one connection behind a [`std::sync::Mutex`]. This keeps the
+//! write path simple and ordered — the daemon is a single process, and
+//! serialising its own operations costs nothing — while WAL + busy timeout
+//! let other *processes* (TUI, export) read the same file concurrently. If a
+//! hot in-process read path ever contends with writes, open extra
+//! connections on the same path; the schema and pragmas already allow it.
+//!
+//! Migrations: the `schema` submodule holds a numbered, append-only list
+//! gated by `PRAGMA user_version` — no external migration files.
 
-/// Placeholder handle for the open `toker.db` connection.
-#[allow(dead_code)]
-#[derive(Debug)]
+mod ledger;
+mod schema;
+mod state;
+
+pub use ledger::{CostKind, RequestRow, RowKind, is_api_measurement};
+pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use rusqlite::Connection;
+use serde_json::Value;
+
+/// Store-layer errors: SQLite/JSON/IO wrapped with context, plus the
+/// store-specific cases (a poisoned lock, a missing data home, a stored
+/// enum value the code no longer understands).
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("store mutex poisoned")]
+    MutexPoisoned,
+    #[error("no data home: set XDG_DATA_HOME or HOME")]
+    NoDataHome,
+    #[error("unknown value {value:?} in column {column}")]
+    UnknownDbValue { column: &'static str, value: String },
+}
+
+/// Result type for all store operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// `$XDG_DATA_HOME/toker/toker.db`, falling back to
+/// `~/.local/share/toker/toker.db` when XDG is unset (plan: Storage).
+/// Callers may pass any path to [`Store::open`] instead.
+pub fn default_db_path() -> Result<PathBuf> {
+    let data_home = match env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .ok_or(Error::NoDataHome)?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    Ok(data_home.join("toker").join("toker.db"))
+}
+
+/// An open `toker.db`: the requests ledger plus state tables, one mutexed
+/// connection (see the module docs for the concurrency choice).
 pub struct Store {
-    /// Placeholder; grows into a rusqlite handle with migrations.
-    pub placeholder: (),
+    conn: Mutex<Connection>,
+}
+
+impl Store {
+    /// Open (creating if needed) the database at `path`, set WAL mode and
+    /// the busy timeout, run pending migrations, and stamp `meta.created_at`
+    /// on first open. `":memory:"` opens a private in-memory database — the
+    /// tests rely on that, and the pragmas no-op gracefully there.
+    pub fn open(path: impl AsRef<Path>) -> Result<Store> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut conn = Connection::open(path)?;
+        // Returns the effective mode ("wal", or "memory" on :memory:).
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        schema::migrate(&mut conn)?;
+        let store = Store {
+            conn: Mutex::new(conn),
+        };
+        if store.get_meta("created_at")?.is_none() {
+            // Zero only if the system clock is before the epoch; good enough
+            // for a creation stamp.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            store.set_meta("created_at", &now.to_string())?;
+        }
+        Ok(store)
+    }
+
+    /// The mutexed connection; every operation goes through this, so
+    /// writes are ordered and no statement interleaves with another.
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|_| Error::MutexPoisoned)
+    }
+
+    /// Append one request row. The only `requests` writer; there is no
+    /// update or delete path anywhere in the store.
+    pub fn record_request(&self, row: &RequestRow) -> Result<()> {
+        ledger::insert(&*self.conn()?, row)
+    }
+
+    /// Rows with `ts_ms >= ts_ms`, oldest first; when the window holds more
+    /// than `limit` rows the newest `limit` are kept (see `ledger`).
+    pub fn requests_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<RequestRow>> {
+        let limit = limit.min(i64::MAX as u64) as i64;
+        ledger::requests_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// Total ledger row count.
+    pub fn count_requests(&self) -> Result<i64> {
+        ledger::count_requests(&*self.conn()?)
+    }
+
+    /// Upsert one lane (caller owns the read-modify-write cycle).
+    pub fn upsert_lane(&self, lane: &Lane) -> Result<()> {
+        state::upsert_lane(&*self.conn()?, lane)
+    }
+
+    /// One lane by key.
+    pub fn load_lane(&self, key: &str) -> Result<Option<Lane>> {
+        state::load_lane(&*self.conn()?, key)
+    }
+
+    /// All lanes, by key.
+    pub fn load_lanes(&self) -> Result<Vec<Lane>> {
+        state::load_lanes(&*self.conn()?)
+    }
+
+    /// Upsert one learned-model entry.
+    pub fn upsert_model(&self, entry: &ModelEntry) -> Result<()> {
+        state::upsert_model(&*self.conn()?, entry)
+    }
+
+    /// One learned-model entry by exact identity.
+    pub fn load_model(&self, model_id: &str) -> Result<Option<ModelEntry>> {
+        state::load_model(&*self.conn()?, model_id)
+    }
+
+    /// All learned-model entries, by identity.
+    pub fn load_models(&self) -> Result<Vec<ModelEntry>> {
+        state::load_models(&*self.conn()?)
+    }
+
+    /// Record an allowance; idempotent per (session, meter, reset value).
+    pub fn record_allowance(&self, allowance: &Allowance) -> Result<()> {
+        state::record_allowance(&*self.conn()?, allowance)
+    }
+
+    /// All allowances, ordered by session, meter, reset value.
+    pub fn load_allowances(&self) -> Result<Vec<Allowance>> {
+        state::load_allowances(&*self.conn()?)
+    }
+
+    /// Append one ping run.
+    pub fn record_ping(&self, ping: &PingRecord) -> Result<()> {
+        state::record_ping(&*self.conn()?, ping)
+    }
+
+    /// Pings with `ts_ms >= ts_ms`, oldest first, newest `limit` kept.
+    pub fn pings_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<PingRecord>> {
+        let limit = limit.min(i64::MAX as u64) as i64;
+        state::pings_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// Overwrite the last meter snapshot (single row).
+    pub fn save_meters(&self, snapshot: &MetersSnapshot) -> Result<()> {
+        state::save_meters(&*self.conn()?, snapshot)
+    }
+
+    /// The last meter snapshot, if the backend has produced one.
+    pub fn load_meters(&self) -> Result<Option<MetersSnapshot>> {
+        state::load_meters(&*self.conn()?)
+    }
+
+    /// Set a meta key/value.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        state::set_meta(&*self.conn()?, key, value)
+    }
+
+    /// Get a meta value by key.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        state::get_meta(&*self.conn()?, key)
+    }
+}
+
+/// Serialise an optional JSON-typed column. `None` stays NULL — never
+/// `"null"` or `{}` (absence ≠ zero).
+fn opt_json_to_text(value: &Option<Value>) -> Result<Option<String>> {
+    match value {
+        None => Ok(None),
+        Some(value) => Ok(Some(serde_json::to_string(value)?)),
+    }
+}
+
+/// Parse an optional JSON-typed column back.
+fn opt_json_from_text(text: Option<String>) -> Result<Option<Value>> {
+    match text {
+        None => Ok(None),
+        Some(text) => Ok(Some(serde_json::from_str(&text)?)),
+    }
+}
+
+/// Run `read` over at most the first row `sql` yields. Shared by the
+/// submodules so row readers return [`Result`] (our error type), letting
+/// JSON and enum parsing inside them report uniformly.
+fn row_of<T, P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    read: impl Fn(&rusqlite::Row<'_>) -> Result<T>,
+) -> Result<Option<T>>
+where
+    P: rusqlite::Params,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    match rows.next()? {
+        Some(row) => Ok(Some(read(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Run `read` over every row `sql` yields, in query order.
+fn rows_of<T, P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+    read: impl Fn(&rusqlite::Row<'_>) -> Result<T>,
+) -> Result<Vec<T>>
+where
+    P: rusqlite::Params,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(read(row)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::schema;
+    use super::{
+        Allowance, CostKind, Error, Lane, MetersSnapshot, ModelEntry, PingRecord, RequestRow,
+        RowKind, Store, is_api_measurement,
+    };
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh private in-memory store per test.
+    fn mem_store() -> Store {
+        Store::open(":memory:").expect("open in-memory store")
+    }
+
+    /// A fresh scratch directory under /tmp/opencode (pre-created and
+    /// approved for external access), unique per call so parallel tests
+    /// never collide.
+    fn test_dir(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            PathBuf::from("/tmp/opencode").join(format!("{}-{}-{}", std::process::id(), name, n));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    fn user_version(store: &Store) -> i64 {
+        let conn = store.conn.lock().expect("lock");
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .expect("read user_version")
+    }
+
+    /// A row with every field set, covering every column's Some path.
+    fn full_row() -> RequestRow {
+        RequestRow {
+            id: None,
+            ts_ms: 1_769_000_000_012,
+            duration_ms: Some(3_456),
+            kind: None,
+            frontend: Some("openai_chat".to_string()),
+            provider: Some("openrouter".to_string()),
+            route: Some("openai_chat:openrouter".to_string()),
+            session_id: Some("ses-abc".to_string()),
+            ping: Some(false),
+            model: Some("z-ai/glm-5.3".to_string()),
+            raw_model: Some("z-ai/glm-5.3".to_string()),
+            requested_model: Some("openrouter/z-ai/glm-5.3".to_string()),
+            effective_model: Some("z-ai/glm-5.3".to_string()),
+            input: Some(12_345),
+            cache_read: Some(100_000),
+            cache_write_total: Some(5_000),
+            cache_write_5m: Some(3_000),
+            cache_write_1h: Some(2_000),
+            output: Some(678),
+            reasoning: Some(90),
+            iterations: Some(1),
+            web_searches: Some(0),
+            code_execs: Some(2),
+            ttl_split_known: Some(true),
+            usage_presence: Some(json!({
+                "input": true, "output": true, "cache_read": true, "cost": true,
+            })),
+            usage_raw: Some(
+                r#"{"prompt_tokens":12345,"cost":0.00213,"cost_details":{"upstream":"0.0019"}}"#
+                    .to_string(),
+            ),
+            cost_usd: Some(0.00213),
+            cost_kind: Some(CostKind::Billed),
+            rate_limits: None, // kind-gated: a real measurement never carries a stale copy
+            req_bytes: Some(51_234),
+            req_messages: Some(42),
+            req_tools: Some(17),
+            tools_hash: Some("sha256:tool5".to_string()),
+            system_chars: Some(9_876),
+            system_hash: Some("sha256:sys2".to_string()),
+            system_blocks: Some(json!([
+                {"hash": "sha256:b1", "chars": 4000},
+                {"hash": "sha256:b2", "chars": 5876},
+            ])),
+            system_messages: Some(2),
+            compact_generations: Some(1),
+            summarising: Some(false),
+            system_change: Some(json!({"added": 1, "removed": 0})),
+            system_ladder: Some("2/17/42/1".to_string()),
+            system_tail: Some("sha256:tail9".to_string()),
+            gate_on: Some(true),
+            cold_on: Some(false),
+            forced_from: Some("z-ai/glm-5.2".to_string()),
+            forced_to: Some("z-ai/glm-5.3".to_string()),
+            downgraded_from: None,
+            downgraded_to: None,
+            cache_stripped: Some(true),
+            system_merged: Some(false),
+            model_mappings: Some(json!([{"from": "gpt-5.6", "to": "z-ai/glm-5.3"}])),
+            drift_digest: None,
+            status: None,
+            error_type: None,
+            retry_after_ms: None,
+            extra: None,
+            betas: Some("context-1m-2025-08-07".to_string()),
+            geo: Some("NZ".to_string()),
+            fast: Some(true),
+        }
+    }
+
+    /// A row with only `ts_ms` — every other column NULL.
+    fn bare_row(ts_ms: i64) -> RequestRow {
+        RequestRow {
+            id: None,
+            ts_ms,
+            duration_ms: None,
+            kind: None,
+            frontend: None,
+            provider: None,
+            route: None,
+            session_id: None,
+            ping: None,
+            model: None,
+            raw_model: None,
+            requested_model: None,
+            effective_model: None,
+            input: None,
+            cache_read: None,
+            cache_write_total: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            output: None,
+            reasoning: None,
+            iterations: None,
+            web_searches: None,
+            code_execs: None,
+            ttl_split_known: None,
+            usage_presence: None,
+            usage_raw: None,
+            cost_usd: None,
+            cost_kind: None,
+            rate_limits: None,
+            req_bytes: None,
+            req_messages: None,
+            req_tools: None,
+            tools_hash: None,
+            system_chars: None,
+            system_hash: None,
+            system_blocks: None,
+            system_messages: None,
+            compact_generations: None,
+            summarising: None,
+            system_change: None,
+            system_ladder: None,
+            system_tail: None,
+            gate_on: None,
+            cold_on: None,
+            forced_from: None,
+            forced_to: None,
+            downgraded_from: None,
+            downgraded_to: None,
+            cache_stripped: None,
+            system_merged: None,
+            model_mappings: None,
+            drift_digest: None,
+            status: None,
+            error_type: None,
+            retry_after_ms: None,
+            extra: None,
+            betas: None,
+            geo: None,
+            fast: None,
+        }
+    }
+
     #[test]
-    fn store_skeleton() {
-        // Schema and round-trip tests land here.
-        assert!(true);
+    fn open_migrates_from_scratch_and_stamps_meta() {
+        let store = mem_store();
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        assert!(store.get_meta("created_at").expect("meta").is_some());
+    }
+
+    #[test]
+    fn file_db_persists_and_reads_across_connections() {
+        let dir = test_dir("file-db");
+        let db = dir.join("nested").join("toker.db"); // exercises parent-dir creation
+        let writer = Store::open(&db).expect("open writer");
+        writer.record_request(&full_row()).expect("record");
+
+        // WAL: a second connection reads committed rows while the first
+        // stays open.
+        let reader = Store::open(&db).expect("open reader");
+        assert_eq!(reader.count_requests().expect("count"), 1);
+        drop(reader);
+        drop(writer);
+
+        // Reopen: the row persists and migrations do not re-run.
+        let reopened = Store::open(&db).expect("reopen");
+        assert_eq!(reopened.count_requests().expect("count"), 1);
+        assert_eq!(
+            reopened.requests_since(0, 10).expect("rows").len(),
+            1,
+            "row persisted across reopen"
+        );
+        assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn full_row_round_trips() {
+        let store = mem_store();
+        let row = full_row();
+        store.record_request(&row).expect("record");
+
+        let mut rows = store.requests_since(0, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        let mut got = rows.remove(0);
+        assert_eq!(got.id, Some(1), "id assigned on insert");
+        got.id = None;
+        assert_eq!(got, row, "every column round-trips byte-for-value");
+    }
+
+    #[test]
+    fn nulls_round_trip_as_none_never_zero() {
+        let store = mem_store();
+        let row = bare_row(42);
+        store.record_request(&row).expect("record");
+
+        let mut rows = store.requests_since(0, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        let mut got = rows.remove(0);
+        assert_eq!(got.ts_ms, 42);
+        got.id = None;
+        assert_eq!(got, row, "absence stays absence on every column");
+
+        // Spot-check the invariant 3 property where a silent zero would be
+        // most damaging: a measurement the provider did not report.
+        assert_eq!(got.input, None);
+        assert_eq!(got.cost_usd, None);
+        assert_eq!(got.cost_kind, None);
+        assert_eq!(got.session_id, None);
+        assert_eq!(got.ping, None);
+        assert_eq!(got.ttl_split_known, None);
+        assert_eq!(got.usage_raw, None);
+    }
+
+    #[test]
+    fn proxy_kinds_are_not_api_measurements() {
+        assert!(is_api_measurement(None), "NULL kind = real API measurement");
+        let kinds = [
+            RowKind::Blocked,
+            RowKind::Released,
+            RowKind::Cold,
+            RowKind::ColdQuiet,
+            RowKind::Awake,
+            RowKind::Error,
+            RowKind::FidelityDrift,
+        ];
+        for kind in kinds {
+            assert!(!is_api_measurement(Some(kind)));
+            assert_eq!(RowKind::parse(kind.as_str()), Some(kind));
+        }
+
+        let store = mem_store();
+        for (i, kind) in kinds.iter().enumerate() {
+            let mut row = bare_row(1_000 + i as i64);
+            row.kind = Some(*kind);
+            store.record_request(&row).expect("record");
+        }
+        let rows = store.requests_since(0, kinds.len() as u64).expect("read");
+        assert_eq!(rows.len(), kinds.len());
+        for (row, kind) in rows.iter().zip(kinds) {
+            assert_eq!(row.kind, Some(kind), "kinds round-trip");
+        }
+        assert!(
+            rows.iter().all(|row| !is_api_measurement(row.kind)),
+            "no proxy-written row classifies as an API measurement"
+        );
+    }
+
+    #[test]
+    fn requests_since_windows_orders_and_limits() {
+        let store = mem_store();
+        // Insert out of order: ids do not follow ts order.
+        for ts in [100, 300, 200, 500, 400] {
+            store.record_request(&bare_row(ts)).expect("record");
+        }
+
+        let ts = |rows: Vec<RequestRow>| rows.into_iter().map(|r| r.ts_ms).collect::<Vec<_>>();
+        assert_eq!(
+            ts(store.requests_since(0, 100).expect("all")),
+            vec![100, 200, 300, 400, 500],
+            "oldest first"
+        );
+        assert_eq!(
+            ts(store.requests_since(200, 100).expect("window")),
+            vec![200, 300, 400, 500],
+            "window is inclusive of the boundary"
+        );
+        assert_eq!(
+            ts(store.requests_since(0, 3).expect("capped")),
+            vec![300, 400, 500],
+            "cap keeps the newest rows, still oldest-first"
+        );
+        assert!(
+            store.requests_since(600, 10).expect("empty").is_empty(),
+            "window past the newest row is empty"
+        );
+        assert_eq!(store.count_requests().expect("count"), 5);
+    }
+
+    #[test]
+    fn state_upserts_round_trip() {
+        let store = mem_store();
+
+        // Lanes: insert, read back, read-modify-write, read back again.
+        let lane = Lane {
+            key: "ses-1|sha256:tool5".to_string(),
+            session_id: Some("ses-1".to_string()),
+            tools_hash: Some("sha256:tool5".to_string()),
+            updated_ms: 1_000,
+            prompt_tokens: Some(12_000),
+            ttl: Some(300_000),
+            ping: Some(false),
+        };
+        store.upsert_lane(&lane).expect("upsert lane");
+        assert_eq!(
+            store.load_lane(&lane.key).expect("load"),
+            Some(lane.clone())
+        );
+        let mut bumped = lane.clone();
+        bumped.updated_ms = 2_000;
+        bumped.prompt_tokens = Some(15_000);
+        store.upsert_lane(&bumped).expect("upsert lane again");
+        assert_eq!(
+            store.load_lane(&lane.key).expect("load"),
+            Some(bumped.clone())
+        );
+        assert_eq!(store.load_lanes().expect("lanes"), vec![bumped]);
+        assert_eq!(store.load_lane("missing").expect("missing"), None);
+
+        // Models: same, including the JSON columns.
+        let model = ModelEntry {
+            model_id: "anthropic/claude-opus-5".to_string(),
+            days_json: Some(json!(["2026-09-28", "2026-09-29"])),
+            max_prompt: Some(180_000),
+            context_window_json: Some(json!({"context": 200_000, "verified": "2026-10-01"})),
+        };
+        store.upsert_model(&model).expect("upsert model");
+        assert_eq!(
+            store.load_model(&model.model_id).expect("load"),
+            Some(model.clone())
+        );
+        let mut learned_more = model.clone();
+        learned_more.max_prompt = Some(190_000);
+        store
+            .upsert_model(&learned_more)
+            .expect("upsert model again");
+        assert_eq!(
+            store.load_model(&model.model_id).expect("load"),
+            Some(learned_more.clone())
+        );
+        assert_eq!(store.load_models().expect("models"), vec![learned_more]);
+        assert_eq!(store.load_model("unknown/model").expect("missing"), None);
+
+        // Allowances: idempotent per (session, meter, reset).
+        let five_h = Allowance {
+            session_id: "ses-1".to_string(),
+            meter: "5h".to_string(),
+            reset_value: 1_769_100_000_000,
+        };
+        store.record_allowance(&five_h).expect("record");
+        store.record_allowance(&five_h).expect("record again");
+        let seven_d = Allowance {
+            session_id: "ses-1".to_string(),
+            meter: "7d".to_string(),
+            reset_value: 1_769_700_000_000,
+        };
+        store.record_allowance(&seven_d).expect("record");
+        assert_eq!(
+            store.load_allowances().expect("allowances"),
+            vec![five_h, seven_d],
+            "same allowance twice is one row"
+        );
+
+        // Pings: insert-only, windowed like the ledger.
+        let ping = PingRecord {
+            id: None,
+            ts_ms: 3_000,
+            exit_code: Some(0),
+            duration_ms: Some(1_234),
+            boundary_ms: Some(2_400),
+        };
+        store.record_ping(&ping).expect("record ping");
+        let mut got = store.pings_since(0, 10).expect("pings");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, Some(1), "id assigned on insert");
+        let mut expected = ping.clone();
+        expected.id = None;
+        got[0].id = None;
+        assert_eq!(got[0], expected);
+        let late = PingRecord {
+            id: None,
+            ts_ms: 5_000,
+            exit_code: Some(1),
+            duration_ms: None,
+            boundary_ms: None,
+        };
+        store.record_ping(&late).expect("record ping");
+        let ts: Vec<i64> = store
+            .pings_since(4_000, 10)
+            .expect("pings")
+            .into_iter()
+            .map(|p| p.ts_ms)
+            .collect();
+        assert_eq!(ts, vec![5_000]);
+        let ts: Vec<i64> = store
+            .pings_since(0, 1)
+            .expect("pings")
+            .into_iter()
+            .map(|p| p.ts_ms)
+            .collect();
+        assert_eq!(ts, vec![5_000], "cap keeps the newest ping");
+
+        // Meters: single row, overwritten on every save.
+        let meters = MetersSnapshot {
+            updated_ms: 4_000,
+            snapshot: json!({"5h": {"used": 42, "limit": 100}}),
+        };
+        store.save_meters(&meters).expect("save");
+        assert_eq!(store.load_meters().expect("load"), Some(meters.clone()));
+        let fresher = MetersSnapshot {
+            updated_ms: 4_500,
+            snapshot: json!({"5h": {"used": 50, "limit": 100}}),
+        };
+        store.save_meters(&fresher).expect("save again");
+        assert_eq!(store.load_meters().expect("load"), Some(fresher));
+
+        // Meta: last write wins.
+        store.set_meta("note", "hello").expect("set");
+        assert_eq!(
+            store.get_meta("note").expect("get"),
+            Some("hello".to_string())
+        );
+        store.set_meta("note", "again").expect("set");
+        assert_eq!(
+            store.get_meta("note").expect("get"),
+            Some("again".to_string())
+        );
+        assert_eq!(store.get_meta("missing").expect("get"), None);
+    }
+
+    #[test]
+    fn unknown_stored_enum_value_is_an_error() {
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO requests (ts_ms, kind) VALUES (1, 'mystery')",
+                [],
+            )
+            .expect("insert bogus kind");
+        }
+        match store.requests_since(0, 10) {
+            Err(Error::UnknownDbValue { column: "kind", .. }) => {}
+            other => panic!("unknown kind must error, got {other:?}"),
+        }
+
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO requests (ts_ms, cost_kind) VALUES (2, 'discounted')",
+                [],
+            )
+            .expect("insert bogus cost_kind");
+        }
+        match store.requests_since(0, 10) {
+            Err(Error::UnknownDbValue {
+                column: "cost_kind",
+                ..
+            }) => {}
+            other => panic!("unknown cost_kind must error, got {other:?}"),
+        }
     }
 }

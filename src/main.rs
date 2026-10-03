@@ -1,19 +1,13 @@
-//! toker — unified local proxy toolsuite.
+//! toker — unified local proxy toolsuite: the binary/CLI surface.
 //!
 //! Design: docs/plans/toker-toolsuite.md. Three layers: frontend protocol
-//! adapters ([proto]) → middleware chain ([middleware]) → backend providers
-//! ([providers]), with [ir] as the canonical request model they share, [store]
-//! as the SQLite ledger, [server] as the listener, and [tui] as the dashboard.
+//! adapters ([`toker::proto`]) → middleware chain ([`toker::middleware`]) →
+//! backend providers ([`toker::providers`]), with [`toker::ir`] as the
+//! canonical request model they share, [`toker::store`] as the SQLite
+//! ledger, [`toker::server`] as the listener, and [`toker::tui`] as the
+//! dashboard. The modules live in the `toker` library crate (src/lib.rs).
 
-mod cmds;
-mod config;
-mod ir;
-mod middleware;
-mod proto;
-mod providers;
-mod server;
-mod store;
-mod tui;
+use toker::cmds;
 
 use clap::{Parser, Subcommand};
 

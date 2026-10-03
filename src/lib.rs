@@ -1,0 +1,24 @@
+//! toker — unified local proxy toolsuite: the library crate.
+//!
+//! Design: docs/plans/toker-toolsuite.md. Three layers: frontend protocol
+//! adapters ([proto]) → middleware chain ([middleware]) → backend providers
+//! ([providers]), with [ir] as the canonical request model they share,
+//! [store] as the SQLite ledger, [server] as the listener, and [tui] as the
+//! dashboard. The binary (src/main.rs) is the CLI surface over these
+//! modules.
+//!
+//! The lib/bin split exists so each unit can land its full public API before
+//! the next unit wires it in: `pub` items here are the crate's public
+//! surface and stay lint-clean without dead-code suppression. (The scaffold
+//! placeholders predate this and still carry `#[allow(dead_code)]`; their
+//! units drop them as they implement.)
+
+pub mod cmds;
+pub mod config;
+pub mod ir;
+pub mod middleware;
+pub mod proto;
+pub mod providers;
+pub mod server;
+pub mod store;
+pub mod tui;
