@@ -19,8 +19,9 @@
 //!     so they record nothing in practice ([`anthropic`]).
 //!   - The batch-result GETs (and cancel) — transparent forwarding like
 //!     `/v1/models`.
-//! - `GET /_toker/status`, `POST /_toker/models/merge` — the control
-//!   endpoint, gated by a custom header ([`control`]).
+//! - `GET /_toker/status`, `POST /_toker/models/merge`,
+//!   `GET /_toker/session` — the control endpoints, gated by a custom
+//!   header ([`control`]); `session` is the attribution plugin's query.
 //!
 //! Timeouts: none. Axum applies no default request or idle timeout, so
 //! streams run as long as both ends keep the connection open — the plan's
@@ -287,6 +288,7 @@ impl Server {
                 post(anthropic::batches_cancel),
             )
             .route("/_toker/status", get(control::status))
+            .route("/_toker/session", get(control::session))
             .route("/_toker/models/merge", post(control::models_merge))
             .with_state(self.clone())
     }

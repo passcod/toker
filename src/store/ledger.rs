@@ -407,6 +407,157 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// One `per_provider`/`per_model` group of a session's billed cost: the
+/// group's label, how many billed rows are in it, and their summed cost.
+/// A group exists because at least one billed row is in it, so `None`
+/// cost means every row in the group carried a NULL cost — not "no
+/// rows".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionCostGroup {
+    /// The group's label: the serving provider (with the backend id as
+    /// fallback) or the model.
+    pub label: String,
+    /// Billed rows in the group.
+    pub requests: i64,
+    /// Summed `cost_usd` over the group's billed rows.
+    pub cost_usd: Option<f64>,
+}
+
+/// The `/_toker/session` aggregate: one session's ledger rows read in
+/// one pass for the opencode sidebar/footer. Absence ≠ zero holds
+/// throughout (invariant 3): every token sum is `None` when no
+/// measurement row carried the metric, and the billed total is `None`
+/// when no row was billed — a real zero sum reads back as `Some(0.0)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    /// The session's API-measurement rows (kind `None`) — proxy-written
+    /// kinds (a blocked gate, an error) are not requests the provider
+    /// measured.
+    pub requests: i64,
+    /// Earliest/latest measurement timestamps; `None` when there are no
+    /// rows.
+    pub first_ts_ms: Option<i64>,
+    pub last_ts_ms: Option<i64>,
+    /// Token sums over the measurement rows; `None` when no row carried
+    /// the bucket.
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub reasoning: Option<i64>,
+    pub cache_read: Option<i64>,
+    pub cache_write_total: Option<i64>,
+    /// Sum of `cost_usd` where `cost_kind = 'billed'` — the openrouter
+    /// reported cost, never the plan-equivalent or estimated kinds.
+    pub billed_total: Option<f64>,
+    /// The billed cost broken down by who served it — the row's
+    /// `extra.serving_provider` (the upstream endpoint openrouter names)
+    /// with the backend id as fallback — cost-desc. Only rows with a
+    /// billed cost appear, so the breakdown partitions `billed_total`
+    /// exactly; a subscription backend's plan-equivalent rows are
+    /// measured (in `requests`/`tokens`) but never billed.
+    pub per_provider: Vec<SessionCostGroup>,
+    /// The same billed rows by `model`, cost-desc.
+    pub per_model: Vec<SessionCostGroup>,
+}
+
+/// The session's totals in one row: `COUNT`/`MIN`/`MAX` and the token /
+/// billed-cost sums over its measurement rows. `SUM` skips NULLs and
+/// yields NULL when no row carried the metric — exactly the absence ≠
+/// zero rule, so the sums need no post-processing.
+const SESSION_TOTALS_SQL: &str = concat!(
+    "SELECT COUNT(*) AS requests,",
+    " MIN(ts_ms) AS first_ts_ms, MAX(ts_ms) AS last_ts_ms,",
+    " SUM(input) AS input, SUM(output) AS output,",
+    " SUM(reasoning) AS reasoning, SUM(cache_read) AS cache_read,",
+    " SUM(cache_write_total) AS cache_write_total,",
+    " SUM(CASE WHEN cost_kind = 'billed' THEN cost_usd END) AS billed_total",
+    " FROM requests WHERE session_id = ?1 AND kind IS NULL",
+);
+
+/// The billed cost by serving provider: `extra.serving_provider` first
+/// (openrouter names the upstream endpoint there), the backend id as
+/// fallback, `unknown` when a row carries neither. The GROUP BY/ORDER BY
+/// repeat the label expression rather than aliasing it — `provider` is
+/// also a column name, and resolution by alias is a rule not worth
+/// leaning on. The name ASC tiebreaker keeps equal-cost groups in a
+/// deterministic order.
+const SESSION_PROVIDER_SQL: &str = concat!(
+    "SELECT COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE session_id = ?1 AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC,",
+    " COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') ASC",
+);
+
+/// The billed cost by model, same shape and ordering as the provider
+/// breakdown.
+const SESSION_MODEL_SQL: &str = concat!(
+    "SELECT COALESCE(model, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE session_id = ?1 AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(model, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC, COALESCE(model, 'unknown') ASC",
+);
+
+/// Read one breakdown row, by column alias.
+fn read_cost_group(row: &rusqlite::Row<'_>) -> Result<SessionCostGroup> {
+    Ok(SessionCostGroup {
+        label: row.get("label")?,
+        requests: row.get("requests")?,
+        cost_usd: row.get("cost_usd")?,
+    })
+}
+
+/// The `/_toker/session` aggregate for one session id — three statements
+/// under the caller's lock: the totals over its measurement rows, then
+/// the billed-cost breakdowns. A session with no rows (or no session at
+/// all — the endpoint cannot tell them apart, by design) answers
+/// `requests: 0` with `None` everywhere else.
+pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<SessionSummary> {
+    // COUNT(*) always yields exactly one row, even over an empty set, so
+    // the only failure mode here is a genuine SQLite error.
+    let (
+        requests,
+        first_ts_ms,
+        last_ts_ms,
+        input,
+        output,
+        reasoning,
+        cache_read,
+        cache_write_total,
+        billed_total,
+    ) = conn.query_row(SESSION_TOTALS_SQL, [session_id], |row| {
+        Ok((
+            row.get::<_, i64>("requests")?,
+            row.get::<_, Option<i64>>("first_ts_ms")?,
+            row.get::<_, Option<i64>>("last_ts_ms")?,
+            row.get::<_, Option<i64>>("input")?,
+            row.get::<_, Option<i64>>("output")?,
+            row.get::<_, Option<i64>>("reasoning")?,
+            row.get::<_, Option<i64>>("cache_read")?,
+            row.get::<_, Option<i64>>("cache_write_total")?,
+            row.get::<_, Option<f64>>("billed_total")?,
+        ))
+    })?;
+    let per_provider = rows_of(conn, SESSION_PROVIDER_SQL, [session_id], read_cost_group)?;
+    let per_model = rows_of(conn, SESSION_MODEL_SQL, [session_id], read_cost_group)?;
+    Ok(SessionSummary {
+        requests,
+        first_ts_ms,
+        last_ts_ms,
+        input,
+        output,
+        reasoning,
+        cache_read,
+        cache_write_total,
+        billed_total,
+        per_provider,
+        per_model,
+    })
+}
+
 /// Read one row by column name, so the SELECT order can never misalign a
 /// field. Unknown `kind`/`cost_kind` strings are an error, not a silent
 /// `None` — a corrupted enum value must never reclassify a row as an API

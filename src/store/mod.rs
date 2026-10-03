@@ -29,7 +29,9 @@ mod ledger;
 mod schema;
 mod state;
 
-pub use ledger::{CostKind, RequestRow, RowKind, is_api_measurement};
+pub use ledger::{
+    CostKind, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
+};
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
 
 use std::env;
@@ -150,6 +152,15 @@ impl Store {
     /// Total ledger row count.
     pub fn count_requests(&self) -> Result<i64> {
         ledger::count_requests(&*self.conn()?)
+    }
+
+    /// The `/_toker/session` aggregate for one session id: the count and
+    /// span of its measurement rows, token sums, the billed total, and
+    /// the billed-cost breakdowns by serving provider and model (see
+    /// `ledger`). A session with no rows answers `requests: 0` with
+    /// `None` everywhere else.
+    pub fn session_summary(&self, session_id: &str) -> Result<SessionSummary> {
+        ledger::session_summary(&*self.conn()?, session_id)
     }
 
     /// Upsert one lane (caller owns the read-modify-write cycle).
@@ -293,7 +304,7 @@ mod tests {
     use super::schema;
     use super::{
         Allowance, CostKind, Error, Lane, MetersSnapshot, ModelEntry, PingRecord, RequestRow,
-        RowKind, Store, is_api_measurement,
+        RowKind, SessionCostGroup, Store, is_api_measurement,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -616,6 +627,301 @@ mod tests {
         let (first, last) = store.record_requests(&more).expect("second batch");
         assert_eq!((first, last), (Some(6), Some(7)));
         assert_eq!(store.count_requests().expect("count"), 7);
+    }
+
+    /// A billed openrouter measurement row for the aggregate tests.
+    fn billed_row(
+        ts_ms: i64,
+        session: &str,
+        serving_provider: Option<&str>,
+        model: Option<&str>,
+        cost: f64,
+    ) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.session_id = Some(session.to_owned());
+        row.provider = Some("openrouter".to_owned());
+        row.model = model.map(str::to_owned);
+        row.cost_usd = Some(cost);
+        row.cost_kind = Some(CostKind::Billed);
+        row.extra = serving_provider.map(|provider| json!({"serving_provider": provider}));
+        row
+    }
+
+    #[test]
+    fn session_summary_aggregates_measurements_tokens_and_billed_cost() {
+        let store = mem_store();
+
+        // Three billed openrouter rows: two via one serving provider,
+        // one with no serving_provider named (falls back to the backend
+        // id), across two models.
+        let mut relace = billed_row(1_000, "ses-agg", Some("Relace"), Some("z-ai/glm-5.3"), 0.01);
+        relace.input = Some(100);
+        relace.output = Some(40);
+        store.record_request(&relace).expect("record");
+        let mut cached = billed_row(2_000, "ses-agg", Some("Relace"), Some("z-ai/glm-5.3"), 0.02);
+        cached.input = Some(50);
+        cached.cache_read = Some(10);
+        store.record_request(&cached).expect("record");
+        let mut fallback = billed_row(3_000, "ses-agg", None, Some("openai/gpt-5.2"), 0.005);
+        fallback.output = Some(5);
+        store.record_request(&fallback).expect("record");
+
+        // A subscription row: measured (tokens, request count), never
+        // billed — plan-equivalent cost is not spend.
+        let mut sub = bare_row(4_000);
+        sub.session_id = Some("ses-agg".to_owned());
+        sub.provider = Some("anthropic_sub".to_owned());
+        sub.model = Some("claude-opus-5".to_owned());
+        sub.input = Some(7);
+        sub.cache_write_total = Some(900);
+        sub.cost_usd = Some(1.5);
+        sub.cost_kind = Some(CostKind::PlanEquivalent);
+        store.record_request(&sub).expect("record");
+
+        // A proxy-written row is not an API measurement: excluded from
+        // every count and sum.
+        let mut error = bare_row(5_000);
+        error.session_id = Some("ses-agg".to_owned());
+        error.kind = Some(RowKind::Error);
+        error.input = Some(999);
+        store.record_request(&error).expect("record");
+
+        // Another session's rows are not this session's.
+        store
+            .record_request(&billed_row(
+                1_500,
+                "ses-other",
+                Some("Elsewhere"),
+                Some("x/y"),
+                0.5,
+            ))
+            .expect("record");
+
+        let summary = store.session_summary("ses-agg").expect("summary");
+        assert_eq!(summary.requests, 4, "three openrouter + one sub row");
+        assert_eq!(summary.first_ts_ms, Some(1_000));
+        assert_eq!(summary.last_ts_ms, Some(4_000));
+        assert_eq!(summary.input, Some(157));
+        assert_eq!(summary.output, Some(45));
+        assert_eq!(summary.cache_read, Some(10));
+        assert_eq!(summary.cache_write_total, Some(900));
+        assert_eq!(summary.reasoning, None, "no row carried the metric");
+        assert_eq!(
+            summary.billed_total,
+            Some(0.035),
+            "billed only — the 1.5 plan-equivalent is not spend"
+        );
+        assert_eq!(
+            summary.per_provider,
+            vec![
+                SessionCostGroup {
+                    label: "Relace".to_owned(),
+                    requests: 2,
+                    cost_usd: Some(0.03)
+                },
+                SessionCostGroup {
+                    label: "openrouter".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.005)
+                },
+            ],
+            "cost-desc, serving_provider first with the backend id as fallback; the sub never bills"
+        );
+        assert_eq!(
+            summary.per_model,
+            vec![
+                SessionCostGroup {
+                    label: "z-ai/glm-5.3".to_owned(),
+                    requests: 2,
+                    cost_usd: Some(0.03)
+                },
+                SessionCostGroup {
+                    label: "openai/gpt-5.2".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.005)
+                },
+            ],
+            "same breakdown by model"
+        );
+
+        // The other session aggregates independently.
+        let other = store.session_summary("ses-other").expect("summary");
+        assert_eq!(other.requests, 1);
+        assert_eq!(other.billed_total, Some(0.5));
+        assert_eq!(
+            other.per_provider,
+            vec![SessionCostGroup {
+                label: "Elsewhere".to_owned(),
+                requests: 1,
+                cost_usd: Some(0.5)
+            }]
+        );
+    }
+
+    #[test]
+    fn session_summary_absence_is_null_and_a_real_zero_survives() {
+        let store = mem_store();
+
+        // A row that reported zeros: 0 input, a 0.0 billed cost — real
+        // zeros, not absence, and they must read back as zeros.
+        let mut zero_input =
+            billed_row(1_000, "ses-zero", Some("Relace"), Some("z-ai/glm-5.3"), 0.0);
+        zero_input.input = Some(0);
+        store.record_request(&zero_input).expect("record");
+        let mut zero_output = bare_row(2_000);
+        zero_output.session_id = Some("ses-zero".to_owned());
+        zero_output.output = Some(0);
+        store.record_request(&zero_output).expect("record");
+
+        let summary = store.session_summary("ses-zero").expect("summary");
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.input, Some(0), "a reported zero is a zero");
+        assert_eq!(summary.output, Some(0));
+        assert_eq!(summary.cache_read, None, "no row carried the metric");
+        assert_eq!(summary.reasoning, None);
+        assert_eq!(summary.cache_write_total, None);
+        assert_eq!(summary.billed_total, Some(0.0), "a real zero sum stays 0");
+        assert_eq!(
+            summary.per_provider,
+            vec![SessionCostGroup {
+                label: "Relace".to_owned(),
+                requests: 1,
+                cost_usd: Some(0.0)
+            }]
+        );
+        assert_eq!(
+            summary.per_model,
+            vec![SessionCostGroup {
+                label: "z-ai/glm-5.3".to_owned(),
+                requests: 1,
+                cost_usd: Some(0.0)
+            }]
+        );
+
+        // A session whose only cost is plan-equivalent: the billed half
+        // is absent, never zero.
+        let mut sub = bare_row(3_000);
+        sub.session_id = Some("ses-plan".to_owned());
+        sub.provider = Some("anthropic_sub".to_owned());
+        sub.model = Some("claude-opus-5".to_owned());
+        sub.input = Some(3);
+        sub.cost_usd = Some(1.5);
+        sub.cost_kind = Some(CostKind::PlanEquivalent);
+        store.record_request(&sub).expect("record");
+
+        let summary = store.session_summary("ses-plan").expect("summary");
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.input, Some(3));
+        assert_eq!(
+            summary.billed_total, None,
+            "no billed rows — absence, not a zero"
+        );
+        assert_eq!(summary.per_provider, Vec::<SessionCostGroup>::new());
+        assert_eq!(summary.per_model, Vec::<SessionCostGroup>::new());
+    }
+
+    #[test]
+    fn session_summary_without_rows_is_zero_requests_with_nulls() {
+        let store = mem_store();
+        // Rows exist, but not for the session asked about — an absent
+        // session is indistinguishable from one that measured nothing,
+        // and the answer is the same zero-and-nulls shape.
+        store
+            .record_request(&billed_row(
+                1_000,
+                "ses-real",
+                Some("Relace"),
+                Some("z-ai/glm-5.3"),
+                0.01,
+            ))
+            .expect("record");
+
+        let summary = store.session_summary("ses-missing").expect("summary");
+        assert_eq!(summary.requests, 0);
+        assert_eq!(summary.first_ts_ms, None);
+        assert_eq!(summary.last_ts_ms, None);
+        assert_eq!(summary.input, None);
+        assert_eq!(summary.output, None);
+        assert_eq!(summary.reasoning, None);
+        assert_eq!(summary.cache_read, None);
+        assert_eq!(summary.cache_write_total, None);
+        assert_eq!(summary.billed_total, None);
+        assert_eq!(summary.per_provider, Vec::<SessionCostGroup>::new());
+        assert_eq!(summary.per_model, Vec::<SessionCostGroup>::new());
+
+        // The empty session id is a real id, answered the same way.
+        let empty = store.session_summary("").expect("summary");
+        assert_eq!(empty.requests, 0);
+        assert_eq!(empty.billed_total, None);
+    }
+
+    #[test]
+    fn session_summary_labels_fall_back_to_backend_then_unknown() {
+        let store = mem_store();
+        // A billed row whose serving provider is absent falls back to
+        // the backend id; one with neither falls to `unknown` — and
+        // equal-cost groups tie-break by label, so the order is
+        // deterministic.
+        store
+            .record_request(&billed_row(
+                1_000,
+                "ses-labels",
+                Some("Relace"),
+                Some("z-ai/glm-5.3"),
+                0.02,
+            ))
+            .expect("record");
+        let mut backend = billed_row(2_000, "ses-labels", None, Some("openai/gpt-5.2"), 0.01);
+        backend.provider = Some("anthropic_api".to_owned());
+        store.record_request(&backend).expect("record");
+        let mut unknown = billed_row(3_000, "ses-labels", None, None, 0.01);
+        unknown.provider = None;
+        unknown.extra = None;
+        store.record_request(&unknown).expect("record");
+
+        let summary = store.session_summary("ses-labels").expect("summary");
+        assert_eq!(
+            summary.per_provider,
+            vec![
+                SessionCostGroup {
+                    label: "Relace".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.02)
+                },
+                SessionCostGroup {
+                    label: "anthropic_api".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.01)
+                },
+                SessionCostGroup {
+                    label: "unknown".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.01)
+                },
+            ],
+            "cost-desc, then label asc for the equal-cost pair"
+        );
+        assert_eq!(
+            summary.per_model,
+            vec![
+                SessionCostGroup {
+                    label: "z-ai/glm-5.3".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.02)
+                },
+                SessionCostGroup {
+                    label: "openai/gpt-5.2".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.01)
+                },
+                SessionCostGroup {
+                    label: "unknown".to_owned(),
+                    requests: 1,
+                    cost_usd: Some(0.01)
+                },
+            ],
+            "cost-desc first, then label asc for the equal-cost pair; the model-less row groups under `unknown`"
+        );
     }
 
     #[test]

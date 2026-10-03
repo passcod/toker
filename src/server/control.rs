@@ -3,10 +3,17 @@
 //! cannot drive it without an unanswered preflight)").
 //!
 //! Gate: the `x-toker-control` header must carry the operation's verb
-//! (`status`, `models-merge`). A page that cannot set a custom header
-//! without an unanswered CORS preflight can never pass the gate. A wrong
-//! or missing gate is a 403 naming what is missing — loopback-only, no
+//! (`status`, `models-merge`, `session`). A page that cannot set a custom
+//! header without an unanswered CORS preflight can never pass the gate. A
+//! wrong or missing gate is a 403 naming what is missing — loopback-only, no
 //! discovery value to suppress.
+//!
+//! `/_toker/session` is the attribution plugin's query (plan: "the
+//! attribution plugin's queries"): opencode sends its session id on every
+//! request, toker records it per ledger row, so the plugin asks for one
+//! session's aggregate and the answer is exact — the ctp-era token-vector
+//! join is retired. The reply is counts, sums, and labels the rows already
+//! carry: no content, no credentials (invariants 1-2).
 //!
 //! `/_toker/models/merge` is the promote-model handover (ctp
 //! `controlMerge`, proxy.mjs:1068-1099): promote-model.mjs grants days to
@@ -24,6 +31,7 @@ use serde_json::{Value, json};
 
 use super::Server;
 use crate::middleware::models::{MergeIncoming, MergeOutcome};
+use crate::store::SessionSummary;
 
 const CONTROL_HEADER: &str = "x-toker-control";
 
@@ -76,6 +84,130 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         "uptime_s": server.started.elapsed().as_secs(),
     });
     Json(body).into_response()
+}
+
+/// `GET /_toker/session?session=<id>` — one session's attribution
+/// aggregate for the opencode plugin: the count and span of its
+/// measurement rows, token sums, and the billed-cost breakdowns by
+/// serving provider and model. The session id is exact (toker records
+/// the frontend's own session header per row), so there is no join to
+/// do and no unmatched remainder to guess about.
+///
+/// Absence ≠ zero (invariant 3) in the reply body: a metric no row
+/// carried is `null`, never 0, and `billed_total` is `null` when no row
+/// was billed. A session id with no rows at all answers `requests: 0`
+/// with `null`s — the endpoint cannot distinguish "absent session" from
+/// "session that measured nothing", and the plugin renders nothing
+/// either way. No content and no credentials leave (invariants 1-2).
+pub(crate) async fn session(State(server): State<Server>, request: Request) -> Response {
+    if !control_token_ok(request.headers(), "session") {
+        return forbidden();
+    }
+    // The verb check ran; the query names the subject — a GET has no body
+    // to carry it. Absence of the parameter is a client bug (the 400
+    // names the required shape), an empty value is a real id answered
+    // like any session with no rows.
+    let Some(session_id) = session_param(request.uri().query()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the session query parameter is required: /_toker/session?session=<id>\n",
+        )
+            .into_response();
+    };
+    match server.store.session_summary(&session_id) {
+        Ok(summary) => Json(session_body(&session_id, &summary)).into_response(),
+        Err(error) => store_error(error),
+    }
+}
+
+/// The `/_toker/session` reply body. The breakdowns are arrays — empty
+/// when there is nothing to break down, never `null`.
+fn session_body(session_id: &str, summary: &SessionSummary) -> Value {
+    let per_provider: Vec<Value> = summary
+        .per_provider
+        .iter()
+        .map(|group| {
+            json!({
+                "provider": group.label,
+                "requests": group.requests,
+                "cost_usd": group.cost_usd,
+            })
+        })
+        .collect();
+    let per_model: Vec<Value> = summary
+        .per_model
+        .iter()
+        .map(|group| {
+            json!({
+                "model": group.label,
+                "requests": group.requests,
+                "cost_usd": group.cost_usd,
+            })
+        })
+        .collect();
+    json!({
+        "session": session_id,
+        "requests": summary.requests,
+        "first_ts_ms": summary.first_ts_ms,
+        "last_ts_ms": summary.last_ts_ms,
+        "tokens": {
+            "input": summary.input,
+            "output": summary.output,
+            "reasoning": summary.reasoning,
+            "cache_read": summary.cache_read,
+            "cache_write_total": summary.cache_write_total,
+        },
+        "cost": {
+            "billed_total": summary.billed_total,
+            "per_provider": per_provider,
+            "per_model": per_model,
+        },
+    })
+}
+
+/// The `session` query parameter — the first occurrence wins, decoded per
+/// the `application/x-www-form-urlencoded` rules (a query string is that
+/// format). `None` when the parameter is absent; an empty value is a
+/// real (empty) session id, not absence.
+fn session_param(query: Option<&str>) -> Option<String> {
+    for pair in query?.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue; // a key with no `=` carries no value
+        };
+        if key == "session" {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+/// Percent-decode a query value: `+` is space, `%XX` is a hex byte. An
+/// invalid escape passes through verbatim — session ids never carry one,
+/// and strict rejection would turn a naming quirk into a hard failure.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if bytes.get(index + 1).is_some_and(|b| b.is_ascii_hexdigit())
+                && bytes.get(index + 2).is_some_and(|b| b.is_ascii_hexdigit()) =>
+            {
+                let hex = |byte: u8| (byte as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(hex(bytes[index + 1]) * 16 + hex(bytes[index + 2]));
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `POST /_toker/models/merge` — the promote-model handover (ctp
@@ -232,4 +364,38 @@ fn forbidden() -> Response {
 fn store_error(error: crate::store::Error) -> Response {
     tracing::error!(%error, "control endpoint store read failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "ledger read failed\n").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{percent_decode, session_param};
+
+    #[test]
+    fn session_param_first_occurrence_wins_and_keys_without_value_are_skipped() {
+        assert_eq!(session_param(None), None);
+        // No `=`: a key with no value, and other keys never match.
+        assert_eq!(session_param(Some("session")), None);
+        assert_eq!(
+            session_param(Some("other=x&session=ses-1")),
+            Some("ses-1".to_owned())
+        );
+        assert_eq!(
+            session_param(Some("session=a&session=b")),
+            Some("a".to_owned())
+        );
+        // An empty value is a real (empty) id, not absence.
+        assert_eq!(session_param(Some("session=")), Some(String::new()));
+    }
+
+    #[test]
+    fn percent_decode_follows_the_query_string_rules() {
+        assert_eq!(percent_decode("ses_abc123"), "ses_abc123");
+        assert_eq!(percent_decode("a+b"), "a b", "`+` is space");
+        assert_eq!(percent_decode("ses%2Fx"), "ses/x");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // Invalid escapes pass through verbatim rather than failing.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%2"), "%2");
+    }
 }
