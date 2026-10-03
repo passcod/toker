@@ -24,4 +24,5 @@ pub mod proto;
 pub mod providers;
 pub mod server;
 pub mod store;
+pub mod translate;
 pub mod tui;
