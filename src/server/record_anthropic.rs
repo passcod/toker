@@ -23,9 +23,10 @@
 //!   meter-source backend (the server does that, not this module). Error
 //!   rows carry none — lean, like the openai error rows; that is a
 //!   deliberate divergence from ctp, which embeds the response's meters
-//!   on its error rows (ctp also embeds a stale copy on blocked rows —
-//!   that is the gate unit's concern, where ctp's own lean rows show the
-//!   rule the gate needs).
+//!   on its error rows (ctp's *blocked* rows do carry a stale copy —
+//!   [`record_anthropic_blocked`] ports that, since the stale snapshot is
+//!   the block's own provenance; an error row describes a response, which
+//!   has fresh headers of its own).
 //! - **`model` is the normalised identity, `raw_model` the wire form**
 //!   (ctp: `normaliseModel` / `rawModel`).
 //! - **`betas`** is the request's `anthropic-beta` header split into
@@ -46,6 +47,7 @@ use serde_json::{Value, json};
 
 use crate::catalog::{CostBuckets, normalise_model_id, price};
 use crate::ir::AnthropicShape;
+use crate::middleware::quota::{Grant, Meter};
 use crate::observe::AnthropicCapture;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
@@ -502,6 +504,236 @@ fn drift_row(ts_ms: i64, route: &str, digest: &str) -> RequestRow {
         geo: None,
         fast: None,
     }
+}
+
+/// Record the release-marker row (ctp: `kind: "released"`, proxy.mjs:1154).
+///
+/// ctp logs a release the moment it is granted, because "a release left no
+/// trace in the log at all, only on stderr, so nothing afterwards could
+/// explain why a session kept spending past a limit that was blocking
+/// everything else". The grant itself is the caller's (the allowances
+/// table, keyed by reset value); this records what is now in force.
+///
+/// `grant` is the **merged** view — fresh grants for the exhausted meters,
+/// the prior live allowance for the rest — matching ctp's row, which
+/// carries the session's whole allowance entry, nulls included. The row
+/// carries `rate_limits`: the stale snapshot the grant was decided on (ctp
+/// parity: `rateLimits: lastMeters`). No duration (ctp omits it), no
+/// usage, never priced — a proxy-written row, excluded from API
+/// measurements by its kind.
+pub(crate) fn record_anthropic_released(
+    server: &Server,
+    session_id: &str,
+    backend_id: &str,
+    grant: &Grant,
+    stale_meters: Option<&Value>,
+) {
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: None,
+        kind: Some(RowKind::Released),
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(format!("anthropic:{backend_id}")),
+        session_id: Some(session_id.to_owned()),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        // ctp parity: the stale snapshot the grant rested on. A blocked
+        // request can never refresh meters, so this is often the same
+        // spent reading the NEXT blocked row will carry — that is the
+        // point of recording it (ctp limit.mjs:150-154's note: measure the
+        // reset lag from response rows only, never these).
+        rate_limits: stale_meters.cloned(),
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: Some(true),
+        cold_on: None,
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        // ctp's `fiveHour`/`sevenDay` row fields, in the kind-specific
+        // payload column (the schema has no dedicated columns).
+        extra: Some(json!({
+            "fiveHour": grant.five_hour,
+            "sevenDay": grant.seven_day,
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST /v1/messages → released {} five_hour={:?} seven_day={:?}",
+        session_id,
+        grant.five_hour,
+        grant.seven_day,
+    );
+}
+
+/// The inputs of one blocked row (see [`record_anthropic_blocked`]) —
+/// a struct because the pieces are exactly the ctp row's own fields, and
+/// a nine-argument call site would be positional-number soup.
+pub(crate) struct BlockedRecord<'a> {
+    /// The server (for the store).
+    pub(crate) server: &'a Server,
+    /// Request start, for `duration_ms`.
+    pub(crate) started: Instant,
+    /// The frontend path, for the per-request log line.
+    pub(crate) path: &'static str,
+    /// Session identity, read by header name only (invariant 2).
+    pub(crate) session_id: Option<&'a str>,
+    /// The backend the request would have reached (the gate's own).
+    pub(crate) backend_id: &'a str,
+    /// Which meter hit its limit.
+    pub(crate) meter: Meter,
+    /// When that meter's window resets, epoch seconds.
+    pub(crate) resets_at: Option<i64>,
+    /// The session's largest-lane prompt, when the lane table knows it —
+    /// a count or `None`, never content (invariant 1).
+    pub(crate) context_tokens: Option<u64>,
+    /// The snapshot the block was decided on — the stale copy.
+    pub(crate) stale_meters: Option<&'a Value>,
+}
+
+/// Record the quota-block row (ctp: `kind: "blocked"`, proxy.mjs:1220-1233).
+///
+/// `stale_meters` is the snapshot the block was decided on — ctp's blocked
+/// rows carry the stale copy (`rateLimits: lastMeters`), and ctp
+/// limit.mjs:150-154 warns what that copy is worth: it is the proxy's own
+/// last reading, not a header from this request, so counting it reports
+/// the proxy's staleness back as the API's.
+///
+/// No model columns (ctp's blocked row carries none), no usage, never
+/// priced; a proxy-written row, excluded from API measurements by its kind.
+pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
+    let BlockedRecord {
+        server,
+        started,
+        path,
+        session_id,
+        backend_id,
+        meter,
+        resets_at,
+        context_tokens,
+        stale_meters,
+    } = record;
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(RowKind::Blocked),
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(format!("anthropic:{backend_id}")),
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: stale_meters.cloned(),
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: Some(true),
+        cold_on: None,
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        // ctp's `meter`/`resetsAt`/`contextTokens` row fields, in the
+        // kind-specific payload column.
+        extra: Some(json!({
+            "meter": meter.as_str(),
+            "resets_at": resets_at,
+            "context_tokens": context_tokens,
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST {path} → BLOCKED {} {}",
+        meter.as_str(),
+        session_id
+            .and_then(|session| session.get(0..8))
+            .unwrap_or("?"),
+    );
 }
 
 /// Parse the error pair from a buffered non-2xx body via the observer

@@ -33,9 +33,10 @@ use serde_json::{Value, json};
 
 use toker::catalog::{CostBuckets, price};
 use toker::config::{AnthropicApiConfig, AnthropicSubConfig, Config, OpenRouterConfig};
-use toker::ir::Request as IrRequest;
+use toker::ir::{Request as IrRequest, SENTINEL};
+use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering, decide};
 use toker::server::Server;
-use toker::store::{CostKind, RequestRow, RowKind, Store};
+use toker::store::{Allowance, CostKind, MetersSnapshot, RequestRow, RowKind, Store};
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_ANTH_5C";
@@ -383,6 +384,7 @@ fn test_config(
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key,
         },
+        gates: toker::config::GatesConfig::default(),
     }
 }
 
@@ -1179,4 +1181,450 @@ async fn client_hangup_aborts_the_upstream_and_records_no_row() {
     // A hung-up stream records no row (plan: Server core).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+/// Whether raw request bytes still contain the release marker.
+fn contains_marker(bytes: &[u8]) -> bool {
+    bytes
+        .windows(SENTINEL.len())
+        .any(|window| window == SENTINEL.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// The quota gate (anthropic_sub only — the sole meter source)
+// ---------------------------------------------------------------------------
+
+/// Poison the meters_state snapshot: a 5-hour window at `util5h` with its
+/// reset `offset_secs` from now, a healthy 7-day one. The snapshot is the
+/// stable ctp shape `parse_rate_limits` stores, so the gate reads it
+/// exactly as it reads a real one. Returns the 5h reset and the snapshot.
+fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    let now_secs = now_ms / 1000;
+    let reset5h = now_secs + offset_secs;
+    let snapshot = json!({
+        "util5h": util5h, "reset5h": reset5h,
+        "util7d": 0.2, "reset7d": now_secs + 5 * 86400,
+        "utilOverage": Value::Null, "resetOverage": Value::Null, "status": Value::Null,
+        "status5h": Value::Null, "status7d": Value::Null, "statusOverage": Value::Null,
+        "claim": Value::Null, "overageInUse": false, "fallbackPct": Value::Null,
+        "other": {},
+    });
+    store
+        .save_meters(&MetersSnapshot {
+            updated_ms: now_ms,
+            snapshot: snapshot.clone(),
+        })
+        .expect("poison meters");
+    (reset5h, snapshot)
+}
+
+/// A Messages body without a `stream` field — the shape that must be
+/// answered with the SSE turn, since a client that omitted the field
+/// cannot be assumed to parse a plain JSON body.
+fn messages_body_no_stream(model: &str) -> Vec<u8> {
+    format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"Hi"}}]}}"#).into_bytes()
+}
+
+fn content_type(response: &reqwest::Response) -> &str {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .expect("content type set")
+}
+
+#[tokio::test]
+async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, snapshot) = poison_meters(&store, 1.0, 3600);
+
+    // `stream` omitted → the SSE turn. The notice names the meter, the
+    // reset (in the local zone, the same one the server renders in), and
+    // the resume path; the turn carries the model the client asked for.
+    let body = messages_body_no_stream("claude-opus-5");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK, "never an error status");
+    assert_eq!(content_type(&response), "text/event-stream");
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let tz = jiff::tz::TimeZone::system();
+    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz);
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    assert_eq!(
+        bytes.as_ref(),
+        expected.as_slice(),
+        "the synthetic SSE turn, ctp's exact event shape"
+    );
+
+    // Upstream NEVER hit: the gate is the only thing that may stop a
+    // session, and it stops it before the wire.
+    assert!(
+        mock.captured().is_empty(),
+        "a blocked request never reaches upstream"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.kind, Some(RowKind::Blocked));
+    assert_eq!(row.frontend.as_deref(), Some("anthropic"));
+    assert_eq!(row.provider.as_deref(), Some("anthropic_sub"));
+    assert_eq!(row.route.as_deref(), Some("anthropic:anthropic_sub"));
+    assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(row.gate_on, Some(true));
+    assert!(row.duration_ms.is_some());
+    // ctp parity: the stale snapshot the block was decided on.
+    assert_eq!(row.rate_limits, Some(snapshot));
+    assert_eq!(
+        row.extra.as_ref().and_then(|extra| extra.get("meter")),
+        Some(&json!("5h"))
+    );
+    assert_eq!(
+        row.extra
+            .as_ref()
+            .and_then(|extra| extra.get("resets_at"))
+            .and_then(Value::as_i64),
+        Some(reset5h)
+    );
+    assert!(
+        row.extra
+            .as_ref()
+            .is_some_and(|extra| extra.get("context_tokens") == Some(&Value::Null)),
+        "not recorded yet — never printed as a zero"
+    );
+    // A proxy-written row: no usage, no model, never priced (ctp's blocked
+    // row carries no model either).
+    assert_eq!(row.model, None);
+    assert_eq!(row.requested_model, None);
+    assert_eq!(row.effective_model, None);
+    assert_eq!(row.input, None);
+    assert_eq!(row.usage_presence, None);
+    assert_eq!(row.cost_usd, None);
+    assert_eq!(row.cost_kind, None);
+    assert_eq!(row.status, None);
+
+    // An explicit `stream: false` gets the plain JSON Message instead —
+    // a client that asked for one cannot parse an event stream.
+    let body = messages_body("claude-opus-5", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(content_type(&response), "application/json");
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Json);
+    assert_eq!(bytes.as_ref(), expected.as_slice());
+
+    assert!(mock.captured().is_empty(), "still nothing upstream");
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(
+        rows.iter().all(|row| row.kind == Some(RowKind::Blocked)),
+        "both blocked rows recorded"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_spent_reading_fails_open_and_forwards() {
+    // The rule that un-wedges the gate: a blocked request can never
+    // refresh meters, so a reading whose window has already passed must
+    // stop counting. Forwarding is self-correcting — the response carries
+    // fresh headers either way.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    poison_meters(&store, 1.0, -3600);
+
+    let body = messages_body("claude-opus-5", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body bytes");
+    assert_eq!(
+        bytes.as_ref(),
+        non_stream_body("claude-opus-5").as_slice(),
+        "forwarded, and the response passes through"
+    );
+    assert_eq!(mock.captured().len(), 1, "the request forwarded");
+
+    // A real measurement, not a blocked row.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None);
+}
+
+#[tokio::test]
+async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, snapshot) = poison_meters(&store, 1.0, 3600);
+
+    // The marker typed into the conversation, opening the last user
+    // message — exactly the turn the human types it on.
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "$#$BURN$#$ go on"}],
+    }))
+    .expect("release body");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK, "the release forwards");
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        !contains_marker(&captured[0].body),
+        "the marker never reaches the model"
+    );
+    // The strip is byte-exact: what went upstream is the IR round-trip
+    // with the marker spliced out.
+    let mut expected = IrRequest::parse(&body).expect("parse");
+    expected.anthropic_mut().strip_release();
+    assert_eq!(captured[0].body.as_ref(), expected.serialise().as_slice());
+
+    // The released row (the trace of "this session may spend overage this
+    // window"), plus the normal measurement for the forwarded request.
+    let rows = wait_for_rows(&store, 2).await;
+    let released = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::Released))
+        .expect("a released row");
+    assert_eq!(released.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(released.provider.as_deref(), Some("anthropic_sub"));
+    assert_eq!(released.gate_on, Some(true));
+    assert_eq!(
+        released.rate_limits,
+        Some(snapshot.clone()),
+        "ctp parity: the stale snapshot the grant rested on"
+    );
+    assert_eq!(
+        released
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("fiveHour")),
+        Some(&json!(reset5h)),
+        "granted for the exhausted meter only, keyed by reset value"
+    );
+    assert_eq!(
+        released
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("sevenDay")),
+        Some(&Value::Null),
+        "the healthy 7-day meter was not granted"
+    );
+    assert_eq!(
+        released.duration_ms, None,
+        "ctp omits duration on released rows"
+    );
+    assert!(
+        rows.iter().any(|row| row.kind.is_none()),
+        "the forwarded request recorded its measurement"
+    );
+
+    // The allowance landed in the store, keyed session + meter + reset.
+    assert_eq!(
+        store.load_allowances().expect("allowances"),
+        vec![Allowance {
+            session_id: "ccses-42".to_owned(),
+            meter: "5h".to_owned(),
+            reset_value: reset5h,
+        }]
+    );
+
+    // And it un-gates the still-spent snapshot it was granted against.
+    let allowances = store.load_allowances().expect("allowances");
+    assert_eq!(
+        decide(
+            Some(Meters::over(&snapshot)),
+            &allowances,
+            jiff::Timestamp::now().as_millisecond(),
+        ),
+        GateDecision::Forward,
+        "held == current: released for this window"
+    );
+}
+
+#[tokio::test]
+async fn marker_stripping_is_unconditional_and_a_healthy_release_still_records() {
+    // No poisoning at all: meters_state absent (cold start), unknown
+    // meters forward — and ctp still grants and records the release
+    // (proxy.mjs:1136 fires on marker + session, not on exhaustion), with
+    // null reset values, because a release that left no trace could never
+    // explain later spending.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "$#$BURN$#$ go on"}],
+    }))
+    .expect("release body");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1, "unknown meters forward");
+    assert!(
+        !contains_marker(&captured[0].body),
+        "the strip runs regardless of the meters — the marker rule is frozen"
+    );
+
+    let rows = wait_for_rows(&store, 2).await;
+    let released = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::Released))
+        .expect("ctp records the release even when nothing is exhausted");
+    assert_eq!(
+        released
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("fiveHour")),
+        Some(&Value::Null),
+        "nothing was exhausted: no reset to grant"
+    );
+    assert_eq!(
+        released
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("sevenDay")),
+        Some(&Value::Null)
+    );
+    assert_eq!(
+        released.rate_limits, None,
+        "no snapshot existed for the grant to rest on"
+    );
+    assert!(
+        rows.iter().any(|row| row.kind.is_none()),
+        "the forwarded request recorded its measurement"
+    );
+    assert!(
+        store.load_allowances().expect("allowances").is_empty(),
+        "no exhausted meters: no allowance rows"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_gate_forwards_but_the_strip_stays_on() {
+    // The toggle arms the gate and the release recording (ctp's LIMIT_ON,
+    // proxy.mjs:1136/1195) — but never the strip: the marker rule is a
+    // frozen public API, and gating it on the flag would change the cached
+    // prefix of every conversation carrying a marker.
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.gates.quota_enabled = false;
+    let (addr, store) = spawn_toker(config).await;
+    poison_meters(&store, 1.0, 3600);
+
+    // A spent meter forwards…
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body("claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the gate is off");
+    assert_eq!(mock.captured().len(), 1);
+
+    // …and a marker run strips but records no released row (ctp gates the
+    // release on LIMIT_ON too).
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "$#$BURN$#$ go on"}],
+    }))
+    .expect("release body");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 2);
+    assert!(
+        !contains_marker(&captured[1].body),
+        "the strip is unconditional"
+    );
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(
+        rows.iter().all(|row| row.kind.is_none()),
+        "no blocked rows, no released rows — only the two measurements"
+    );
+    assert!(store.load_allowances().expect("allowances").is_empty());
+}
+
+#[tokio::test]
+async fn count_tokens_and_the_api_backend_never_gate() {
+    // count_tokens is not the gated path — blocking it protects no quota,
+    // only breaks the client — and neither is the api backend, which is
+    // not a meter source. Both must forward against live poisoned meters.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        upstream,
+        Some("sk-ant-literal-test".to_owned()),
+        "anthropic_sub",
+    ))
+    .await;
+
+    // count_tokens: same pipeline, never a gate target.
+    poison_meters(&store, 1.0, 3600);
+    let response = post_messages(
+        addr,
+        "/v1/messages/count_tokens",
+        &[],
+        &messages_body("claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 1, "forwarded untouched");
+    assert_no_rows(&store).await;
+
+    // The api backend: the gate never fires, and the api is not a meter
+    // source either, so meters_state keeps its poisoned snapshot.
+    poison_meters(&store, 1.0, 3600);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body("anthropic_api/claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 2, "routed to the api and forwarded");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None, "a measurement, not a blocked row");
+    assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
+    let meters = store
+        .load_meters()
+        .expect("meters")
+        .expect("still poisoned");
+    assert_eq!(
+        meters.snapshot.get("util5h").and_then(Value::as_f64),
+        Some(1.0),
+        "the api's RPM-style headers never overwrite the gate's snapshot"
+    );
+}
+
+#[tokio::test]
+async fn an_unparseable_body_on_the_gated_path_still_gates() {
+    // ctp decides on `gated` alone (proxy.mjs:1195), not on the body's
+    // parseability — a broken client must not be able to duck under a
+    // spent quota. `clientWants` reads model/stream independently and
+    // falls back to null/false on a JSON failure, so the answer is the
+    // SSE turn under the default model.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+
+    let response = post_messages(addr, "/v1/messages", &[], b"not json at all").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "blocked, never an error status — even for a broken body"
+    );
+    assert_eq!(content_type(&response), "text/event-stream");
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let tz = jiff::tz::TimeZone::system();
+    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz);
+    let expected = Blocking::blocked_turn(&notice, None, Rendering::Sse);
+    assert_eq!(
+        bytes.as_ref(),
+        expected.as_slice(),
+        "SSE turn, default model — clientWants' fallback"
+    );
+    assert!(mock.captured().is_empty());
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Blocked));
 }

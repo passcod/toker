@@ -75,6 +75,31 @@ pub struct Config {
     pub anthropic_sub: AnthropicSubConfig,
     /// The anthropic API provider block.
     pub anthropic_api: AnthropicApiConfig,
+    /// The middleware gates block.
+    pub gates: GatesConfig,
+}
+
+/// The `[gates]` block, resolved (plan: Middleware — route-scoped toggles,
+/// enabled per route in config).
+#[derive(Debug, Clone)]
+pub struct GatesConfig {
+    /// The quota gate (plan: "Quota gate + release marker"). Arms only on
+    /// the anthropic_sub backend — today's only meter source — where it
+    /// blocks a request whose quota window is spent, answering with a
+    /// synthetic assistant turn; every other backend is a no-op. The
+    /// marker *stripping* is the frozen marker rule's, not the toggle's:
+    /// it runs on the `/v1/messages` path regardless of this setting (a
+    /// toggled strip would change the cached prefix of every conversation
+    /// carrying a marker).
+    pub quota_enabled: bool,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        GatesConfig {
+            quota_enabled: true,
+        }
+    }
 }
 
 /// The openrouter provider block, resolved.
@@ -255,6 +280,9 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_BACKEND_ANTHROPIC.to_owned()),
             anthropic_sub,
             anthropic_api,
+            gates: GatesConfig {
+                quota_enabled: file.gates.quota_enabled.unwrap_or(true),
+            },
         };
 
         // Env overrides (config file loses).
@@ -320,6 +348,14 @@ struct FileConfig {
     default_backend_openai_chat: Option<String>,
     default_backend_anthropic: Option<String>,
     providers: FileProviders,
+    gates: FileGates,
+}
+
+/// The `[gates]` block of `toker.toml`, serde-side.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileGates {
+    quota_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -466,6 +502,9 @@ mod tests {
             config.openrouter.upstream.as_str(),
             DEFAULT_OPENROUTER_UPSTREAM
         );
+        // The quota gate is on by default: a proxy that silently stopped
+        // gating is a proxy that quietly spends overage.
+        assert!(config.gates.quota_enabled);
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -571,6 +610,36 @@ api_key = "ak-literal-test"
         assert_eq!(
             config.anthropic_sub.upstream,
             reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream")
+        );
+    }
+
+    #[test]
+    fn the_gates_block_is_read_and_a_config_without_it_defaults_to_on() {
+        let dir = test_dir("gates");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+[gates]
+quota_enabled = false
+"#,
+        )
+        .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let config = super::Config::load().expect("load config");
+        assert!(!config.gates.quota_enabled, "the file value is read");
+
+        // A phase-1 toker.toml (no [gates] block at all) parses with the
+        // default — and an unknown gates key is an error, not a silent
+        // default, like every other block.
+        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
+        let config = super::Config::load().expect("phase-1 config parses");
+        assert!(config.gates.quota_enabled, "absent block = default = on");
+
+        fs::write(dir.join("toker.toml"), "[gates]\nquota_on = true\n").expect("rewrite config");
+        assert!(
+            super::Config::load().is_err(),
+            "a typo'd gates key must fail to load"
         );
     }
 

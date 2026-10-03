@@ -3,12 +3,23 @@
 //! Routes, all served by the anthropic backends ([`crate::providers`]):
 //!
 //! - `POST /v1/messages` — **the usage path** (ctp: `req.url.split("?")[0]
-//!   === "/v1/messages"` — exactly, query stripped). Fully recorded.
+//!   === "/v1/messages"` — exactly, query stripped; axum matches on the
+//!   path alone, so the route IS the gate's path check, and
+//!   `count_tokens`/`batches` can never land in it). Fully recorded, and
+//!   **the quota gate's only target**: on the anthropic_sub backend (the
+//!   sole meter source), a spent meter is answered 200 with a synthetic
+//!   assistant turn instead of forwarding — never an error status (ctp
+//!   measured it on 2026-09-10: 529 retries silently, 429 mislabels, 403
+//!   looks like broken credentials). The release marker is read from the
+//!   ORIGINAL body, then stripped unconditionally (the frozen marker rule
+//!   runs on this path for every backend and regardless of the gate's
+//!   toggle — a toggled strip would change the cached prefix of every
+//!   conversation carrying a marker).
 //! - `POST /v1/messages/count_tokens`, `POST /v1/messages/batches` — the
 //!   same pipeline end to end (buffer → IR parse → fidelity check →
-//!   routing → forward → tee → record), but they are **not gated**: gates
-//!   arrive with the phase-2 quota-gate unit, and none is implemented
-//!   here. Their responses carry no usage, so they record nothing in
+//!   routing → forward → tee → record), but they are **never gated**
+//!   (blocking them protects no quota, only breaks the client). Their
+//!   responses carry no usage, so they record nothing in
 //!   practice — their error and drift rows are real, ctp logs those too.
 //! - The batch-result GETs and cancel — transparent forwarding, like the
 //!   openai path's `/v1/models`: no recording, no observation.
@@ -40,16 +51,19 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::Stream;
 
 use crate::ir::{Fidelity, Request as IrRequest, compare};
+use crate::middleware::quota::{
+    Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for,
+};
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
-use crate::store::MetersSnapshot;
+use crate::store::{Allowance, MetersSnapshot};
 
 use super::Server;
 use super::proxy::{
@@ -59,10 +73,12 @@ use super::proxy::{
 };
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
-    AnthropicRecordCtx, error_pair, record_anthropic_error, record_anthropic_measurement,
+    AnthropicRecordCtx, BlockedRecord, error_pair, record_anthropic_blocked,
+    record_anthropic_error, record_anthropic_measurement, record_anthropic_released,
 };
 
-/// `POST /v1/messages` — the anthropic usage path.
+/// `POST /v1/messages` — the anthropic usage path, and the quota gate's
+/// only target.
 pub(crate) async fn messages(State(server): State<Server>, request: Request) -> Response {
     usage_path(server, request, "/v1/messages").await
 }
@@ -99,7 +115,8 @@ pub(crate) async fn batches_cancel(State(server): State<Server>, request: Reques
 }
 
 /// The shared usage-path pipeline (see the module docs). `path` is the
-/// route's own literal, for the per-request log line.
+/// route's own literal, for the per-request log line and the gate's
+/// exact-path rule: only `"/v1/messages"` gates.
 async fn usage_path(server: Server, request: Request, path: &'static str) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
@@ -125,6 +142,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut forward = original.clone();
     let mut record = None;
     let mut backend = server.default_anthropic().clone();
+    // ctp `clientWants` (proxy.mjs:1047-1054): the client's own model and
+    // whether it explicitly asked for a plain JSON Message — both read
+    // BEFORE any transform, because the blocked answer renders the model
+    // the client named and in the shape it asked for.
+    let mut client_model: Option<String> = None;
+    let mut stream_explicitly_false = false;
+    // The gate's meter snapshot, loaded at most once per request and only
+    // when the gate is armed (every other backend must be a no-op without
+    // even reading meters).
+    let mut meters_snapshot: Option<serde_json::Value> = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
         // 3. Invariant 5, verified per request: Exact is the normal case;
         // Drift forwards the original buffer either way, and lands a
@@ -133,10 +160,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if let Fidelity::Drift { digest, .. } = compare(&original, &ir.serialise()) {
             drift = Some(digest);
         }
+        client_model = ir.anthropic().model().map(str::to_owned);
+        stream_explicitly_false = ir.anthropic().stream_explicitly_false();
         // 4. Routing: read the model through the typed view; a provider
         // prefix overrides the backend per request.
-        let model = ir.anthropic().model().map(str::to_owned);
+        let model = client_model.clone();
         let mut effective_model = model.clone();
+        let mut transformed = false;
         if let Some((provider, rest)) = model
             .as_deref()
             .and_then(|model| strip_anthropic_prefix(&server, model))
@@ -147,6 +177,95 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             backend = provider.clone();
             effective_model = Some(rest.to_owned());
             ir.anthropic_mut().set_model(rest);
+            transformed = true;
+        }
+
+        // ── the quota gate + release marker, ctp proxy.mjs:1135-1241 ──
+        //
+        // Sequence (every step's order is measured, not stylistic):
+        // release check on the ORIGINAL body → grant/record → the
+        // unconditional strip → the gate decision. A release is read
+        // before the strip because the strip removes the very marker the
+        // release is made of.
+        let gate_armed = path == "/v1/messages"
+            && server.config.gates.quota_enabled
+            && backend.id() == "anthropic_sub";
+        if gate_armed {
+            meters_snapshot = server
+                .store
+                .load_meters()
+                .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "meter snapshot load failed");
+                    None
+                });
+        }
+        if path == "/v1/messages" {
+            // A release: grant/refresh an allowance for the
+            // currently-exhausted meters only, and record it. ctp gates
+            // this on the marker + the session id + the toggle
+            // (proxy.mjs:1136) — a sessionless request cannot hold an
+            // allowance.
+            if gate_armed
+                && let Some(session) = session_id.as_deref()
+                && ir.anthropic().carries_release()
+            {
+                let meters = meters_snapshot.as_ref().map(Meters::over);
+                let now = now_ms();
+                let fresh = grant_for(meters, now);
+                for (meter, reset) in [
+                    (Meter::FiveHour, fresh.five_hour),
+                    (Meter::SevenDay, fresh.seven_day),
+                ] {
+                    if let Some(reset) = reset
+                        && let Err(error) = server.store.record_allowance(&Allowance {
+                            session_id: session.to_owned(),
+                            meter: meter.as_str().to_owned(),
+                            reset_value: reset,
+                        })
+                    {
+                        tracing::error!(%error, "allowance record failed");
+                    }
+                }
+                // ctp merges, never replaces (proxy.mjs:1137-1147): a fresh
+                // null for a meter defers to the allowance already held,
+                // so a release while only the 5-hour window is spent must
+                // not wipe an existing 7-day allowance.
+                let merged = Grant {
+                    five_hour: fresh
+                        .five_hour
+                        .or_else(|| prior_live(&server, session, "5h", now)),
+                    seven_day: fresh
+                        .seven_day
+                        .or_else(|| prior_live(&server, session, "7d", now)),
+                };
+                record_anthropic_released(
+                    &server,
+                    session,
+                    backend.id(),
+                    &merged,
+                    meters_snapshot.as_ref(),
+                );
+            }
+
+            // The strip: UNCONDITIONAL on this path — it runs for every
+            // backend and regardless of the gate's toggle, because the
+            // marker rule is a frozen public API and a toggled strip would
+            // change the cached prefix of every conversation carrying a
+            // marker (invariant 4; ctp proxy.mjs:1166-1177). Record
+            // nothing for the strip itself: the released row is the
+            // user-visible event, and the strip is the API's own rule.
+            let pre_strip = ir.serialise();
+            ir.anthropic_mut().strip_release();
+            if ir.serialise() != pre_strip {
+                transformed = true;
+            }
+        }
+        if transformed {
+            // A deliberate transform: forward the serialised IR. When the
+            // only transform was a strip on a drifted (non-canonical)
+            // body, this surfaces as the drift row already recorded above
+            // — the marker still must not reach the model.
             forward = Bytes::from(ir.serialise());
         }
         let shape = ir.anthropic().shape();
@@ -154,7 +273,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             server: server.clone(),
             started,
             path,
-            session_id,
+            // Cloned, not moved: the gate decision below still reads the
+            // session (allowances lookup, blocked row).
+            session_id: session_id.clone(),
             requested_model: model,
             effective_model,
             drift,
@@ -162,6 +283,76 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             betas,
             shape: Some(shape),
         });
+    }
+
+    // ── the gate decision (after the strip, ctp proxy.mjs:1195) ──
+    //
+    // Runs on the exact `/v1/messages` path, only for the anthropic_sub
+    // backend (the sole meter source), and only when the gate is enabled —
+    // for every other backend this whole block is a no-op that never even
+    // reads meters. It runs for unparseable bodies too (ctp decides on
+    // `gated` alone): a client that cannot parse an event stream still
+    // gets the SSE turn, since `streamFalse` could not be read.
+    let gate_armed = path == "/v1/messages"
+        && server.config.gates.quota_enabled
+        && backend.id() == "anthropic_sub";
+    if gate_armed {
+        if meters_snapshot.is_none() {
+            // The unparseable-body case: the release/strip section above
+            // never ran, so the snapshot was never loaded.
+            meters_snapshot = server
+                .store
+                .load_meters()
+                .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "meter snapshot load failed");
+                    None
+                });
+        }
+        let allowances = allowances_for_session(&server, session_id.as_deref());
+        let decision = decide(
+            meters_snapshot.as_ref().map(Meters::over),
+            &allowances,
+            now_ms(),
+        );
+        if let GateDecision::Block { meter, resets_at } = decision {
+            // Answer 200 with a synthetic assistant turn, never an error
+            // status — measured against a real client (see the module
+            // docs). The context size is the session's largest lane's,
+            // which the lane table does not track yet: `None`, so the
+            // notice drops the clause rather than guessing (absence ≠
+            // zero, invariant 3).
+            let text = Blocking::notice(meter, resets_at, None, &jiff::tz::TimeZone::system());
+            let rendering = if stream_explicitly_false {
+                Rendering::Json
+            } else {
+                Rendering::Sse
+            };
+            let body = Blocking::blocked_turn(&text, client_model.as_deref(), rendering);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                match rendering {
+                    Rendering::Sse => header::HeaderValue::from_static("text/event-stream"),
+                    Rendering::Json => header::HeaderValue::from_static("application/json"),
+                },
+            );
+            record_anthropic_blocked(BlockedRecord {
+                server: &server,
+                started,
+                path,
+                session_id: session_id.as_deref(),
+                backend_id: backend.id(),
+                meter,
+                resets_at,
+                // The lane table does not track prompts yet: `None`, so
+                // the notice drops the clause rather than guessing
+                // (absence ≠ zero, invariant 3).
+                context_tokens: None,
+                stale_meters: meters_snapshot.as_ref(),
+            });
+            return build_response(StatusCode::OK, headers, Body::from(body));
+        }
     }
 
     // 6. Upstream; 7.-9. in forward_response. Session headers pass
@@ -178,6 +369,48 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
         }
     }
+}
+
+/// The session's stored allowances, or none for a sessionless request (ctp
+/// proxy.mjs:1196 passes `allowances.get(sessionId)`, which is undefined
+/// without a session — decide then sees no allowances). A store error
+/// loses the allowances, never the request (invariant 6): the gate
+/// treats it as "nothing held", the conservative reading.
+fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allowance> {
+    let Some(session) = session_id else {
+        return Vec::new();
+    };
+    server
+        .store
+        .load_allowances()
+        .map(|allowances| {
+            allowances
+                .into_iter()
+                .filter(|allowance| allowance.session_id == session)
+                .collect()
+        })
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "allowances load failed");
+            Vec::new()
+        })
+}
+
+/// The live prior allowance a session holds for one meter (ctp's merge
+/// rule, proxy.mjs:1141: `fresh ?? prior`). ctp stores one value per
+/// meter per session; the store's reset-value keying can hold several
+/// across rolled windows, and the one still in force is the live
+/// (future-reset) row with the greatest reset — a rolled window's rows
+/// are inert by the value match and never answer here for long.
+fn prior_live(server: &Server, session: &str, meter: &str, now_ms: i64) -> Option<i64> {
+    server
+        .store
+        .load_allowances()
+        .ok()?
+        .into_iter()
+        .filter(|allowance| allowance.session_id == session && allowance.meter == meter)
+        .map(|allowance| allowance.reset_value)
+        .filter(|reset| reset.saturating_mul(1000) > now_ms)
+        .max()
 }
 
 /// Transparent forwarding (the batch-result paths): routed to the default

@@ -267,6 +267,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             api_key_env: api_key_env.to_owned(),
             api_key: None,
         },
+        gates: toker::config::GatesConfig::default(),
     }
 }
 
@@ -811,4 +812,67 @@ async fn control_status_is_gated_and_secret_free() {
         .await
         .expect("merge request");
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn poisoned_meters_state_never_blocks_the_openai_path() {
+    // The quota gate is anthropic_sub-only — today's sole meter source —
+    // and the openai frontend routes to openrouter, so a poisoned
+    // meters_state (a spent reading from another backend's snapshot) must
+    // not stop a chat completion. The openai path never consults meters
+    // at all: it forwards untouched and records normally.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    // A spent 5-hour window with its reset comfortably in the future —
+    // exactly the reading that blocks the anthropic_sub path.
+    let now_secs = jiff::Timestamp::now().as_millisecond() / 1000;
+    store
+        .save_meters(&toker::store::MetersSnapshot {
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
+            snapshot: serde_json::json!({
+                "util5h": 1.0, "reset5h": now_secs + 3600,
+                "util7d": 0.2, "reset7d": now_secs + 5 * 86400,
+                "utilOverage": serde_json::Value::Null,
+                "resetOverage": serde_json::Value::Null,
+                "status": serde_json::Value::Null,
+                "status5h": serde_json::Value::Null,
+                "status7d": serde_json::Value::Null,
+                "statusOverage": serde_json::Value::Null,
+                "claim": serde_json::Value::Null,
+                "overageInUse": false,
+                "fallbackPct": serde_json::Value::Null,
+                "other": {},
+            }),
+        })
+        .expect("poison meters");
+
+    let body = chat_body("z-ai/glm-5.3", false);
+    let response = post_chat(addr, &body).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the gate never fires for the openai path"
+    );
+    let bytes = response.bytes().await.expect("body bytes");
+    assert_eq!(
+        bytes.as_ref(),
+        NON_STREAM_BODY.as_bytes(),
+        "the response passes through untouched"
+    );
+    assert_eq!(mock.captured().len(), 1, "the request forwarded");
+    assert_eq!(
+        mock.captured()[0].body.as_ref(),
+        body.as_slice(),
+        "the request body forwards byte-identical"
+    );
+
+    // A normal measurement row, not a blocked one.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows[0].kind, None,
+        "a real API measurement, never a gate row"
+    );
+    assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
+    assert_eq!(rows[0].input, Some(48));
 }
