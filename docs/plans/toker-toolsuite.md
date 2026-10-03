@@ -1,7 +1,7 @@
 # toker — unified local proxy toolsuite
 
 Date: 2026-10-03
-Status: agreed design, phase 1 in progress
+Status: phase 1 + phase 2 shipped (see Phases); dogfooding live via opencode → openrouter; anthropic side awaiting first claude wiring
 
 ## Purpose
 
