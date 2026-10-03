@@ -1,0 +1,1 @@
+{"model":"deepseek/deepseek-v4","messages":[{"role":"user","content":"line1\nline2\ttabbed \"quoted\" back\\slash \u0007bell \u001besc done"}],"stop":["\n"],"logprobs":true,"top_logprobs":0,"n":1}

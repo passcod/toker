@@ -1,0 +1,1 @@
+{"model":"openai/o9-pro","messages":[{"role":"developer","content":"Always respond with valid JSON."},{"role":"system","content":"Legacy system prompt still present."},{"role":"user","content":"Give me a JSON schema for a user record."}],"temperature":0.2,"response_format":{"type":"json_object"}}

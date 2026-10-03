@@ -1,0 +1,1 @@
+{"model":"anthropic/claude-sonnet-4.6","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Summarise the state of the build."}],"stream":true,"max_tokens":1024,"temperature":0.3}

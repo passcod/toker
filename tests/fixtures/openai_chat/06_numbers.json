@@ -1,0 +1,1 @@
+{"model":"openai/gpt-5.2","messages":[{"role":"user","content":"Roll a die."}],"temperature":1.0,"top_p":1,"frequency_penalty":0.5,"presence_penalty":0,"seed":42,"max_completion_tokens":4096,"metadata":{"user_id":987654321098765432109876543210987,"session_int":-9223372036854775809,"tiny":1e-5,"neg_zero":-0.0},"stream":false}
