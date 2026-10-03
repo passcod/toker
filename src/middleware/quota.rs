@@ -35,6 +35,7 @@
 
 use serde_json::Value;
 
+use super::notice::{NoticeStyle, render};
 use crate::store::Allowance;
 
 /// A meter is exhausted when its utilisation reaches this fraction of the
@@ -326,9 +327,10 @@ pub enum Rendering {
 pub struct Blocking;
 
 impl Blocking {
-    /// The text the user sees (ctp `blockNotice`). It is the entire
-    /// interface of this feature — the only place they learn which meter
-    /// they hit, when it clears, and how to resume — so it says all three.
+    /// The text the user sees (ctp `blockNotice`, natively rendered — plan:
+    /// "Native rendering for gate notices"). It is the entire interface of
+    /// this feature — the only place they learn which meter they hit, when
+    /// it clears, and how to resume — so it says all three.
     ///
     /// Bracketed and third-person on purpose: the client already injects
     /// notices of that shape, so the model has an established convention
@@ -336,21 +338,28 @@ impl Blocking {
     /// marker itself is deliberately not embedded — it would then sit in
     /// conversation history as assistant text.
     ///
-    /// Pure function of its inputs (invariant 4): the reset time renders
-    /// in the passed timezone, to the minute (`%H:%M`, 24-hour — ctp
-    /// follows the process locale's hour cycle, which has no jiff
-    /// equivalent; the local timezone is the part of that which matters,
-    /// the hour convention is pinned instead of guessed). The context
-    /// size is stated and nothing is concluded from it; dropped entirely
-    /// when unknown or zero rather than printed as a zero (a notice
-    /// reading "0 tokens" would be read as a measurement). A reset the
-    /// reading did not carry is "an unknown time" — the same verdict as
-    /// ctp's null `resetsAt`.
+    /// The content is then wrapped per `style` ([`render`]): the frontend's
+    /// own structured format where one exists (claude's insight block by
+    /// default, a GFM alert for Workhorse-style frontends), plain text
+    /// otherwise. The style is the caller's config threading; here it is
+    /// just one more input.
+    ///
+    /// Pure function of its inputs, style included (invariant 4): the
+    /// reset time renders in the passed timezone, to the minute (`%H:%M`,
+    /// 24-hour — ctp follows the process locale's hour cycle, which has
+    /// no jiff equivalent; the local timezone is the part of that which
+    /// matters, the hour convention is pinned instead of guessed). The
+    /// context size is stated and nothing is concluded from it; dropped
+    /// entirely when unknown or zero rather than printed as a zero (a
+    /// notice reading "0 tokens" would be read as a measurement). A reset
+    /// the reading did not carry is "an unknown time" — the same verdict
+    /// as ctp's null `resetsAt`.
     pub fn notice(
         meter: Meter,
         resets_at: Option<i64>,
         context_tokens: Option<u64>,
         tz: &jiff::tz::TimeZone,
+        style: NoticeStyle,
     ) -> String {
         let when = resets_at
             .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
@@ -364,11 +373,12 @@ impl Blocking {
             }
             _ => String::new(),
         };
-        format!(
+        let content = format!(
             "[Session stopped by toker: {} quota is spent, resets at {when}.{size} \
              Reply with the release marker to continue and spend overage until then.]",
             meter.notice_name(),
-        )
+        );
+        render(style, &content)
     }
 
     /// A synthetic assistant turn carrying `text`, in the requested
@@ -514,6 +524,7 @@ mod tests {
         Allowance, Blocking, GateDecision, Meter, Meters, Rendering, THRESHOLD, decide,
         exhausted_meters, expired, grant_for,
     };
+    use crate::middleware::notice::{INSIGHT_FOOTER, INSIGHT_HEADER, NoticeStyle};
     use serde_json::json;
 
     /// A spent 5-hour window with its reset comfortably in the future, and
@@ -873,30 +884,56 @@ mod tests {
 
     #[test]
     fn the_notice_names_the_meter_the_reset_and_the_resume_path() {
-        // 1_769_500_800 = 2026-01-27 08:00:00 UTC.
+        // Rendered Plain so these assertions pin the notice's CONTENT —
+        // the meter, the reset, the resume path — independent of any
+        // wrapping style; the styles themselves are pinned below.
         let tz = utc();
         assert_eq!(
-            Blocking::notice(Meter::FiveHour, Some(1_769_500_800), None, &tz),
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Plain
+            ),
             "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
              Reply with the release marker to continue and spend overage until then.]"
         );
         // The context size rides in the same sentence, comma-grouped,
         // and is dropped entirely when unknown (never printed as zero).
         assert_eq!(
-            Blocking::notice(Meter::SevenDay, Some(1_769_500_800), Some(123_456), &tz),
+            Blocking::notice(
+                Meter::SevenDay,
+                Some(1_769_500_800),
+                Some(123_456),
+                &tz,
+                NoticeStyle::Plain
+            ),
             "[Session stopped by toker: 7-day quota is spent, resets at 08:00. \
              This session's context is 123,456 tokens. \
              Reply with the release marker to continue and spend overage until then.]"
         );
         // A zero context is not a measurement: dropped like an absent one.
         assert_eq!(
-            Blocking::notice(Meter::FiveHour, Some(1_769_500_800), Some(0), &tz),
-            Blocking::notice(Meter::FiveHour, Some(1_769_500_800), None, &tz),
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                Some(0),
+                &tz,
+                NoticeStyle::Plain
+            ),
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Plain
+            ),
             "ctp's `known` check: `Number.isFinite(n) && n > 0`"
         );
         // No reset carried: name the ignorance, exactly as ctp words it.
         assert_eq!(
-            Blocking::notice(Meter::FiveHour, None, None, &tz),
+            Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain),
             "[Session stopped by toker: 5-hour quota is spent, resets at an unknown time. \
              Reply with the release marker to continue and spend overage until then.]"
         );
@@ -905,24 +942,85 @@ mod tests {
     #[test]
     fn the_notice_is_a_pure_function_of_its_inputs() {
         // Invariant 4: a gate notice enters replayed history, so the same
-        // inputs must render the same bytes, forever, on every call.
+        // inputs (style included) must render the same bytes, forever, on
+        // every call. Pinned in the DEFAULT style, the generic GFM alert —
+        // the wrapper the client actually carries is part of the pinned
+        // bytes now.
         let tz = utc();
+        let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
+                      This session's context is 9,872,344 tokens. \
+                      Reply with the release marker to continue and spend overage until then.]";
+        let expected = format!("> [!NOTE]\n> {content}");
         for _ in 0..3 {
             assert_eq!(
-                Blocking::notice(Meter::FiveHour, Some(1_769_500_800), Some(9_872_344), &tz),
-                "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
-                 This session's context is 9,872,344 tokens. \
-                 Reply with the release marker to continue and spend overage until then.]"
+                Blocking::notice(
+                    Meter::FiveHour,
+                    Some(1_769_500_800),
+                    Some(9_872_344),
+                    &tz,
+                    NoticeStyle::default()
+                ),
+                expected
             );
         }
         // The timezone is an input: a different zone renders different
-        // bytes for the same instant, deterministically.
+        // bytes for the same instant, deterministically — inside the
+        // same frozen wrapper.
         let auckland = jiff::tz::TimeZone::get("Pacific/Auckland").expect("IANA zone");
         assert_eq!(
-            Blocking::notice(Meter::FiveHour, Some(1_769_500_800), None, &auckland),
-            "[Session stopped by toker: 5-hour quota is spent, resets at 21:00. \
-             Reply with the release marker to continue and spend overage until then.]",
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &auckland,
+                NoticeStyle::default()
+            ),
+            "> [!NOTE]\n> [Session stopped by toker: 5-hour quota is spent, resets at 21:00. \
+            Reply with the release marker to continue and spend overage until then.]",
             "2026-01-27 08:00 UTC is 21:00 NZDT the same day"
+        );
+    }
+
+    #[test]
+    fn the_notice_renders_in_the_configured_style() {
+        // One decision, three styles: the CONTENT is identical, only the
+        // wrapping differs. Plain is the pre-wrapper form, byte for byte;
+        // gfm is the default (generic — insight rendering is claude-only).
+        let tz = utc();
+        let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
+                      Reply with the release marker to continue and spend overage until then.]";
+        assert_eq!(
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Plain
+            ),
+            content,
+            "plain: the content verbatim — the pre-insight form, pinned"
+        );
+        assert_eq!(
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Insight
+            ),
+            format!("{INSIGHT_HEADER}\n{content}\n{INSIGHT_FOOTER}"),
+            "insight: the frozen block around the same content"
+        );
+        assert_eq!(
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Gfm
+            ),
+            format!("> [!NOTE]\n> {content}"),
+            "gfm: the alert form"
         );
     }
 
@@ -1019,6 +1117,41 @@ mod tests {
             assert_eq!(
                 Blocking::blocked_turn("same text", Some("claude-opus-5"), Rendering::Sse),
                 sse.clone()
+            );
+        }
+    }
+
+    #[test]
+    fn the_rendered_notice_rides_in_both_turn_renderings() {
+        // The wiring the server does — notice(style) → blocked_turn —
+        // carries the RENDERED notice, block and all: the insight block
+        // is part of both the SSE and the JSON body bytes (invariant 4).
+        // JSON escapes the block's newlines as `\n`; everything else
+        // (the star, the dashes) rides the text field raw.
+        let tz = utc();
+        let rendered = Blocking::notice(
+            Meter::FiveHour,
+            Some(1_769_500_800),
+            None,
+            &tz,
+            NoticeStyle::Insight,
+        );
+        let sse_bytes = Blocking::sse_turn(&rendered, Some("claude-opus-5"));
+        let json_bytes = Blocking::json_turn(&rendered, Some("claude-opus-5"));
+        let sse = std::str::from_utf8(&sse_bytes).expect("utf-8");
+        let json = std::str::from_utf8(&json_bytes).expect("utf-8");
+        for body in [&sse, &json] {
+            assert!(
+                body.contains(&rendered.replace('\n', "\\n")),
+                "the insight block rides the turn body, its newlines JSON-escaped"
+            );
+            assert!(
+                body.contains(INSIGHT_HEADER),
+                "the frozen header is in the body"
+            );
+            assert!(
+                body.contains(INSIGHT_FOOTER),
+                "the frozen footer is in the body"
             );
         }
     }

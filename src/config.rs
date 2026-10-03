@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
+use crate::middleware::notice::NoticeStyle;
 use crate::store;
 
 /// The default listener port (plan: a new port, not 18082 — ctp stays
@@ -92,12 +93,19 @@ pub struct GatesConfig {
     /// toggled strip would change the cached prefix of every conversation
     /// carrying a marker).
     pub quota_enabled: bool,
+    /// How the quota gate's notice is rendered (plan: "Native rendering
+    /// for gate notices"). The config's stand-in for the per-frontend
+    /// choice, until a client-selection mechanism exists: insight (the
+    /// default) for claude, gfm for Workhorse-style frontends, plain to
+    /// degrade.
+    pub notice_style: NoticeStyle,
 }
 
 impl Default for GatesConfig {
     fn default() -> Self {
         GatesConfig {
             quota_enabled: true,
+            notice_style: NoticeStyle::default(),
         }
     }
 }
@@ -282,6 +290,7 @@ impl Config {
             anthropic_api,
             gates: GatesConfig {
                 quota_enabled: file.gates.quota_enabled.unwrap_or(true),
+                notice_style: file.gates.notice_style.unwrap_or_default(),
             },
         };
 
@@ -356,6 +365,9 @@ struct FileConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileGates {
     quota_enabled: Option<bool>,
+    /// Parsed by [`NoticeStyle`]'s case-insensitive deserialiser; an
+    /// unknown value fails the load, like a typo'd key would.
+    notice_style: Option<NoticeStyle>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -423,6 +435,7 @@ mod tests {
         DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources,
         OpenRouterConfig,
     };
+    use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
     use std::fs;
     use std::path::PathBuf;
@@ -505,6 +518,10 @@ mod tests {
         // The quota gate is on by default: a proxy that silently stopped
         // gating is a proxy that quietly spends overage.
         assert!(config.gates.quota_enabled);
+        // The notice renders in the default style (the generic GFM alert —
+        // the insight block is claude-only): a change here would change the
+        // bytes of every notice overnight.
+        assert_eq!(config.gates.notice_style, NoticeStyle::Gfm);
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -640,6 +657,60 @@ quota_enabled = false
         assert!(
             super::Config::load().is_err(),
             "a typo'd gates key must fail to load"
+        );
+    }
+
+    #[test]
+    fn notice_style_is_read_case_insensitively_and_unknown_values_fail() {
+        let dir = test_dir("notice-style");
+        let load = |text: &str| {
+            let _guard = env_lock().lock().unwrap();
+            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+            fs::write(dir.join("toker.toml"), text).expect("write config");
+            super::Config::load()
+        };
+
+        // Explicitly named styles load, whatever their casing.
+        assert_eq!(
+            load("[gates]\nnotice_style = \"plain\"\n")
+                .expect("plain loads")
+                .gates
+                .notice_style,
+            NoticeStyle::Plain
+        );
+        assert_eq!(
+            load("[gates]\nnotice_style = \"Gfm\"\n")
+                .expect("gfm loads")
+                .gates
+                .notice_style,
+            NoticeStyle::Gfm
+        );
+        assert_eq!(
+            load("[gates]\nnotice_style = \"INSIGHT\"\n")
+                .expect("insight loads")
+                .gates
+                .notice_style,
+            NoticeStyle::Insight
+        );
+
+        // Absent: the default (the generic GFM alert) — never a silent downgrade.
+        assert_eq!(
+            load("port = 19999\n")
+                .expect("absent block parses")
+                .gates
+                .notice_style,
+            NoticeStyle::Gfm
+        );
+
+        // An unknown value is a load error, not a silent default — the
+        // deny_unknown_fields precedent, on the value side. The plain
+        // Display is only the "parsing <path>" context; the alternate
+        // form carries the TOML error, whose snippet names the key.
+        let error = load("[gates]\nnotice_style = \"fancy\"\n").expect_err("unknown style");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("notice_style") && chain.contains("fancy"),
+            "the error names the key and the value: {chain}"
         );
     }
 

@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use toker::catalog::{CostBuckets, price};
 use toker::config::{AnthropicApiConfig, AnthropicSubConfig, Config, OpenRouterConfig};
 use toker::ir::{Request as IrRequest, SENTINEL};
+use toker::middleware::notice::NoticeStyle;
 use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering, decide};
 use toker::server::Server;
 use toker::store::{Allowance, CostKind, MetersSnapshot, RequestRow, RowKind, Store};
@@ -1249,7 +1250,10 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     assert_eq!(content_type(&response), "text/event-stream");
     let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
-    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz);
+    // GatesConfig::default() above → the notice renders in the default
+    // style, the generic GFM alert; the expected turn is built the same
+    // way, wrapper and all.
+    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
     let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
     assert_eq!(
         bytes.as_ref(),
@@ -1319,6 +1323,67 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
         rows.iter().all(|row| row.kind == Some(RowKind::Blocked)),
         "both blocked rows recorded"
     );
+}
+
+#[tokio::test]
+async fn the_notice_style_threads_from_the_gates_config() {
+    // The default test above serves the insight block; these pin that
+    // the `[gates] notice_style` value reaches the served bytes — plain
+    // restores the pre-insight form, gfm serves the Workhorse-style
+    // alert. Same spent meter, same decision, only the wrapping moves.
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.gates.notice_style = NoticeStyle::Plain;
+    let (addr, store) = spawn_toker(config).await;
+    let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body_no_stream("claude-opus-5"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let tz = jiff::tz::TimeZone::system();
+    let notice = Blocking::notice(
+        Meter::FiveHour,
+        Some(reset5h),
+        None,
+        &tz,
+        NoticeStyle::Plain,
+    );
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    assert_eq!(
+        bytes.as_ref(),
+        expected.as_slice(),
+        "plain: the pre-insight form, served byte for byte"
+    );
+    assert!(mock.captured().is_empty());
+
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.gates.notice_style = NoticeStyle::Gfm;
+    let (addr, store) = spawn_toker(config).await;
+    let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body_no_stream("claude-opus-5"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let tz = jiff::tz::TimeZone::system();
+    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    assert_eq!(
+        bytes.as_ref(),
+        expected.as_slice(),
+        "gfm: the alert form, served byte for byte"
+    );
+    assert!(mock.captured().is_empty());
 }
 
 #[tokio::test]
@@ -1616,7 +1681,7 @@ async fn an_unparseable_body_on_the_gated_path_still_gates() {
     assert_eq!(content_type(&response), "text/event-stream");
     let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
-    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz);
+    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
     let expected = Blocking::blocked_turn(&notice, None, Rendering::Sse);
     assert_eq!(
         bytes.as_ref(),

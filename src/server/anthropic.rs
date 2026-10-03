@@ -322,7 +322,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // which the lane table does not track yet: `None`, so the
             // notice drops the clause rather than guessing (absence ≠
             // zero, invariant 3).
-            let text = Blocking::notice(meter, resets_at, None, &jiff::tz::TimeZone::system());
+            let text = Blocking::notice(
+                meter,
+                resets_at,
+                None,
+                &jiff::tz::TimeZone::system(),
+                server.config.gates.notice_style,
+            );
             let rendering = if stream_explicitly_false {
                 Rendering::Json
             } else {

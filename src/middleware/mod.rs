@@ -7,4 +7,5 @@
 //! serialises the result. There is no passthrough code path — passthrough is
 //! what the IR produces when nothing transforms it.
 
+pub mod notice;
 pub mod quota;

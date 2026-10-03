@@ -188,7 +188,7 @@ Each phase usable standalone; dogfood-first ordering:
 ## Stretch goals
 
 - **Per-session dashboard in the opencode sidebar.** Extend the opencode plugin beyond cost attribution: render the toker dashboard specialised to the *active* session — context occupancy, token/cache breakdown, spend, lane state — querying `/_toker`. Builds on the attribution plugin work (phase 5).
-- **Native rendering for gate notices.** Gate and cold notices are synthetic assistant turns; render them in the frontend's own structured format where one exists: claude's insight block, Workhorse's `> [!NOTE]` GFM alert blocks, degrading to plain text elsewhere. Notice text stays a pure function of the gate decision (invariant 4) — the format choice is per-frontend-protocol, and a rendered notice enters replayed history byte-stably like any other turn. Lands with the anthropic gates (phase 2).
+- **Native rendering for gate notices.** Gate and cold notices are synthetic assistant turns; render them in the frontend's own structured format where one exists: claude's insight block (claude-only rendering), the generic GFM `> [!NOTE]` alert (Workhorse and every markdown-ish renderer show it sensibly), degrading to plain text elsewhere. **The GFM alert is the default** — toker cannot yet tell anthropic-frontend clients apart, so the generic wrapper wins; `notice_style = "insight"` opts in for claude-only setups. Notice text stays a pure function of the gate decision (invariant 4) — the wrapper's width is frozen (50 columns) so a rendered notice enters replayed history byte-stably like any other turn.
 
 ## Verify at implementation (known unknowns)
 
