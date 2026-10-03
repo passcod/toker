@@ -13,6 +13,7 @@
 //! placeholders that have not been implemented yet are doc-only; their
 //! units replace them wholesale.
 
+pub mod catalog;
 pub mod cmds;
 pub mod config;
 pub mod ir;

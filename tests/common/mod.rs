@@ -2,6 +2,12 @@
 //! canonical-body generator. Seeded, not random — the corpus and the
 //! prefix-stability property reproduce byte-for-byte on every run, without
 //! a proptest dependency.
+//!
+//! This module is compiled into every integration-test binary, and each binary
+//! uses a different subset of the helpers — hence the module-level dead_code
+//! allow below.
+
+#![allow(dead_code)]
 
 /// splitmix64: small, deterministic, plenty to vary generated bodies.
 pub struct Rng(u64);

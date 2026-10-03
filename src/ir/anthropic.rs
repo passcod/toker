@@ -415,7 +415,7 @@ impl<'a> Messages<'a> {
     }
 
     /// Every message, in order (reversible, for last-user-message scans).
-    pub fn iter(&self) -> impl Iterator<Item = Message<'a>> + DoubleEndedIterator {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = Message<'a>> {
         self.parts.iter().map(|value| Message { value })
     }
 }
@@ -656,7 +656,7 @@ pub struct SystemBlockDigest {
 /// The system text pieces, in order (ctp `requestShape`'s `blocks`,
 /// proxy.mjs:858-862): a string system is one piece; a block array
 /// contributes each string element and each block's `text`.
-fn system_pieces<'a>(value: &'a Value) -> Vec<&'a str> {
+fn system_pieces(value: &Value) -> Vec<&str> {
     match value.get("system") {
         Some(Value::String(text)) => vec![text],
         Some(Value::Array(blocks)) => blocks

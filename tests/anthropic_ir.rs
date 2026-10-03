@@ -51,6 +51,9 @@ fn block(chars: u64, hash: &str) -> SystemBlockDigest {
     }
 }
 
+// A test constructor that spells out every shape field — 12 args is the
+// point here (the row/shape structs have no builders by design).
+#[allow(clippy::too_many_arguments)]
 fn expected_shape(
     req_bytes: u64,
     req_messages: Option<u64>,

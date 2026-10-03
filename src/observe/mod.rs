@@ -16,6 +16,11 @@
 //! - [`usage`]: the per-response [`UsageObserver`] — latches `id`,
 //!   `model`, `provider`, and the verbatim `usage` object from the final
 //!   usage-bearing chunk, with earlier chunks as fallback.
+//! - [`anthropic`]: the Anthropic Messages sibling, [`AnthropicObserver`]
+//!   — folds `message_start`/`message_delta` usage into one set of buckets
+//!   (ctp's `foldUsage`: TTL-split reconciliation, iterations fallback),
+//!   latches model/stop reason/speed/geo, and captures `error` events for
+//!   error rows.
 //!
 //! Invariant 6 (accounting must never break a session): every parse path
 //! here is infallible at the stream level. Malformed JSON, non-JSON
@@ -33,8 +38,10 @@
 //! arguments, and every other choice-bearing field are parsed past and
 //! dropped.
 
+pub mod anthropic;
 pub mod sse;
 pub mod usage;
 
+pub use anthropic::{AnthropicCapture, AnthropicObserver, Measurement, UsagePresence, measurement};
 pub use sse::{SseEvent, SseSplitter};
 pub use usage::{UsageCapture, UsageObserver};
