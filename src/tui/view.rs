@@ -1,27 +1,38 @@
 //! Rendering: a [`Snapshot`] plus a frame in, pixels out.
 //!
 //! ratatui over crossterm, alternate screen handled by the parent module's
-//! init/restore. [`render`] is a pure function of the snapshot and the
-//! clock string — no I/O, no time reads — so the TestBackend tests below
-//! assert real buffer contents at several terminal sizes without ever
-//! touching a real terminal.
+//! init/restore. [`render`] is a pure function of the snapshot, the
+//! clock string, and the timezone — no I/O, no time reads — so the
+//! TestBackend tests below assert real buffer contents at several
+//! terminal sizes without ever touching a real terminal.
 //!
-//! Layout, phase 1 (the grown panel set lands in phase 5 and slots into
-//! the same frame):
+//! Layout, phase 2:
 //!
 //! ```text
 //! ─ toker · live · last 30m · 2 sessions · 17 requests in window   12:34:56
-//! ┌ SESSIONS ────────────────────────┐ ┌ SPEND ─────┐ ┌ RATE ──────┐
-//! │ table, sheds rightmost columns   │ │ billed     │ │ 0.6/min    │
-//! │ when the terminal narrows         │ │ breakdown  │ │ ▁▂▃█  err  │
-//! └───────────────────────────────────┘ └────────────┘ └────────────┘
+//! ┌ SESSIONS ────────────────────────────────────────────────────────┐
+//! │ table, sheds rightmost columns when the terminal narrows          │
+//! └────────────────────────────────────────────────────────────────────┘
+//! ┌ SPEND ─────────────┐ ┌ RATE & QUOTA ──────────────────────────────┐
+//! │ billed             │ │ 0.6/min  ▁▂▃█  errors: 0 · drift: 0        │
+//! │ breakdown          │ │ 5-hour   ██░░░░  12%  resets 14:53 · on track
+//! │ no cost data: N    │ │ 7-day    ██████░  74%  resets Mon 05:00 · stops ~Thu 08:49
+//! └─────────────────────┘ │ overage  ██████░  64%  resets 1 Oct · estimating
+//!                         │ spent    today +3%  ·  30m <1%            │
+//!                         │ binding  five_hour                         │
+//!                         └────────────────────────────────────────────┘
 //! ```
+//! (the bottom strip holds SPEND and RATE & QUOTA side by side, and the
+//! quota lines render only when the snapshot carries a quota section —
+//! absence renders nothing, never zeros).
 //!
 //! Invariant 3 in rendering: every unknown renders as an explicit string —
 //! `?` for unknown models and token counts, "no billed cost data",
-//! "no cost data: N", "no requests in window" — never as a confident
+//! "no cost data: N", "no requests in window", `estimating`/`window
+//! rolled over`/`no data` for the meters — never as a confident
 //! zero.
 
+use jiff::tz::TimeZone;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -31,11 +42,19 @@ use ratatui::{
 };
 
 use super::model::{NO_SESSION, Snapshot};
+use super::quota::{MeterPanel, Spent};
+use crate::middleware::cold::{Verdict, alongside, reset_label};
 
-/// Bottom panel row height: SPEND and RATE side by side. Tall enough for
-/// the total line, the never-dropped "no cost data" line, and a few
-/// breakdown lines.
+/// Bottom panel row height while no quota section exists: SPEND and
+/// RATE side by side. Tall enough for the total line, the
+/// never-dropped "no cost data" line, and a few breakdown lines. The
+/// quota section grows it (see [`bottom_height`]).
 const BOTTOM_HEIGHT: u16 = 9;
+
+/// The meter bar's width (ctp live.mjs:574's `bar(v, 22)`), the widest
+/// it ever renders — it shrinks as the panel narrows rather than
+/// letting the line wrap or the verdict clip.
+const BAR_WIDTH: u16 = 22;
 
 /// The sessions table's columns, left to right, with their base widths.
 /// When the terminal is too narrow the *rightmost* columns shed first
@@ -53,13 +72,14 @@ const SESSION_COLUMNS: [(&str, u16); 7] = [
 /// Sparkline blocks, low → high (▁▂▃▄▅▆▇█ style; a space is a flat minute).
 const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-/// The whole frame. `clock` is the preformatted HH:MM:SS string so tests
+/// The whole frame. `clock` is the preformatted HH:MM:SS string and
+/// `tz` the zone the quota labels render in, both passed in so tests
 /// stay deterministic.
-pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str) {
+pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone) {
     let [header, sessions, bottom] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
-        Constraint::Length(BOTTOM_HEIGHT),
+        Constraint::Length(bottom_height(snap)),
     ])
     .areas(frame.area());
 
@@ -68,7 +88,27 @@ pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str) {
     let [spend, rate] =
         Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(bottom);
     render_spend(frame, spend, snap);
-    render_rate(frame, rate, snap);
+    render_rate(frame, rate, snap, tz);
+}
+
+/// The bottom row's height: the fixed [`BOTTOM_HEIGHT`] floor, grown to
+/// fit the quota section's lines when one exists — ctp drops from the
+/// middle rather than let the quota block scroll off the bottom
+/// ("the part worth watching", live.mjs:660-679); here the sessions
+/// panel yields the rows instead.
+fn bottom_height(snap: &Snapshot) -> u16 {
+    let Some(quota) = &snap.quota else {
+        return BOTTOM_HEIGHT;
+    };
+    let mut lines = 3; // per-minute, sparkline, errors/drift
+    lines += quota.meters.len();
+    if quota.spent_today.is_some() {
+        lines += 1;
+    }
+    if quota.binding.is_some() {
+        lines += 1;
+    }
+    BOTTOM_HEIGHT.max((lines + 2) as u16) // + 2 border rows
 }
 
 /// Header line: `toker · live · last 30m` + window summary, clock at the
@@ -234,10 +274,13 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// RATE: requests per minute, the per-minute sparkline (minutes with
-/// errors flagged in red), and the error/drift counters.
-fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot) {
-    let block = Block::bordered().title_top("RATE");
+/// RATE & QUOTA: requests per minute, the per-minute sparkline (minutes
+/// with errors flagged in red), the error/drift counters — and, when the
+/// snapshot carries a quota section, the plan's own meters with their
+/// reset clocks and forecasts, the `spent` line, and the `binding`
+/// claim (ctp live.mjs's RATE & QUOTA block, 524-626).
+fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
+    let block = Block::bordered().title_top("RATE & QUOTA");
     let inner = block.inner(area);
     let mut lines = vec![Line::from(format!("{:.1}/min", snap.rate.per_minute))];
 
@@ -270,7 +313,268 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         "errors: {} · drift: {}",
         snap.errors, snap.drift
     )));
+
+    // The quota lines: absent when the section is absent — an openai
+    // window has no quota meters and no quota lines (the per-backend
+    // panel rule).
+    if let Some(quota) = &snap.quota {
+        for meter in &quota.meters {
+            lines.push(meter_line(
+                meter,
+                quota.gate_assumed,
+                inner.width,
+                snap.now_ms,
+                tz,
+            ));
+        }
+        if let (Some(today), Some(window)) = (quota.spent_today, quota.spent_window) {
+            lines.push(spent_line(today, window, snap.window_mins));
+        }
+        if let Some(binding) = &quota.binding {
+            lines.push(binding_line(binding, quota.overage_in_use));
+        }
+    }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// One meter line (ctp live.mjs's `q()`, the whole shape of it): the
+/// label, a utilisation bar coloured by how much is left, and — shed
+/// before anything else when the panel narrows, never wrapped — the
+/// resets clock and the forecast verdict. The verdict is the last
+/// thing to go; the status is the first.
+fn meter_line(
+    meter: &MeterPanel,
+    gate_assumed: bool,
+    width: u16,
+    now_ms: i64,
+    tz: &TimeZone,
+) -> Line<'static> {
+    let width = width as usize;
+
+    // The verdict, with its clock: a runout lands at `at`, labelled so
+    // it cannot be misread as belonging to the reset's day. The gate
+    // is recoverable — the release marker spends past it — where real
+    // exhaustion is not: different walls, different colours (`stops`
+    // yellow, `out` red).
+    let (verdict_text, verdict_style) = match meter.verdict {
+        Verdict::Runout { at_ms } => {
+            let other = meter
+                .reset_s
+                .map(|reset| reset as f64 * 1000.0)
+                .unwrap_or(at_ms);
+            let label = alongside(at_ms, other, now_ms, tz);
+            if meter.target < 1.0 {
+                (format!("stops ~{label}"), Style::new().fg(Color::Yellow))
+            } else {
+                (format!("out ~{label}"), Style::new().fg(Color::Red))
+            }
+        }
+        Verdict::OnTrack => ("on track".to_owned(), Style::new().fg(Color::Green)),
+        Verdict::Reached => ("spent".to_owned(), Style::new().fg(Color::Red)),
+        // A rolled window and an unmeasurable one both say so in words
+        // — never a silent guess (invariant 3).
+        Verdict::Stale => ("window rolled over".to_owned(), Style::new().dim()),
+        Verdict::Unknown => ("estimating".to_owned(), Style::new().dim()),
+    };
+    let gated_prefix = meter
+        .exhausted
+        .then(|| "gated · ".to_owned())
+        .unwrap_or_default();
+    let assumed_suffix = (meter.gated && gate_assumed).then_some("?").unwrap_or("");
+    let verdict_full = format!("{gated_prefix}{verdict_text}{assumed_suffix}");
+
+    // The resets clause goes with a live verdict only — "resets ?"
+    // beside "window rolled over" would assert a present tense the
+    // reading no longer has. An absent reset is named, never guessed.
+    let resets = match meter.verdict {
+        Verdict::Stale => None,
+        _ => Some(match meter.reset_s {
+            Some(reset) => format!(
+                "resets {} · ",
+                reset_label(reset as f64 * 1000.0, now_ms, tz)
+            ),
+            None => "resets ? · ".to_owned(),
+        }),
+    };
+    let status = meter
+        .status
+        .as_deref()
+        .filter(|status| *status != "allowed")
+        .map(str::to_owned);
+
+    // Compose the right side, shedding as the panel narrows: the status
+    // first, then the resets clause, the verdict last (ctp
+    // live.mjs:584-589). Where ctp cuts the bar string mid-glyph at
+    // this point, the bar here shrinks instead — every surviving piece
+    // keeps its styling and a partial bar still reads as a bar.
+    let len = |s: &str| s.chars().count();
+    let with = |status: Option<&str>, resets: Option<&str>| {
+        let mut right = String::new();
+        if let Some(status) = status {
+            right.push_str(status);
+            right.push_str("  ");
+        }
+        if let Some(resets) = resets {
+            right.push_str(resets);
+        }
+        right.push_str(&verdict_full);
+        right
+    };
+    let mut use_status = status.as_deref();
+    let mut use_resets = resets.as_deref();
+    let mut right = with(use_status, use_resets);
+    if 17 + len(&right) + BAR_WIDTH as usize > width {
+        use_status = None;
+        right = with(None, use_resets);
+    }
+    if 17 + len(&right) + BAR_WIDTH as usize > width {
+        use_resets = None;
+        right = with(None, None);
+    }
+    let bar_width = width
+        .saturating_sub(17 + len(&right))
+        .min(BAR_WIDTH as usize) as u16;
+
+    // A reading from a window that has rolled is dimmed along with its
+    // bar: the verdict says so in words, but a bright 95% next to it
+    // is the thing the eye actually reads.
+    let bar_style = match meter.verdict {
+        Verdict::Stale => Style::new().dim(),
+        _ if meter.util > 0.95 => Style::new().fg(Color::Red),
+        _ if meter.util > 0.8 => Style::new().fg(Color::Yellow),
+        _ => Style::new().fg(Color::Green),
+    };
+    let pct = format!("{:>3}%", (meter.util * 100.0).round() as i64);
+    let left = format!("  {:<9}{} {}", meter.label, bar(meter.util, bar_width), pct);
+
+    // The styled left side: the label plain, the bar and its
+    // percentage in the bar's colour.
+    let left_spans = || -> Vec<Span<'static>> {
+        vec![
+            Span::raw(format!("  {:<9}", meter.label)),
+            Span::styled(bar(meter.util, bar_width), bar_style),
+            Span::raw(" "),
+            Span::styled(pct.clone(), bar_style),
+        ]
+    };
+
+    // The styled right side, kept whole: the verdict is the last thing
+    // to go, so it is never the thing that gets clipped.
+    let right_spans = || -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if let Some(status) = use_status {
+            spans.push(Span::styled(status.to_owned(), Style::new().fg(Color::Red)));
+            spans.push(Span::raw("  "));
+        }
+        if let Some(resets) = use_resets {
+            spans.push(Span::styled(resets.to_owned(), Style::new().dim()));
+        }
+        if meter.exhausted {
+            spans.push(Span::styled(
+                gated_prefix.clone(),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        spans.push(Span::styled(verdict_text.clone(), verdict_style));
+        if !assumed_suffix.is_empty() {
+            spans.push(Span::styled(assumed_suffix, Style::new().dim()));
+        }
+        spans
+    };
+
+    if 16 + bar_width as usize + 1 + len(&right) <= width {
+        let gap = width - 16 - bar_width as usize - 1 - len(&right);
+        let mut spans = left_spans();
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans());
+        Line::from(spans)
+    } else {
+        // Degenerate width: cut the left so the verdict survives —
+        // ctp's spread clamps the left side of the line, at the price
+        // of the cut portion's styling.
+        let keep = width.saturating_sub(len(&right) + 1);
+        let mut spans = vec![
+            Span::raw(left.chars().take(keep).collect::<String>()),
+            Span::raw(" "),
+        ];
+        spans.extend(right_spans());
+        Line::from(spans)
+    }
+}
+
+/// The `spent` line (ctp live.mjs:602-621): how much overage today and
+/// this window actually cost — the thing the utilisation bar cannot
+/// say, because a meter sitting at 64% got there at some point in the
+/// past, not necessarily this span. "Today" is the user's local day.
+fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
+    // The five display states (the README's `spent` table): a total,
+    // a quantisation ceiling, a floor, idle, and no data — a busy span
+    // that did not move the 1%-quantised figure must not print as a
+    // measured "+0%".
+    let show = |spent: Spent| -> (String, bool) {
+        match spent {
+            Spent::NoData => ("no data".to_owned(), true),
+            Spent::Idle => ("idle".to_owned(), true),
+            Spent::Measured { points, floor } => {
+                let pct = (points * 100.0).round();
+                if pct < 1.0 {
+                    return ("<1%".to_owned(), true);
+                }
+                (
+                    if floor {
+                        format!("≥+{pct}%")
+                    } else {
+                        format!("+{pct}%")
+                    },
+                    false,
+                )
+            }
+        }
+    };
+    let (today_text, today_dim) = show(today);
+    let (window_text, window_dim) = show(window);
+    let dim_of = |dim: bool| {
+        if dim {
+            Style::new().dim()
+        } else {
+            Style::new()
+        }
+    };
+    Line::from(vec![
+        Span::raw("  spent   "),
+        Span::styled("today ", Style::new().dim()),
+        Span::styled(today_text, dim_of(today_dim)),
+        Span::styled("  ·  ", Style::new().dim()),
+        Span::styled(format!("{window_mins}m "), Style::new().dim()),
+        Span::styled(window_text, dim_of(window_dim)),
+    ])
+}
+
+/// The `binding` line (ctp live.mjs:622-625): the representative-claim
+/// naming which limit is in force, with the overage flag beside it —
+/// spend has shifted off plan quota, which is not a footnote.
+fn binding_line(claim: &str, overage_in_use: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled("binding", Style::new().dim()),
+        Span::raw(format!("  {claim}")),
+    ];
+    if overage_in_use {
+        spans.push(Span::styled(
+            "   overage IN USE",
+            Style::new().fg(Color::Red),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The meter bar: fill to `round(frac × w)`, pad with `░` (ctp's `bar`).
+fn bar(frac: f64, w: u16) -> String {
+    let w = w as usize;
+    let f = frac.clamp(0.0, 1.0);
+    let fill = (f * w as f64).round() as usize;
+    let fill = fill.min(w);
+    "█".repeat(fill) + &"░".repeat(w.saturating_sub(fill))
 }
 
 /// Dollar formatting for the spend panel.
@@ -281,12 +585,26 @@ fn usd(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::model;
-    use super::super::testrows::{bare, billed, kind_row};
+    use super::super::quota::Spent;
+    use super::super::testrows::{bare, billed, kind_row, metered};
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use serde_json::json;
 
     const NOW: i64 = 1_769_000_000_000;
+    const MIN: i64 = 60_000;
+    const HOUR: i64 = 60 * MIN;
+    const DAY: i64 = 24 * HOUR;
+    /// The test frame's local-day start: 2026-01-21T12:53:20Z minus
+    /// twelve hours, arbitrary but stable.
+    const TODAY: i64 = NOW - 12 * HOUR;
+
+    /// A fixed zone keeps the pinned clock strings independent of the
+    /// machine running the tests; UTC keeps them readable.
+    fn utc() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::get("UTC").expect("UTC is always present in the tzdb")
+    }
 
     /// The shared synthetic window: two sessions plus a NULL-session group,
     /// a billed spread for the sparkline, a NULL-cost request, and one
@@ -323,13 +641,76 @@ mod tests {
         unpriced.input = Some(500);
         rows.push(unpriced);
         rows.push(kind_row(NOW - 10_000, RowKind::Error));
-        model::aggregate(&rows, 30, NOW, 523)
+        model::aggregate(&rows, &rows, 30, NOW, 523, TODAY)
+    }
+
+    /// The shared synthetic quota rows: real-shaped anthropic meter
+    /// snapshots across three windows —
+    ///
+    /// - 5-hour: 0.10 → 0.30 → 0.32 over ninety minutes, resetting
+    ///   three hours out (a measured burn that resets first → `on
+    ///   track`), and `overageInUse` on the newest reading, so the
+    ///   gate counts it spent → the `gated ·` prefix and a countdown
+    ///   to exhaustion rather than to the gate;
+    /// - 7-day: 0.10 → 0.80 over two days (the day-scale-span rule
+    ///   demands at least a day), resetting four days out → a runout
+    ///   before the reset, against the armed gate → `stops ~…` with
+    ///   the alongside weekday;
+    /// - overage: 0.58 → 0.64 across midnight and flat inside the
+    ///   window → `estimating` (no span out-measures the quantisation
+    ///   across the day-scale minimum), `spent today +6%` measured
+    ///   from the pre-midnight baseline, `30m <1%` flat, a `rejected`
+    ///   status, and the `binding` claim with overage in use.
+    ///
+    /// `gate_on` false builds the same readings from rows that predate
+    /// the `gate_on` field — the assumed-gate fixture.
+    fn quota_rows(gate_on: bool) -> Vec<crate::store::RequestRow> {
+        let reset5h = (NOW + 3 * HOUR) / 1000;
+        let reset7d = (NOW + 4 * DAY) / 1000;
+        let reset_overage = (NOW + 20 * DAY) / 1000;
+        let mut rows = vec![
+            metered(NOW - 2 * DAY, json!({"util7d": 0.10, "reset7d": reset7d})),
+            metered(NOW - DAY, json!({"util7d": 0.80, "reset7d": reset7d})),
+            metered(
+                NOW - 13 * HOUR,
+                json!({"utilOverage": 0.58, "resetOverage": reset_overage}),
+            ),
+            metered(NOW - 90 * MIN, json!({"util5h": 0.10, "reset5h": reset5h})),
+            metered(
+                NOW - 45 * MIN,
+                json!({
+                    "util5h": 0.30, "reset5h": reset5h,
+                    "utilOverage": 0.64, "resetOverage": reset_overage,
+                }),
+            ),
+            metered(
+                NOW - 10 * MIN,
+                json!({
+                    "util5h": 0.32, "reset5h": reset5h,
+                    "util7d": 0.80, "reset7d": reset7d,
+                    "utilOverage": 0.64, "resetOverage": reset_overage,
+                    "status5h": "allowed", "status7d": "allowed",
+                    "statusOverage": "rejected",
+                    "claim": "five_hour", "overageInUse": true,
+                }),
+            ),
+        ];
+        if gate_on {
+            rows.last_mut().expect("the newest row").gate_on = Some(true);
+        }
+        rows
+    }
+
+    fn quota_snapshot() -> model::Snapshot {
+        let rows = quota_rows(true);
+        model::aggregate(&rows, &rows, 30, NOW, 523, TODAY)
     }
 
     fn rendered(snap: &model::Snapshot, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let tz = utc();
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56"))
+            .draw(|frame| super::render(frame, snap, "12:34:56", &tz))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -368,7 +749,7 @@ mod tests {
 
     #[test]
     fn empty_window_renders_absence_not_zero() {
-        let snap = model::aggregate(&[], 30, NOW, 523);
+        let snap = model::aggregate(&[], &[], 30, NOW, 523, TODAY);
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
@@ -381,7 +762,7 @@ mod tests {
 
     #[test]
     fn truly_empty_ledger_says_ledger_empty() {
-        let snap = model::aggregate(&[], 30, NOW, 0);
+        let snap = model::aggregate(&[], &[], 30, NOW, 0, TODAY);
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("ledger empty"));
         assert!(text.contains("no requests in window"));
@@ -453,5 +834,160 @@ mod tests {
         // Leftover width lands on SESSION: at 90 cells, 82 are needed.
         let (_, widths) = super::session_plan(90);
         assert_eq!(widths[0], ratatui::layout::Constraint::Length(18 + 8));
+    }
+
+    // ── the rate & quota panel ────────────────────────────────────────
+
+    #[test]
+    fn quota_panel_renders_meters_spent_and_binding() {
+        let snap = quota_snapshot();
+        // 200 columns: the rate panel's inner 78 hold every meter line
+        // at full width — bar, resets clock, status, verdict.
+        let text = rendered(&snap, 200, 30);
+        assert!(text.contains("RATE & QUOTA"));
+        // The 5-hour meter: measured burn that resets first, gated by
+        // overageInUse, so the countdown is to exhaustion — but the
+        // gate is why the prefix is there.
+        assert!(text.contains("resets 15:53 · gated · on track"));
+        // The 7-day meter: a day-scale burn (the day-scale-span rule)
+        // reaching the armed gate's threshold before the reset, the
+        // runout labelled with a weekday so it cannot be misread as
+        // the reset's day.
+        assert!(text.contains("resets Sun 12:53 · stops ~Thu 01:55"));
+        // The overage meter: no span out-measures the quantisation at
+        // the day-scale minimum — an explicit "estimating", never a
+        // silent guess — plus a status that is not "allowed".
+        assert!(text.contains("rejected  resets 10 Feb · estimating"));
+        // The spent line: today measured from the pre-midnight
+        // baseline, the window flat below the quantisation.
+        assert!(text.contains("today +6%  ·  30m <1%"), "{text}");
+        // The binding claim, with overage flagged.
+        assert!(text.contains("binding  five_hour"), "{text}");
+        assert!(text.contains("overage IN USE"), "{text}");
+        // The bars render utilisation: 32% of a 22-cell bar is 7
+        // filled, 80% is 18, 64% is 14.
+        assert!(
+            text.contains(&format!(
+                "  5-hour   {}  32%",
+                "█".repeat(7) + &"░".repeat(15)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  7-day    {}  80%",
+                "█".repeat(18) + &"░".repeat(4)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  overage  {}  64%",
+                "█".repeat(14) + &"░".repeat(8)
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn quota_panel_renders_nothing_without_meter_rows() {
+        // The per-backend panel rule: an openai-shaped window (rows
+        // with no rate-limit snapshots) gets the sparkline but no
+        // meter bars, no spent line, no binding claim — absence, not
+        // zeros.
+        let snap = snapshot();
+        let text = rendered(&snap, 100, 30);
+        assert!(text.contains("RATE & QUOTA"), "the panel itself stays");
+        assert!(!text.contains("5-hour"));
+        assert!(!text.contains("7-day"));
+        assert!(!text.contains("overage"));
+        assert!(!text.contains("binding"));
+        assert!(!text.contains("spent"));
+        assert_eq!(snap.quota, None);
+    }
+
+    #[test]
+    fn a_narrow_panel_sheds_resets_and_status_but_keeps_the_verdicts() {
+        let snap = quota_snapshot();
+        // 100 columns → the rate panel's inner 38: the resets clause
+        // and the status go, the bar shrinks, every verdict survives —
+        // the verdict is the last thing to go (ctp live.mjs:585).
+        let text = rendered(&snap, 100, 30);
+        assert!(!text.contains("resets"), "the resets clause is shed");
+        assert!(!text.contains("rejected"), "the status is shed first");
+        assert!(text.contains("gated · on track"));
+        assert!(text.contains("stops ~Thu 01:55"));
+        assert!(text.contains("estimating"));
+        assert!(text.contains("today +6%  ·  30m <1%"), "spent stays");
+    }
+
+    #[test]
+    fn an_assumed_gate_marks_its_countdowns_with_a_question() {
+        // The same readings from rows predating `gateOn`: the gate is
+        // assumed (ctp's default of armed) and every gate-aware
+        // countdown says so — an assumed gate must not read the same
+        // as an observed one.
+        let rows = quota_rows(false);
+        let snap = model::aggregate(&rows, &rows, 30, NOW, 523, TODAY);
+        assert!(snap.quota.as_ref().expect("readings exist").gate_assumed);
+        let text = rendered(&snap, 200, 30);
+        assert!(text.contains("gated · on track?"), "{text}");
+        assert!(text.contains("stops ~Thu 01:55?"), "{text}");
+        assert!(
+            !text.contains("estimating?"),
+            "the overage meter is not gate-aware, so no question mark"
+        );
+    }
+
+    #[test]
+    fn spent_line_renders_all_five_states() {
+        // The README's `spent` table, one line each: a total, a
+        // quantisation ceiling (<1%), a floor (≥+N%), idle, and no
+        // data — the last three dim, and none of them a zero.
+        let line = |today: Spent, window: Spent| {
+            let mut text = String::new();
+            let mut spans = super::spent_line(today, window, 30).spans.into_iter();
+            for span in spans.by_ref() {
+                text.push_str(span.content.as_ref());
+            }
+            text
+        };
+        assert_eq!(
+            line(
+                Spent::Measured {
+                    points: 0.03,
+                    floor: false
+                },
+                Spent::Measured {
+                    points: 0.004,
+                    floor: false
+                }
+            ),
+            "  spent   today +3%  ·  30m <1%"
+        );
+        assert_eq!(
+            line(
+                Spent::Measured {
+                    points: 0.06,
+                    floor: true
+                },
+                Spent::Idle
+            ),
+            "  spent   today ≥+6%  ·  30m idle"
+        );
+        assert_eq!(
+            line(Spent::NoData, Spent::NoData),
+            "  spent   today no data  ·  30m no data"
+        );
+    }
+
+    #[test]
+    fn a_tiny_terminal_renders_the_quota_lines_without_panicking() {
+        let snap = quota_snapshot();
+        // The quota section grows the bottom row to ten; a 12-row
+        // terminal still renders the panel titles and clips cleanly.
+        let text = rendered(&snap, 40, 12);
+        assert!(text.contains("RATE"));
+        assert!(text.contains("SESSIONS"));
     }
 }

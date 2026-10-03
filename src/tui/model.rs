@@ -2,20 +2,26 @@
 //!
 //! Pure over [`RequestRow`]s — no terminal types, no clocks, no store — so
 //! every panel number is testable against synthetic row sets. The loop in
-//! the parent module owns time and I/O; [`aggregate`] receives `now_ms` and
-//! the window length as data.
+//! the parent module owns time and I/O; [`aggregate`] receives `now_ms`,
+//! the window length, the meter lookback (a superset of the window — a
+//! burn rate needs a span a display window cannot hold) and the local
+//! day's start as data, and the quota section is [super::quota]'s
+//! aggregation of that lookback.
 //!
 //! Invariant 3 (absence ≠ zero) is the design rule here: a NULL column is
 //! never read as zero. Sums that would need a missing operand stay `None`
 //! (`input + cache_read` needs both present), a session's model stays
-//! `None` until a row actually reports one, and the billed total stays
-//! `None` when no billed row exists — the view renders each of those as an
-//! explicit "no data"-shaped string, so "no rows" and "rows with zero"
-//! are visibly different states. The one deliberate zero is the count of
-//! requests without cost data: a count over known rows is a real number.
+//! `None` until a row actually reports one, the billed total stays
+//! `None` when no billed row exists, and the quota section stays `None`
+//! when no row carries a meter snapshot — the view renders each of those
+//! as an explicit "no data"-shaped string or no panel at all, so "no
+//! rows" and "rows with zero" are visibly different states. The one
+//! deliberate zero is the count of requests without cost data: a count
+//! over known rows is a real number.
 
 use std::collections::HashMap;
 
+use super::quota::QuotaAgg;
 use crate::store::{CostKind, RequestRow, RowKind, is_api_measurement};
 
 /// The label for rows grouped without a session id (NULL `session_id`).
@@ -48,6 +54,11 @@ pub(crate) struct Snapshot {
     /// `kind = fidelity-drift` rows in the window (invariant 5: drift is a
     /// visible metric, not a hoped-for absence).
     pub drift: usize,
+    /// The rate & quota section, from the meter lookback (rows beyond
+    /// the display window — a burn needs a span a display window cannot
+    /// provide). `None` when no row carries a meter snapshot: the panel
+    /// renders nothing, never zeros (invariant 3's per-backend rule).
+    pub quota: Option<QuotaAgg>,
 }
 
 /// One session's aggregate over the window. All "latest" values are by
@@ -127,19 +138,24 @@ pub(crate) struct MinuteBucket {
 
 /// The pre-refresh placeholder: an empty window of the right shape.
 pub(crate) fn empty(window_mins: u64) -> Snapshot {
-    aggregate(&[], window_mins, 0, 0)
+    aggregate(&[], &[], window_mins, 0, 0, 0)
 }
 
-/// Aggregate one window of ledger rows into a [`Snapshot`]. `now_ms` is the
-/// frame's reference time (bucket edges anchor to it); `total_requests` is
+/// Aggregate one window of ledger rows into a [`Snapshot`]. `now_ms` is
+/// the frame's reference time (bucket edges anchor to it); `total_requests` is
 /// the ledger's total row count, kept distinct from the window so the
-/// header can show both. Rows may arrive in any order — "latest" is
-/// decided by `ts_ms` throughout.
+/// header can show both. `quota_rows` is the meter lookback (the
+/// 7-day read; a superset of the window) and `today_start_ms` the local
+/// day's start — the quota section's `spent today` span anchors there,
+/// passed in so the model stays pure over its inputs. Rows may arrive
+/// in any order — "latest" is decided by `ts_ms` throughout.
 pub(crate) fn aggregate(
     rows: &[RequestRow],
+    quota_rows: &[RequestRow],
     window_mins: u64,
     now_ms: i64,
     total_requests: i64,
+    today_start_ms: i64,
 ) -> Snapshot {
     let window_mins = window_mins.max(1) as usize;
 
@@ -275,6 +291,12 @@ pub(crate) fn aggregate(
         },
         errors,
         drift,
+        quota: super::quota::aggregate(
+            quota_rows,
+            now_ms,
+            today_start_ms,
+            now_ms.saturating_sub(window_mins.max(1) as i64 * 60_000),
+        ),
     }
 }
 
@@ -295,13 +317,17 @@ mod tests {
     use super::{NO_SESSION, Snapshot};
     use crate::store::{CostKind, RequestRow, RowKind};
     use crate::tui::testrows::{bare, billed, kind_row};
+    use serde_json::json;
 
     /// A fixed frame time: 2026-01-21T22:13:20Z-ish, arbitrary but stable.
     const NOW: i64 = 1_769_000_000_000;
     const WINDOW: u64 = 30;
 
     fn agg(rows: &[RequestRow], total: i64) -> Snapshot {
-        super::aggregate(rows, WINDOW, NOW, total)
+        // The meter lookback is a superset of the window; the tests pass
+        // the same rows, which is the shape of a real window that fits
+        // inside the lookback.
+        super::aggregate(rows, rows, WINDOW, NOW, total, NOW - 12 * 60 * 60_000)
     }
 
     /// A measurement row a given number of minutes before `NOW`.
@@ -604,11 +630,49 @@ mod tests {
 
     #[test]
     fn zero_window_mins_clamps_to_one() {
-        let snap = super::aggregate(&[bare(NOW)], 0, NOW, 1);
+        let snap = super::aggregate(&[bare(NOW)], &[], 0, NOW, 1, NOW);
         assert_eq!(snap.window_mins, 1);
         assert_eq!(snap.rate.buckets.len(), 1);
         assert_eq!(snap.rate.buckets[0].requests, 1);
         assert_eq!(snap.rate.per_minute, 1.0);
+    }
+
+    #[test]
+    fn the_quota_section_comes_from_the_lookback_not_the_window() {
+        // The wiring this panel rides: the section is aggregated from
+        // the meter lookback, which holds rows the display window does
+        // not — a burn needs a span a window cannot provide — and rows
+        // without meter snapshots leave it absent, never zero-filled.
+        let mut in_window = bare(mins_ago(2));
+        in_window.rate_limits = Some(json!({"util5h": 0.42, "reset5h": 123, "claim": "five_hour"}));
+        let mut older_reading = bare(mins_ago(60));
+        older_reading.rate_limits = Some(json!({"util5h": 0.30, "reset5h": 123}));
+
+        let snap = super::aggregate(
+            &[in_window.clone()],
+            &[older_reading, in_window],
+            WINDOW,
+            NOW,
+            2,
+            NOW - 12 * 60 * 60_000,
+        );
+        let quota = snap.quota.expect("the lookback carries meter snapshots");
+        assert_eq!(quota.meters.len(), 1, "only the 5h meter is carried");
+        // Every figure is from the NEWEST reading, which lives in the
+        // window here — and the claim from the same reading.
+        assert!((quota.meters[0].util - 0.42).abs() < 1e-9);
+        assert_eq!(quota.binding.as_deref(), Some("five_hour"));
+
+        // A lookback of rows without meters: no section at all.
+        let snap = super::aggregate(
+            &[bare(mins_ago(1))],
+            &[bare(mins_ago(90))],
+            WINDOW,
+            NOW,
+            2,
+            NOW,
+        );
+        assert_eq!(snap.quota, None);
     }
 
     #[test]

@@ -1,14 +1,18 @@
 //! Ratatui dashboard (plan: "TUI").
 //!
 //! A long-running terminal view over the SQLite ledger, refreshing ~every
-//! 2 s — the replacement for `watch … live.mjs`. Phase 1 renders the
-//! sessions, spend, and rate panels; the full panel set (context bars,
-//! tokens, cache rebuilds, quota) lands with phase 5, and the split into a
-//! pure aggregation [model] plus a [view] over it exists so those panels
-//! can grow without touching terminal plumbing.
+//! 2 s — the replacement for `watch … live.mjs`. Phase 1 rendered the
+//! sessions, spend, and rate panels; phase 2 grows the rate panel into
+//! **rate & quota** (meter bars, forecasts, spent, binding — [quota]),
+//! and the rest of the panel set (context bars, tokens, cache rebuilds)
+//! lands with phase 5. The split into a pure aggregation [model] plus a
+//! [view] over it exists so those panels can grow without touching
+//! terminal plumbing.
 //!
 //! - [model]: ledger rows in, dashboard snapshot out. No terminal types —
 //!   testable against synthetic [`RequestRow`] sets alone.
+//! - [quota]: the rate & quota section of that snapshot — ctp's meter
+//!   forecasting, ported from forecast.mjs/live.mjs.
 //! - [view]: snapshot + frame in, pixels out, via ratatui. Rendering is
 //!   exercised with ratatui's `TestBackend`, never a real terminal.
 //! - [`run`]: the loop wiring them to the store. Reads tolerate a
@@ -21,11 +25,13 @@
 //! explicit "no … data" / `?` strings, never as zero.
 
 mod model;
+mod quota;
 mod view;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
 use crate::store::Store;
 
 /// Refresh cadence: the plan's "~2 s refresh from SQLite".
@@ -46,6 +52,9 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
     let mut terminal = ratatui::try_init()?;
     let _restore = RestoreGuard;
 
+    // The system zone, read once: every local clock the panels render
+    // (the quota resets and runout labels) anchors here.
+    let tz = jiff::tz::TimeZone::system();
     let mut next_refresh = Instant::now(); // first pass refreshes immediately
     let mut snapshot = model::empty(window_mins);
     loop {
@@ -54,7 +63,7 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
             snapshot = refresh(&store, window_mins)?;
             next_refresh = now + REFRESH;
         }
-        terminal.draw(|frame| view::render(frame, &snapshot, &clock()))?;
+        terminal.draw(|frame| view::render(frame, &snapshot, &clock(), &tz))?;
 
         // Block until the next refresh is due or an event arrives — no
         // busy loop.
@@ -92,12 +101,45 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
 /// Reload the window's rows and total, then aggregate. Errors propagate —
 /// with WAL and the store's 5 s busy timeout a read failure is real
 /// trouble, not a blip worth hiding behind a stale frame.
+///
+/// Two reads: the display window's rows (sessions, spend, rate) and
+/// the meter lookback (quota) — a burn rate and a spent span need
+/// history a display window cannot hold, ctp's "readings are taken from
+/// every row read, not just the windowed ones" (live.mjs:269-272). The
+/// lookback reuses the cold outlook's constants: same 7-day span, same
+/// row cap.
 fn refresh(store: &Store, window_mins: u64) -> anyhow::Result<model::Snapshot> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
     let rows = store.requests_since(since, ROW_CAP)?;
     let total = store.count_requests()?;
-    Ok(model::aggregate(&rows, window_mins, now_ms, total))
+    let quota_rows =
+        store.requests_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)?;
+    Ok(model::aggregate(
+        &rows,
+        &quota_rows,
+        window_mins,
+        now_ms,
+        total,
+        local_day_start_ms(now_ms),
+    ))
+}
+
+/// The local day's start (midnight, the system zone) in epoch ms — the
+/// quota panel's `spent today` anchor. "Today" is the user's day, not
+/// UTC's (ctp live.mjs:604's `setHours(0,0,0,0)`). A clock outside
+/// jiff's representable range cannot name a day, so `now` stands in:
+/// the today span degenerates to empty rather than guessing.
+fn local_day_start_ms(now_ms: i64) -> i64 {
+    jiff::Timestamp::from_millisecond(now_ms)
+        .ok()
+        .and_then(|ts| {
+            ts.to_zoned(jiff::tz::TimeZone::system())
+                .start_of_day()
+                .ok()
+                .map(|day| day.timestamp().as_millisecond())
+        })
+        .unwrap_or(now_ms)
 }
 
 /// The local-clock string for the header (HH:MM:SS, the system zone). Kept
@@ -223,6 +265,15 @@ pub(crate) mod testrows {
     pub(crate) fn kind_row(ts_ms: i64, kind: RowKind) -> RequestRow {
         let mut row = bare(ts_ms);
         row.kind = Some(kind);
+        row
+    }
+
+    /// A measurement row carrying an anthropic meter snapshot at
+    /// `ts_ms` — ctp's `rateLimits` shape (util/reset per window plus
+    /// the status/claim/overage fields), for the quota panel's tests.
+    pub(crate) fn metered(ts_ms: i64, limits: serde_json::Value) -> RequestRow {
+        let mut row = bare(ts_ms);
+        row.rate_limits = Some(limits);
         row
     }
 }

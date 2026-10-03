@@ -279,14 +279,28 @@ pub const METER_7D: MeterSpec = MeterSpec {
     length_ms: Some(7 * 24 * 3600 * 1000),
 };
 
+/// The overage window (ctp `METERS.overage`). Its length is NOT known —
+/// the reset is a monthly instant, but utilisation has been seen to
+/// restart at other times — so nothing may assume where it began: the
+/// burn declines its zero-anchor for it and a span total resting on its
+/// first reading can only give a floor. The TUI's quota panel reads it;
+/// the cold outlook does not (the weights were fitted against 5-hour
+/// windows).
+pub const METER_OVERAGE: MeterSpec = MeterSpec {
+    util_key: "utilOverage",
+    reset_key: "resetOverage",
+    length_ms: None,
+};
+
 /// The reporting step. Movement below two of these is not a measurement
-/// (ctp `QUANTUM`/`FLOOR`, forecast.mjs:38-39).
-const QUANTUM: f64 = 0.01;
+/// (ctp `QUANTUM`/`FLOOR`, forecast.mjs:38-39). Shared with the TUI
+/// quota panel's span totals, which run the same fall/restart tests.
+pub(crate) const QUANTUM: f64 = 0.01;
 const FLOOR: f64 = 2.0 * QUANTUM;
 
 /// Binary-float tolerance (ctp `EPS`, forecast.mjs:47): 0.57 - 0.55 is
 /// 0.019999999999999907, which fails a bare `>= 0.02`.
-const EPS: f64 = 1e-9;
+pub(crate) const EPS: f64 = 1e-9;
 
 /// Lookback rungs, shortest first (ctp `LADDER_MS`, forecast.mjs:57): the
 /// shortest rung that clears the floor wins, so a burst after a quiet hour
@@ -310,7 +324,7 @@ const MIN_SPAN_MS: i64 = 60_000;
 /// How long a fall must hold before it counts as a restart rather than a
 /// late-arriving reading (ctp `REORDER_MS`, forecast.mjs:79) — measured
 /// p99.9 request duration is 164 s, so ten minutes clears reordering.
-const REORDER_MS: i64 = 10 * 60_000;
+pub(crate) const REORDER_MS: i64 = 10 * 60_000;
 
 /// A projection that spans nights must be measured across at least one
 /// (ctp `DIURNAL_MS`, forecast.mjs:93).
@@ -1676,13 +1690,23 @@ fn scale_of(at_ms: f64, now_ms: i64) -> usize {
 /// `at`, labelled so it cannot be misread as belonging to `other`'s day
 /// (ctp `alongside`, fmt.mjs:83-86): "resets Mon 05:00 · stops ~06:43"
 /// reads as 06:43 on Monday when in fact it is Thursday. `d` carries at
-/// least a weekday whenever `other` carries one.
-fn alongside(at_ms: f64, other_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
+/// least a weekday whenever `other` carries one. The TUI's quota panel
+/// shares this for its meter lines — one labelling rule, everywhere two
+/// instants sit side by side.
+pub(crate) fn alongside(at_ms: f64, other_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
     // ctp's Math.max(scaleOf(d), Math.min(scaleOf(other), 1), 0): the
     // final 0 is defensive (scales are non-negative here), so it has no
     // Rust equivalent to carry.
     let scale = scale_of(at_ms, now_ms).max(scale_of(other_ms, now_ms).min(1));
     at_scale(at_ms, tz, scale)
+}
+
+/// A future instant at the coarsest resolution that still identifies it
+/// (ctp `resetLabel`, fmt.mjs:71 — the same three scales `alongside`
+/// picks from, chosen on the instant alone): the TUI quota panel's
+/// `resets` clause.
+pub fn reset_label(at_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
+    at_scale(at_ms, tz, scale_of(at_ms, now_ms))
 }
 
 fn zoned_of(at_ms: f64, tz: &TimeZone) -> Option<jiff::Zoned> {

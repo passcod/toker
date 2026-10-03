@@ -194,6 +194,6 @@ Each phase usable standalone; dogfood-first ordering:
 
 - Codex sub's usage-limit reporting shape (headers vs response body).
 - Whether lunaroute exposes per-request cost or only dashboard usage reports.
-- Whether opencode supports per-provider custom headers for session attribution.
-- claude CLI's Linux credential store location and refresh mechanics for the anthropic-sub signing path.
-- Anthropic's cache granularity vs re-serialisation in practice (the fidelity monitor answers this in production; corpus tests answer it beforehand).
+- ~~Whether opencode supports per-provider custom headers for session attribution~~ **Resolved 2026-10-03: opencode sends `x-session-id` natively** (toker's default header list picks it up) — attribution is server-side and exact; no join plugin needed.
+- claude CLI's Linux credential store location and refresh mechanics for the anthropic-sub signing path (still pending — matters when a non-claude frontend drives anthropic sub).
+- Anthropic's cache granularity vs re-serialisation in practice (the fidelity monitor answers this in production; corpus tests answer it beforehand — zero drift rows observed on live openai traffic so far).
