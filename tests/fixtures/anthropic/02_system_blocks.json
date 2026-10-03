@@ -1,0 +1,1 @@
+{"model":"claude-opus-5","system":[{"type":"text","text":"You are a careful assistant.","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Second block."},"bare string element",{"no_text":true}],"messages":[{"role":"user","content":"Hi"}],"stream":true}

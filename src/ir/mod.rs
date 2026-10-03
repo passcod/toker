@@ -42,9 +42,13 @@
 //! — appended turns keep the serialised prefix stable — is enforced by the
 //! prefix-stability test over deterministic seeded conversations.
 
+pub mod anthropic;
 pub mod fidelity;
 pub mod openai_chat;
 
+pub use anthropic::{
+    AnthropicBody, AnthropicBodyMut, AnthropicShape, SENTINEL, System, SystemBlockDigest,
+};
 pub use fidelity::{Fidelity, compare};
 pub use openai_chat::{
     BlockDigest, ChatBody, ChatBodyMut, Content, Message, Messages, Shape, Tool, Tools,

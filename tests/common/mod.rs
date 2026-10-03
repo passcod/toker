@@ -91,3 +91,57 @@ pub fn conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u8> {
     map.insert("messages".to_owned(), serde_json::Value::Array(messages));
     serde_json::to_vec(&serde_json::Value::Object(map)).expect("serialise generated body")
 }
+
+const ANTHROPIC_MODELS: &[&str] = &["claude-opus-5", "claude-sonnet-4.6", "claude-haiku-4.5"];
+const ANTHROPIC_SYSTEMS: &[&str] = &[
+    "You are a careful assistant.",
+    "Be terse and verify every claim.",
+    "Prefer canonical JSON output.",
+];
+
+/// A canonical Anthropic Messages body with `messages` as the last key —
+/// the shape the anthropic prefix-stability property splices at. Uses the
+/// same seeded spread of surrounding keys as the OpenAI-chat generator,
+/// with Anthropic's top-level `system` and `tools` fields.
+pub fn anthropic_conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u8> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "model".to_owned(),
+        serde_json::json!(rng.pick(ANTHROPIC_MODELS)),
+    );
+    if rng.below(2) == 0 {
+        map.insert(
+            "system".to_owned(),
+            serde_json::json!(rng.pick(ANTHROPIC_SYSTEMS)),
+        );
+    }
+    if rng.below(3) == 0 {
+        let tools: Vec<_> = (0..1 + rng.below(2))
+            .map(|_| {
+                serde_json::json!({
+                    "name": rng.pick(TOOL_NAMES),
+                    "input_schema": {"type": "object"},
+                })
+            })
+            .collect();
+        map.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    }
+    if rng.below(2) == 0 {
+        map.insert("stream".to_owned(), serde_json::json!(true));
+    }
+    if rng.below(3) == 0 {
+        map.insert("max_tokens".to_owned(), serde_json::json!(1024));
+    }
+    let mut messages = Vec::with_capacity(message_count);
+    for i in 0..message_count {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        let words = 1 + rng.below(5) as usize;
+        let content: String = (0..words)
+            .map(|_| rng.pick(WORDS))
+            .collect::<Vec<_>>()
+            .join(" ");
+        messages.push(serde_json::json!({"role": role, "content": content}));
+    }
+    map.insert("messages".to_owned(), serde_json::Value::Array(messages));
+    serde_json::to_vec(&serde_json::Value::Object(map)).expect("serialise generated body")
+}

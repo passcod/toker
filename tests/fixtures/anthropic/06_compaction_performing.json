@@ -1,0 +1,1 @@
+{"model":"claude-opus-5","tools":[{"name":"read_file","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Earlier work."},{"role":"assistant","content":"Done."},{"role":"user","content":[{"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far."}]}]}

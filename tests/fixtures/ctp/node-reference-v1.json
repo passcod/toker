@@ -1,0 +1,152 @@
+{
+  "contract": "ctp-node-reference/v1",
+  "metadata": {
+    "license": "MIT OR Apache-2.0",
+    "authorship": "Authored as synthetic fixture data for dual licensing.",
+    "safety": "Language-neutral, content-free, and free of credentials, client identifiers, private URLs, and production log data."
+  },
+  "cases": [
+    {
+      "id": "usage-provider-omitted-cache-write-and-reasoning",
+      "operation": "usage-presence",
+      "input": {
+        "fields": ["cacheCreateTotal", "thinking"],
+        "values": {"cacheCreateTotal": 0, "thinking": 0},
+        "presence": {"cacheCreateTotal": false, "thinking": false}
+      },
+      "expected": {
+        "cacheCreateTotal": {"state": "unavailable"},
+        "thinking": {"state": "unavailable"}
+      }
+    },
+    {
+      "id": "usage-provider-reported-explicit-zero",
+      "operation": "usage-presence",
+      "input": {
+        "fields": ["cacheCreateTotal", "thinking"],
+        "values": {"cacheCreateTotal": 0, "thinking": 0},
+        "presence": {"cacheCreateTotal": true, "thinking": true}
+      },
+      "expected": {
+        "cacheCreateTotal": {"state": "measured", "value": 0},
+        "thinking": {"state": "measured", "value": 0}
+      }
+    },
+    {
+      "id": "route-keeps-requested-effective-and-served-distinct",
+      "operation": "route-identity",
+      "input": {
+        "modelMap": {"model:model-requested": "model-effective"},
+        "requestedModel": "model-requested",
+        "servedModel": "model-served"
+      },
+      "expected": {
+        "requestedModel": "model-requested",
+        "effectiveModel": "model-effective",
+        "servedModel": "model-served",
+        "mapped": true
+      }
+    },
+    {
+      "id": "hard-quota-blocks-without-current-window-release",
+      "operation": "quota-decision",
+      "input": {
+        "now": 2000000000000,
+        "meters": {
+          "util5h": 0.995,
+          "reset5h": 2000000600,
+          "util7d": 0.5,
+          "reset7d": 2000600000
+        },
+        "allowance": null
+      },
+      "expected": {
+        "action": "block",
+        "meter": "5h",
+        "resetsAt": 2000000600
+      }
+    },
+    {
+      "id": "hard-quota-release-is-bound-to-current-reset",
+      "operation": "quota-release",
+      "input": {
+        "now": 2000000000000,
+        "meters": {
+          "util5h": 0.995,
+          "reset5h": 2000000600,
+          "util7d": 0.5,
+          "reset7d": 2000600000
+        }
+      },
+      "expected": {
+        "allowance": {"fiveHour": 2000000600, "sevenDay": null},
+        "decision": {"action": "forward"}
+      }
+    },
+    {
+      "id": "cold-large-expired-lane-notices-once",
+      "operation": "cold-decision",
+      "input": {
+        "now": 2000000000000,
+        "lane": {"at": 1999996399999, "prompt": 200000, "ttl": "1h"}
+      },
+      "expected": {
+        "action": "notice",
+        "idleMs": 3600001,
+        "prompt": 200000,
+        "outlook": null
+      }
+    },
+    {
+      "id": "cold-compaction-is-forwarded-for-route-rewrite",
+      "operation": "cold-decision",
+      "input": {
+        "now": 2000000000000,
+        "summarising": true,
+        "lane": {"at": 1999996399999, "prompt": 200000, "ttl": "1h"}
+      },
+      "expected": {"action": "forward"}
+    },
+    {
+      "id": "cold-compaction-strips-dead-cache-metadata",
+      "operation": "compaction-decision",
+      "input": {"model": "model-effective", "cold": true},
+      "expected": {
+        "action": "rewrite",
+        "effectiveModel": "model-effective",
+        "cacheStripped": 1
+      }
+    },
+    {
+      "id": "awake-holds-for-live-non-ping-lane",
+      "operation": "awake-decision",
+      "input": {
+        "now": 2000000000000,
+        "lanes": {
+          "live": {"at": 1999999999000, "prompt": 200000, "ttl": "5m"},
+          "timer": {"at": 1999999999000, "prompt": 1, "ttl": "1h", "ping": true}
+        }
+      },
+      "expected": {
+        "hold": true,
+        "until": 2000000299000,
+        "reason": "1 live lane"
+      }
+    },
+    {
+      "id": "awake-ignores-ping-only-activity",
+      "operation": "awake-decision",
+      "input": {
+        "now": 2000000000000,
+        "lanes": {
+          "timer": {"at": 1999999999000, "prompt": 1, "ttl": "1h", "ping": true}
+        }
+      },
+      "expected": {
+        "hold": false,
+        "until": null,
+        "reason": "no live lanes"
+      }
+    }
+  ]
+}

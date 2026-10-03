@@ -1,0 +1,1 @@
+{"model":"claude-sonnet-4.6","system":"Be terse.","tools":[{"name":"read_file","description":"Read a file","input_schema":{"type":"object"}},{"name":"list_dir","description":"List a directory","input_schema":{"type":"object"}},{"type":"custom_tool"}],"messages":[{"role":"user","content":"List the directory."}]}

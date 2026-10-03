@@ -1,0 +1,1 @@
+{"model":"claude-opus-5","system":"You are a careful assistant.","messages":[{"role":"user","content":"Earlier work."},{"role":"assistant","content":"Ok."},{"role":"user","content":[{"type":"text","text":"$#$BURN$#$ keep going"}]},{"role":"system","content":[{"type":"text","text":"reminder"}]}]}

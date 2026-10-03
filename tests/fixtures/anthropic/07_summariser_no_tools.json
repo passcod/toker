@@ -1,0 +1,1 @@
+{"model":"claude-haiku-4.5","messages":[{"role":"user","content":[{"type":"text","text":"Your task is to create a detailed summary of this conversation for a title."}]}]}

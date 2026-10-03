@@ -1,0 +1,1 @@
+{"requests":[{"params":{"model":"claude-opus-5","system":"Batch system.","messages":[{"role":"user","content":"First"}],"max_tokens":100}},{"params":{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"Second"}],"max_tokens":100}}]}
