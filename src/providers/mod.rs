@@ -3,21 +3,25 @@
 //! Plan: "Backend providers" — providers within a protocol share an adapter
 //! (see [crate::proto]) and differ in auth, cost semantics (billed /
 //! estimated / plan-equivalent), and meter parsing (e.g. anthropic sub's
-//! `anthropic-ratelimit-*` headers). Phase 1 wires exactly one
-//! ([`openrouter`]); the trait below stays deliberately small and grows one
-//! method at a time as the anthropic/codex units need it.
+//! `anthropic-ratelimit-*` headers). Phase 1 wired [OpenRouter] only; the
+//! anthropic unit adds the two anthropic providers
+//! ([`AnthropicSub`], [`AnthropicApi`]), and later phases add more to
+//! exactly the slots the router holds.
 
+mod anthropic;
 mod openrouter;
 
+pub use anthropic::{AnthropicApi, AnthropicSub, parse_rate_limits};
 pub use openrouter::OpenRouter;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, header};
 use reqwest::Url;
+use serde_json::Value;
 
-/// A backend provider: identity, upstream endpoint mapping, and credential
-/// injection. Same-protocol providers (openrouter, openai api, lunaroute)
-/// all satisfy this today; cross-protocol backends add their adapter in
-/// later phases.
+/// A backend provider: identity, upstream endpoint mapping, credential
+/// injection, and (when the provider is a meter source) meter parsing.
+/// Same-protocol providers (openrouter, openai api, lunaroute) all satisfy
+/// this today; cross-protocol backends add their adapter in later phases.
 pub trait Provider: Send + Sync {
     /// The stable provider id — the ledger's `provider` column and the
     /// backend half of `frontend:backend` routes.
@@ -29,14 +33,38 @@ pub trait Provider: Send + Sync {
     /// frontend paths to this provider's upstream shape lives here.
     fn endpoint(&self, path: &str) -> Url;
 
+    /// Whether the incoming request already carries this provider's
+    /// credential — pass-through-when-present (plan: Credentials): a
+    /// frontend that brings its own credential keeps it, verbatim. The
+    /// server consults this before [`Provider::inject_auth`].
+    ///
+    /// The default checks `authorization`; a provider whose credential
+    /// lives in another header (anthropic api's `x-api-key`) overrides —
+    /// accepting more than one header as "already credentialed" rather
+    /// than trying to out-rank what the frontend brought.
+    fn credential_present(&self, incoming: &HeaderMap) -> bool {
+        incoming.contains_key(header::AUTHORIZATION)
+    }
+
     /// Inject this provider's credential headers into the outgoing
-    /// request. The server calls this **only** when the incoming request
-    /// carries no Authorization header of its own — pass-through-when-
-    /// present (plan: Credentials): a frontend that brings its own
-    /// credential keeps it, verbatim.
+    /// request. The server calls this **only** when
+    /// [`Provider::credential_present`] says the incoming request carries no
+    /// credential of its own.
     ///
     /// A provider with no resolved key injects nothing, and the upstream's
     /// 401 body passes through unchanged — that passthrough is the visible
     /// verification of the wiring (ledger-proxy lesson).
     fn inject_auth(&self, outgoing: &mut HeaderMap);
+
+    /// Parse this provider's meter snapshot from one upstream response's
+    /// headers, when this provider is a **meter source** (plan: quota
+    /// gate — "Anthropic sub is the only meter source today. The meter
+    /// interface is open so codex sub's usage limits can become one").
+    /// `None` — the default — for providers without meters: the snapshot
+    /// the gate reads must never be overwritten by a backend that has no
+    /// quota to report.
+    fn meters(&self, headers: &HeaderMap) -> Option<Value> {
+        let _ = headers;
+        None
+    }
 }

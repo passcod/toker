@@ -26,8 +26,13 @@ pub const DEFAULT_PORT: u16 = 18_123;
 
 /// Default session-attribution header names, read by name only (plan:
 /// Attribution, headers-first; invariant 2 — request headers are never
-/// captured wholesale).
-pub const DEFAULT_SESSION_HEADERS: &[&str] = &["x-toker-session", "x-session-id"];
+/// captured wholesale). `x-claude-code-session-id` is claude's own
+/// (ctp's header); `x-toker-session` is what setup injects into opencode.
+pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
+    "x-toker-session",
+    "x-claude-code-session-id",
+    "x-session-id",
+];
 
 /// OpenRouter's upstream base, including the `/v1` prefix.
 pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
@@ -38,6 +43,18 @@ pub const DEFAULT_OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 /// The phase-1 default backend for the openai_chat protocol. Only
 /// "openrouter" exists; [`crate::server::Server::new`] enforces it.
 pub const DEFAULT_BACKEND_OPENAI_CHAT: &str = "openrouter";
+
+/// Anthropic's upstream base — the API root, no `/v1` prefix: the
+/// frontend's `/v1/messages…` paths are already the upstream's paths.
+pub const DEFAULT_ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
+
+/// The env var holding the Anthropic API key.
+pub const DEFAULT_ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The default backend for the anthropic protocol (plan: Routing —
+/// configured default backend per frontend protocol; bare model names go
+/// to the protocol default).
+pub const DEFAULT_BACKEND_ANTHROPIC: &str = "anthropic_sub";
 
 /// Resolved runtime configuration: file defaults ← `toker.toml` ← env.
 #[derive(Debug, Clone)]
@@ -52,6 +69,12 @@ pub struct Config {
     pub default_backend_openai_chat: String,
     /// The openrouter provider block.
     pub openrouter: OpenRouterConfig,
+    /// The default backend for the anthropic protocol.
+    pub default_backend_anthropic: String,
+    /// The anthropic subscription provider block.
+    pub anthropic_sub: AnthropicSubConfig,
+    /// The anthropic API provider block.
+    pub anthropic_api: AnthropicApiConfig,
 }
 
 /// The openrouter provider block, resolved.
@@ -71,19 +94,66 @@ impl OpenRouterConfig {
     /// unauthenticated and openrouter's 401 body passes through, which
     /// verifies the wiring (ledger-proxy lesson).
     pub fn api_key(&self) -> Option<String> {
-        if let Some(key) = env::var_os(&self.api_key_env).filter(|key| !key.is_empty()) {
-            return key.into_string().ok();
-        }
-        self.api_key.clone()
+        resolve_api_key(&self.api_key_env, &self.api_key)
     }
 
     /// Which key sources are set, for status reporting (invariant 2: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
-        KeySources {
-            env_set: env::var_os(&self.api_key_env).is_some_and(|key| !key.is_empty()),
-            literal_set: self.api_key.is_some(),
-        }
+        key_sources_of(&self.api_key_env, &self.api_key)
+    }
+}
+
+/// The anthropic subscription provider block, resolved. No key sources:
+/// auth is pass-through-when-present and toker has no stored sub token yet
+/// (a later credentials unit adds signing).
+#[derive(Debug, Clone)]
+pub struct AnthropicSubConfig {
+    /// Upstream base — the API root, no `/v1` prefix.
+    pub upstream: reqwest::Url,
+}
+
+/// The anthropic API provider block, resolved — the same KeySources
+/// pattern as openrouter.
+#[derive(Debug, Clone)]
+pub struct AnthropicApiConfig {
+    /// Upstream base — the API root, no `/v1` prefix.
+    pub upstream: reqwest::Url,
+    /// The env var the API key is read from.
+    pub api_key_env: String,
+    /// An optional literal key, used only when the env var is unset.
+    pub api_key: Option<String>,
+}
+
+impl AnthropicApiConfig {
+    /// The API key to use: the env var when set, else the configured
+    /// literal. `None` when neither is set — requests then go upstream
+    /// unauthenticated and anthropic's 401 body passes through.
+    pub fn api_key(&self) -> Option<String> {
+        resolve_api_key(&self.api_key_env, &self.api_key)
+    }
+
+    /// Which key sources are set, for status reporting (invariant 2).
+    pub fn key_sources(&self) -> KeySources {
+        key_sources_of(&self.api_key_env, &self.api_key)
+    }
+}
+
+/// Resolve an API key: the named env var when set, else the literal (the
+/// shared KeySources resolution every api-key provider uses).
+fn resolve_api_key(api_key_env: &str, literal: &Option<String>) -> Option<String> {
+    if let Some(key) = env::var_os(api_key_env).filter(|key| !key.is_empty()) {
+        return key.into_string().ok();
+    }
+    literal.clone()
+}
+
+/// Which key sources are set — the whole of what status may report about
+/// credentials (invariant 2).
+fn key_sources_of(api_key_env: &str, literal: &Option<String>) -> KeySources {
+    KeySources {
+        env_set: env::var_os(api_key_env).is_some_and(|key| !key.is_empty()),
+        literal_set: literal.is_some(),
     }
 }
 
@@ -133,6 +203,37 @@ impl Config {
                 .and_then(|p| p.api_key.clone()),
         };
 
+        let anthropic_sub = AnthropicSubConfig {
+            upstream: parse_upstream(
+                file.providers
+                    .anthropic_sub
+                    .as_ref()
+                    .and_then(|p| p.upstream.as_deref())
+                    .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
+            )?,
+        };
+        let anthropic_api = AnthropicApiConfig {
+            upstream: parse_upstream(
+                file.providers
+                    .anthropic_api
+                    .as_ref()
+                    .and_then(|p| p.upstream.as_deref())
+                    .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
+            )?,
+            api_key_env: file
+                .providers
+                .anthropic_api
+                .as_ref()
+                .and_then(|p| p.api_key_env.as_deref())
+                .unwrap_or(DEFAULT_ANTHROPIC_API_KEY_ENV)
+                .to_owned(),
+            api_key: file
+                .providers
+                .anthropic_api
+                .as_ref()
+                .and_then(|p| p.api_key.clone()),
+        };
+
         let mut config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
             db_path: match file.db_path {
@@ -149,6 +250,11 @@ impl Config {
                 .default_backend_openai_chat
                 .unwrap_or_else(|| DEFAULT_BACKEND_OPENAI_CHAT.to_owned()),
             openrouter,
+            default_backend_anthropic: file
+                .default_backend_anthropic
+                .unwrap_or_else(|| DEFAULT_BACKEND_ANTHROPIC.to_owned()),
+            anthropic_sub,
+            anthropic_api,
         };
 
         // Env overrides (config file loses).
@@ -186,6 +292,19 @@ impl Config {
                 bail!("session_header_names entry {name:?} is not a valid header name: {error}");
             }
         }
+        // Both anthropic backends are wired regardless of enabled state
+        // (routing resolves by name), but the protocol default must name
+        // one of them — anything else cannot route anywhere.
+        if !matches!(
+            self.default_backend_anthropic.as_str(),
+            "anthropic_sub" | "anthropic_api"
+        ) {
+            bail!(
+                "default_backend_anthropic must be \"anthropic_sub\" or \
+                 \"anthropic_api\", not {:?}",
+                self.default_backend_anthropic
+            );
+        }
         Ok(())
     }
 }
@@ -199,6 +318,7 @@ struct FileConfig {
     db_path: Option<String>,
     session_header_names: Option<Vec<String>>,
     default_backend_openai_chat: Option<String>,
+    default_backend_anthropic: Option<String>,
     providers: FileProviders,
 }
 
@@ -206,11 +326,27 @@ struct FileConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileProviders {
     openrouter: Option<FileOpenRouter>,
+    anthropic_sub: Option<FileAnthropicSub>,
+    anthropic_api: Option<FileAnthropicApi>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileOpenRouter {
+    upstream: Option<String>,
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileAnthropicSub {
+    upstream: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileAnthropicApi {
     upstream: Option<String>,
     api_key_env: Option<String>,
     api_key: Option<String>,
@@ -247,6 +383,7 @@ fn parse_upstream(upstream: &str) -> anyhow::Result<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::{
+        DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_ANTHROPIC_UPSTREAM, DEFAULT_BACKEND_ANTHROPIC,
         DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources,
         OpenRouterConfig,
     };
@@ -308,7 +445,23 @@ mod tests {
                 .map(|s| s.to_owned())
                 .collect::<Vec<_>>()
         );
+        assert!(
+            DEFAULT_SESSION_HEADERS.contains(&"x-claude-code-session-id"),
+            "claude identifies itself by its own header (ctp's)"
+        );
         assert_eq!(config.default_backend_openai_chat, "openrouter");
+        assert_eq!(config.default_backend_anthropic, DEFAULT_BACKEND_ANTHROPIC);
+        // The default constant is a bare host; the resolved Url carries
+        // its normalised trailing slash.
+        let default_upstream =
+            reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream");
+        assert_eq!(config.anthropic_sub.upstream, default_upstream);
+        assert_eq!(config.anthropic_api.upstream, default_upstream);
+        assert_eq!(
+            config.anthropic_api.api_key_env,
+            DEFAULT_ANTHROPIC_API_KEY_ENV
+        );
+        assert_eq!(config.anthropic_api.api_key, None);
         assert_eq!(
             config.openrouter.upstream.as_str(),
             DEFAULT_OPENROUTER_UPSTREAM
@@ -351,6 +504,88 @@ api_key = "literal-key"
         assert_eq!(config.openrouter.upstream.as_str(), "http://localhost:9/v1");
         assert_eq!(config.openrouter.api_key_env, "TOKER_TEST_KEY_FILE");
         assert_eq!(config.openrouter.api_key.as_deref(), Some("literal-key"));
+    }
+
+    #[test]
+    fn anthropic_blocks_are_read_and_a_config_without_them_parses() {
+        let dir = test_dir("anthropic");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+default_backend_anthropic = "anthropic_api"
+
+[providers.anthropic_sub]
+upstream = "http://localhost:9"
+
+[providers.anthropic_api]
+upstream = "http://localhost:10"
+api_key_env = "TOKER_TEST_ANTHROPIC_KEY_FILE"
+api_key = "ak-literal-test"
+"#,
+        )
+        .expect("write config");
+
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
+        let config = super::Config::load().expect("load config");
+        assert_eq!(config.default_backend_anthropic, "anthropic_api");
+        assert_eq!(
+            config.anthropic_sub.upstream.as_str(),
+            "http://localhost:9/"
+        );
+        assert_eq!(
+            config.anthropic_api.upstream.as_str(),
+            "http://localhost:10/"
+        );
+        assert_eq!(
+            config.anthropic_api.api_key_env,
+            "TOKER_TEST_ANTHROPIC_KEY_FILE"
+        );
+        assert_eq!(
+            config.anthropic_api.api_key.as_deref(),
+            Some("ak-literal-test")
+        );
+
+        // The shared KeySources resolution, mirroring openrouter's.
+        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", Some("ak-from-env"));
+        assert_eq!(
+            config.anthropic_api.api_key().as_deref(),
+            Some("ak-from-env")
+        );
+        assert_eq!(
+            config.anthropic_api.key_sources(),
+            KeySources {
+                env_set: true,
+                literal_set: true
+            }
+        );
+        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
+
+        // A config with no anthropic keys at all (a phase-1 toker.toml)
+        // still parses and resolves to the defaults — the defaults test's
+        // domain, here proven against a real file too.
+        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
+        let config = super::Config::load().expect("phase-1 config parses");
+        assert_eq!(config.default_backend_anthropic, "anthropic_sub");
+        assert_eq!(
+            config.anthropic_sub.upstream,
+            reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream")
+        );
+    }
+
+    #[test]
+    fn an_unknown_default_backend_anthropic_is_an_error() {
+        let dir = test_dir("bad-backend");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"default_backend_anthropic = "not-a-backend""#,
+        )
+        .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let error = super::Config::load().expect_err("unroutable default must fail");
+        assert!(error.to_string().contains("default_backend_anthropic"));
     }
 
     #[test]

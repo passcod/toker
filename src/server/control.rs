@@ -33,11 +33,13 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         Err(error) => return store_error(error),
     };
     let sources = server.config.openrouter.key_sources();
+    let anthropic_api_sources = server.config.anthropic_api.key_sources();
     let body = json!({
         "port": server.config.port,
         "db_path": server.config.db_path.display().to_string(),
         "session_header_names": server.config.session_header_names,
         "default_backend_openai_chat": server.config.default_backend_openai_chat,
+        "default_backend_anthropic": server.config.default_backend_anthropic,
         "providers": {
             "openrouter": {
                 "upstream": server.config.openrouter.upstream.as_str(),
@@ -45,6 +47,15 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
                 // Key *sources* only — never values (invariant 2).
                 "api_key_env_set": sources.env_set,
                 "api_key_literal_set": sources.literal_set,
+            },
+            "anthropic_sub": {
+                "upstream": server.config.anthropic_sub.upstream.as_str(),
+            },
+            "anthropic_api": {
+                "upstream": server.config.anthropic_api.upstream.as_str(),
+                "api_key_env": server.config.anthropic_api.api_key_env,
+                "api_key_env_set": anthropic_api_sources.env_set,
+                "api_key_literal_set": anthropic_api_sources.literal_set,
             },
         },
         "requests": rows,

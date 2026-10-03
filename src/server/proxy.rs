@@ -44,6 +44,7 @@ use futures::stream::{Stream, StreamExt};
 
 use crate::ir::{Fidelity, Request as IrRequest, compare};
 use crate::observe::{SseSplitter, UsageObserver};
+use crate::providers::Provider;
 
 use super::Server;
 use super::record::{
@@ -53,11 +54,11 @@ use super::record::{
 /// Request bodies are buffered for gating and the fidelity check; 64 MiB
 /// is far beyond any chat body, so hitting the cap is a client bug worth a
 /// named status rather than a silent OOM.
-const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 /// Cap for buffered response bodies (non-streaming completions).
-const MAX_RESPONSE_BUFFER: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BUFFER: usize = 64 * 1024 * 1024;
 /// Cap for buffered non-2xx bodies, which are small in practice.
-const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
 
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
@@ -124,7 +125,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     }
 
     // 6. Upstream; 7.-9. in forward_upstream.
-    match send_upstream(&server, &parts, forward).await {
+    match send_upstream(
+        &server,
+        server.openrouter.as_ref(),
+        &parts,
+        forward,
+        &server.config.session_header_names,
+    )
+    .await
+    {
         Ok(upstream) => forward_upstream(upstream, record).await,
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
@@ -152,7 +161,15 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
             );
         }
     };
-    match send_upstream(&server, &parts, body).await {
+    match send_upstream(
+        &server,
+        server.openrouter.as_ref(),
+        &parts,
+        body,
+        &server.config.session_header_names,
+    )
+    .await
+    {
         Ok(upstream) => forward_upstream(upstream, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
@@ -162,26 +179,32 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
 }
 
 /// Send one request upstream: mapped endpoint, cleaned headers, auth
-/// injection, and the (possibly rewritten) body.
-async fn send_upstream(
+/// injection, and the (possibly rewritten) body. `provider` decides the
+/// endpoint mapping and the credential rules; `session_header_names` is
+/// the strip list for [`upstream_request_headers`] — the openai path
+/// passes the configured attribution headers, the anthropic path passes
+/// an empty slice (ctp forwards claude's session header verbatim).
+pub(crate) async fn send_upstream(
     server: &Server,
+    provider: &dyn Provider,
     parts: &Parts,
     body: Bytes,
+    session_header_names: &[String],
 ) -> Result<reqwest::Response, reqwest::Error> {
     let path = parts
         .uri
         .path_and_query()
         .map(|path| path.as_str())
         .unwrap_or_else(|| parts.uri.path());
-    let url = server.openrouter.endpoint(path);
-    let mut headers = upstream_request_headers(&parts.headers, &server.config.session_header_names);
+    let url = provider.endpoint(path);
     // Pass-through-when-present (plan: Credentials): a frontend that
-    // brings its own Authorization keeps it verbatim; the stored
-    // credential is injected only when the request carries none. If
-    // neither exists the request goes unauthenticated and openrouter's
-    // 401 body passes through — visibly verifying the wiring.
-    if !parts.headers.contains_key(header::AUTHORIZATION) {
-        server.openrouter.inject_auth(&mut headers);
+    // brings its own credential keeps it verbatim; the stored credential
+    // is injected only when the request carries none. If neither exists
+    // the request goes unauthenticated and the upstream's 401 body passes
+    // through — visibly verifying the wiring.
+    let mut headers = upstream_request_headers(&parts.headers, session_header_names);
+    if !provider.credential_present(&parts.headers) {
+        provider.inject_auth(&mut headers);
     }
     server
         .http
@@ -263,7 +286,7 @@ pub(crate) fn strip_provider_prefix(model: &str) -> Option<&str> {
 
 /// The session identity from the configured header names, in priority
 /// order, read by name only (invariant 2).
-fn session_id(names: &[String], headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_id(names: &[String], headers: &HeaderMap) -> Option<String> {
     for name in names {
         if let Some(value) = headers
             .get(name.as_str())
@@ -295,8 +318,19 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// hop-by-hop, minus `host`/`content-length` (the transport re-frames),
 /// minus `accept-encoding` (identity is forced — the SSE observation needs
 /// plaintext; ledger-proxy lesson), minus toker's own attribution and
-/// control headers (addressed to the proxy, not the provider).
-fn upstream_request_headers(incoming: &HeaderMap, session_header_names: &[String]) -> HeaderMap {
+/// control headers (addressed to the proxy, not the provider), minus the
+/// configured session-attribution header names.
+///
+/// The session-name strip is the caller's choice: the openai path strips
+/// them all, while the anthropic path passes `&[]` — ctp parity, since
+/// claude's `x-claude-code-session-id` is forwarded verbatim by the proxy
+/// toker replaces and the upstream already receives it in production.
+/// `x-toker-*` is stripped unconditionally either way: those headers are
+/// addressed to the proxy, never the provider.
+pub(crate) fn upstream_request_headers(
+    incoming: &HeaderMap,
+    session_header_names: &[String],
+) -> HeaderMap {
     let mut outgoing = HeaderMap::with_capacity(incoming.len());
     for (name, value) in incoming {
         let name_str = name.as_str();
@@ -325,7 +359,7 @@ fn upstream_request_headers(incoming: &HeaderMap, session_header_names: &[String
 /// body), minus `content-encoding` — unless `keep_content_encoding`, for
 /// the untouched compressed-passthrough branch, where the bytes are
 /// verbatim and the encoding must stay.
-fn response_headers(upstream: &HeaderMap, keep_content_encoding: bool) -> HeaderMap {
+pub(crate) fn response_headers(upstream: &HeaderMap, keep_content_encoding: bool) -> HeaderMap {
     let mut outgoing = HeaderMap::with_capacity(upstream.len());
     for (name, value) in upstream {
         if is_hop_by_hop(name)
@@ -339,7 +373,7 @@ fn response_headers(upstream: &HeaderMap, keep_content_encoding: bool) -> Header
     outgoing
 }
 
-fn is_compressed(headers: &HeaderMap) -> bool {
+pub(crate) fn is_compressed(headers: &HeaderMap) -> bool {
     match headers
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -349,7 +383,7 @@ fn is_compressed(headers: &HeaderMap) -> bool {
     }
 }
 
-fn is_event_stream(headers: &HeaderMap) -> bool {
+pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -359,13 +393,13 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 /// A partial buffer of a response body: `rest` is `Some` when the cap
 /// overflowed and the response (positioned after `bytes`) remains, so the
 /// caller can forward the remainder verbatim.
-struct Buffered {
-    bytes: Vec<u8>,
-    rest: Option<reqwest::Response>,
+pub(crate) struct Buffered {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) rest: Option<reqwest::Response>,
 }
 
 /// Buffer a response body up to `cap` bytes.
-async fn buffer_up_to(mut response: reqwest::Response, cap: usize) -> Buffered {
+pub(crate) async fn buffer_up_to(mut response: reqwest::Response, cap: usize) -> Buffered {
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
@@ -390,7 +424,7 @@ async fn buffer_up_to(mut response: reqwest::Response, cap: usize) -> Buffered {
 /// The response body for a buffered-then-maybe-overflowed response: the
 /// buffered prefix chained onto the remaining upstream stream, byte order
 /// preserved.
-fn buffered_body(buffered: Buffered) -> Body {
+pub(crate) fn buffered_body(buffered: Buffered) -> Body {
     match buffered.rest {
         Some(response) => {
             let prefix = Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes));
@@ -401,7 +435,7 @@ fn buffered_body(buffered: Buffered) -> Body {
 }
 
 /// The upstream body stream type, boxed so [`ObservedStream`] can name it.
-type UpstreamBody = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
+pub(crate) type UpstreamBody = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
 /// The SSE response stream with the usage observation riding alongside:
 /// bytes pass through verbatim (backpressured by axum's poll-driven body),
@@ -503,7 +537,7 @@ fn observe_chunk(splitter: &mut SseSplitter, observer: &mut UsageObserver, chunk
 }
 
 /// Build a response with an explicit status and header set.
-fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
+pub(crate) fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -511,7 +545,7 @@ fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Respons
 }
 
 /// A minimal status-page response for proxy-level failures.
-fn plain_status(status: StatusCode, message: &'static str) -> Response {
+pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Response {
     let mut response = Response::new(Body::from(message));
     *response.status_mut() = status;
     response

@@ -21,8 +21,9 @@ pub async fn serve() -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Arc::new(Store::open(&config.db_path)?);
     tracing::info!(
-        "serving openai_chat → {} (db: {})",
+        "serving openai_chat → {} , anthropic → {} (db: {})",
         config.openrouter.upstream,
+        config.anthropic_sub.upstream,
         config.db_path.display()
     );
     Server::new(config, store)?.serve().await
@@ -43,12 +44,26 @@ pub fn status() -> anyhow::Result<()> {
         "default backend (openai_chat): {}",
         config.default_backend_openai_chat
     );
+    println!(
+        "default backend (anthropic): {}",
+        config.default_backend_anthropic
+    );
 
     println!("openrouter: {}", config.openrouter.upstream);
     let sources = config.openrouter.key_sources();
     println!(
         "openrouter api key: env {} ({}), literal ({})",
         config.openrouter.api_key_env,
+        if sources.env_set { "set" } else { "unset" },
+        if sources.literal_set { "set" } else { "unset" },
+    );
+
+    println!("anthropic sub: {}", config.anthropic_sub.upstream);
+    println!("anthropic api: {}", config.anthropic_api.upstream);
+    let sources = config.anthropic_api.key_sources();
+    println!(
+        "anthropic api key: env {} ({}), literal ({})",
+        config.anthropic_api.api_key_env,
         if sources.env_set { "set" } else { "unset" },
         if sources.literal_set { "set" } else { "unset" },
     );

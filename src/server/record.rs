@@ -72,12 +72,12 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 /// Wall-clock duration in milliseconds, saturated to i64.
-fn elapsed_ms(started: Instant) -> i64 {
+pub(crate) fn elapsed_ms(started: Instant) -> i64 {
     started.elapsed().as_millis().min(i64::MAX as u128) as i64
 }
 
 /// u64 → i64 for the row's integer columns, saturated.
-fn i64_of(value: u64) -> i64 {
+pub(crate) fn i64_of(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 

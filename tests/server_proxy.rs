@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures::Stream;
 use serde_json::Value;
 
-use toker::config::{Config, OpenRouterConfig};
+use toker::config::{AnthropicApiConfig, AnthropicSubConfig, Config, OpenRouterConfig};
 use toker::ir::Request as IrRequest;
 use toker::server::Server;
 use toker::store::{CostKind, RequestRow, RowKind, Store};
@@ -242,6 +242,12 @@ fn test_dir(name: &str) -> PathBuf {
 }
 
 fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String>) -> Config {
+    // The anthropic fields exist only so the Config literal compiles after
+    // the anthropic unit grew it; no openai-path test touches an
+    // anthropic route (the anthropic suite in server_anthropic.rs
+    // exercises them).
+    let anthropic_upstream: reqwest::Url =
+        "https://api.anthropic.com".parse().expect("upstream url");
     Config {
         port: 0,
         db_path: test_dir("db").join("toker.db"),
@@ -251,6 +257,15 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             upstream,
             api_key_env: api_key_env.to_owned(),
             api_key,
+        },
+        default_backend_anthropic: "anthropic_sub".to_owned(),
+        anthropic_sub: AnthropicSubConfig {
+            upstream: anthropic_upstream.clone(),
+        },
+        anthropic_api: AnthropicApiConfig {
+            upstream: anthropic_upstream,
+            api_key_env: api_key_env.to_owned(),
+            api_key: None,
         },
     }
 }

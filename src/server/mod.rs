@@ -6,12 +6,19 @@
 //! response streams with a crash-proof SSE side-parser for
 //! usage/model/cost.
 //!
-//! Routes (phase 1, the openai_chat frontend → openrouter backend):
+//! Routes:
 //!
-//! - `POST /v1/chat/completions` — the usage path: buffered, parsed to the
-//!   IR, fidelity-checked, routed, recorded ([`proxy`]).
-//! - `GET /v1/models` — transparent forwarding, no recording (not a usage
-//!   path).
+//! - OpenAI-chat frontend (phase 1, → openrouter):
+//!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
+//!     the IR, fidelity-checked, routed, recorded ([`proxy`]).
+//!   - `GET /v1/models` — transparent forwarding, no recording.
+//! - Anthropic frontend (phase 2, → anthropic sub/api backends):
+//!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
+//!     `count_tokens` and `batches` run the same pipeline (they are not
+//!     gated — gates arrive with the quota-gate unit) but carry no usage,
+//!     so they record nothing in practice ([`anthropic`]).
+//!   - The batch-result GETs (and cancel) — transparent forwarding like
+//!     `/v1/models`.
 //! - `GET /_toker/status`, `POST /_toker/models/merge` — the control
 //!   endpoint, gated by a custom header ([`control`]).
 //!
@@ -27,9 +34,11 @@
 //! fields (ts, duration) — never for bytes (invariant 4); serialisation
 //! decisions never consult runtime state.
 
+pub(crate) mod anthropic;
 pub(crate) mod control;
 pub(crate) mod proxy;
 mod record;
+mod record_anthropic;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,7 +48,7 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::config::Config;
-use crate::providers::{OpenRouter, Provider};
+use crate::providers::{AnthropicApi, AnthropicSub, OpenRouter, Provider};
 use crate::store::Store;
 
 /// The running proxy: config, ledger, upstream client, and the backend
@@ -52,23 +61,36 @@ pub struct Server {
     /// timeout, so streams live as long as their connections do (see the
     /// module docs).
     pub(crate) http: reqwest::Client,
-    /// Phase 1's one backend; a trait object because routing selects by
-    /// `provider/model` prefix and later phases add providers to exactly
-    /// this slot.
+    /// Phase 1's one openai-chat backend; a trait object because routing
+    /// selects by `provider/model` prefix and later phases add providers
+    /// to exactly this slot.
     pub(crate) openrouter: Arc<dyn Provider>,
+    /// The anthropic subscription backend (the protocol default).
+    pub(crate) anthropic_sub: Arc<dyn Provider>,
+    /// The anthropic API backend.
+    pub(crate) anthropic_api: Arc<dyn Provider>,
     /// Process start, for `/_toker/status` uptime.
     pub(crate) started: Instant,
 }
 
 impl Server {
-    /// Build the server: resolve the provider credential once, validate
-    /// the phase-1 routing table, build the upstream client.
+    /// Build the server: resolve the provider credentials once, validate
+    /// the routing table, build the upstream client.
     pub fn new(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
         if config.default_backend_openai_chat != "openrouter" {
             bail!(
                 "phase 1 wires only the openrouter backend, \
                  default_backend_openai_chat = {:?} is not available yet",
                 config.default_backend_openai_chat
+            );
+        }
+        if !matches!(
+            config.default_backend_anthropic.as_str(),
+            "anthropic_sub" | "anthropic_api"
+        ) {
+            bail!(
+                "no anthropic backend named {:?} is wired",
+                config.default_backend_anthropic
             );
         }
         let http = reqwest::Client::builder()
@@ -80,13 +102,36 @@ impl Server {
             config.openrouter.upstream.clone(),
             config.openrouter.api_key(),
         ));
+        let anthropic_sub = Arc::new(AnthropicSub::new(config.anthropic_sub.upstream.clone()));
+        let anthropic_api = Arc::new(AnthropicApi::new(
+            config.anthropic_api.upstream.clone(),
+            config.anthropic_api.api_key(),
+        ));
         Ok(Server {
             store,
             config: Arc::new(config),
             http,
             openrouter,
+            anthropic_sub,
+            anthropic_api,
             started: Instant::now(),
         })
+    }
+
+    /// Resolve an anthropic backend by provider name — routing and the
+    /// configured protocol default both resolve here (plan: Routing).
+    pub(crate) fn anthropic_backend(&self, name: &str) -> Option<&Arc<dyn Provider>> {
+        match name {
+            "anthropic_sub" => Some(&self.anthropic_sub),
+            "anthropic_api" => Some(&self.anthropic_api),
+            _ => None,
+        }
+    }
+
+    /// The configured default anthropic backend. Validated at startup.
+    pub(crate) fn default_anthropic(&self) -> &Arc<dyn Provider> {
+        self.anthropic_backend(&self.config.default_backend_anthropic)
+            .expect("default_backend_anthropic is validated at startup")
     }
 
     /// The full route table.
@@ -94,6 +139,21 @@ impl Server {
         Router::new()
             .route("/v1/chat/completions", post(proxy::chat_completions))
             .route("/v1/models", get(proxy::models))
+            .route("/v1/messages", post(anthropic::messages))
+            .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+            .route(
+                "/v1/messages/batches",
+                post(anthropic::batches_create).get(anthropic::batches_list),
+            )
+            .route("/v1/messages/batches/{id}", get(anthropic::batches_get))
+            .route(
+                "/v1/messages/batches/{id}/results",
+                get(anthropic::batches_results),
+            )
+            .route(
+                "/v1/messages/batches/{id}/cancel",
+                post(anthropic::batches_cancel),
+            )
             .route("/_toker/status", get(control::status))
             .route("/_toker/models/merge", post(control::models_merge))
             .with_state(self.clone())
