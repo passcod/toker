@@ -63,6 +63,23 @@ pub const DEFAULT_ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// to the protocol default).
 pub const DEFAULT_BACKEND_ANTHROPIC: &str = "anthropic_sub";
 
+/// The codex subscription backend's upstream: the ChatGPT backend API's
+/// codex root. Frontend paths append (`/responses` →
+/// `https://chatgpt.com/backend-api/codex/responses`), like the
+/// anthropic providers' base.
+pub const DEFAULT_CODEX_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
+
+/// The `originator` the codex client identifies itself with (the
+/// ChatGPT backend routes on it; the codex CLI's `DEFAULT_ORIGINATOR`).
+pub const DEFAULT_CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// The codex CLI's login file — shared: toker reads and refreshes the
+/// same login the CLI owns.
+pub const DEFAULT_CODEX_AUTH_PATH: &str = "~/.codex/auth.json";
+
+/// The OAuth refresh endpoint (the codex CLI's `REFRESH_TOKEN_URL`).
+pub const DEFAULT_CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
+
 /// Resolved runtime configuration: file defaults ← `toker.toml` ← env.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -86,6 +103,8 @@ pub struct Config {
     pub anthropic_sub: AnthropicSubConfig,
     /// The anthropic API provider block.
     pub anthropic_api: AnthropicApiConfig,
+    /// The codex subscription provider block.
+    pub codex_sub: CodexSubConfig,
     /// The middleware gates block.
     pub gates: GatesConfig,
     /// The idle-sleep lock (ctp `CTP_AWAKE !== "off"`, proxy.mjs:440 —
@@ -239,6 +258,22 @@ impl AnthropicApiConfig {
     }
 }
 
+/// The codex subscription provider block, resolved. No key sources:
+/// auth is the shared `auth.json` login (see [`crate::providers::codex`]
+/// — always toker-signed, never pass-through), reported by presence
+/// only (invariant 2: never the values).
+#[derive(Debug, Clone)]
+pub struct CodexSubConfig {
+    /// Upstream base — the codex backend root, no `/responses` suffix.
+    pub upstream: reqwest::Url,
+    /// The `originator` header value.
+    pub originator: String,
+    /// Where the shared `auth.json` lives (`~` expanded at load).
+    pub auth_path: PathBuf,
+    /// The OAuth refresh endpoint.
+    pub refresh_url: reqwest::Url,
+}
+
 /// Resolve an API key: the named env var when set, else the literal (the
 /// shared KeySources resolution every api-key provider uses).
 fn resolve_api_key(api_key_env: &str, literal: &Option<String>) -> Option<String> {
@@ -333,6 +368,36 @@ impl Config {
                 .as_ref()
                 .and_then(|p| p.api_key.clone()),
         };
+        let codex_sub = CodexSubConfig {
+            upstream: parse_upstream(
+                file.providers
+                    .codex_sub
+                    .as_ref()
+                    .and_then(|p| p.upstream.as_deref())
+                    .unwrap_or(DEFAULT_CODEX_UPSTREAM),
+            )?,
+            originator: file
+                .providers
+                .codex_sub
+                .as_ref()
+                .and_then(|p| p.originator.as_deref())
+                .unwrap_or(DEFAULT_CODEX_ORIGINATOR)
+                .to_owned(),
+            auth_path: expand_tilde(
+                file.providers
+                    .codex_sub
+                    .as_ref()
+                    .and_then(|p| p.auth_path.as_deref())
+                    .unwrap_or(DEFAULT_CODEX_AUTH_PATH),
+            ),
+            refresh_url: parse_upstream(
+                file.providers
+                    .codex_sub
+                    .as_ref()
+                    .and_then(|p| p.refresh_url.as_deref())
+                    .unwrap_or(DEFAULT_CODEX_REFRESH_URL),
+            )?,
+        };
 
         let mut config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
@@ -358,6 +423,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_BACKEND_ANTHROPIC.to_owned()),
             anthropic_sub,
             anthropic_api,
+            codex_sub,
             gates: GatesConfig {
                 quota_enabled: file.gates.quota_enabled.unwrap_or(true),
                 notice_style: file.gates.notice_style.unwrap_or_default(),
@@ -442,6 +508,14 @@ impl Config {
                 self.default_backend_anthropic
             );
         }
+        // The codex originator rides on every request header: an
+        // unusable value would silently never reach the upstream.
+        if let Err(error) = axum::http::HeaderValue::from_str(&self.codex_sub.originator) {
+            bail!(
+                "providers.codex_sub originator {:?} is not a valid header value: {error}",
+                self.codex_sub.originator
+            );
+        }
         Ok(())
     }
 }
@@ -487,6 +561,7 @@ struct FileProviders {
     openrouter: Option<FileOpenRouter>,
     anthropic_sub: Option<FileAnthropicSub>,
     anthropic_api: Option<FileAnthropicApi>,
+    codex_sub: Option<FileCodexSub>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -509,6 +584,15 @@ struct FileAnthropicApi {
     upstream: Option<String>,
     api_key_env: Option<String>,
     api_key: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileCodexSub {
+    upstream: Option<String>,
+    originator: Option<String>,
+    auth_path: Option<String>,
+    refresh_url: Option<String>,
 }
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
@@ -539,12 +623,26 @@ fn parse_upstream(upstream: &str) -> anyhow::Result<reqwest::Url> {
     Ok(url)
 }
 
+/// Expand a leading `~/` against `$HOME` — the codex auth path's
+/// default is the CLI's `~/.codex/auth.json`. A literal path, or `~`
+/// without a home to expand against, passes through unchanged.
+fn expand_tilde(path: &str) -> PathBuf {
+    let Some(rest) = path.strip_prefix("~/") else {
+        return PathBuf::from(path);
+    };
+    match env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => PathBuf::from(home).join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_ANTHROPIC_UPSTREAM, DEFAULT_BACKEND_ANTHROPIC,
-        DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources,
-        OpenRouterConfig,
+        DEFAULT_CODEX_AUTH_PATH, DEFAULT_CODEX_ORIGINATOR, DEFAULT_CODEX_REFRESH_URL,
+        DEFAULT_CODEX_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS,
+        KeySources, OpenRouterConfig,
     };
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
@@ -611,6 +709,20 @@ mod tests {
         );
         assert_eq!(config.default_backend_openai_chat, "openrouter");
         assert_eq!(config.default_backend_anthropic, DEFAULT_BACKEND_ANTHROPIC);
+        // The codex defaults: the ChatGPT backend API's codex root, the
+        // codex CLI's own originator and login/refresh endpoints, the
+        // auth path tilde-expanded against $HOME.
+        assert_eq!(config.codex_sub.upstream.as_str(), DEFAULT_CODEX_UPSTREAM);
+        assert_eq!(config.codex_sub.originator, DEFAULT_CODEX_ORIGINATOR);
+        assert_eq!(
+            config.codex_sub.auth_path,
+            super::expand_tilde(DEFAULT_CODEX_AUTH_PATH),
+            "the default auth path is the codex CLI's, tilde-expanded"
+        );
+        assert_eq!(
+            config.codex_sub.refresh_url.as_str(),
+            DEFAULT_CODEX_REFRESH_URL
+        );
         // The default constant is a bare host; the resolved Url carries
         // its normalised trailing slash.
         let default_upstream =
@@ -755,6 +867,80 @@ api_key = "ak-literal-test"
             config.anthropic_sub.upstream,
             reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream")
         );
+    }
+
+    #[test]
+    fn the_codex_block_is_read_and_a_config_without_it_parses() {
+        let dir = test_dir("codex");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+[providers.codex_sub]
+upstream = "http://localhost:9/backend-api/codex"
+originator = "my_tools_proxy"
+auth_path = "/tmp/opencode/some-login.json"
+refresh_url = "http://localhost:10/oauth/token"
+"#,
+        )
+        .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let config = super::Config::load().expect("load config");
+        assert_eq!(
+            config.codex_sub.upstream.as_str(),
+            "http://localhost:9/backend-api/codex"
+        );
+        assert_eq!(config.codex_sub.originator, "my_tools_proxy");
+        assert_eq!(
+            config.codex_sub.auth_path,
+            PathBuf::from("/tmp/opencode/some-login.json")
+        );
+        assert_eq!(
+            config.codex_sub.refresh_url.as_str(),
+            "http://localhost:10/oauth/token"
+        );
+
+        // An auth path relative to home: `~` expands at load.
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+[providers.codex_sub]
+auth_path = "~/.codex/auth.json"
+"#,
+        )
+        .expect("rewrite config");
+        let config = super::Config::load().expect("load config");
+        assert_eq!(
+            config.codex_sub.auth_path,
+            super::expand_tilde("~/.codex/auth.json")
+        );
+
+        // A phase-1 toker.toml (no codex block at all) parses with the
+        // defaults, and a typo'd key is an error, not a silent default.
+        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
+        let config = super::Config::load().expect("phase-1 config parses");
+        assert_eq!(config.codex_sub.originator, super::DEFAULT_CODEX_ORIGINATOR);
+
+        fs::write(
+            dir.join("toker.toml"),
+            "[providers.codex_sub]\nupstream = \"http://x\"\noriginater = \"typo\"\n",
+        )
+        .expect("rewrite config");
+        assert!(
+            super::Config::load().is_err(),
+            "a typo'd codex key must fail to load"
+        );
+
+        // An originator that cannot ride a header (a newline is never
+        // legal in one) fails at load, not as a silently missing header
+        // per request.
+        fs::write(
+            dir.join("toker.toml"),
+            "[providers.codex_sub]\noriginator = \"codex\\ncli\"\n",
+        )
+        .expect("rewrite config");
+        let error = super::Config::load().expect_err("invalid originator must fail");
+        assert!(format!("{error:#}").contains("originator"));
     }
 
     #[test]

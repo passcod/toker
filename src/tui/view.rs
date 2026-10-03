@@ -376,11 +376,8 @@ fn meter_line(
         Verdict::Stale => ("window rolled over".to_owned(), Style::new().dim()),
         Verdict::Unknown => ("estimating".to_owned(), Style::new().dim()),
     };
-    let gated_prefix = meter
-        .exhausted
-        .then(|| "gated · ".to_owned())
-        .unwrap_or_default();
-    let assumed_suffix = (meter.gated && gate_assumed).then_some("?").unwrap_or("");
+    let gated_prefix = if meter.exhausted { "gated · " } else { "" };
+    let assumed_suffix = if meter.gated && gate_assumed { "?" } else { "" };
     let verdict_full = format!("{gated_prefix}{verdict_text}{assumed_suffix}");
 
     // The resets clause goes with a live verdict only — "resets ?"

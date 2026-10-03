@@ -11,7 +11,9 @@
 //! - [`sse`]: the incremental event splitter ([`SseSplitter`]) — tolerant
 //!   of both `\n\n` and `\r\n\r\n` event delimiters (no end-of-stream
 //!   fallback for the `\r\n` dialect), skipping keep-alive comments,
-//!   other fields, and `[DONE]`, and buffering only the pending partial
+//!   other fields, and `[DONE]`, capturing the `event:` line's value
+//!   (the responses dialect's kind names — the openai/anthropic
+//!   observers ignore it), and buffering only the pending partial
 //!   event so per-chunk work stays small however long the stream runs.
 //! - [`usage`]: the per-response [`UsageObserver`] — latches `id`,
 //!   `model`, `provider`, and the verbatim `usage` object from the final

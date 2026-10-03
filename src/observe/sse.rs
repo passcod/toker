@@ -16,12 +16,15 @@
 //! - **Buffering**: only the bytes since the last complete line. Per-chunk
 //!   work is proportional to the chunk, not to the stream, however long
 //!   the stream runs.
-//! - **Per event**: only `data:` lines are kept. A `data:` line that is
-//!   not valid UTF-8 is skipped as unobservable — invariant 6: it loses a
-//!   measurement, never a request. Comment lines (`:`-prefixed keep-alives)
-//!   and other fields (`event:`, `id:`, `retry:`) are parsed and ignored;
-//!   an event left with no data lines is skipped, and so is the `[DONE]`
-//!   sentinel.
+//! - **Per event**: `data:` lines are kept, and so is the `event:`
+//!   line's value (the responses dialect names its events that way —
+//!   see [crate::providers::codex::sse]; the openai/anthropic observers
+//!   ignore it, their dialects naming kinds inside the data JSON). A
+//!   `data:` line that is not valid UTF-8 is skipped as unobservable —
+//!   invariant 6: it loses a measurement, never a request. Comment
+//!   lines (`:`-prefixed keep-alives) and other fields (`id:`,
+//!   `retry:`) are parsed and ignored; an event left with no data lines
+//!   is skipped, and so is the `[DONE]` sentinel.
 //! - **Framing**: exactly one leading space after the colon is stripped
 //!   (SSE semantics), one trailing `\r` per line, multi-line data joined
 //!   by `\n`.
@@ -36,7 +39,7 @@
 use std::mem;
 
 /// One complete SSE event: the payloads of its `data:` lines, in arrival
-/// order.
+/// order, plus its `event:` line's value when it carried one.
 ///
 /// Each element is one `data:` line's bytes after SSE framing — the
 /// `data:` prefix removed, exactly one leading space after the colon
@@ -47,6 +50,12 @@ use std::mem;
 pub struct SseEvent {
     /// The `data:` line payloads of this event, in arrival order.
     pub data_lines: Vec<String>,
+    /// The `event:` line's value (one leading space after the colon
+    /// stripped, like SSE framing): the event's kind name. `None` when
+    /// the event carried no `event:` line — the openai/anthropic
+    /// dialects never do; the responses dialect always does (and names
+    /// the same kind inside the data JSON too).
+    pub event: Option<String>,
 }
 
 impl SseEvent {
@@ -67,6 +76,9 @@ pub struct SseSplitter {
     buffer: Vec<u8>,
     /// The `data:` lines of the event under assembly.
     pending: Vec<String>,
+    /// The `event:` line's value of the event under assembly, if seen
+    /// (the last one wins, per SSE dispatch semantics).
+    pending_event: Option<String>,
 }
 
 impl SseSplitter {
@@ -88,11 +100,15 @@ impl SseSplitter {
             if line.is_empty() {
                 // Blank line: event boundary. Emit the event under
                 // assembly, if it has anything observable.
-                if let Some(event) = event_of(mem::take(&mut self.pending)) {
+                if let Some(event) =
+                    event_of(self.pending_event.take(), mem::take(&mut self.pending))
+                {
                     events.push(event);
                 }
-            } else if let Some(data) = data_line_of(line) {
+            } else if let Some(data) = field_line_of(line, b"data") {
                 self.pending.push(data);
+            } else if let Some(event) = field_line_of(line, b"event") {
+                self.pending_event = Some(event);
             }
         }
         // Keep only the partial line: the buffer never grows past one
@@ -111,31 +127,33 @@ impl SseSplitter {
         if !self.buffer.is_empty() {
             let tail = mem::take(&mut self.buffer);
             let line = tail.strip_suffix(b"\r").unwrap_or(&tail);
-            if !line.is_empty()
-                && let Some(data) = data_line_of(line)
-            {
-                self.pending.push(data);
+            if !line.is_empty() {
+                if let Some(data) = field_line_of(line, b"data") {
+                    self.pending.push(data);
+                } else if let Some(event) = field_line_of(line, b"event") {
+                    self.pending_event = Some(event);
+                }
             }
         }
-        event_of(mem::take(&mut self.pending))
+        event_of(self.pending_event.take(), mem::take(&mut self.pending))
     }
 }
 
-/// One complete, non-empty line → the `data:` payload it contributes.
+/// One complete, non-empty line → the named SSE field's payload.
 ///
-/// Comments (a `:`-leading keep-alive), other fields (`event:`, `id:`,
-/// `retry:`), and a field line without a colon whose name is not `data`
-/// contribute nothing. A `data:` value that is not valid UTF-8 contributes
-/// nothing either — skipped as unobservable rather than lossily decoded
-/// (invariant 6: the skipped line can leave the event's data unparseable
-/// downstream, losing the measurement, never the request).
-fn data_line_of(line: &[u8]) -> Option<String> {
-    let (field, value) = match line.iter().position(|&b| b == b':') {
+/// Comments (a `:`-leading keep-alive), other fields (`id:`, `retry:`),
+/// and a field line without a colon whose name does not match contribute
+/// nothing. A value that is not valid UTF-8 contributes nothing either —
+/// skipped as unobservable rather than lossily decoded (invariant 6: the
+/// skipped line can leave the event's data unparseable downstream, losing
+/// the measurement, never the request).
+fn field_line_of(line: &[u8], field: &[u8]) -> Option<String> {
+    let (name, value) = match line.iter().position(|&b| b == b':') {
         Some(colon) => (&line[..colon], &line[colon + 1..]),
         // SSE: a line without a colon is a field with an empty value.
         None => (line, &[][..]),
     };
-    if field != b"data" {
+    if name != field {
         return None;
     }
     // Exactly one leading space after the colon (SSE framing).
@@ -144,19 +162,20 @@ fn data_line_of(line: &[u8]) -> Option<String> {
     Some(text.to_string())
 }
 
-/// Close the event whose data lines are `data_lines`.
+/// Close the event whose data lines are `data_lines` (and whose `event:`
+/// line, if any, named it `event`).
 ///
 /// `None` for the two events that carry nothing observable: an event with
 /// no data lines at all (comment/other-field-only), and the `[DONE]`
 /// sentinel (always a single `data: [DONE]` line).
-fn event_of(data_lines: Vec<String>) -> Option<SseEvent> {
+fn event_of(event: Option<String>, data_lines: Vec<String>) -> Option<SseEvent> {
     if data_lines.is_empty() {
         return None;
     }
     if data_lines.len() == 1 && data_lines[0] == "[DONE]" {
         return None;
     }
-    Some(SseEvent { data_lines })
+    Some(SseEvent { data_lines, event })
 }
 
 #[cfg(test)]
@@ -353,5 +372,38 @@ mod tests {
         let events = run(&[b"data: a\rb\n\n"]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data(), "a\rb");
+    }
+
+    #[test]
+    fn event_lines_are_captured_and_last_wins() {
+        // The responses dialect names its events with an `event:` line;
+        // the capture is additive — data behavior is unchanged.
+        let events = run(&[
+            b"event: response.created\ndata: {\"a\":1}\n\n",
+            b"event: response.completed\r\ndata: {\"b\":2}\r\n\r\n",
+        ]);
+        assert_eq!(events[0].event.as_deref(), Some("response.created"));
+        assert_eq!(events[0].data(), "{\"a\":1}");
+        assert_eq!(
+            events[1].event.as_deref(),
+            Some("response.completed"),
+            "the \\r\\n dialect strips the event line's trailing \\r"
+        );
+        assert_eq!(events[1].data(), "{\"b\":2}");
+
+        // The last `event:` line before dispatch wins, per SSE semantics.
+        let events = run(&[b"event: first\nevent: second\ndata: {}\n\n"]);
+        assert_eq!(events[0].event.as_deref(), Some("second"));
+
+        // Exactly one leading space after the colon is stripped (the
+        // second stays, like `data:` framing), and an event line
+        // without data still yields no event.
+        let events = run(&[b"event:  spaced-kind\ndata: x\n\n"]);
+        assert_eq!(events[0].event.as_deref(), Some(" spaced-kind"));
+        assert!(run(&[b"event: only-a-kind\n\n"]).is_empty());
+        assert!(
+            run(&[b"event: [DONE]\n\n"]).is_empty(),
+            "the sentinel rule is a data rule — an event line alone never emits"
+        );
     }
 }

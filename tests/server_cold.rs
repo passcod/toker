@@ -36,7 +36,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 
 use toker::config::{
-    AnthropicApiConfig, AnthropicSubConfig, Config, GatesConfig, OpenRouterConfig,
+    AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, GatesConfig, OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
 use toker::server::Server;
@@ -183,6 +183,20 @@ fn test_config(upstream: reqwest::Url) -> Config {
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
+        },
+        // The codex backend's config: never routed to in these suites
+        // (the responses frontend lands later), pointed at an upstream
+        // that never answers and an auth path that never exists — no
+        // test may touch a real login.
+        codex_sub: CodexSubConfig {
+            upstream: "http://127.0.0.1:9/backend-api/codex"
+                .parse()
+                .expect("codex upstream url"),
+            originator: "codex_cli_rs".to_owned(),
+            auth_path: test_dir("codex-absent").join("auth.json"),
+            refresh_url: "https://auth.openai.com/oauth/token"
+                .parse()
+                .expect("codex refresh url"),
         },
         gates: GatesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take

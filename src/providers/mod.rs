@@ -4,14 +4,18 @@
 //! (see [crate::proto]) and differ in auth, cost semantics (billed /
 //! estimated / plan-equivalent), and meter parsing (e.g. anthropic sub's
 //! `anthropic-ratelimit-*` headers). Phase 1 wired [OpenRouter] only; the
-//! anthropic unit adds the two anthropic providers
-//! ([`AnthropicSub`], [`AnthropicApi`]), and later phases add more to
-//! exactly the slots the router holds.
+//! anthropic unit added the two anthropic providers
+//! ([`AnthropicSub`], [`AnthropicApi`]); the codex unit adds
+//! [`CodexSub`] (the OpenAI-Responses backend, client + auth first —
+//! its routing lands with the responses frontend), and later phases add
+//! more to exactly the slots the router holds.
 
 mod anthropic;
+pub mod codex;
 mod openrouter;
 
 pub use anthropic::{AnthropicApi, AnthropicSub, parse_rate_limits};
+pub use codex::CodexSub;
 pub use openrouter::OpenRouter;
 
 use axum::http::{HeaderMap, header};

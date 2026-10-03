@@ -1,0 +1,17 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_trunc","object":"response","created_at":1789999999,"status":"in_progress","model":"gpt-5.2-codex"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_trunc","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"type":"message","id":"msg_trunc","role":"assistant","content":[],"status":"in_progress"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_trunc","output_index":0,"content_index":0,"delta":"A partial answer runs out of room when the "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_trunc","output_index":0,"content_index":0,"delta":"output budget is spent."}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":5,"response":{"id":"resp_trunc","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":null}}
