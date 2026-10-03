@@ -17,6 +17,7 @@ pub mod cmds;
 pub mod config;
 pub mod ir;
 pub mod middleware;
+pub mod observe;
 pub mod proto;
 pub mod providers;
 pub mod server;

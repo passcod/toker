@@ -1,0 +1,7 @@
+data: {"id":"gen-1760000300-aa55","provider":"mistral","model":"mistral/mistral-large-3","object":"chat.completion.chunk","created":1760000300,"choices":[{"index":0,"delta":{"role":"assistant"}}],"usage":{"prompt_tokens":800,"completion_tokens":1,"cost":0.001}}
+
+data: {"id":"gen-1760000300-aa55","provider":"mistral","model":"mistral/mistral-large-3","object":"chat.completion.chunk","created":1760000300,"choices":[{"index":0,"delta":{"content":"Partial"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000300-aa55","provider":"mistral","model":"mistral/mistral-large-3","object":"chat.completion.chunk","created":1760000300,"choices":[],"usage":{"prompt_tokens":802,"completion_tokens":40,"total_tokens":842,"prompt_tokens_details":{"cached_tokens":512},"cost":0.001688,"cost_details":{"upstream":0.00144}}}
+
+data: [DONE]

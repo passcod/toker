@@ -1,0 +1,11 @@
+data: {"id":"gen-1760000100-77e1","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000100,"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_kJ4n","type":"function","function":{"name":"get_weather","arguments":""}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000100-77e1","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000100,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000100-77e1","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000100,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Wellington\",\"units\":\"metric\"}"}}]},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000100-77e1","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000100,"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}]}
+
+data: {"id":"gen-1760000100-77e1","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000100,"choices":[],"usage":{"prompt_tokens":512,"completion_tokens":48,"total_tokens":560,"prompt_tokens_details":{"cached_tokens":384,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":12,"accepted_prediction_tokens":3},"cost":0.00084,"cost_details":{"upstream":0.00072,"router":0.00012}}}
+
+data: [DONE]

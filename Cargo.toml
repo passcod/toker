@@ -19,7 +19,7 @@ ratatui = "0.30.2"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
 sha2 = "0.11.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["full"] }

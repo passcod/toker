@@ -1,0 +1,9 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1760000400-beef","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000400,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000400-beef","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000400,"choices":[{"index":0,"delta":{"content":"Stream"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000400-beef","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000400,"choices":[{"index":0,"delta":{"content":" cut"},"logprobs":null,"finish_reason":null}]}
+
+data: [DONE]

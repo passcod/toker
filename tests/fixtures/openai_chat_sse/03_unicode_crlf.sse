@@ -1,0 +1,11 @@
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1760000200-c0de","provider":"deepseek","model":"deepseek/deepseek-chat-v4","object":"chat.completion.chunk","created":1760000200,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000200-c0de","provider":"deepseek","model":"deepseek/deepseek-chat-v4","object":"chat.completion.chunk","created":1760000200,"choices":[{"index":0,"delta":{"content":"héllo — 世界 🌏, déjà-vu"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000200-c0de","provider":"deepseek","model":"deepseek/deepseek-chat-v4","object":"chat.completion.chunk","created":1760000200,"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+data: {"id":"gen-1760000200-c0de","provider":"deepseek","model":"deepseek/deepseek-chat-v4","object":"chat.completion.chunk","created":1760000200,"choices":[],"usage":{"prompt_tokens":96,"completion_tokens":24,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":64},"cost":0.000288,"cost_details":{"upstream":0.00024}}}
+
+data: [DONE]

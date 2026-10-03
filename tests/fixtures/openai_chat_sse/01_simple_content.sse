@@ -1,0 +1,11 @@
+data: {"id":"gen-1760000000-3f2a","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000000,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000000-3f2a","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000000,"choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000000-3f2a","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000000,"choices":[{"index":0,"delta":{"content":"!"},"logprobs":null,"finish_reason":null}]}
+
+data: {"id":"gen-1760000000-3f2a","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000000,"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
+
+data: {"id":"gen-1760000000-3f2a","provider":"z-ai","model":"z-ai/glm-5.3","object":"chat.completion.chunk","created":1760000000,"choices":[],"usage":{"prompt_tokens":128,"completion_tokens":16,"total_tokens":144,"cost":0.000192,"cost_details":{"upstream":0.00016,"router":0.000032}}}
+
+data: [DONE]
