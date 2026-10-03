@@ -1,0 +1,36 @@
+[Unit]
+Description=toker proxy service (socket-activated)
+Documentation=file:///home/passcod/code/rust/toker/docs/plans/toker-toolsuite.md
+Requires=toker.socket
+After=toker.socket
+
+[Service]
+# Points at the debug build while dogfooding: `cargo build` then
+# `systemctl --user restart toker.service` picks up a new binary; a running
+# service keeps serving the old inode until restarted. Swap to the
+# cargo-installed path once one exists.
+Type=exec
+ExecStart=/home/passcod/code/rust/toker/target/debug/toker serve
+Restart=always
+RestartSec=1
+SyslogIdentifier=toker
+
+# Hardening, following the openrouter-ledger-proxy unit pattern.
+# MemoryDenyWriteExecute is safe for a Rust binary (it was false only for the
+# JS runtime). The state dir is the only writable path; credentials pass
+# through in transit and are never written to disk by the proxy itself.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/toker
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# No [Install] section: this unit is never enabled directly. toker.socket is
+# the enabled unit and starts this on demand.

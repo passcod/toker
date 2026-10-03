@@ -1,0 +1,12 @@
+[Unit]
+Description=toker proxy socket (local proxy + measurement for AI coding traffic)
+Documentation=file:///home/passcod/code/rust/toker/docs/plans/toker-toolsuite.md
+
+[Socket]
+# One long-lived server process is handed the listening socket, rather than one
+# process per connection: toker holds per-lane state across requests.
+ListenStream=127.0.0.1:18123
+Accept=no
+
+[Install]
+WantedBy=sockets.target
