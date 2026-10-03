@@ -47,6 +47,7 @@ use serde_json::{Value, json};
 
 use crate::catalog::{CostBuckets, normalise_model_id, price};
 use crate::ir::AnthropicShape;
+use crate::middleware::lanes;
 use crate::middleware::quota::{Grant, Meter};
 use crate::observe::AnthropicCapture;
 use crate::providers::Provider;
@@ -80,6 +81,9 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) betas: Option<Value>,
     /// The content-free request shape ([`AnthropicShape`]).
     pub(crate) shape: Option<AnthropicShape>,
+    /// The request carried the ping header: its lane is recorded but
+    /// excluded from liveness (plan: Ping tagging).
+    pub(crate) ping: bool,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -109,6 +113,10 @@ pub(crate) fn record_anthropic_measurement(
                 ctx,
                 measurement_row(ctx, ts_ms, duration_ms, &route, capture, rate_limits),
             );
+            // The lane table and the learned store update alongside the
+            // row, on the response identity (ctp proxy.mjs:1767-1777) —
+            // never the model asked for, which may have been rewritten.
+            note_lane_and_model(ctx, capture, ts_ms);
             true
         }
         _ => false,
@@ -210,6 +218,64 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
         || presence.code_execs
 }
 
+/// What this response taught the lane table and the learned model store,
+/// after the API actually served it (ctp proxy.mjs:1756-1777).
+///
+/// Both follow the **response** model — the model that actually served the
+/// request — never the one asked for, which may have been rewritten. The
+/// prompt total is what a cold resume would have to re-read: the whole
+/// prefix, however it was billed this time. The TTL tier comes from where
+/// the writes actually landed, sticky across the lane ([`lanes::lane_ttl`]).
+///
+/// Accounting must never break a session (invariant 6): a store error here
+/// is logged and lost — the measurement row is already in.
+fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_ms: i64) {
+    // ctp `held`: fresh input + cache read + cache writes, missing metrics
+    // folding in as 0.
+    let held = capture.input().unwrap_or(0)
+        + capture.cache_read().unwrap_or(0)
+        + capture.cache_write_total().unwrap_or(0);
+
+    // ctp `noteSeen` — a model is "seen" when a response named it. Days
+    // are local calendar days; the system zone is the server's, read once
+    // per response.
+    if let Some(model) = capture.model() {
+        let tz = jiff::tz::TimeZone::system();
+        if let Err(error) = ctx.server.models.note_seen(model, ts_ms, held, &tz) {
+            tracing::error!(%error, "learned model update failed");
+        }
+    }
+
+    // ctp `noteLaneResponse`: the lane keyed by session × tools-hash, moved
+    // only now that the response completed. `forced` is `None` — the
+    // adaptive rewrite that produces it is a later unit's; a compaction
+    // still neither starts nor ends one.
+    let forced = None;
+    let compaction = ctx
+        .shape
+        .as_ref()
+        .is_some_and(AnthropicShape::is_compaction);
+    if let Err(error) = lanes::note_lane_response(
+        &ctx.server.store,
+        lanes::LaneResponse {
+            session_id: ctx.session_id.as_deref(),
+            tools_hash: ctx
+                .shape
+                .as_ref()
+                .and_then(|shape| shape.tools_hash.as_deref()),
+            at_ms: ts_ms,
+            prompt: i64::try_from(held).unwrap_or(i64::MAX),
+            write_5m: capture.cache_write_5m().unwrap_or(0),
+            write_1h: capture.cache_write_1h().unwrap_or(0),
+            ping: ctx.ping,
+            forced,
+            compaction,
+        },
+    ) {
+        tracing::error!(%error, "lane table update failed");
+    }
+}
+
 /// The cost kind the backend's semantics pick (plan: Storage): the same
 /// list-price arithmetic, different meaning — the API bills it, the
 /// subscription never does.
@@ -291,7 +357,9 @@ fn measurement_row(
         provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
-        ping: None,
+        // ctp proxy.mjs:1751: `...(isPing(req.headers) ? { ping: true } :
+        // {})` — only a ping request says so, never a non-ping one.
+        ping: ctx.ping.then_some(true),
         // ctp: `model` is the normalised identity, `raw_model` the wire
         // form the provider actually served.
         model: capture.model().and_then(normalise_model_id),

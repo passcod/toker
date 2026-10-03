@@ -35,6 +35,12 @@ pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
     "x-session-id",
 ];
 
+/// The default ping-tagging header (plan: "Ping tagging — marks ping lanes
+/// so they never hold the sleep lock"; ctp's is `x-ctp-ping`). The window
+/// pinger injects it via `ANTHROPIC_CUSTOM_HEADERS`, read by name only
+/// (invariant 2).
+pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
+
 /// OpenRouter's upstream base, including the `/v1` prefix.
 pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
 
@@ -66,6 +72,10 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Session-attribution header names, in priority order.
     pub session_header_names: Vec<String>,
+    /// The header the window pinger tags its requests with; a lane whose
+    /// request carried it is recorded but excluded from liveness (plan:
+    /// Ping tagging).
+    pub ping_header_name: String,
     /// The default backend for the openai_chat protocol.
     pub default_backend_openai_chat: String,
     /// The openrouter provider block.
@@ -279,6 +289,9 @@ impl Config {
                     .map(|s| (*s).to_owned())
                     .collect()
             }),
+            ping_header_name: file
+                .ping_header_name
+                .unwrap_or_else(|| DEFAULT_PING_HEADER.to_owned()),
             default_backend_openai_chat: file
                 .default_backend_openai_chat
                 .unwrap_or_else(|| DEFAULT_BACKEND_OPENAI_CHAT.to_owned()),
@@ -329,6 +342,17 @@ impl Config {
                 bail!("session_header_names entry {name:?} is not a valid header name: {error}");
             }
         }
+        // The ping header is read by name on every gated request; an
+        // unusable name would silently disable ping tagging.
+        if self.ping_header_name.is_empty() {
+            bail!("ping_header_name must not be empty");
+        }
+        if let Err(error) = axum::http::HeaderName::from_bytes(self.ping_header_name.as_bytes()) {
+            bail!(
+                "ping_header_name {:?} is not a valid header name: {error}",
+                self.ping_header_name
+            );
+        }
         // Both anthropic backends are wired regardless of enabled state
         // (routing resolves by name), but the protocol default must name
         // one of them — anything else cannot route anywhere.
@@ -354,6 +378,7 @@ struct FileConfig {
     port: Option<u16>,
     db_path: Option<String>,
     session_header_names: Option<Vec<String>>,
+    ping_header_name: Option<String>,
     default_backend_openai_chat: Option<String>,
     default_backend_anthropic: Option<String>,
     providers: FileProviders,
@@ -726,6 +751,34 @@ quota_enabled = false
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let error = super::Config::load().expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
+    }
+
+    #[test]
+    fn ping_header_name_reads_the_file_and_validates() {
+        // Absent: the default (ctp's header renamed for toker).
+        let config = load_from(&test_dir("ping-default"));
+        assert_eq!(config.ping_header_name, super::DEFAULT_PING_HEADER);
+
+        // Present: the file value is read.
+        let dir = test_dir("ping-file");
+        fs::write(dir.join("toker.toml"), r#"ping_header_name = "x-my-ping""#)
+            .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let config = super::Config::load().expect("load config");
+        assert_eq!(config.ping_header_name, "x-my-ping");
+
+        // An unusable name is a load error, not a silent no-match.
+        fs::write(
+            dir.join("toker.toml"),
+            r#"ping_header_name = "not a header!""#,
+        )
+        .expect("rewrite config");
+        let error = super::Config::load().expect_err("an invalid header name must fail");
+        assert!(error.to_string().contains("ping_header_name"));
+
+        fs::write(dir.join("toker.toml"), r#"ping_header_name = """#).expect("rewrite config");
+        assert!(super::Config::load().is_err(), "the empty name fails too");
     }
 
     #[test]

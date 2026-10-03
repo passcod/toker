@@ -58,6 +58,7 @@ use futures::future::{AbortHandle, Abortable};
 use futures::stream::Stream;
 
 use crate::ir::{Fidelity, Request as IrRequest, compare};
+use crate::middleware::lanes;
 use crate::middleware::quota::{
     Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for,
 };
@@ -125,6 +126,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // never captured wholesale: they carry credentials (invariant 2).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
     let betas = request_betas(&parts.headers);
+    // Ping tagging (plan: Middleware): a lane whose request carried the
+    // ping header is recorded but excluded from liveness — the window
+    // pinger's probe must never hold the sleep lock.
+    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
 
     // 1. Buffer the request body fully.
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -148,6 +153,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // the client named and in the shape it asked for.
     let mut client_model: Option<String> = None;
     let mut stream_explicitly_false = false;
+    // The model about to be sent upstream, for the served-model mark
+    // (ctp `servedModel`, proxy.mjs:1549).
+    let mut served_model: Option<String> = None;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
@@ -269,6 +277,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forward = Bytes::from(ir.serialise());
         }
         let shape = ir.anthropic().shape();
+        // The model this request is about to be sent on — the note-served
+        // mark below needs it after `effective_model` moves into the
+        // record context.
+        served_model = effective_model.clone();
         record = Some(AnthropicRecordCtx {
             server: server.clone(),
             started,
@@ -282,6 +294,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             backend: backend.clone(),
             betas,
             shape: Some(shape),
+            ping,
         });
     }
 
@@ -359,6 +372,18 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             });
             return build_response(StatusCode::OK, headers, Body::from(body));
         }
+    }
+
+    // ── the served-model mark, BEFORE the request goes (ctp
+    // proxy.mjs:1544-1551) ──
+    //
+    // Not after: a lane deciding while this one is still in flight must see
+    // the final effective model as in use. The response may later name a
+    // different served identity; that remains authoritative for
+    // observations and accounting. In-memory and infallible, like ctp's
+    // map. Gated to the exact `/v1/messages` path, ctp's `gated`.
+    if path == "/v1/messages" {
+        server.models.note_served(served_model.as_deref(), now_ms());
     }
 
     // 6. Upstream; 7.-9. in forward_response. Session headers pass

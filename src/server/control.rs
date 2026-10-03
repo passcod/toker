@@ -7,16 +7,29 @@
 //! without an unanswered CORS preflight can never pass the gate. A wrong
 //! or missing gate is a 403 naming what is missing — loopback-only, no
 //! discovery value to suppress.
+//!
+//! `/_toker/models/merge` is the promote-model handover (ctp
+//! `controlMerge`, proxy.mjs:1068-1099): promote-model.mjs grants days to
+//! a model the proxy has already served, so a promotion applies to the
+//! running process instead of waiting for a restart. It can only add to
+//! what the store already knows, and only for models it has served — the
+//! worst it can do is what promote-model does on purpose. The custom
+//! header and the JSON content type are what keep a web page out.
 
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::Server;
+use crate::middleware::models::{MergeIncoming, MergeOutcome};
 
 const CONTROL_HEADER: &str = "x-toker-control";
+
+/// A control body larger than this is a client bug, not a promotion —
+/// the handover carries one model's days and ceiling.
+const MAX_CONTROL_BODY: usize = 1024 * 1024;
 
 /// `GET /_toker/status` — the resolved config (sans secrets), ledger row
 /// count, last request ts, and uptime.
@@ -65,14 +78,137 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
     Json(body).into_response()
 }
 
-/// `POST /_toker/models/merge` — phase-2 control parity placeholder.
-pub(crate) async fn models_merge(request: Request) -> Response {
+/// `POST /_toker/models/merge` — the promote-model handover (ctp
+/// `controlMerge`, proxy.mjs:1068-1099, made real; replaces the phase-1
+/// 501 stub).
+///
+/// Body: one entry, `{"model": id, "days": [...], "maxPrompt": n}` — the
+/// single-model shape of ctp's store merge, with ctp's `pruneSeen`
+/// validation: `days` must be an array of day strings (non-strings and
+/// empties dropped, the rest deduped and sorted), `maxPrompt` a finite
+/// number when present. Validation failures answer 400 (`unparseable
+/// store`, ctp's wording); a wrong control verb, method, or content type
+/// answers 403 (`not a control request`).
+///
+/// The semantics are `mergeSeen(into, from, {only: true})`: days union and
+/// the higher `maxPrompt` for a model **already served**, nothing for one
+/// the store has never seen (never invents). ctp answered 200 with the
+/// unknown model on its `refused` list; toker answers **404** with the
+/// `known` list, so the caller learns the typo instead of a silent no-op.
+///
+/// The reply carries the effect, not the intent: `target` is what the
+/// family's election now names, because a promotion does not guarantee the
+/// slot — a newer version may already hold it, and saying so beats leaving
+/// the caller to discover it. The path is never forwarded, whatever the
+/// outcome.
+pub(crate) async fn models_merge(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "models-merge") {
         return forbidden();
     }
+    let (parts, body) = request.into_parts();
+    // ctp checks all three up front and answers them alike: method, verb,
+    // content type. The verb check already ran above.
+    if parts.method != Method::POST || !json_content_type(&parts.headers) {
+        return forbidden();
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
+        Ok(bytes) => bytes,
+        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
+    };
+
+    // ctp `pruneSeen` over the incoming entry: a store that does not
+    // validate is a store that does not apply, never a best-effort guess.
+    let incoming: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
+    };
+    let Some(model) = incoming.get("model").and_then(Value::as_str) else {
+        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
+    };
+    let Some(model) = crate::catalog::windows::model_identity(model) else {
+        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
+    };
+    let Some(days) = incoming.get("days").and_then(Value::as_array) else {
+        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
+    };
+    let days: Vec<String> = {
+        let mut days: Vec<String> = days
+            .iter()
+            .filter_map(|day| day.as_str().map(str::to_owned))
+            .filter(|day| !day.is_empty())
+            .collect();
+        days.sort();
+        days.dedup();
+        days
+    };
+    // ctp `pruneSeen`: a non-finite or absent maxPrompt reads as 0 — the
+    // merge then simply cannot raise the ceiling, only the days.
+    let max_prompt = incoming
+        .get("maxPrompt")
+        .and_then(Value::as_f64)
+        .filter(|prompt| prompt.is_finite())
+        .map(|prompt| prompt.max(0.0) as i64);
+
+    match server.models.merge(&MergeIncoming {
+        model_id: model,
+        days,
+        max_prompt,
+    }) {
+        Ok(MergeOutcome::Merged { entry, target }) => {
+            let family = crate::middleware::models::family_of(&entry.model_id)
+                .map(|family| family.name)
+                .unwrap_or_default();
+            Json(json!({
+                "toker": "models-merge",
+                "ok": true,
+                "merged": [entry.model_id],
+                "refused": [],
+                // ctp's `targets`, one family touched: what the election
+                // names now, so the caller reports the effect.
+                "targets": {family: target},
+            }))
+            .into_response()
+        }
+        Ok(MergeOutcome::Unseen) => {
+            // ctp's reason word ("unseen") and its `known` list, on a
+            // status that cannot be mistaken for success.
+            let known = server.models.known_models().unwrap_or_default();
+            let mut reply = json!({
+                "toker": "models-merge",
+                "ok": false,
+                "error": "unseen",
+            });
+            reply["known"] = json!(known);
+            (StatusCode::NOT_FOUND, Json(reply)).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "models merge store failure");
+            merge_error(StatusCode::INTERNAL_SERVER_ERROR, "store failure")
+        }
+    }
+}
+
+/// `content-type` starts with `application/json` (ctp controlMerge's
+/// `String(...).startsWith`) — the second half of what keeps a browser
+/// out: a cross-origin page cannot send either half without an
+/// unanswered preflight.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"))
+}
+
+/// ctp's error replies: `{ctp: "models-merge", ok: false, error}` — the
+/// proxy's name swapped for toker's.
+fn merge_error(status: StatusCode, error: &str) -> Response {
     (
-        StatusCode::NOT_IMPLEMENTED,
-        "models/merge arrives with phase 2 control parity\n",
+        status,
+        Json(json!({
+            "toker": "models-merge",
+            "ok": false,
+            "error": error,
+        })),
     )
         .into_response()
 }

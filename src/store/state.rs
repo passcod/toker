@@ -16,6 +16,13 @@ use rusqlite::Connection;
 
 /// One lane row: `key` is the composite `"sessionId|toolsHash"` (plan: Lane
 /// tracking + sleep lock). `ping` lanes never hold the sleep lock.
+///
+/// ctp's lane record, in store form: `updated_ms` is ctp's `at` (moved only
+/// when a response the API actually served completes), `noticed_at` is
+/// `noticedAt` (moved only when the cold notice fires — see
+/// `decideCold`'s separation), `forced_from`/`forced_to` are `forced:
+/// {from, to}` (the sticky-upgrade record, consulted while the lane's cache
+/// may still be warm).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lane {
     pub key: String,
@@ -25,6 +32,13 @@ pub struct Lane {
     pub prompt_tokens: Option<i64>,
     pub ttl: Option<i64>,
     pub ping: Option<bool>,
+    /// When the cold notice last fired for this lane's idle spell; never
+    /// moves with `updated_ms` (a notice resets nothing it measures).
+    pub noticed_at: Option<i64>,
+    /// The sticky upgrade: the model this lane's conversation was moved off.
+    pub forced_from: Option<String>,
+    /// The model its cache now lives on.
+    pub forced_to: Option<String>,
 }
 
 /// One learned-model row: days served and max prompt observed for an exact
@@ -75,15 +89,20 @@ pub struct MetersSnapshot {
 
 pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
     conn.execute(
-        "INSERT INTO lanes (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping)
-         VALUES (:key, :session_id, :tools_hash, :updated_ms, :prompt_tokens, :ttl, :ping)
+        "INSERT INTO lanes (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+                            noticed_at, forced_from, forced_to)
+         VALUES (:key, :session_id, :tools_hash, :updated_ms, :prompt_tokens, :ttl, :ping,
+                 :noticed_at, :forced_from, :forced_to)
          ON CONFLICT (key) DO UPDATE SET
              session_id = excluded.session_id,
              tools_hash = excluded.tools_hash,
              updated_ms = excluded.updated_ms,
              prompt_tokens = excluded.prompt_tokens,
              ttl = excluded.ttl,
-             ping = excluded.ping",
+             ping = excluded.ping,
+             noticed_at = excluded.noticed_at,
+             forced_from = excluded.forced_from,
+             forced_to = excluded.forced_to",
         rusqlite::named_params! {
             ":key": lane.key,
             ":session_id": lane.session_id,
@@ -92,6 +111,9 @@ pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
             ":prompt_tokens": lane.prompt_tokens,
             ":ttl": lane.ttl,
             ":ping": lane.ping,
+            ":noticed_at": lane.noticed_at,
+            ":forced_from": lane.forced_from,
+            ":forced_to": lane.forced_to,
         },
     )?;
     Ok(())
@@ -100,7 +122,8 @@ pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
 pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
     row_of(
         conn,
-        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping
+        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+                noticed_at, forced_from, forced_to
          FROM lanes WHERE key = ?1",
         [key],
         read_lane,
@@ -110,7 +133,8 @@ pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
 pub(super) fn load_lanes(conn: &Connection) -> Result<Vec<Lane>> {
     rows_of(
         conn,
-        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping
+        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+                noticed_at, forced_from, forced_to
          FROM lanes ORDER BY key",
         [],
         read_lane,
@@ -126,6 +150,9 @@ fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
         prompt_tokens: row.get("prompt_tokens")?,
         ttl: row.get("ttl")?,
         ping: row.get("ping")?,
+        noticed_at: row.get("noticed_at")?,
+        forced_from: row.get("forced_from")?,
+        forced_to: row.get("forced_to")?,
     })
 }
 
@@ -176,6 +203,33 @@ fn read_model(row: &rusqlite::Row<'_>) -> Result<ModelEntry> {
         max_prompt: row.get("max_prompt")?,
         context_window_json: super::opt_json_from_text(row.get("context_window_json")?)?,
     })
+}
+
+/// Age and cap the lanes table (ctp `pruneLanes`, cold.mjs:534-573): drop
+/// lanes whose `updated_ms` sits in the future (a clock that moved — a
+/// lane that could never go idle) or further back than `max_age_ms`, then
+/// keep only the newest `max_lanes`. Rows the caller wrote are already
+/// well-formed, so the file-era paranoia about hand-edited records does
+/// not apply — the SQL is the whole rule. Returns how many rows went.
+///
+/// The caller owns the cadence: ctp prunes on its 30-second flush, never
+/// per request.
+pub(super) fn prune_lanes(
+    conn: &Connection,
+    now_ms: i64,
+    max_lanes: usize,
+    max_age_ms: i64,
+) -> Result<u64> {
+    let aged = conn.execute(
+        "DELETE FROM lanes WHERE updated_ms > ?1 OR updated_ms < ?2",
+        [now_ms, now_ms.saturating_sub(max_age_ms)],
+    )?;
+    let capped = conn.execute(
+        "DELETE FROM lanes WHERE key NOT IN
+            (SELECT key FROM lanes ORDER BY updated_ms DESC LIMIT ?1)",
+        [max_lanes.min(i64::MAX as usize) as i64],
+    )?;
+    Ok((aged + capped) as u64)
 }
 
 /// Idempotent: recording the same (session, meter, reset) allowance twice is

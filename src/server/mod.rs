@@ -48,15 +48,29 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::config::Config;
+use crate::middleware::lanes;
+use crate::middleware::models::ModelStore;
 use crate::providers::{AnthropicApi, AnthropicSub, OpenRouter, Provider};
 use crate::store::Store;
 
-/// The running proxy: config, ledger, upstream client, and the backend
-/// providers, cloned cheaply into every request handler.
+use record::now_ms;
+
+/// How many ledger rows the startup seed reads (ctp's 16 MiB log tail,
+/// proxy.mjs:148, as a row count): enough to span several days of heavy
+/// use, which is far more than the lane table or the served-model map look
+/// back over (ctp's own `RECENT_MAX`).
+const SEED_ROWS: u64 = 20_000;
+
+/// The running proxy: config, ledger, upstream client, backend providers,
+/// and the learned model store, cloned cheaply into every request handler.
 #[derive(Clone)]
 pub struct Server {
     pub(crate) store: Arc<Store>,
     pub(crate) config: Arc<Config>,
+    /// The learned model store (days served + maxPrompt, the day-based
+    /// family election) with its in-memory recently-served map, seeded
+    /// from the ledger tail at startup.
+    pub(crate) models: Arc<ModelStore>,
     /// The shared upstream HTTP client. Connect timeout only — no read
     /// timeout, so streams live as long as their connections do (see the
     /// module docs).
@@ -107,6 +121,20 @@ impl Server {
             config.anthropic_api.upstream.clone(),
             config.anthropic_api.api_key(),
         ));
+
+        // The startup seed (ctp `readLogTail` + `loadLanes` +
+        // `loadModels`, proxy.mjs:150-269): the newest ledger rows, read
+        // once, feed both state stores. Reseeding is idempotent, so every
+        // Server::new — serve, tests, restarts — rebuilds the same state.
+        let total = store.count_requests()?;
+        let seed = store.requests_since(0, SEED_ROWS)?;
+        // ctp `servedCoveredSince`: the tail read everything (no cut) →
+        // the served map vouches from the beginning (`-Infinity` there);
+        // else only from the oldest row the tail kept.
+        let covered =
+            (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
+        lanes::reseed(&store, &seed)?;
+        let models = Arc::new(ModelStore::seeded(store.clone(), &seed, covered));
         Ok(Server {
             store,
             config: Arc::new(config),
@@ -114,6 +142,7 @@ impl Server {
             openrouter,
             anthropic_sub,
             anthropic_api,
+            models,
             started: Instant::now(),
         })
     }
@@ -173,7 +202,35 @@ impl Server {
         };
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
+        self.spawn_lane_prune();
         axum::serve(listener, self.router()).await?;
         Ok(())
+    }
+
+    /// The lane-table prune on ctp's flush cadence (proxy.mjs:380-394:
+    /// `LANE_FLUSH_MS` 30 s, `unref`'d, never per request): a cheap SQL
+    /// statement on a timer — the upserts themselves go straight into the
+    /// store on every response, so unlike ctp nothing here carries state.
+    fn spawn_lane_prune(&self) {
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let mut timer =
+                tokio::time::interval(std::time::Duration::from_millis(lanes::LANE_FLUSH_MS));
+            loop {
+                timer.tick().await;
+                let now = record::now_ms();
+                match store.prune_lanes(now, lanes::LANE_MAX, lanes::LANE_MAX_AGE_MS) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        tracing::debug!("lane prune removed {count} lanes");
+                    }
+                    Err(error) => {
+                        // The prune is never worth a request (invariant 6
+                        // spirit): it retries on the next tick.
+                        tracing::error!(%error, "lane prune failed");
+                    }
+                }
+            }
+        });
     }
 }

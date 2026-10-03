@@ -154,6 +154,18 @@ pub(super) const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     "#,
+    // v2 — lanes: the cold gate's noticedAt (decideCold's separation: `at`
+    // moves only when a response reaches upstream, `noticedAt` only when
+    // the notice fires, so a notice never resets the lane's cache clock)
+    // and the sticky-upgrade record (`forced: {from, to}` — an upgrade is
+    // decided once, and every later request in that conversation must stay
+    // on the model its cache now lives on). Additive ALTER TABLE only,
+    // per the append-only rule; a v1 row reads the new columns as NULL.
+    r#"
+    ALTER TABLE lanes ADD COLUMN noticed_at INTEGER;
+    ALTER TABLE lanes ADD COLUMN forced_from TEXT;
+    ALTER TABLE lanes ADD COLUMN forced_to TEXT;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.

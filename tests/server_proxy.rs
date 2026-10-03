@@ -252,6 +252,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         port: 0,
         db_path: test_dir("db").join("toker.db"),
         session_header_names: vec!["x-toker-session".to_owned(), "x-session-id".to_owned()],
+        ping_header_name: "x-toker-ping".to_owned(),
         default_backend_openai_chat: "openrouter".to_owned(),
         openrouter: OpenRouterConfig {
             upstream,
@@ -798,7 +799,11 @@ async fn control_status_is_gated_and_secret_free() {
     assert_eq!(value["last_request_ts_ms"], Value::Null);
     assert!(value["uptime_s"].is_u64());
 
-    // The merge stub is gated the same way and answers 501.
+    // The merge endpoint is gated the same way: no verb → 403, and the
+    // verb alone is not enough — ctp demands a JSON content type too, so a
+    // browser cannot drive it without an unanswered preflight. The real
+    // merge behaviour is the anthropic suite's (models are learned from
+    // anthropic responses).
     let response = client()
         .post(toker_url(addr, "/_toker/models/merge"))
         .send()
@@ -811,7 +816,7 @@ async fn control_status_is_gated_and_secret_free() {
         .send()
         .await
         .expect("merge request");
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -875,4 +880,46 @@ async fn poisoned_meters_state_never_blocks_the_openai_path() {
     );
     assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
     assert_eq!(rows[0].input, Some(48));
+}
+
+#[tokio::test]
+async fn the_openai_path_grows_no_lanes_and_no_learned_models() {
+    // Phase 2's lane table and learned model store wire into the
+    // anthropic path only (plan: unit 5's scope — the openai route
+    // table stays phase-1). A successful, fully-recorded openai chat
+    // completion must leave both state tables untouched: no lane row,
+    // no learned entry, whatever the request carries.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    // A session header and a ping header, so the assertion is not passed
+    // merely by the request carrying nothing to key on.
+    let response = client()
+        .post(toker_url(addr, "/v1/chat/completions"))
+        .header("x-toker-session", "ses-openai-1")
+        .header("x-toker-ping", "1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(chat_body("z-ai/glm-5.3", false))
+        .send()
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None, "a real measurement, fully recorded");
+    assert_eq!(rows[0].session_id.as_deref(), Some("ses-openai-1"));
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        store.load_lanes().expect("lanes").is_empty(),
+        "the openai path writes no lanes"
+    );
+    assert!(
+        store.load_models().expect("models").is_empty(),
+        "the openai path teaches the learned store nothing"
+    );
+    assert_eq!(
+        mock.captured().len(),
+        1,
+        "the request forwarded exactly once"
+    );
 }

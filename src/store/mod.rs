@@ -158,6 +158,14 @@ impl Store {
         state::load_lanes(&*self.conn()?)
     }
 
+    /// Age and cap the lanes table (see `state::prune_lanes`): future-dated
+    /// rows, rows older than `max_age_ms`, and everything beyond the
+    /// newest `max_lanes` go. The caller owns the cadence — ctp prunes on
+    /// its 30-second flush, never per request.
+    pub fn prune_lanes(&self, now_ms: i64, max_lanes: usize, max_age_ms: i64) -> Result<u64> {
+        state::prune_lanes(&*self.conn()?, now_ms, max_lanes, max_age_ms)
+    }
+
     /// Upsert one learned-model entry.
     pub fn upsert_model(&self, entry: &ModelEntry) -> Result<()> {
         state::upsert_model(&*self.conn()?, entry)
@@ -278,6 +286,7 @@ mod tests {
         Allowance, CostKind, Error, Lane, MetersSnapshot, ModelEntry, PingRecord, RequestRow,
         RowKind, Store, is_api_measurement,
     };
+    use rusqlite::Connection;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -591,6 +600,9 @@ mod tests {
             prompt_tokens: Some(12_000),
             ttl: Some(300_000),
             ping: Some(false),
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
         };
         store.upsert_lane(&lane).expect("upsert lane");
         assert_eq!(
@@ -600,6 +612,11 @@ mod tests {
         let mut bumped = lane.clone();
         bumped.updated_ms = 2_000;
         bumped.prompt_tokens = Some(15_000);
+        // The v2 columns round-trip too: a notice already given, and a
+        // sticky upgrade the lane must keep honouring.
+        bumped.noticed_at = Some(1_900);
+        bumped.forced_from = Some("claude-opus-5".to_string());
+        bumped.forced_to = Some("claude-opus-5-5".to_string());
         store.upsert_lane(&bumped).expect("upsert lane again");
         assert_eq!(
             store.load_lane(&lane.key).expect("load"),
@@ -751,5 +768,122 @@ mod tests {
             }) => {}
             other => panic!("unknown cost_kind must error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lanes_prune_drops_aged_future_and_beyond_cap_rows() {
+        let store = mem_store();
+        let now = 1_000_000_000_000i64;
+        let age = 30 * 24 * 3600 * 1000i64;
+        let lane = |key: &str, updated_ms: i64| Lane {
+            key: key.to_owned(),
+            session_id: Some("ses".to_owned()),
+            tools_hash: Some(key.to_owned()),
+            updated_ms,
+            prompt_tokens: Some(1),
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+        };
+
+        // Fresh, within the age window: kept.
+        store
+            .upsert_lane(&lane("fresh", now - 1_000))
+            .expect("upsert");
+        // Exactly 30 days old: kept (ctp drops strictly older).
+        store.upsert_lane(&lane("edge", now - age)).expect("upsert");
+        // A day past the window: gone.
+        store
+            .upsert_lane(&lane("stale", now - age - 24 * 3600 * 1000))
+            .expect("upsert");
+        // A future timestamp is a clock that moved, not an idle-proof lane.
+        store
+            .upsert_lane(&lane("future", now + 60_000))
+            .expect("upsert");
+
+        assert_eq!(
+            store.prune_lanes(now, 4000, age).expect("prune"),
+            2,
+            "the stale and future rows go"
+        );
+        let keys: Vec<String> = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .map(|lane| lane.key)
+            .collect();
+        assert_eq!(keys, vec!["edge".to_owned(), "fresh".to_owned()]);
+
+        // The cap keeps the NEWEST rows (ctp pruneLanes sorts by `at`
+        // descending and slices), not the first-inserted.
+        let store = mem_store();
+        for i in 0..6 {
+            store
+                .upsert_lane(&lane(&format!("lane-{i}"), now - 6_000 + i as i64 * 1_000))
+                .expect("upsert");
+        }
+        assert_eq!(store.prune_lanes(now, 4, age).expect("prune"), 2);
+        let keys: Vec<String> = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .map(|lane| lane.key)
+            .collect();
+        assert_eq!(keys, vec!["lane-2", "lane-3", "lane-4", "lane-5"]);
+    }
+
+    #[test]
+    fn migration_v2_upgrades_a_v1_database_in_place() {
+        let dir = test_dir("v1-upgrade");
+        let db = dir.join("toker.db");
+        // A v1-shaped database: only the first migration applied, with a
+        // v1-era lane row (no noticed_at / forced columns).
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw v1 db");
+            conn.execute_batch(schema::MIGRATIONS[0])
+                .expect("apply the v1 migration alone");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+            conn.execute(
+                "INSERT INTO lanes (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping)
+                 VALUES ('ses-old|sha256:t1', 'ses-old', 'sha256:t1', 12345, 999, 300000, 0)",
+                [],
+            )
+            .expect("insert a v1 lane row");
+        }
+
+        // Opening with current code migrates cleanly: user_version reaches
+        // the head, the old row survives with the new columns reading as
+        // NULL (absence, never zero), and a fresh upsert writes them.
+        let store = Store::open(&db).expect("v1 db migrates");
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        let lane = store
+            .load_lane("ses-old|sha256:t1")
+            .expect("v1 lane loads")
+            .expect("v1 lane survived the migration");
+        assert_eq!(lane.updated_ms, 12_345);
+        assert_eq!(lane.prompt_tokens, Some(999));
+        assert_eq!(lane.ttl, Some(300_000));
+        assert_eq!(lane.noticed_at, None, "new columns start absent");
+        assert_eq!(lane.forced_from, None);
+        assert_eq!(lane.forced_to, None);
+
+        let mut upgraded = lane.clone();
+        upgraded.noticed_at = Some(20_000);
+        upgraded.forced_from = Some("claude-opus-5".to_owned());
+        upgraded.forced_to = Some("claude-opus-5-5".to_owned());
+        store.upsert_lane(&upgraded).expect("upsert upgraded lane");
+        assert_eq!(
+            store.load_lane("ses-old|sha256:t1").expect("reload"),
+            Some(upgraded)
+        );
+
+        // And the upgraded database reopens at the head without re-running.
+        drop(store);
+        let reopened = Store::open(&db).expect("reopen");
+        assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
     }
 }

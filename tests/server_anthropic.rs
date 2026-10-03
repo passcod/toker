@@ -244,6 +244,18 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             metered(&mut response, "0.4127");
             response
         }
+        // A 5-minute-tier-only write (fixture 04): the lane-stickiness
+        // probe — a warm follow-up whose writes landed on the short tier
+        // must not shorten what the lane already holds.
+        "5m-tier" if stream => {
+            let mut response = raw_response(
+                StatusCode::OK,
+                "text/event-stream",
+                fixture("04_5m_only_write.sse"),
+            );
+            metered(&mut response, "0.4127");
+            response
+        }
         _ if stream => {
             // The CRLF-dialect fixture: fast mode, us geo, a 1h-tier write
             // with a reconciling split, thinking zero — the richest
@@ -370,6 +382,7 @@ fn test_config(
             "x-claude-code-session-id".to_owned(),
             "x-session-id".to_owned(),
         ],
+        ping_header_name: "x-toker-ping".to_owned(),
         default_backend_openai_chat: "openrouter".to_owned(),
         openrouter: OpenRouterConfig {
             upstream: unused_openrouter,
@@ -457,6 +470,22 @@ fn messages_body(model: &str, stream: bool) -> Vec<u8> {
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"Hi"}}],"stream":{stream}}}"#
     )
     .into_bytes()
+}
+
+/// A body whose tool set gives the request a tools-hash — without tools
+/// there is no lane, just a session (the lane rule: a session is not a
+/// cache entry).
+fn tools_body(model: &str, stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "stream": stream,
+        "tools": [
+            {"name": "Read", "input_schema": {"type": "object"}},
+            {"name": "Bash", "input_schema": {"type": "object"}},
+        ],
+        "messages": [{"role": "user", "content": "Hi"}],
+    }))
+    .expect("serialise tools body")
 }
 
 // ---------------------------------------------------------------------------
@@ -1692,4 +1721,437 @@ async fn an_unparseable_body_on_the_gated_path_still_gates() {
 
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, Some(RowKind::Blocked));
+}
+
+// ---------------------------------------------------------------------------
+// The lane table + learned model store (phase 2, unit 5)
+// ---------------------------------------------------------------------------
+
+/// Poll the lanes table until it holds exactly `count` rows — the lane
+/// upsert lands at response completion right after (not atomically with)
+/// the ledger row, so a row-count wait is not a lane-count wait.
+async fn wait_for_lanes(store: &Store, count: usize) -> Vec<toker::store::Lane> {
+    for _ in 0..200 {
+        let lanes = store.load_lanes().expect("read lanes");
+        if lanes.len() == count {
+            return lanes;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    store.load_lanes().expect("read lanes")
+}
+
+/// The one lane the session `ccses-42` holds (post_messages' session id),
+/// or panic naming what was actually there.
+fn the_lane(lanes: Vec<toker::store::Lane>) -> toker::store::Lane {
+    let ours: Vec<_> = lanes
+        .iter()
+        .filter(|lane| lane.session_id.as_deref() == Some("ccses-42"))
+        .collect();
+    assert_eq!(ours.len(), 1, "one lane for the session, got {lanes:?}");
+    ours[0].clone()
+}
+
+#[tokio::test]
+async fn lane_rows_written_on_response_upsert_not_duplicate() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // First response: fixture 03 — a 1h-tier write of 82,420 tokens.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("authorization", "Bearer claude-oauth-token")],
+        &tools_body("claude-opus-5", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = wait_for_rows(&store, 1).await;
+    let first_ts = rows[0].ts_ms;
+    let lanes = wait_for_lanes(&store, 1).await;
+    let lane = the_lane(lanes);
+    assert_eq!(
+        lane.prompt_tokens,
+        Some(82_422),
+        "prompt = fresh input + cache read + cache writes (2 + 0 + 82,420)"
+    );
+    assert_eq!(
+        lane.ttl,
+        Some(3_600_000),
+        "the 1h-tier write sets the hour tier"
+    );
+    assert_eq!(lane.ping, None, "an ordinary request is not a ping");
+    assert_eq!(
+        lane.noticed_at, None,
+        "no cold notice has fired (that unit is next)"
+    );
+
+    // Second response in the same lane: fixture 04 (via the mock's 5m-tier
+    // arm) — a warm follow-up whose writes landed on the 5-minute tier.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("authorization", "Bearer claude-oauth-token")],
+        &tools_body("5m-tier", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = wait_for_rows(&store, 2).await;
+
+    // Upsert, not insert: the second response UPDATES the one lane.
+    let lanes = wait_for_lanes(&store, 1).await;
+    assert_eq!(lanes.len(), 1, "same session × tools-hash is one lane");
+    let lane = the_lane(lanes);
+    assert_eq!(lane.updated_ms, rows[1].ts_ms.max(first_ts));
+    assert!(
+        lane.updated_ms > first_ts,
+        "`at` moved with the served response"
+    );
+    assert_eq!(
+        lane.prompt_tokens,
+        Some(5 + 82_420 + 1_200),
+        "the later reading is the lane"
+    );
+    // THE stickiness rule, end to end: a later 5m-only write does not
+    // shorten the 1h prefix the lane already holds.
+    assert_eq!(lane.ttl, Some(3_600_000));
+
+    // The served model was learned: the response identity (fixture 04
+    // names claude-opus-5), with today's local day and the held prompt as
+    // the empirical ceiling.
+    let models = store.load_models().expect("models");
+    assert_eq!(models.len(), 1, "both fixtures served the same identity");
+    assert_eq!(models[0].model_id, "claude-opus-5");
+    let days = models[0]
+        .days_json
+        .as_ref()
+        .and_then(Value::as_array)
+        .expect("days recorded");
+    assert_eq!(days.len(), 1, "both responses landed on one local day");
+    assert_eq!(
+        models[0].max_prompt,
+        Some(83_625),
+        "the ceiling is the max held"
+    );
+    assert_eq!(mock.captured().len(), 2);
+
+    // A different tools-hash is a different conversation, not an update
+    // (the lane rule: one session interleaves several prefixes).
+    let mut other_tools = tools_body("claude-opus-5", true);
+    other_tools.extend_from_slice(br#",{"role":"user","content":"again"}]"#);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("authorization", "Bearer claude-oauth-token")],
+        &serde_json::to_vec(&json!({
+            "model": "claude-opus-5", "stream": true,
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}},
+                {"name": "Grep", "input_schema": {"type": "object"}},
+            ],
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+        .expect("body"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_lanes(&store, 2).await;
+}
+
+#[tokio::test]
+async fn a_request_without_both_halves_writes_no_lane() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // No tools → no tools-hash → no lane, but the row still records.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body("claude-opus-5", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_rows(&store, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        store.load_lanes().expect("lanes").is_empty(),
+        "no tools-hash, no lane"
+    );
+
+    // count_tokens carries the same pipeline but its responses hold no
+    // usage: nothing records, nothing lanes.
+    let response = post_messages(
+        addr,
+        "/v1/messages/count_tokens",
+        &[],
+        &tools_body("claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(store.load_lanes().expect("lanes").is_empty());
+    assert_eq!(mock.captured().len(), 2, "both requests still forwarded");
+}
+
+#[tokio::test]
+async fn ping_tagged_requests_record_the_lane_but_flag_it() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // The window pinger's probe: same pipeline, same lane, flagged.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("x-toker-ping", "1")],
+        &tools_body("claude-opus-5", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows[0].ping,
+        Some(true),
+        "ctp parity: only a ping request says so"
+    );
+    let lane = the_lane(wait_for_lanes(&store, 1).await);
+    assert_eq!(lane.ping, Some(true), "recorded, so restarts remember it");
+
+    // A later ordinary request clears the flag — the flag describes the
+    // latest request, and a lane wrongly marked one is a session the
+    // machine may sleep through.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &tools_body("claude-opus-5", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_rows(&store, 2).await;
+    let lane = the_lane(wait_for_lanes(&store, 1).await);
+    assert_eq!(lane.ping, None);
+    assert_eq!(store.requests_since(0, 10).expect("rows")[1].ping, None);
+}
+
+#[tokio::test]
+async fn lanes_reseed_on_restart_from_the_requests_table() {
+    let (mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, None, "anthropic_sub");
+    let (addr, store) = spawn_toker(config.clone()).await;
+
+    // Two responses in one lane: a 1h-tier write, then a 5m-tier one.
+    for model in ["claude-opus-5", "5m-tier"] {
+        let response = post_messages(addr, "/v1/messages", &[], &tools_body(model, true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    wait_for_rows(&store, 2).await;
+    let lane = the_lane(wait_for_lanes(&store, 1).await);
+    let live_prompt = lane.prompt_tokens;
+    let live_ttl = lane.ttl;
+    assert_eq!(live_ttl, Some(3_600_000), "sticky across both responses");
+
+    // A brand-new Store handle over the same database sees the lane: the
+    // table is durable, not in-process state.
+    let reopened = Store::open(&config.db_path).expect("reopen store");
+    assert_eq!(reopened.load_lanes().expect("lanes").len(), 1);
+
+    // Lose the table entirely (the state ctp's restart-before-flush could
+    // lose) — a restart must rebuild it from the ledger, exactly the
+    // sessions that went quiet before it.
+    {
+        let conn = rusqlite::Connection::open(&config.db_path).expect("wipe connection");
+        conn.execute("DELETE FROM lanes", []).expect("wipe lanes");
+    }
+    assert!(
+        store.load_lanes().expect("lanes").is_empty(),
+        "the wipe took"
+    );
+
+    // Restart: a new Server over the same database reseeds from the
+    // requests table (ctp lanesFromRows), last-wins by ts.
+    let (_addr2, store2) = spawn_toker(config).await;
+    let lanes = store2.load_lanes().expect("lanes");
+    assert_eq!(lanes.len(), 1, "the lane is rebuilt, not invented");
+    let lane = the_lane(lanes);
+    assert_eq!(lane.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(
+        lane.tools_hash,
+        store.load_lanes().expect("lanes")[0].tools_hash
+    );
+    assert_eq!(lane.prompt_tokens, live_prompt, "same per-row derivation");
+    assert_eq!(lane.ttl, live_ttl, "the stickiness rule replays over rows");
+    assert_eq!(lane.noticed_at, None);
+    assert_eq!(mock.captured().len(), 2, "the restart forwarded nothing");
+}
+
+#[tokio::test]
+async fn models_merge_endpoint_merges_served_models_and_moves_the_election() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // The learned store as weeks of history would leave it: an incumbent
+    // with eight days, a newcomer with one. The bar is min(7, 9/2) = 4.5,
+    // so the newcomer's single day is a trial, not an adoption.
+    let incumbent_days: Vec<String> = (0..8).map(|i| format!("2026-09-2{}", i)).collect();
+    let incumbent_refs: Vec<&str> = incumbent_days.iter().map(String::as_str).collect();
+    store
+        .upsert_model(&toker::store::ModelEntry {
+            model_id: "claude-opus-5".to_owned(),
+            days_json: Some(json!(incumbent_refs)),
+            max_prompt: Some(150_000),
+            context_window_json: None,
+        })
+        .expect("upsert incumbent");
+    store
+        .upsert_model(&toker::store::ModelEntry {
+            model_id: "claude-opus-5-5".to_owned(),
+            days_json: Some(json!(["2026-10-01"])),
+            max_prompt: Some(180_000),
+            context_window_json: None,
+        })
+        .expect("upsert newcomer");
+
+    // A merge for the incumbent changes nothing it did not already have,
+    // and reports the family's target as it stands: the newcomer is below
+    // the bar, so the incumbent holds the family.
+    let response = client()
+        .post(toker_url(addr, "/_toker/models/merge"))
+        .header("x-toker-control", "models-merge")
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({"model": "claude-opus-5", "days": [], "maxPrompt": 100}))
+        .send()
+        .await
+        .expect("merge incumbent");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["merged"], json!(["claude-opus-5"]));
+    assert_eq!(body["targets"], json!({"opus": "claude-opus-5"}));
+    // Only adds: a LOWER maxPrompt cannot shrink the ceiling.
+    assert_eq!(
+        store
+            .load_model("claude-opus-5")
+            .expect("load")
+            .expect("entry")
+            .max_prompt,
+        Some(150_000)
+    );
+
+    // The promotion: grant the newcomer days the log already has. The
+    // union clears the bar and the election moves — the reply reports the
+    // effect, not the intent.
+    let granted = incumbent_days[..5].to_vec();
+    let response = client()
+        .post(toker_url(addr, "/_toker/models/merge"))
+        .header("x-toker-control", "models-merge")
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({"model": "claude-opus-5-5", "days": granted, "maxPrompt": 200_000}))
+        .send()
+        .await
+        .expect("merge newcomer");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["targets"], json!({"opus": "claude-opus-5-5"}));
+    let entry = store
+        .load_model("claude-opus-5-5")
+        .expect("load")
+        .expect("entry");
+    // Days union (1 + 5 granted = 6), the higher ceiling kept.
+    assert_eq!(
+        entry.days_json,
+        Some(json!([
+            "2026-09-20",
+            "2026-09-21",
+            "2026-09-22",
+            "2026-09-23",
+            "2026-09-24",
+            "2026-10-01"
+        ])),
+        "days union, sorted and deduped"
+    );
+    assert_eq!(entry.max_prompt, Some(200_000));
+
+    // Unknown model: 4xx naming the store's known identities — never a
+    // silent refusal, never an invented entry.
+    let response = client()
+        .post(toker_url(addr, "/_toker/models/merge"))
+        .header("x-toker-control", "models-merge")
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({"model": "claude-fable-9", "days": ["2026-10-01"]}))
+        .send()
+        .await
+        .expect("merge unknown");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"], json!("unseen"));
+    assert_eq!(body["known"], json!(["claude-opus-5", "claude-opus-5-5"]));
+    assert_eq!(
+        store.load_model("claude-fable-9").expect("load"),
+        None,
+        "a model the proxy never served is never invented"
+    );
+}
+
+#[tokio::test]
+async fn models_merge_endpoint_gates_like_ctp_and_validates_the_body() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // ctp controlMerge proxy.mjs:1076-1079: a wrong verb, method, or
+    // content type is 403 "not a control request" — the two halves (custom
+    // header + JSON content type) are what keep a web page out.
+    for headers in [
+        vec![],
+        vec![("x-toker-control", "status")],
+        vec![("x-toker-control", "models-merge")],
+    ] {
+        let mut request = client().post(toker_url(addr, "/_toker/models/merge"));
+        for (name, value) in &headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.send().await.expect("merge request");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "headers {headers:?} do not pass the gate"
+        );
+    }
+
+    // Right gate, unparseable store: ctp's 400.
+    let response = client()
+        .post(toker_url(addr, "/_toker/models/merge"))
+        .header("x-toker-control", "models-merge")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(b"not json"[..].to_vec())
+        .send()
+        .await
+        .expect("merge request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["error"], json!("unparseable store"));
+
+    // Parseable but not a valid entry (no days array): the same 400 —
+    // ctp pruneSeen drops what does not validate rather than guessing.
+    for body in [
+        json!({"days": []}),
+        json!({"model": "claude-opus-5", "days": "2026-10-01"}),
+        json!({"model": "", "days": []}),
+    ] {
+        let response = client()
+            .post(toker_url(addr, "/_toker/models/merge"))
+            .header("x-toker-control", "models-merge")
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .expect("merge request");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "body {body} is an unparseable store"
+        );
+    }
 }
