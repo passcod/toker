@@ -229,7 +229,11 @@ pub fn newest_in_family_accepting(
 /// an unproven model declines, which costs an upgrade where the
 /// alternative costs a failed request at the worst possible moment.)
 /// Absence reads as zero, never a free pass.
-fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> bool {
+///
+/// Shared by the two rewrites that need it: the compaction retarget
+/// ([`compaction_target_of`]) and the force-newest move
+/// ([`crate::middleware::force_newest`]) — ctp's one `fitsContext`.
+pub(crate) fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> bool {
     entries
         .iter()
         .find(|entry| entry.model_id == model)
@@ -450,6 +454,19 @@ impl ModelStore {
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
         Ok(compaction_target_of(&entries, spec, prompt))
+    }
+
+    /// The strictly-newer learned member of `model`'s family that a
+    /// request could be rewritten onto, proven at `prompt` (ctp
+    /// `forceTarget`, models.mjs:415-422 — the decision core lives in
+    /// [`crate::middleware::force_newest::force_target_of`], where the
+    /// sequencing that calls it is ported). A store error propagates; the
+    /// caller loses the upgrade, never the request (invariant 6).
+    pub fn force_target(&self, model: &str, prompt: u64) -> crate::store::Result<Option<String>> {
+        let entries = self.store.load_models()?;
+        Ok(crate::middleware::force_newest::force_target_of(
+            &entries, model, prompt,
+        ))
     }
 
     /// Every exact identity the store has learned, sorted (for the

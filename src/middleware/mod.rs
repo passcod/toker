@@ -22,10 +22,21 @@
 //! - [`models`] — the learned model store (days served + maxPrompt, ctp
 //!   models.mjs's family parsing and day-based newest election) and the
 //!   in-memory recently-served map, plus the merge semantics the
-//!   `/_toker/models/merge` control endpoint carries.
+//!   `/_toker/models/merge` control endpoint carries;
+//! - [`force_newest`] — the force-newest model rewrite (ctp
+//!   models.mjs's `forceTarget`/`stickyTarget` plus the proxy.mjs block
+//!   that sequences them): move a request onto its family's learned
+//!   newest, only where no cache can be lost, never down, sticky once
+//!   moved;
+//! - [`model_map`] — the model routing map (ctp model-map.mjs): opaque
+//!   operator routing policy, the pure parse/match/rewrite interface the
+//!   `route-identity` parity case pins (config and server wiring are the
+//!   model-routing unit's).
 
 pub mod cold;
+pub mod force_newest;
 pub mod lanes;
+pub mod model_map;
 pub mod models;
 pub mod notice;
 pub mod quota;

@@ -95,6 +95,14 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) downgraded_to: Option<String>,
     pub(crate) cache_stripped: Option<bool>,
     pub(crate) system_merged: Option<bool>,
+    /// The force-newest rewrite's provenance, when it moved this request
+    /// (ctp proxy.mjs:1489-1496): the model asked for and the learned
+    /// family newest it was moved onto. Unlike the retarget this
+    /// transform changes only the model value — the conversation's
+    /// cache_control survives, because the rewrite starts a conversation
+    /// that should cache its prefix on the model it will actually use.
+    pub(crate) forced_from: Option<String>,
+    pub(crate) forced_to: Option<String>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -258,10 +266,23 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
     }
 
     // ctp `noteLaneResponse`: the lane keyed by session × tools-hash, moved
-    // only now that the response completed. `forced` is `None` — the
-    // adaptive rewrite that produces it is a later unit's; a compaction
-    // still neither starts nor ends one.
-    let forced = None;
+    // only now that the response completed. `forced` is the upgrade this
+    // response made (ctp proxy.mjs:1775: `forcedTo ? { from:
+    // modelIdentity(forcedFrom), to: modelIdentity(forcedTo) } : null`) —
+    // the lane keeps it while its cache is warm, and a compaction
+    // neither starts nor ends one (merge_lane's rule). Identities
+    // normalise; a value with no identity records no upgrade, never a
+    // wrong one.
+    let forced = ctx
+        .forced_from
+        .as_deref()
+        .zip(ctx.forced_to.as_deref())
+        .and_then(|(from, to)| {
+            Some(lanes::Forced {
+                from: crate::catalog::windows::model_identity(from)?,
+                to: crate::catalog::windows::model_identity(to)?,
+            })
+        });
     let compaction = ctx
         .shape
         .as_ref()
@@ -423,8 +444,16 @@ fn measurement_row(
         // armed state of each gate at request time.
         gate_on: Some(ctx.server.config.gates.quota_enabled),
         cold_on: Some(ctx.server.config.gates.cold_enabled),
-        forced_from: None,
-        forced_to: None,
+        // ctp proxy.mjs:1748: `...(forcedFrom ? { forcedFrom } : {})` —
+        // the adaptive rewrite's provenance, independent from host
+        // mapping. ctp records `forcedTo` only when the host map also
+        // mapped (`forcedTo && modelMapResult.mapped`), because before a
+        // map the response model implicitly names the adaptive target;
+        // toker has no host map, so the value is unambiguous and both
+        // halves record (the same call the retarget's `downgraded_to`
+        // already makes).
+        forced_from: ctx.forced_from.clone(),
+        forced_to: ctx.forced_to.clone(),
         downgraded_from: ctx.downgraded_from.clone(),
         downgraded_to: ctx.downgraded_to.clone(),
         // The v1 schema fixed these as booleans, so the row records THAT

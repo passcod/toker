@@ -2,14 +2,15 @@
 //! `tests/fixtures/ctp/node-reference-v1.json` (a verbatim copy of
 //! claude-token-proxy's fixture) names one pure decision interface and
 //! the exact normalised result. This harness drives the **quota gate's**
-//! operations (`quota-decision`, `quota-release`) and the **cold gate's**
-//! (`cold-decision`, `compaction-decision`) through the Rust ports and
-//! asserts the expected outputs byte-for-value; that is the whole point
-//! of having vendored the fixture.
+//! operations (`quota-decision`, `quota-release`), the **cold gate's**
+//! (`cold-decision`, `compaction-decision`), and the **model map's**
+//! (`route-identity`) through the Rust ports and asserts the expected
+//! outputs byte-for-value; that is the whole point of having vendored the
+//! fixture.
 //!
-//! The other operations (`usage-presence`, `route-identity`,
-//! `awake-decision`) belong to their own units and are skipped here;
-//! `node_reference_contract.rs` keeps the fixture itself honest.
+//! The other operations (`usage-presence`, `awake-decision`) belong to
+//! their own units and are skipped here; `node_reference_contract.rs`
+//! keeps the fixture itself honest.
 
 use std::fs;
 use std::path::Path;
@@ -19,6 +20,7 @@ use serde_json::Value;
 use toker::ir::Request;
 use toker::middleware::cold::{self, ColdDecision};
 use toker::middleware::lanes::Ttl;
+use toker::middleware::model_map;
 use toker::middleware::quota::{self, GateDecision, Meter, Meters};
 use toker::store::{Allowance, Lane};
 
@@ -316,5 +318,81 @@ fn quota_gate_cases_pass_against_the_vendored_contract() {
     assert!(
         release_cases >= 1,
         "the fixture carries quota-release cases; none dispatched"
+    );
+}
+
+#[test]
+fn model_map_cases_pass_against_the_vendored_contract() {
+    let contract = contract();
+    let mut route_cases = 0;
+
+    for case in contract
+        .get("cases")
+        .and_then(Value::as_array)
+        .expect("an ordered cases array")
+    {
+        let id = case.get("id").and_then(Value::as_str).expect("case id");
+        let operation = case
+            .get("operation")
+            .and_then(Value::as_str)
+            .expect("case operation");
+        let input = case.get("input").expect("case input");
+        let expected = case.get("expected").expect("case expected");
+
+        match operation {
+            // routeIdentity(): the routing identity contract — the model
+            // the client asked for, the model the map sends upstream, and
+            // the model that served stay three distinct things. The
+            // fixture's map is stringified and re-parsed exactly as
+            // node-reference.mjs does (`JSON.stringify(input.modelMap)`),
+            // and the synthetic body carries only a model — no prompt,
+            // completion, system, or tool content enters the fixture.
+            "route-identity" => {
+                let raw_map = serde_json::to_string(input.get("modelMap").expect("case modelMap"))
+                    .expect("serialise the fixture map");
+                let policy = model_map::parse_model_map(&raw_map)
+                    .expect("case model map parses")
+                    .expect("the fixture's map is enabled");
+                let requested = input
+                    .get("requestedModel")
+                    .and_then(Value::as_str)
+                    .expect("case requestedModel");
+                let body = serde_json::to_vec(&serde_json::json!({"model": requested}))
+                    .expect("serialise the fixture body");
+                let rewritten =
+                    model_map::rewrite_mapped_models(Some(&policy), &body, "POST", "/v1/messages");
+                assert_eq!(
+                    rewritten.pre_map_model.as_deref(),
+                    expected.get("requestedModel").and_then(Value::as_str),
+                    "case {id}: requested model"
+                );
+                assert_eq!(
+                    rewritten.effective_model.as_deref(),
+                    expected.get("effectiveModel").and_then(Value::as_str),
+                    "case {id}: effective model"
+                );
+                assert_eq!(
+                    rewritten.mapped,
+                    expected.get("mapped") == Some(&Value::Bool(true)),
+                    "case {id}: mapped"
+                );
+                // `servedModel` is the response identity — the row's, not
+                // the rewrite's. The oracle echoes it; so does this
+                // harness, pinning that the rewrite never touches it.
+                assert_eq!(
+                    input.get("servedModel"),
+                    expected.get("servedModel"),
+                    "case {id}: served model is the response's, untouched"
+                );
+                route_cases += 1;
+            }
+            // Other units' operations: not this harness's to dispatch.
+            _ => continue,
+        }
+    }
+
+    assert!(
+        route_cases >= 1,
+        "the fixture carries route-identity cases; none dispatched"
     );
 }

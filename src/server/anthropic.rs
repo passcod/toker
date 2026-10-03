@@ -61,6 +61,7 @@ use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
 use crate::ir::{Fidelity, Request as IrRequest, compare};
 use crate::middleware::cold;
+use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
 use crate::middleware::quota::{
     Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for,
@@ -312,6 +313,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             downgraded_to: None,
             cache_stripped: None,
             system_merged: None,
+            forced_from: None,
+            forced_to: None,
         });
         gate_shape = Some(shape);
         parsed = Some(ir);
@@ -588,6 +591,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // lane still means its cache writes are bought and never
             // read, so the strip goes ahead without one.
             let prompt = cold_lane
+                .as_ref()
                 .and_then(|lane| lane.prompt_tokens)
                 .filter(|prompt| *prompt >= 0)
                 .unwrap_or_default() as u64;
@@ -631,6 +635,67 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     outcome.merged,
                 );
             }
+        }
+    }
+
+    // ── the force-newest rewrite (ctp proxy.mjs:1444-1500) ──
+    //
+    // Use the newest version of whatever model was asked for — but only
+    // where no cache can be lost by it. A known lane that is cold has
+    // nothing to lose; an UNKNOWN lane is the awkward one (the table
+    // forgets lanes, so a session whose cache is warm upstream can look
+    // brand new here), and qualifies when the request itself shows a
+    // short conversation, or when nothing has been served on the model
+    // it asks for within a full TTL — no cache it could read exists.
+    // Once a lane has been moved it stays moved while its cache is warm:
+    // that cache is on the new model now, and sending the client's
+    // choice through would rebuild it on the old one.
+    //
+    // Never runs after a compaction retarget that moved the model (ctp's
+    // `!downgradedFrom`): that rewrite already chose the model this
+    // compaction will run on. The only body edit is set_model — every
+    // cache_control survives, unlike the retarget, because this rewrite
+    // STARTS a conversation that should cache its prefix on the model it
+    // is actually going to use. The fidelity compare ran on the
+    // pre-transform body, so this deliberate rewrite can never surface as
+    // drift.
+    if path == "/v1/messages"
+        && server.config.gates.force_newest
+        && record
+            .as_ref()
+            .is_none_or(|ctx| ctx.downgraded_from.is_none())
+        && let Some(ir) = parsed.as_mut()
+    {
+        // ctp `asked` (proxy.mjs:1469): the model the body names as it
+        // stands at this point — after routing, after any retarget —
+        // which is `served_model`'s reading here. The lane is the same
+        // record the cold gate loaded; the shape is the request's own,
+        // pre-transform (ctp's ordering: the row's shape fields are).
+        let decision = force_newest::decide(
+            &force_newest::ForceContext {
+                model: served_model.as_deref(),
+                lane: cold_lane.as_ref(),
+                req_messages: gate_shape.as_ref().and_then(|shape| shape.req_messages),
+                compaction: gate_shape
+                    .as_ref()
+                    .is_some_and(AnthropicShape::is_compaction),
+                body_bytes: forward.len() as u64,
+                min_idle_ms: cold_idle_ms(&server.config.gates),
+                now_ms: now_ms(),
+            },
+            &server.models,
+        );
+        if let ForceDecision::Move(forced) = decision {
+            ir.anthropic_mut().set_model(&forced.to);
+            forward = Bytes::from(ir.serialise());
+            if let Some(ctx) = record.as_mut() {
+                ctx.forced_from = Some(forced.from.clone());
+                ctx.forced_to = Some(forced.to.clone());
+            }
+            // ctp `servedModel = target` (proxy.mjs:1495): the mark below
+            // must see the model actually being sent.
+            served_model = Some(forced.to.clone());
+            tracing::info!("model: {} → {}", forced.from, forced.to);
         }
     }
 

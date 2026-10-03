@@ -141,6 +141,18 @@ pub struct GatesConfig {
     /// than Haiku: Haiku 4.5's window is 200k and the lanes this fires on
     /// routinely hold three times that.
     pub compact_model: Option<String>,
+    /// The force-newest model rewrite (ctp `CTP_FORCE_NEWEST`, default
+    /// ON — ctp disables it with exactly `CTP_FORCE_NEWEST=off`):
+    /// transparently move a request onto the newest version of its
+    /// model's family that the log has proven, but only where no cache
+    /// can be lost by the move — a cold lane, an unknown lane with a
+    /// barely-started conversation, or a model nothing has been served on
+    /// within a full cache TTL. Never downgrades, never exceeds a
+    /// target's observed maxPrompt, and sticky once moved (the lane's
+    /// cache lives on the new model). Anthropic usage path only, in
+    /// ctp's exact sequencing slot: after the compaction retarget, before
+    /// the served-model mark.
+    pub force_newest: bool,
 }
 
 impl Default for GatesConfig {
@@ -153,6 +165,7 @@ impl Default for GatesConfig {
             cold_min_tokens: crate::middleware::cold::DEFAULT_MIN_TOKENS,
             cold_idle_min: None,
             compact_model: None,
+            force_newest: true,
         }
     }
 }
@@ -349,6 +362,8 @@ impl Config {
                     .unwrap_or(crate::middleware::cold::DEFAULT_MIN_TOKENS),
                 cold_idle_min: file.gates.cold_idle_min,
                 compact_model: file.gates.compact_model,
+                // ctp's `CTP_FORCE_NEWEST !== "off"`: on unless disabled.
+                force_newest: file.gates.force_newest.unwrap_or(true),
             },
         };
 
@@ -452,6 +467,7 @@ struct FileGates {
     /// out).
     cold_idle_min: Option<f64>,
     compact_model: Option<String>,
+    force_newest: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -614,6 +630,10 @@ mod tests {
         assert_eq!(config.gates.cold_min_tokens, 175_000);
         assert_eq!(config.gates.cold_idle_min, None);
         assert_eq!(config.gates.compact_model, None);
+        // The force-newest rewrite defaults ON, ctp's
+        // `CTP_FORCE_NEWEST !== "off"`: a proxy that silently stopped
+        // upgrading is a proxy pinned below every newer model.
+        assert!(config.gates.force_newest);
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -768,7 +788,7 @@ quota_enabled = false
         let config = load(
             "[gates]\ncold_enabled = false\ncold_outlook = false\n\
              cold_min_tokens = 50000\ncold_idle_min = 0.5\n\
-             compact_model = \"claude-sonnet-5\"\n",
+             compact_model = \"claude-sonnet-5\"\nforce_newest = false\n",
         )
         .expect("cold gates load");
         assert!(!config.gates.cold_enabled);
@@ -779,6 +799,8 @@ quota_enabled = false
             config.gates.compact_model.as_deref(),
             Some("claude-sonnet-5")
         );
+        // The force-newest toggle reads too — ctp's CTP_FORCE_NEWEST=off.
+        assert!(!config.gates.force_newest);
 
         // A negative idle floor is a config error, not a gate that fires
         // on every request.
