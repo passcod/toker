@@ -96,6 +96,18 @@ impl CostKind {
     }
 }
 
+/// CLI-facing parse ([`CostKind::parse`] with the value spelled out in the
+/// error, for `--cost-kind`).
+impl std::str::FromStr for CostKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("unknown cost kind {s:?} (expected billed, estimated, or plan_equivalent)")
+        })
+    }
+}
+
 /// Invariant 3: proxy-written rows are never API measurements. A row is an
 /// API measurement iff its kind is `None` — that is the whole rule, kept in
 /// one place so every consumer (TUI, report, export) classifies identically.
@@ -242,7 +254,8 @@ pub struct RequestRow {
 }
 
 /// Insert one row. The only writer to `requests`; named parameters keep the
-/// SQL columns and the bound fields aligned.
+/// SQL columns and the bound fields aligned. The statement is cached on the
+/// connection, so the batch path ([insert_batch]) parses it once.
 pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     // JSON columns are serialised once up front; usage_raw is already text
     // and passes through verbatim.
@@ -255,7 +268,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let kind = row.kind.map(RowKind::as_str);
     let cost_kind = row.cost_kind.map(CostKind::as_str);
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "INSERT INTO requests (
             ts_ms, duration_ms, kind, frontend, provider, route, session_id, ping,
             model, raw_model, requested_model, effective_model,
@@ -343,6 +356,32 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":fast": row.fast,
     })?;
     Ok(())
+}
+
+/// Insert many rows in one transaction — the `toker import` batch path
+/// (plan: Storage). One transaction per batch keeps a 54 MB ingest from
+/// holding one giant write transaction, while a failure can never expose
+/// a partial batch: the transaction commits whole or not at all. Returns
+/// the first and last assigned row ids (`(None, None)` for an empty
+/// batch), so the importer can checkpoint the id range its rows occupy —
+/// the undo path for export-style tooling; the insert-only convention
+/// means the importer itself never deletes.
+pub(super) fn insert_batch(
+    conn: &mut Connection,
+    rows: &[RequestRow],
+) -> Result<(Option<i64>, Option<i64>)> {
+    if rows.is_empty() {
+        return Ok((None, None));
+    }
+    let tx = conn.transaction()?;
+    let mut first_id = None;
+    for row in rows {
+        insert(&tx, row)?;
+        first_id.get_or_insert_with(|| tx.last_insert_rowid());
+    }
+    let last_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok((first_id, Some(last_id)))
 }
 
 /// Rows with `ts_ms >= ts_ms`, oldest first. When the window holds more

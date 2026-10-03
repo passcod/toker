@@ -131,6 +131,15 @@ impl Store {
         ledger::insert(&*self.conn()?, row)
     }
 
+    /// Append many rows in one transaction — the import batch path (plan:
+    /// `toker import`). Returns the first and last assigned row ids so the
+    /// importer can checkpoint the id range its rows occupy; see
+    /// `ledger::insert_batch` for the batching rationale.
+    pub fn record_requests(&self, rows: &[RequestRow]) -> Result<(Option<i64>, Option<i64>)> {
+        let mut conn = self.conn()?;
+        ledger::insert_batch(&mut conn, rows)
+    }
+
     /// Rows with `ts_ms >= ts_ms`, oldest first; when the window holds more
     /// than `limit` rows the newest `limit` are kept (see `ledger`).
     pub fn requests_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<RequestRow>> {
@@ -585,6 +594,28 @@ mod tests {
             "window past the newest row is empty"
         );
         assert_eq!(store.count_requests().expect("count"), 5);
+    }
+
+    #[test]
+    fn batched_rows_share_one_transaction_and_report_their_id_range() {
+        let store = mem_store();
+        // An empty batch touches nothing and claims no ids.
+        assert_eq!(
+            store.record_requests(&[]).expect("empty batch"),
+            (None, None)
+        );
+
+        let rows: Vec<RequestRow> = (0..5).map(bare_row).collect();
+        let (first, last) = store.record_requests(&rows).expect("batch insert");
+        assert_eq!((first, last), (Some(1), Some(5)), "ids span the batch");
+        assert_eq!(store.count_requests().expect("count"), 5);
+
+        // A later batch continues the range; each batch is its own
+        // transaction.
+        let more: Vec<RequestRow> = (5..7).map(bare_row).collect();
+        let (first, last) = store.record_requests(&more).expect("second batch");
+        assert_eq!((first, last), (Some(6), Some(7)));
+        assert_eq!(store.count_requests().expect("count"), 7);
     }
 
     #[test]

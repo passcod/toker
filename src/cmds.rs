@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::server::Server;
-use crate::store::Store;
+use crate::store::{CostKind, Store};
 
 /// `serve`: config → store → server, with tracing on.
 pub async fn serve() -> anyhow::Result<()> {
@@ -84,6 +84,27 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
     let db_path = db.unwrap_or(config.db_path);
     crate::tui::run(&db_path, window_mins)
+}
+
+/// `import`: ingest ctp's usage.jsonl into the ledger (plan: Storage).
+/// `--db` overrides the path; otherwise `TOKER_DB` and the config default
+/// apply (Config::load already layered env over file).
+pub fn import(
+    from: PathBuf,
+    db: Option<PathBuf>,
+    cost_kind: CostKind,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let db = db.unwrap_or(config.db_path);
+    crate::import::run(crate::import::ImportOpts {
+        from,
+        db,
+        cost_kind,
+        force,
+        dry_run,
+    })
 }
 
 /// A local-clock rendering of a row ts (the system zone; UTC-shaped on

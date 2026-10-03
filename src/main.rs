@@ -8,6 +8,7 @@
 //! dashboard. The modules live in the `toker` library crate (src/lib.rs).
 
 use toker::cmds;
+use toker::store::CostKind;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -46,7 +47,26 @@ enum Command {
     /// Show configuration and backend status (plan: Credentials).
     Status,
     /// Ingest ctp's usage.jsonl into the ledger (plan: Storage).
-    Import,
+    Import {
+        /// The ctp usage.jsonl to import.
+        #[arg(long = "from", value_name = "PATH")]
+        from: PathBuf,
+        /// Ledger path; TOKER_DB env or the config default when omitted.
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<PathBuf>,
+        /// Cost semantics for imported costUsd (plan: Storage); ctp priced
+        /// at list rates on a subscription, so plan-equivalent is the
+        /// default and api-era logs want `estimated`.
+        #[arg(long = "cost-kind", default_value = "plan_equivalent")]
+        cost_kind: CostKind,
+        /// Re-import the whole file even though a checkpoint says otherwise
+        /// (the ledger is insert-only, so the old rows stay: duplicates).
+        #[arg(long)]
+        force: bool,
+        /// Parse and report; insert nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     /// Emit the ledger as JSONL for greppability (plan: Storage).
     Export,
 
@@ -73,7 +93,13 @@ fn main() -> anyhow::Result<()> {
         Command::Report => not_implemented("report"),
         Command::Setup => not_implemented("setup"),
         Command::Status => cmds::status(),
-        Command::Import => not_implemented("import"),
+        Command::Import {
+            from,
+            db,
+            cost_kind,
+            force,
+            dry_run,
+        } => cmds::import(from, db, cost_kind, force, dry_run),
         Command::Export => not_implemented("export"),
         Command::WakeArm => cmds::wake_arm(),
         Command::Hold => cmds::hold(),

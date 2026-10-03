@@ -566,7 +566,7 @@ mod tests {
         // 5-minute tier: live now, expired one tick past the window.
         let live_5m = lane(NOW - 1_000, Some(Ttl::FiveMinutes.as_ms()), false);
         assert_eq!(
-            decide_awake(&[live_5m.clone()], 0, NOW),
+            decide_awake(std::slice::from_ref(&live_5m), 0, NOW),
             AwakeDecision {
                 hold: true,
                 until: Some(NOW - 1_000 + FIVE_MINUTES),
@@ -575,14 +575,14 @@ mod tests {
         );
         // The boundary: expires == now is gone (ctp `expires <= now`).
         let expired_5m = lane(NOW - FIVE_MINUTES, Some(Ttl::FiveMinutes.as_ms()), false);
-        assert_eq!(decide_awake(&[expired_5m], 0, NOW).hold, false);
+        assert!(!decide_awake(&[expired_5m], 0, NOW).hold);
         // One tick before the boundary: still live.
         let almost = lane(
             NOW - FIVE_MINUTES + 1,
             Some(Ttl::FiveMinutes.as_ms()),
             false,
         );
-        assert_eq!(decide_awake(&[almost], 0, NOW).hold, true);
+        assert!(decide_awake(&[almost], 0, NOW).hold);
 
         // 1-hour tier, and the unrecorded tier reads as the hour (ctp
         // ttlOf: anything not "5m" is the long one — guessing short would
@@ -666,7 +666,7 @@ mod tests {
         let late = lane(NOW - 2_000, Some(Ttl::Hour.as_ms()), false);
         let expired = lane(NOW - HOUR - 5_000, Some(Ttl::Hour.as_ms()), false);
         let decision = decide_awake(&[early, late, expired], 0, NOW);
-        assert_eq!(decision.hold, true);
+        assert!(decision.hold);
         assert_eq!(decision.until, Some(NOW - 2_000 + HOUR));
         assert_eq!(decision.reason, "2 live lanes");
     }
@@ -959,8 +959,8 @@ mod tests {
         let second = state
             .evaluate(&release(), NOW + 60_000)
             .expect("the flip back is a row");
-        assert_eq!(second.held, false);
-        assert_eq!(second.want, false);
+        assert!(!second.held);
+        assert!(!second.want);
         assert_eq!(fake.kills(), 1, "release kills the child's group");
         // No further evaluation writes anything until a flip.
         assert_eq!(state.evaluate(&release(), NOW + 61_000), None);
@@ -1004,8 +1004,8 @@ mod tests {
         let row = state
             .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + RETRY_MS)
             .expect("the retry takes the lock, a flip off never-held");
-        assert_eq!(row.held, true);
-        assert_eq!(row.want, true);
+        assert!(row.held);
+        assert!(row.want);
         assert_eq!(fake.attempts(), 2);
         assert_eq!(
             state.failed_at,
@@ -1022,7 +1022,7 @@ mod tests {
         let row = state
             .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW)
             .expect("held");
-        assert_eq!(row.held, true);
+        assert!(row.held);
 
         // The session bus goes away; the child exits. The next
         // evaluation sees it (ctp's exit listener, polled here) and the
@@ -1033,8 +1033,8 @@ mod tests {
         let row = state
             .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 10_000)
             .expect("losing the lock is a flip");
-        assert_eq!(row.held, false);
-        assert_eq!(row.want, true);
+        assert!(!row.held);
+        assert!(row.want);
         assert_eq!(fake.kills(), 0);
         assert_eq!(state.failed_at, Some(NOW + 10_000));
 
@@ -1053,7 +1053,7 @@ mod tests {
                 NOW + 10_000 + RETRY_MS,
             )
             .expect("re-spawned after the backoff");
-        assert_eq!(row.held, true);
+        assert!(row.held);
         assert_eq!(fake.attempts(), 2);
     }
 
@@ -1077,7 +1077,7 @@ mod tests {
         let row = state
             .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 2 * RETRY_MS)
             .expect("takes the lock");
-        assert_eq!(row.held, true);
+        assert!(row.held);
         state.evaluate(&release(), NOW + 2 * RETRY_MS + 1);
         assert!(!state.complained, "a lasting release re-arms the complaint");
 
@@ -1104,7 +1104,7 @@ mod tests {
             );
         }
         assert_eq!(fake.attempts(), 0);
-        assert_eq!(state.held(), false);
+        assert!(!state.held());
     }
 
     // ── the real spawner, manual verification only ─────────────────
@@ -1126,7 +1126,7 @@ mod tests {
         let row = state
             .evaluate(&hold(Some(now + 60_000), "manual verification"), now)
             .expect("the lock was taken");
-        assert_eq!(row.held, true);
+        assert!(row.held);
 
         // Give a broken child time to die (a missing session bus kills
         // systemd-inhibit within milliseconds), then re-evaluate: no flip
@@ -1143,6 +1143,6 @@ mod tests {
         let row = state
             .evaluate(&release(), now)
             .expect("the release is a flip");
-        assert_eq!(row.held, false);
+        assert!(!row.held);
     }
 }
