@@ -38,6 +38,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::ir::Shape;
+use crate::middleware::awake;
 use crate::observe::UsageCapture;
 use crate::store::{CostKind, RequestRow, RowKind};
 
@@ -155,6 +156,95 @@ pub(crate) fn record_error(
 /// The route column, `frontend:backend`.
 fn route_of(ctx: &RecordCtx) -> String {
     format!("openai_chat:{}", ctx.server.openrouter.id())
+}
+
+/// Record one sleep-lock transition (ctp: `kind: "awake"`, the row
+/// `evaluateAwake` writes on every held flip, proxy.mjs:472-479).
+///
+/// The row is what separates "released because the sessions went quiet"
+/// from "the lock quietly stopped working": both leave a machine that
+/// sleeps. `want` differing from `held` is a lock that could not be
+/// taken. ctp's shape `{held, want, until, reason}` rides the
+/// kind-specific payload column; `until` is epoch milliseconds (ctp
+/// logged an ISO string — toker's rows keep the ts_ms convention), `None`
+/// where the hold rests on something without an expiry or there is no
+/// hold. No duration, no session, never priced — a proxy-written row,
+/// excluded from API measurements by its kind.
+pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition, now: i64) {
+    let row = RequestRow {
+        id: None,
+        ts_ms: now,
+        duration_ms: None,
+        kind: Some(RowKind::Awake),
+        frontend: None,
+        provider: None,
+        route: None,
+        session_id: None,
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: None,
+        cold_on: None,
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: Some(json!({
+            "held": transition.held,
+            "want": transition.want,
+            "until": transition.until,
+            "reason": transition.reason,
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "sleep lock {} ({})",
+        if transition.held { "held" } else { "released" },
+        transition.reason,
+    );
 }
 
 fn drift_note(ctx: &RecordCtx) -> String {

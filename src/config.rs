@@ -88,6 +88,13 @@ pub struct Config {
     pub anthropic_api: AnthropicApiConfig,
     /// The middleware gates block.
     pub gates: GatesConfig,
+    /// The idle-sleep lock (ctp `CTP_AWAKE !== "off"`, proxy.mjs:440 —
+    /// on by default, disabled with exactly `CTP_AWAKE=off`): while any
+    /// lane is live or any request is in flight, hold an idle-only
+    /// sleep lock so desktop idle-suspend cannot kill running sessions
+    /// (see [`crate::middleware::awake`]). Off → never hold, never
+    /// spawn, never write awake rows.
+    pub awake: bool,
 }
 
 /// The `[gates]` block, resolved (plan: Middleware — route-scoped toggles,
@@ -365,6 +372,8 @@ impl Config {
                 // ctp's `CTP_FORCE_NEWEST !== "off"`: on unless disabled.
                 force_newest: file.gates.force_newest.unwrap_or(true),
             },
+            // ctp's `CTP_AWAKE !== "off"`: on unless disabled.
+            awake: file.awake.unwrap_or(true),
         };
 
         // Env overrides (config file loses).
@@ -448,6 +457,8 @@ struct FileConfig {
     ping_header_name: Option<String>,
     default_backend_openai_chat: Option<String>,
     default_backend_anthropic: Option<String>,
+    /// The idle-sleep lock toggle (ctp `CTP_AWAKE`).
+    awake: Option<bool>,
     providers: FileProviders,
     gates: FileGates,
 }
@@ -634,6 +645,10 @@ mod tests {
         // `CTP_FORCE_NEWEST !== "off"`: a proxy that silently stopped
         // upgrading is a proxy pinned below every newer model.
         assert!(config.gates.force_newest);
+        // The idle-sleep lock defaults ON, ctp's `CTP_AWAKE !== "off"`:
+        // a proxy that silently stopped holding the machine awake is a
+        // proxy whose sessions die to idle-suspend.
+        assert!(config.awake);
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -880,6 +895,27 @@ quota_enabled = false
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let error = super::Config::load().expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
+    }
+
+    #[test]
+    fn the_awake_toggle_reads_the_file_and_defaults_on() {
+        let dir = test_dir("awake-toggle");
+        let load = |text: &str| {
+            let _guard = env_lock().lock().unwrap();
+            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+            fs::write(dir.join("toker.toml"), text).expect("write config");
+            super::Config::load()
+        };
+
+        // ctp's `CTP_AWAKE !== "off"`: off is the only way to disable it.
+        assert!(
+            !load("awake = false\n").expect("off loads").awake,
+            "the file value is read"
+        );
+        assert!(
+            load("port = 19999\n").expect("absent key parses").awake,
+            "absent awake = default = on"
+        );
     }
 
     #[test]

@@ -3,14 +3,15 @@
 //! claude-token-proxy's fixture) names one pure decision interface and
 //! the exact normalised result. This harness drives the **quota gate's**
 //! operations (`quota-decision`, `quota-release`), the **cold gate's**
-//! (`cold-decision`, `compaction-decision`), and the **model map's**
-//! (`route-identity`) through the Rust ports and asserts the expected
-//! outputs byte-for-value; that is the whole point of having vendored the
+//! (`cold-decision`, `compaction-decision`), the **model map's**
+//! (`route-identity`), and the **sleep lock's** (`awake-decision`)
+//! through the Rust ports and asserts the expected outputs
+//! byte-for-value; that is the whole point of having vendored the
 //! fixture.
 //!
-//! The other operations (`usage-presence`, `awake-decision`) belong to
-//! their own units and are skipped here; `node_reference_contract.rs`
-//! keeps the fixture itself honest.
+//! The remaining operation (`usage-presence`) belongs to its own unit
+//! and is skipped here; `node_reference_contract.rs` keeps the fixture
+//! itself honest.
 
 use std::fs;
 use std::path::Path;
@@ -18,6 +19,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use toker::ir::Request;
+use toker::middleware::awake::decide_awake;
 use toker::middleware::cold::{self, ColdDecision};
 use toker::middleware::lanes::Ttl;
 use toker::middleware::model_map;
@@ -318,6 +320,96 @@ fn quota_gate_cases_pass_against_the_vendored_contract() {
     assert!(
         release_cases >= 1,
         "the fixture carries quota-release cases; none dispatched"
+    );
+}
+
+#[test]
+fn awake_cases_pass_against_the_vendored_contract() {
+    let contract = contract();
+    let mut awake_cases = 0;
+
+    for case in contract
+        .get("cases")
+        .and_then(Value::as_array)
+        .expect("an ordered cases array")
+    {
+        let id = case.get("id").and_then(Value::as_str).expect("case id");
+        let operation = case
+            .get("operation")
+            .and_then(Value::as_str)
+            .expect("case operation");
+        let input = case.get("input").expect("case input");
+        let expected = case.get("expected").expect("case expected");
+
+        match operation {
+            // decideAwake(): hold or release, off the lane table. The
+            // fixture's `now` is epoch milliseconds and its lanes carry
+            // ctp's `at`/`prompt`/`ttl`/`ping` shape, remapped onto the
+            // store's lane row (`inFlight` defaults to 0, ctp's own
+            // default).
+            "awake-decision" => {
+                let now_ms = input.get("now").and_then(Value::as_i64).expect("case now");
+                let in_flight = input.get("inFlight").and_then(Value::as_u64).unwrap_or(0);
+                let lanes: Vec<Lane> = input
+                    .get("lanes")
+                    .and_then(Value::as_object)
+                    .map(|entries| {
+                        entries
+                            .values()
+                            .map(|lane| Lane {
+                                key: "fixture|fixture".to_owned(),
+                                session_id: Some("fixture".to_owned()),
+                                tools_hash: Some("fixture".to_owned()),
+                                updated_ms: lane
+                                    .get("at")
+                                    .and_then(Value::as_i64)
+                                    .expect("lane at"),
+                                prompt_tokens: lane.get("prompt").and_then(Value::as_i64),
+                                // ctp `ttlOf`: only the exact "5m" is the
+                                // short tier; everything else (including
+                                // "1h" here) reads as the hour.
+                                ttl: match lane.get("ttl").and_then(Value::as_str) {
+                                    Some("5m") => Some(Ttl::FiveMinutes.as_ms()),
+                                    _ => Some(Ttl::Hour.as_ms()),
+                                },
+                                ping: (lane.get("ping") == Some(&Value::Bool(true)))
+                                    .then_some(true),
+                                noticed_at: None,
+                                forced_from: None,
+                                forced_to: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let decision = decide_awake(&lanes, in_flight, now_ms);
+                assert_eq!(
+                    decision.hold,
+                    expected.get("hold") == Some(&Value::Bool(true)),
+                    "case {id}: hold"
+                );
+                assert_eq!(
+                    decision.until,
+                    expected.get("until").and_then(Value::as_i64),
+                    "case {id}: until (epoch ms, ctp's own unit for it)"
+                );
+                assert_eq!(
+                    decision.reason,
+                    expected
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .expect("case reason"),
+                    "case {id}: reason"
+                );
+                awake_cases += 1;
+            }
+            // Other units' operations: not this harness's to dispatch.
+            _ => continue,
+        }
+    }
+
+    assert!(
+        awake_cases >= 1,
+        "the fixture carries awake-decision cases; none dispatched"
     );
 }
 

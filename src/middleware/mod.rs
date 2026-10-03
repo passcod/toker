@@ -19,6 +19,12 @@
 //! - [`lanes`] — the lane table (`sessionId|toolsHash`, ctp docs/internals/
 //!   lanes.md's lane rule) with its TTL stickiness, ping tagging, prune
 //!   policy, and restart reseed — the substrate both gates read;
+//! - [`awake`] — the idle-sleep lock (ctp awake.mjs + inhibit.mjs + the
+//!   `evaluateAwake` wiring): live lanes + in-flight want-to-hold, the
+//!   platform command table (GNOME → `gnome-session-inhibit`, other
+//!   Linux → `systemd-inhibit --what=idle --mode=block`), the detached
+//!   PID-watching child, the 5-minute retry backoff, and the held/want
+//!   flip bookkeeping — Linux v1, idle-only on purpose;
 //! - [`models`] — the learned model store (days served + maxPrompt, ctp
 //!   models.mjs's family parsing and day-based newest election) and the
 //!   in-memory recently-served map, plus the merge semantics the
@@ -33,6 +39,7 @@
 //!   `route-identity` parity case pins (config and server wiring are the
 //!   model-routing unit's).
 
+pub mod awake;
 pub mod cold;
 pub mod force_newest;
 pub mod lanes;

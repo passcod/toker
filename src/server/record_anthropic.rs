@@ -154,6 +154,13 @@ pub(crate) fn record_anthropic_measurement(
         drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
+
+    // The lane table just moved, so the sleep lock is re-evaluated (ctp
+    // proxy.mjs:1778: `evaluateAwake()` runs right after
+    // `noteLaneResponse` — pings included, since a ping's response is
+    // what marks its lane). Idempotent: the request's own in-flight hold,
+    // if any, is still standing until its body is dropped.
+    ctx.server.evaluate_awake();
 }
 
 /// Record a non-2xx anthropic usage-path response (plan: Server core): an

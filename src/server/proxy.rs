@@ -46,6 +46,7 @@ use crate::ir::{Fidelity, Request as IrRequest, compare};
 use crate::observe::{SseSplitter, UsageObserver};
 use crate::providers::Provider;
 
+use super::InFlightGuard;
 use super::Server;
 use super::record::{
     RecordCtx, parse_error_type, record_error, record_measurement, retry_after_ms,
@@ -80,6 +81,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             );
         }
     };
+
+    // A request being served holds the machine awake (ctp
+    // proxy.mjs:1126-1132): a lane's `at` moves only when a response
+    // finishes, and one long turn can outlast a 5-minute tier. The
+    // openai path has no ping lanes — the window pinger tags anthropic
+    // lanes — so every chat completion counts. The guard's Drop is the
+    // decrement, so no early return can leak it; for a streamed
+    // response it rides the body stream.
+    let in_flight = Some(server.begin_in_flight());
 
     // 2.-5. Parse, fidelity-check, route.
     let mut forward = original.clone();
@@ -134,12 +144,13 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     )
     .await
     {
-        Ok(upstream) => forward_upstream(upstream, record).await,
+        Ok(upstream) => forward_upstream(upstream, record, in_flight).await,
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
             // provider-response-shaped (status/type/retry-after), so this
             // surfaces as 502 unledgered and logged — never a fabricated
-            // provider status.
+            // provider status. The guard drops here too: the exchange is
+            // over, however it ended.
             tracing::warn!(%error, "upstream request failed");
             plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
         }
@@ -170,7 +181,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
     )
     .await
     {
-        Ok(upstream) => forward_upstream(upstream, None).await,
+        Ok(upstream) => forward_upstream(upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
             plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
@@ -218,9 +229,14 @@ pub(crate) async fn send_upstream(
 /// Forward one upstream response to the client, branching on
 /// compression / status / content-type. `record` is the chat-path
 /// completion context; `None` means pure transparent forwarding.
+/// `in_flight` is the request's sleep-lock hold: it rides the SSE
+/// stream (dropping when axum drops the body — ctp's `close`, "however
+/// the exchange ends") and drops at the end of this function on every
+/// other branch, after whatever row was owed has landed.
 pub(crate) async fn forward_upstream(
     upstream: reqwest::Response,
     record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
 ) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -255,7 +271,7 @@ pub(crate) async fn forward_upstream(
     // SSE: chunks stream through with backpressure (axum Body from a
     // stream), each also feeding the side observation.
     if is_event_stream(&upstream_headers) {
-        let stream = ObservedStream::new(upstream, status.as_u16(), ctx);
+        let stream = ObservedStream::new(upstream, status.as_u16(), ctx, in_flight);
         let body = Body::from_stream(stream);
         return build_response(status, response_headers(&upstream_headers, false), body);
     }
@@ -456,11 +472,21 @@ struct ObservedStream {
     /// The recording context, taken at completion: only a completed
     /// stream records (a hung-up one records nothing, plan: Server core).
     ctx: Option<RecordCtx>,
+    /// The request's sleep-lock hold, riding the stream: it drops when
+    /// axum drops the body — natural completion or client hangup — so the
+    /// in-flight count never leaks on a streamed response (ctp's
+    /// `res.on("close")`).
+    in_flight: Option<InFlightGuard>,
     status: u16,
 }
 
 impl ObservedStream {
-    fn new(response: reqwest::Response, status: u16, ctx: RecordCtx) -> ObservedStream {
+    fn new(
+        response: reqwest::Response,
+        status: u16,
+        ctx: RecordCtx,
+        in_flight: Option<InFlightGuard>,
+    ) -> ObservedStream {
         let (abort, registration) = AbortHandle::new_pair();
         let stream: UpstreamBody = Box::pin(response.bytes_stream());
         ObservedStream {
@@ -469,6 +495,7 @@ impl ObservedStream {
             splitter: SseSplitter::new(),
             observer: UsageObserver::new(),
             ctx: Some(ctx),
+            in_flight,
             status,
         }
     }
@@ -494,6 +521,9 @@ impl Stream for ObservedStream {
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
+                // The exchange is over however it ended (ctp: `close`
+                // fires on failure too): the in-flight hold goes with it.
+                drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Ready(None) => {
@@ -511,6 +541,10 @@ impl Stream for ObservedStream {
                     let capture = std::mem::take(observer).finish();
                     record_measurement(&ctx, capture.as_ref(), this.status);
                 }
+                // The response is done, so the in-flight hold ends now —
+                // ctp's `res.on("close")` fires at stream end, and a
+                // hung-up stream ends it in Drop instead.
+                drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
         }

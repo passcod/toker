@@ -399,6 +399,10 @@ fn test_config(
             api_key,
         },
         gates: toker::config::GatesConfig::default(),
+        // The sleep lock stays off in tests: the real spawner would take
+        // a REAL idle-sleep lock on the host running the suite. The awake
+        // suite (server_awake.rs) injects a fake spawner and turns it on.
+        awake: false,
     }
 }
 

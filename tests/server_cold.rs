@@ -185,6 +185,10 @@ fn test_config(upstream: reqwest::Url) -> Config {
             api_key: None,
         },
         gates: GatesConfig::default(),
+        // The sleep lock stays off in tests: the real spawner would take
+        // a REAL idle-sleep lock on the host running the suite. The awake
+        // suite (server_awake.rs) injects a fake spawner and turns it on.
+        awake: false,
     }
 }
 

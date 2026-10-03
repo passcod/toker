@@ -70,6 +70,7 @@ use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
 use crate::store::{Allowance, MetersSnapshot};
 
+use super::InFlightGuard;
 use super::Server;
 use super::proxy::{
     MAX_ERROR_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_BUFFER, UpstreamBody, buffer_up_to,
@@ -147,6 +148,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             );
         }
     };
+
+    // A gated non-ping request is in flight (ctp proxy.mjs:1129-1132:
+    // `if (gated && !isPing(req.headers))` — count_tokens and batches are
+    // never `gated`, ctp's exact-path match, so they do not count): a
+    // request being served holds the machine awake, pings aside. The
+    // guard's Drop is the decrement, so no early return — a blocked
+    // answer, a cold notice, a 502 — can leak the count; for a streamed
+    // response it rides the body stream.
+    let in_flight = (path == "/v1/messages" && !ping).then(|| server.begin_in_flight());
 
     // 2.-5. Parse, fidelity-check, route.
     let mut forward = original.clone();
@@ -715,12 +725,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // through (ctp parity — see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.
     match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
-        Ok(upstream) => forward_response(server, backend, upstream, record).await,
+        Ok(upstream) => forward_response(server, backend, upstream, record, in_flight).await,
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
             // provider-response-shaped (status/type/retry-after), so this
             // surfaces as 502 unledgered and logged — never a fabricated
-            // provider status.
+            // provider status. The guard drops here too: the exchange is
+            // over, however it ended.
             tracing::warn!(%error, "upstream request failed");
             plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
         }
@@ -794,7 +805,8 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// anthropic backend, auth rules applied, bytes both ways untouched — no
 /// recording, no observation, like the openai `/v1/models` path. The
 /// meters still feed: a background batch poll is exactly the call ctp's
-/// "not just accounted ones" rule names.
+/// "not just accounted ones" rule names. No in-flight hold either — ctp
+/// counts only the exact `/v1/messages` path.
 async fn transparent(server: Server, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -809,7 +821,7 @@ async fn transparent(server: Server, request: Request) -> Response {
     };
     let backend = server.default_anthropic().clone();
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
-        Ok(upstream) => forward_response(server, backend, upstream, None).await,
+        Ok(upstream) => forward_response(server, backend, upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
             plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
@@ -865,12 +877,17 @@ fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
 /// Forward one upstream response to the client, branching on compression /
 /// status / content-type — the anthropic mirror of the openai
 /// `forward_upstream`, plus the meter feed. `record` is the usage-path
-/// completion context; `None` means transparent forwarding.
+/// completion context; `None` means transparent forwarding. `in_flight` is
+/// the request's sleep-lock hold: it rides the SSE stream (dropping when
+/// axum drops the body — ctp's `close`, "however the exchange ends") and
+/// drops at the end of this function on every other branch, after
+/// whatever row was owed has landed.
 async fn forward_response(
     server: Server,
     backend: Arc<dyn Provider>,
     upstream: reqwest::Response,
     record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
 ) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -930,7 +947,8 @@ async fn forward_response(
     // SSE: chunks stream through with backpressure, each also feeding the
     // side observation.
     if is_event_stream(&upstream_headers) {
-        let stream = AnthropicObservedStream::new(upstream, status.as_u16(), ctx, rate_limits);
+        let stream =
+            AnthropicObservedStream::new(upstream, status.as_u16(), ctx, rate_limits, in_flight);
         let body = Body::from_stream(stream);
         return build_response(status, response_headers(&upstream_headers, false), body);
     }
@@ -977,6 +995,11 @@ struct AnthropicObservedStream {
     ctx: Option<AnthropicRecordCtx>,
     /// This response's own meter snapshot, for the measurement row.
     rate_limits: Option<serde_json::Value>,
+    /// The request's sleep-lock hold, riding the stream: it drops when
+    /// axum drops the body — natural completion or client hangup — so the
+    /// in-flight count never leaks on a streamed response (ctp's
+    /// `res.on("close")`).
+    in_flight: Option<InFlightGuard>,
     status: u16,
 }
 
@@ -986,6 +1009,7 @@ impl AnthropicObservedStream {
         status: u16,
         ctx: AnthropicRecordCtx,
         rate_limits: Option<serde_json::Value>,
+        in_flight: Option<InFlightGuard>,
     ) -> AnthropicObservedStream {
         let (abort, registration) = AbortHandle::new_pair();
         let stream: UpstreamBody = Box::pin(response.bytes_stream());
@@ -996,6 +1020,7 @@ impl AnthropicObservedStream {
             observer: AnthropicObserver::new(),
             ctx: Some(ctx),
             rate_limits,
+            in_flight,
             status,
         }
     }
@@ -1021,6 +1046,9 @@ impl Stream for AnthropicObservedStream {
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
+                // The exchange is over however it ended (ctp: `close`
+                // fires on failure too): the in-flight hold goes with it.
+                drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Ready(None) => {
@@ -1044,6 +1072,10 @@ impl Stream for AnthropicObservedStream {
                         this.status,
                     );
                 }
+                // The response is done, so the in-flight hold ends now —
+                // ctp's `res.on("close")` fires at stream end, and a
+                // hung-up stream ends it in Drop instead.
+                drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
         }

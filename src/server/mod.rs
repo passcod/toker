@@ -40,7 +40,9 @@ pub(crate) mod proxy;
 mod record;
 mod record_anthropic;
 
-use std::sync::Arc;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
@@ -48,6 +50,7 @@ use axum::Router;
 use axum::routing::{get, post};
 
 use crate::config::Config;
+use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::providers::{AnthropicApi, AnthropicSub, OpenRouter, Provider};
@@ -83,14 +86,37 @@ pub struct Server {
     pub(crate) anthropic_sub: Arc<dyn Provider>,
     /// The anthropic API backend.
     pub(crate) anthropic_api: Arc<dyn Provider>,
+    /// In-flight usage-path requests (the anthropic `/v1/messages`
+    /// non-ping ones and the openai chat completions — a running request
+    /// holds the machine awake regardless of protocol): the sleep lock's
+    /// other input besides the lane table (ctp `inFlight`,
+    /// proxy.mjs:455).
+    pub(crate) in_flight: Arc<AtomicUsize>,
+    /// The idle-sleep lock's state (ctp's `sleepLock` + `awakeHeld`), or
+    /// `None` when `awake` is off (ctp: `sleepLock = null` when
+    /// `CTP_AWAKE=off` — never hold, never spawn).
+    pub(crate) awake: Option<Arc<Mutex<AwakeState>>>,
     /// Process start, for `/_toker/status` uptime.
     pub(crate) started: Instant,
 }
 
 impl Server {
     /// Build the server: resolve the provider credentials once, validate
-    /// the routing table, build the upstream client.
+    /// the routing table, build the upstream client, and arm the
+    /// idle-sleep lock over this host's platform command.
     pub fn new(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
+        Self::with_awake_spawner(config, store, Box::new(awake::ProcessSpawner))
+    }
+
+    /// [`Server::new`], with the sleep-lock spawner injected. The real
+    /// spawner takes a REAL idle-sleep lock via systemd-inhibit /
+    /// gnome-session-inhibit, so tests inject a fake through here and
+    /// never arm a real inhibitor on the host they run on.
+    pub fn with_awake_spawner(
+        config: Config,
+        store: Arc<Store>,
+        spawner: Box<dyn LockSpawner>,
+    ) -> anyhow::Result<Server> {
         if config.default_backend_openai_chat != "openrouter" {
             bail!(
                 "phase 1 wires only the openrouter backend, \
@@ -122,6 +148,20 @@ impl Server {
             config.anthropic_api.api_key(),
         ));
 
+        // ctp proxy.mjs:440-454: the lock exists only while the toggle is
+        // on, and an unavailable platform says so once, at startup —
+        // `CTP_AWAKE has no effect` there, `awake` here.
+        let awake = config.awake.then(|| {
+            let state = AwakeState::new(
+                awake::platform_command(awake::INHIBIT_WHO, awake::INHIBIT_WHY),
+                spawner,
+            );
+            if !state.available() {
+                tracing::warn!("no idle-sleep lock on this platform; `awake` has no effect");
+            }
+            Arc::new(Mutex::new(state))
+        });
+
         // The startup seed (ctp `readLogTail` + `loadLanes` +
         // `loadModels`, proxy.mjs:150-269): the newest ledger rows, read
         // once, feed both state stores. Reseeding is idempotent, so every
@@ -143,6 +183,8 @@ impl Server {
             anthropic_sub,
             anthropic_api,
             models,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            awake,
             started: Instant::now(),
         })
     }
@@ -161,6 +203,67 @@ impl Server {
     pub(crate) fn default_anthropic(&self) -> &Arc<dyn Provider> {
         self.anthropic_backend(&self.config.default_backend_anthropic)
             .expect("default_backend_anthropic is validated at startup")
+    }
+
+    // ── the idle-sleep lock (ctp evaluateAwake, proxy.mjs:465-482) ──
+
+    /// Take or drop the sleep lock to match the lane table and the
+    /// in-flight count, and write an `awake` row on every held/want flip.
+    ///
+    /// ctp wraps its whole body in a try/catch — "the lock is not worth
+    /// a request" — so a panic here is caught and logged, never
+    /// propagated to the request it rode in on. A store error just loses
+    /// this one evaluation.
+    pub(crate) fn evaluate_awake(&self) {
+        let Some(awake) = &self.awake else {
+            return; // ctp: `if (!sleepLock) return` — the toggle is off.
+        };
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.evaluate_awake_inner(awake)));
+    }
+
+    fn evaluate_awake_inner(&self, awake: &Arc<Mutex<AwakeState>>) {
+        let lanes = match self.store.load_lanes() {
+            Ok(lanes) => lanes,
+            Err(error) => {
+                tracing::error!(%error, "awake: lane table load failed");
+                return;
+            }
+        };
+        let in_flight = self.in_flight.load(Ordering::SeqCst) as u64;
+        let now = now_ms();
+        let decision = awake::decide_awake(&lanes, in_flight, now);
+        // A poisoned lock recovers: the state is held/backoff bookkeeping
+        // only, and a panic inside an evaluation must not disable the
+        // sleep lock for the rest of the process's life.
+        let transition = {
+            let mut state = match awake.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.evaluate(&decision, now)
+        };
+        if let Some(transition) = transition {
+            record::record_awake(self, &transition, now);
+        }
+    }
+
+    /// A usage-path request is now in flight (ctp proxy.mjs:1129-1132:
+    /// `inFlight++; … evaluateAwake()`): a lane's `at` moves only when a
+    /// response finishes, and one long turn can outlast a 5-minute tier,
+    /// so a request being served holds the machine awake, pings aside.
+    pub(crate) fn begin_in_flight(&self) -> InFlightGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.evaluate_awake();
+        InFlightGuard {
+            server: self.clone(),
+        }
+    }
+
+    /// The other half of the guard's Drop (ctp: `res.on("close")` fires
+    /// however the exchange ends — completion, error, hangup).
+    fn end_in_flight(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.evaluate_awake();
     }
 
     /// The full route table.
@@ -203,8 +306,34 @@ impl Server {
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
         self.spawn_lane_prune();
+        self.spawn_awake_timer();
+        // A restart inside a live session takes the lock straight back
+        // (ctp proxy.mjs:494).
+        self.evaluate_awake();
         axum::serve(listener, self.router()).await?;
         Ok(())
+    }
+
+    /// The sleep lock's wall-clock re-evaluation on ctp's 60-second
+    /// cadence (ctp proxy.mjs:487-491, `setInterval` + `unref`). Wall
+    /// clock rather than a timeout aimed at the expiry: the interval
+    /// runs on a monotonic clock that stops while the machine is
+    /// suspended, so a release due at 18:30 would otherwise slip by
+    /// however long the lid was shut — the decision reads the wall
+    /// clock, so the first tick after a resume re-evaluates correctly.
+    fn spawn_awake_timer(&self) {
+        if self.awake.is_none() {
+            return; // ctp: no sleepLock, no timer.
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            let tick = Duration::from_millis(awake::AWAKE_TICK_MS);
+            let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + tick, tick);
+            loop {
+                timer.tick().await;
+                server.evaluate_awake();
+            }
+        });
     }
 
     /// The lane-table prune on ctp's flush cadence (proxy.mjs:380-394:
@@ -232,5 +361,22 @@ impl Server {
                 }
             }
         });
+    }
+}
+
+/// One in-flight request's hold on the sleep lock: increments on entry,
+/// and Drop is the decrement plus the re-evaluation — ctp's
+/// `res.on("close")`, which "fires however the exchange ends". A guard,
+/// so no early return and no error path can leak the count: for a
+/// streamed response the guard rides the body stream (it drops when axum
+/// drops the body — client hangup or natural completion); for everything
+/// else it drops when the handler's work is done.
+pub(crate) struct InFlightGuard {
+    server: Server,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.server.end_in_flight();
     }
 }
