@@ -10,6 +10,7 @@
 use toker::cmds;
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 /// toker: local LLM proxy, ledger, and dashboard.
 #[derive(Debug, Parser)]
@@ -26,7 +27,18 @@ enum Command {
     /// Run the proxy server (plan: Server core).
     Serve,
     /// Run the ratatui dashboard (plan: TUI).
-    Tui,
+    Tui {
+        /// Dashboard window length in minutes.
+        #[arg(
+            long = "window-mins",
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(1..=1440)
+        )]
+        window_mins: u64,
+        /// Ledger path; TOKER_DB env or the config default when omitted.
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<PathBuf>,
+    },
     /// Print ledger-derived reports (plan: `toker report`).
     Report,
     /// Run the interactive setup wizard (plan: Setup wizard).
@@ -57,7 +69,7 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(cmds::serve()),
-        Command::Tui => not_implemented("tui"),
+        Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Report => not_implemented("report"),
         Command::Setup => not_implemented("setup"),
         Command::Status => cmds::status(),

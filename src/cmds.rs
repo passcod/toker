@@ -3,10 +3,12 @@
 //! The timer verbs serve the systemd wake/hold/ping units (plan: "Sleep
 //! lock, wake, ping") and are registered as hidden subcommands so they are
 //! reachable by the units but not part of the everyday CLI surface.
-//! `serve` and `status` are this unit's commands: config → store → server,
-//! and the resolved-config/ledger summary (plan: Credentials — status
-//! reports which key sources are in use, never the values).
+//! `serve`, `status`, and `tui` are the wired commands: config → store →
+//! server; the resolved-config/ledger summary (plan: Credentials — status
+//! reports which key sources are in use, never the values); and the
+//! ratatui dashboard (plan: TUI).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -58,6 +60,15 @@ pub fn status() -> anyhow::Result<()> {
         None => println!("last request: none"),
     }
     Ok(())
+}
+
+/// `tui`: the ratatui dashboard over the ledger (plan: TUI). `--db`
+/// overrides the path; otherwise `TOKER_DB` and the config default apply
+/// (Config::load already layered env over file).
+pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let db_path = db.unwrap_or(config.db_path);
+    crate::tui::run(&db_path, window_mins)
 }
 
 /// A local-clock rendering of a row ts (the system zone; UTC-shaped on
