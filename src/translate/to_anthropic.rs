@@ -716,6 +716,7 @@ mod tests {
         let events = vec![
             ResponseEvent::Created {
                 response_id: Some("resp_1".to_owned()),
+                model: None,
             },
             ResponseEvent::OutputTextDelta {
                 delta: "Part one.".to_owned(),
@@ -792,6 +793,7 @@ mod tests {
         let events = vec![
             ResponseEvent::Created {
                 response_id: Some("resp_1".to_owned()),
+                model: None,
             },
             ResponseEvent::OutputTextDelta {
                 delta: "First.".to_owned(),
@@ -859,6 +861,7 @@ mod tests {
         let events = vec![
             ResponseEvent::Created {
                 response_id: Some("resp_1".to_owned()),
+                model: None,
             },
             ResponseEvent::ReasoningSummaryDelta {
                 delta: "A".to_owned(),
@@ -923,6 +926,7 @@ mod tests {
         let events = vec![
             ResponseEvent::Created {
                 response_id: Some("resp_1".to_owned()),
+                model: None,
             },
             ResponseEvent::OutputTextDelta {
                 delta: "half a reply".to_owned(),
@@ -1095,9 +1099,13 @@ mod tests {
         // And a later created still opens the message exactly once.
         let emitted = stream.feed(&ResponseEvent::Created {
             response_id: Some("resp_1".to_owned()),
+            model: None,
         });
         assert_eq!(emitted.len(), 1);
-        let again = stream.feed(&ResponseEvent::Created { response_id: None });
+        let again = stream.feed(&ResponseEvent::Created {
+            response_id: None,
+            model: None,
+        });
         assert!(again.is_empty(), "message_start is emitted exactly once");
     }
 
@@ -1205,6 +1213,7 @@ mod tests {
         for event in [
             ResponseEvent::Created {
                 response_id: Some("resp_1".to_owned()),
+                model: None,
             },
             ResponseEvent::Incomplete {
                 reason: Some("content_filter".to_owned()),

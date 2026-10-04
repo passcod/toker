@@ -263,9 +263,11 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         },
         default_backend_anthropic: "anthropic_sub".to_owned(),
         anthropic_sub: AnthropicSubConfig {
+            model_map: None,
             upstream: anthropic_upstream.clone(),
         },
         anthropic_api: AnthropicApiConfig {
+            model_map: None,
             upstream: anthropic_upstream,
             api_key_env: api_key_env.to_owned(),
             api_key: None,
@@ -275,6 +277,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
         codex_sub: CodexSubConfig {
+            model_map: None,
             upstream: "http://127.0.0.1:9/backend-api/codex"
                 .parse()
                 .expect("codex upstream url"),
@@ -853,23 +856,26 @@ async fn poisoned_meters_state_never_blocks_the_openai_path() {
     // exactly the reading that blocks the anthropic_sub path.
     let now_secs = jiff::Timestamp::now().as_millisecond() / 1000;
     store
-        .save_meters(&toker::store::MetersSnapshot {
-            updated_ms: jiff::Timestamp::now().as_millisecond(),
-            snapshot: serde_json::json!({
-                "util5h": 1.0, "reset5h": now_secs + 3600,
-                "util7d": 0.2, "reset7d": now_secs + 5 * 86400,
-                "utilOverage": serde_json::Value::Null,
-                "resetOverage": serde_json::Value::Null,
-                "status": serde_json::Value::Null,
-                "status5h": serde_json::Value::Null,
-                "status7d": serde_json::Value::Null,
-                "statusOverage": serde_json::Value::Null,
-                "claim": serde_json::Value::Null,
-                "overageInUse": false,
-                "fallbackPct": serde_json::Value::Null,
-                "other": {},
-            }),
-        })
+        .save_meters(
+            "anthropic_sub",
+            &toker::store::MetersSnapshot {
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+                snapshot: serde_json::json!({
+                    "util5h": 1.0, "reset5h": now_secs + 3600,
+                    "util7d": 0.2, "reset7d": now_secs + 5 * 86400,
+                    "utilOverage": serde_json::Value::Null,
+                    "resetOverage": serde_json::Value::Null,
+                    "status": serde_json::Value::Null,
+                    "status5h": serde_json::Value::Null,
+                    "status7d": serde_json::Value::Null,
+                    "statusOverage": serde_json::Value::Null,
+                    "claim": serde_json::Value::Null,
+                    "overageInUse": false,
+                    "fallbackPct": serde_json::Value::Null,
+                    "other": {},
+                }),
+            },
+        )
         .expect("poison meters");
 
     let body = chat_body("z-ai/glm-5.3", false);

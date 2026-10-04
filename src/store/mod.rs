@@ -222,14 +222,17 @@ impl Store {
         state::pings_since(&*self.conn()?, ts_ms, limit)
     }
 
-    /// Overwrite the last meter snapshot (single row).
-    pub fn save_meters(&self, snapshot: &MetersSnapshot) -> Result<()> {
-        state::save_meters(&*self.conn()?, snapshot)
+    /// Overwrite one meter-source backend's last snapshot, keyed by
+    /// provider id (migration v3): the anthropic sub's quota meters and
+    /// the codex sub's usage limits each keep their own slot.
+    pub fn save_meters(&self, provider_id: &str, snapshot: &MetersSnapshot) -> Result<()> {
+        state::save_meters(&*self.conn()?, provider_id, snapshot)
     }
 
-    /// The last meter snapshot, if the backend has produced one.
-    pub fn load_meters(&self) -> Result<Option<MetersSnapshot>> {
-        state::load_meters(&*self.conn()?)
+    /// One provider's last meter snapshot, if that backend has produced
+    /// one.
+    pub fn load_meters(&self, provider_id: &str) -> Result<Option<MetersSnapshot>> {
+        state::load_meters(&*self.conn()?, provider_id)
     }
 
     /// Set a meta key/value.
@@ -1045,19 +1048,45 @@ mod tests {
             .collect();
         assert_eq!(ts, vec![5_000], "cap keeps the newest ping");
 
-        // Meters: single row, overwritten on every save.
+        // Meters: per-provider slots (migration v3), overwritten on every
+        // save, and one backend's snapshot never answers for another's.
         let meters = MetersSnapshot {
             updated_ms: 4_000,
             snapshot: json!({"5h": {"used": 42, "limit": 100}}),
         };
-        store.save_meters(&meters).expect("save");
-        assert_eq!(store.load_meters().expect("load"), Some(meters.clone()));
+        store.save_meters("anthropic_sub", &meters).expect("save");
+        assert_eq!(
+            store.load_meters("anthropic_sub").expect("load"),
+            Some(meters.clone())
+        );
         let fresher = MetersSnapshot {
             updated_ms: 4_500,
             snapshot: json!({"5h": {"used": 50, "limit": 100}}),
         };
-        store.save_meters(&fresher).expect("save again");
-        assert_eq!(store.load_meters().expect("load"), Some(fresher));
+        store
+            .save_meters("anthropic_sub", &fresher)
+            .expect("save again");
+        assert_eq!(
+            store.load_meters("anthropic_sub").expect("load"),
+            Some(fresher)
+        );
+        // A slot never written reads as absent, never as another's data.
+        assert_eq!(store.load_meters("codex_sub").expect("load"), None);
+        let codex = MetersSnapshot {
+            updated_ms: 5_000,
+            snapshot: json!({"primary": {"used_percent": 12.5}}),
+        };
+        store.save_meters("codex_sub", &codex).expect("save codex");
+        assert_eq!(store.load_meters("codex_sub").expect("load"), Some(codex));
+        assert_eq!(
+            store
+                .load_meters("anthropic_sub")
+                .expect("load")
+                .expect("present")
+                .updated_ms,
+            4_500,
+            "the anthropic slot survived the codex save"
+        );
 
         // Meta: last write wins.
         store.set_meta("note", "hello").expect("set");
@@ -1222,5 +1251,74 @@ mod tests {
         drop(store);
         let reopened = Store::open(&db).expect("reopen");
         assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn migration_v3_moves_the_single_meter_slot_to_the_anthropic_sub_row() {
+        let dir = test_dir("v2-upgrade");
+        let db = dir.join("toker.db");
+        // A v2-shaped database: the first two migrations applied, with a
+        // single-slot meters_state row (the only shape a v2 proxy could
+        // write — the anthropic sub was its only meter source).
+        std::fs::create_dir_all(&dir).expect("create the db parent dir");
+        {
+            let conn = Connection::open(&db).expect("open raw v2 db");
+            for script in &schema::MIGRATIONS[..2] {
+                conn.execute_batch(script).expect("apply v1+v2 migrations");
+            }
+            conn.pragma_update(None, "user_version", 2)
+                .expect("stamp v2");
+            conn.execute(
+                "INSERT INTO meters_state (id, updated_ms, snapshot) VALUES (1, 12345, \
+                 '{\"util5h\":0.42,\"reset5h\":1769500800}')",
+                [],
+            )
+            .expect("insert a v2 meters row");
+        }
+
+        // Opening with current code migrates cleanly: user_version reaches
+        // the head, the old single slot survives as the anthropic_sub row
+        // (its only writer), and a codex save lands beside it without
+        // touching it.
+        let store = Store::open(&db).expect("v2 db migrates");
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        let meters = store
+            .load_meters("anthropic_sub")
+            .expect("load")
+            .expect("the v2 slot became the anthropic_sub row");
+        assert_eq!(meters.updated_ms, 12_345);
+        assert_eq!(
+            meters.snapshot,
+            json!({"util5h": 0.42, "reset5h": 1769500800}),
+            "imported/old data survives the migration whole"
+        );
+
+        let codex = MetersSnapshot {
+            updated_ms: 99_000,
+            snapshot: json!({"primary": {"used_percent": 80}}),
+        };
+        store.save_meters("codex_sub", &codex).expect("codex slot");
+        assert_eq!(store.load_meters("codex_sub").expect("load"), Some(codex));
+        assert_eq!(
+            store
+                .load_meters("anthropic_sub")
+                .expect("load")
+                .expect("still present")
+                .updated_ms,
+            12_345,
+            "the codex save never overwrites the anthropic slot"
+        );
+
+        // Reopen: at the head, no re-run, both slots persist.
+        drop(store);
+        let reopened = Store::open(&db).expect("reopen");
+        assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
+        assert!(
+            reopened
+                .load_meters("anthropic_sub")
+                .expect("load")
+                .is_some()
+        );
+        assert!(reopened.load_meters("codex_sub").expect("load").is_some());
     }
 }

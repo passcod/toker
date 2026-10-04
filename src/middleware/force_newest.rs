@@ -174,6 +174,18 @@ pub struct ForceContext<'a> {
     /// `asked`, proxy.mjs:1469 — `clientWants(body).model`). `None` when
     /// the body names no model: nothing to rewrite.
     pub model: Option<&'a str>,
+    /// The identity the upstream will actually receive for `model` once
+    /// the routing map is applied — ctp proxy.mjs:1480's
+    /// `previewMappedModel(MODEL_MAP, asked)`, the preview hook into this
+    /// decision. The served-recency condition reads THIS, never the asked
+    /// model: a mapped request's cache lives on the target identity
+    /// upstream, so warmth is the target's warmth — without the preview,
+    /// a claimed model (never served as itself, only ever as its target)
+    /// would always read as idle and force-newest would move requests the
+    /// map is about to claim. `None` when no map is configured: the
+    /// preview is then the asked model, which is what the decision
+    /// assumed before the map existed.
+    pub served_as: Option<&'a str>,
     /// The lane record, when the table holds one (ctp `known`). `None` is
     /// the unknown-lane case with its own, stricter eligibility.
     pub lane: Option<&'a Lane>,
@@ -253,7 +265,11 @@ pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision 
             Some(_) => cold,
             None => request.req_messages.is_some_and(|messages| {
                 messages <= NEW_CONVERSATION_MESSAGES || {
-                    let last_seen = models.last_served(asked);
+                    // ctp proxy.mjs:1480: the recency lookup runs on the
+                    // map preview, never the asked model — the cache a
+                    // mapped request could read lives on the target.
+                    let cache_identity = request.served_as.unwrap_or(asked);
+                    let last_seen = models.last_served(cache_identity);
                     idle_for_ttl(last_seen, models.covered_since(), request.now_ms)
                 }
             }),
@@ -356,6 +372,7 @@ mod tests {
     ) -> ForceContext<'a> {
         ForceContext {
             model,
+            served_as: None,
             lane,
             req_messages,
             compaction: false,
@@ -837,6 +854,80 @@ mod tests {
             decide(&unknown, &models),
             ForceDecision::Leave,
             "the byte bound refused the 500k-proven target"
+        );
+    }
+
+    #[test]
+    fn the_map_preview_informs_the_recency_lookup_never_the_election() {
+        // ctp proxy.mjs:1480: `idleForTtl` reads
+        // `servedOn.get(modelIdentity(previewMappedModel(MODEL_MAP, asked)))`
+        // — the cache a mapped request could read lives on the TARGET
+        // identity upstream, so warmth is the target's warmth. Without
+        // the preview a claimed model (only ever served as its target,
+        // never as itself) would always read as idle and every unknown
+        // lane with a history would be moved before the map could claim
+        // it.
+        let store = mem_store();
+        for (model, max_prompt) in [
+            ("claude-opus-5", 2_000_000i64),
+            ("claude-opus-4-8", 2_000_000),
+        ] {
+            store
+                .upsert_model(&entry(model, &D, Some(max_prompt)))
+                .expect("seed entry");
+        }
+        let models = ModelStore::seeded(store, &[], None);
+
+        // The map claims opus-4-8 → gpt-5.6-sol, and the TARGET has been
+        // served within the TTL: the request is warm through the map, and
+        // force-newest must not move it — the map is about to claim it.
+        let mut deep = context(Some("claude-opus-4-8"), None, Some(300), NOW);
+        deep.body_bytes = 2_400_000;
+        deep.served_as = Some("gpt-5.6-sol");
+        models.note_served(Some("gpt-5.6-sol"), NOW - 12_000);
+        assert_eq!(
+            decide(&deep, &models),
+            ForceDecision::Leave,
+            "the mapped target's warmth is the request's warmth"
+        );
+
+        // The same request with the target never served: no cache it
+        // could read exists, and the move happens — the election still
+        // runs on the ASKED model (the claude family's newest), never
+        // the mapped target's family.
+        let fresh_store = mem_store();
+        for (model, max_prompt) in [
+            ("claude-opus-5", 2_000_000i64),
+            ("claude-opus-4-8", 2_000_000),
+        ] {
+            fresh_store
+                .upsert_model(&entry(model, &D, Some(max_prompt)))
+                .expect("seed entry");
+        }
+        let fresh = ModelStore::seeded(fresh_store, &[], None);
+        assert_eq!(
+            decide(&deep, &fresh),
+            ForceDecision::Move(Forced {
+                from: "claude-opus-4-8".to_owned(),
+                to: "claude-opus-5".to_owned(),
+            }),
+            "the election is the asked model's family, the preview only \
+             the recency lookup"
+        );
+
+        // No preview (no map configured): the recency lookup falls back
+        // to the asked model — the committed decision's original
+        // behaviour, which a mapped target's recent service must not
+        // disturb.
+        let mut unmapped = context(Some("claude-opus-4-8"), None, Some(300), NOW);
+        unmapped.body_bytes = 2_400_000;
+        assert_eq!(
+            decide(&unmapped, &models),
+            ForceDecision::Move(Forced {
+                from: "claude-opus-4-8".to_owned(),
+                to: "claude-opus-5".to_owned(),
+            }),
+            "without a preview the asked model's own recency decides"
         );
     }
 

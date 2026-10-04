@@ -77,9 +77,12 @@ pub struct PingRecord {
     pub boundary_ms: Option<i64>,
 }
 
-/// The last meter snapshot, single-row (plan: Server core). Every response
-/// updates it when the backend has meters, so a spent reading stops
-/// counting once its window's reset passes.
+/// The last meter snapshot for one meter-source backend (plan: Server
+/// core). Every response updates its own provider's slot when the
+/// backend has meters, so a spent reading stops counting once its
+/// window's reset passes. Keyed by provider id (migration v3): the
+/// anthropic sub's quota shape and the codex sub's usage-limit shape
+/// never overwrite each other, and the quota gate reads only its own.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetersSnapshot {
     pub updated_ms: i64,
@@ -303,23 +306,27 @@ fn read_ping(row: &rusqlite::Row<'_>) -> Result<PingRecord> {
     })
 }
 
-pub(super) fn save_meters(conn: &Connection, snapshot: &MetersSnapshot) -> Result<()> {
+pub(super) fn save_meters(
+    conn: &Connection,
+    provider_id: &str,
+    snapshot: &MetersSnapshot,
+) -> Result<()> {
     let snapshot_json = serde_json::to_string(&snapshot.snapshot)?;
     conn.execute(
-        "INSERT INTO meters_state (id, updated_ms, snapshot) VALUES (1, ?1, ?2)
-         ON CONFLICT (id) DO UPDATE SET
+        "INSERT INTO meters_by_provider (provider_id, updated_ms, snapshot) VALUES (?1, ?2, ?3)
+         ON CONFLICT (provider_id) DO UPDATE SET
              updated_ms = excluded.updated_ms,
              snapshot = excluded.snapshot",
-        (snapshot.updated_ms, snapshot_json),
+        (provider_id, snapshot.updated_ms, snapshot_json),
     )?;
     Ok(())
 }
 
-pub(super) fn load_meters(conn: &Connection) -> Result<Option<MetersSnapshot>> {
+pub(super) fn load_meters(conn: &Connection, provider_id: &str) -> Result<Option<MetersSnapshot>> {
     row_of(
         conn,
-        "SELECT updated_ms, snapshot FROM meters_state WHERE id = 1",
-        [],
+        "SELECT updated_ms, snapshot FROM meters_by_provider WHERE provider_id = ?1",
+        [provider_id],
         read_meters,
     )
 }

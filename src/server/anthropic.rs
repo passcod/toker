@@ -225,7 +225,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if gate_armed {
             meters_snapshot = server
                 .store
-                .load_meters()
+                .load_meters("anthropic_sub")
                 .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
                 .unwrap_or_else(|error| {
                     tracing::error!(%error, "meter snapshot load failed");
@@ -347,7 +347,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // never ran, so the snapshot was never loaded.
             meters_snapshot = server
                 .store
-                .load_meters()
+                .load_meters("anthropic_sub")
                 .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
                 .unwrap_or_else(|error| {
                     tracing::error!(%error, "meter snapshot load failed");
@@ -684,6 +684,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let decision = force_newest::decide(
             &force_newest::ForceContext {
                 model: served_model.as_deref(),
+                // The map preview (ctp: recency reads the identity the
+                // request would be MAPPED to, never the asked model).
+                // None until the model-map application below feeds it —
+                // the semantics of "no map configured".
+                served_as: None,
                 lane: cold_lane.as_ref(),
                 req_messages: gate_shape.as_ref().and_then(|shape| shape.req_messages),
                 compaction: gate_shape
@@ -902,7 +907,7 @@ async fn forward_response(
             updated_ms: now_ms(),
             snapshot: meters,
         };
-        if let Err(error) = server.store.save_meters(&snapshot) {
+        if let Err(error) = server.store.save_meters(backend.id(), &snapshot) {
             tracing::error!(%error, "meter snapshot save failed");
         }
     }

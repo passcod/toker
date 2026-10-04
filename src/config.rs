@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
+use crate::middleware::model_map::{self, ModelMap};
 use crate::middleware::notice::NoticeStyle;
 use crate::store;
 
@@ -230,6 +231,11 @@ impl OpenRouterConfig {
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
+    /// The model routing map (plan: Middleware — "Model routing map"):
+    /// `[providers.anthropic_sub.model_map]`, an optional operator policy
+    /// applied as the pipeline's final routing stage on this backend.
+    /// `None` when the table is absent (the default — no mapping).
+    pub model_map: Option<ModelMap>,
 }
 
 /// The anthropic API provider block, resolved — the same KeySources
@@ -238,6 +244,9 @@ pub struct AnthropicSubConfig {
 pub struct AnthropicApiConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
+    /// The model routing map on this backend (see
+    /// [`AnthropicSubConfig::model_map`]).
+    pub model_map: Option<ModelMap>,
     /// The env var the API key is read from.
     pub api_key_env: String,
     /// An optional literal key, used only when the env var is unset.
@@ -272,6 +281,55 @@ pub struct CodexSubConfig {
     pub auth_path: PathBuf,
     /// The OAuth refresh endpoint.
     pub refresh_url: reqwest::Url,
+    /// The model routing map on this backend (see
+    /// [`AnthropicSubConfig::model_map`]) — the anthropic→codex model
+    /// pairings that make the translated route useful at all.
+    pub model_map: Option<ModelMap>,
+}
+
+/// Resolve one provider's `[providers.<id>.model_map]` TOML table into the
+/// parsed, validated [`ModelMap`] (the committed parser's domain — the
+/// table is rendered as the JSON object it expects, so every selector
+/// rule, canonical-folding, and duplicate check runs exactly once, in the
+/// tested place). `None` when the table is absent: the disabled state is
+/// absence, like every other optional block. A present table with bad
+/// selector syntax **fails the load** — a typo'd policy must not silently
+/// read as "no mapping" while the operator believes their routing is on.
+fn parse_model_map_table(
+    provider: &'static str,
+    table: &toml::Table,
+) -> anyhow::Result<Option<ModelMap>> {
+    let mut object = serde_json::Map::new();
+    for (selector, target) in table {
+        let Some(target) = target.as_str() else {
+            bail!(
+                "providers.{provider}.model_map[{selector:?}]: the target must \
+                 be a string, not {}",
+                toml_type_of(target)
+            );
+        };
+        object.insert(
+            selector.clone(),
+            serde_json::Value::String(target.to_owned()),
+        );
+    }
+    let raw = serde_json::to_string(&object)
+        .map_err(|error| anyhow::anyhow!("serialising providers.{provider}.model_map: {error}"))?;
+    model_map::parse_model_map(&raw).with_context(|| format!("providers.{provider}.model_map"))
+}
+
+/// A TOML value's kind, for the non-string-target error (serde's own
+/// wording names types confusingly for config errors).
+fn toml_type_of(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "a string",
+        toml::Value::Integer(_) => "an integer",
+        toml::Value::Float(_) => "a float",
+        toml::Value::Boolean(_) => "a boolean",
+        toml::Value::Datetime(_) => "a datetime",
+        toml::Value::Array(_) => "an array",
+        toml::Value::Table(_) => "a table",
+    }
 }
 
 /// Resolve an API key: the named env var when set, else the literal (the
@@ -346,6 +404,13 @@ impl Config {
                     .and_then(|p| p.upstream.as_deref())
                     .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
             )?,
+            model_map: match file.providers.anthropic_sub.as_ref() {
+                Some(sub) => match &sub.model_map {
+                    Some(table) => parse_model_map_table("anthropic_sub", table)?,
+                    None => None,
+                },
+                None => None,
+            },
         };
         let anthropic_api = AnthropicApiConfig {
             upstream: parse_upstream(
@@ -355,6 +420,13 @@ impl Config {
                     .and_then(|p| p.upstream.as_deref())
                     .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
             )?,
+            model_map: match file.providers.anthropic_api.as_ref() {
+                Some(api) => match &api.model_map {
+                    Some(table) => parse_model_map_table("anthropic_api", table)?,
+                    None => None,
+                },
+                None => None,
+            },
             api_key_env: file
                 .providers
                 .anthropic_api
@@ -397,6 +469,13 @@ impl Config {
                     .and_then(|p| p.refresh_url.as_deref())
                     .unwrap_or(DEFAULT_CODEX_REFRESH_URL),
             )?,
+            model_map: match file.providers.codex_sub.as_ref() {
+                Some(sub) => match &sub.model_map {
+                    Some(table) => parse_model_map_table("codex_sub", table)?,
+                    None => None,
+                },
+                None => None,
+            },
         };
 
         let mut config = Config {
@@ -495,16 +574,17 @@ impl Config {
         {
             bail!("cold_idle_min must be a non-negative number of minutes");
         }
-        // Both anthropic backends are wired regardless of enabled state
-        // (routing resolves by name), but the protocol default must name
-        // one of them — anything else cannot route anywhere.
+        // The anthropic protocol's backends are all wired (routing resolves
+        // by name; codex_sub serves through the translation pipeline), but
+        // the protocol default must name one of them — anything else cannot
+        // route anywhere.
         if !matches!(
             self.default_backend_anthropic.as_str(),
-            "anthropic_sub" | "anthropic_api"
+            "anthropic_sub" | "anthropic_api" | "codex_sub"
         ) {
             bail!(
-                "default_backend_anthropic must be \"anthropic_sub\" or \
-                 \"anthropic_api\", not {:?}",
+                "default_backend_anthropic must be \"anthropic_sub\", \
+                 \"anthropic_api\", or \"codex_sub\", not {:?}",
                 self.default_backend_anthropic
             );
         }
@@ -576,12 +656,16 @@ struct FileOpenRouter {
 #[serde(default, deny_unknown_fields)]
 struct FileAnthropicSub {
     upstream: Option<String>,
+    /// The model routing map: selector keys → target model ids, parsed by
+    /// [`parse_model_map_table`] into the committed [`ModelMap`].
+    model_map: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileAnthropicApi {
     upstream: Option<String>,
+    model_map: Option<toml::Table>,
     api_key_env: Option<String>,
     api_key: Option<String>,
 }
@@ -593,6 +677,7 @@ struct FileCodexSub {
     originator: Option<String>,
     auth_path: Option<String>,
     refresh_url: Option<String>,
+    model_map: Option<toml::Table>,
 }
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
@@ -644,6 +729,7 @@ mod tests {
         DEFAULT_CODEX_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS,
         KeySources, OpenRouterConfig,
     };
+    use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
     use std::fs;
@@ -723,6 +809,11 @@ mod tests {
             config.codex_sub.refresh_url.as_str(),
             DEFAULT_CODEX_REFRESH_URL
         );
+        // No model map is configured anywhere by default: absence is the
+        // disabled state, the same as every other optional block.
+        assert_eq!(config.anthropic_sub.model_map, None);
+        assert_eq!(config.anthropic_api.model_map, None);
+        assert_eq!(config.codex_sub.model_map, None);
         // The default constant is a bare host; the resolved Url carries
         // its normalised trailing slash.
         let default_upstream =
@@ -941,6 +1032,125 @@ auth_path = "~/.codex/auth.json"
         .expect("rewrite config");
         let error = super::Config::load().expect_err("invalid originator must fail");
         assert!(format!("{error:#}").contains("originator"));
+    }
+
+    #[test]
+    fn the_model_map_blocks_parse_per_provider() {
+        // The `[providers.<id>.model_map]` table on each wired backend:
+        // selector keys → opaque target ids, validated by the committed
+        // parser (canonical folding, duplicate selectors, family rules).
+        let dir = test_dir("model-map");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+[providers.codex_sub.model_map]
+"family:opus" = "gpt-5.6-sol"
+"family:haiku" = "gpt-5.6-luna"
+"model:claude-opus-4-5" = "special-opus"
+
+[providers.anthropic_sub.model_map]
+"family:opus" = "claude-opus-4-8"
+"#,
+        )
+        .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let config = super::Config::load().expect("load config");
+
+        // Parsed into the committed policy: exact identity ahead of
+        // family, published snapshots folding to their identities.
+        let codex_map = config.codex_sub.model_map.as_ref().expect("codex map");
+        assert_eq!(
+            model_map::preview_mapped_model(Some(codex_map), "claude-opus-5"),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            model_map::preview_mapped_model(Some(codex_map), "claude-opus-4-5-20251101"),
+            Some("special-opus"),
+            "the exact selector beats the family one"
+        );
+        assert_eq!(
+            model_map::preview_mapped_model(Some(codex_map), "claude-sonnet-5"),
+            Some("claude-sonnet-5"),
+            "an unmatched model is the identity"
+        );
+        let sub_map = config.anthropic_sub.model_map.as_ref().expect("sub map");
+        assert_eq!(
+            model_map::preview_mapped_model(Some(sub_map), "claude-opus-4-5"),
+            Some("claude-opus-4-8")
+        );
+        // A backend with no table carries no policy, and one backend's
+        // map never answers for another's.
+        assert_eq!(config.anthropic_api.model_map, None);
+        assert_eq!(
+            model_map::preview_mapped_model(
+                config.anthropic_api.model_map.as_ref(),
+                "claude-opus-5"
+            ),
+            Some("claude-opus-5")
+        );
+
+        // A present table with bad selector syntax fails the load naming
+        // its provider block — a typo'd policy must not silently read as
+        // "no mapping" while the operator believes their routing is on.
+        let cases = [
+            (
+                "[providers.codex_sub.model_map]\n\"route:opus\" = \"x\"\n",
+                "unknown selector type",
+            ),
+            (
+                "[providers.anthropic_sub.model_map]\n\"family:opus-4\" = \"x\"\n",
+                "must name a family",
+            ),
+            (
+                "[providers.anthropic_api.model_map]\n\"family:opus\" = 4\n",
+                "must be a string",
+            ),
+            (
+                "[providers.codex_sub.model_map]\n\"family:opus\" = \"a\"\n\
+                 \"family:OPUS\" = \"b\"\n",
+                "duplicate canonical selector",
+            ),
+        ];
+        for (text, message) in cases {
+            fs::write(dir.join("toker.toml"), text).expect("rewrite config");
+            let error = super::Config::load().expect_err("bad policy must fail");
+            let chain = format!("{error:#}");
+            assert!(
+                chain.contains("model_map") && chain.contains(message),
+                "{text:?}: expected {message:?} in {chain}"
+            );
+        }
+
+        // An empty table parses as an (empty) policy — explicitly nothing,
+        // not an error.
+        fs::write(dir.join("toker.toml"), "[providers.codex_sub.model_map]\n")
+            .expect("rewrite config");
+        let config = super::Config::load().expect("empty table parses");
+        assert!(
+            config.codex_sub.model_map.is_some(),
+            "an empty table is an explicitly empty policy"
+        );
+        assert_eq!(
+            model_map::preview_mapped_model(config.codex_sub.model_map.as_ref(), "claude-opus-5"),
+            Some("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn codex_sub_is_a_valid_anthropic_protocol_default() {
+        // The translated route: bare model names on the anthropic frontend
+        // can default to the codex backend (unit C's routing).
+        let dir = test_dir("codex-default");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"default_backend_anthropic = "codex_sub""#,
+        )
+        .expect("write config");
+        let _guard = env_lock().lock().unwrap();
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        let config = super::Config::load().expect("load config");
+        assert_eq!(config.default_backend_anthropic, "codex_sub");
     }
 
     #[test]

@@ -177,9 +177,11 @@ fn test_config(upstream: reqwest::Url) -> Config {
         },
         default_backend_anthropic: "anthropic_sub".to_owned(),
         anthropic_sub: AnthropicSubConfig {
+            model_map: None,
             upstream: upstream.clone(),
         },
         anthropic_api: AnthropicApiConfig {
+            model_map: None,
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
@@ -189,6 +191,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
         codex_sub: CodexSubConfig {
+            model_map: None,
             upstream: "http://127.0.0.1:9/backend-api/codex"
                 .parse()
                 .expect("codex upstream url"),

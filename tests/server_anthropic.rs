@@ -393,9 +393,11 @@ fn test_config(
         },
         default_backend_anthropic: default_backend.to_owned(),
         anthropic_sub: AnthropicSubConfig {
+            model_map: None,
             upstream: anthropic_upstream.clone(),
         },
         anthropic_api: AnthropicApiConfig {
+            model_map: None,
             upstream: anthropic_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key,
@@ -405,6 +407,7 @@ fn test_config(
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
         codex_sub: CodexSubConfig {
+            model_map: None,
             upstream: "http://127.0.0.1:9/backend-api/codex"
                 .parse()
                 .expect("codex upstream url"),
@@ -659,7 +662,7 @@ async fn sse_messages_pass_through_byte_identically_and_ledger() {
 
     // The meters feed from this response: meters_state holds the snapshot.
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("a snapshot exists");
     assert_eq!(meters.snapshot, expected_rate_limits("0.4127"));
@@ -739,7 +742,7 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
 
     // The api is not a meter source: meters_state stays untouched.
     assert_eq!(
-        store.load_meters().expect("meters"),
+        store.load_meters("anthropic_sub").expect("meters"),
         None,
         "the API's RPM headers are not quota meters and never overwrite the gate's snapshot"
     );
@@ -948,7 +951,7 @@ async fn non_2xx_forwards_the_body_and_records_a_lean_error_row_that_still_feeds
     // …but the meters_state table took the response's snapshot anyway
     // (ctp rule: feed from every response, not just accounted ones).
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("fed from the 401");
     assert_eq!(meters.snapshot, expected_rate_limits("0.77"));
@@ -976,7 +979,7 @@ async fn count_tokens_forwards_unledgered_but_feeds_the_meters() {
     assert_no_rows(&store).await;
     // …but the meters moved — from the unaccounted response.
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("the unaccounted count_tokens response fed the meters");
     assert_eq!(meters.snapshot, expected_rate_limits("0.99"));
@@ -1045,7 +1048,7 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
     // The meters fed from the background poll — ctp's "not just accounted
     // ones" rule.
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("the background batch poll fed the meters");
     assert_eq!(meters.snapshot, expected_rate_limits("0.55"));
@@ -1168,7 +1171,7 @@ async fn non_json_bodies_forward_unchanged_with_no_row_but_the_meters_feed() {
 
     assert_no_rows(&store).await;
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("even the unparseable request's response fed the meters");
     assert_eq!(meters.snapshot, expected_rate_limits("0.4127"));
@@ -1261,10 +1264,13 @@ fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
         "other": {},
     });
     store
-        .save_meters(&MetersSnapshot {
-            updated_ms: now_ms,
-            snapshot: snapshot.clone(),
-        })
+        .save_meters(
+            "anthropic_sub",
+            &MetersSnapshot {
+                updated_ms: now_ms,
+                snapshot: snapshot.clone(),
+            },
+        )
         .expect("poison meters");
     (reset5h, snapshot)
 }
@@ -1700,7 +1706,7 @@ async fn count_tokens_and_the_api_backend_never_gate() {
     assert_eq!(rows[0].kind, None, "a measurement, not a blocked row");
     assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
     let meters = store
-        .load_meters()
+        .load_meters("anthropic_sub")
         .expect("meters")
         .expect("still poisoned");
     assert_eq!(

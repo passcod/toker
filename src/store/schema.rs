@@ -166,6 +166,24 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE lanes ADD COLUMN forced_from TEXT;
     ALTER TABLE lanes ADD COLUMN forced_to TEXT;
     "#,
+    // v3 — meters_state becomes per-provider: the anthropic sub's quota
+    // meters and the codex sub's usage limits are different shapes with
+    // different consumers (the quota gate reads only the anthropic_sub
+    // slot), so each meter source keeps its own last snapshot under its
+    // provider id. The copy-into-a-new-table pattern per the append-only
+    // rule: the existing single slot becomes the anthropic_sub row (its
+    // only writer), so imported/old data survives the migration, and the
+    // old table goes — nothing reads it after this entry.
+    r#"
+    CREATE TABLE meters_by_provider (
+        provider_id TEXT PRIMARY KEY,
+        updated_ms INTEGER NOT NULL,
+        snapshot    TEXT NOT NULL
+    );
+    INSERT INTO meters_by_provider (provider_id, updated_ms, snapshot)
+        SELECT 'anthropic_sub', updated_ms, snapshot FROM meters_state;
+    DROP TABLE meters_state;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.

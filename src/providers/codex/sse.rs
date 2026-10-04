@@ -106,13 +106,18 @@ fn event_of(raw: SseEvent) -> Option<ResponseEvent> {
         .or(raw.event.as_deref())?
         .to_owned();
     let typed = match kind.as_str() {
-        "response.created" => value
-            .pointer("/response/id")
-            .and_then(Value::as_str)
-            .map(|id| ResponseEvent::Created {
-                response_id: Some(id.to_owned()),
-            })
-            .or_else(|| Some(ResponseEvent::Created { response_id: None })),
+        "response.created" => {
+            let response = object_of(&value, "response");
+            let response_id = response
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(|id| id.to_owned());
+            let model = response
+                .and_then(|response| response.get("model"))
+                .and_then(Value::as_str)
+                .map(|model| model.to_owned());
+            Some(ResponseEvent::Created { response_id, model })
+        }
         "response.output_item.added" => {
             item_of(&value).map(|item| ResponseEvent::OutputItemAdded { item })
         }
@@ -192,6 +197,10 @@ pub struct TurnCapture {
     /// The response id, from `response.created` and confirmed by
     /// `response.completed` when it repeats one.
     response_id: Option<String>,
+    /// The model slug the response named at `response.created` — the
+    /// identity the upstream actually engaged (the routing unit's
+    /// `model`/`raw_model` columns).
+    model: Option<String>,
     /// The items that completed (`output_item.done` only — where the
     /// function-call arguments arrive whole).
     items: Vec<Item>,
@@ -222,9 +231,12 @@ impl TurnCapture {
     /// stream (invariant 6).
     pub fn observe(&mut self, event: &ResponseEvent) {
         match event {
-            ResponseEvent::Created { response_id } => {
+            ResponseEvent::Created { response_id, model } => {
                 if self.response_id.is_none() {
                     self.response_id.clone_from(response_id);
+                }
+                if self.model.is_none() {
+                    self.model.clone_from(model);
                 }
             }
             ResponseEvent::OutputItemDone { item } => self.items.push(item.clone()),
@@ -259,6 +271,11 @@ impl TurnCapture {
     /// The response id, when the stream named one.
     pub fn response_id(&self) -> Option<&str> {
         self.response_id.as_deref()
+    }
+
+    /// The model slug the response named, when it carried one.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// The completed output items, in arrival order (function-call
@@ -419,12 +436,15 @@ mod tests {
              pass through as unknowns, never dropped)"
         );
         let created = &events[0];
+        let (created_id, created_model) = match created {
+            ResponseEvent::Created { response_id, model } => (response_id, model),
+            other => panic!("unexpected first event: {other:?}"),
+        };
+        assert_eq!(*created_id, Some("resp_6f3c9a".to_owned()));
         assert_eq!(
-            *match created {
-                ResponseEvent::Created { response_id } => response_id,
-                other => panic!("unexpected first event: {other:?}"),
-            },
-            Some("resp_6f3c9a".to_owned())
+            *created_model,
+            Some("gpt-5.2-codex".to_owned()),
+            "the response's own model slug is captured"
         );
         // The last event is the terminator.
         assert_eq!(kinds.last(), Some(&"response.completed"));
@@ -439,6 +459,11 @@ mod tests {
         }
         assert!(capture.turn_ended());
         assert_eq!(capture.response_id(), Some("resp_6f3c9a"));
+        assert_eq!(
+            capture.model(),
+            Some("gpt-5.2-codex"),
+            "the capture latches the response's own model slug"
+        );
 
         // The function call: buffered from output_item.done, arguments
         // COMPLETE — never assembled from the ignorable deltas.

@@ -301,6 +301,12 @@ pub struct FunctionTool {
 /// The usage object of `response.completed` (invariant 3: the detail
 /// fields are `Option` — an absent or `null` detail is `None`, never a
 /// fabricated `0`).
+///
+/// Unknown fields ride in `extra` (the IR's raw-preservation rule, so a
+/// wire detail toker does not model survives a round trip): serialising
+/// the usage reproduces every member the response carried, which is what
+/// the ledger's `usage_raw` column wants — the verbatim
+/// `response.completed` usage JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -308,6 +314,10 @@ pub struct Usage {
     pub output_tokens: u64,
     pub output_tokens_details: Option<OutputTokensDetails>,
     pub total_tokens: u64,
+    /// Every usage member the wire carried beyond the modeled five —
+    /// preserved and re-emitted after them.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// The input-token details: `{cached_tokens, cache_write_tokens?}`.
@@ -331,9 +341,15 @@ pub struct OutputTokensDetails {
 /// dialect grows faster than any client's enum.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResponseEvent {
-    /// `response.created` — the response id, when the payload carries
-    /// one.
-    Created { response_id: Option<String> },
+    /// `response.created` — the response id and the model slug the
+    /// response names, when the payload carries them.
+    Created {
+        response_id: Option<String>,
+        /// The response object's `model` — the identity the upstream
+        /// actually engaged (the routing unit's `model`/`raw_model`
+        /// columns read it through [`TurnCapture`]).
+        model: Option<String>,
+    },
     /// `response.output_item.added` — an item mid-assembly (a function
     /// call's arguments may still be partial here).
     OutputItemAdded { item: Item },
@@ -738,6 +754,7 @@ mod tests {
     fn event_kinds_name_themselves_and_mark_the_terminators() {
         let created = ResponseEvent::Created {
             response_id: Some("resp_1".to_owned()),
+            model: None,
         };
         assert_eq!(created.kind(), "response.created");
         assert!(!created.ends_turn());
