@@ -22,14 +22,15 @@ use crate::middleware::model_map::{self, ModelMap};
 use crate::middleware::notice::NoticeStyle;
 use crate::store;
 
-/// The default listener port (plan: a new port, not 18082 — ctp stays
+/// The default listener port (plan: a new port, not 18082 — the
+/// predecessor stays
 /// running at work during migration).
 pub const DEFAULT_PORT: u16 = 18_123;
 
 /// Default session-attribution header names, read by name only (plan:
 /// Attribution, headers-first; invariant 2 — request headers are never
 /// captured wholesale). `x-claude-code-session-id` is claude's own
-/// (ctp's header); `x-toker-session` is what setup injects into opencode.
+/// header; `x-toker-session` is what setup injects into opencode.
 pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
     "x-toker-session",
     "x-claude-code-session-id",
@@ -37,7 +38,8 @@ pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
 ];
 
 /// The default ping-tagging header (plan: "Ping tagging — marks ping lanes
-/// so they never hold the sleep lock"; ctp's is `x-ctp-ping`). The window
+/// so they never hold the sleep lock"; the predecessor's was
+/// `x-ctp-ping`). The window
 /// pinger injects it via `ANTHROPIC_CUSTOM_HEADERS`, read by name only
 /// (invariant 2).
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
@@ -111,17 +113,16 @@ pub struct Config {
     pub codex_sub: CodexSubConfig,
     /// The middleware gates block.
     pub gates: GatesConfig,
-    /// The idle-sleep lock (ctp `CTP_AWAKE !== "off"`, proxy.mjs:440 —
-    /// on by default, disabled with exactly `CTP_AWAKE=off`): while any
+    /// The idle-sleep lock (on by default, disabled with exactly
+    /// `awake = false`): while any
     /// lane is live or any request is in flight, hold an idle-only
     /// sleep lock so desktop idle-suspend cannot kill running sessions
     /// (see [`crate::middleware::awake`]). Off → never hold, never
     /// spawn, never write awake rows.
     pub awake: bool,
-    /// Extra transcript roots for the dashboard's session labels (ctp's
-    /// `CTP_TRANSCRIPTS`, ctp README "Transcripts are looked for under
-    /// `~/.claude` and `$CLAUDE_CONFIG_DIR`… list those
-    /// colon-separated"): those two are always searched, and these add
+    /// Extra transcript roots for the dashboard's session labels
+    /// (a colon-separated list, like a PATH entry): `~/.claude` and
+    /// `$CLAUDE_CONFIG_DIR` are always searched, and these add
     /// harnesses that run their agents under a config directory of
     /// their own — Workhorse does — whose transcripts this shell's
     /// environment cannot see. A leading `~/` expands at lookup time.
@@ -149,7 +150,7 @@ pub struct GatesConfig {
     /// default) for claude, gfm for Workhorse-style frontends, plain to
     /// degrade.
     pub notice_style: NoticeStyle,
-    /// The cold gate (plan: "Cold gate"; ctp `CTP_COLD`): a session
+    /// The cold gate (plan: "Cold gate"): a session
     /// resumed after its prompt cache expired would re-read its whole
     /// prefix as fresh input, so the gate interrupts once per idle spell
     /// with a notice advising `/compact`. Advisory — it fires once,
@@ -158,31 +159,31 @@ pub struct GatesConfig {
     /// per lane, so it runs on every backend the anthropic frontend
     /// routes to, not just the meter source.
     pub cold_enabled: bool,
-    /// The cold gate's quota outlook (ctp `CTP_COLD_QUOTA`): when a notice
+    /// The cold gate's quota outlook: when a notice
     /// would fire, project the 5-hour window's wall and withhold the
     /// notice when the window can absorb the re-read — recording a
     /// `cold-quiet` row so the suppression is visible, never silent.
     pub cold_outlook: bool,
     /// Below this a rebuild is too cheap for the interruption to be worth
-    /// it (ctp `CTP_COLD_MIN_TOKENS`, default [`crate::middleware::cold::
+    /// it (default [`crate::middleware::cold::
     /// DEFAULT_MIN_TOKENS`]: 175,000, chosen against the log rather than
     /// picked round).
     pub cold_min_tokens: u64,
-    /// The idle floor override, in minutes and deliberately fractional
-    /// (ctp `CTP_COLD_IDLE_MIN`): `None` follows the TTL tier the lane
+    /// The idle floor override, in minutes and deliberately fractional:
+    /// `None` follows the TTL tier the lane
     /// was last seen writing, which tracks what the client actually does
     /// rather than pinning an hour here.
     pub cold_idle_min: Option<f64>,
-    /// The model a cold compaction is rewritten onto (ctp
-    /// `CTP_COMPACT_MODEL`): a family name resolved against what is
+    /// The model a cold compaction is rewritten onto:
+    /// a family name resolved against what is
     /// actually in use (`"sonnet"`, the default), an explicit model id,
     /// or `"off"` to disable the *model change* — a cold lane's cache
     /// writes are still stripped, which needs no target. Sonnet rather
     /// than Haiku: Haiku 4.5's window is 200k and the lanes this fires on
     /// routinely hold three times that.
     pub compact_model: Option<String>,
-    /// The force-newest model rewrite (ctp `CTP_FORCE_NEWEST`, default
-    /// ON — ctp disables it with exactly `CTP_FORCE_NEWEST=off`):
+    /// The force-newest model rewrite (default
+    /// ON — disabled with exactly `force_newest = false`):
     /// transparently move a request onto the newest version of its
     /// model's family that the log has proven, but only where no cache
     /// can be lost by the move — a cold lane, an unknown lane with a
@@ -190,7 +191,7 @@ pub struct GatesConfig {
     /// within a full cache TTL. Never downgrades, never exceeds a
     /// target's observed maxPrompt, and sticky once moved (the lane's
     /// cache lives on the new model). Anthropic usage path only, in
-    /// ctp's exact sequencing slot: after the compaction retarget, before
+    /// the fixed sequencing slot: after the compaction retarget, before
     /// the served-model mark.
     pub force_newest: bool,
 }
@@ -672,10 +673,10 @@ impl Config {
                     .unwrap_or(crate::middleware::cold::DEFAULT_MIN_TOKENS),
                 cold_idle_min: file.gates.cold_idle_min,
                 compact_model: file.gates.compact_model,
-                // ctp's `CTP_FORCE_NEWEST !== "off"`: on unless disabled.
+                // On unless disabled.
                 force_newest: file.gates.force_newest.unwrap_or(true),
             },
-            // ctp's `CTP_AWAKE !== "off"`: on unless disabled.
+            // On unless disabled.
             awake: file.awake.unwrap_or(true),
             transcript_roots: file
                 .transcript_roots
@@ -766,7 +767,7 @@ pub(crate) struct FileConfig {
     default_backend_openai_chat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_backend_anthropic: Option<String>,
-    /// The idle-sleep lock toggle (ctp `CTP_AWAKE`).
+    /// The idle-sleep lock toggle.
     #[serde(skip_serializing_if = "Option::is_none")]
     awake: Option<bool>,
     /// Extra transcript roots for the TUI's session labels, before `~`
@@ -793,7 +794,7 @@ pub(crate) struct FileGates {
     cold_outlook: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cold_min_tokens: Option<u64>,
-    /// Minutes, fractional (ctp's smoke test needs a floor it can wait
+    /// Minutes, fractional (a smoke test needs a floor it can wait
     /// out).
     #[serde(skip_serializing_if = "Option::is_none")]
     cold_idle_min: Option<f64>,
@@ -988,7 +989,7 @@ mod tests {
         );
         assert!(
             DEFAULT_SESSION_HEADERS.contains(&"x-claude-code-session-id"),
-            "claude identifies itself by its own header (ctp's)"
+            "claude identifies itself by its own header"
         );
         assert_eq!(config.default_backend_openai_chat, "openrouter");
         assert_eq!(config.default_backend_anthropic, DEFAULT_BACKEND_ANTHROPIC);
@@ -1033,7 +1034,8 @@ mod tests {
         // the insight block is claude-only): a change here would change the
         // bytes of every notice overnight.
         assert_eq!(config.gates.notice_style, NoticeStyle::Gfm);
-        // The cold gate's defaults are ctp's: on, outlook on, the 175k
+        // The cold gate's defaults are the measured ones: on, outlook on,
+        // the 175k
         // bar chosen against the log, the lane's own TTL tier as the idle
         // floor, and the sonnet family for the compaction retarget.
         assert!(config.gates.cold_enabled);
@@ -1041,11 +1043,11 @@ mod tests {
         assert_eq!(config.gates.cold_min_tokens, 175_000);
         assert_eq!(config.gates.cold_idle_min, None);
         assert_eq!(config.gates.compact_model, None);
-        // The force-newest rewrite defaults ON, ctp's
-        // `CTP_FORCE_NEWEST !== "off"`: a proxy that silently stopped
+        // The force-newest rewrite defaults ON
+        // ("on unless disabled"): a proxy that silently stopped
         // upgrading is a proxy pinned below every newer model.
         assert!(config.gates.force_newest);
-        // The idle-sleep lock defaults ON, ctp's `CTP_AWAKE !== "off"`:
+        // The idle-sleep lock defaults ON:
         // a proxy that silently stopped holding the machine awake is a
         // proxy whose sessions die to idle-suspend.
         assert!(config.awake);
@@ -1411,7 +1413,7 @@ quota_enabled = false
             config.gates.compact_model.as_deref(),
             Some("claude-sonnet-5")
         );
-        // The force-newest toggle reads too — ctp's CTP_FORCE_NEWEST=off.
+        // The force-newest toggle reads too — a false value disables it.
         assert!(!config.gates.force_newest);
 
         // A negative idle floor is a config error, not a gate that fires
@@ -1504,7 +1506,7 @@ quota_enabled = false
             super::Config::load()
         };
 
-        // ctp's `CTP_AWAKE !== "off"`: off is the only way to disable it.
+        // Off is the only way to disable the idle-sleep lock.
         assert!(
             !load("awake = false\n").expect("off loads").awake,
             "the file value is read"
@@ -1517,7 +1519,7 @@ quota_enabled = false
 
     #[test]
     fn transcript_roots_are_read_and_a_config_without_them_parses() {
-        // The harness-root list, ctp's `CTP_TRANSCRIPTS`: the file names
+        // The harness-root list: the file names
         // the extra config directories whose transcripts the session
         // labels also look under. `~` is NOT expanded at load — it
         // expands at lookup, against whatever home is running the view.
@@ -1552,7 +1554,8 @@ quota_enabled = false
 
     #[test]
     fn ping_header_name_reads_the_file_and_validates() {
-        // Absent: the default (ctp's header renamed for toker).
+        // Absent: the default (the predecessor's header, renamed for
+        // toker).
         let config = load_from(&test_dir("ping-default"));
         assert_eq!(config.ping_header_name, super::DEFAULT_PING_HEADER);
 

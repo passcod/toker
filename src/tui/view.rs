@@ -54,22 +54,22 @@ use crate::middleware::cold::{Verdict, alongside, reset_label};
 /// quota section grows it (see [`bottom_height`]).
 const BOTTOM_HEIGHT: u16 = 9;
 
-/// The meter bar's width (ctp live.mjs:574's `bar(v, 22)`), the widest
+/// The meter bar's width (22 cells), the widest
 /// it ever renders — it shrinks as the panel narrows rather than
 /// letting the line wrap or the verdict clip.
 const BAR_WIDTH: u16 = 22;
 
 /// Past this a session is not mid-turn; the context list goes quiet
-/// about it (ctp live.mjs:200's `IDLE_SEC`).
+/// about it.
 const IDLE_SECS: i64 = 180;
 
 /// The context panel lists sessions with at least this many requests —
 /// occupancy is a claim about a conversation, and two rows say nothing
-/// yet (ctp live.mjs:400's `main.length < 3`).
+/// yet (a "fewer than three" check).
 const CONTEXT_MIN_REQUESTS: usize = 3;
 
-/// The least width a session NAME renders in (ctp live.mjs:333-334's
-/// `labelW >= 12`): whatever is left over after the table, ctp gives to
+/// The least width a session NAME renders in (`labelW >= 12`):
+/// whatever is left over after the table goes to
 /// the label, and less than this is noise — the id renders instead.
 const LABEL_MIN_W: u16 = 12;
 
@@ -78,23 +78,23 @@ const LABEL_MIN_W: u16 = 12;
 /// without leaving the dashboard for `toker report`.
 const REBUILD_DETAIL_LINES: usize = 3;
 
-/// The tokens panel's label and amount column widths (live.mjs's
-/// `padEnd(15)` / `padStart(13)`).
+/// The tokens panel's label and amount column widths
+/// (`padEnd(15)` / `padStart(13)`).
 const TOKENS_LABEL_W: usize = 15;
 const TOKENS_AMOUNT_W: usize = 13;
 
-/// The least width a tokens bar renders at — live.mjs:461's and 499's
-/// shared `Math.max(6, …)` floor.
+/// The least width a tokens bar renders at — the shared
+/// `max(6, …)` floor.
 const TOKENS_BAR_MIN_W: usize = 6;
 
-/// The share percentage's rendered width: `" NNN%"` (live.mjs:462).
+/// The share percentage's rendered width: `" NNN%"`.
 const TOKENS_PCT_W: usize = 5;
 
 /// The least inner width a bucket row's bar and percentage render in:
 /// indent, label, amount, gap, the least bar, and the percentage.
 /// Below this the pair sheds whole — the counts are the information,
 /// the bar is the shape, and a bar clipped mid-glyph is neither
-/// (live.mjs lets the final `clamp` cut the line; the panel here
+/// (the reference let the final clamp cut the line; the panel here
 /// drops the column pair cleanly instead, the quota meter's rule).
 const TOKENS_SHARE_MIN_W: usize =
     2 + TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W + TOKENS_PCT_W;
@@ -127,13 +127,14 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// `tz` the zone the quota labels render in, both passed in so tests
 /// stay deterministic.
 ///
-/// The panels stack in ctp live.mjs's order — SESSIONS / CONTEXT /
+/// The panels stack in the reference dashboard's order — SESSIONS /
+/// CONTEXT /
 /// TOKENS / CACHE REBUILDS, then the bottom strip holding the
 /// toker-only SPEND beside RATE & QUOTA — into a height budget
 /// computed from the snapshot ([`panel_areas`]): lists grow into
 /// slack, and a short terminal sheds panel rows from the top of the
 /// middle (sessions first) rather than ever letting the quota block
-/// scroll off the bottom, "the part worth watching" (live.mjs:660-679).
+/// scroll off the bottom, "the part worth watching".
 pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone) {
     let [header, sessions, context, tokens, rebuilds, bottom] = panel_areas(snap, frame.area());
 
@@ -151,10 +152,10 @@ pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZ
 /// The frame's panel areas, from the snapshot's content and the frame's
 /// height: the header and the bottom strip are pinned, the four middle
 /// panels get their natural heights plus any slack (the sessions list
-/// grows into it, live.mjs's two lists doing the same), and a deficit
+/// grows into it, as the reference's two lists did), and a deficit
 /// sheds rows top-first among the middle panels — down to each panel's
 /// scaffold (borders and a title row) before the scaffolds give way,
-/// so the quota block never scrolls (live.mjs's final guard).
+/// so the quota block never scrolls.
 fn panel_areas(snap: &Snapshot, frame: Rect) -> [Rect; 6] {
     let bottom = bottom_height(snap);
     let room = frame.height.saturating_sub(1 + bottom);
@@ -172,7 +173,7 @@ fn panel_areas(snap: &Snapshot, frame: Rect) -> [Rect; 6] {
 
 /// The four middle panels' heights within `room` rows. Natural heights
 /// come from the snapshot; a deficit sheds from the top (sessions
-/// first, then context, tokens, rebuilds — live.mjs's middle cut keeps
+/// first, then context, tokens, rebuilds — the middle cut keeps
 /// the tail), each panel keeping its scaffold while it can; slack goes
 /// to the sessions list. The result always sums to exactly `room`, so
 /// the layout never wraps and never leaves a gap.
@@ -198,8 +199,8 @@ fn middle_heights(snap: &Snapshot, room: u16) -> [u16; 4] {
     }
     // Still short: the scaffolds give way bottom-first — the rebuild
     // and tokens panels fold before the context list, and the sessions
-    // panel's title last, matching live.mjs's guard keeping its `top`
-    // (header plus the SESSIONS scaffold) over the middle.
+    // panel's title last, matching the guard that keeps the header
+    // plus the SESSIONS scaffold over the middle.
     for (height, floor) in out.iter_mut().zip(scaffold).rev() {
         let cut = (*height).min(floor).min(over);
         *height -= cut;
@@ -209,8 +210,8 @@ fn middle_heights(snap: &Snapshot, room: u16) -> [u16; 4] {
         }
     }
     debug_assert_eq!(over, 0, "the floors sum to more than any real room");
-    // Slack: the sessions list takes what is left, like live.mjs's
-    // lists sharing the page.
+    // Slack: the sessions list takes what is left, like the
+    // reference's lists sharing the page.
     let used: u16 = out.iter().sum();
     out[0] += room.saturating_sub(used);
     out
@@ -230,7 +231,7 @@ fn context_height(snap: &Snapshot) -> u16 {
 /// The TOKENS panel's natural height: the four input buckets, output,
 /// the reasoning row when a provider reported thinking tokens (it is
 /// rendered only then), and the hit-rate lines the data supports
-/// (live.mjs renders no hit-rate line at all when nothing was reused).
+/// (no hit-rate line at all when nothing was reused).
 fn tokens_height(snap: &Snapshot) -> u16 {
     if snap.window_empty {
         return 2 + 1;
@@ -284,9 +285,10 @@ fn rebuilds_lines(snap: &Snapshot) -> usize {
 }
 
 /// The bottom row's height: the fixed [`BOTTOM_HEIGHT`] floor, grown to
-/// fit the quota section's lines when one exists — ctp drops from the
-/// middle rather than let the quota block scroll off the bottom
-/// ("the part worth watching", live.mjs:660-679); here the middle
+/// fit the quota section's lines when one exists — the reference
+/// dashboard drops middle rows
+/// rather than let the quota block scroll off the bottom
+/// ("the part worth watching"); here the middle
 /// panels shed their rows first ([`middle_heights`]) and the bottom
 /// strip is pinned at whatever it needs.
 fn bottom_height(snap: &Snapshot) -> u16 {
@@ -333,7 +335,8 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     );
 }
 
-/// The sessions table (live.mjs's SESSIONS block). Column shedding is a
+/// The sessions table (the reference's SESSIONS block). Column shedding
+/// is a
 /// width-fallback chain: keep the leftmost columns that fit, give the
 /// leftover width to SESSION.
 fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
@@ -354,7 +357,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let inner = block.inner(area);
     let (headers, widths) = session_plan(inner.width);
     // The SESSION column's width is the label's budget — the leftover
-    // width the table plan hands that column (live.mjs's `labelW`).
+    // width the table plan hands that column.
     let session_w = match widths.first() {
         Some(ratatui::layout::Constraint::Length(width)) => *width,
         _ => 0,
@@ -401,9 +404,10 @@ fn session_plan(available: u16) -> (Vec<&'static str>, Vec<Constraint>) {
 ///
 /// The `↑` is bright while the conversation is being served upgraded
 /// and dim once it has been at some point in the window but the latest
-/// turn was not (live.mjs:362-367); the `$` marks a session released
+/// turn was not; the `$` marks a session released
 /// past the armed quota gate for the window now running. Idle ages dim
-/// past [`IDLE_SECS`], like live.mjs's idle column. `session_w` is the
+/// past [`IDLE_SECS`], like the reference's idle column. `session_w` is
+/// the
 /// SESSION column's width — the label's budget (see [`session_cell`]).
 fn session_cells(
     session: &SessionAgg,
@@ -435,8 +439,8 @@ fn session_cells(
     push_if(
         7,
         Cell::new(
-            // live.mjs:389's `String(gens || "-")`: the latest generation,
-            // and zero/absent renders as a dash.
+            // The latest generation,
+            // and zero/absent renders as a dash (`String(gens || "-")`).
             session
                 .compact_generations
                 .filter(|generations| *generations > 0)
@@ -459,15 +463,16 @@ fn session_cells(
 }
 
 /// The SESSION cell: the session's name — its working directory and the
-/// title the frontend gave it (live.mjs:376-381's label, `shortDir(cwd)
+/// title the frontend gave it (`shortDir(cwd)
 /// · title ?? prompt`, the directory cyan and the separator dim) — where
-/// the column is wide enough for a name ([`LABEL_MIN_W`], live.mjs:334's
-/// "too narrow a name is noise"), else the session id. An absent label
+/// the column is wide enough for a name ([`LABEL_MIN_W`], on the
+/// "too narrow a name is noise" rule), else the session id. An absent
+/// label
 /// — no transcript, an unreadable one, a tail with nothing usable — is
 /// the id, never an empty cell: the row never loses its name, and
 /// "unlabelled" stays visibly different from "absent" (invariant 3).
 /// The cell clips at the column's width, which grows with the terminal
-/// exactly like live.mjs's leftover label column.
+/// exactly like the reference's leftover label column.
 fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
     if let Some(label) = &session.label
         && width >= LABEL_MIN_W
@@ -493,7 +498,7 @@ fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
 
 /// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
 /// none — green and bright for a native exact 1M, yellow otherwise
-/// (live.mjs's `contextName` colouring, 358-361).
+/// (the reference's context colouring).
 fn ctx_cell(ctx: ContextWindow) -> Cell<'static> {
     match ctx {
         ContextWindow::Unknown => Cell::new("?").dim(),
@@ -525,7 +530,7 @@ fn model_cell(session: &SessionAgg) -> Cell<'static> {
 }
 
 /// Unknown token counts render as `?`, never as a fake zero; known ones
-/// comma-grouped like ctp's `n()`.
+/// comma-grouped.
 fn unknown_or_grouped(value: Option<i64>) -> String {
     value
         .map(|n| super::rebuilds::grouped(Some(n)))
@@ -547,7 +552,7 @@ fn rel_age(delta_ms: i64) -> String {
 }
 
 /// CONTEXT: per-session occupancy against the known ceilings
-/// (live.mjs's context block, 396-434) — a bar and a percentage only
+/// (the reference's context block) — a bar and a percentage only
 /// where both the prompt and the ceiling are known; an unknown prompt
 /// or an unknown ceiling claims nothing (`? / 1M`, `136,260 / ?`),
 /// and an idle session is dimmed, because a session that is not about
@@ -622,7 +627,7 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         let near = frac > 0.8 && !idle;
         // The bar budgets for the line's fixed text AND the trailing
         // note — the "← compacts soon" marker or the idle label —
-        // exactly live.mjs's `Math.max(10, WIDTH - 52)`, which leaves
+        // the `max(10, WIDTH - 52)` rule, which leaves
         // room for its own marker at its shorter fixed text.
         let bar_width = width.saturating_sub(66).max(10) as u16;
         let bar_style = if idle {
@@ -662,7 +667,7 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 }
 
 /// The ceiling label's span, coloured like the sessions table's CTX
-/// cell (live.mjs:358-361).
+/// cell.
 fn ctx_span(label: &str, ctx: ContextWindow) -> Span<'static> {
     let style = match ctx {
         ContextWindow::Unknown => Style::new().dim(),
@@ -674,8 +679,8 @@ fn ctx_span(label: &str, ctx: ContextWindow) -> Span<'static> {
     Span::styled(label.to_owned(), style)
 }
 
-/// TOKENS: where the window's input went (live.mjs's TOKENS block,
-/// 436-504). Shares are computed only when no input bucket is missing
+/// TOKENS: where the window's input went (the reference's TOKENS
+/// block). Shares are computed only when no input bucket is missing
 /// rows; a bucket with unavailable rows renders as a floor (`≥`) with
 /// the reason, and the hit rate is over the REUSABLE prefix — hits
 /// plus rewrites, never all input (fresh input was never going to be a
@@ -717,7 +722,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         ("cache write 5m", &tokens.write_5m),
     ] {
         if incomplete {
-            // live.mjs:453-459 — a missing bucket hides every share,
+            // A missing bucket hides every share,
             // because the total is not a total; each line says why.
             let why = if bucket.unavailable > 0 {
                 format!("{} req unknown", bucket.unavailable)
@@ -751,7 +756,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     }
 
     // Output: no shared denominator with the input buckets, so no bar
-    // (live.mjs:464-470) — just the total and the per-request average.
+    // — just the total and the per-request average.
     let output_note = if tokens.output.unavailable > 0 {
         format!("{} req unknown", tokens.output.unavailable)
     } else {
@@ -772,10 +777,10 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     ]));
 
     // Reasoning: rendered only when a provider reported thinking
-    // tokens (live.mjs:471-475) — an output-side bucket, so the note
+    // tokens — an output-side bucket, so the note
     // carries the per-request average like the output row's. A window
-    // where EVERY row lacks reasoning has nothing to say: live.mjs
-    // renders nothing, and so does this (absence across the board is
+    // where EVERY row lacks reasoning has nothing to say:
+    // nothing renders, and rightly (absence across the board is
     // the provider's silence, not unknown data).
     let reasoning_partial =
         tokens.reasoning.unavailable > 0 && tokens.reasoning.unavailable < tokens.requests;
@@ -880,14 +885,14 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             ]));
         }
         // Nothing was read or rewritten: no rate is claimable either
-        // way, and live.mjs renders no line at all.
+        // way, and no line renders at all.
         HitRate::NothingReusable => {}
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// CACHE REBUILDS: the panel to watch (live.mjs's rebuild block,
-/// 507-522) — rewrites over the threshold, by cause, and the newest
+/// CACHE REBUILDS: the panel to watch (the reference's rebuild
+/// block) — rewrites over the threshold, by cause, and the newest
 /// localised system-prompt changes. The panel never vanishes: no
 /// rebuilds is a verdict ("none — every prefix held"), not an absence
 /// of data, and unknown rewrites are counted, never guessed.
@@ -915,7 +920,8 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     // The denominator is the walk's own window count (`measured` +
     // `unmeasured`), not the display aggregation's: the rebuild read
     // is capped separately, and a fraction must be honest about its
-    // own denominator (live.mjs's `usage.length` is its walk's too).
+    // own denominator (the reference's own walked-row count, the same
+    // rule).
     let walked = rebuilds.measured + rebuilds.unmeasured;
     if rebuilds.unmeasured > 0 {
         lines.push(Line::from(format!(
@@ -945,8 +951,8 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             Span::styled("▬".repeat((*count).min(30)), Style::new().dim()),
         ]));
     }
-    // The newest localised system-prompt changes (summarise.mjs's
-    // per-rebuild line, the part that makes a change diagnosable).
+    // The newest localised system-prompt changes (the per-rebuild
+    // line, the part that makes a change diagnosable).
     for event in rebuilds
         .events
         .iter()
@@ -963,7 +969,7 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// ctp's `shortTokens` (live.mjs:180-184): round thousands and millions
+/// Short tokens: round thousands and millions
 /// abbreviate; anything else renders comma-grouped.
 fn short_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
@@ -975,14 +981,14 @@ fn short_tokens(tokens: u64) -> String {
     }
 }
 
-/// Comma-grouped counts, ctp `n()`'s rendering (shared with the
+/// Comma-grouped counts (shared with the
 /// rebuild panel's detail lines).
 fn grouped(value: Option<i64>) -> String {
     super::rebuilds::grouped(value)
 }
 
-/// The TOKENS panel's bucket bars (ctp live.mjs:461's `bar` with
-/// `▬` fill and space pad — a share bar, visually distinct from the
+/// The TOKENS panel's bucket bars (`▬`
+/// fill and space pad — a share bar, visually distinct from the
 /// occupancy and meter bars).
 fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
     let frac = frac.clamp(0.0, 1.0);
@@ -1038,7 +1044,7 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 /// with errors flagged in red), the error/drift counters — and, when the
 /// snapshot carries a quota section, the plan's own meters with their
 /// reset clocks and forecasts, the `spent` line, and the `binding`
-/// claim (ctp live.mjs's RATE & QUOTA block, 524-626).
+/// claim (the reference's RATE & QUOTA block).
 fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
     let block = Block::bordered().title_top("RATE & QUOTA");
     let inner = block.inner(area);
@@ -1097,7 +1103,7 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// One meter line (ctp live.mjs's `q()`, the whole shape of it): the
+/// One meter line (the reference dashboard's exact line shape): the
 /// label, a utilisation bar coloured by how much is left, and — shed
 /// before anything else when the panel narrows, never wrapped — the
 /// resets clock and the forecast verdict. The verdict is the last
@@ -1160,8 +1166,8 @@ fn meter_line(
         .map(str::to_owned);
 
     // Compose the right side, shedding as the panel narrows: the status
-    // first, then the resets clause, the verdict last (ctp
-    // live.mjs:584-589). Where ctp cuts the bar string mid-glyph at
+    // first, then the resets clause, the verdict last.
+    // Where the reference cuts the bar string mid-glyph at
     // this point, the bar here shrinks instead — every surviving piece
     // keeps its styling and a partial bar still reads as a bar.
     let len = |s: &str| s.chars().count();
@@ -1244,8 +1250,8 @@ fn meter_line(
         Line::from(spans)
     } else {
         // Degenerate width: cut the left so the verdict survives —
-        // ctp's spread clamps the left side of the line, at the price
-        // of the cut portion's styling.
+        // the reference's spread clamps the left side of the line, at
+        // the price of the cut portion's styling.
         let keep = width.saturating_sub(len(&right) + 1);
         let mut spans = vec![
             Span::raw(left.chars().take(keep).collect::<String>()),
@@ -1256,12 +1262,12 @@ fn meter_line(
     }
 }
 
-/// The `spent` line (ctp live.mjs:602-621): how much overage today and
+/// The `spent` line: how much overage today and
 /// this window actually cost — the thing the utilisation bar cannot
 /// say, because a meter sitting at 64% got there at some point in the
 /// past, not necessarily this span. "Today" is the user's local day.
 fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
-    // The five display states (the README's `spent` table): a total,
+    // The five display states (the `spent` display table): a total,
     // a quantisation ceiling, a floor, idle, and no data — a busy span
     // that did not move the 1%-quantised figure must not print as a
     // measured "+0%".
@@ -1304,7 +1310,7 @@ fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
     ])
 }
 
-/// The `binding` line (ctp live.mjs:622-625): the representative-claim
+/// The `binding` line: the representative-claim
 /// naming which limit is in force, with the overage flag beside it —
 /// spend has shifted off plan quota, which is not a footnote.
 fn binding_line(claim: &str, overage_in_use: bool) -> Line<'static> {
@@ -1322,7 +1328,7 @@ fn binding_line(claim: &str, overage_in_use: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The meter bar: fill to `round(frac × w)`, pad with `░` (ctp's `bar`).
+/// The meter bar: fill to `round(frac × w)`, pad with `░`.
 fn bar(frac: f64, w: u16) -> String {
     let w = w as usize;
     let f = frac.clamp(0.0, 1.0);
@@ -1738,7 +1744,7 @@ mod tests {
         let snap = snapshot();
         // Height 12 leaves the middle panels two rows between the
         // header and the fixed bottom row; the sessions scaffold keeps
-        // them (ctp's guard keeps its top — the SESSIONS scaffold and
+        // them (the guard keeps its top — the SESSIONS scaffold and
         // the quota block — over everything else). Width 16 is barely
         // enough for the panel titles. The point: no panic, and the
         // two panels that matter survive.
@@ -1871,7 +1877,7 @@ mod tests {
         let snap = quota_snapshot();
         // 100 columns → the rate panel's inner 38: the resets clause
         // and the status go, the bar shrinks, every verdict survives —
-        // the verdict is the last thing to go (ctp live.mjs:585).
+        // the verdict is the last thing to go.
         let text = rendered(&snap, 100, 30);
         assert!(!text.contains("resets"), "the resets clause is shed");
         assert!(!text.contains("rejected"), "the status is shed first");
@@ -1884,7 +1890,7 @@ mod tests {
     #[test]
     fn an_assumed_gate_marks_its_countdowns_with_a_question() {
         // The same readings from rows predating `gateOn`: the gate is
-        // assumed (ctp's default of armed) and every gate-aware
+        // assumed (armed, by default) and every gate-aware
         // countdown says so — an assumed gate must not read the same
         // as an observed one.
         let rows = quota_rows(false);
@@ -2000,9 +2006,9 @@ mod tests {
     }
 
     /// The session NAME: working directory and title in the SESSION
-    /// cell where the column fits a name (live.mjs:376-381's
-    /// `shortDir(cwd) · title ?? prompt`, the directory cyan), the
-    /// session id where it does not — too narrow (live.mjs:334's
+    /// cell where the column fits a name
+    /// (`shortDir(cwd) · title ?? prompt`, the directory cyan), the
+    /// session id where it does not — too narrow (the
     /// 12-cell rule) or no label at all. An absent label is the id,
     /// never an empty cell.
     #[test]
@@ -2047,8 +2053,8 @@ mod tests {
         );
         labels.insert(
             "ses-prompt".to_owned(),
-            // No cwd, no title: the last prompt stands in, live.mjs's
-            // `title ?? prompt`.
+            // No cwd, no title: the last prompt stands in
+            // (`title ?? prompt`).
             Label {
                 cwd: None,
                 title: None,
@@ -2142,7 +2148,7 @@ mod tests {
     fn context_panel_says_so_when_no_session_has_enough_history() {
         // Occupancy is a claim about a conversation: a window whose
         // sessions never reach the three-request rule gets the explicit
-        // line, never a vanishing panel (live.mjs's
+        // line, never a vanishing panel (the reference's
         // "(no session with enough history yet)").
         let mut rows = Vec::new();
         for at in [2, 4] {
@@ -2348,8 +2354,8 @@ mod tests {
 
     #[test]
     fn tokens_panel_pins_bar_widths_and_percentages_at_a_wide_terminal() {
-        // Inner width 118 → the share bar is 70 wide (live.mjs:461's
-        // WIDTH − 48) and the row keeps its 11 of slack. The space
+        // Inner width 118 → the share bar is 70 wide (the
+        // WIDTH − 48 rule) and the row keeps its 11 of slack. The space
         // counts below are the pins: label padEnd(15) + amount
         // padStart(13), the fill `round(share × 70)`, the empty the
         // rest, the percentage `round(share × 100)` in " NNN%".
@@ -2529,7 +2535,7 @@ mod tests {
             1,
         );
         let text = rendered(&snap, 120, 30);
-        // The max(total, 1) denominator (live.mjs:460) makes each
+        // The max(total, 1) denominator makes each
         // share 0/1 — a 0% with a blank bar, not a crash and not a
         // reason.
         assert!(
@@ -2544,7 +2550,7 @@ mod tests {
             !text.contains("unknown"),
             "nothing is unknown — everything was reported:\n{text}"
         );
-        // Nothing was read or rewritten: live.mjs renders no
+        // Nothing was read or rewritten: no
         // hit-rate line at all.
         assert!(
             !text.contains("hit rate"),
@@ -2573,7 +2579,8 @@ mod tests {
     fn rebuilds_panel_without_rebuilds_says_so_rather_than_vanishing() {
         // No rewrites over the threshold: the panel keeps its place and
         // its verdict. With unknown rewrites the verdict is scoped to
-        // the measured requests, exactly live.mjs's two none-lines.
+        // the measured requests, exactly the reference's two
+        // none-lines.
         let none = crate::tui::rebuilds::RebuildAgg {
             rebuilds: 0,
             measured: 12,

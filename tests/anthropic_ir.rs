@@ -1,7 +1,8 @@
 //! Anthropic IR corpus tests: round-trip byte-equality plus shape
-//! extraction pinned against values computed with ctp's own formulas
-//! (claude-token-proxy proxy.mjs `requestShape`, run on each fixture via
-//! Node — the digests below are ctp's output, not toker's, so any drift in
+//! extraction pinned against values computed with the predecessor
+//! proxy's own formulas (its request-shape extraction, run on each
+//! fixture via Node — the digests below are the predecessor's output,
+//! not toker's, so any drift in
 //! the port fails here). Release-marker parity is pinned the same way.
 //!
 //! Invariants covered: 5 (corpus round-trip), 1 (shapes carry no content),
@@ -110,8 +111,8 @@ fn fixtures_corpus_round_trips_byte_exactly() {
 }
 
 #[test]
-fn minimal_body_shape_matches_ctp() {
-    // ctp: reqBytes 171, systemChars 28, tail over the last 8/16/24 units.
+fn minimal_body_shape_matches_the_pinned_reference() {
+    // Pinned: reqBytes 171, systemChars 28, tail over the last 8/16/24 units.
     assert_eq!(
         shape_of("01_minimal.json"),
         expected_shape(
@@ -137,9 +138,9 @@ fn minimal_body_shape_matches_ctp() {
 }
 
 #[test]
-fn system_blocks_shape_matches_ctp_including_fallback_pieces() {
+fn system_blocks_shape_matches_the_reference_including_fallback_pieces() {
     // The bare string element and the text-less object both count as
-    // pieces (the latter as ""), per ctp's `b?.text || ""`.
+    // pieces (the latter as ""), per the `b?.text || ""` fallback.
     assert_eq!(
         shape_of("02_system_blocks.json"),
         expected_shape(
@@ -174,7 +175,7 @@ fn system_blocks_shape_matches_ctp_including_fallback_pieces() {
 }
 
 #[test]
-fn tools_shape_matches_ctps_name_extraction_and_join() {
+fn tools_shape_matches_the_reference_name_extraction_and_join() {
     // read_file, list_dir, then the type fallback for the type-only entry.
     assert_eq!(
         shape_of("03_tools.json"),
@@ -268,7 +269,7 @@ fn performing_compaction_is_summarising_with_tools() {
 
 #[test]
 fn routine_summariser_is_summarising_but_not_a_compaction() {
-    // ctp cold.mjs `isCompaction`: the title summariser carries the
+    // The compaction test: the title summariser carries the
     // wording but no tools — the measured separator between a compaction
     // and a routine one-shot.
     let shape = shape_of("07_summariser_no_tools.json");
@@ -319,7 +320,8 @@ fn release_marker_fixture_carries_and_shapes() {
 
 #[test]
 fn strip_is_byte_equal_to_the_hand_done_splice() {
-    // ctp's splice on this fixture (verified in Node): keep the opening
+    // The reference splice on this fixture (verified in Node): keep the
+    // opening
     // quote, remove the 10 marker bytes. toker's IR removal must produce
     // exactly those bytes — the equivalence the strip's doc claims.
     let original = fixture("08_release_marker.json");
@@ -329,7 +331,7 @@ fn strip_is_byte_equal_to_the_hand_done_splice() {
     let expected: &[u8] = br#"{"model":"claude-opus-5","system":"You are a careful assistant.","messages":[{"role":"user","content":"Earlier work."},{"role":"assistant","content":"Ok."},{"role":"user","content":[{"type":"text","text":" keep going"}]},{"role":"system","content":[{"type":"text","text":"reminder"}]}]}"#;
     assert_eq!(request.serialise(), expected);
 
-    // The splice window assertions, ctp limit-sentinel.mjs style:
+    // The splice window assertions, splice-style:
     // everything outside the spliced literal is preserved byte for byte.
     let out = request.serialise();
     let needle = format!("\"{SENTINEL}");
@@ -361,7 +363,7 @@ fn strip_is_byte_equal_to_the_hand_done_splice() {
 fn marker_negatives_never_fire_or_strip() {
     // Mid-text marker (code fragment and mid-sentence), the compaction
     // wordings quoted mid-line in the last message, the resume preamble
-    // outside the first message: ctp's shape is all-absent, the strip is
+    // outside the first message: the pinned shape is all-absent, the strip is
     // a byte-for-byte no-op, and the marker never reads as carried.
     let request = parse_fixture("09_marker_negatives.json");
     assert!(!request.anthropic().carries_release());
@@ -393,9 +395,10 @@ fn marker_negatives_never_fire_or_strip() {
 }
 
 #[test]
-fn unicode_system_ladder_matches_ctps_utf16_semantics() {
+fn unicode_system_ladder_matches_the_reference_utf16_semantics() {
     // 16587 UTF-16 units (not scalar chars): two prefix rungs, and the
-    // tail ladder at all 44 offsets. Pinned against ctp's Node output on
+    // tail ladder at all 44 offsets. Pinned against the predecessor's
+    // Node output on
     // this exact fixture; the sampled tail entries are the first (8
     // units), the 16th (128), the last fine step (256), the first coarse
     // step (320), and the last (1024).

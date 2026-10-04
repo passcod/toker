@@ -5,20 +5,20 @@
 //! to the record functions here, which build the [`RequestRow`], insert
 //! it, and emit the per-request tracing line.
 //!
-//! Token-bucket normalization mirrors the ledger proxy's join plugin
-//! exactly (`openrouter-ledger-proxy/plugins/ledger-cost/join.mjs`), which
+//! Token-bucket normalization mirrors the earlier ledger proxy's cost
+//! join exactly, which
 //! the attribution join (phase 5) will rely on both sides observing the
 //! same arithmetic:
 //!
-//! - `input  = max(0, prompt_tokens − cached_tokens)` — join.mjs also
+//! - `input  = max(0, prompt_tokens − cached_tokens)` — the join also
 //!   subtracts `cache_write_tokens`; openrouter reports none (an
-//!   anthropic-ism), so the term contributes 0 exactly like join.mjs's
-//!   `num()` coercion of a missing value.
+//!   anthropic-ism), so the term contributes 0 exactly like the join's
+//!   coercion of a missing value.
 //! - `output = max(0, completion_tokens − reasoning_tokens)` — clamps at 0
-//!   like join.mjs's `Math.max(0, …)` (a provider that reports
+//!   (a provider that reports
 //!   `reasoning > completion` clamps rather than going negative).
 //! - `cache_read = cached_tokens`, `reasoning = reasoning_tokens` —
-//!   unclamped in join.mjs, unclamped here.
+//!   unclamped in the join, unclamped here.
 //!
 //! Absence ≠ zero (invariant 3): a bucket derived from an absent source
 //! metric stays `None` (input needs `prompt_tokens`, output needs
@@ -158,15 +158,16 @@ fn route_of(ctx: &RecordCtx) -> String {
     format!("openai_chat:{}", ctx.server.openrouter.id())
 }
 
-/// Record one sleep-lock transition (ctp: `kind: "awake"`, the row
-/// `evaluateAwake` writes on every held flip, proxy.mjs:472-479).
+/// Record one sleep-lock transition (the `kind: "awake"` row
+/// the lock state machine writes on every held flip).
 ///
 /// The row is what separates "released because the sessions went quiet"
 /// from "the lock quietly stopped working": both leave a machine that
 /// sleeps. `want` differing from `held` is a lock that could not be
-/// taken. ctp's shape `{held, want, until, reason}` rides the
-/// kind-specific payload column; `until` is epoch milliseconds (ctp
-/// logged an ISO string — toker's rows keep the ts_ms convention), `None`
+/// taken. The shape `{held, want, until, reason}` rides the
+/// kind-specific payload column; `until` is epoch milliseconds (the
+/// predecessor logged an ISO string — toker's rows keep the ts_ms
+/// convention), `None`
 /// where the hold rests on something without an expiry or there is no
 /// hold. No duration, no session, never priced — a proxy-written row,
 /// excluded from API measurements by its kind.
@@ -263,7 +264,7 @@ fn insert(ctx: &RecordCtx, row: RequestRow) {
 }
 
 /// The normalized token buckets from one capture (see the module docs for
-/// the formulas and their join.mjs lineage).
+/// the formulas and their lineage).
 pub(crate) struct TokenBuckets {
     /// `max(0, prompt_tokens − cached_tokens)`.
     pub input: Option<i64>,
@@ -282,7 +283,7 @@ pub(crate) struct TokenBuckets {
 /// Normalize one capture into the ledger's token buckets (see the module
 /// docs).
 pub(crate) fn token_buckets(capture: &UsageCapture) -> TokenBuckets {
-    // join.mjs's num(): a missing sub-metric contributes 0 to the
+    // A missing sub-metric contributes 0 to the
     // arithmetic of a metric that *is* present.
     let cached = capture.cached_tokens().unwrap_or(0);
     let written = capture.cache_write_tokens().unwrap_or(0);
@@ -605,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn full_capture_normalizes_like_join_mjs() {
+    fn full_capture_normalizes_the_three_way_subtraction() {
         let b = buckets(json!({
             "prompt_tokens": 100,
             "completion_tokens": 50,
@@ -629,8 +630,8 @@ mod tests {
     }
 
     #[test]
-    fn over_reporting_subsets_clamp_at_zero_like_join_mjs() {
-        // cached > prompt and reasoning > completion: join.mjs's
+    fn over_reporting_subsets_clamp_at_zero() {
+        // cached > prompt and reasoning > completion: the
         // Math.max(0, …) clamps; saturating_sub clamps the same way.
         let b = buckets(json!({
             "prompt_tokens": 10,
@@ -667,7 +668,7 @@ mod tests {
 
     #[test]
     fn a_cache_write_subtracts_from_input_and_charges_the_1h_tier() {
-        // The three-way join.mjs subtraction, and the conservative
+        // The three-way subtraction, and the conservative
         // apportionment: no TTL tiers on this wire, so the whole write
         // lands on the 1-hour tier, flagged as an apportioned guess.
         let b = buckets(json!({

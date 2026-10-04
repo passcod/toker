@@ -1,5 +1,6 @@
-//! The vendored ctp parity contract (a verbatim copy of
-//! claude-token-proxy's `fixtures/node-reference-v1.json`).
+//! The vendored parity contract (a verbatim copy of the predecessor
+//! proxy's `node-reference-v1.json`, vendored at
+//! `tests/fixtures/ctp/node-reference-v1.json`).
 //!
 //! The later phase-2 gate units build their parity tests against this
 //! fixture: it is the language-neutral, content-free statement of the

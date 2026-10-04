@@ -201,7 +201,8 @@ pub struct Paths {
     pub opencode_config: PathBuf,
     /// The shell rc candidates, in offer order.
     pub shell_rcs: Vec<PathBuf>,
-    /// ctp's usage log — the `toker import` source, offered when it
+    /// The predecessor proxy's usage log — the `toker import` source,
+    /// offered when it
     /// exists.
     pub ctp_usage: PathBuf,
     /// The codex CLI's shared login — `codex_sub` is offered as an
@@ -292,7 +293,8 @@ WantedBy=sockets.target
 }
 
 /// `toker.service` for this binary — socket-activated, hardened like
-/// the hand-installed unit (the openrouter-ledger-proxy pattern), with
+/// the hand-installed unit (the pattern the earlier ledger proxy
+/// established), with
 /// `ExecStart` a function of the binary that ran the wizard
 /// (`std::env::current_exe`, resolved by the caller) rather than a
 /// hardcoded path, and `ReadWritePaths` the configured state dir
@@ -316,7 +318,7 @@ Restart=always
 RestartSec=1
 SyslogIdentifier=toker
 
-# Hardening, following the openrouter-ledger-proxy unit pattern.
+# Hardening, following the established hand-installed unit pattern.
 # MemoryDenyWriteExecute is safe for a Rust binary. The state dir is
 # the only writable path; credentials pass through in transit and are
 # never written to disk by the proxy itself.
@@ -441,7 +443,7 @@ struct Detected {
     /// The DETECTED frontends, in the fixed offer order (claude,
     /// workhorse, opencode, shell rc).
     frontends: Vec<FrontendDetected>,
-    /// ctp's usage log exists — the import candidate.
+    /// The predecessor proxy's usage log exists — the import candidate.
     ctp_usage: bool,
     /// The codex CLI's login exists — `codex_sub` is offered when it
     /// does (there is nothing to configure; the login is shared).
@@ -511,7 +513,7 @@ pub struct RunReport {
     /// The frontends whose patch refused (the file shape was not
     /// understood; nothing was clobbered).
     pub patch_failed: Vec<String>,
-    /// The ctp log imported this run, if any.
+    /// The predecessor log imported this run, if any.
     pub import_ran: Option<PathBuf>,
 }
 
@@ -709,7 +711,7 @@ impl<'a> Wizard<'a> {
 
     /// The state summary print (from [`Wizard::detect_state`], before
     /// any prompt): the config, the socket, each frontend (offered or
-    /// not, and why), the codex login, the ctp log.
+    /// not, and why), the codex login, the predecessor's usage log.
     fn state_summary(&mut self, detected: &Detected) -> Result<()> {
         self.say("toker setup — the state of this machine")?;
         let config_line = match (&detected.config, &detected.config_error) {
@@ -754,10 +756,10 @@ impl<'a> Wizard<'a> {
         ))?;
         match detected.ctp_usage {
             true => self.say(&format!(
-                "  ctp history : {} (an import candidate)",
+                "  predecessor history : {} (an import candidate)",
                 self.paths.ctp_usage.display()
             ))?,
-            false => self.say("  ctp history : none")?,
+            false => self.say("  predecessor history : none")?,
         }
         Ok(())
     }
@@ -1253,8 +1255,9 @@ impl<'a> Wizard<'a> {
     // ── the toggles ───────────────────────────────────────────────
 
     /// The plan's optional toggles, after the frontends: the awake
-    /// report (asked at the backends step — it is config), the ctp
-    /// import offer (when the source exists: the existing `toker
+    /// report (asked at the backends step — it is config), the
+    /// history import offer (when the source exists: the existing
+    /// `toker
     /// import` logic, in-process, into the ledger the config names),
     /// and the deferred timers' note — the wake/hold/ping verbs are a
     /// following unit, so the wizard says they are not yet available
@@ -1276,15 +1279,15 @@ impl<'a> Wizard<'a> {
              (a following unit)",
         )?;
         if !detected.ctp_usage {
-            self.say("  ctp history: none to import")?;
+            self.say("  predecessor history: none to import")?;
             return Ok(());
         }
         let question = format!(
-            "Import ctp's usage history into the toker ledger now? (source: {})",
+            "Import the predecessor's usage history into the toker ledger now? (source: {})",
             self.paths.ctp_usage.display()
         );
         if !self.prompt.confirm(&question, true)? {
-            self.say("  ctp import: skipped")?;
+            self.say("  import: skipped")?;
             return Ok(());
         }
         let opts = ImportOpts {
@@ -1299,7 +1302,7 @@ impl<'a> Wizard<'a> {
                 // import::run prints its own report; the wizard adds
                 // where it landed.
                 self.say(&format!(
-                    "  ctp history imported into {}",
+                    "  predecessor history imported into {}",
                     current.db_path.display()
                 ))?;
                 report.import_ran = Some(self.paths.ctp_usage.clone());
@@ -1371,7 +1374,7 @@ impl<'a> Wizard<'a> {
             self.say(&format!("    refused: {name}"))?;
         }
         let ledger = match &report.import_ran {
-            Some(from) => format!("ctp history imported ({})", from.display()),
+            Some(from) => format!("predecessor history imported ({})", from.display()),
             None => "not imported".to_owned(),
         };
         self.say(&format!("  ledger    : {ledger}"))?;
@@ -1880,7 +1883,7 @@ mod tests {
     /// own tests use the same text).
     const EXISTING_TOML: &str = r#"# toker — local config (this machine). Claude drives the codex sub
 # through toker's translation; opencode drives openrouter unchanged.
-# The family map is ctp's own: claude's model names → codex slugs.
+# The family map (inherited from the predecessor): claude's model names → codex slugs.
 default_backend_anthropic = "codex_sub"
 
 [providers.codex_sub.model_map]
@@ -2405,7 +2408,7 @@ WantedBy=sockets.target
     }
 
     #[tokio::test]
-    async fn an_existing_ctp_log_is_offered_and_imported_in_process() {
+    async fn an_existing_predecessor_log_is_offered_and_imported_in_process() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "import",
@@ -2418,13 +2421,13 @@ WantedBy=sockets.target
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
-                confirm(true), // import ctp's history
+                confirm(true), // import the predecessor's history
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let ctp = rig.paths().ctp_usage;
         if let Some(parent) = ctp.parent() {
-            std::fs::create_dir_all(parent).expect("create the ctp dir");
+            std::fs::create_dir_all(parent).expect("create the predecessor dir");
         }
         std::fs::write(
             &ctp,
@@ -2433,7 +2436,7 @@ WantedBy=sockets.target
                 "\n",
             ),
         )
-        .expect("seed the ctp log");
+        .expect("seed the predecessor log");
 
         let report = rig
             .run(VERIFY_TIMEOUT)

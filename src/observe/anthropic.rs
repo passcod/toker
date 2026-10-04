@@ -2,7 +2,7 @@
 //! [`usage`](super::usage) observer, over the same
 //! [`SseSplitter`](super::sse::SseSplitter) events.
 //!
-//! Ports ctp's stream accounting (proxy.mjs): the `message_start` /
+//! Ports the predecessor's stream accounting: the `message_start` /
 //! `message_delta` usage latch and the [`fold`] that collapses them into
 //! one set of buckets. `message_start` carries the cache-creation TTL split
 //! but only a provisional `output_tokens`; the final `message_delta`
@@ -11,7 +11,7 @@
 //! than one iteration, so the array is summed rather than trusting the
 //! top-level scalars.
 //!
-//! TTL split reconciliation (ctp `foldUsage`): the 5m/1h write split is
+//! TTL split reconciliation: the 5m/1h write split is
 //! checked against the authoritative `cache_creation_input_tokens` total,
 //! and any unexplained remainder is charged to the 1h tier — the expensive
 //! one — so the estimate errs high rather than quietly under-reporting,
@@ -23,8 +23,9 @@
 //! and an explicit `null` are `None`, never `0`; a present `0` is a real
 //! `0`. The [`UsagePresence`] map records which metrics the response
 //! actually carried, so a reader can tell a reported zero from an
-//! apportioned or absent one — the additive contract ctp's `usage.mjs`
-//! documents, extracted here from the response itself. Where the fold
+//! apportioned or absent one — the additive contract the predecessor's
+//! usage accounting documents, extracted here from the response itself.
+//! Where the fold
 //! apportions despite absence (the 1h remainder, the forced 5m/1h zeros
 //! when there is nothing to split), the bucket still holds the number the
 //! ledger needs while presence stays `false`: a value without presence is
@@ -46,11 +47,12 @@ use super::sse::SseEvent;
 
 /// Which usage metrics the response actually carried, metric → reported.
 ///
-/// The row's additive presence contract (ctp `usage.mjs` /
-/// `docs/internals/log-schema.md`): keys are this row's metric names and a
+/// The row's additive presence contract:
+/// keys are this row's metric names and a
 /// `false` means the provider did not report the metric even when the
 /// compatibility numeric column holds a finite value (the fold's
-/// apportionment). ctp's key spellings map on import: `input`→`input`,
+/// apportionment). The predecessor's key spellings map on import:
+/// `input`→`input`,
 /// `cacheRead`→`cache_read`, `cacheCreateTotal`→`cache_write_total`,
 /// `write5m`→`cache_write_5m`, `write1h`→`cache_write_1h`, `output`→
 /// `output`, `thinking`→`reasoning`.
@@ -69,8 +71,8 @@ pub struct UsagePresence {
     pub cache_write_1h: bool,
     /// `output_tokens`, in the fold's selected sources.
     pub output: bool,
-    /// `output_tokens_details.thinking_tokens` on the final delta (ctp
-    /// reads thinking from the delta only, never the start).
+    /// `output_tokens_details.thinking_tokens` on the final delta
+    /// (thinking is read from the delta only, never the start).
     pub reasoning: bool,
     /// `server_tool_use.web_search_requests` (delta first, start fallback).
     pub web_searches: bool,
@@ -96,9 +98,10 @@ impl UsagePresence {
     }
 }
 
-/// One metric's verdict for a presence-aware reader: ctp `usage.mjs`
-/// `usageMeasurement`'s rules for a row that carries the map (rules 1–3;
-/// ctp's rule 4 — legacy rows without a map reading missing-as-zero — has
+/// One metric's verdict for a presence-aware reader: the
+/// measurement-interpretation rules for a row that carries the map
+/// (rules 1–3; rule 4 — legacy rows without a map reading
+/// missing-as-zero — has
 /// no toker rows to apply to).
 ///
 /// `false` presence wins over a numeric value: the compatibility number is
@@ -229,7 +232,7 @@ impl AnthropicCapture {
     }
 
     /// Thinking tokens (`output_tokens_details.thinking_tokens`; the row's
-    /// `reasoning` bucket, ctp's `thinking`).
+    /// `reasoning` bucket — the predecessor called it `thinking`).
     pub fn reasoning(&self) -> Option<u64> {
         self.reasoning
     }
@@ -246,7 +249,7 @@ impl AnthropicCapture {
     }
 
     /// Agentic iterations the response folded: `iterations[].len()` when
-    /// the response fell back across models, else 1 (ctp's `iterations`).
+    /// the response fell back across models, else 1.
     pub fn iterations(&self) -> u64 {
         self.iterations
     }
@@ -302,7 +305,7 @@ impl AnthropicObserver {
         self.observe_text(&event.data());
     }
 
-    /// Observe a complete non-streaming JSON response body (ctp's buffered
+    /// Observe a complete non-streaming JSON response body (the buffered
     /// path: the body's top-level `usage` plays the delta's role as the
     /// authoritative snapshot, its `model`/`stop_reason` latch, and its
     /// `error` object latches for an error row). A body that is not valid
@@ -374,7 +377,7 @@ impl AnthropicObserver {
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = Some(model.to_owned());
         }
-        // ctp also reads the message-level speed beside the usage one.
+        // The message-level speed is read beside the usage one.
         if self.speed.is_none()
             && let Some(speed) = message.get("speed").and_then(Value::as_str)
         {
@@ -429,9 +432,9 @@ impl AnthropicObserver {
         }
     }
 
-    /// Collapse the latched snapshots into the capture (ctp `foldUsage`).
+    /// Collapse the latched snapshots into the capture.
     fn fold(self) -> AnthropicCapture {
-        // ctp's source selection: a non-empty `iterations[]` on the delta is
+        // Source selection: a non-empty `iterations[]` on the delta is
         // authoritative and summed; otherwise the delta alone is (the
         // start's scalars are a second report of the same measurement, and
         // summing both would double-count); the start alone when no delta
@@ -465,7 +468,7 @@ impl AnthropicObserver {
         let output = sum_metric(&scalar_sources, "output_tokens");
 
         // The TTL split: from the selected sources' `cache_creation`
-        // objects, falling back to the start's (ctp replaces, not adds —
+        // objects, falling back to the start's (replace, not add —
         // the fallback only runs when no selected source carried a split).
         let mut split_seen = false;
         let mut w5_seen = false;
@@ -516,7 +519,7 @@ impl AnthropicObserver {
         let (cache_write_5m, cache_write_1h, ttl_split_known) = match cache_write_total {
             // No cache write reported: nothing to split, no claim to make.
             None => (None, None, None),
-            // Nothing to split is a known split (ctp: splitKnown = true).
+            // Nothing to split is a known split.
             Some(0) => (Some(0), Some(0), Some(true)),
             Some(total) if !split_seen => {
                 // Only the total, no split: charge it all to the 1h
@@ -529,8 +532,8 @@ impl AnthropicObserver {
                     (Some(w5), Some(w1), Some(true))
                 } else {
                     // The unknown remainder goes to the 1h tier; a split
-                    // that over-reports the total clamps there (ctp pins
-                    // w5 to the total rather than going negative).
+                    // that over-reports the total clamps there (w5 pins
+                    // to the total rather than going negative).
                     let w1_adjusted = w1 as i128 + (total as i128 - split_sum);
                     if w1_adjusted < 0 {
                         (Some(total), Some(0), Some(false))
@@ -604,7 +607,7 @@ impl AnthropicObserver {
     }
 }
 
-/// Sum one metric over the fold's selected sources (ctp's `+= u.field || 0`):
+/// Sum one metric over the fold's selected sources:
 /// absent and malformed entries contribute nothing, and the sum is `None`
 /// when no source reported the metric at all (absence ≠ zero).
 fn sum_metric(sources: &[&Value], key: &str) -> Option<u64> {
@@ -764,7 +767,7 @@ mod tests {
     #[test]
     fn iterations_fallback_sums_the_array_not_the_scalars() {
         let capture = observe(&[&fixture("05_iterations_fallback.sse")]).expect("usage-bearing");
-        // ctp: when the delta carries non-empty iterations[], the top-level
+        // When the delta carries non-empty iterations[], the top-level
         // scalars are ignored — the array is summed.
         assert_eq!(capture.input(), Some(6), "3 + 3, not the 999 top level");
         assert_eq!(
@@ -857,7 +860,7 @@ mod tests {
     #[test]
     fn start_only_streams_fold_the_provisional_snapshot() {
         // No message_delta ever arrived (upstream closed early but clean):
-        // ctp accounts from the start's usage alone.
+        // account from the start's usage alone.
         let stream = concat!(
             "event: message_start\n",
             "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n\n",
@@ -890,7 +893,7 @@ mod tests {
 
     #[test]
     fn empty_iterations_array_falls_back_to_the_delta_scalars() {
-        // ctp: `iterations?.length` — an empty array is no fallback.
+        // An empty array is no fallback.
         let capture = stream(
             r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}"#,
             r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":4,"output_tokens":9,"iterations":[]}}"#,
@@ -953,8 +956,8 @@ mod tests {
 
     #[test]
     fn split_that_over_reports_clamps_to_the_total() {
-        // 400 + 0 reported against a 100 total: ctp clamps w1 up from -300
-        // and pins w5 to the total.
+        // 400 + 0 reported against a 100 total: the fold clamps w1 up from
+        // -300 and pins w5 to the total.
         let capture = stream(
             r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":400,"ephemeral_1h_input_tokens":0}}}}"#,
             r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":100}}"#,
@@ -967,7 +970,7 @@ mod tests {
 
     #[test]
     fn a_cache_creation_object_without_ephemeral_keys_is_a_zero_split() {
-        // ctp's `if (u.cache_creation)`: the object itself claims the split
+        // A present `cache_creation` object itself claims the split
         // exists, so the fold does not fall back to the start — and the
         // empty split reconciles the whole total onto 1h, unknown.
         let capture = stream(
@@ -1139,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn measurement_interpretation_is_usage_mjs_rules_one_to_three() {
+    fn measurement_interpretation_is_rules_one_to_three() {
         // Rule 1: false presence wins over a finite value.
         assert_eq!(measurement(Some(700), false), Measurement::Unavailable);
         // Rule 2: a finite value is measured, including an explicit zero,

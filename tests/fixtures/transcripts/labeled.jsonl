@@ -4,6 +4,6 @@
 {"parentUuid":"a3","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"ai-title","aiTitle":"Old title"}
 {"parentUuid":"a4","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"last-prompt","lastPrompt":"fix the\n  thing"}
 {"parentUuid":"a5","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"user","cwd":"/home/u/code/toker","message":{"role":"user","content":"port the transcript reader"}}
-{"parentUuid":"a6","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading transcript.mjs first"}]}}
+{"parentUuid":"a6","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading the predecessor's transcript reader first"}]}}
 {"parentUuid":"a7","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"ai-title","aiTitle":"TUI session labels from transcripts"}
-{"parentUuid":"a8","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"last-prompt","lastPrompt":"port the transcript reader from transcript.mjs"}
+{"parentUuid":"a8","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"last-prompt","lastPrompt":"port the transcript reader from the predecessor"}

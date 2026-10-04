@@ -68,8 +68,8 @@ impl<'a> ChatBody<'a> {
         self.request.value.get("stream") == Some(&Value::Bool(true))
     }
 
-    /// The content-free request shape for the ledger and lanes (ctp
-    /// parity): counts, lengths, and digests only, never content
+    /// The content-free request shape for the ledger and lanes
+    /// (row parity): counts, lengths, and digests only, never content
     /// (invariant 1).
     pub fn shape(&self) -> Shape {
         let value = &self.request.value;
@@ -78,7 +78,7 @@ impl<'a> ChatBody<'a> {
 
         // System text: every system-family message — role `system` or
         // `developer`, the o-series replacement — in order, each textual
-        // piece one block (ctp's per-block system digests, mapped from
+        // piece one block (per-block system digests, mapped from
         // Anthropic's top-level `system` array to Chat's in-band system
         // messages).
         let mut system = String::new();
@@ -100,14 +100,14 @@ impl<'a> ChatBody<'a> {
 
         Shape {
             req_bytes: self.request.req_bytes,
-            // ctp parity: null when `messages` is missing or not an array,
+            // Row parity: null when `messages` is missing or not an array,
             // not zero (absence ≠ zero, invariant 3).
             req_messages: value
                 .get("messages")
                 .and_then(Value::as_array)
                 .map(|messages| messages.len() as u64),
             req_tools: tool_names.len() as u64,
-            // ctp hashed the empty join to a constant; toker records None
+            // The predecessor hashed the empty join to a constant; toker records None
             // for an empty tool list instead (absence ≠ zero, invariant 3).
             // Lane behaviour is identical either way — every no-tools
             // request shares one lane — but a no-tools lane key now shows a
@@ -115,7 +115,7 @@ impl<'a> ChatBody<'a> {
             tools_hash: (!tool_names.is_empty())
                 .then(|| short_hash(tool_names.join("\0").as_bytes())),
             system_chars: system.chars().count() as u64,
-            // Always present, even for an empty system (ctp parity: the
+            // Always present, even for an empty system (row parity: the
             // digest of "" is a valid, comparable identity).
             system_hash: short_hash(system.as_bytes()),
             system_blocks,
@@ -290,10 +290,10 @@ pub struct Tool<'a> {
 }
 
 impl<'a> Tool<'a> {
-    /// The tool's name: OpenAI nests it at `function.name`; ctp's fallback
+    /// The tool's name: OpenAI nests it at `function.name`; the fallback
     /// chain (`name`, then `type`, then a constant `?`) covers non-standard
     /// bodies. A tool never reads as absent — the `?` keeps the count and
-    /// the join aligned the way ctp's did.
+    /// the join aligned the way the ledger's always been.
     pub fn name(&self) -> &'a str {
         self.value
             .get("function")
@@ -305,7 +305,7 @@ impl<'a> Tool<'a> {
     }
 }
 
-/// The content-free request shape for the ledger and lanes (ctp parity):
+/// The content-free request shape for the ledger and lanes (row parity):
 /// counts, lengths, and digests only — never message, system, or tool text
 /// (invariant 1). The server unit copies these into the `requests` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,21 +315,21 @@ pub struct Shape {
     /// Message count; `None` when `messages` is missing or not an array
     /// (absence ≠ zero, invariant 3).
     pub req_messages: Option<u64>,
-    /// Tool count (0 when `tools` is absent — ctp parity).
+    /// Tool count (0 when `tools` is absent — row parity).
     pub req_tools: u64,
     /// Digest of the tool-name list joined with `\0`, in order (order
     /// matters as much as membership: tools render first, so any reordering
     /// invalidates the entire prefix). `None` when the tool list is empty —
-    /// see [`ChatBody::shape`] for the deliberate divergence from ctp's
-    /// hash-of-empty-join.
+    /// see [`ChatBody::shape`] for the deliberate divergence from the
+    /// predecessor's hash-of-empty-join.
     pub tools_hash: Option<String>,
     /// Total system text length in characters (Unicode scalar values).
     pub system_chars: u64,
     /// Digest of the concatenated system/developer text; always present,
-    /// even when empty (ctp parity).
+    /// even when empty (row parity).
     pub system_hash: String,
     /// Per-block digests/lengths: one per textual piece of every
-    /// system-family message, in order (ctp's `systemBlocks`, mapped from
+    /// system-family message, in order (mapped from
     /// Anthropic's top-level array to Chat's in-band system messages).
     pub system_blocks: Vec<BlockDigest>,
 }
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_names_follow_the_openai_path_with_ctp_fallbacks() {
+    fn tool_names_follow_the_openai_path_with_predecessor_fallbacks() {
         let body = br#"{"tools":[{"type":"function","function":{"name":"a"}},{"name":"b"},{"type":"custom"},{"weird":true}]}"#;
         let request = parse(body);
         let tools = request.openai_chat().tools();

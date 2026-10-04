@@ -1,6 +1,6 @@
 //! The lane table: per `sessionId|toolsHash` cache state (plan: Middleware —
-//! "Lane tracking + sleep lock"; the ctp lane rule,
-//! claude-token-proxy/docs/internals/lanes.md).
+//! "Lane tracking + sleep lock"; the lane rule,
+//! as the predecessor proxy's internal docs stated it).
 //!
 //! **A session is not a cache entry.** One session interleaves the main
 //! agent, its subagents, and small utility calls, each with its own cached
@@ -9,28 +9,31 @@
 //! session alone, a two-token title summariser would stand in for the main
 //! agent's 400k prefix *and* keep resetting its idle clock.
 //!
-//! A faithful port of ctp's lane table, measured over weeks of production
-//! traffic — ported, not improved. Sources:
+//! A faithful port of the predecessor proxy's lane table, measured over
+//! weeks of production traffic — ported, not improved. Pieces:
 //!
-//! - `laneKey` — ctp cold.mjs:391 (toker keeps ctp's `?`-collapse out: no
+//! - the lane key ([`lane_key`] — toker keeps the predecessor's
+//!   `?`-collapse out: no
 //!   session or no tools-hash means no lane at all, per this unit's plan);
-//! - `laneTtl` (the TTL stickiness rule) — cold.mjs:519-523;
-//! - `noteLaneResponse` — proxy.mjs:407-416;
-//! - `lanesFromRows` (restart reseed) — cold.mjs:459-500;
-//! - `pruneLanes` (the 4000-lane / 30-day policy) — cold.mjs:534-573, as
+//! - the TTL stickiness rule ([`lane_ttl`]);
+//! - the response merge ([`note_lane_response`]);
+//! - the restart reseed ([`lanes_from_rows`]);
+//! - the 4000-lane / 30-day prune policy ([`LANE_MAX`],
+//!   [`LANE_MAX_AGE_MS`]), as
 //!   SQL in the store ([`Store::prune_lanes`]) because toker has a database
-//!   where ctp rewrote a whole file;
-//! - `isPing` — proxy.mjs:446;
-//! - the 30-second flush cadence — proxy.mjs:380-394.
+//!   where the predecessor rewrote a whole file;
+//! - the ping-header test ([`is_ping`]);
+//! - the 30-second flush cadence ([`LANE_FLUSH_MS`]).
 //!
-//! Where ctp kept an in-memory `Map` flushed to `lanes.json` every 30 s,
+//! Where the predecessor kept an in-memory `Map` flushed to a JSON file
+//! every 30 s,
 //! toker upserts straight into the `lanes` table on every response (one
 //! single-row write, the same rate the ledger already writes at) and keeps
-//! only the *prune* on ctp's 30-second timer — a cheap SQL statement run
+//! only the *prune* on the 30-second timer — a cheap SQL statement run
 //! periodically, never per request.
 //!
-//! Units: `updated_ms`/`noticed_at` are epoch milliseconds (ctp `Date.now()`
-//! convention). The TTL tier is stored as its duration in milliseconds
+//! Units: `updated_ms`/`noticed_at` are epoch milliseconds (a
+//! `Date.now()`-style convention). The TTL tier is stored as its duration in milliseconds
 //! (`300_000` = the 5-minute tier, `3_600_000` = the 1-hour tier), the same
 //! shape the store's v1 schema already fixed.
 //!
@@ -45,28 +48,28 @@ use axum::http::HeaderMap;
 use crate::catalog::windows::model_identity;
 use crate::store::{Lane, RequestRow, RowKind, Store};
 
-/// How many lanes the table keeps (ctp `LANE_MAX`, cold.mjs:377): 908
+/// How many lanes the table keeps: 908
 /// accumulated over a fortnight of heavy use, so this is generous rather
 /// than tight.
 pub const LANE_MAX: usize = 4000;
 
-/// Beyond this a lane is not a session anyone is going to resume (ctp
-/// `LANE_MAX_AGE_MS`, cold.mjs:380).
+/// Beyond this a lane is not a session anyone is going to resume.
 pub const LANE_MAX_AGE_MS: i64 = 30 * 24 * 3600 * 1000;
 
-/// How often the lane table prunes (ctp `LANE_FLUSH_MS`, proxy.mjs:380): a
+/// How often the lane table prunes: a
 /// threshold measured in hours does not miss up to this much staleness, and
 /// real I/O never lands on the request path.
 pub const LANE_FLUSH_MS: u64 = 30_000;
 
 /// The default header the window pinger tags its requests with (plan:
 /// "Ping tagging — marks ping lanes so they never hold the sleep lock";
-/// ctp's is `x-ctp-ping`, read by name like every request header —
+/// the predecessor's header was `x-ctp-ping`, read by name like every
+/// request header —
 /// invariant 2). Setup can rename it via config.
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
 
-/// The cache TTL tier a lane's cached prefix survives on (ctp `laneTtl`'s
-/// two tiers). Stored in the lane row as its duration in milliseconds.
+/// The cache TTL tier a lane's cached prefix survives on (the two
+/// tiers). Stored in the lane row as its duration in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ttl {
     /// The 5-minute cache-write tier.
@@ -85,9 +88,9 @@ impl Ttl {
     }
 
     /// The tier a stored `ttl` value names; `None` for an unrecorded or
-    /// unrecognised value. ctp's `ttlOf` treats an unrecorded tier as the
-    /// long one when reading (guessing short would fire on lanes whose
-    /// cache is still live); that reading is the cold gate's, the next
+    /// unrecognised value. Reading an unrecorded tier as the
+    /// long one (guessing short would fire on lanes whose
+    /// cache is still live) is the cold gate's rule, the next
     /// unit's — here absence stays absence.
     pub fn from_ms(ms: Option<i64>) -> Option<Ttl> {
         match ms {
@@ -103,11 +106,12 @@ impl Ttl {
     }
 }
 
-/// The lane key: `sessionId|toolsHash` (ctp `laneKey`, cold.mjs:391).
+/// The lane key: `sessionId|toolsHash`.
 ///
 /// `None` when either half is absent: a request without a session cannot be
 /// attributed to a conversation, and one without a tools-hash has no lane
-/// identity to compare against — ctp folded both into a shared `"?"` lane,
+/// identity to compare against — the predecessor folded both into a shared
+/// `"?"` lane,
 /// which exists for its pre-`toolsHash` log rows; toker's rows always carry
 /// both when they carry either, so no lane is the cleaner answer.
 pub fn lane_key(session_id: Option<&str>, tools_hash: Option<&str>) -> Option<String> {
@@ -116,8 +120,8 @@ pub fn lane_key(session_id: Option<&str>, tools_hash: Option<&str>) -> Option<St
     Some(format!("{session}|{tools}"))
 }
 
-/// The cache TTL tier a lane carries, given what this request wrote (ctp
-/// `laneTtl`, cold.mjs:519-523 — the stickiness rule, ported exactly).
+/// The cache TTL tier a lane carries, given what this request wrote
+/// (the stickiness rule, ported exactly).
 ///
 /// The **longest-lived tier the lane has been observed writing**, and
 /// sticky: a lane's cached prefix survives as long as its longest-lived
@@ -140,10 +144,10 @@ pub fn lane_ttl(prev: Option<Ttl>, write_5m: u64, write_1h: u64) -> Option<Ttl> 
     prev
 }
 
-/// Does this request carry the ping header? (ctp `isPing`, proxy.mjs:446 —
-/// `headers["x-ctp-ping"] === "1"`, read by name only: request headers are
+/// Does this request carry the ping header?
+/// (`"<ping header>" === "1"`, read by name only: request headers are
 /// never captured wholesale, they carry credentials — invariant 2.) The
-/// exact literal `"1"` is ctp's, kept verbatim.
+/// exact literal `"1"` is the frozen wire form, kept verbatim.
 pub fn is_ping(headers: &HeaderMap, name: &str) -> bool {
     headers
         .get(name)
@@ -151,8 +155,8 @@ pub fn is_ping(headers: &HeaderMap, name: &str) -> bool {
         .is_some_and(|value| value == "1")
 }
 
-/// A sticky model upgrade the lane must keep honouring (ctp's
-/// `forced: {from, to}`): the upgrade is decided once, where no cache can be
+/// A sticky model upgrade the lane must keep honouring
+/// (`forced: {from, to}`): the upgrade is decided once, where no cache can be
 /// lost by it, and the conversation's cache then lives on `to`. This unit
 /// only carries the record — the force-newest rewrite that produces it is
 /// the next unit's.
@@ -176,13 +180,13 @@ impl Forced {
     }
 }
 
-/// What one served response teaches the lane table (ctp `noteLaneResponse`'s
-/// inputs, proxy.mjs:407-416 and 1767-1777).
+/// What one served response teaches the lane table (the response
+/// observer's inputs — see also the row the server writes for each).
 #[derive(Debug, Clone)]
 pub struct LaneResponse<'a> {
     pub session_id: Option<&'a str>,
     pub tools_hash: Option<&'a str>,
-    /// When the response completed — epoch ms. ctp's `at` moves only here,
+    /// When the response completed — epoch ms. `updated_ms` moves only here,
     /// because it means "when this lane's cache was last touched", not
     /// "when the proxy last saw a request for it".
     pub at_ms: i64,
@@ -204,16 +208,17 @@ pub struct LaneResponse<'a> {
 }
 
 /// Remember what a lane holds, after a response the API actually served
-/// (ctp `noteLaneResponse`, proxy.mjs:407-416, over the store instead of an
+/// (over the store instead of an
 /// in-memory `Map`).
 ///
-/// The forced-keep rule is ctp's verbatim: a request served **unrewritten**
+/// The forced-keep rule, verbatim from the predecessor: a request served
+/// **unrewritten**
 /// ends an upgrade (the user chose a model, or the lane went cold and was
 /// decided afresh); a **compaction** does not — a cold one is rewritten on
 /// its own terms and says nothing about the model the conversation resumes
 /// on. `noticed_at` never moves here: nothing was measured and nothing
 /// reached upstream when a notice fired, so the lane's prefix and cache age
-/// are exactly what they were (see ctp `noteLaneNotice`, proxy.mjs:425-430).
+/// are exactly what they were (the notice path never touches the lane).
 ///
 /// Returns the stored lane, or `None` when there is no lane to key on.
 /// A store error propagates; the caller keeps the request alive (invariant
@@ -232,7 +237,7 @@ pub fn note_lane_response(
 }
 
 /// The pure core of [`note_lane_response`]: `{ ...prev, at, prompt, ttl,
-/// ping, forced: keep }` (ctp proxy.mjs:413-414). Exposed for the reseed's
+/// ping, forced: keep }`. Exposed for the reseed's
 /// tests; the prev-spread is what keeps `noticed_at` across responses.
 fn merge_lane(prev: Option<&Lane>, key: &str, response: &LaneResponse<'_>) -> Lane {
     let keep = if response.compaction {
@@ -254,7 +259,7 @@ fn merge_lane(prev: Option<&Lane>, key: &str, response: &LaneResponse<'_>) -> La
             response.write_1h,
         )
         .map(Ttl::as_ms),
-        // ctp's `ping || undefined`: only `true` is a ping — a lane
+        // Only `true` is a ping — a lane
         // wrongly marked one is a session the machine may sleep through,
         // so a non-ping response clears the flag rather than sticking.
         ping: response.ping.then_some(true),
@@ -266,8 +271,8 @@ fn merge_lane(prev: Option<&Lane>, key: &str, response: &LaneResponse<'_>) -> La
     }
 }
 
-/// Rebuild the lane table from ledger rows (ctp `lanesFromRows`,
-/// cold.mjs:459-500 — the same per-row derivation, the same keying, the
+/// Rebuild the lane table from ledger rows (the same per-row derivation,
+/// the same keying, the
 /// same last-wins by ts).
 ///
 /// The gate cannot fire for a lane it has no record of, and an empty table
@@ -345,13 +350,14 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
     lanes
 }
 
-/// Re-seed the lane table on startup (ctp `loadLanes`, proxy.mjs:226-246):
+/// Re-seed the lane table on startup:
 /// derive lanes from the ledger tail, then take the later reading wherever
 /// the stored row disagrees, and remember a notice recorded by either.
 ///
 /// Neither source is a superset of the other: the ledger is written per
 /// request, the lanes table per response — the same either-can-be-fresher
-/// property that made ctp merge the log seed with its file, except toker's
+/// property that made the predecessor merge the log seed with its file,
+/// except toker's
 /// table is already durable, so the merge only has to reconcile.
 ///
 /// Idempotent: running it over an already-seeded store changes nothing.
@@ -360,7 +366,7 @@ pub fn reseed(store: &Store, rows: &[RequestRow]) -> crate::store::Result<()> {
     for stored in store.load_lanes()? {
         let key = stored.key.clone();
         let derived = merged.remove(&key);
-        // ctp: take the later reading, remember a notice recorded by either.
+        // Take the later reading, remember a notice recorded by either.
         let updated_ms = derived.as_ref().map_or(stored.updated_ms, |derived| {
             derived.updated_ms.max(stored.updated_ms)
         });
@@ -387,9 +393,9 @@ pub fn reseed(store: &Store, rows: &[RequestRow]) -> crate::store::Result<()> {
     Ok(())
 }
 
-/// A row's prompt: what a cold resume of that request would re-read (ctp
-/// `lanesFromRows`: `(r.input || 0) + (r.cacheRead || 0) +
-/// (r.cacheCreateTotal || 0)` — missing metrics contribute 0, the sum is a
+/// A row's prompt: what a cold resume of that request would re-read
+/// (fresh input + cache read + cache writes — missing metrics contribute
+/// 0; the sum is a
 /// measurement that exists once any one of them does).
 fn prompt_of(row: &RequestRow) -> i64 {
     row.input
@@ -398,17 +404,17 @@ fn prompt_of(row: &RequestRow) -> i64 {
         .saturating_add(row.cache_write_total.unwrap_or(0))
 }
 
-/// ctp `isCompaction` over a ledger row (cold.mjs:701-706): the separator
+/// The compaction test over a ledger row: the separator
 /// between a compaction and the routine title summariser is the session's
-/// tool set, not size. A row with no `req_tools` cannot say (`null` in ctp),
-/// which reads as not-a-compaction here exactly as `isCompaction(r) === true`
-/// reads false there.
+/// tool set, not size. A row with no `req_tools` cannot say,
+/// which reads as not-a-compaction here — the same verdict the
+/// predecessor's test gave rows it could not classify.
 fn is_compaction_row(row: &RequestRow) -> bool {
     row.summarising == Some(true) && row.req_tools.unwrap_or(0) > 0
 }
 
-/// The sticky-upgrade record from a ledger row (ctp `lanesFromRows`'s
-/// `forced` derivation, cold.mjs:488-496).
+/// The sticky-upgrade record from a ledger row (the `forced`
+/// derivation).
 fn forced_from_row(row: &RequestRow) -> Option<Forced> {
     let from = model_identity(row.forced_from.as_deref()?)?;
     // Before host mapping, the response model was the adaptive target.
@@ -529,7 +535,7 @@ mod tests {
         }
     }
 
-    // ── keying (ctp laneKey) ──────────────────────────────────────────
+    // ── keying ───────────────────────────────────────────────────────
 
     #[test]
     fn a_lane_needs_both_a_session_and_a_tools_hash() {
@@ -553,7 +559,7 @@ mod tests {
         assert!(store.load_lanes().expect("lanes").is_empty());
     }
 
-    // ── TTL stickiness (ctp laneTtl) ──────────────────────────────────
+    // ── TTL stickiness ───────────────────────────────────────────────
 
     #[test]
     fn the_longest_lived_tier_wins_and_stays() {
@@ -588,7 +594,7 @@ mod tests {
         assert_eq!(Ttl::Hour.duration_ms(), 3_600_000);
     }
 
-    // ── ping tagging (ctp isPing) ─────────────────────────────────────
+    // ── ping tagging ─────────────────────────────────────────────────
 
     #[test]
     fn the_ping_header_is_read_by_name_for_the_exact_literal_one() {
@@ -602,7 +608,7 @@ mod tests {
         assert!(is_ping(&headers, "x-toker-ping"));
     }
 
-    // ── note_lane_response (ctp noteLaneResponse) ──────────────────────
+    // ── note_lane_response ────────────────────────────────────────────
 
     #[test]
     fn a_second_response_updates_the_lane_it_does_not_duplicate() {
@@ -634,7 +640,7 @@ mod tests {
 
     #[test]
     fn a_non_ping_response_clears_the_ping_flag() {
-        // ctp `ping: ping || undefined` — the flag describes the latest
+        // `ping: ping || undefined` — the flag describes the latest
         // request, so a lane wrongly marked one stops being one.
         let store = mem_store();
         let mut pinged = response(Some("ses-1"), Some("t1"), 1_000);
@@ -681,7 +687,7 @@ mod tests {
         assert_eq!(lane.forced_to, None);
     }
 
-    // ── reseed from rows (ctp lanesFromRows) ───────────────────────────
+    // ── reseed from rows ──────────────────────────────────────────────
 
     #[test]
     fn rows_rebuild_lanes_last_wins_by_ts() {
@@ -805,7 +811,7 @@ mod tests {
         let lanes = lanes_from_rows(&rows);
         assert_eq!(lanes["ses-1|t1"].forced_to, None);
 
-        // Without forced_to the response model is the target (ctp's
+        // Without forced_to the response model is the target (the
         // pre-host-mapping rule: rawModel, then model).
         let mut rows = vec![measurement_row(Some("ses-1"), Some("t1"), 1_000)];
         rows[0].forced_from = Some("claude-opus-5".to_owned());
@@ -830,7 +836,7 @@ mod tests {
         assert_eq!(lanes["ses-1|t1"].ping, None);
     }
 
-    // ── the reseed merge (ctp loadLanes) ──────────────────────────────
+    // ── the reseed merge ──────────────────────────────────────────────
 
     #[test]
     fn reseed_takes_the_later_reading_and_remember_either_s_notice() {
@@ -895,11 +901,11 @@ mod tests {
         assert_eq!(store.load_lanes().expect("lanes").len(), 3);
     }
 
-    // ── the prune policy (ctp pruneLanes) is asserted at the store level;
+    // ── the prune policy is asserted at the store level;
     //    the constants it runs with are pinned here ─────────────────────
 
     #[test]
-    fn the_prune_constants_are_ctps() {
+    fn the_prune_constants_are_the_measured_ones() {
         assert_eq!(LANE_MAX_AGE_MS, 30 * 24 * 3600 * 1000);
         assert_eq!(super::LANE_MAX, 4000);
         assert_eq!(super::LANE_FLUSH_MS, 30_000);

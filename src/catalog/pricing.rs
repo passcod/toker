@@ -1,31 +1,33 @@
-//! API list prices, USD per million tokens — port of ctp's `pricing.mjs`
-//! (verified table, fast mode, geo multiplier, normalisation).
+//! API list prices, USD per million tokens — port of the predecessor
+//! proxy's verified table (verified table, fast mode, geo multiplier,
+//! normalisation).
 //!
 //! Cache-read is stored explicitly per model rather than derived as 0.1×
 //! input: Fable 5.1 / Mythos 5.1 read at 0.025×, and deriving them would
 //! silently overcharge those models 4×. Every rate the ledger needs is a
 //! table entry, never arithmetic on another entry.
 //!
-//! Not ported from `pricing.mjs` (plan: the plan/overage layer died with
-//! ctp): `PLAN_USD_PER_MONTH`, `PLAN_PRO_MULTIPLE`, `OVERAGE_RATE_MULTIPLIER`,
+//! Not ported from the predecessor (plan: the plan/overage layer died
+//! with ctp): `PLAN_USD_PER_MONTH`, `PLAN_PRO_MULTIPLE`,
+//! `OVERAGE_RATE_MULTIPLIER`,
 //! `ALT_PLAN`. Only per-token prices, the fast-mode table, the web-search
 //! per-call price, and the US-geo multiplier survive into toker.
 
 /// The date this table was last verified against the provider's pricing
-/// page (ctp `PRICING_VERIFIED_ON`; the banner prints it, and re-verifying
+/// page (the banner prints it, and re-verifying
 /// is a human duty that moves this date).
 pub const VERIFIED_ON: &str = "2026-09-03";
 
 /// Server-side web search bills per call, not per token
-/// (ctp `WEB_SEARCH_USD_PER_REQUEST`: $10 per 1,000 requests).
+/// ($10 per 1,000 requests).
 pub const WEB_SEARCH_USD_PER_REQUEST: f64 = 10.0 / 1000.0;
 
-/// `inference_geo: "us"` bills 1.1× across every token category
-/// (ctp `US_GEO_MULTIPLIER`).
+/// `inference_geo: "us"` bills 1.1× across every token category.
 pub const US_GEO_MULTIPLIER: f64 = 1.1;
 
-/// One model's rates: USD per million tokens, per category. The constructor
-/// shape mirrors ctp's `T(input, output, write5m, write1h, read)` helper.
+/// One model's rates: USD per million tokens, per category. The
+/// constructor argument order is
+/// `T(input, output, write5m, write1h, read)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rates {
     /// Base input tokens.
@@ -40,7 +42,7 @@ pub struct Rates {
     pub read: f64,
 }
 
-/// ctp's `T(...)`: the table reads in the same argument order.
+/// The table reads in the same argument order.
 const fn rates(input: f64, output: f64, write_5m: f64, write_1h: f64, read: f64) -> Rates {
     Rates {
         input,
@@ -51,7 +53,7 @@ const fn rates(input: f64, output: f64, write_5m: f64, write_1h: f64, read: f64)
     }
 }
 
-/// The hand-verified price table (ctp `PRICING`), keyed by normalised model
+/// The hand-verified price table, keyed by normalised model
 /// id (see [`normalise_model_id`]).
 static PRICING: &[(&str, Rates)] = &[
     ("claude-fable-5-1", rates(10.0, 50.0, 12.5, 20.0, 0.25)),
@@ -76,7 +78,7 @@ static PRICING: &[(&str, Rates)] = &[
 ];
 
 /// Fast mode (`/fast` in Claude Code) reprices the base rates; the cache
-/// multipliers then apply on top of the fast base (ctp `FAST_PRICING`).
+/// multipliers then apply on top of the fast base.
 static FAST_PRICING: &[(&str, Rates)] = &[
     ("claude-opus-5", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
     ("claude-opus-4-8", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
@@ -84,8 +86,7 @@ static FAST_PRICING: &[(&str, Rates)] = &[
 
 /// One model's resolved pricing: the rates that apply (fast and/or geo
 /// adjustments already folded in), the normalised id they belong to, and
-/// whether fast mode actually repriced this model (ctp `ratesFor`'s return
-/// shape).
+/// whether fast mode actually repriced this model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pricing {
     /// The applicable rates, per Mtok, geo multiplier included.
@@ -97,8 +98,8 @@ pub struct Pricing {
     pub fast: bool,
 }
 
-/// The token buckets a cost is computed from. ctp `costOf` folds missing
-/// metrics in as 0 — cost is an estimate, so an unreported bucket
+/// The token buckets a cost is computed from. The cost fold treats
+/// missing metrics as 0 — cost is an estimate, so an unreported bucket
 /// contributes nothing rather than poisoning the total; the caller decides
 /// what a `None` observation means (the presence map carries that verdict).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -118,7 +119,7 @@ pub struct CostBuckets {
 }
 
 impl Pricing {
-    /// Cost in USD for one request's token buckets (ctp `costOf`):
+    /// Cost in USD for one request's token buckets:
     /// Σ bucket × rate / 1e6, plus web searches at the per-call price.
     pub fn cost_usd(&self, buckets: &CostBuckets) -> f64 {
         let rates = &self.rates;
@@ -132,7 +133,7 @@ impl Pricing {
 }
 
 /// Strip client-only bracket variants and snapshot-date suffixes from a wire
-/// model id (ctp `normaliseModel`): `claude-opus-5[1m]` and
+/// model id: `claude-opus-5[1m]` and
 /// `claude-haiku-4-5-20251001` both fold to their price-table identities.
 ///
 /// `None` for an id with nothing left — the caller records no price, never a
@@ -148,7 +149,7 @@ pub fn normalise_model_id(model: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
-/// The pricing lookup (ctp `ratesFor`). `fast` selects the fast-mode table
+/// The pricing lookup. `fast` selects the fast-mode table
 /// when the model has a fast entry (otherwise base rates price the request);
 /// `geo == Some("us")` multiplies every rate by [`US_GEO_MULTIPLIER`].
 ///
@@ -185,7 +186,7 @@ fn lookup(table: &[(&str, Rates)], id: &str) -> Option<Rates> {
         .map(|(_, rates)| *rates)
 }
 
-/// Remove every complete `[...]` group (ctp's `/\[[^\]]*\]/g`); an
+/// Remove every complete `[...]` group; an
 /// unterminated `[` is data, not a group, and stays.
 fn strip_brackets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -207,7 +208,7 @@ fn strip_brackets(text: &str) -> String {
     out
 }
 
-/// Drop a trailing snapshot date, `-YYYYMMDD` (ctp's `/-\d{8}$/`); a longer
+/// Drop a trailing snapshot date, `-YYYYMMDD`; a longer
 /// or shorter digit tail is not a snapshot date and stays.
 fn strip_snapshot_date(text: &str) -> &str {
     let bytes = text.as_bytes();
@@ -229,8 +230,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn verified_on_is_pinned_to_ctps_date() {
-        // The freshness discipline (ctp PRICING_VERIFIED_ON): the date must
+    fn verified_on_is_pinned_to_the_verified_date() {
+        // The freshness discipline: the date must
         // exist and be date-shaped; re-verification moves it deliberately.
         assert_eq!(VERIFIED_ON, "2026-09-03");
         assert!(
@@ -240,13 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn per_call_and_geo_constants_match_ctp() {
+    fn per_call_and_geo_constants_match_the_reference() {
         assert_eq!(WEB_SEARCH_USD_PER_REQUEST, 10.0 / 1000.0);
         assert_eq!(US_GEO_MULTIPLIER, 1.1);
     }
 
     #[test]
-    fn pinned_rates_come_from_the_ctp_table() {
+    fn pinned_rates_come_from_the_measured_table() {
         let cases = [
             // Cache-read stored explicitly: Fable/Mythos 5.1 read at 0.025x.
             ("claude-fable-5-1", rates(10.0, 50.0, 12.5, 20.0, 0.25)),
@@ -269,7 +270,7 @@ mod tests {
 
     #[test]
     fn unknown_models_price_to_none_never_a_guess() {
-        // The caller records NULL cost and warns once (ctp's rule); a guess
+        // The caller records NULL cost and warns once; a guess
         // here would defeat it.
         assert_eq!(price("claude-opus-6", false, None), None);
         assert_eq!(price("some-other-provider/model", false, None), None);
@@ -293,7 +294,8 @@ mod tests {
         assert_eq!(normalise_model_id(""), None);
         assert_eq!(normalise_model_id("   "), None);
         assert_eq!(normalise_model_id("[1m]"), None);
-        // A 9-digit tail is not a snapshot date (ctp's -\d{8}$ is anchored).
+        // A 9-digit tail is not a snapshot date (the date tail is anchored
+        // at exactly 8 digits).
         assert_eq!(
             normalise_model_id("claude-opus-5-202510012").as_deref(),
             Some("claude-opus-5-202510012")
@@ -328,7 +330,7 @@ mod tests {
         assert_eq!(fast48.rates, rates(10.0, 50.0, 12.5, 20.0, 1.0));
 
         // Sonnet 5 does not: a fast request prices at base, flagged as not
-        // fast-repriced (ctp's Boolean(fast && FAST_PRICING[id])).
+        // fast-repriced.
         let base = price("claude-sonnet-5", true, None).expect("priced");
         assert!(!base.fast);
         assert_eq!(base.rates, rates(2.0, 10.0, 2.5, 4.0, 0.2));
@@ -359,8 +361,9 @@ mod tests {
     }
 
     #[test]
-    fn cost_matches_ctps_cost_of() {
-        // ctp's COLD probe scenario: 2 input, 82,420 cache-read at the 1h
+    fn cost_matches_the_reference_scenario() {
+        // The predecessor's cold-probe scenario (measured in production):
+        // 2 input, 82,420 cache-read at the 1h
         // tier, 13 output, Opus 5 list prices.
         let priced = price("claude-opus-5", false, None).expect("priced");
         let cost = priced.cost_usd(&CostBuckets {

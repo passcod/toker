@@ -1,6 +1,6 @@
-//! `toker import`: ingest claude-token-proxy's `usage.jsonl` into the
-//! requests ledger (plan: Storage — "`toker import` ingests ctp's
-//! usage.jsonl (honoring ctp's docs/internals/log-schema.md field-era
+//! `toker import`: ingest the predecessor proxy's `usage.jsonl` into the
+//! requests ledger (plan: Storage — "`toker import` ingests the
+//! predecessor's usage.jsonl (honoring its field-era
 //! notes) so learned model state and 7-day forecasting stay continuous
 //! from day one").
 //!
@@ -10,7 +10,7 @@
 //!   few thousand), so an interrupted import exposes at most a
 //!   re-runnable prefix, never a partial batch;
 //! - a malformed line never aborts the import (invariant 6's spirit, and
-//!   log-schema.md's "always handle `undefined`"): it is skipped, counted,
+//!   the schema's "always handle `undefined`"): it is skipped, counted,
 //!   and the count is reported;
 //! - idempotence (plan: Storage): after every committed batch the
 //!   importer writes a checkpoint into the meta table — source path as
@@ -25,18 +25,20 @@
 //!   rows — the ledger is insert-only, so the importer itself never
 //!   deletes.
 //!
-//! Field mapping: ctp's rows are camelCase, toker's [RequestRow] is
-//! snake_case; [CtpRow] is ctp's row schema as it is really written
-//! (proxy.mjs `report()` plus the kind-row writers) and [map_row] is the
-//! explicit mapping. ctp's field-era rule — a missing field means "not
-//! recorded then", never zero (log-schema.md) — is preserved throughout:
+//! Field mapping: the predecessor's rows are camelCase, toker's
+//! [RequestRow] is snake_case; [CtpRow] is that row schema as it is
+//! really written (the report row plus the kind-row writers) and
+//! [map_row] is the explicit mapping. The field-era rule — a missing
+//! field means "not recorded then", never zero (the schema's own
+//! contract) — is preserved throughout:
 //! every field but `ts` is an `Option` that stays `None` (invariant 3).
 //! Imported rows are written to be indistinguishable from toker-written
 //! rows: kind-specific payloads ride the `extra` column in the same
 //! shapes toker's own writers use, and `awake` rows keep their
 //! frontend/provider/route unset like toker's.
 //!
-//! Cost: ctp priced at API list rates on a subscription, so an imported
+//! Cost: the predecessor priced at API list rates on a subscription, so
+//! an imported
 //! `costUsd` is [CostKind::PlanEquivalent] by default ("what is the plan
 //! worth?"); `--cost-kind` re-labels api-era logs.
 
@@ -53,14 +55,16 @@ use sha2::{Digest, Sha256};
 
 use crate::store::{CostKind, RequestRow, RowKind, Store};
 
-/// Frontend protocol every ctp row was served over.
+/// Frontend protocol every imported row was served over.
 pub const FRONTEND: &str = "anthropic";
 
-/// Provider for rows ctp did not name one for — ctp's row-level `provider`
+/// Provider for rows the predecessor did not name one for — its
+/// row-level `provider`
 /// exists for compat upstreams; every row of the real log predates it.
 pub const DEFAULT_PROVIDER: &str = "anthropic_sub";
 
-/// ctp prices at API list rates on a subscription — the plan-equivalent
+/// The predecessor priced at API list rates on a subscription — the
+/// plan-equivalent
 /// semantics (plan: Storage) — so that is the default cost kind for an
 /// imported `costUsd`. `--cost-kind` re-labels api-era logs.
 pub const DEFAULT_COST_KIND: CostKind = CostKind::PlanEquivalent;
@@ -76,7 +80,7 @@ const META_KEY_PREFIX: &str = "import.ctp:";
 
 /// `toker import` options, as the CLI resolves them.
 pub struct ImportOpts {
-    /// The ctp `usage.jsonl` to import.
+    /// The predecessor proxy's `usage.jsonl` to import.
     pub from: PathBuf,
     /// The ledger to import into.
     pub db: PathBuf,
@@ -220,7 +224,8 @@ fn run_(opts: &ImportOpts, batch_rows: usize) -> Result<Outcome> {
         }
         line_no += 1;
         // The terminator is transport, not content; everything else —
-        // including an empty line — is the line as ctp appended it.
+        // including an empty line — is the line as the predecessor
+        // appended it.
         let line = raw
             .strip_suffix('\n')
             .map_or(raw.as_str(), |l| l.strip_suffix('\r').unwrap_or(l));
@@ -358,24 +363,28 @@ fn mtime_ms(metadata: &Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// One ctp `usage.jsonl` row, exactly as ctp's row writers produce it
-/// (proxy.mjs `report()` ~1717 plus the kind-row writers). Every field
-/// but `ts` is optional: ctp added fields over time and a row that
+/// One imported `usage.jsonl` row, exactly as the predecessor's row
+/// writers produce it (the measurement row plus the kind-row writers).
+/// Every field
+/// but `ts` is optional: fields were added over time and a row that
 /// predates one simply lacks it — absence means "not recorded then",
-/// never zero (log-schema.md), and it stays `None` (invariant 3).
+/// never zero (the schema's own contract), and it stays `None`
+/// (invariant 3).
 ///
 /// JSON `null` and an absent field both deserialize to `None` here,
-/// which is the right collapse everywhere ctp writes null as "no value"
+/// which is the right collapse everywhere the source format writes null
+/// as "no value"
 /// (`rateLimits`, `costUsd`, `geo`, `until`, …) — and where the two would
 /// mean different things (`betas`: null means "not captured", absence
 /// means "before the field existed"), both still mean "no captured
-/// betas", so the distinction ctp preserves is against the *empty list*,
+/// betas", so the distinction the format preserves is against the
+/// *empty list*,
 /// and that survives: `Some([])` is a captured-empty header, `None` is
 /// not captured.
 ///
 /// Mapping to [RequestRow] (camelCase → snake_case unless noted):
 ///
-/// | ctp field | RequestRow field | note |
+/// | imported field | RequestRow field | note |
 /// | --- | --- | --- |
 /// | `ts` | `ts_ms` | ISO 8601 string → epoch ms (jiff) |
 /// | `durationMs` | `duration_ms` | |
@@ -391,11 +400,11 @@ fn mtime_ms(metadata: &Metadata) -> i64 {
 /// | `webSearches` / `codeExecs` / `iterations` | `web_searches` / `code_execs` / `iterations` | |
 /// | `ttlSplitKnown` | `ttl_split_known` | |
 /// | `costUsd` | `cost_usd` + `cost_kind` | kind set only when the cost is |
-/// | `rateLimits` | `rate_limits` | ported faithfully per kind — ctp already encoded the kind rule in what it wrote |
+/// | `rateLimits` | `rate_limits` | ported faithfully per kind — the kind rule is already encoded in what was written |
 /// | `gateOn` / `coldOn` | `gate_on` / `cold_on` | |
 /// | `forcedFrom`/`forcedTo` | `forced_from`/`forced_to` | |
 /// | `downgradedFrom`/`downgradedTo` | `downgraded_from`/`downgraded_to` | |
-/// | `cacheStripped` | `cache_stripped` | ctp's count collapses to whether (the count rides the source log; toker's column is boolean) |
+/// | `cacheStripped` | `cache_stripped` | the source's count collapses to whether (the count rides the source log; toker's column is boolean) |
 /// | `systemMerged` | `system_merged` | ditto |
 /// | `requestedModel`/`effectiveModel` | `requested_model`/`effective_model` | |
 /// | `modelMappings` | `model_mappings` | JSON verbatim |
@@ -416,7 +425,8 @@ fn mtime_ms(metadata: &Metadata) -> i64 {
 /// | (derived) | `frontend`, `route` | [`FRONTEND`] / `"{FRONTEND}:{provider}"` |
 /// | (kind payloads) | `extra` | see [map_row] |
 ///
-/// Fields with no ctp source stay `None`: `usage_raw` (ctp rows carry
+/// Fields with no imported source stay `None`: `usage_raw` (imported rows
+/// carry
 /// folded buckets, not the response's raw usage JSON) and `drift_digest`
 /// (a toker-only kind).
 #[derive(Debug, Deserialize)]
@@ -448,7 +458,8 @@ struct CtpRow {
     forced_to: Option<String>,
     downgraded_from: Option<String>,
     downgraded_to: Option<String>,
-    /// ctp records counts (breakpoints dropped / prompts merged); toker's
+    /// The source format records counts (breakpoints dropped / prompts
+    /// merged); toker's
     /// columns record whether.
     cache_stripped: Option<Value>,
     system_merged: Option<Value>,
@@ -476,16 +487,16 @@ struct CtpRow {
     /// the anthropic subscription.
     provider: Option<String>,
 
-    // kind: "blocked" (proxy.mjs:1220-1233) — `resetsAt` is epoch
-    // seconds (limit.mjs:245,266); `contextTokens` null means the lane
+    // kind: "blocked" — `resetsAt` is epoch
+    // seconds; `contextTokens` null means the lane
     // table had forgotten the session, not "empty conversation".
     meter: Option<String>,
     resets_at: Option<i64>,
     context_tokens: Option<i64>,
-    // kind: "released" (proxy.mjs:1154-1162) — reset values, epoch seconds.
+    // kind: "released" — reset values, epoch seconds.
     five_hour: Option<i64>,
     seven_day: Option<i64>,
-    // kind: "cold" (proxy.mjs:1342-1362) / "cold-quiet" (1279-1298).
+    // kind: "cold" / "cold-quiet".
     idle_ms: Option<i64>,
     last_prompt: Option<i64>,
     compact_target: Option<String>,
@@ -493,12 +504,12 @@ struct CtpRow {
     quota_bound: Option<bool>,
     quota_meter: Option<String>,
     util_5h: Option<f64>,
-    // kind: "awake" (proxy.mjs:472-479) — `until` is an ISO string.
+    // kind: "awake" — `until` is an ISO string.
     held: Option<bool>,
     want: Option<bool>,
     until: Option<String>,
     reason: Option<String>,
-    // kind: "error" (proxy.mjs:1667-1681) — `retryAfter` is the response
+    // kind: "error" — `retryAfter` is the response
     // header verbatim (seconds as a string).
     status: Option<i64>,
     error_type: Option<String>,
@@ -506,7 +517,7 @@ struct CtpRow {
     retry_after: Option<Value>,
 }
 
-/// Map one parsed ctp row onto the ledger row. Errors are per-line
+/// Map one parsed imported row onto the ledger row. Errors are per-line
 /// reasons — the caller skips and counts the line, never aborts the
 /// import (invariant 6's spirit). An unknown `kind` is an error, not a
 /// default: `kind IS NULL` is what marks a real API measurement, so an
@@ -518,7 +529,8 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
         Some(k) => Some(RowKind::parse(k).ok_or_else(|| format!("unknown kind {k:?}"))?),
     };
 
-    // ctp names a provider only on compat-upstream rows; every other row
+    // The source format names a provider only on compat-upstream rows;
+    // every other row
     // was the anthropic subscription. Awake rows carry neither route
     // nor provider in toker's own writer — the lock is not a route — so
     // imported ones match.
@@ -550,8 +562,10 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
     // - blocked: the gate's own fields, snake_case like toker's writer;
     //   its stale rateLimits ride the `rate_limits` column, as the kind
     //   explicitly allowed to carry a stale copy;
-    // - released: reset values under ctp's own names, like toker's writer;
-    // - cold / cold-quiet: ctp's camelCase names, like toker's writer;
+    // - released: reset values under the source format's own names, like
+    //   toker's writer;
+    // - cold / cold-quiet: the source format's camelCase names, like
+    //   toker's writer;
     // - awake: `until` converted to epoch ms, toker's ts_ms convention;
     // - error: the message half of the error pair in `extra` (there is no
     //   error_message column), plus a retry-after that would not parse as
@@ -637,7 +651,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
         code_execs: row.code_execs,
         ttl_split_known: row.ttl_split_known,
         usage_presence: row.usage_presence.clone(),
-        // ctp rows carry folded buckets, not the response's raw usage
+        // Imported rows carry folded buckets, not the response's raw usage
         // JSON — nothing to store verbatim.
         usage_raw: None,
         cost_usd: row.cost_usd,
@@ -676,7 +690,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
     })
 }
 
-/// An ISO 8601 timestamp (ctp's `ts`, and `awake`'s `until`) as epoch ms.
+/// An ISO 8601 timestamp (the row's `ts`, and `awake`'s `until`) as epoch ms.
 /// Unparseable means the row's spine is broken: the caller skips the
 /// line, it never guesses a time (invariant 3).
 fn parse_ts_ms(ts: &str) -> Result<i64, String> {
@@ -695,7 +709,8 @@ fn ladder_text(rungs: &Option<Vec<String>>) -> Option<String> {
     }
 }
 
-/// ctp writes `cacheStripped`/`systemMerged` as counts, toker's columns as
+/// The source format writes `cacheStripped`/`systemMerged` as counts,
+/// toker's columns as
 /// booleans: n ≥ 1 happened. A non-number, non-bool value is a schema
 /// surprise the caller must not paper over.
 fn count_or_bool(field: &'static str, value: &Option<Value>) -> Result<Option<bool>, String> {
@@ -811,7 +826,7 @@ mod tests {
         );
         assert_eq!(
             row.usage_raw, None,
-            "ctp carries folded buckets, no raw usage"
+            "imported rows carry folded buckets, no raw usage"
         );
         assert_eq!(row.cost_usd, Some(0.039712));
         assert_eq!(row.cost_kind, Some(CostKind::PlanEquivalent));
@@ -847,7 +862,7 @@ mod tests {
         assert_eq!(
             row.cache_stripped,
             Some(true),
-            "ctp's count collapses to whether"
+            "the source count collapses to whether"
         );
         assert_eq!(row.system_merged, Some(true));
         assert_eq!(
@@ -899,7 +914,8 @@ mod tests {
         assert_eq!(row.usage_presence, None);
         assert_eq!(row.extra, None);
 
-        // Explicit nulls mean "no value" in ctp, and map to absence.
+        // Explicit nulls mean "no value" in the source format, and map to
+        // absence.
         let row = map(
             r#"{"ts":"2026-09-26T16:49:18.414Z","geo":null,"costUsd":null,"rateLimits":null,"sessionId":null,"betas":null,"cacheStripped":null}"#,
         );
@@ -954,7 +970,7 @@ mod tests {
             "null contextTokens = the lane table forgot, kept as null"
         );
 
-        // released: reset values under ctp's own names.
+        // released: reset values under the source format's own names.
         let row = map(
             r#"{"kind":"released","ts":"2026-09-27T01:02:03.000Z","sessionId":"ses-1","fiveHour":1790000600,"sevenDay":null,"gateOn":true,"rateLimits":null}"#,
         );
@@ -1168,8 +1184,9 @@ mod tests {
             .map(|row| row.id.expect("id"))
             .collect();
 
-        // The file grows (append-only, as ctp promises: "There is no
-        // rotation"): only the new tail imports, and the prefix counts as
+        // The file grows (append-only, as the source format promises:
+        // "There is no rotation"): only the new tail imports, and the
+        // prefix counts as
         // skipped-duplicate, verified by hash, not by trust.
         write_jsonl(
             &from,
@@ -1403,11 +1420,12 @@ mod tests {
         assert_eq!(checkpoint.last_id, Some(5));
     }
 
-    /// The real 54 MB ctp log: a full import into a scratch db, read-only
+    /// The real 54 MB predecessor log: a full import into a scratch db,
+    /// read-only
     /// with respect to the source. Manual host verification:
     /// `cargo test -p toker --lib import -- --ignored --nocapture`.
     #[test]
-    #[ignore = "imports the real 54 MB ctp usage.jsonl — manual host verification"]
+    #[ignore = "imports the real 54 MB predecessor usage.jsonl — manual host verification"]
     fn real_usage_jsonl_smoke() {
         let from = PathBuf::from("/home/passcod/.local/share/claude-token-proxy/usage.jsonl");
         if !from.exists() {

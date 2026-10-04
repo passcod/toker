@@ -1,8 +1,8 @@
-//! The context-window catalogue — port of ctp's `models.mjs`
-//! (`MODEL_CAPABILITIES`, `MODEL_ID_ALIASES`, `resolveContextWindow`).
+//! The context-window catalogue — port of the predecessor proxy's
+//! model-capability table (capabilities, id aliases, window resolution).
 //!
 //! Verified 2026-09-27 against Anthropic's context-windows and
-//! release-notes pages and OpenAI Codex's models.json (ctp's source list;
+//! release-notes pages and OpenAI Codex's models.json (the source list;
 //! see [`VERIFIED_ON`]).
 //!
 //! Keep identities exact. A future model that happens to share a family
@@ -14,16 +14,15 @@
 
 use serde_json::Value;
 
-/// The date this catalogue was last verified against the providers' pages
-/// (ctp `models.mjs` header comment).
+/// The date this catalogue was last verified against the providers' pages.
 pub const VERIFIED_ON: &str = "2026-09-27";
 
 /// The retired request beta that selected a 1M window on the models that
-/// once had one (ctp `CONTEXT_1M_BETA`).
+/// once had one.
 pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 
-/// A declared context window: `{default, max}` in tokens (ctp
-/// `validContextWindow`'s accepted shape).
+/// A declared context window: `{default, max}` in tokens
+/// (the accepted declaration shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowRange {
     /// The window a request gets without selecting anything.
@@ -32,8 +31,8 @@ pub struct WindowRange {
     pub max_tokens: u64,
 }
 
-/// One beta-selected window variant (ctp `betaContext`'s `variants[]` —
-/// always a single beta per capability in the hand-verified catalogue).
+/// One beta-selected window variant —
+/// always a single beta per capability in the hand-verified catalogue..
 #[derive(Debug, Clone, Copy)]
 pub struct Variant {
     /// The `anthropic-beta` value that selects this window.
@@ -42,7 +41,7 @@ pub struct Variant {
     pub tokens: u64,
 }
 
-/// One capability entry's window facts (ctp's capability object minus
+/// One capability entry's window facts (the capability object minus
 /// `phases`).
 #[derive(Debug, Clone, Copy)]
 pub struct Capability {
@@ -53,7 +52,7 @@ pub struct Capability {
     pub variant: Option<Variant>,
 }
 
-/// One dated phase of a capability (ctp `during(from, until, …)`): `from`
+/// One dated phase of a capability: `from`
 /// inclusive, `until` exclusive, ISO dates.
 #[derive(Debug, Clone, Copy)]
 pub struct Phase {
@@ -62,7 +61,7 @@ pub struct Phase {
     pub capability: Capability,
 }
 
-/// ctp `fixedContext(tokens)`: one limit, default and maximum.
+/// One limit, default and maximum.
 const fn fixed(tokens: u64) -> Capability {
     Capability {
         context_window: WindowRange {
@@ -73,7 +72,7 @@ const fn fixed(tokens: u64) -> Capability {
     }
 }
 
-/// ctp `betaContext(dflt, beta, tokens)`: a default window the listed beta
+/// A default window the listed beta
 /// raises to `tokens`.
 const fn beta_window(default: u64, beta: &'static str, tokens: u64) -> Capability {
     Capability {
@@ -85,7 +84,7 @@ const fn beta_window(default: u64, beta: &'static str, tokens: u64) -> Capabilit
     }
 }
 
-/// ctp `declaredContext(dflt, max)`: a provider declaration whose default is
+/// A provider declaration whose default is
 /// lower than its maximum (only the maximum is a ceiling).
 const fn declared(default: u64, max: u64) -> Capability {
     Capability {
@@ -97,7 +96,7 @@ const fn declared(default: u64, max: u64) -> Capability {
     }
 }
 
-/// ctp `during(from, until, capability)`.
+/// One dated phase: `during(from, until, capability)`.
 const fn during(
     from: Option<&'static str>,
     until: Option<&'static str>,
@@ -148,7 +147,7 @@ static SONNET_4_6_PHASES: &[Phase] = &[
 ];
 
 // One catalogue entry: either a single current capability, or a phased one
-// whose current capability is the last phase (ctp `phasedContext`).
+// whose current capability is the last phase.
 #[derive(Debug, Clone, Copy)]
 enum Entry {
     Current(Capability),
@@ -158,8 +157,7 @@ enum Entry {
     },
 }
 
-/// The hand-verified catalogue, keyed by exact normalised identity (ctp
-/// `MODEL_CAPABILITIES`).
+/// The hand-verified catalogue, keyed by exact normalised identity.
 static CATALOG: &[(&str, Entry)] = &[
     // Anthropic's current native 1M models. The beta header does not
     // select their window; 1M is both the default and maximum.
@@ -222,7 +220,7 @@ static CATALOG: &[(&str, Entry)] = &[
 
 // Pre-4.6 Claude API snapshots used dated IDs. Match only published IDs
 // here: stripping an arbitrary future-looking date would turn an unknown
-// identity into a known dateless 4.6+ model (ctp `MODEL_ID_ALIASES`).
+// identity into a known dateless 4.6+ model.
 static ALIASES: &[(&str, &str)] = &[
     ("claude-opus-4-5-20251101", "claude-opus-4-5"),
     ("claude-opus-4-1-20250805", "claude-opus-4-1"),
@@ -242,7 +240,7 @@ static ALIASES: &[(&str, &str)] = &[
 ];
 
 /// A provider's context-window declaration as stored alongside a learned
-/// model (`{default, max}` JSON; ctp `validContextWindow` validates it
+/// model (`{default, max}` JSON; validated
 /// before it counts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeclaredWindow {
@@ -269,8 +267,8 @@ impl DeclaredWindow {
     }
 }
 
-/// The resolved context evidence for one served response (ctp
-/// `resolveContextWindow`'s `{kind, tokens}`).
+/// The resolved context evidence for one served response
+/// (`{kind, tokens}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextWindow {
     /// Source-owned fact: the model's ceiling, no request metadata needed.
@@ -283,7 +281,7 @@ pub enum ContextWindow {
 }
 
 impl ContextWindow {
-    /// ctp's `kind` string: `exact` | `declared` | `unknown`.
+    /// The `kind` string: `exact` | `declared` | `unknown`.
     pub fn kind(&self) -> &'static str {
         match self {
             ContextWindow::Exact { .. } => "exact",
@@ -301,8 +299,8 @@ impl ContextWindow {
     }
 }
 
-/// The exact catalogue identity of a model (ctp `capabilityModelId` /
-/// `modelIdentity`): lower-cased, client-only bracket variants stripped,
+/// The exact catalogue identity of a model:
+/// lower-cased, client-only bracket variants stripped,
 /// published snapshot aliases folded. Unlike pricing's
 /// [`normalise_model_id`](super::pricing::normalise_model_id), an
 /// *unpublished* trailing date is not stripped — a future identity must not
@@ -322,8 +320,7 @@ pub fn model_identity(model: &str) -> Option<String> {
     )
 }
 
-/// Resolve the context evidence for one served response (ctp
-/// `resolveContextWindow`).
+/// Resolve the context evidence for one served response.
 ///
 /// - `model`: the served model id (response identity is authoritative).
 /// - `betas`: the request's captured `anthropic-beta` values, `None` when
@@ -337,8 +334,8 @@ pub fn model_identity(model: &str) -> Option<String> {
 /// - `at`: when the row was served, ISO date or timestamp. `None` resolves
 ///   the model's *current* capability; a date selects the historical phase
 ///   that applied. A date that parses but selects no phase — an invalid
-///   date, or one outside every phase's bounds — is `Unknown`, exactly
-///   ctp's null return.
+///   date, or one outside every phase's bounds — is `Unknown`, the same
+///   verdict as no evidence.
 pub fn resolve_context_window(
     model: &str,
     betas: Option<&[&str]>,
@@ -395,7 +392,7 @@ fn catalog_entry(id: &str) -> Option<Entry> {
         .map(|(_, entry)| *entry)
 }
 
-/// ctp `capabilityAt`: the phase that applied at `at`, the current
+/// The phase that applied at `at`, the current
 /// capability when no date was given, and `None` for a date that selects no
 /// phase (or does not parse).
 fn capability_at(entry: Entry, at: Option<&str>) -> Option<Capability> {
@@ -417,8 +414,8 @@ fn capability_at(entry: Entry, at: Option<&str>) -> Option<Capability> {
     }
 }
 
-/// The date part of a served-at value, validated as `YYYY-MM-DD` (ctp's
-/// slice-then-regex); anything else selects no phase.
+/// The date part of a served-at value, validated as `YYYY-MM-DD`
+/// (slice-then-shape); anything else selects no phase.
 fn iso_day(at: &str) -> Option<&str> {
     let day = at.get(..10)?;
     let bytes = day.as_bytes();
@@ -432,14 +429,14 @@ fn iso_day(at: &str) -> Option<&str> {
     .then_some(day)
 }
 
-/// A strictly-integer positive field, JS `Number.isInteger` semantics
-/// (ctp `validContextWindow`): fractional, negative, and string numbers
+/// A strictly-integer positive field, JS `Number.isInteger` semantics:
+/// fractional, negative, and string numbers
 /// are all invalid.
 fn integer_at(object: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
     object.get(key).and_then(Value::as_u64).filter(|&v| v > 0)
 }
 
-/// ctp `capabilityModelId`'s bracket strip, shared with pricing: remove
+/// The bracket strip, shared with pricing: remove
 /// complete `[...]` groups, keep an unterminated `[` as data.
 fn strip_brackets(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -480,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_on_is_pinned_to_ctps_date() {
+    fn verified_on_is_pinned_to_the_verified_date() {
         assert_eq!(VERIFIED_ON, "2026-09-27");
         assert!(
             VERIFIED_ON.len() == 10 && VERIFIED_ON.as_bytes()[4] == b'-',
@@ -823,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn context_window_reports_ctps_kind_strings() {
+    fn context_window_reports_the_kind_strings() {
         assert_eq!(exact(1).kind(), "exact");
         assert_eq!(declared(1).kind(), "declared");
         assert_eq!(ContextWindow::Unknown.kind(), "unknown");

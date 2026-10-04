@@ -6,29 +6,30 @@
 //! Differences that are the protocol's, not accidents:
 //!
 //! - **Buckets come folded, not normalised.** The anthropic observer
-//!   already produces the ledger's buckets (ctp `foldUsage`: TTL-split
+//!   already produces the ledger's buckets (TTL-split
 //!   reconciliation, iterations fallback), so the row copies them; the
-//!   openai path's join.mjs arithmetic has no equivalent here.
+//!   openai path's subtract-and-clamp arithmetic has no equivalent here.
 //! - **Cost is always catalog-priced** ([`crate::catalog::price`] over the
 //!   normalised response model, fast mode from `usage.speed`, the
 //!   US-geo 1.1× multiplier from `usage.inference_geo`) — with the kind
 //!   carrying the semantics per backend (plan: Storage): `estimated` for
 //!   anthropic_api (the API bills it), `plan_equivalent` for anthropic_sub
 //!   (list-price "what the plan is worth" — never billed). An unknown
-//!   model prices to NULL with a one-time warning per model (ctp's rule),
+//!   model prices to NULL with a one-time warning per model,
 //!   never a guess.
 //! - **`rate_limits` is this response's own meter snapshot**, parsed from
 //!   its `anthropic-ratelimit-*` headers ([`parse_rate_limits`]); the
 //!   `meters_state` table gets the same update from every response on a
 //!   meter-source backend (the server does that, not this module). Error
 //!   rows carry none — lean, like the openai error rows; that is a
-//!   deliberate divergence from ctp, which embeds the response's meters
-//!   on its error rows (ctp's *blocked* rows do carry a stale copy —
+//!   deliberate divergence from the predecessor, which embeds the
+//!   response's meters
+//!   on its error rows (its *blocked* rows do carry a stale copy —
 //!   [`record_anthropic_blocked`] ports that, since the stale snapshot is
 //!   the block's own provenance; an error row describes a response, which
 //!   has fresh headers of its own).
 //! - **`model` is the normalised identity, `raw_model` the wire form**
-//!   (ctp: `normaliseModel` / `rawModel`).
+//!   (the normalise/raw pair, as the predecessor named them).
 //! - **`betas`** is the request's `anthropic-beta` header split into
 //!   flags, stored as a JSON array; `None` when the header is absent —
 //!   absent ≠ empty.
@@ -85,8 +86,8 @@ pub(crate) struct AnthropicRecordCtx {
     /// The request carried the ping header: its lane is recorded but
     /// excluded from liveness (plan: Ping tagging).
     pub(crate) ping: bool,
-    /// The compaction retarget's provenance, when it rewrote this request
-    /// (ctp proxy.mjs:1387-1442): the models moved between, and whether
+    /// The compaction retarget's provenance, when it rewrote this request:
+    /// the models moved between, and whether
     /// the transform stripped breakpoints or merged system messages (the
     /// v1 schema records booleans; the counts ride the log line). A
     /// same-model strip carries no `downgraded_from` — that model also
@@ -95,22 +96,23 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) downgraded_to: Option<String>,
     pub(crate) cache_stripped: Option<bool>,
     pub(crate) system_merged: Option<bool>,
-    /// The force-newest rewrite's provenance, when it moved this request
-    /// (ctp proxy.mjs:1489-1496): the model asked for and the learned
+    /// The force-newest rewrite's provenance, when it moved this request:
+    /// the model asked for and the learned
     /// family newest it was moved onto. Unlike the retarget this
     /// transform changes only the model value — the conversation's
     /// cache_control survives, because the rewrite starts a conversation
     /// that should cache its prefix on the model it will actually use.
     pub(crate) forced_from: Option<String>,
     pub(crate) forced_to: Option<String>,
-    /// Batch model-map provenance (ctp `modelMappings`): the per-request
-    /// from→to list, when the request was a batch the map claimed.
+    /// Batch model-map provenance (the per-request
+    /// from→to list), when the request was a batch the map claimed.
     pub(crate) model_mappings: Option<Value>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
-/// when the capture carries usage (ctp accounts only responses with usage
-/// — a hung-up stream, an all-keepalive stream, or a usage-less capture on
+/// when the capture carries usage (only responses with usage are
+/// accounted for — a hung-up stream, an all-keepalive stream, or a
+/// usage-less capture on
 /// a 200 records no row), plus the fidelity-drift row when the request
 /// drifted. `rate_limits` is this response's own meter snapshot, parsed by
 /// the server from its headers. `status` is the upstream status the client
@@ -136,7 +138,7 @@ pub(crate) fn record_anthropic_measurement(
                 measurement_row(ctx, ts_ms, duration_ms, &route, capture, rate_limits),
             );
             // The lane table and the learned store update alongside the
-            // row, on the response identity (ctp proxy.mjs:1767-1777) —
+            // row, on the response identity —
             // never the model asked for, which may have been rewritten.
             note_lane_and_model(ctx, capture, ts_ms);
             true
@@ -158,9 +160,9 @@ pub(crate) fn record_anthropic_measurement(
         ctx.started.elapsed().as_secs_f64(),
     );
 
-    // The lane table just moved, so the sleep lock is re-evaluated (ctp
-    // proxy.mjs:1778: `evaluateAwake()` runs right after
-    // `noteLaneResponse` — pings included, since a ping's response is
+    // The lane table just moved, so the sleep lock is re-evaluated
+    // (the evaluate runs right after
+    // the lane note — pings included, since a ping's response is
     // what marks its lane). Idempotent: the request's own in-flight hold,
     // if any, is still standing until its body is dropped.
     ctx.server.evaluate_awake();
@@ -230,9 +232,9 @@ fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     }
 }
 
-/// Whether the capture carries any usage metric at all. ctp accounts only
-/// responses with usage (`if (!startUsage && !deltaUsage) return`), so an
-/// error event alone on a 200 is not a row, and neither is an all-keepalive
+/// Whether the capture carries any usage metric at all. Only responses
+/// with usage are accounted for, so an error event alone on a 200 is not a
+/// row, and neither is an all-keepalive
 /// stream (which finishes to no capture at all).
 fn usage_bearing(capture: &AnthropicCapture) -> bool {
     let presence = capture.presence();
@@ -248,7 +250,7 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
 }
 
 /// What this response taught the lane table and the learned model store,
-/// after the API actually served it (ctp proxy.mjs:1756-1777).
+/// after the API actually served it.
 ///
 /// Both follow the **response** model — the model that actually served the
 /// request — never the one asked for, which may have been rewritten. The
@@ -259,13 +261,14 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
 /// Accounting must never break a session (invariant 6): a store error here
 /// is logged and lost — the measurement row is already in.
 fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_ms: i64) {
-    // ctp `held`: fresh input + cache read + cache writes, missing metrics
+    // The held total: fresh input + cache read + cache writes, missing
+    // metrics
     // folding in as 0.
     let held = capture.input().unwrap_or(0)
         + capture.cache_read().unwrap_or(0)
         + capture.cache_write_total().unwrap_or(0);
 
-    // ctp `noteSeen` — a model is "seen" when a response named it. Days
+    // A model is "seen" when a response named it. Days
     // are local calendar days; the system zone is the server's, read once
     // per response.
     if let Some(model) = capture.model() {
@@ -275,10 +278,10 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
         }
     }
 
-    // ctp `noteLaneResponse`: the lane keyed by session × tools-hash, moved
+    // The lane keyed by session × tools-hash, moved
     // only now that the response completed. `forced` is the upgrade this
-    // response made (ctp proxy.mjs:1775: `forcedTo ? { from:
-    // modelIdentity(forcedFrom), to: modelIdentity(forcedTo) } : null`) —
+    // response made (normalised from/to identities)
+    // —
     // the lane keeps it while its cache is warm, and a compaction
     // neither starts nor ends one (merge_lane's rule). Identities
     // normalise; a value with no identity records no upgrade, never a
@@ -329,7 +332,7 @@ fn cost_kind_of(backend_id: &str) -> CostKind {
     }
 }
 
-/// The catalog-priced cost for one capture (ctp `ratesFor` + `costOf`):
+/// The catalog-priced cost for one capture:
 /// list prices over the folded buckets — missing metrics contribute 0,
 /// cost being an estimate — with fast mode and the US-geo multiplier from
 /// the response, and the kind carrying the backend's semantics. An
@@ -344,7 +347,7 @@ fn cost_of(capture: &AnthropicCapture, kind: CostKind) -> (Option<f64>, Option<C
         warn_unpriced_once(model);
         return (None, None);
     };
-    // ctp `costOf` folds missing buckets in as 0: cost is an estimate, and
+    // The cost fold treats missing buckets as 0: cost is an estimate, and
     // the presence map (stored beside the buckets) carries the verdict on
     // each number.
     let buckets = CostBuckets {
@@ -358,7 +361,7 @@ fn cost_of(capture: &AnthropicCapture, kind: CostKind) -> (Option<f64>, Option<C
     (Some(priced.cost_usd(&buckets)), Some(kind))
 }
 
-/// ctp's one-time unpriced-model warning (`unknownModels`): tokens are
+/// The one-time unpriced-model warning: tokens are
 /// counted, the cost is left null, and the complaint is logged once per
 /// model per process — never per request.
 fn warn_unpriced_once(model: &str) {
@@ -399,10 +402,9 @@ fn measurement_row(
         provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
-        // ctp proxy.mjs:1751: `...(isPing(req.headers) ? { ping: true } :
-        // {})` — only a ping request says so, never a non-ping one.
+        // Only a ping request says so, never a non-ping one.
         ping: ctx.ping.then_some(true),
-        // ctp: `model` is the normalised identity, `raw_model` the wire
+        // `model` is the normalised identity, `raw_model` the wire
         // form the provider actually served.
         model: capture.model().and_then(normalise_model_id),
         raw_model: capture.model().map(str::to_owned),
@@ -421,7 +423,8 @@ fn measurement_row(
         ttl_split_known: capture.ttl_split_known(),
         usage_presence: Some(capture.presence().to_json()),
         // The anthropic fold is computed, not echoed: the capture keeps
-        // counts, not the response's usage JSON (ctp rows carry no raw
+        // counts, not the response's usage JSON (imported predecessor rows
+        // carry no raw
         // usage either).
         usage_raw: None,
         cost_usd,
@@ -449,15 +452,15 @@ fn measurement_row(
         system_change: None,
         system_ladder: shape.and_then(|s| ladder_json(&s.system_ladder)),
         system_tail: shape.and_then(|s| ladder_json(&s.system_tail)),
-        // ctp logs gateOn/coldOn on every row because readers cannot see
-        // the service's env (README: the `?`-assumed-gate fallback); the
-        // armed state of each gate at request time.
+        // The armed state of each gate rides every row, because readers
+        // cannot see the service's config (a `?` row would be a gate that
+        // may simply have been off).
         gate_on: Some(ctx.server.config.gates.quota_enabled),
         cold_on: Some(ctx.server.config.gates.cold_enabled),
-        // ctp proxy.mjs:1748: `...(forcedFrom ? { forcedFrom } : {})` —
-        // the adaptive rewrite's provenance, independent from host
-        // mapping. ctp records `forcedTo` only when the host map also
-        // mapped (`forcedTo && modelMapResult.mapped`), because before a
+        // The adaptive rewrite's provenance, independent from host
+        // mapping. The predecessor recorded `forcedTo` only when the host
+        // map also
+        // mapped, because before a
         // map the response model implicitly names the adaptive target;
         // toker has no host map, so the value is unambiguous and both
         // halves record (the same call the retarget's `downgraded_to`
@@ -467,7 +470,7 @@ fn measurement_row(
         downgraded_from: ctx.downgraded_from.clone(),
         downgraded_to: ctx.downgraded_to.clone(),
         // The v1 schema fixed these as booleans, so the row records THAT
-        // the transform happened (ctp records counts; those ride the log
+        // the transform happened (the counts ride the log
         // line), and only when it did.
         cache_stripped: ctx.cache_stripped,
         system_merged: ctx.system_merged,
@@ -486,7 +489,8 @@ fn measurement_row(
 /// The error row (plan: non-2xx on a usage path): status, the error pair,
 /// and retry-after; never priced, no usage, no `rate_limits` (lean, like
 /// the openai error rows — see the module docs for the deliberate
-/// divergence from ctp). The request's shape is not re-measured on the way
+/// divergence from the predecessor). The request's shape is not
+/// re-measured on the way
 /// to a failure the provider already summarised. `error` is the
 /// `(type, message)` pair from the response's error object.
 fn error_row(
@@ -630,19 +634,21 @@ fn drift_row(ts_ms: i64, route: &str, digest: &str) -> RequestRow {
     }
 }
 
-/// Record the release-marker row (ctp: `kind: "released"`, proxy.mjs:1154).
+/// Record the release-marker row (the `kind: "released"` row).
 ///
-/// ctp logs a release the moment it is granted, because "a release left no
+/// A release is logged the moment it is granted, because "a release left no
 /// trace in the log at all, only on stderr, so nothing afterwards could
 /// explain why a session kept spending past a limit that was blocking
-/// everything else". The grant itself is the caller's (the allowances
+/// everything else" — a lesson carried from the predecessor. The grant
+/// itself is the caller's (the allowances
 /// table, keyed by reset value); this records what is now in force.
 ///
 /// `grant` is the **merged** view — fresh grants for the exhausted meters,
-/// the prior live allowance for the rest — matching ctp's row, which
+/// the prior live allowance for the rest — matching the predecessor's row,
+/// which
 /// carries the session's whole allowance entry, nulls included. The row
-/// carries `rate_limits`: the stale snapshot the grant was decided on (ctp
-/// parity: `rateLimits: lastMeters`). No duration (ctp omits it), no
+/// carries `rate_limits`: the stale snapshot the grant was decided on
+/// (row parity: the last-seen meters). No duration, no
 /// usage, never priced — a proxy-written row, excluded from API
 /// measurements by its kind.
 pub(crate) fn record_anthropic_released(
@@ -681,10 +687,10 @@ pub(crate) fn record_anthropic_released(
         usage_raw: None,
         cost_usd: None,
         cost_kind: None,
-        // ctp parity: the stale snapshot the grant rested on. A blocked
+        // Row parity: the stale snapshot the grant rested on. A blocked
         // request can never refresh meters, so this is often the same
         // spent reading the NEXT blocked row will carry — that is the
-        // point of recording it (ctp limit.mjs:150-154's note: measure the
+        // point of recording it (measure the
         // reset lag from response rows only, never these).
         rate_limits: stale_meters.cloned(),
         req_bytes: None,
@@ -716,7 +722,7 @@ pub(crate) fn record_anthropic_released(
         status: None,
         error_type: None,
         retry_after_ms: None,
-        // ctp's `fiveHour`/`sevenDay` row fields, in the kind-specific
+        // The fiveHour/sevenDay row fields, in the kind-specific
         // payload column (the schema has no dedicated columns).
         extra: Some(json!({
             "fiveHour": grant.five_hour,
@@ -738,7 +744,7 @@ pub(crate) fn record_anthropic_released(
 }
 
 /// The inputs of one blocked row (see [`record_anthropic_blocked`]) —
-/// a struct because the pieces are exactly the ctp row's own fields, and
+/// a struct because the pieces are exactly the row's own fields, and
 /// a nine-argument call site would be positional-number soup.
 pub(crate) struct BlockedRecord<'a> {
     /// The server (for the store).
@@ -762,15 +768,17 @@ pub(crate) struct BlockedRecord<'a> {
     pub(crate) stale_meters: Option<&'a Value>,
 }
 
-/// Record the quota-block row (ctp: `kind: "blocked"`, proxy.mjs:1220-1233).
+/// Record the quota-block row (the `kind: "blocked"` row).
 ///
-/// `stale_meters` is the snapshot the block was decided on — ctp's blocked
-/// rows carry the stale copy (`rateLimits: lastMeters`), and ctp
-/// limit.mjs:150-154 warns what that copy is worth: it is the proxy's own
+/// `stale_meters` is the snapshot the block was decided on — the
+/// predecessor's blocked
+/// rows carry the stale copy (the last-seen meters), and that copy has a
+/// known worth: it is the proxy's own
 /// last reading, not a header from this request, so counting it reports
 /// the proxy's staleness back as the API's.
 ///
-/// No model columns (ctp's blocked row carries none), no usage, never
+/// No model columns (the predecessor's blocked row carries none), no
+/// usage, never
 /// priced; a proxy-written row, excluded from API measurements by its kind.
 pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
     let BlockedRecord {
@@ -842,7 +850,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         status: None,
         error_type: None,
         retry_after_ms: None,
-        // ctp's `meter`/`resetsAt`/`contextTokens` row fields, in the
+        // The meter/resets_at/context_tokens row fields, in the
         // kind-specific payload column.
         extra: Some(json!({
             "meter": meter.as_str(),
@@ -865,7 +873,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
     );
 }
 
-/// The cold-notice row (ctp: `kind: "cold"`, proxy.mjs:1342-1362).
+/// The cold-notice row (the `kind: "cold"` row).
 ///
 /// The record of a notice the user was interrupted with: the idle spell
 /// measured, the prefix that would be re-read, the message count of the
@@ -875,7 +883,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
 /// the compaction model the notice named, and the quota figures the
 /// decision rested on.
 ///
-/// **No `rate_limits`** (ctp parity, and the row shape's rule for
+/// **No `rate_limits`** (row parity, and the row shape's rule for
 /// proxy-written kinds): nothing reached upstream, so the only meters
 /// available would be the proxy's own stale copy, and a row carrying
 /// those gets counted as an observation of the API. No usage, never
@@ -952,7 +960,7 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         status: None,
         error_type: None,
         retry_after_ms: None,
-        // ctp's cold-row fields, in the kind-specific payload column.
+        // The cold-row fields, in the kind-specific payload column.
         extra: Some(json!({
             "idleMs": idle_ms,
             "lastPrompt": prompt,
@@ -1005,12 +1013,12 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) compact_target: Option<&'a str>,
     /// The quota outlook the decision rested on, when one was measured.
     pub(crate) outlook: Option<&'a Outlook>,
-    /// Whether the quota gate is armed (ctp `gateOn: LIMIT_ON` — a view
+    /// Whether the quota gate is armed (a view
     /// reading this row cannot infer the toggle from anywhere else).
     pub(crate) gate_on: bool,
 }
 
-/// The withheld-notice row (ctp: `kind: "cold-quiet"`, proxy.mjs:1279-1298).
+/// The withheld-notice row (the `kind: "cold-quiet"` row).
 ///
 /// A suppressed notice is a re-read the user never hears about, so it is
 /// recorded — otherwise the notice count simply falls and no view can tell
@@ -1138,11 +1146,11 @@ pub(crate) fn error_pair(body: &[u8]) -> (Option<String>, Option<String>) {
 
 /// Record a completed codex turn (kind `None` = a real API measurement).
 ///
-/// Buckets follow the join.mjs parity rule already used on the openai
+/// Buckets follow the parity rule already used on the openai
 /// path: fresh input = input_tokens − cached − cache-write, clamped at
 /// zero (never a negative fabricated). The codex usage object has no
 /// TTL tiers — one `cache_write_tokens` figure — so the conservative
-/// ctp split applies: the whole write charges to the 1-hour tier with
+/// split applies: the whole write charges to the 1-hour tier with
 /// `ttl_split_known = false`, never a silent guess at a cheaper split.
 ///
 /// The usage object rides `usage_raw` verbatim (the codex `Usage`
@@ -1162,7 +1170,7 @@ pub(crate) fn record_codex_measurement(
     let usage = capture.usage();
     let shape = ctx.shape.as_ref();
 
-    // The join.mjs three-way subtraction, clamped (never negative).
+    // The three-way subtraction, clamped (never negative).
     let cached = usage
         .and_then(|usage| usage.input_tokens_details.as_ref())
         .and_then(|details| details.cached_tokens);

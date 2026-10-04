@@ -61,8 +61,9 @@ pub trait Provider: Send + Sync {
     fn inject_auth(&self, outgoing: &mut HeaderMap);
 
     /// The operator's model routing map for this backend, when one is
-    /// configured (`[providers.<id>.model_map]`, ctp's `CTP_MODEL_MAP`
-    /// pattern): the final routing stage consults it, and force-newest
+    /// configured (`[providers.<id>.model_map]`, the same
+    /// env-typed pattern the predecessor used):
+    /// the final routing stage consults it, and force-newest
     /// previews through it (recency reads the identity a request would be
     /// mapped to, never the asked model). `None` — the default — for
     /// providers without a map.

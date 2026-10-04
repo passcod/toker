@@ -839,7 +839,8 @@ async fn control_status_is_gated_and_secret_free() {
     assert!(value["uptime_s"].is_u64());
 
     // The merge endpoint is gated the same way: no verb → 403, and the
-    // verb alone is not enough — ctp demands a JSON content type too, so a
+    // verb alone is not enough — a JSON content type is demanded too, so
+    // a
     // browser cannot drive it without an unanswered preflight. The real
     // merge behaviour is the anthropic suite's (models are learned from
     // anthropic responses).

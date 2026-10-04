@@ -267,7 +267,8 @@ fn the_release_marker_rides_through_and_system_roles_translate() {
     // The marker is middleware's to strip, not translation's — it
     // rides in the user text verbatim. The trailing mid-conversation
     // system-role message merges into the PRECEDING user turn as a
-    // `[PROMPT_INJECTION]`-prefixed text part (ctp's transform for
+    // `[PROMPT_INJECTION]`-prefixed text part (the same transform the
+    // predecessor proxy used for
     // the same problem; the codex backend refuses system-role input
     // items — verified live: "System messages are not allowed").
     assert_eq!(

@@ -60,10 +60,10 @@ use crate::store::Store;
 
 use record::now_ms;
 
-/// How many ledger rows the startup seed reads (ctp's 16 MiB log tail,
-/// proxy.mjs:148, as a row count): enough to span several days of heavy
+/// How many ledger rows the startup seed reads (the predecessor's
+/// 16 MiB log tail, as a row count): enough to span several days of heavy
 /// use, which is far more than the lane table or the served-model map look
-/// back over (ctp's own `RECENT_MAX`).
+/// back over.
 const SEED_ROWS: u64 = 20_000;
 
 /// The running proxy: config, ledger, upstream client, backend providers,
@@ -99,12 +99,11 @@ pub struct Server {
     /// In-flight usage-path requests (the anthropic `/v1/messages`
     /// non-ping ones and the openai chat completions — a running request
     /// holds the machine awake regardless of protocol): the sleep lock's
-    /// other input besides the lane table (ctp `inFlight`,
-    /// proxy.mjs:455).
+    /// other input besides the lane table.
     pub(crate) in_flight: Arc<AtomicUsize>,
-    /// The idle-sleep lock's state (ctp's `sleepLock` + `awakeHeld`), or
-    /// `None` when `awake` is off (ctp: `sleepLock = null` when
-    /// `CTP_AWAKE=off` — never hold, never spawn).
+    /// The idle-sleep lock's state, or
+    /// `None` when `awake` is off (`awake = false` in config
+    /// — never hold, never spawn).
     pub(crate) awake: Option<Arc<Mutex<AwakeState>>>,
     /// Process start, for `/_toker/status` uptime.
     pub(crate) started: Instant,
@@ -172,9 +171,9 @@ impl Server {
         )?);
         let codex_sub: Arc<dyn Provider> = codex_turn.clone();
 
-        // ctp proxy.mjs:440-454: the lock exists only while the toggle is
+        // The lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
-        // `CTP_AWAKE has no effect` there, `awake` here.
+        // "`awake` has no effect" there, `awake` here.
         let awake = config.awake.then(|| {
             let state = AwakeState::new(
                 awake::platform_command(awake::INHIBIT_WHO, awake::INHIBIT_WHY),
@@ -186,14 +185,15 @@ impl Server {
             Arc::new(Mutex::new(state))
         });
 
-        // The startup seed (ctp `readLogTail` + `loadLanes` +
-        // `loadModels`, proxy.mjs:150-269): the newest ledger rows, read
-        // once, feed both state stores. Reseeding is idempotent, so every
+        // The startup seed: the newest ledger rows, read
+        // once, feed both state stores (lanes and served-models).
+        // Reseeding is idempotent, so every
         // Server::new — serve, tests, restarts — rebuilds the same state.
         let total = store.count_requests()?;
         let seed = store.requests_since(0, SEED_ROWS)?;
-        // ctp `servedCoveredSince`: the tail read everything (no cut) →
-        // the served map vouches from the beginning (`-Infinity` there);
+        // How far the served map vouches: the tail read everything (no
+        // cut) →
+        // the served map vouches from the beginning;
         // else only from the oldest row the tail kept.
         let covered =
             (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
@@ -232,18 +232,18 @@ impl Server {
             .expect("default_backend_anthropic is validated at startup")
     }
 
-    // ── the idle-sleep lock (ctp evaluateAwake, proxy.mjs:465-482) ──
+    // ── the idle-sleep lock ──────────────────────────────────────────
 
     /// Take or drop the sleep lock to match the lane table and the
     /// in-flight count, and write an `awake` row on every held/want flip.
     ///
-    /// ctp wraps its whole body in a try/catch — "the lock is not worth
+    /// The whole body runs under a catch — "the lock is not worth
     /// a request" — so a panic here is caught and logged, never
     /// propagated to the request it rode in on. A store error just loses
     /// this one evaluation.
     pub(crate) fn evaluate_awake(&self) {
         let Some(awake) = &self.awake else {
-            return; // ctp: `if (!sleepLock) return` — the toggle is off.
+            return; // The toggle is off: no lock, nothing to evaluate.
         };
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.evaluate_awake_inner(awake)));
     }
@@ -274,8 +274,8 @@ impl Server {
         }
     }
 
-    /// A usage-path request is now in flight (ctp proxy.mjs:1129-1132:
-    /// `inFlight++; … evaluateAwake()`): a lane's `at` moves only when a
+    /// A usage-path request is now in flight:
+    /// a lane's `updated_ms` moves only when a
     /// response finishes, and one long turn can outlast a 5-minute tier,
     /// so a request being served holds the machine awake, pings aside.
     pub(crate) fn begin_in_flight(&self) -> InFlightGuard {
@@ -286,7 +286,7 @@ impl Server {
         }
     }
 
-    /// The other half of the guard's Drop (ctp: `res.on("close")` fires
+    /// The other half of the guard's Drop (the close event fires
     /// however the exchange ends — completion, error, hangup).
     fn end_in_flight(&self) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -335,15 +335,14 @@ impl Server {
         tracing::info!("toker listening on http://{address}");
         self.spawn_lane_prune();
         self.spawn_awake_timer();
-        // A restart inside a live session takes the lock straight back
-        // (ctp proxy.mjs:494).
+        // A restart inside a live session takes the lock straight back.
         self.evaluate_awake();
         axum::serve(listener, self.router()).await?;
         Ok(())
     }
 
-    /// The sleep lock's wall-clock re-evaluation on ctp's 60-second
-    /// cadence (ctp proxy.mjs:487-491, `setInterval` + `unref`). Wall
+    /// The sleep lock's wall-clock re-evaluation on a 60-second
+    /// cadence. Wall
     /// clock rather than a timeout aimed at the expiry: the interval
     /// runs on a monotonic clock that stops while the machine is
     /// suspended, so a release due at 18:30 would otherwise slip by
@@ -351,7 +350,7 @@ impl Server {
     /// clock, so the first tick after a resume re-evaluates correctly.
     fn spawn_awake_timer(&self) {
         if self.awake.is_none() {
-            return; // ctp: no sleepLock, no timer.
+            return; // No lock, no timer.
         }
         let server = self.clone();
         tokio::spawn(async move {
@@ -364,10 +363,10 @@ impl Server {
         });
     }
 
-    /// The lane-table prune on ctp's flush cadence (proxy.mjs:380-394:
-    /// `LANE_FLUSH_MS` 30 s, `unref`'d, never per request): a cheap SQL
+    /// The lane-table prune on a 30-second flush cadence
+    /// (never per request): a cheap SQL
     /// statement on a timer — the upserts themselves go straight into the
-    /// store on every response, so unlike ctp nothing here carries state.
+    /// store on every response, so nothing here carries state.
     fn spawn_lane_prune(&self) {
         let store = self.store.clone();
         tokio::spawn(async move {
@@ -393,8 +392,8 @@ impl Server {
 }
 
 /// One in-flight request's hold on the sleep lock: increments on entry,
-/// and Drop is the decrement plus the re-evaluation — ctp's
-/// `res.on("close")`, which "fires however the exchange ends". A guard,
+/// and Drop is the decrement plus the re-evaluation — the close
+/// event, which "fires however the exchange ends". A guard,
 /// so no early return and no error path can leak the count: for a
 /// streamed response the guard rides the body stream (it drops when axum
 /// drops the body — client hangup or natural completion); for everything

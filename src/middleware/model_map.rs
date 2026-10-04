@@ -3,20 +3,24 @@
 //! policy mapping the models clients ask for onto the identities a
 //! compatibility upstream will actually receive.
 //!
-//! A faithful port of ctp's `model-map.mjs`, measured in production —
+//! A faithful port of the predecessor proxy's model routing map, measured
+//! in production —
 //! ported, not improved. Targets are deliberately opaque: a routing rule
 //! is not model capability or pricing evidence. Parsing and matching live
 //! here so the caller only decides when the final rewrite runs.
 //!
 //! **Status:** the pure decision interface, ported and pinned by the
-//! vendored `route-identity` parity case (ctp `fixtures/node-reference-v1.
-//! json` via `tests/node_reference_parity.rs`). Config and the server's
+//! vendored `route-identity` parity case (the fixture vendored at
+//! `tests/fixtures/ctp/node-reference-v1.json`, driven by
+//! `tests/node_reference_parity.rs`). Config and the server's
 //! final routing stage are the model-routing unit's; until it lands,
-//! [`crate::middleware::force_newest`] consults nothing here (ctp previews
+//! [`crate::middleware::force_newest`] consults nothing here (the
+//! predecessor previews
 //! the map before its served-recency lookup — with no map configured that
 //! preview is the identity, which is what the force decision assumes).
 //!
-//! **Why a lexical tree, not a re-serialisation** (ctp model-map.mjs:11-13,
+//! **Why a lexical tree, not a re-serialisation** (the predecessor's
+//! rationale,
 //! kept verbatim): nodes retain source spans so mapped model string tokens
 //! are replaced without parsing and serialising unrelated numbers or
 //! prompt/tool content — `JSON.parse` alone would round large integers,
@@ -28,7 +32,7 @@ use std::collections::BTreeMap;
 use crate::catalog::windows::model_identity;
 use crate::middleware::models::family_of;
 
-// ── the lexical JSON tree (ctp jsonTree, model-map.mjs:14-66) ─────────────
+// ── the lexical JSON tree ────────────────────────────────────────────
 
 /// One node of the span-retaining JSON tree: the grammar JSON.parse has
 /// already accepted, with the byte spans a mapped model token replaces.
@@ -45,7 +49,8 @@ enum Node {
     Object { properties: Vec<(String, Node)> },
     /// An array of items in source order.
     Array { items: Vec<Node> },
-    /// Anything else — numbers, literals (ctp's node keeps their spans
+    /// Anything else — numbers, literals (the predecessor's node keeps
+    /// their spans
     /// too; no documented model position is ever one, so the span would
     /// never be read).
     Primitive,
@@ -60,7 +65,7 @@ struct Tree<'a> {
 impl<'a> Tree<'a> {
     fn whitespace(&mut self) {
         while let Some(&byte) = self.bytes.get(self.at) {
-            // ctp's /\s/: JSON's own whitespace, plus the control
+            // JS \s semantics: JSON's own whitespace, plus the control
             // characters JS's \s also admits. Valid JSON never carries
             // either inside a value.
             if matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
@@ -71,9 +76,8 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// A string token: its span and its decoded value (ctp's
-    /// `JSON.parse(text.slice(start, end))` on the token — escapes and
-    /// all).
+    /// A string token: its span and its decoded value
+    /// (escapes decoded, exactly as a JSON parser would).
     fn string(&mut self) -> Option<(usize, usize, String)> {
         let start = self.at;
         self.at += 1; // the opening quote
@@ -155,8 +159,7 @@ impl<'a> Tree<'a> {
 }
 
 /// The tree over already-valid JSON bytes, or `None` for bytes the
-/// grammar rejects (ctp calls the tree only after `JSON.parse` has
-/// accepted the text; callers here validate first the same way).
+/// grammar rejects (callers validate first, the same way).
 fn json_tree(bytes: &[u8]) -> Option<Node> {
     let mut tree = Tree { bytes, at: 0 };
     let root = tree.value()?;
@@ -164,8 +167,7 @@ fn json_tree(bytes: &[u8]) -> Option<Node> {
     (tree.at == bytes.len()).then_some(root)
 }
 
-/// A property of an object node, last duplicate winning (ctp's
-/// `findLast`).
+/// A property of an object node, last duplicate winning.
 fn property_of<'a>(node: &'a Node, key: &str) -> Option<&'a Node> {
     let Node::Object { properties } = node else {
         return None;
@@ -177,10 +179,10 @@ fn property_of<'a>(node: &'a Node, key: &str) -> Option<&'a Node> {
         .map(|(_, value)| value)
 }
 
-// ── the policy (ctp parseModelMap / mappedModel / previewMappedModel) ─────
+// ── the policy ───────────────────────────────────────────────────────
 
 /// One mapped target: the opaque upstream id and the canonical selector
-/// that matched it (ctp's `{ target, selector }` map values).
+/// that matched it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapTarget {
     /// The opaque upstream model id — a routing rule is not capability or
@@ -192,7 +194,7 @@ pub struct MapTarget {
 }
 
 /// A parsed, validated routing policy: exact identities first, families
-/// behind them (ctp's `{ exact, families }`).
+/// behind them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelMap {
     exact: BTreeMap<String, MapTarget>,
@@ -214,8 +216,8 @@ impl ModelMap {
     }
 }
 
-/// Parse and validate one configured value; `Ok(None)` means disabled
-/// (ctp `parseModelMap`, model-map.mjs:74-129). A present but invalid
+/// Parse and validate one configured value; `Ok(None)` means disabled.
+/// A present but invalid
 /// policy is an error, never a silent empty map — a typo'd startup value
 /// must fail loudly.
 pub fn parse_model_map(raw: &str) -> anyhow::Result<Option<ModelMap>> {
@@ -224,7 +226,8 @@ pub fn parse_model_map(raw: &str) -> anyhow::Result<Option<ModelMap>> {
         return Ok(None);
     }
 
-    // The tree runs after validation, exactly as ctp orders it: JSON that
+    // The tree runs after validation, in the same order the predecessor
+    // ran it: JSON that
     // parses, then the raw-key duplicate check only the tree can see
     // (JSON.parse collapses duplicate keys silently, last winning).
     let value: serde_json::Value = serde_json::from_str(raw)
@@ -299,7 +302,7 @@ pub fn parse_model_map(raw: &str) -> anyhow::Result<Option<ModelMap>> {
         }
 
         // A family selector must name a family, never a model version
-        // (ctp: `familyOf(selector)` with no version segments).
+        // (a selector with no version segments).
         let Some(family) = family_of(selector).filter(|family| family.version.is_empty()) else {
             return Err(invalid(format!(
                 "family selector {} must name a family, not a model version",
@@ -319,8 +322,8 @@ pub fn parse_model_map(raw: &str) -> anyhow::Result<Option<ModelMap>> {
     Ok(Some(map))
 }
 
-/// Select an opaque upstream target, exact identity ahead of family (ctp
-/// `mappedModel`, model-map.mjs:132-139). `None` when there is no policy
+/// Select an opaque upstream target, exact identity ahead of family.
+/// `None` when there is no policy
 /// or no match.
 pub fn mapped_model<'a>(policy: Option<&'a ModelMap>, model: &str) -> Option<&'a MapTarget> {
     let policy = policy?;
@@ -336,8 +339,8 @@ pub fn mapped_model<'a>(policy: Option<&'a ModelMap>, model: &str) -> Option<&'a
     policy.families.get(&family)
 }
 
-/// Side-effect-free effective identity for pre-flight decisions (ctp
-/// `previewMappedModel`, model-map.mjs:143-144): the mapped target when
+/// Side-effect-free effective identity for pre-flight decisions:
+/// the mapped target when
 /// one matches, the model unchanged otherwise.
 pub fn preview_mapped_model<'a>(policy: Option<&'a ModelMap>, model: &'a str) -> Option<&'a str> {
     mapped_model(policy, model)
@@ -345,9 +348,9 @@ pub fn preview_mapped_model<'a>(policy: Option<&'a ModelMap>, model: &'a str) ->
         .or(Some(model))
 }
 
-// ── the rewrite (ctp rewriteMappedModels, model-map.mjs:163-237) ─────────
+// ── the rewrite ──────────────────────────────────────────────────────
 
-/// One matched model position (ctp's `models` entries): where the model
+/// One matched model position (the row's `models` entries): where the model
 /// token sat, what it was, and what the upstream will receive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedPosition {
@@ -364,8 +367,8 @@ pub struct MappedPosition {
     pub selector: Option<String>,
 }
 
-/// The result of applying (or not applying) the map to one request body
-/// (ctp `rewriteMappedModels`'s return): the possibly-rewritten body, and
+/// The result of applying (or not applying) the map to one request body:
+/// the possibly-rewritten body, and
 /// the routing identity contract the row records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappedRewrite {
@@ -385,7 +388,7 @@ pub struct MappedRewrite {
     pub models: Vec<MappedPosition>,
 }
 
-/// The unchanged result (ctp's `unchanged` helper).
+/// The unchanged result.
 fn unchanged(body: &[u8]) -> MappedRewrite {
     MappedRewrite {
         body: body.to_vec(),
@@ -397,8 +400,8 @@ fn unchanged(body: &[u8]) -> MappedRewrite {
     }
 }
 
-/// Apply the map only to documented Anthropic request model positions
-/// (ctp `rewriteMappedModels`, model-map.mjs:163-237): the top-level
+/// Apply the map only to documented Anthropic request model positions:
+/// the top-level
 /// `model` on `/v1/messages` and `/v1/messages/count_tokens`, and
 /// `requests[].params.model` on `/v1/messages/batches`.
 ///
@@ -438,7 +441,7 @@ pub fn rewrite_mapped_models(
         return unchanged(body);
     };
 
-    // The documented model positions, in order (ctp model-map.mjs:181-195).
+    // The documented model positions, in order.
     #[derive(Clone, Copy)]
     struct Position<'a> {
         model: &'a Node,
@@ -495,8 +498,8 @@ pub fn rewrite_mapped_models(
         });
         any_matched |= was_matched;
         if changed {
-            // ctp's `JSON.stringify(effectiveModel)`: the token with its
-            // quotes, minimally escaped.
+            // The token with its
+            // quotes, minimally escaped — the JSON form of the value.
             let token = serde_json::to_string(&serde_json::Value::String(effective_model))
                 .expect("a bare string serialises");
             replacements.push((*start, *end, token));
@@ -527,7 +530,7 @@ mod tests {
         MapTarget, mapped_model, parse_model_map, preview_mapped_model, rewrite_mapped_models,
     };
 
-    /// ctp test/model-map.mjs's policy.
+    /// The routing policy the predecessor's test suite pinned.
     fn policy() -> Option<super::ModelMap> {
         parse_model_map(
             r#"{
@@ -598,7 +601,8 @@ mod tests {
 
     #[test]
     fn invalid_policies_fail_validation_clearly() {
-        // ctp test/model-map.mjs's invalid set, message for message.
+        // The invalid set the predecessor's tests pinned, message for
+        // message.
         for (raw, message) in [
             ("{", "expected a JSON object"),
             ("[]", "expected a JSON object"),

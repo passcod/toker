@@ -1,11 +1,12 @@
 //! The CACHE REBUILDS panel's aggregation (plan: TUI — "the panel to
-//! watch"): a port of ctp's lane walk, cause classification, and
-//! system-change localisation.
+//! watch"): a port of the predecessor's lane walk, cause classification,
+//! and system-change localisation.
 //!
-//! The walk ([`classify`]) is ctp live.mjs:205-243's lane walk with
-//! summarise.mjs:512-561's careful lane rules:
+//! The walk ([`classify`]) is the reference dashboard's lane walk with
+//! the reference analysis's careful lane rules:
 //!
-//! - **A session is not a cache entry** (docs/internals/lanes.md). One
+//! - **A session is not a cache entry** (the lane rule, as the lane
+//!   docs state it). One
 //!   session interleaves the main agent, subagents, and utility calls,
 //!   each an independent prefix with its own cache; comparing a
 //!   request against whatever preceded it in wall-clock order invents
@@ -17,45 +18,47 @@
 //!   look like a brand-new prefix, and every window would open with
 //!   phantom "new prefix" rebuilds. The 24 h tail the TUI reads exists
 //!   to provide those predecessors.
-//! - **The abandoned-lane test** (summarise.mjs:546-557): the first
+//! - **The abandoned-lane test**: the first
 //!   request of a lane is either a concurrent lane that will alternate
 //!   with the old one (a subagent — nothing was invalidated) or a real
 //!   tool-set change that never comes back. Whether the previous lane
 //!   returns tells them apart — a real change is one-way.
 //!
-//! The causes follow the live.mjs table (README "Interpreting the
-//! causes"); the tests for each follow summarise.mjs:442-492's
-//! `classifyRebuild`, in its order — the first rule that fires wins:
+//! The causes follow the reference's table (its README's "Interpreting
+//! the causes"); the tests for each follow the reference classifier's
+//! own cases, in its order — the first rule that fires wins:
 //!
 //! 1. no predecessor in the lane → `new prefix / first turn` (a
 //!    session's first request, or a concurrent lane), or `tool set
 //!    changed` when the previous lane was abandoned;
 //! 2. a gap longer than the 1-hour cache TTL → `idle — 1h cache TTL
-//!    expired` (summarise.mjs:445-446);
+//!    expired`;
 //! 3. a compaction generation bump → `compaction` — a fact Claude Code
-//!    stamps into the conversation, not an inference
-//!    (summarise.mjs:468-470);
+//!    stamps into the conversation, not an inference (a compaction
+//!    continues a session, so its first message carries the
+//!    continuation preamble);
 //! 4. a message count collapsing to a handful → `subagent started`
-//!    (summarise.mjs:474-480's `NEW_CONVERSATION_MESSAGES` rule);
+//!    (the at-most-8-messages rule);
 //! 5. a changed system hash → `system prompt changed`, localised;
 //! 6. anything else → `mid-history change` — an earlier turn differs.
 //!
-//! Deviations from summarise, deliberate and scoped: its `history
+//! Deviations from the reference, deliberate and scoped: its `history
 //! shrank` and `unknown` labels fold into `mid-history change` (the
-//! live.mjs table has neither), and a NULL `tools_hash` keys its own
-//! lane rather than aborting classification (live.mjs's `?` lane).
+//! reference table has neither), and a NULL `tools_hash` keys its own
+//! lane rather than aborting classification (the reference's shared
+//! `?` lane).
 //! `summarising` is carried on the row but never consulted — the same
 //! prompt shape serves routine background summaries, so treating it
-//! as a compaction would fire constantly (summarise.mjs:481-483).
+//! as a compaction would fire constantly.
 //!
-//! The localisation ([`localise`]) ports summarise.mjs:374-434 /
-//! proxy.mjs:671-710: which block changed (per-block digests), then
+//! The localisation ([`localise`]) ports the reference's split: which
+//! block changed (per-block digests), then
 //! the ladder window (cumulative digests every 8 192 bytes), then the
 //! tail (8-byte steps over the last 256, 64-byte steps to 1 024 — the
 //! geometry [`crate::ir::anthropic`] cuts the stored rungs to). The
 //! capture-time `system_change.where` is preferred when the row
-//! carries it (summarise.mjs:385-387 — toker itself never writes that
-//! column, but the imported ctp history does). A localisation never
+//! carries it — toker itself never writes that
+//! column, but the imported history does. A localisation never
 //! names a position the rungs do not bound: no rungs, no claim.
 //!
 //! Absence ≠ zero (invariant 3) throughout: a NULL `cache_write_total`
@@ -70,61 +73,58 @@ use crate::store::{LocalisationRow, RebuildRow};
 use serde_json::Value;
 
 /// Tokens of cache-write in one request before it counts as a rebuild
-/// rather than a turn (ctp live.mjs:205, summarise.mjs:49-57 — the
-/// default `--min` of `summarise.mjs --rebuilds`).
+/// rather than a turn — the reference analysis's default threshold
+/// (itself picked against the log: 50 k separates real rebuilds from
+/// ordinary turns).
 pub(crate) const REBUILD_MIN: i64 = 50_000;
 
 /// A gap longer than the 1-hour cache TTL explains a rewrite on its
-/// own: anything older has nothing left to lose (summarise.mjs:444-446;
-/// live.mjs's `idle N min` row of the causes table).
+/// own: anything older has nothing left to lose (the causes table's
+/// `idle N min` row).
 const IDLE_TTL_MS: i64 = 60 * 60 * 1000;
 
 /// A conversation restarting from at most this many messages is a new
-/// agent — a subagent or sidechain, not the same prompt mutating
-/// (summarise.mjs:55's `NEW_CONVERSATION_MESSAGES`). The full test is
-/// summarise.mjs:474-480's (`messages ≤ 8 && prev > 2×messages`);
-/// live.mjs:238 tests the same collapse with the fixed bound
-/// `prev > 16` — the port keeps summarise's ratio, which also fires
+/// agent — a subagent or sidechain, not the same prompt mutating.
+/// The full test is the ratio
+/// (`messages ≤ 8 && prev > 2×messages`), which also fires
 /// on a 9-message restart after a 20-message lane.
 const NEW_CONVERSATION_MESSAGES: i64 = 8;
 
-/// The cause table keeps at most this many rows (live.mjs:243's
-/// `slice(0, 5)`).
+/// The cause table keeps at most this many rows.
 pub(crate) const MAX_CAUSE_ROWS: usize = 5;
 
 /// A rebuild's cause — the stable label the by-cause table groups on.
 /// The variable detail lives beside it ([`RebuildEvent::detail`]), not
 /// inside it: every time the detail has been folded into the label
-/// string, something silently split into one row per value (ctp
-/// summarise.mjs:436-439's hard-won rule).
+/// string, something silently split into one row per value — a
+/// hard-won rule carried from the reference analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Cause {
     /// No predecessor in the lane: the session's first request, or a
-    /// concurrent lane with its own cache (live.mjs:235).
+    /// concurrent lane with its own cache.
     NewPrefix,
-    /// The lane went quiet longer than the cache lives (live.mjs's
-    /// `idle N min — 1h cache TTL expired`).
+    /// The lane went quiet longer than the cache lives
+    /// (`idle N min — 1h cache TTL expired`).
     Idle,
-    /// The previous lane never came back — a one-way tool-set change
-    /// (summarise.mjs:551).
+    /// The previous lane never came back — a one-way tool-set change.
     ToolSet,
     /// Claude Code stamped a compaction continuation into the
-    /// conversation (live.mjs:236).
+    /// conversation.
     Compaction,
     /// A message count collapsed to a handful: a subagent started, not
-    /// a compaction (live.mjs:238; the compaction marker is the fact
-    /// that tells them apart — lanes.md).
+    /// a compaction (the compaction marker is the fact
+    /// that tells them apart).
     Subagent,
     /// The system prompt changed, invalidating all history
-    /// (live.mjs:237) — localised in the detail.
+    /// — localised in the detail.
     SystemPrompt,
     /// An earlier turn in the conversation differs: a rewind, an edit,
-    /// a tool result changing retroactively (live.mjs:239).
+    /// a tool result changing retroactively.
     MidHistory,
 }
 
 impl Cause {
-    /// The panel's label (live.mjs's exact cause strings).
+    /// The panel's label (the frozen cause strings).
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::NewPrefix => "new prefix / first turn",
@@ -182,17 +182,18 @@ pub(crate) struct SystemChange {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Walk {
     /// Measurement rows the walk saw inside the window — the panel's
-    /// denominator (live.mjs's `usage.length`).
+    /// denominator (the walked rows count).
     pub window_rows: usize,
-    /// In-window rows whose rewritten total is unknown (live.mjs's
-    /// `rebuildUnknown`): counted, never zero-filled.
+    /// In-window rows whose rewritten total is unknown:
+    /// counted, never zero-filled.
     pub unmeasured: usize,
     /// The classified rebuilds, oldest first.
     pub events: Vec<RebuildEvent>,
 }
 
 /// Walk lanes over the tail's rows and classify the window's rewrites
-/// (live.mjs:205-243, plus summarise.mjs:512-561's lane rules).
+/// (the reference dashboard's lane walk plus the reference analysis's
+/// lane rules).
 ///
 /// `window_since_ms` filters which rows are *counted*; every row read
 /// still walks its lane first — that ordering is the anti-phantom rule.
@@ -218,7 +219,7 @@ pub(crate) fn classify(rows: &[RebuildRow], window_since_ms: i64) -> Walk {
 
     let mut walk = Walk::default();
     for mut group in groups {
-        // summarise.mjs:525-526 sorts each session's rows by timestamp;
+        // The reference sorts each session's rows by timestamp;
         // the store read already returns (ts, id) order, but the walk's
         // every rule is predecessor-based, so the sort is cheap
         // insurance rather than a silent order dependency.
@@ -227,7 +228,7 @@ pub(crate) fn classify(rows: &[RebuildRow], window_since_ms: i64) -> Walk {
         // abandoned-lane test: a real tool-set change never comes back,
         // so the previous lane's last sighting at or before the row
         // that replaced it is what tells the change from a concurrent
-        // lane (summarise.mjs:553-557's `rows.slice(i + 1).some(…)`).
+        // lane (the does-the-old-lane-return scan).
         let mut last_seen: HashMap<Option<&str>, usize> = HashMap::new();
         for (pos, row) in group.iter().enumerate() {
             last_seen.insert(row.tools_hash.as_deref(), pos);
@@ -248,7 +249,7 @@ pub(crate) fn classify(rows: &[RebuildRow], window_since_ms: i64) -> Walk {
             }
             let Some(rewritten) = row.cache_write_total else {
                 // An unknown rewrite is not a zero rewrite: counted
-                // separately, classified never (live.mjs:228-231).
+                // separately, classified never.
                 if in_window {
                     walk.unmeasured += 1;
                 }
@@ -272,7 +273,7 @@ pub(crate) fn classify(rows: &[RebuildRow], window_since_ms: i64) -> Walk {
 }
 
 /// Classify one rewrite against its lane predecessor (the cause order
-/// is summarise.mjs:442-492's; see the module docs for the mapping).
+/// is the reference classifier's; see the module docs for the mapping).
 fn classify_one(
     row: &RebuildRow,
     prev_in_lane: Option<&RebuildRow>,
@@ -315,7 +316,7 @@ fn classify_one(
     };
 
     // Idle: the lane went quiet past the cache lifetime. Checked first
-    // (summarise's order): a resume after two hours is an expiry
+    // (the reference's order): a resume after two hours is an expiry
     // whatever else changed alongside it.
     let gap = row.ts_ms - prev.ts_ms;
     if gap > IDLE_TTL_MS {
@@ -324,7 +325,7 @@ fn classify_one(
     }
     // Compaction: the generation marker is a fact, and it must be
     // checked before the message-count tests, which cannot tell a
-    // compaction from a subagent (summarise.mjs:468-470).
+    // compaction from a subagent.
     if row.compact_generations.unwrap_or(0) > prev.compact_generations.unwrap_or(0) {
         let detail = row
             .compact_generations
@@ -333,7 +334,7 @@ fn classify_one(
     }
     // A conversation restarting from a handful of messages is a new
     // agent — its prefix was never cached, so nothing was invalidated
-    // (summarise.mjs:474-480). Checked before the system test, which
+    // (the at-most-8 rule). Checked before the system test, which
     // would otherwise claim a prompt "changed" between two unrelated
     // conversations that merely share a tool set.
     if let (Some(messages), Some(prev_messages)) = (row.req_messages, prev.req_messages)
@@ -356,15 +357,16 @@ fn classify_one(
         };
         return event(Cause::SystemPrompt, None, Some(system));
     }
-    // summarise's `history shrank` folds here: the live.mjs table has
+    // The reference's `history shrank` folds here: its own table has
     // no such row, and both cases say "an earlier turn differs".
     event(Cause::MidHistory, None, None)
 }
 
-/// Fill every system-prompt event's detail (summarise.mjs:475-481's
-/// `chars … where` line): `43,696 → 43,801 chars; block 2, in the last
+/// Fill every system-prompt event's detail (the `chars … where`
+/// line): `43,696 → 43,801 chars; block 2, in the last
 /// 8 bytes`. The position clause prefers the capture-time
-/// `system_change.where` the row may carry (summarise.mjs:385-387) and
+/// `system_change.where` the row may carry (written by the predecessor;
+/// toker never writes it itself) and
 /// otherwise re-derives it from the ladders ([`where_changed`]).
 pub(crate) fn localise(events: &mut [RebuildEvent], by_id: &HashMap<i64, LocalisationRow>) {
     for event in events {
@@ -401,14 +403,14 @@ fn tail_of(loc: Option<&LocalisationRow>) -> Option<&[String]> {
     loc.and_then(|row| row.system_tail.as_deref())
 }
 
-/// Where the system prompt changed, from the block map and the rungs
-/// (summarise.mjs:374-434 / proxy.mjs:679-702): which block, then the
+/// Where the system prompt changed, from the block map and the rungs:
+/// which block, then the
 /// ladder window, then the tail bound. `None` when the rungs bound
 /// nothing — never a guessed position.
 fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
-    // Which block (proxy.mjs:679-686): naming the block is not enough
+    // Which block: naming the block is not enough
     // on its own — the bulk of a prompt is one block — but it is the
     // first half of the answer.
     let blocks =
@@ -435,12 +437,12 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
         }
     }
 
-    // The ladder window (proxy.mjs:690-692): the first prefix rung
+    // The ladder window: the first prefix rung
     // that differs bounds the change to one 8 192-byte step. Every
     // shared rung matching puts the change past the last complete step
     // — the ladder's blind spot, which the tail covers. (The step is
-    // the geometry the stored rungs were cut to, proxy.mjs:591's
-    // `LADDER_STEP = 8192`; summarise.mjs:428's re-analysis hardcodes
+    // the geometry the stored rungs were cut to,
+    // 8 192 bytes; the predecessor's re-analysis hardcoded
     // a stale 2048, which would mislabel a live rung window 4×.)
     let prev_loc = by_id.get(&system.prev_id);
     let row_loc = by_id.get(&system.row_id);
@@ -460,7 +462,7 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
     match ladder_window {
         Some(window) => parts.push(window),
         None => {
-            // The tail bound (proxy.mjs:694-701): suffixes compare by
+            // The tail bound: suffixes compare by
             // length, so a change P bytes from the end leaves every
             // shorter suffix identical — the first differing rung
             // bounds it, and the offsets (8-byte steps over the last
@@ -499,7 +501,7 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
             } else if let (Some(prev), Some(row)) = (ladder(prev_loc), ladder(row_loc)) {
                 // Ladders on both rows but no tails: the change is
                 // after the last complete step either of them measured
-                // (summarise.mjs:430-432's fallback, at the geometry
+                // (the fallback bound, at the geometry
                 // the stored rungs actually follow).
                 parts.push(format!(
                     "after byte {}",
@@ -512,8 +514,8 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// A block map entry's `chars`, rendered as ctp's `n()` renders a
-/// missing count (`-`), never as a zero.
+/// A block map entry's `chars`, rendered as a missing count renders
+/// (`-`), never as a zero.
 fn chars_of(block: &Value) -> String {
     grouped(block.get("chars").and_then(Value::as_i64))
 }
@@ -530,14 +532,14 @@ pub(crate) struct RebuildAgg {
     /// In-window requests whose rewritten total is unknown.
     pub unmeasured: usize,
     /// The cause table: count desc, label asc, capped at
-    /// [`MAX_CAUSE_ROWS`] (live.mjs:243).
+    /// [`MAX_CAUSE_ROWS`].
     pub causes: Vec<(Cause, usize)>,
     /// The classified events, newest first — the panel's localised
     /// detail lines render from these.
     pub events: Vec<RebuildEvent>,
 }
 
-/// Summarise a localised walk into the panel's data (live.mjs:507-521).
+/// Summarise a localised walk into the panel's data.
 pub(crate) fn aggregate(walk: Walk) -> RebuildAgg {
     let mut counts: HashMap<Cause, usize> = HashMap::new();
     for event in &walk.events {
@@ -559,7 +561,7 @@ pub(crate) fn aggregate(walk: Walk) -> RebuildAgg {
     }
 }
 
-/// Comma-grouped token counts, ctp `n()`'s rendering: `12,213,961`,
+/// Comma-grouped token counts: `12,213,961`,
 /// and `-` for an unknown, never a zero (the detail lines only ever
 /// render a known count or an explicit gap).
 pub(crate) fn grouped(value: Option<i64>) -> String {
@@ -609,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_lane_predecessor_before_the_window_prevents_phantom_new_prefixes() {
-        // The anti-phantom rule (lanes.md / live.mjs:208-215): the
+        // The anti-phantom rule: the
         // window's first request shares its lane with a pre-window
         // row, so it must classify against THAT row — not report a
         // fresh prefix every window.
@@ -642,7 +644,7 @@ mod tests {
 
     #[test]
     fn a_concurrent_lane_is_a_new_prefix_an_abandoned_one_a_tool_change() {
-        // summarise.mjs:546-557: the first request of a NEW lane is a
+        // The abandoned-lane test: the first request of a NEW lane is a
         // tool-set change only when the previous lane never returns;
         // a lane that alternates back is a concurrent subagent lane.
         let mut main = rewrite(NOW - 60 * MIN);
@@ -738,7 +740,7 @@ mod tests {
 
     #[test]
     fn a_message_count_collapse_is_a_subagent_start() {
-        // summarise.mjs:474-480: at most 8 messages after more than
+        // At most 8 messages after more than
         // twice as many — a sidechain with its own prefix, nothing to
         // reuse. The system hash may differ between the two
         // conversations; the subagent test fires first.
@@ -833,7 +835,7 @@ mod tests {
         );
 
         // A stored capture-time localisation wins over the re-derived
-        // one (summarise.mjs:385-387) — imported ctp rows carry it.
+        // one — imported predecessor rows carry it.
         let mut stored = HashMap::new();
         stored.insert(
             12,
@@ -1039,8 +1041,7 @@ mod tests {
             "count desc, then label asc"
         );
 
-        // The cap: a walk holding all seven causes keeps five rows
-        // (live.mjs:243's slice(0, 5)).
+        // The cap: a walk holding all seven causes keeps five rows.
         let every_cause = [
             Cause::NewPrefix,
             Cause::Idle,
@@ -1072,7 +1073,7 @@ mod tests {
 
     #[test]
     fn a_changed_block_count_is_named_without_a_block_index() {
-        // proxy.mjs:681-683: when the block map changes length, the
+        // When the block map changes length, the
         // count itself is the localisation — there is no block i to
         // name against a mismatched pair.
         let mut prev = rebuild_bare(NOW - 10 * MIN);
@@ -1107,8 +1108,9 @@ mod tests {
     }
 
     #[test]
-    fn null_tool_hashes_share_one_lane_like_live_mjs() {
-        // live.mjs keys a NULL toolsHash under `?` — one lane, so a
+    fn null_tool_hashes_share_one_lane() {
+        // A NULL toolsHash keys one lane (the reference's shared `?`
+        // lane) — a
         // hash-less history still classifies by its other fields
         // instead of every row reading as a fresh prefix.
         let mut prev = rebuild_bare(NOW - 10 * MIN);

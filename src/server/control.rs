@@ -11,12 +11,13 @@
 //! `/_toker/session` is the attribution plugin's query (plan: "the
 //! attribution plugin's queries"): opencode sends its session id on every
 //! request, toker records it per ledger row, so the plugin asks for one
-//! session's aggregate and the answer is exact — the ctp-era token-vector
-//! join is retired. The reply is counts, sums, and labels the rows already
+//! session's aggregate and the answer is exact — the predecessor-era
+//! token-vector join is retired. The reply is counts, sums, and labels the rows already
 //! carry: no content, no credentials (invariants 1-2).
 //!
-//! `/_toker/models/merge` is the promote-model handover (ctp
-//! `controlMerge`, proxy.mjs:1068-1099): promote-model.mjs grants days to
+//! `/_toker/models/merge` is the promote-model handover
+//! (the predecessor's control-merge semantics, made real):
+//! the promote-model tool grants days to
 //! a model the proxy has already served, so a promotion applies to the
 //! running process instead of waiting for a restart. It can only add to
 //! what the store already knows, and only for models it has served — the
@@ -210,23 +211,24 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `POST /_toker/models/merge` — the promote-model handover (ctp
-/// `controlMerge`, proxy.mjs:1068-1099, made real; replaces the phase-1
+/// `POST /_toker/models/merge` — the promote-model handover
+/// (replaces the phase-1
 /// 501 stub).
 ///
 /// Body: one entry, `{"model": id, "days": [...], "maxPrompt": n}` — the
-/// single-model shape of ctp's store merge, with ctp's `pruneSeen`
-/// validation: `days` must be an array of day strings (non-strings and
+/// single-model shape of the store merge, with the
+/// day-list validation: `days` must be an array of day strings (non-strings and
 /// empties dropped, the rest deduped and sorted), `maxPrompt` a finite
 /// number when present. Validation failures answer 400 (`unparseable
-/// store`, ctp's wording); a wrong control verb, method, or content type
+/// store`, the frozen wording); a wrong control verb, method, or content type
 /// answers 403 (`not a control request`).
 ///
 /// The semantics are `mergeSeen(into, from, {only: true})`: days union and
 /// the higher `maxPrompt` for a model **already served**, nothing for one
-/// the store has never seen (never invents). ctp answered 200 with the
-/// unknown model on its `refused` list; toker answers **404** with the
-/// `known` list, so the caller learns the typo instead of a silent no-op.
+/// the store has never seen (never invents). The predecessor answered 200
+/// with the unknown model on its `refused` list; toker answers **404** with
+/// the `known` list, so the caller learns the typo instead of a silent
+/// no-op.
 ///
 /// The reply carries the effect, not the intent: `target` is what the
 /// family's election now names, because a promotion does not guarantee the
@@ -238,7 +240,7 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
         return forbidden();
     }
     let (parts, body) = request.into_parts();
-    // ctp checks all three up front and answers them alike: method, verb,
+    // All three are checked up front and answered alike: method, verb,
     // content type. The verb check already ran above.
     if parts.method != Method::POST || !json_content_type(&parts.headers) {
         return forbidden();
@@ -248,7 +250,8 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
         Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
     };
 
-    // ctp `pruneSeen` over the incoming entry: a store that does not
+    // The incoming entry is validated before anything else: a store that
+    // does not
     // validate is a store that does not apply, never a best-effort guess.
     let incoming: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
@@ -273,7 +276,7 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
         days.dedup();
         days
     };
-    // ctp `pruneSeen`: a non-finite or absent maxPrompt reads as 0 — the
+    // A non-finite or absent maxPrompt reads as 0 — the
     // merge then simply cannot raise the ceiling, only the days.
     let max_prompt = incoming
         .get("maxPrompt")
@@ -295,15 +298,15 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
                 "ok": true,
                 "merged": [entry.model_id],
                 "refused": [],
-                // ctp's `targets`, one family touched: what the election
+                // The `targets` map, one family touched: what the election
                 // names now, so the caller reports the effect.
                 "targets": {family: target},
             }))
             .into_response()
         }
         Ok(MergeOutcome::Unseen) => {
-            // ctp's reason word ("unseen") and its `known` list, on a
-            // status that cannot be mistaken for success.
+            // The frozen reason word ("unseen") and the `known` list, on
+            // a status that cannot be mistaken for success.
             let known = server.models.known_models().unwrap_or_default();
             let mut reply = json!({
                 "toker": "models-merge",
@@ -320,8 +323,8 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
     }
 }
 
-/// `content-type` starts with `application/json` (ctp controlMerge's
-/// `String(...).startsWith`) — the second half of what keeps a browser
+/// `content-type` starts with `application/json`
+/// (the prefix check) — the second half of what keeps a browser
 /// out: a cross-origin page cannot send either half without an
 /// unanswered preflight.
 fn json_content_type(headers: &HeaderMap) -> bool {
@@ -331,8 +334,8 @@ fn json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.starts_with("application/json"))
 }
 
-/// ctp's error replies: `{ctp: "models-merge", ok: false, error}` — the
-/// proxy's name swapped for toker's.
+/// The error replies: `{toker: "models-merge", ok: false, error}` — the
+/// reply signed with the proxy's own name.
 fn merge_error(status: StatusCode, error: &str) -> Response {
     (
         status,

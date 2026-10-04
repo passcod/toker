@@ -1,48 +1,50 @@
 //! The cold-cache gate and the compaction retarget (plan: Middleware —
-//! "Cold gate" + "Compaction retarget"), the second gate ctp grew and the
-//! only transform that changes model-visible prompt structure.
+//! "Cold gate" + "Compaction retarget"), the second gate the predecessor
+//! grew and the only transform that changes model-visible prompt structure.
 //!
-//! A faithful port of claude-token-proxy's `cold.mjs` plus the two pieces
-//! its `coldOutlook` calls (`forecast.mjs`'s burn-rate ladder and
-//! `quota.mjs`'s weight fit), measured over weeks of production traffic —
-//! ported, not improved. Sources:
+//! A faithful port of the predecessor proxy's cold gate plus the two
+//! pieces its quota outlook calls (the burn-rate ladder and the
+//! weight fit), measured over weeks of production traffic —
+//! ported, not improved. Pieces:
 //!
-//! - `DEFAULT_MIN_TOKENS`, `ttlOf`, `coldness`, `laneIsCold` —
-//!   cold.mjs:28, 44, 73-93;
-//! - `decideCold` (the once-per-idle-spell rule, the summarising refusal,
-//!   the outlook suppression) — cold.mjs:181-227;
-//! - `quotaOutlook` / `outlookTarget` — cold.mjs:121-179;
-//! - `humanIdle`, `coldNotice`, `outlookLine` — cold.mjs:235-360;
-//! - `retargetCompaction` (model swap, cache_control strip, system merge,
-//!   the all-or-nothing rule) — cold.mjs:624-796;
-//! - `isCompaction` — already ported ([`crate::ir::AnthropicShape::is_compaction`],
-//!   ctp cold.mjs:701-706);
-//! - `burnRate` / `projectTo` — ctp forecast.mjs:109-271, the two pieces
-//!   `coldOutlook` calls (the span/total verdicts are the TUI/report
+//! - the cold bar, TTL tier, coldness, and lane-cold verdict
+//!   ([`DEFAULT_MIN_TOKENS`], [`ttl_of`], [`coldness`], [`lane_is_cold`]);
+//! - the gate decision ([`decide_cold`] — the once-per-idle-spell rule,
+//!   the summarising refusal, the outlook suppression);
+//! - the quota outlook ([`quota_outlook`] / [`outlook_target`]);
+//! - the notice rendering ([`human_idle`], [`ColdBlocking`],
+//!   [`outlook_line`]);
+//! - the compaction retarget ([`retarget_compaction`] — model swap,
+//!   cache_control strip, system merge, the all-or-nothing rule);
+//! - `isCompaction` — already ported ([`crate::ir::AnthropicShape::is_compaction`]);
+//! - the burn ladder ([`burn_rate`] / [`project_to`]) — the two pieces
+//!   the outlook calls (the span/total verdicts are the TUI/report
 //!   unit's, not ported here);
-//! - `fitQuotaModel` / `quotaFor` — ctp quota.mjs, the weight fit
-//!   `coldOutlook` prices the re-read with (the diagnostics surface —
+//! - the weight fit ([`fit_quota_model`] / [`quota_for`]) — what the
+//!   outlook prices the re-read with (the diagnostics surface —
 //!   groups, spreads, worst window — stays the report unit's);
 //! - the pipeline sequencing (quota gate first; the cold notice exempting
-//!   summarising requests; the retarget's `laneIsCold` licence) —
-//!   ctp proxy.mjs:1246-1442.
+//!   summarising requests; the retarget's lane-cold licence) —
+//!   see [`crate::server::anthropic`].
 //!
 //! **Two clocks, two questions.** The notice asks "should the user be
 //! interrupted" ([`decide_cold`]: refuses once it has spoken this idle
 //! spell, refuses a summarising request outright). The retarget asks "is
 //! the cache gone" ([`lane_is_cold`]: no once-per-spell rule, no
-//! summarising exemption). ctp conflated them once and the compaction the
+//! summarising exemption). The predecessor conflated them once and the
+//! compaction the
 //! notice had promised ran on the wrong model a keystroke later — the
 //! separation is load-bearing and is ported as two functions.
 //!
 //! Everything here is pure except the store-backed conveniences
 //! ([`outlook_over`], [`note_lane_notice`]); state lives in the store, and
-//! every function only decides. The one deliberate impurity in ctp — the
+//! every function only decides. The one deliberate impurity in the
+//! predecessor — the
 //! notice names a wall-clock time — is an *input* here like the quota
 //! gate's port (invariant 4): the caller passes the timestamp and the
 //! [`jiff::tz::TimeZone`].
 //!
-//! Units: `now` is **epoch milliseconds** (ctp's `Date.now()` convention,
+//! Units: `now` is **epoch milliseconds** (a `Date.now()`-style convention,
 //! kept so the vendored contract fixture's `now` values dispatch
 //! unchanged); meter resets are **epoch seconds** (the wire form).
 //!
@@ -65,31 +67,32 @@ use crate::catalog::windows::model_identity;
 use crate::ir::Request;
 use crate::store::{Lane, RequestRow, Store};
 
-/// Below this the rebuild is too cheap for the interruption to be worth it
-/// (ctp `DEFAULT_MIN_TOKENS`, cold.mjs:28). Chosen against the log rather
+/// Below this the rebuild is too cheap for the interruption to be worth it.
+/// Chosen against the log rather
 /// than picked round: of 15 notices fired over a fortnight, a 175k bar
 /// keeps 10 and drops the small ones, sitting just under the cluster of
 /// real cold rebuilds at 199,416 / 200,621 / 200,956 tokens.
 pub const DEFAULT_MIN_TOKENS: u64 = 175_000;
 
 /// How far back the outlook's store query reads. The burn ladder's longest
-/// rung is 4 days (ctp `LADDER_MS`), and the weight fit needs whole 5-hour
+/// rung is 4 days, and the weight fit needs whole 5-hour
 /// windows; seven days covers both with the margin a quiet weekend needs.
-/// ctp reads its whole in-memory log tail — toker's equivalent is the
+/// The predecessor read its whole in-memory log tail — toker's equivalent is the
 /// newest rows, capped like the startup seed.
 pub const OUTLOOK_LOOKBACK_MS: i64 = 7 * 24 * 3600 * 1000;
 
-/// How many rows the outlook's store query reads (ctp's 16 MiB log tail,
+/// How many rows the outlook's store query reads (the predecessor's
+/// 16 MiB log tail,
 /// as a row count — the same cap the startup seed uses).
 pub const OUTLOOK_ROWS: u64 = 20_000;
 
 const MIN_MS: i64 = 60_000;
 const HOUR_MS: i64 = 60 * MIN_MS;
 
-// ── lane coldness (ctp coldness / laneIsCold / ttlOf) ─────────────────────
+// ── lane coldness ────────────────────────────────────────────────────
 
-/// How long this lane's cache survives without traffic (ctp `ttlOf`,
-/// cold.mjs:44): read from the tier the lane was last observed writing
+/// How long this lane's cache survives without traffic: read from the
+/// tier the lane was last observed writing
 /// rather than pinned, and an unrecorded or unrecognised tier is the LONG
 /// one — see the module docs.
 pub fn ttl_of(lane: &Lane) -> i64 {
@@ -100,7 +103,7 @@ pub fn ttl_of(lane: &Lane) -> i64 {
     }
 }
 
-/// The idle measurement a cold lane carries (ctp `coldness`'s return).
+/// The idle measurement a cold lane carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Coldness {
     /// How long since the lane's cache was last touched.
@@ -110,7 +113,6 @@ pub struct Coldness {
 }
 
 /// Is this lane's cache gone, and is its prefix big enough to care about?
-/// (ctp `coldness`, cold.mjs:73-90.)
 ///
 /// Every uncertain case is `None`: an absent lane has no idle time to
 /// measure, and a lane without a recorded prompt (or one in the future — a
@@ -141,8 +143,8 @@ pub fn coldness(
     })
 }
 
-/// Whether the cache is gone and the prefix is worth acting on (ctp
-/// `laneIsCold`, cold.mjs:93). **Not** [`decide_cold`]: this one has no
+/// Whether the cache is gone and the prefix is worth acting on. **Not**
+/// [`decide_cold`]: this one has no
 /// once-per-spell rule and no summarising refusal — it answers the
 /// retarget's question, "is the cache gone", not the notice's.
 pub fn lane_is_cold(
@@ -154,7 +156,7 @@ pub fn lane_is_cold(
     coldness(lane, min_tokens, min_idle_ms, now_ms).is_some()
 }
 
-// ── the decision (ctp decideCold) ────────────────────────────────────────
+// ── the decision ─────────────────────────────────────────────────────
 
 /// Notice, withheld notice, or forward — the cold gate's whole answer.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,9 +165,10 @@ pub enum ColdDecision {
     /// summarising, or laneless.
     Forward,
     /// The notice would have fired, but the quota outlook says the window
-    /// can absorb this re-read (ctp's caller-side `verdict forward && fired
-    /// notice`, folded here so the suppression rule lives in one place —
-    /// the drift ctp's comment warns about cannot happen). The row and the
+    /// can absorb this re-read (the caller-side "forward AND fired
+    /// notice" verdict,
+    /// folded here so the suppression rule lives in one place —
+    /// the drift the predecessor's comment warned about cannot happen). The row and the
     /// re-armed lane are the caller's; the figures ride along so a
     /// `cold-quiet` row can say what the decision rested on.
     Quiet {
@@ -182,7 +185,7 @@ pub enum ColdDecision {
     },
 }
 
-/// Notice or forward (ctp `decideCold`, cold.mjs:181-227 — ported exactly,
+/// Notice or forward (ported exactly,
 /// with the suppression's verdict folded into [`ColdDecision::Quiet`]).
 ///
 /// - A **summarising** request forwards: the notice exists to advise
@@ -197,7 +200,7 @@ pub enum ColdDecision {
 /// - The outlook runs **deliberately last**: a warm, small or already
 ///   spoken-about lane needs no quota estimate to stay quiet, and the
 ///   caller only measures one when this returns [`ColdDecision::Notice`]
-///   (ctp calls this twice for the same reason). Suppression records
+///   (the caller asks twice for the same reason). Suppression records
 ///   nothing — marking the lane noticed here would spend its one notice on
 ///   a turn the user never saw.
 pub fn decide_cold(
@@ -240,8 +243,8 @@ pub fn decide_cold(
     }
 }
 
-/// Remember that the notice has already been given for this idle spell
-/// (ctp `noteLaneNotice`, proxy.mjs:425-430): **`at` does not move** —
+/// Remember that the notice has already been given for this idle spell:
+/// **`at` does not move** —
 /// nothing was measured and nothing reached upstream, so the lane's prefix
 /// and cache age are exactly what they were, and the compaction the user
 /// runs after reading the notice is still seen as cold. A store error
@@ -254,10 +257,10 @@ pub fn note_lane_notice(store: &Store, key: &str, now_ms: i64) -> crate::store::
     store.upsert_lane(&lane)
 }
 
-// ── the burn ladder (ctp forecast.mjs burnRate / projectTo) ──────────────
+// ── the burn ladder ──────────────────────────────────────────────────
 
 /// One meter's fields on a row's `rate_limits`, and the window's length
-/// where known (ctp `METERS`). The 5h/7d windows have lengths; the
+/// where known. The 5h/7d windows have lengths; the
 /// overage window's is not known and is the report unit's concern.
 pub struct MeterSpec {
     pub util_key: &'static str,
@@ -265,21 +268,21 @@ pub struct MeterSpec {
     pub length_ms: Option<i64>,
 }
 
-/// The 5-hour window (ctp `METERS["5h"]`).
+/// The 5-hour window.
 pub const METER_5H: MeterSpec = MeterSpec {
     util_key: "util5h",
     reset_key: "reset5h",
     length_ms: Some(5 * 3600 * 1000),
 };
 
-/// The 7-day window (ctp `METERS["7d"]`).
+/// The 7-day window.
 pub const METER_7D: MeterSpec = MeterSpec {
     util_key: "util7d",
     reset_key: "reset7d",
     length_ms: Some(7 * 24 * 3600 * 1000),
 };
 
-/// The overage window (ctp `METERS.overage`). Its length is NOT known —
+/// The overage window. Its length is NOT known —
 /// the reset is a monthly instant, but utilisation has been seen to
 /// restart at other times — so nothing may assume where it began: the
 /// burn declines its zero-anchor for it and a span total resting on its
@@ -292,17 +295,17 @@ pub const METER_OVERAGE: MeterSpec = MeterSpec {
     length_ms: None,
 };
 
-/// The reporting step. Movement below two of these is not a measurement
-/// (ctp `QUANTUM`/`FLOOR`, forecast.mjs:38-39). Shared with the TUI
+/// The reporting step. Movement below two of these is not a measurement.
+/// Shared with the TUI
 /// quota panel's span totals, which run the same fall/restart tests.
 pub(crate) const QUANTUM: f64 = 0.01;
 const FLOOR: f64 = 2.0 * QUANTUM;
 
-/// Binary-float tolerance (ctp `EPS`, forecast.mjs:47): 0.57 - 0.55 is
+/// Binary-float tolerance: 0.57 - 0.55 is
 /// 0.019999999999999907, which fails a bare `>= 0.02`.
 pub(crate) const EPS: f64 = 1e-9;
 
-/// Lookback rungs, shortest first (ctp `LADDER_MS`, forecast.mjs:57): the
+/// Lookback rungs, shortest first: the
 /// shortest rung that clears the floor wins, so a burst after a quiet hour
 /// reads as a burst. 15, 30, 60, 120, 240, 480, 1440, 2880, 5760 minutes.
 const LADDER_MS: [i64; 9] = [
@@ -317,17 +320,16 @@ const LADDER_MS: [i64; 9] = [
     345_600_000,
 ];
 
-/// Below this the span is too short for the quantisation to survive
-/// (ctp `MIN_SPAN_MS`, forecast.mjs:63).
+/// Below this the span is too short for the quantisation to survive.
 const MIN_SPAN_MS: i64 = 60_000;
 
 /// How long a fall must hold before it counts as a restart rather than a
-/// late-arriving reading (ctp `REORDER_MS`, forecast.mjs:79) — measured
+/// late-arriving reading — measured
 /// p99.9 request duration is 164 s, so ten minutes clears reordering.
 pub(crate) const REORDER_MS: i64 = 10 * 60_000;
 
 /// A projection that spans nights must be measured across at least one
-/// (ctp `DIURNAL_MS`, forecast.mjs:93).
+/// night.
 const DIURNAL_MS: i64 = 24 * 3600 * 1000;
 
 fn min_span_for(reset_ms: i64, now_ms: i64) -> i64 {
@@ -355,8 +357,8 @@ pub struct MeterSample {
     pub reset_s: i64,
 }
 
-/// How fast a meter is being consumed (ctp `burnRate`, forecast.mjs:109 —
-/// the four states and the distinction between the last two are the point
+/// How fast a meter is being consumed
+/// (the four states and the distinction between the last two are the point
 /// of the module, ported verbatim):
 ///
 /// - `None` — no reading for this meter at all;
@@ -367,7 +369,7 @@ pub struct MeterSample {
 /// - `Measured` — a rate, from a span that out-measures the quantisation.
 ///
 /// Readings come from **every** row that carries the meter fields,
-/// proxy-written kinds included (ctp keeps them on purpose: after a block
+/// proxy-written kinds included (kept on purpose: after a block
 /// they are the only rows there are, and their reset value is what says
 /// whether the window is still live). The weight fit is the one that
 /// excludes kinds — see [`fit_quota_model`].
@@ -442,7 +444,7 @@ impl Burn {
         }
     }
 
-    /// ctp's `{ ...burn5h, util: burn5h.util + extra }` — the same burn
+    /// The same burn
     /// with the re-read's share added to its utilisation, for the
     /// with-and-without pair of projections.
     fn plus_util(&self, extra: f64) -> Burn {
@@ -512,8 +514,8 @@ impl Burn {
     }
 }
 
-/// Measure how fast a meter is being consumed (ctp `burnRate`,
-/// forecast.mjs:109-236, ported step for step — the window-restart fall
+/// Measure how fast a meter is being consumed
+/// (ported step for step — the window-restart fall
 /// detection, the zero-reading anchor, the envelope over late-arriving
 /// readings, and the shortest-clearing rung).
 ///
@@ -525,8 +527,8 @@ pub fn burn_rate(rows: &[RequestRow], spec: &MeterSpec, now_ms: i64) -> Burn {
 }
 
 /// [`burn_rate`]'s per-row extraction: one sample per row that carries
-/// the meter's fields, kinds included (see [`burn_rate`] for why ctp
-/// keeps those rows).
+/// the meter's fields, kinds included (see [`burn_rate`] for why those
+/// rows stay).
 fn samples_of(rows: &[RequestRow], spec: &MeterSpec) -> Vec<MeterSample> {
     rows.iter()
         .filter_map(|row| {
@@ -687,8 +689,8 @@ pub fn burn_rate_samples(samples: &[MeterSample], spec: &MeterSpec, now_ms: i64)
     }
 }
 
-/// When a measured burn reaches `target`, against when the window resets
-/// (ctp `projectTo`, forecast.mjs:251-271). `target` is 1 for exhaustion,
+/// When a measured burn reaches `target`, against when the window resets.
+/// `target` is 1 for exhaustion,
 /// or the gate's threshold when the gate is on — the gate is the nearer
 /// wall and the one that actually stops the session.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -751,10 +753,10 @@ fn burn_rate_max(burn: &Burn) -> f64 {
     }
 }
 
-// ── the quota outlook (ctp quotaOutlook / coldOutlook) ────────────────────
+// ── the quota outlook ────────────────────────────────────────────────
 
-/// What the quota window has to say about this re-read (ctp `quotaOutlook`'s
-/// return, cold.mjs:121-176). Every uncertain input answers `known: false`,
+/// What the quota window has to say about this re-read. Every uncertain
+/// input answers `known: false`,
 /// and the caller fires as it always did — a suppressed notice is a re-read
 /// the user never hears about, so the feature is allowed to be less useful
 /// and not to be silently wrong.
@@ -805,8 +807,7 @@ impl Outlook {
     }
 }
 
-/// Whether the quota window can absorb this re-read without noticing (ctp
-/// `quotaOutlook`, cold.mjs:121-176).
+/// Whether the quota window can absorb this re-read without noticing.
 ///
 /// NOT "would this re-read push the window over" — measured across every
 /// notice in the log, it never would: a 200k re-read is about 2% of a
@@ -925,46 +926,41 @@ pub fn quota_outlook(
 }
 
 /// The wall the projection is measured against: the gate's threshold when
-/// the gate is armed, actual exhaustion otherwise (ctp `outlookTarget`,
-/// cold.mjs:179).
+/// the gate is armed, actual exhaustion otherwise.
 pub fn outlook_target(gate_on: bool) -> f64 {
     if gate_on { THRESHOLD } else { 1.0 }
 }
 
-// ── the weight fit (ctp quota.mjs fitQuotaModel / quotaFor) ───────────────
+// ── the weight fit ───────────────────────────────────────────────────
 
 /// The 5-hour window is not a dollar amount and not a token count:
 /// consumption tracks fresh prompt tokens (uncached input + cache writes)
 /// and output tokens, weighted per model. These weights are MEASUREMENTS
-/// re-derived from the ledger (ctp `fitQuotaModel`, quota.mjs — ported
-/// for what `coldOutlook` calls; the diagnostics surface is the report
+/// re-derived from the ledger (ported
+/// for what the outlook calls; the diagnostics surface is the report
 /// unit's).
 ///
-/// A window contributes nothing if utilisation barely moved across it
-/// (ctp `MIN_WINDOW_UTIL`).
+/// A window contributes nothing if utilisation barely moved across it.
 const MIN_WINDOW_UTIL: f64 = 0.05;
 const MIN_WINDOW_REQUESTS: usize = 20;
 const MIN_WINDOWS: usize = 4;
 
 /// A model group must appear in at least this many windows before its
-/// weight is worth trying to separate (ctp `MIN_GROUP_WINDOWS`/`SHARE`).
+/// weight is worth trying to separate.
 const MIN_GROUP_WINDOWS: usize = 3;
 const MIN_GROUP_SHARE: f64 = 0.01;
 
 /// A window whose traffic is largely from groups that cannot be weighted
-/// tells us nothing about the groups that can (ctp
-/// `MAX_UNATTRIBUTED_SHARE`).
+/// tells us nothing about the groups that can.
 const MAX_UNATTRIBUTED_SHARE: f64 = 0.1;
 
 /// Presence is not identifiability: a group whose volume moves in lockstep
-/// with another's has no weight the data can separate (ctp
-/// `MAX_COLLINEARITY_R2`).
+/// with another's has no weight the data can separate.
 const MAX_COLLINEARITY_R2: f64 = 0.98;
 
 /// The weaker net for groups that are separable in principle but unstable
 /// in this particular log: leave one window out, and demote any group
-/// whose own contribution swings by more than this fraction of itself
-/// (ctp `MAX_CONTRIBUTION_SWING`).
+/// whose own contribution swings by more than this fraction of itself.
 const MAX_CONTRIBUTION_SWING: f64 = 0.5;
 
 /// One model group's fitted weight: window fraction per million fresh /
@@ -992,7 +988,7 @@ pub struct QuotaFit {
 
 impl QuotaFit {
     /// What `fresh` prompt tokens on `model` would cost a window, with the
-    /// provenance of the figure (ctp `quotaFor`, quota.mjs:457-462):
+    /// provenance of the figure:
     /// `(fresh / 1e6) × weight.fresh`, and `bound` true where the group
     /// borrowed its weight from the host it was folded into — an upper
     /// bound rather than a measurement, which a caller that prints it must
@@ -1008,20 +1004,20 @@ impl QuotaFit {
 }
 
 /// Fresh prompt tokens: everything the model had to read that was not
-/// cached (ctp `freshOf`).
+/// cached.
 fn fresh_of(row: &RequestRow) -> f64 {
     (row.input.unwrap_or(0).max(0) + row.cache_write_total.unwrap_or(0).max(0)) as f64
 }
 
 /// Is this a row the API answered, rather than one the proxy wrote about
-/// itself? (ctp `isResponseRow`, quota.mjs:267 — any `kind` disqualifies.)
+/// itself? (Any `kind` disqualifies.)
 fn is_response_row(row: &RequestRow) -> bool {
     row.kind.is_none() && row.model.as_deref().is_some_and(|model| !model.is_empty())
 }
 
 /// Models sharing a price row plausibly share a quota weight; pooling by
 /// price signature rather than name needs no maintenance when a model is
-/// added (ctp `priceKey`, quota.mjs:65-70). Routing aliases are not price
+/// added. Routing aliases are not price
 /// evidence — toker's price lookup IS the identity the host will be billed
 /// (there is no host model map yet; when one lands it goes here).
 fn price_key(model: &str) -> String {
@@ -1055,7 +1051,7 @@ struct Window {
 }
 
 /// Split the log into 5-hour windows and measure how far utilisation
-/// advanced across each (ctp `buildWindows`, quota.mjs:146-174). The first
+/// advanced across each. The first
 /// row anchors the window: its own usage is already reflected in the
 /// utilisation it reports, so it is not part of the advance.
 fn build_windows(rows: &[RequestRow]) -> Vec<Window> {
@@ -1119,7 +1115,7 @@ struct GroupInfo {
 
 /// Fraction of `target`'s variation explained by a least-squares
 /// combination of `others`, through the normal equations with a small
-/// ridge term (ctp `explainedBy`, quota.mjs:78-108) — enough for the
+/// ridge term — enough for the
 /// handful of columns here and cannot blow up when two are identical, the
 /// case this exists to detect.
 fn explained_by(target: &[f64], others: &[Vec<f64>]) -> f64 {
@@ -1207,8 +1203,7 @@ fn explained_by(target: &[f64], others: &[Vec<f64>]) -> f64 {
     }
 }
 
-/// Non-negative least squares by projected coordinate descent (ctp `nnls`,
-/// quota.mjs:111-139).
+/// Non-negative least squares by projected coordinate descent.
 fn nnls(a: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
     let m = a.len();
     let k = a.first().map_or(0, Vec::len);
@@ -1243,8 +1238,8 @@ fn nnls(a: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
     x
 }
 
-/// Decide, per group, whether its weight can be separated from the others'
-/// (ctp `classify`, quota.mjs:191-244): fitted, folded (present throughout
+/// Decide, per group, whether its weight can be separated from the others':
+/// fitted, folded (present throughout
 /// but moving in lockstep — no weight of its own), or unattributed (too
 /// few windows to say anything).
 fn classify(windows: &[Window]) -> BTreeMap<String, GroupInfo> {
@@ -1354,7 +1349,7 @@ fn classify(windows: &[Window]) -> BTreeMap<String, GroupInfo> {
 
 /// One solve: the NNLS over the fitted groups' fresh/output columns, plus
 /// how much each group's measured contribution swings when any one window
-/// is left out (ctp `solve`, quota.mjs:305-341).
+/// is left out.
 struct Solve {
     x: Vec<f64>,
     /// Columns in order: (group key, 0 = fresh | 1 = output).
@@ -1380,8 +1375,7 @@ fn solve(
     };
     // A folded group's volume rides on the group it was folded into — but
     // no fold has a host until the demotion loop ends, so during the
-    // solves a folded group contributes to nobody (ctp's `foldMap` holds
-    // undefined/null until the host is known; ported as-is).
+    // solves a folded group contributes to nobody (ported as-is).
     let row_of = |window: &Window| -> Vec<f64> {
         columns
             .iter()
@@ -1460,7 +1454,7 @@ fn solve(
     Solve { x, columns, swing }
 }
 
-/// Fit the model (ctp `fitQuotaModel`, quota.mjs:269-463): weights when
+/// Fit the model: weights when
 /// the log can support them, a reason when it cannot — never a number
 /// without the evidence behind it.
 pub fn fit_quota_model(rows: &[RequestRow]) -> QuotaFit {
@@ -1501,7 +1495,7 @@ pub fn fit_quota_model(rows: &[RequestRow]) -> QuotaFit {
         return unfit("the usable windows are dominated by unattributable traffic");
     }
 
-    // ctp's `foldMap`: every folded group maps to a host that is not known
+    // Every folded group maps to a host that is not known
     // until the demotion loop ends, so they carry `None` through all the
     // solves and borrow the host's weight only at the end.
     let mut fold_map: BTreeMap<String, Option<String>> = info
@@ -1623,8 +1617,9 @@ pub fn fit_quota_model(rows: &[RequestRow]) -> QuotaFit {
 }
 
 /// What the quota window has to say about re-reading `fresh` tokens on
-/// `model`, over `rows` (ctp `coldOutlook`, proxy.mjs:361-378 — the pure
-/// core; the store fetch is [`outlook_over`]). `None` is ctp's "blind":
+/// `model`, over `rows` (the pure
+/// core; the store fetch is [`outlook_over`]). `None` is the "blind"
+/// verdict: the
 /// the toggle off, a young log that cannot fit weights, or a model whose
 /// group never separated — and the notice fires exactly as it did before
 /// this existed.
@@ -1653,7 +1648,7 @@ pub fn outlook_of(
     ))
 }
 
-/// [`outlook_of`] over the store's recent rows (ctp's `knownRows`): the
+/// [`outlook_of`] over the store's recent rows: the
 /// newest [`OUTLOOK_ROWS`] rows within [`OUTLOOK_LOOKBACK_MS`]. A store
 /// error is "blind" — the notice fires, the safe direction.
 pub fn outlook_over(
@@ -1669,10 +1664,9 @@ pub fn outlook_over(
     outlook_of(&rows, model, fresh, gate_on, now_ms)
 }
 
-// ── the notice (ctp coldNotice / humanIdle / outlookLine) ─────────────────
+// ── the notice ──────────────────────────────────────────────────────
 
-/// "47m", "2h 6m", "3h" — the shape a human uses for "how long was I away"
-/// (ctp `humanIdle`, cold.mjs:235-241).
+/// "47m", "2h 6m", "3h" — the shape a human uses for "how long was I away".
 pub fn human_idle(ms: i64) -> String {
     let minutes = ((ms as f64) / 60_000.0).round() as i64;
     if minutes < 60 {
@@ -1680,7 +1674,7 @@ pub fn human_idle(ms: i64) -> String {
     }
     let hours = minutes / 60;
     let minutes = minutes % 60;
-    // ctp's defensive `if (m === 60)` is unrepresentable here: minutes is
+    // A defensive `if (m === 60)` is unrepresentable here: minutes is
     // already rounded and remaindered, so it is always 0..59.
     if minutes != 0 {
         format!("{hours}h {minutes}m")
@@ -1690,7 +1684,7 @@ pub fn human_idle(ms: i64) -> String {
 }
 
 /// Render `at_ms` in `tz` at one of the three resolutions a future instant
-/// needs (ctp `SCALES`/`scaleOf`, fmt.mjs:63-71): a bare clock within 20 h
+/// needs: a bare clock within 20 h
 /// (a future 06:43 read at 20:45 can only be tomorrow), a weekday within
 /// 6 d, day + month beyond. The forms are pinned, not locale-derived
 /// (invariant 4): `%H:%M`, `%a %H:%M`, day-then-month.
@@ -1716,14 +1710,14 @@ fn scale_of(at_ms: f64, now_ms: i64) -> usize {
     }
 }
 
-/// `at`, labelled so it cannot be misread as belonging to `other`'s day
-/// (ctp `alongside`, fmt.mjs:83-86): "resets Mon 05:00 · stops ~06:43"
+/// `at`, labelled so it cannot be misread as belonging to `other`'s day:
+/// "resets Mon 05:00 · stops ~06:43"
 /// reads as 06:43 on Monday when in fact it is Thursday. `d` carries at
 /// least a weekday whenever `other` carries one. The TUI's quota panel
 /// shares this for its meter lines — one labelling rule, everywhere two
 /// instants sit side by side.
 pub(crate) fn alongside(at_ms: f64, other_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
-    // ctp's Math.max(scaleOf(d), Math.min(scaleOf(other), 1), 0): the
+    // The scale is max(own, min(other, 1)); the
     // final 0 is defensive (scales are non-negative here), so it has no
     // Rust equivalent to carry.
     let scale = scale_of(at_ms, now_ms).max(scale_of(other_ms, now_ms).min(1));
@@ -1731,7 +1725,7 @@ pub(crate) fn alongside(at_ms: f64, other_ms: f64, now_ms: i64, tz: &TimeZone) -
 }
 
 /// A future instant at the coarsest resolution that still identifies it
-/// (ctp `resetLabel`, fmt.mjs:71 — the same three scales `alongside`
+/// (the same three scales `alongside`
 /// picks from, chosen on the instant alone): the TUI quota panel's
 /// `resets` clause.
 pub fn reset_label(at_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
@@ -1748,7 +1742,7 @@ fn zoned_of(at_ms: f64, tz: &TimeZone) -> Option<jiff::Zoned> {
     )
 }
 
-/// The quota line of the cold notice (ctp `outlookLine`, cold.mjs:274-305)
+/// The quota line of the cold notice
 /// — the part that says the window was ALREADY heading for its wall,
 /// never that the re-read caused one.
 fn outlook_line(outlook: Option<&Outlook>, now_ms: i64, tz: &TimeZone) -> Option<String> {
@@ -1821,8 +1815,8 @@ fn outlook_line(outlook: Option<&Outlook>, now_ms: i64, tz: &TimeZone) -> Option
     ))
 }
 
-/// The cold notice: the synthetic turn's text (ctp `coldNotice`,
-/// cold.mjs:333-360), wrapped per `style` like the quota gate's.
+/// The cold notice: the synthetic turn's text,
+/// wrapped per `style` like the quota gate's.
 pub struct ColdBlocking;
 
 impl ColdBlocking {
@@ -1893,9 +1887,9 @@ impl ColdBlocking {
     }
 }
 
-// ── the compaction retarget (ctp retargetCompaction) ──────────────────────
+// ── the compaction retarget ──────────────────────────────────────────
 
-/// The prefix of the merged block (ctp cold.mjs:787): Sonnet 5 does not
+/// The prefix of the merged block: Sonnet 5 does not
 /// accept mid-conversation `role: "system"` entries in `messages[]`, and
 /// Claude Code emits them routinely.
 const PROMPT_INJECTION: &str = "[PROMPT_INJECTION]";
@@ -1918,9 +1912,9 @@ pub struct RetargetOutcome {
 }
 
 /// `target` if it is strictly cheaper to prompt than `from`, else `None`
-/// (ctp `cheaperOf`, cold.mjs:650-664 — judged on the published input rate
+/// (judged on the published input rate
 /// rather than a hand-kept ordering, so a new model needs no edit here.
-/// ctp's `priceAs` lets a host route supply the identities that will really
+/// The predecessor let a host route supply the identities that will really
 /// be billed; toker has no host model map yet, so the price lookup IS the
 /// identity the upstream bills). Never sideways, never upward: that would
 /// buy nothing and cost the quality difference.
@@ -1932,8 +1926,8 @@ fn cheaper_of(from: Option<&str>, target: Option<&str>) -> Option<String> {
     (target_input < from_input).then(|| target.to_owned())
 }
 
-/// A message's content as a block array, whatever shape it arrived in (ctp
-/// `blocksOf`, cold.mjs:667-669): string content synthesises one text
+/// A message's content as a block array, whatever shape it arrived in:
+/// string content synthesises one text
 /// block; anything but a string or an array is not convertible.
 fn blocks_of(message: &Value) -> Option<Vec<Value>> {
     match message.get("content") {
@@ -1947,7 +1941,7 @@ fn blocks_of(message: &Value) -> Option<Vec<Value>> {
 }
 
 /// Strip every cache_control breakpoint, anywhere in the tree, and report
-/// how many went (ctp `dropCacheControl`, cold.mjs:632-639).
+/// how many went.
 fn drop_cache_control(node: &mut Value) -> u64 {
     match node {
         Value::Array(parts) => parts.iter_mut().map(drop_cache_control).sum(),
@@ -1971,10 +1965,11 @@ fn js_trim(text: &str) -> &str {
     text.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
 }
 
-/// Rewrite a cold compaction onto a cheaper model, or decline (ctp
-/// `retargetCompaction`, cold.mjs:757-796 — ported exactly, over the IR
-/// instead of raw bytes: toker's serialisation purity makes ctp's
-/// byte-splicing unnecessary, since the IR round-trip is byte-exact and
+/// Rewrite a cold compaction onto a cheaper model, or decline (ported
+/// exactly, over the IR
+/// instead of raw bytes: toker's serialisation purity makes the
+/// predecessor's byte-splicing unnecessary, since the IR round-trip is
+/// byte-exact and
 /// the re-serialised transform is deterministic).
 ///
 /// This is the only transform that changes model-visible prompt structure,
@@ -2084,8 +2079,8 @@ pub fn retarget_compaction(
 
     // The commit: the whole transform was built above without touching the
     // request, so anything that declined left it untouched. `to || from`
-    // with neither present removes the key, exactly as ctp's
-    // `j.model = to || from` drops it under `JSON.stringify`.
+    // with neither present removes the key — a serialised absent model is
+    // a body with no `model` at all.
     let resolved = to.clone().or_else(|| from.clone());
     let mut new_value = original.clone();
     let map = new_value.as_object_mut()?;
@@ -2239,7 +2234,7 @@ mod tests {
         }
     }
 
-    /// The synthetic ledger the outlook tests pin (ctp's rule set made
+    /// The synthetic ledger the outlook tests pin (the rule set made
     /// checkable): four complete 5-hour windows the weight fit can price —
     /// each 21 rows (the row the window opens on, plus the 20 body rows
     /// the fit measures) with utilisation advancing 0.10 → 0.40, all
@@ -2294,13 +2289,13 @@ mod tests {
         rows
     }
 
-    // ── the coldness measurement (ctp coldness / ttlOf) ────────────────
+    // ── the coldness measurement ─────────────────────────────────────
 
     #[test]
-    fn the_min_tokens_bar_is_ctps_and_strict() {
-        assert_eq!(DEFAULT_MIN_TOKENS, 175_000, "ctp DEFAULT_MIN_TOKENS");
+    fn the_min_tokens_bar_is_measured_and_strict() {
+        assert_eq!(DEFAULT_MIN_TOKENS, 175_000, "the measured bar, verbatim");
         // At the bar exactly: a rebuild this cheap is not worth the
-        // interruption (ctp's `prompt <= minTokens`).
+        // interruption (`prompt <= minTokens`).
         assert_eq!(
             coldness(
                 Some(&lane(NOW - 2 * HOUR, 175_000, None)),
@@ -2389,7 +2384,7 @@ mod tests {
 
     #[test]
     fn an_idle_override_replaces_the_tier_floor() {
-        // ctp COLD_IDLE_MIN: the configured floor wins over the tier, in
+        // The configured idle floor wins over the tier, in
         // either direction.
         // A 5m-tier lane at 2 minutes: warm by its tier, cold under a
         // 1-minute override.
@@ -2409,7 +2404,7 @@ mod tests {
         );
     }
 
-    // ── the decision (ctp decideCold) ───────────────────────────────────
+    // ── the decision ────────────────────────────────────────────────
 
     #[test]
     fn a_summarising_request_forwards_even_on_a_cold_lane() {
@@ -2602,7 +2597,7 @@ mod tests {
         ));
     }
 
-    // ── the burn ladder (ctp burnRate / projectTo) ─────────────────────
+    // ── the burn ladder ─────────────────────────────────────────────
 
     #[test]
     fn the_samples_entry_is_the_same_ladder_as_the_rows_entry() {
@@ -3058,7 +3053,7 @@ mod tests {
         assert_eq!(outlook_target(false), 1.0);
     }
 
-    // ── the weight fit (ctp fitQuotaModel / quotaFor) ──────────────────
+    // ── the weight fit ──────────────────────────────────────────────
 
     #[test]
     fn a_young_log_declines_to_fit_rather_than_guess() {
@@ -3091,11 +3086,12 @@ mod tests {
         // the other borrows the survivor's weight — the figure the notice
         // must print as "at most", never as a measurement.
         //
-        // Which one survives is arbitrary by ctp's own account ("the
-        // solver picks one arbitrarily and hands it the other's weight
-        // too", quota.mjs) — there it follows the `seen` map's insertion
-        // order, here the price-key sort, so the survivor is haiku in this
-        // port. What is NOT arbitrary is the invariant: the demoted group
+        // Which one survives is arbitrary — the
+        // predecessor's solver "picks one arbitrarily and hands it the
+        // other's weight
+        // too", following its `seen` map's insertion
+        // order, where this port follows the price-key sort, so the survivor is haiku here.
+        // What is NOT arbitrary is the invariant: the demoted group
         // rides the survivor's weight, and `bound` says so.
         let mut rows = Vec::new();
         let window_span = 5 * HOUR;
@@ -3199,7 +3195,7 @@ mod tests {
         );
     }
 
-    // ── the notice (ctp coldNotice / humanIdle / outlookLine) ───────────
+    // ── the notice ─────────────────────────────────────────────────
 
     #[test]
     fn human_idle_takes_the_shape_a_human_uses() {
@@ -3444,7 +3440,7 @@ mod tests {
         assert!(!notice.contains("window was"), "{notice}");
     }
 
-    // ── the compaction retarget (ctp retargetCompaction) ───────────────
+    // ── the compaction retarget ─────────────────────────────────────
 
     /// A compaction-shaped body with cache_control in all three positions
     /// (system blocks, tool definitions, message content parts) and one
@@ -3645,7 +3641,7 @@ mod tests {
     fn a_cold_lane_strips_without_a_target_and_without_a_model_key() {
         // The cold licence alone: no model change (there is none to make),
         // but the cache writes are bought-never-read, so the strip goes
-        // ahead — and ctp's `j.model = to || from` with neither present
+        // ahead — and `j.model = to || from` with neither present
         // DROPS the key, ported as-is.
         let mut request = Request::parse(
             br#"{"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],
@@ -3658,11 +3654,7 @@ mod tests {
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.stripped, 1);
         let value: Value = serde_json::from_slice(&request.serialise()).expect("serialises");
-        assert_eq!(
-            value.get("model"),
-            None,
-            "the key drops, exactly as ctp's does"
-        );
+        assert_eq!(value.get("model"), None, "the key drops, ported as-is");
         assert!(
             value.get("system").unwrap()[0]
                 .get("cache_control")

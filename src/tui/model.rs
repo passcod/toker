@@ -75,16 +75,19 @@ pub(crate) struct Snapshot {
 /// `ts_ms`, not input order — the ledger is insert-only and rows arrive
 /// slightly out of order.
 ///
-/// One deliberate deviation from live.mjs, scoped and priced: ctp picks
-/// each session's MAIN lane (the largest by prompt size, cold.mjs's
-/// `mainLane`) and reads `ctx`/`msgs`/`cmpct`/prompt off its latest row;
+/// One deliberate deviation from the predecessor dashboard, scoped and
+/// priced: it picks
+/// each session's MAIN lane (the largest by prompt size) and reads
+/// `ctx`/`msgs`/`cmpct`/prompt off its latest row;
 /// this aggregation is session-scoped, reading the latest row of the
 /// session. Lane-picking needs `tools_hash` plus the write share on the
 /// narrow read — a text column on the 2-second tick — and a subagent's
 /// turn landing after the main lane's would move every "latest" to it,
-/// where ctp's would stay on the main conversation. On the single-lane
+/// where the lane-picked reading would stay on the main conversation.
+/// On the single-lane
 /// sessions that dominate real traffic the two read identically; on
-/// multi-lane ones the ctp behaviour lands with `toker report`, whose
+/// multi-lane ones the lane-picked behaviour lands with `toker report`,
+/// whose
 /// full-row reads can afford the lane walk.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SessionAgg {
@@ -95,8 +98,8 @@ pub(crate) struct SessionAgg {
     /// The latest non-NULL model; `None` when no row reported one.
     pub model: Option<String>,
     /// The latest row's prompt — `input + cache_read + cache writes`,
-    /// the measure ctp's "prompt now" and the CONTEXT bars share
-    /// (live.mjs:170-175's `PROMPT_FIELDS`). `None` unless every
+    /// the measure the "prompt now" figure and the CONTEXT bars share.
+    /// `None` unless every
     /// operand is known: anthropic's `input_tokens` excludes cache
     /// writes, so a row without its write share does not understate
     /// the context — it refuses to guess it (see [`prompt_of`]).
@@ -107,21 +110,21 @@ pub(crate) struct SessionAgg {
     /// Sum of reported output tokens; `None` when no row reported output.
     pub output_total: Option<i64>,
     /// The latest row's message count — the `msgs` column
-    /// (live.mjs:388's `last.reqMessages`); `None` when no row carried
+    /// (the latest row's `reqMessages`); `None` when no row carried
     /// one (`?`, never zero).
     pub req_messages: Option<i64>,
     /// The latest row's compaction generation — the `cmpct` column.
-    /// live.mjs:356 reads the lane's LATEST marker, not a count over
-    /// the window, and renders zero/absent as `-`; `None` and zero
+    /// The lane's LATEST marker is read, not a count over
+    /// the window, and zero/absent renders as `-`; `None` and zero
     /// stay distinct here and render the same.
     pub compact_generations: Option<i64>,
     /// The latest row was served on a rewritten (newer) model — the
-    /// bright `↑` (live.mjs:367).
+    /// bright `↑`.
     pub forced_latest: bool,
     /// Some row in the window was — the dim `↑` when not the latest.
     pub forced_any: bool,
     /// The session holds a live allowance for the quota window now
-    /// running — the `$` marker (live.mjs:287-296): released past the
+    /// running — the `$` marker: released past the
     /// armed gate, spending overage where the others stop. Decided by
     /// the caller from the allowances table against the current meter
     /// resets, and passed in as a set.
@@ -195,7 +198,7 @@ pub(crate) struct MinuteBucket {
     pub errors: usize,
 }
 
-/// One TOKENS-panel bucket (live.mjs's `sumUsage`, 445-447): a sum over
+/// One TOKENS-panel bucket: a sum over
 /// the rows that reported the metric, plus how many did not. A sum of
 /// zero over rows that all reported is a real zero; the same sum with
 /// `unavailable > 0` is a floor, and the panel renders it with the `≥`
@@ -218,8 +221,8 @@ impl BucketAgg {
     }
 }
 
-/// Where the window's input tokens went (live.mjs's TOKENS panel,
-/// 436-504): the four input buckets, output, and the cache-metric
+/// Where the window's input tokens went (the TOKENS panel's shape):
+/// the four input buckets, output, and the cache-metric
 /// counters the hit-rate lines need. `requests` is the window's
 /// measurement-row count — the per-request averages' denominator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -241,10 +244,9 @@ pub(crate) struct TokensAgg {
     /// The window's measurement rows — the averages' denominator.
     pub requests: usize,
     /// Rows missing any cache metric (read, either write tier):
-    /// hit-rate lines cannot be computed over them (live.mjs:483-489).
+    /// hit-rate lines cannot be computed over them.
     pub cache_unknown: usize,
-    /// Rows whose cache read was not above zero — "reused nothing"
-    /// (live.mjs:493's `!(r.cacheRead > 0)`).
+    /// Rows whose cache read was not above zero — "reused nothing".
     pub cold: usize,
 }
 
@@ -263,7 +265,7 @@ impl TokensAgg {
 
     /// Whether any input bucket has unavailable rows — the panel then
     /// replaces every share with the reason it cannot be computed
-    /// (live.mjs:449-459: "N req unknown" / "share unknown").
+    /// ("N req unknown" / "share unknown").
     pub(crate) fn input_incomplete(&self) -> bool {
         self.fresh_input.unavailable > 0
             || self.cache_read.unavailable > 0
@@ -271,16 +273,16 @@ impl TokensAgg {
             || self.write_5m.unavailable > 0
     }
 
-    /// The hit rate over the REUSABLE prefix — hits plus rewrites, not
-    /// all input: fresh input is the new turn's content, which was
+    /// Hit rate over the reusable prefix: cache reads as a share of
+    /// everything cache could have served — reads plus rewrites, not
+    /// all input. Fresh input is the new turn's content, which was
     /// never going to be a hit, so including it would drag the rate
-    /// down permanently and make an improving cache look static
-    /// (live.mjs:478-481).
+    /// down permanently and make an improving cache look static.
     ///
     /// Three states, all explicit: [`HitRate::Unknown`] when rows are
     /// missing cache metrics (rendered `?`, never a rate);
     /// [`HitRate::NothingReusable`] when nothing was read or rewritten
-    /// (live.mjs renders no line at all — no denominator, no claim);
+    /// (no line at all — no denominator, no claim);
     /// [`HitRate::Rate`] otherwise.
     pub(crate) fn hit_rate(&self) -> HitRate {
         if self.cache_unknown > 0 {
@@ -329,7 +331,7 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// lane walk over the 24 h tail, [`super::rebuilds`]), `released`
 /// the sessions holding a live allowance for the window now running
 /// (read from the allowances table against the quota section's
-/// current resets, live.mjs:287-296), and `labels` the
+/// current resets), and `labels` the
 /// transcript-derived session labels resolved by the display tick
 /// (one read per session per refresh, [`super::labels::Labels`]) —
 /// all built on their own slower cadences or the tick itself, passed
@@ -452,7 +454,7 @@ pub(crate) fn aggregate(
             session.output_total = Some(session.output_total.unwrap_or(0) + output);
         }
         // The latest row decides `msgs`, `cmpct`, and the bright `↑`;
-        // any row's rewrite lights the dim one (live.mjs:356-367).
+        // any row's rewrite lights the dim one.
         session.req_messages = row.req_messages;
         session.compact_generations = row.compact_generations;
         session.forced_latest = row.forced_to.is_some();
@@ -483,9 +485,9 @@ pub(crate) fn aggregate(
     }
 
     // The context ceiling is a pure catalogue lookup off each session's
-    // latest model, resolved as of the latest row (live.mjs's `ctxOf`
-    // passes `at: r.ts`, so a phased capability resolves to the phase
-    // that applied, never to today's against historical rows).
+    // latest model, resolved as of the latest row's
+    // timestamp, so a phased capability resolves to the phase
+    // that applied, never to today's against historical rows.
     for session in &mut sessions {
         session.ctx = session_ctx(session.model.as_deref(), session.latest_ts_ms);
     }
@@ -534,7 +536,7 @@ pub(crate) fn aggregate(
 
 /// One row's prompt size — the measure the sessions panel's prompt
 /// columns and the CONTEXT bars share: `input + cache_read + cache
-/// writes` (live.mjs:167-175's `PROMPT_FIELDS`). `None` unless every
+/// writes`. `None` unless every
 /// operand is known — a missing operand is unknown, not zero.
 ///
 /// The write share is protocol arithmetic, and the row's provider
@@ -566,12 +568,12 @@ fn anthropic_shaped(provider: Option<&str>) -> bool {
 }
 
 /// The session's context ceiling: the catalogue lookup of its latest
-/// model, resolved as of the latest row (live.mjs:177-179's `ctxOf`
-/// with `at: r.ts`). No betas and no learned declaration: the
+/// model, resolved as of the latest row's timestamp
+/// (its own served-at). No betas and no learned declaration: the
 /// hand-verified catalogue carries the exact identities that matter
 /// (claude native-1M/fixed-200k, the gpt-5.6-sol/luna 872k
 /// declarations), a beta-selectable phase without captured betas stays
-/// `Unknown` exactly as ctp leaves it, and a model outside the
+/// `Unknown` exactly as the catalogue leaves it, and a model outside the
 /// catalogue renders `?` rather than inheriting a family's ceiling.
 fn session_ctx(model: Option<&str>, latest_ts_ms: i64) -> ContextWindow {
     let Some(model) = model else {
@@ -1911,7 +1913,7 @@ mod tests {
         assert_eq!(tokens.hit_rate(), HitRate::Unknown);
 
         // Nothing read, nothing written, everything reported: no rate
-        // is claimable either way — live.mjs renders no line.
+        // is claimable either way — no line at all.
         let mut cold = display_bare(mins_ago(1));
         cold.session_id = Some("ses-c".into());
         cold.input = Some(1_000);

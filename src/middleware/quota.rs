@@ -2,23 +2,27 @@
 //! turn a block is answered with (plan: Middleware — "Quota gate + release
 //! marker", the anthropic_sub backend being today's only meter source).
 //!
-//! Everything here is a faithful port of claude-token-proxy's `limit.mjs`,
-//! measured over weeks of live traffic — ported, not improved. Sources:
+//! Everything here is a faithful port of the predecessor proxy's quota
+//! gate, measured over weeks of live traffic — ported, not improved.
+//! Pieces:
 //!
-//! - `THRESHOLD`, `expired`, `exhaustedMeters`, `grantFor`, `decide` —
-//!   ctp limit.mjs:127, 156, 168-179, 191-197, 236-248;
+//! - the exhaustion test, window expiry, grant snapshot, and the
+//!   block-or-forward walk ([`THRESHOLD`], [`expired`],
+//!   [`exhausted_meters`], [`grant_for`], [`decide`]);
 //! - `carriesRelease` / `stripSentinel` (the frozen marker rule) — the IR
 //!   already ports those ([`crate::ir::anthropic`]: [`SENTINEL`],
 //!   `carries_release`, `strip_release`);
-//! - `blockNotice` — ctp limit.mjs:265-280;
-//! - `syntheticSSE` / `syntheticJSON` — ctp limit.mjs:298-347;
+//! - the block notice and the synthetic turn it is answered with
+//!   ([`Blocking`]);
 //! - the request-pipeline sequencing (release check on the original body
 //!   before the strip; the gate after it; blocked requests answered 200
-//!   with a synthetic turn, never an error status) — ctp proxy.mjs:1135-1241.
+//!   with a synthetic turn, never an error status) — see
+//!   [`crate::server::anthropic`].
 //!
 //! Everything in this module is **pure**: state (the last meter snapshot,
 //! the allowances) lives in the store, and every function here only
-//! decides. The one deliberate impurity in ctp — the notice names a
+//! decides. The one deliberate impurity in the predecessor — the notice
+//! names a
 //! wall-clock time — is made an *input* here: the caller passes the
 //! [`jiff::tz::TimeZone`] to render in, so the notice text stays a pure
 //! function of its arguments (invariant 4 — a gate notice enters replayed
@@ -26,7 +30,7 @@
 //!
 //! Units: meter resets are **epoch seconds** (the wire form in the
 //! `anthropic-ratelimit-unified-*-reset` headers); `now` is **epoch
-//! milliseconds** (ctp's `Date.now()` convention, kept so the vendored
+//! milliseconds** (a `Date.now()`-style convention, kept so the vendored
 //! contract fixture's `now` values dispatch unchanged).
 //!
 //! Absence ≠ a limit (invariant 3): unknown meters forward. A proxy that
@@ -39,16 +43,17 @@ use super::notice::{NoticeStyle, render};
 use crate::store::Allowance;
 
 /// A meter is exhausted when its utilisation reaches this fraction of the
-/// window (ctp `THRESHOLD`, limit.mjs:127).
+/// window.
 pub const THRESHOLD: f64 = 0.99;
 
-/// The synthetic turn's model when the request names none — ctp's
-/// `model || "claude-opus-5"` default.
+/// The synthetic turn's model when the request names none (a stand-in the
+/// client renders like any other).
 const DEFAULT_MODEL: &str = "claude-opus-5";
 
 /// The id on every synthetic assistant turn, so a reader of the client's
 /// transcript or the ledger can tell a proxy answer from a provider one.
-/// (ctp's is `msg_ctp_blocked`; toker signs its own name — the id is
+/// (The predecessor's rows carry `msg_ctp_blocked`; toker signs its own
+/// name — the id is
 /// cosmetic to the client, which renders the turn as a normal message
 /// either way.)
 const SYNTHETIC_ID: &str = "msg_toker_blocked";
@@ -66,7 +71,7 @@ pub enum Meter {
 }
 
 impl Meter {
-    /// The stable short name, ctp's ledger spelling (`"5h"`/`"7d"`) — also
+    /// The stable short name, the ledger spelling (`"5h"`/`"7d"`) — also
     /// the `meter` key of an [`Allowance`] row and of the vendored
     /// contract fixture.
     pub fn as_str(self) -> &'static str {
@@ -86,7 +91,7 @@ impl Meter {
         }
     }
 
-    /// The human spelling the notice uses (ctp `METER_NAMES`).
+    /// The human spelling the notice uses.
     pub fn notice_name(self) -> &'static str {
         match self {
             Meter::FiveHour => "5-hour",
@@ -96,7 +101,7 @@ impl Meter {
 }
 
 /// A typed view over the parsed rate-limits JSON (the store keeps the
-/// snapshot whole as a [`Value`], ctp's stable shape — see
+/// snapshot whole as a [`Value`], the stable wire shape — see
 /// [`crate::providers::anthropic::parse_rate_limits`]). This view reads
 /// only the fields the gate decides on: util/reset per window, whether
 /// spend has shifted to overage, and the binding claim.
@@ -147,8 +152,8 @@ impl<'a> Meters<'a> {
     }
 
     /// Whether this reading already draws on overage rather than plan
-    /// quota (ctp's exact `=== "true"` on the header, so anything but the
-    /// literal `true` is false).
+    /// quota (exactly the literal `true` on the header, so anything but
+    /// that is false).
     pub fn overage_in_use(&self) -> bool {
         self.snapshot.get("overageInUse") == Some(&Value::Bool(true))
     }
@@ -162,8 +167,8 @@ impl<'a> Meters<'a> {
     }
 }
 
-/// Has this meter's window already ended? (ctp `expired`, limit.mjs:156 —
-/// the rule that un-wedges the gate.)
+/// Has this meter's window already ended? (The rule that un-wedges the
+/// gate.)
 ///
 /// A reading describes the window it was taken in. Once that window's
 /// reset instant passes, the reading says nothing about the one now
@@ -174,7 +179,7 @@ impl<'a> Meters<'a> {
 /// back fresh meters, so the next request is blocked on the same stale
 /// figure, forever. Forwarding instead is self-correcting — being more
 /// restrictive than the API about a window we cannot see is not this
-/// gate's job. An absent reset reads as not-expired (ctp: non-numbers
+/// gate's job. An absent reset reads as not-expired (non-numbers
 /// never expire), so a spent util with no reset still blocks, with
 /// `resets_at: None` naming the ignorance.
 pub fn expired(reset_seconds: Option<i64>, now_ms: i64) -> bool {
@@ -182,7 +187,7 @@ pub fn expired(reset_seconds: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Which meters are currently exhausted, in the order a notice should name
-/// them (ctp `exhaustedMeters`, limit.mjs:168-179).
+/// them.
 ///
 /// `overageInUse` counts as the 5-hour meter being gone — it means spend
 /// has already shifted off plan quota, which is the thing being prevented —
@@ -211,8 +216,7 @@ pub fn exhausted_meters(meters: Option<Meters<'_>>, now_ms: i64) -> Vec<Meter> {
 }
 
 /// The allowance a release grants right now: the current reset value for
-/// each meter that is exhausted, and `None` for each that is not (ctp
-/// `grantFor`, limit.mjs:191-197).
+/// each meter that is exhausted, and `None` for each that is not.
 ///
 /// Storing the reset **value** rather than a timestamp is what makes the
 /// allowance expire without a clock: when the window rolls, the reported
@@ -220,7 +224,7 @@ pub fn exhausted_meters(meters: Option<Meters<'_>>, now_ms: i64) -> Vec<Meter> {
 /// Granting only for meters that are exhausted is what stops a release for
 /// the afternoon from quietly becoming a release for the week — a fresh
 /// `None` defers to whatever allowance is already held (the merge happens
-/// in the server wiring, ctp proxy.mjs:1137-1147).
+/// in the server wiring).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grant {
     /// The 5-hour window a release covers, by reset value; `None` when the
@@ -248,7 +252,7 @@ pub fn grant_for(meters: Option<Meters<'_>>, now_ms: i64) -> Grant {
     }
 }
 
-/// Block or forward (ctp `decide`, limit.mjs:236-248).
+/// Block or forward.
 ///
 /// `allowances` are the session's stored [`Allowance`] rows — the caller
 /// loads and session-filters them. An allowance un-gates the exhausted
@@ -256,7 +260,8 @@ pub fn grant_for(meters: Option<Meters<'_>>, now_ms: i64) -> Grant {
 /// reported reset**: an allowance cannot outlive its window, because a
 /// rolled window reports a different reset and no longer matches. Stale
 /// rows from rolled windows are inert by the same rule (enforcement needs
-/// no clock; ctp's load-time pruning is only housekeeping, and toker's
+/// no clock; the predecessor's load-time pruning was only housekeeping,
+/// and toker's
 /// keyed rows are its equivalent).
 ///
 /// Unknown meters forward (see the module docs): absence of
@@ -272,7 +277,7 @@ pub enum GateDecision {
     Block {
         /// Which meter hit its limit.
         meter: Meter,
-        /// When that meter's window resets, epoch seconds — ctp's
+        /// When that meter's window resets, epoch seconds — the row's
         /// `resetsAt`.
         resets_at: Option<i64>,
     },
@@ -288,7 +293,8 @@ pub fn decide(meters: Option<Meters<'_>>, allowances: &[Allowance], now_ms: i64)
             Meter::FiveHour => meters.reset5h(),
             Meter::SevenDay => meters.reset7d(),
         };
-        // ctp: `held != null && held === current` — released for this window.
+        // Released for this window: a stored reset that is present and
+        // equals the meter's currently reported one.
         let released = current.is_some_and(|reset| {
             allowances.iter().any(|allowance| {
                 allowance.meter == meter.as_str() && allowance.reset_value == reset
@@ -304,8 +310,8 @@ pub fn decide(meters: Option<Meters<'_>>, allowances: &[Allowance], now_ms: i64)
     GateDecision::Forward
 }
 
-/// Which wire form a blocked request is answered in (ctp proxy.mjs:1213-1219:
-/// a client that *explicitly* asked for a plain JSON Message cannot parse an
+/// Which wire form a blocked request is answered in (a client that
+/// *explicitly* asked for a plain JSON Message cannot parse an
 /// event stream; everyone else — `stream: true` or the field omitted — gets
 /// the SSE turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,9 +323,8 @@ pub enum Rendering {
 }
 
 /// The blocked answer: the notice text, and the synthetic assistant turn
-/// that carries it (ctp `blockNotice` / `syntheticSSE` / `syntheticJSON`,
-/// limit.mjs:265-347). Shared shape, measured against a real client on
-/// 2026-09-10 — a 200 renders the notice verbatim, exits clean, and
+/// that carries it. Shared shape, measured against a real client on
+/// 2026-09-10 with the predecessor proxy — a 200 renders the notice verbatim, exits clean, and
 /// cannot be retried; an error status is worse than useless (529 retried
 /// eight times over 46 s and printed nothing, so control never returned to
 /// the keyboard and the release marker could never be typed; 429 is
@@ -327,7 +332,7 @@ pub enum Rendering {
 pub struct Blocking;
 
 impl Blocking {
-    /// The text the user sees (ctp `blockNotice`, natively rendered — plan:
+    /// The text the user sees (natively rendered — plan:
     /// "Native rendering for gate notices"). It is the entire interface of
     /// this feature — the only place they learn which meter they hit, when
     /// it clears, and how to resume — so it says all three.
@@ -346,14 +351,15 @@ impl Blocking {
     ///
     /// Pure function of its inputs, style included (invariant 4): the
     /// reset time renders in the passed timezone, to the minute (`%H:%M`,
-    /// 24-hour — ctp follows the process locale's hour cycle, which has
+    /// 24-hour — the predecessor followed the process locale's hour
+    /// cycle, which has
     /// no jiff equivalent; the local timezone is the part of that which
     /// matters, the hour convention is pinned instead of guessed). The
     /// context size is stated and nothing is concluded from it; dropped
     /// entirely when unknown or zero rather than printed as a zero (a
     /// notice reading "0 tokens" would be read as a measurement). A reset
     /// the reading did not carry is "an unknown time" — the same verdict
-    /// as ctp's null `resetsAt`.
+    /// as a null `resetsAt`.
     pub fn notice(
         meter: Meter,
         resets_at: Option<i64>,
@@ -365,7 +371,7 @@ impl Blocking {
             .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
             .map(|timestamp| timestamp.to_zoned(tz.clone()).strftime("%H:%M").to_string())
             .unwrap_or_else(|| "an unknown time".to_owned());
-        // ctp `group`: comma-grouped, never locale-moving — these figures
+        // Comma-grouped, never locale-moving — these figures
         // land in notices the tests assert on.
         let size = match context_tokens {
             Some(tokens) if tokens > 0 => {
@@ -382,9 +388,9 @@ impl Blocking {
     }
 
     /// A synthetic assistant turn carrying `text`, in the requested
-    /// rendering. `model` is the client's own request model (ctp reads it
+    /// rendering. `model` is the client's own request model (read
     /// before any rewrite), defaulting to [`DEFAULT_MODEL`] when the
-    /// request named none — ctp's `model || "claude-opus-5"`.
+    /// request named none.
     pub fn blocked_turn(text: &str, model: Option<&str>, rendering: Rendering) -> Vec<u8> {
         match rendering {
             Rendering::Sse => Blocking::sse_turn(text, model),
@@ -392,8 +398,8 @@ impl Blocking {
         }
     }
 
-    /// The turn as an event stream — ctp `syntheticSSE` (limit.mjs:298-323)
-    /// byte for byte in event shape, order, and zeroed usage (nothing
+    /// The turn as an event stream — byte for byte
+    /// in event shape, order, and zeroed usage (nothing
     /// reached upstream, and a synthetic row that claimed tokens would be
     /// counted by every view that reads the ledger): `message_start`,
     /// `content_block_start`, `content_block_delta` carrying the notice,
@@ -465,8 +471,8 @@ impl Blocking {
         out.into_bytes()
     }
 
-    /// The same turn for a request that asked for `"stream": false` — ctp
-    /// `syntheticJSON` (limit.mjs:333-347): a client that asked for a
+    /// The same turn for a request that asked for `"stream": false`:
+    /// a client that asked for a
     /// plain JSON Message cannot parse an event stream. Same zeroed usage.
     pub fn json_turn(text: &str, model: Option<&str>) -> Vec<u8> {
         let model = model
@@ -492,7 +498,7 @@ impl Blocking {
 }
 
 /// One SSE event block: `event:` line, `data:` line, blank separator —
-/// ctp's `push` in `syntheticSSE`, whose joined lines plus trailing
+/// the joined lines plus trailing
 /// newline produce exactly this per-event shape.
 fn sse_event(out: &mut String, event: &str, data: &Value) {
     out.push_str("event: ");
@@ -503,7 +509,7 @@ fn sse_event(out: &mut String, event: &str, data: &Value) {
     out.push_str("\n\n");
 }
 
-/// Comma-grouped digit rendering (ctp `group`, fmt.mjs:45): deliberately
+/// Comma-grouped digit rendering: deliberately
 /// NOT locale-moving — these figures land in notices whose bytes are
 /// pinned by tests and replayed in history (invariant 4). Shared with the
 /// cold gate's notice.
@@ -559,7 +565,7 @@ mod tests {
 
     #[test]
     fn the_threshold_edge_blocks_at_0_99_and_above_only() {
-        assert_eq!(THRESHOLD, 0.99, "ctp's threshold, verbatim");
+        assert_eq!(THRESHOLD, 0.99, "the measured threshold, verbatim");
         for util in [1.0, 0.995, 0.99] {
             let snapshot = json!({"util5h": util, "reset5h": 2_000_000_600});
             assert_eq!(
@@ -583,7 +589,7 @@ mod tests {
     fn a_util_below_one_can_still_block_because_the_threshold_is_fractional() {
         // 0.99 of a window is spent even though 0.01 remains: the residual
         // is smaller than any single large request, so the gate treats the
-        // window as gone (ctp's measured rationale for 0.99).
+        // window as gone (the predecessor's measured rationale for 0.99).
         let snapshot = json!({"util5h": 0.994, "reset5h": 2_000_000_600});
         assert!(matches!(
             decide(meters(&snapshot), &[], NOW_MS),
@@ -613,7 +619,7 @@ mod tests {
         assert!(expired(Some(2_000_000), 2_000_000_000));
         // One epoch-second before the reset: still the old window.
         assert!(!expired(Some(2_000_000), 1_999_999_999));
-        // Absent resets never expire (ctp: non-numbers), so a spent util
+        // Absent resets never expire (non-numbers), so a spent util
         // with no reset still blocks — naming its own ignorance.
         assert!(!expired(None, NOW_MS));
         let snapshot = json!({"util5h": 1.0});
@@ -682,7 +688,7 @@ mod tests {
             }
         );
 
-        // Anything but the literal `true` is false (ctp's `=== "true"`).
+        // Anything but the literal `true` is false.
         let snapshot = json!({"util5h": 0.21, "reset5h": 2_000_000_600, "overageInUse": "TRUE"});
         assert_eq!(
             decide(meters(&snapshot), &[], NOW_MS),
@@ -802,7 +808,7 @@ mod tests {
         );
 
         // An exhausted meter that carries no reset has no value to key an
-        // allowance on: the grant is null (ctp's `meters.reset5h ?? null`).
+        // allowance on: the grant is null (a missing reset grants nothing).
         let resetless = json!({"util5h": 1.0});
         assert_eq!(
             grant_for(meters(&resetless), NOW_MS),
@@ -853,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn the_typed_view_reads_the_stable_ctp_shape() {
+    fn the_typed_view_reads_the_stable_wire_shape() {
         let snapshot = json!({
             "util5h": 0.4127, "reset5h": 1_769_500_800,
             "util7d": 0.2214, "reset7d": 1_769_846_400,
@@ -930,9 +936,9 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            "ctp's `known` check: `Number.isFinite(n) && n > 0`"
+            "a zero context is not a measurement: the known check is finite and > 0"
         );
-        // No reset carried: name the ignorance, exactly as ctp words it.
+        // No reset carried: name the ignorance, in the frozen wording.
         assert_eq!(
             Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain),
             "[Session stopped by toker: 5-hour quota is spent, resets at an unknown time. \
@@ -1057,17 +1063,17 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&bytes).expect("utf-8"),
             expected,
-            "ctp's exact event shape: a client renders it as a normal assistant message"
+            "the exact event shape: a client renders it as a normal assistant message"
         );
 
-        // No model named: ctp's `model || "claude-opus-5"` default.
+        // No model named: the "claude-opus-5" default.
         let bytes = Blocking::sse_turn("x", None);
         assert!(
             std::str::from_utf8(&bytes)
                 .expect("utf-8")
                 .contains("\"model\":\"claude-opus-5\"")
         );
-        // ctp's `||` also defaults an EMPTY model.
+        // The default also covers an EMPTY model.
         let bytes = Blocking::sse_turn("x", Some(""));
         assert!(
             std::str::from_utf8(&bytes)

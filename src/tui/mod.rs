@@ -1,7 +1,8 @@
 //! Ratatui dashboard (plan: "TUI").
 //!
 //! A long-running terminal view over the SQLite ledger, refreshing ~every
-//! 2 s — the replacement for `watch … live.mjs`. Phase 1 rendered the
+//! 2 s — the replacement for the predecessor's watched log script.
+//! Phase 1 rendered the
 //! sessions, spend, and rate panels; phase 2 grows the rate panel into
 //! **rate & quota** (meter bars, forecasts, spent, binding — [quota]),
 //! and the rest of the panel set (context bars, tokens, cache rebuilds)
@@ -12,12 +13,15 @@
 //! - [model]: narrow display rows in, dashboard snapshot out. No
 //!   terminal types — testable against synthetic [`crate::store::DisplayRow`]
 //!   sets alone (the store's display-window projection, invariant 7).
-//! - [labels]: session names from Claude Code's own transcripts — ctp's
-//!   transcript.mjs ported. Read-only, tail-only, newest-wins; a session
+//! - [labels]: session names from Claude Code's own transcripts — the
+//!   predecessor's transcript reader, ported. Read-only, tail-only,
+//!   newest-wins; a session
 //!   with no name keeps its id.
-//! - [quota]: the rate & quota section of that snapshot — ctp's meter
-//!   forecasting, ported from forecast.mjs/live.mjs.
-//! - [rebuilds]: the CACHE REBUILDS section — ctp's lane walk and cause
+//! - [quota]: the rate & quota section of that snapshot — the
+//!   predecessor's meter
+//!   forecasting, ported.
+//! - [rebuilds]: the CACHE REBUILDS section — the predecessor's lane
+//!   walk and cause
 //!   classification over the store's rebuild-tail projection.
 //! - [view]: snapshot + frame in, pixels out, via ratatui. Rendering is
 //!   exercised with ratatui's `TestBackend`, never a real terminal.
@@ -53,8 +57,9 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// columns, one JSON parse per row — see [`quota_snapshot`]) and
 /// aggregates burn rates over it — far heavier than the display read,
 /// and nothing about it changes on a 2-second scale: meters move on
-/// the upstream's window scale (hours), and ctp itself refit its quota
-/// model every 30 MINUTES (QUOTA_REFIT_MS). Refreshing it at the
+/// the upstream's window scale (hours), and the predecessor itself refit
+/// its quota
+/// model every 30 MINUTES. Refreshing it at the
 /// display cadence made the loop spin: the read overran the tick, the
 /// next deadline landed in the past, and `event::poll(0)` never
 /// blocked — 80% of a core, fixed here.
@@ -70,10 +75,12 @@ const QUOTA_REFRESH: Duration = Duration::from_secs(60);
 /// The rebuild walk's tail: 24 hours, strictly longer than the longest
 /// display window (`--window-mins` caps at 1440), so every lane whose
 /// predecessor predates the window still gets its real predecessor —
-/// the anti-phantom rule (ctp lanes.md / live.mjs:208-215).
+/// the anti-phantom rule (as the lane docs state it: a predecessor must
+/// be a served request, no matter how far back it sits).
 const REBUILD_TAIL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// The rebuild tail's row cap, sized like ctp live.mjs's effective
+/// The rebuild tail's row cap, sized like the predecessor dashboard's
+/// effective
 /// tail (16 MB of JSONL ≈ 20-30 k rows): enough to cover the tail many
 /// times over at any plausible request rate — a single day's traffic
 /// is nowhere near it — so the cap only guards a pathologically hot
@@ -93,7 +100,8 @@ const ROW_CAP: u64 = 10_000;
 ///
 /// `extra_transcript_roots` is the config's `transcript_roots` — the
 /// harness config directories whose transcripts the session labels also
-/// look under (see [labels]; ctp's `CTP_TRANSCRIPTS`).
+/// look under (see [labels]; the same colon-list idea the predecessor
+/// used).
 pub fn run(
     db_path: &Path,
     window_mins: u64,
@@ -191,7 +199,7 @@ pub fn run(
 /// blip worth hiding behind a stale frame.
 ///
 /// Session labels resolve here, once per session per display tick
-/// ([`labels::Labels`], live.mjs's economics: its 2-second render
+/// ([`labels::Labels`], the labels' economics: a 2-second refresh
 /// re-reads each tail so a title that regenerates mid-session stays
 /// current) — never per render, which is why the label state is loop
 /// state passed in rather than a fresh read per frame.
@@ -266,7 +274,7 @@ fn rebuild_snapshot(
 }
 
 /// The sessions holding a live allowance for the quota window now
-/// running — the `$` marker's set (live.mjs:282-296). A release names
+/// running — the `$` marker's set. A release names
 /// the window it was for, so it only counts while that window is the
 /// current one: a stored `(meter, reset)` allowance is live iff the
 /// newest meter reading still reports that reset. Nothing is live
@@ -312,8 +320,9 @@ fn released_sessions(
 
 /// Reload the meter lookback and aggregate the quota section — the
 /// heavy read, on its own cadence. A burn rate and a spent span need
-/// history a display window cannot hold, ctp's "readings are taken
-/// from every row read, not just the windowed ones" (live.mjs:269-272);
+/// history a display window cannot hold — "readings are taken
+/// from every row read, not just the windowed ones" (the predecessor's
+/// rule);
 /// the lookback reuses the cold outlook's constants: same 7-day span,
 /// same row cap.
 ///
@@ -343,7 +352,7 @@ fn quota_snapshot(store: &Store, window_mins: u64) -> anyhow::Result<Option<quot
 
 /// The local day's start (midnight, the system zone) in epoch ms — the
 /// quota panel's `spent today` anchor. "Today" is the user's day, not
-/// UTC's (ctp live.mjs:604's `setHours(0,0,0,0)`). A clock outside
+/// UTC's (the local clock's midnight). A clock outside
 /// jiff's representable range cannot name a day, so `now` stands in:
 /// the today span degenerates to empty rather than guessing.
 fn local_day_start_ms(now_ms: i64) -> i64 {
@@ -496,7 +505,7 @@ pub(crate) mod testrows {
     }
 
     /// A meter-lookback row carrying an anthropic meter snapshot at
-    /// `ts_ms` — ctp's `rateLimits` shape (util/reset per window plus
+    /// `ts_ms` — the parsed rate-limits shape (util/reset per window plus
     /// the status/claim/overage fields), for the quota panel's tests.
     /// The quota aggregation's native input: the narrow read returns
     /// these, so its tests build them directly.
@@ -684,7 +693,8 @@ pub(crate) mod testrows {
 #[cfg(test)]
 mod tests {
     //! The parity probe against the live production ledger — the real
-    //! work-shaped data the imported ctp history is. Read-only, run
+    //! work-shaped data the imported predecessor history is. Read-only,
+    //! run
     //! deliberately with `--ignored` (the service is live; the probe
     //! reads exactly the way the TUI's own ticks do and writes
     //! nothing).

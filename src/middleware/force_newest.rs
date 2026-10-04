@@ -3,9 +3,10 @@
 //! model's family that the log has actually proven — but only where no
 //! cache can be lost by the move.
 //!
-//! A faithful port of ctp's `forceTarget`/`stickyTarget`/`idleForTtl`/
-//! `promptBound` (models.mjs:415-469) and the sequencing block that calls
-//! them (proxy.mjs:1444-1500), measured over weeks of production traffic —
+//! A faithful port of the predecessor proxy's force-newest decision
+//! (the target election, the sticky rule, the idle-for-TTL
+//! condition, and the prompt bound) and the sequencing block that calls
+//! them, measured over weeks of production traffic —
 //! ported, not improved. The decision is the server's slot to fill; the
 //! body edit itself is [`crate::ir::AnthropicBodyMut::set_model`] — the
 //! ONLY value this middleware changes, so unlike the compaction retarget
@@ -14,7 +15,7 @@
 //! conversation that should cache its prefix on the model it is actually
 //! going to use.
 //!
-//! The three no-cache-loss conditions (ctp proxy.mjs:1476-1487), each of
+//! The three no-cache-loss conditions, each of
 //! which answers "moving this request cannot cost a cached prefix":
 //!
 //! - **a cold lane** — its cache is already gone, so the rewrite is free.
@@ -46,7 +47,7 @@
 //! keeps asking for the old one, so honouring that request is what would
 //! lose the cache — every upgraded conversation paid its prefix twice,
 //! once on each model, before this rule. Sticky is consulted only while
-//! the lane is *warm* (ctp `known && !cold`): a lane that has gone cold
+//! the lane is *warm* (known and not cold): a lane that has gone cold
 //! re-decides from scratch, because its cache is gone either way. Only a
 //! request still naming the model that was rewritten sticks — one naming
 //! anything else is the user choosing, and is left alone.
@@ -58,8 +59,7 @@
 //!
 //! Everything here is pure — a function of its inputs, with no clock
 //! beyond the `now_ms` passed in (invariant 4). Store errors read as
-//! absence: a missed upgrade, never a lost request (ctp's `try/catch`,
-//! proxy.mjs:1499).
+//! absence: a missed upgrade, never a lost request.
 
 use crate::catalog::windows::model_identity;
 use crate::middleware::cold::lane_is_cold;
@@ -70,33 +70,32 @@ use crate::middleware::models::{
 use crate::store::{Lane, ModelEntry};
 
 /// What counts as "a conversation that has barely started" for a lane the
-/// table has no record of (ctp `NEW_CONVERSATION_MESSAGES`, proxy.mjs:140
-/// — Claude Code opens with one user message; two allows for a
+/// table has no record of
+/// (Claude Code opens with one user message; two allows for a
 /// system-reminder turn without admitting a real history).
 pub const NEW_CONVERSATION_MESSAGES: u64 = 2;
 
-/// The longest a cache survives untouched: the 1-hour tier (ctp
-/// `CACHE_TTL_MAX_MS`, models.mjs:425). The idle-for-TTL condition reads
+/// The longest a cache survives untouched: the 1-hour tier. The
+/// idle-for-TTL condition reads
 /// the asked model's recency against this horizon, never the lane's own
 /// tier — warmth can come from places no lane records.
 pub const CACHE_TTL_MAX_MS: i64 = 3_600_000;
 
-/// Bytes a token, from below (ctp `MIN_BYTES_PER_TOKEN`, models.mjs:462):
+/// Bytes a token, from below:
 /// 2.385 was the least observed over 17,608 single-iteration requests
 /// above 200k tokens (2026-09-25; median 2.83). Smaller requests have run
 /// denser, but they are nowhere near a context ceiling.
 pub const MIN_BYTES_PER_TOKEN: u64 = 2;
 
-/// An upper bound on a request's prompt size, before it is sent (ctp
-/// `promptBound`, models.mjs:469): the byte count is all there is until
+/// An upper bound on a request's prompt size, before it is sent:
+/// the byte count is all there is until
 /// the API reports usage. Server-side tool iterations add tokens after
 /// this, which no pre-flight figure can see.
 pub fn prompt_bound(bytes: u64) -> u64 {
     bytes.div_ceil(MIN_BYTES_PER_TOKEN)
 }
 
-/// Has nothing been served on this model for a full cache TTL? (ctp
-/// `idleForTtl`, models.mjs:449-454.)
+/// Has nothing been served on this model for a full cache TTL?
 ///
 /// The lane table forgets lanes, so an unknown lane deep in a
 /// conversation may be a warm session the proxy has lost track of — and
@@ -106,14 +105,14 @@ pub fn prompt_bound(bytes: u64) -> u64 {
 /// within [`CACHE_TTL_MAX_MS`], no cache it could read exists, and moving
 /// it loses nothing.
 ///
-/// Only as good as the record behind `last_seen` (ctp `coveredSince`):
+/// Only as good as the record behind `last_seen`:
 /// silence counts for nothing unless the record reaches back past the
 /// TTL, so a record that starts later than the horizon answers false.
 /// Every doubtful value answers false, which costs an upgrade; a wrong
 /// yes costs a rebuild of the whole prefix.
 ///
 /// `covered_since` is [`ModelStore::covered_since`]'s reading: `None`
-/// means the whole ledger was seeded (ctp's `-Infinity`, never fails the
+/// means the whole ledger was seeded (never fails the
 /// horizon check); `Some(ts)` is the oldest row a cut tail kept.
 pub fn idle_for_ttl(last_seen: Option<i64>, covered_since: Option<i64>, now_ms: i64) -> bool {
     let horizon = now_ms - CACHE_TTL_MAX_MS;
@@ -124,7 +123,7 @@ pub fn idle_for_ttl(last_seen: Option<i64>, covered_since: Option<i64>, now_ms: 
     }
     match last_seen {
         // Never served, in a record that reaches back past the TTL: no
-        // cache exists. (ctp's `lastSeen === undefined || null` — a
+        // cache exists. (A
         // last-seen in the future, a clock that moved, reads as warm via
         // the numeric arm below.)
         None => true,
@@ -133,8 +132,8 @@ pub fn idle_for_ttl(last_seen: Option<i64>, covered_since: Option<i64>, now_ms: 
 }
 
 /// The model this request should be sent to instead, or `None` to leave
-/// it be (ctp `forceTarget`, models.mjs:415-422 — without ctp's optional
-/// `accept` hook: the proxy's only call site passes none).
+/// it be (without the optional
+/// `accept` hook: the only call site passes none).
 ///
 /// Strictly newer, always ([`newer_than`]); the family's learned-newest
 /// ([`newest_in_family`]); and proven at `prompt` ([`fits_context`]).
@@ -150,8 +149,7 @@ pub fn force_target_of(entries: &[ModelEntry], model: &str, prompt: u64) -> Opti
     Some(best)
 }
 
-/// The model a lane the proxy has already upgraded must stay on (ctp
-/// `stickyTarget`, models.mjs:483-487).
+/// The model a lane the proxy has already upgraded must stay on.
 ///
 /// Only a request still asking for the model that was rewritten sticks;
 /// one naming anything else is the user choosing, and is left alone.
@@ -164,19 +162,19 @@ pub fn sticky_target(lane: &Lane, model: &str) -> Option<String> {
     (asked == from).then_some(to)
 }
 
-/// Everything the decision reads about one request (ctp
-/// proxy.mjs:1468-1487's block inputs): the asked model, the lane record,
+/// Everything the decision reads about one request
+/// (the block inputs): the asked model, the lane record,
 /// the request shape, and the idle floor the cold gate shares. `now_ms`
 /// is the only clock (invariant 4).
 #[derive(Debug, Clone, Copy)]
 pub struct ForceContext<'a> {
-    /// The model the request asks for, as it stands after routing (ctp
-    /// `asked`, proxy.mjs:1469 — `clientWants(body).model`). `None` when
+    /// The model the request asks for, as it stands after routing
+    /// (the client's own named model). `None` when
     /// the body names no model: nothing to rewrite.
     pub model: Option<&'a str>,
     /// The identity the upstream will actually receive for `model` once
-    /// the routing map is applied — ctp proxy.mjs:1480's
-    /// `previewMappedModel(MODEL_MAP, asked)`, the preview hook into this
+    /// the routing map is applied — the map's
+    /// preview, the hook into this
     /// decision. The served-recency condition reads THIS, never the asked
     /// model: a mapped request's cache lives on the target identity
     /// upstream, so warmth is the target's warmth — without the preview,
@@ -186,21 +184,21 @@ pub struct ForceContext<'a> {
     /// preview is then the asked model, which is what the decision
     /// assumed before the map existed.
     pub served_as: Option<&'a str>,
-    /// The lane record, when the table holds one (ctp `known`). `None` is
+    /// The lane record, when the table holds one. `None` is
     /// the unknown-lane case with its own, stricter eligibility.
     pub lane: Option<&'a Lane>,
-    /// The request's message count (ctp `shape?.reqMessages`); `None`
+    /// The request's message count; `None`
     /// when the body carries no `messages` array — an unknown lane
     /// without one is never eligible, never guessed as short.
     pub req_messages: Option<u64>,
-    /// The request is a compaction (ctp `isCompaction(shape) === true`):
+    /// The request is a compaction:
     /// excluded from the *first* decision — a warm compaction reads the
     /// same cache, so it still sticks.
     pub compaction: bool,
-    /// The request body's byte length (ctp `body.length`): the prompt
+    /// The request body's byte length: the prompt
     /// bound's input when the lane is unknown and has no measured size.
     pub body_bytes: u64,
-    /// The idle floor override (ctp `COLD_IDLE_MS`); `None` follows the
+    /// The idle floor override; `None` follows the
     /// TTL tier the lane was last seen writing.
     pub min_idle_ms: Option<i64>,
     /// Now, epoch milliseconds.
@@ -213,16 +211,16 @@ pub struct ForceContext<'a> {
 pub enum ForceDecision {
     /// No rewrite: something would be lost by it, or nothing was learned.
     Leave,
-    /// Rewrite onto `to` — `from` is the asked model (ctp's
-    /// `forcedFrom`/`forcedTo`, proxy.mjs:1493-1494).
+    /// Rewrite onto `to` — `from` is the asked model
+    /// (the lane row's `forcedFrom`/`forcedTo`).
     Move(Forced),
 }
 
-/// Decide the force-newest rewrite for one request (ctp
-/// proxy.mjs:1465-1500's decision, minus the body edit and the row
+/// Decide the force-newest rewrite for one request (the
+/// decision, minus the body edit and the row
 /// provenance, which are the server's slot).
 ///
-/// The order is ctp's exactly: sticky first and only while the lane is
+/// The order is exact: sticky first and only while the lane is
 /// warm, then — when there is nothing to stick to and the request is not
 /// a compaction — eligibility, the prompt figure, and the family
 /// election. The prompt a known lane carries is its own measured size,
@@ -230,18 +228,18 @@ pub enum ForceDecision {
 /// a zero there waved every one past the context check once a deep
 /// conversation could qualify.
 ///
-/// A store error reads as absence (ctp's `try/catch`): a missed upgrade,
+/// A store error reads as absence: a missed upgrade,
 /// never a lost request.
 pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision {
     let known = request.lane;
     // Whether the cache is gone, not whether the user has been spoken to
-    // (ctp proxy.mjs:1472-1474): `minTokens: 0` because a new
+    // (the cold lane test): `minTokens: 0` because a new
     // conversation is worth upgrading at any size.
     let cold = known.is_some_and(|_| lane_is_cold(known, 0, request.min_idle_ms, request.now_ms));
 
     let asked = request.model;
     // Sticky once moved, and only while the lane's cache may still be live
-    // (ctp proxy.mjs:1475: `known && !cold ? stickyTarget(...) : null`) —
+    // (known and not cold) —
     // a lane that has gone cold re-decides, since its cache is gone
     // either way. A warm compaction still sticks: it reads the same cache.
     let mut target = None;
@@ -257,7 +255,7 @@ pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision 
         && !request.compaction
         && let Some(asked) = asked
     {
-        // Eligibility (ctp proxy.mjs:1477-1482): a known lane qualifies
+        // Eligibility: a known lane qualifies
         // by coldness alone; an unknown one by a short conversation or by
         // the asked model having sat unserved for a full TTL — in which
         // case no cache it could read exists.
@@ -265,7 +263,7 @@ pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision 
             Some(_) => cold,
             None => request.req_messages.is_some_and(|messages| {
                 messages <= NEW_CONVERSATION_MESSAGES || {
-                    // ctp proxy.mjs:1480: the recency lookup runs on the
+                    // The recency lookup runs on the
                     // map preview, never the asked model — the cache a
                     // mapped request could read lives on the target.
                     let cache_identity = request.served_as.unwrap_or(asked);
@@ -278,7 +276,7 @@ pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision 
             // An unknown lane has no measured size, and a zero here waved
             // every one past the context check: harmless while only
             // two-message conversations qualified, not once a 300-message
-            // one could (ctp proxy.mjs:1483-1486).
+            // one could.
             let prompt = match known {
                 Some(lane) => lane.prompt_tokens.unwrap_or(0).max(0) as u64,
                 None => prompt_bound(request.body_bytes),
@@ -321,8 +319,8 @@ mod tests {
         }
     }
 
-    /// Nine days of history on every entry (ctp test/models-force.mjs's
-    /// `SEEN`): comfortably above the election bar (needed = 4.5).
+    /// Nine days of history on every entry (the predecessor's force-test
+    /// fixture): comfortably above the election bar (needed = 4.5).
     const D: [&str; 9] = [
         "2026-09-01",
         "2026-09-02",
@@ -335,7 +333,7 @@ mod tests {
         "2026-09-09",
     ];
 
-    /// The learned store ctp's force tests use: opus-5 and opus-4-8 both
+    /// The learned store the force tests use: opus-5 and opus-4-8 both
     /// proven, opus-5 the elected newest.
     fn seeded_opus(store: &Arc<Store>) -> ModelStore {
         let models = ModelStore::seeded(store.clone(), &[], None);
@@ -385,13 +383,13 @@ mod tests {
     const NOW: i64 = 1_800_000_000_000; // a fixed, arbitrary now
     const HOUR: i64 = 3_600_000;
 
-    // ── the election core (ctp forceTarget) ───────────────────────────
+    // ── the election core ────────────────────────────────────────────
 
     #[test]
     fn an_older_version_is_upgraded_to_the_newest_in_its_family() {
-        // The case this exists for (ctp test/models-force.mjs). maxPrompt
-        // defaults to 1e9 there (`maxPrompt ?? 1e9`): proven at any size
-        // the tests ask for.
+        // The case this exists for. maxPrompt
+        // defaults to 1e9 in the reference tests (`maxPrompt ?? 1e9`):
+        // proven at any size the tests ask for.
         let entries = [
             entry("claude-opus-5", &D, Some(1_000_000_000)),
             entry("claude-opus-4-8", &D, Some(1_000_000_000)),
@@ -471,11 +469,11 @@ mod tests {
         assert_eq!(force_target_of(&unproven, "claude-opus-4-8", 1), None);
     }
 
-    // ── sticky (ctp stickyTarget) ────────────────────────────────────
+    // ── sticky ───────────────────────────────────────────────────────
 
     #[test]
     fn a_lane_stays_on_its_upgrade_while_its_cache_is_warm() {
-        // ctp test/models-force.mjs's lane: moved off claude-opus-4-5.
+        // The reference tests' lane: moved off claude-opus-4-5.
         let mut upgraded = lane(NOW, Some(1));
         upgraded.forced_from = Some("claude-opus-4-5".to_owned());
         upgraded.forced_to = Some("claude-opus-5".to_owned());
@@ -505,11 +503,11 @@ mod tests {
         assert_eq!(sticky_target(&unidentifiable, "claude-opus-4-8"), None);
     }
 
-    // ── the served-recency condition (ctp idleForTtl) ────────────────
+    // ── the served-recency condition ─────────────────────────────────
 
     #[test]
     fn a_model_nothing_has_been_served_on_for_an_hour_has_no_cache_to_lose() {
-        // ctp test/models-force.mjs: a model idle three hours (or never
+        // A model idle three hours (or never
         // served, in a record reaching back far enough) may be moved.
         assert!(idle_for_ttl(Some(NOW - 3 * HOUR), None, NOW));
         assert!(idle_for_ttl(None, Some(NOW - 2 * HOUR), NOW));
@@ -522,7 +520,7 @@ mod tests {
         );
         // A last-seen in the future is a clock that moved, not idleness.
         assert!(!idle_for_ttl(Some(NOW + HOUR), None, NOW));
-        // Exactly the horizon is idle (ctp's `<=`).
+        // Exactly the horizon is idle (`<=`).
         assert!(idle_for_ttl(Some(NOW - CACHE_TTL_MAX_MS), None, NOW));
     }
 
@@ -538,7 +536,7 @@ mod tests {
         assert_eq!(NEW_CONVERSATION_MESSAGES, 2);
     }
 
-    // ── the decision (ctp proxy.mjs:1465-1500) ───────────────────────
+    // ── the decision ─────────────────────────────────────────────────
 
     #[test]
     fn a_cold_lane_is_moved_no_matter_how_big_its_conversation() {
@@ -859,8 +857,8 @@ mod tests {
 
     #[test]
     fn the_map_preview_informs_the_recency_lookup_never_the_election() {
-        // ctp proxy.mjs:1480: `idleForTtl` reads
-        // `servedOn.get(modelIdentity(previewMappedModel(MODEL_MAP, asked)))`
+        // The idle-for-TTL recency lookup reads
+        // the served map through the map preview of the asked model
         // — the cache a mapped request could read lives on the TARGET
         // identity upstream, so warmth is the target's warmth. Without
         // the preview a claimed model (only ever served as its target,

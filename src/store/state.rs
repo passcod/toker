@@ -17,10 +17,12 @@ use rusqlite::Connection;
 /// One lane row: `key` is the composite `"sessionId|toolsHash"` (plan: Lane
 /// tracking + sleep lock). `ping` lanes never hold the sleep lock.
 ///
-/// ctp's lane record, in store form: `updated_ms` is ctp's `at` (moved only
+/// The predecessor's lane record, in store form: `updated_ms` is its
+/// `at` (moved only
 /// when a response the API actually served completes), `noticed_at` is
-/// `noticedAt` (moved only when the cold notice fires — see
-/// `decideCold`'s separation), `forced_from`/`forced_to` are `forced:
+/// `noticedAt` (moved only when the cold notice fires — the decision
+/// unit keeps the two questions apart),
+/// `forced_from`/`forced_to` are `forced:
 /// {from, to}` (the sticky-upgrade record, consulted while the lane's cache
 /// may still be warm).
 #[derive(Debug, Clone, PartialEq)]
@@ -208,15 +210,15 @@ fn read_model(row: &rusqlite::Row<'_>) -> Result<ModelEntry> {
     })
 }
 
-/// Age and cap the lanes table (ctp `pruneLanes`, cold.mjs:534-573): drop
+/// Age and cap the lanes table: drop
 /// lanes whose `updated_ms` sits in the future (a clock that moved — a
 /// lane that could never go idle) or further back than `max_age_ms`, then
 /// keep only the newest `max_lanes`. Rows the caller wrote are already
 /// well-formed, so the file-era paranoia about hand-edited records does
 /// not apply — the SQL is the whole rule. Returns how many rows went.
 ///
-/// The caller owns the cadence: ctp prunes on its 30-second flush, never
-/// per request.
+/// The caller owns the cadence: the prune runs on the 30-second flush,
+/// never per request.
 pub(super) fn prune_lanes(
     conn: &Connection,
     now_ms: i64,

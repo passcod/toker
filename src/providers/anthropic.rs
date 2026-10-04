@@ -12,17 +12,19 @@
 //!   injected only when the request carries neither `x-api-key` nor
 //!   `authorization` of its own.
 //!
-//! [`parse_rate_limits`] is the faithful port of ctp's `rateLimits`
-//! (proxy.mjs:911) — the meter-header parser. Every `anthropic-ratelimit-*`
+//! [`parse_rate_limits`] is the faithful port of the predecessor's
+//! meter-header parser. Every `anthropic-ratelimit-*`
 //! header folds into the stable shape: util/reset per window (resets in
 //! epoch seconds), the per-claim statuses, `status`, `claim` =
 //! `representative-claim`, `overageInUse`, `fallbackPct` — and anything
-//! unknown lands in `other`, kept, never dropped. (The first ctp cut
+//! unknown lands in `other`, kept, never dropped. (The predecessor's
+//! first cut
 //! cherry-picked and silently discarded the representative-claim and the
 //! per-claim statuses, which turned out to be the signals that matter
 //! most; the KNOWN set and the `other` catch-all are that lesson, ported.)
 //!
-//! Key spellings are ctp's camelCase verbatim — "the stable shape, so
+//! Key spellings are the predecessor's camelCase verbatim — "the stable
+//! shape, so
 //! existing analysis keeps working" — including on the wire into the
 //! ledger's `rate_limits` and `meters_state` JSON columns.
 
@@ -43,8 +45,8 @@ const X_API_KEY: header::HeaderName = header::HeaderName::from_static("x-api-key
 pub struct AnthropicSub {
     upstream: Url,
     /// The operator's model routing map, when one is configured
-    /// (`[providers.anthropic_sub.model_map]`) — ctp's `CTP_MODEL_MAP`
-    /// on this backend.
+    /// (`[providers.anthropic_sub.model_map]`) — the routing map this
+    /// backend applies, ported from the predecessor's env-typed knob.
     model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
@@ -170,10 +172,11 @@ impl Provider for AnthropicApi {
     // the plan names the sub as today's only meter source.
 }
 
-/// The meter-header keys lifted into the stable shape's named fields
-/// (ctp `KNOWN_LIMIT_KEYS`). Everything else the API sends lands in
+/// The meter-header keys lifted into the stable shape's named fields.
+/// Everything else the API sends lands in
 /// `other` rather than being dropped. Note `reset` is known but not
-/// lifted — ctp never surfaced it either; it is simply excluded from
+/// lifted — the predecessor never surfaced it either; it is simply
+/// excluded from
 /// `other`, exactly as ported.
 const KNOWN_LIMIT_KEYS: &[&str] = &[
     "5h-utilization",
@@ -192,19 +195,19 @@ const KNOWN_LIMIT_KEYS: &[&str] = &[
     "overage-in-use",
 ];
 
-/// Parse the quota meter snapshot from one response's headers (ctp
-/// `rateLimits`, proxy.mjs:911 — a faithful port; see the module docs).
+/// Parse the quota meter snapshot from one response's headers
+/// (a faithful port; see the module docs).
 ///
 /// `None` when the response carries no `anthropic-ratelimit-*` headers at
-/// all. Every key ctp lifts is present in the returned object, `null` when
+/// all. Every key the parser lifts is present in the returned object,
+/// `null` when
 /// the response did not carry it; unknown keys are preserved in `other`
 /// with the `anthropic-ratelimit-unified-` family prefix stripped (the
-/// same strip ctp applies before lookup, so non-unified unknowns keep
+/// same strip the lookup applies, so non-unified unknowns keep
 /// their full header names).
 pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
-    // ctp: `all[k.replace(/^anthropic-ratelimit-unified-?/, "")] = v` —
-    // the first occurrence of a repeated header name wins (Node's Headers
-    // would have merged them; a merge ctp never saw in production).
+    // The first occurrence of a repeated header name wins (Node's Headers
+    // would have merged them; a merge production never showed).
     let mut all: Vec<(String, String)> = Vec::new();
     for (name, value) in headers {
         let name = name.as_str();
@@ -226,7 +229,7 @@ pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
         return None;
     }
 
-    // ctp's `num(k)`: `Number(all[k])` — the raw header string parsed as a
+    // The raw header string parsed as a
     // JSON number keeps its literal verbatim (epoch-second resets stay
     // integers, utilisations keep their precision), and anything
     // non-numeric is `NaN`, which JSON-serialises as `null`.
@@ -245,7 +248,7 @@ pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
         .collect();
 
     Some(json!({
-        // Stable shape, so existing analysis keeps working (ctp).
+        // Stable shape, so existing analysis keeps working.
         "util5h": num("5h-utilization"),
         "reset5h": num("5h-reset"),
         "util7d": num("7d-utilization"),
@@ -261,7 +264,7 @@ pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
         "statusOverage": text("overage-status"),
         "claim": text("representative-claim"),
         // Whether this request is drawing on overage rather than plan
-        // quota (ctp's `=== "true"`: a bool, false when absent).
+        // quota (exactly the literal `true`: a bool, false when absent).
         "overageInUse": get("overage-in-use") == Some("true"),
         "fallbackPct": num("fallback-percentage"),
         "other": Value::Object(other),
@@ -436,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn the_full_meter_set_parses_to_the_stable_ctp_shape() {
+    fn the_full_meter_set_parses_to_the_stable_wire_shape() {
         let mut headers = HeaderMap::new();
         metered(&mut headers);
         assert_eq!(
@@ -458,7 +461,7 @@ mod tests {
                 // Unknown keys are kept, never dropped — under the full
                 // header name, because the unified-family strip never
                 // matched. `reset` is known-but-unlifted, so it is not
-                // here either (ctp parity).
+                // here either (parser parity).
                 "other": {"anthropic-ratelimit-experiment-thing": "42"},
             })),
             "epoch resets stay integers and unknown keys land in other"
@@ -509,7 +512,7 @@ mod tests {
         let parsed = parse_rate_limits(&headers).expect("ratelimit headers present");
         assert_eq!(parsed["util5h"], serde_json::Value::Null, "NaN → null");
         assert_eq!(parsed["fallbackPct"], serde_json::Value::Null);
-        // ctp's `=== "true"` is exact and case-sensitive.
+        // The overage flag is exact and case-sensitive.
         assert_eq!(
             parsed["overageInUse"],
             json!(false),

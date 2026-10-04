@@ -8,12 +8,12 @@
 //! directory, a generated title, the deliberate agent name, and the last
 //! prompt as it goes. The dashboard reads that to put a name on a row;
 //! this module only ever reads, and nothing it returns is written
-//! anywhere — ctp's transcript.mjs, ported whole:
+//! anywhere — the predecessor's transcript reader, ported whole:
 //!
 //! - [`transcript_roots`]: every config directory to look in — Claude
 //!   Code's own default, whatever `CLAUDE_CONFIG_DIR` says, and any more
-//!   listed in the config's `transcript_roots` (ctp's `CTP_TRANSCRIPTS`:
-//!   a harness that runs its agents under a config directory of its own
+//!   listed in the config's `transcript_roots`
+//!   (a harness that runs its agents under a config directory of its own
 //!   — Workhorse does — keeps their transcripts somewhere this shell's
 //!   environment cannot see).
 //! - [`find_transcript`]: the `projects/<dir>/<session-id>.jsonl`
@@ -22,10 +22,10 @@
 //! - [`session_label`]: the tail-only read. A transcript is mostly tool
 //!   results and a single one can run to hundreds of KiB, so only the
 //!   last [`TAIL_BYTES`] are ever read, and only the few small records
-//!   wanted are parsed out of them, newest first (transcript.mjs:39-63).
+//!   wanted are parsed out of them, newest first.
 //! - [`Labels`]: the per-refresh cache — one read per session per
-//!   refresh, never per render (live.mjs re-resolves every 2-second
-//!   render; the tick is that render here).
+//!   refresh, never per render (the reference re-resolved on every
+//!   2-second render; the tick is that render here).
 //!
 //! Failure is always "no label": a missing transcript, an unreadable
 //! one, a tail with nothing usable — the view falls back to the session
@@ -36,8 +36,9 @@ use std::env;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-/// How much of a transcript is ever read (ctp transcript.mjs:29's
-/// `TAIL_BYTES`). Claude Code re-appends the title and last prompt every
+/// How much of a transcript is ever read
+/// (`TAIL_BYTES`, the reference's tail cap). Claude Code re-appends the
+/// title and last prompt every
 /// turn, so they sit within a few KiB of the end — but a long turn's
 /// tool results land after them, and a single one can run to hundreds of
 /// KiB.
@@ -45,10 +46,10 @@ pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
 
 /// The name, working directory, and last prompt a transcript's tail
 /// carries, or [`None`] via the `Option` that holds it when it carries
-/// none of them (transcript.mjs:39-63's `labelFromTail` output). The
+/// none of them (the tail-read's output). The
 /// title is the deliberate agent name when the tail carries one, else
 /// the generated ai-title — the agent name wins wherever in the tail it
-/// sits, because ctp reads `clean(name) ?? clean(title)`.
+/// sits (`clean(name) ?? clean(title)`).
 ///
 /// Nothing here is ever written anywhere: labels exist at view time
 /// only (invariant 1), which is also why this type has no serialisation
@@ -66,8 +67,8 @@ pub(crate) struct Label {
 /// Every transcript root to look in, each carrying the `projects/`
 /// level Claude Code keeps its transcripts under: Claude Code's own
 /// default (`~/.claude`), whatever this shell's `CLAUDE_CONFIG_DIR`
-/// says, and any more listed in the config's `transcript_roots` — ctp
-/// transcript.mjs:20-24's `transcriptRoots`, with the env read hoisted
+/// says, and any more listed in the config's `transcript_roots` — the
+/// env read hoisted
 /// out so the pure core ([`roots_from`]) stays testable without
 /// touching process env.
 pub(crate) fn transcript_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
@@ -82,9 +83,9 @@ pub(crate) fn transcript_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 
 /// The roots computation under explicit inputs: the two defaults, the
 /// configured extras, `~` expanded against the home, `projects/`
-/// appended, empties dropped, duplicates collapsed in order — ctp
-/// transcript.mjs:20-24, with `CTP_TRANSCRIPTS`' colon list standing in
-/// as the `extra` slice.
+/// appended, empties dropped, duplicates collapsed in order —
+/// the pure mirror of the env-reading wrapper, with the configured
+/// extras standing in for the colon list.
 fn roots_from(
     home: Option<PathBuf>,
     config_dir: Option<PathBuf>,
@@ -103,7 +104,7 @@ fn roots_from(
         if dir.as_os_str().is_empty() {
             continue;
         }
-        // ctp's `d.replace(/^~(?=\/|$)/, homedir())`: a leading `~` (or
+        // A leading `~` (or
         // a bare one) expands against the home, and without a home to
         // expand against the path passes through unchanged — the root
         // then simply never holds a transcript.
@@ -125,8 +126,8 @@ fn roots_from(
     roots
 }
 
-/// The transcript file for a session id, or `None` — ctp
-/// transcript.mjs:66-78's `findTranscript`. The id is interpolated into
+/// The transcript file for a session id, or `None` — the
+/// reference's find rule. The id is interpolated into
 /// a path, so anything outside `[0-9a-zA-Z-]` is refused outright; the
 /// ledger's session ids are opaque strings the proxy never validated.
 /// Each root is scanned for any project directory holding
@@ -150,8 +151,8 @@ fn find_transcript(sid: &str, roots: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// A session's label, from the tail of its transcript — ctp
-/// transcript.mjs:101-118's `sessionLabel`. Only the last
+/// A session's label, from the tail of its transcript — the
+/// reference's session-label rule. Only the last
 /// `tail_bytes` are read; a read that starts mid-line drops up to the
 /// first newline first, because half a record can match the cwd pattern
 /// on the wrong string. Never panics: every failure — no transcript, an
@@ -178,8 +179,8 @@ pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Op
     label_from_tail(&text)
 }
 
-/// The label a transcript tail carries (ctp transcript.mjs:39-63's
-/// `labelFromTail`). Only the few small records wanted are parsed —
+/// The label a transcript tail carries. Only the few small records
+/// wanted are parsed —
 /// the rest of the tail is mostly tool results, and parsing a megabyte
 /// of them for every session every two seconds would be the whole cost
 /// of the view — and the scan runs newest-first so the LATEST of each
@@ -190,7 +191,8 @@ pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Op
 /// stands in for nothing; the scan keeps going.
 fn label_from_tail(text: &str) -> Option<Label> {
     // The raw field values, newest-first; `None` keeps the scan going,
-    // exactly ctp's `??=` (a record whose field is missing or JSON null
+    // exactly the reference's keep-until-set rule (a record whose field
+    // is missing or JSON null
     // never wins, and a non-string value wins only to clean to `None`).
     let mut name: Option<serde_json::Value> = None;
     let mut title: Option<serde_json::Value> = None;
@@ -232,7 +234,7 @@ fn label_from_tail(text: &str) -> Option<Label> {
     (label.cwd.is_some() || label.title.is_some() || label.prompt.is_some()).then_some(label)
 }
 
-/// One line's named-record field (ctp transcript.mjs:43-46's `record`):
+/// One line's named-record field:
 /// the line must carry the exact marker substring — the cheap
 /// pre-filter that keeps a full JSON parse off most lines — and then
 /// parse, and the field must be present and not JSON null. `None`
@@ -251,7 +253,7 @@ fn record_field(line: &str, marker: &str, field: &str) -> Option<serde_json::Val
 }
 
 /// The first `"cwd":"…"` value on the line, unescaped (the
-/// `/"cwd":"((?:[^"\\]|\\.)*)"/` capture of ctp transcript.mjs:55-56,
+/// `/"cwd":"((?:[^"\\]|\\.)*)"/` capture,
 /// re-quoted and JSON-parsed so escapes resolve). Scans the raw bytes:
 /// a UTF-8 continuation byte is never `"` or `\`, so multibyte content
 /// cannot end the capture early. A capture that does not close before
@@ -278,7 +280,7 @@ fn cwd_of(line: &str) -> Option<String> {
     serde_json::from_str(&quoted).ok()
 }
 
-/// ctp transcript.mjs:60's `clean`: a non-empty string with its
+/// `clean`: a non-empty string with its
 /// whitespace runs collapsed to single spaces; anything else (a
 /// non-string field, a blank one) is `None`, never an empty label.
 fn clean(value: Option<String>) -> Option<String> {
@@ -295,8 +297,8 @@ fn clean_value(value: Option<&serde_json::Value>) -> Option<String> {
     clean(value.and_then(|value| value.as_str()).map(str::to_owned))
 }
 
-/// A working directory short enough for a column (ctp
-/// transcript.mjs:85-95's `shortDir`). A worktree's own name is usually
+/// A working directory short enough for a column (the
+/// reference's short-dir rule). A worktree's own name is usually
 /// a branch or a card code, which says nothing without its repo, so
 /// `repo/.../worktrees/x1` reads `repo/x1`.
 pub(crate) fn short_dir(cwd: Option<&str>) -> Option<String> {
@@ -321,7 +323,8 @@ pub(crate) fn short_dir(cwd: Option<&str>) -> Option<String> {
 /// [`Labels::resolve`] reads a session's transcript tail at most once
 /// per refresh (the loop's display tick) and caches the answer — `None`
 /// included, so a session with no name is not re-probed per row —
-/// exactly live.mjs's economics: its 2-second render re-reads each tail
+/// the reference dashboard's economics: a 2-second refresh re-reads each
+/// tail
 /// (a title that regenerates mid-session stays current) and never pays
 /// twice within one frame. [`Labels::start_refresh`] is that tick.
 pub(crate) struct Labels {
@@ -372,14 +375,14 @@ fn projects_of(root: &std::path::Path, dir: &str, sid: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    //! ctp transcript-label.mjs's cases, ported — plus the end-to-end
+    //! The reference transcript-label cases, ported — plus the end-to-end
     //! path over scratch transcript layouts built from the checked-in
     //! fixtures, the tail-only discipline, and the cache economics.
     //!
     //! Env is never touched here: [`super::roots_from`] is the pure
     //! core of the env-reading [`super::transcript_roots`], so the
-    //! root-resolution cases pass home/config-dir values as data, ctp
-    //! test's own `transcriptRoots(env)` trick.
+    //! root-resolution cases pass home/config-dir values as data, the
+    //! reference test's own env-as-data trick.
 
     use std::path::{Path, PathBuf};
 
@@ -412,7 +415,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("read fixture {path:?}: {error}"))
     }
 
-    // ── label_from_tail: ctp transcript-label.mjs, ported ──────────
+    // ── label_from_tail: the reference cases, ported ────────────────
 
     #[test]
     fn the_latest_record_wins_and_a_quoted_tool_result_is_not_a_record() {
@@ -479,7 +482,7 @@ mod tests {
             "torn line produced a label"
         );
         // A cwd whose value is complete on a torn line still reads —
-        // ctp's cwd pattern matches the raw line, not the parsed record.
+        // the cwd pattern matches the raw line, not the parsed record.
         assert_eq!(
             label_from_tail(r#"{"type":"user","cwd":"/home/u/code/repo","mess"#)
                 .expect("the torn line's complete cwd reads")
@@ -514,7 +517,7 @@ mod tests {
 
     #[test]
     fn roots_carry_projects_dedupe_and_expand_tilde() {
-        // ctp transcript-label.mjs's "roots are deduplicated and
+        // "Roots are deduplicated and
         // empties dropped": the home default and CLAUDE_CONFIG_DIR
         // naming the same place collapse, `~` expands against the
         // home, and an empty root is dropped.
@@ -569,7 +572,7 @@ mod tests {
 
     // ── end to end over the checked-in fixtures ──────────────────────
 
-    /// The realistic tail shapes ctp reads, one fixture each: a
+    /// The realistic tail shapes the reader faces, one fixture each: a
     /// session that drifts (old cwd and title, then new ones), a
     /// session with nothing usable in its tail, a malformed tail line
     /// that must not stand in for the real records, and a final line
@@ -590,7 +593,8 @@ mod tests {
         let cfg_projects = config_dir.join("projects");
         let extra_projects = extra.join("projects");
         // The same sid under two roots: the first root in the order
-        // wins (ctp scans roots in order and stops at the first hit).
+        // wins (the scan reads roots in order and stops at the first
+        // hit).
         let write = |projects: &Path, slug: &str, sid: &str, text: &str| {
             let path = super::projects_of(projects, slug, sid);
             std::fs::write(&path, text).expect("write the transcript");
@@ -620,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             label.prompt.as_deref(),
-            Some("port the transcript reader from transcript.mjs")
+            Some("port the transcript reader from the predecessor")
         );
 
         // A session with nothing usable: no label, never an empty one.
@@ -784,7 +788,7 @@ mod tests {
 
     #[test]
     fn a_smaller_tail_budget_excludes_what_sits_before_its_window() {
-        // ctp's `bytes` option: the window is the last N bytes. With
+        // The tail window is the last N bytes. With
         // the canary inside a big window but outside a small one, the
         // two budgets must resolve differently — the small one clips
         // the canary, the big one reads it.
@@ -859,7 +863,7 @@ mod tests {
             "a second resolve in one refresh must not re-read"
         );
 
-        // The next display tick re-reads, exactly live.mjs's
+        // The next display tick re-reads — the
         // per-refresh pass.
         labels.start_refresh();
         assert_eq!(

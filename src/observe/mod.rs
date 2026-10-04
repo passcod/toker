@@ -20,7 +20,7 @@
 //!   usage-bearing chunk, with earlier chunks as fallback.
 //! - [`anthropic`]: the Anthropic Messages sibling, [`AnthropicObserver`]
 //!   — folds `message_start`/`message_delta` usage into one set of buckets
-//!   (ctp's `foldUsage`: TTL-split reconciliation, iterations fallback),
+//!   (the TTL-split reconciliation, iterations fallback),
 //!   latches model/stop reason/speed/geo, and captures `error` events for
 //!   error rows.
 //!

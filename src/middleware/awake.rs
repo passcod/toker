@@ -1,7 +1,7 @@
-//! The idle-sleep lock — ctp's awake subsystem (plan: "Lane tracking +
-//! sleep lock"; ctp awake.mjs + inhibit.mjs + the `evaluateAwake` wiring
-//! in proxy.mjs), ported faithfully. Linux v1: ctp's `nextWake` is
-//! macOS-only (`pmset repeat` re-arming) and is deliberately NOT ported.
+//! The idle-sleep lock — the predecessor proxy's awake subsystem (plan:
+//! "Lane tracking + sleep lock"), ported faithfully. Linux v1: the
+//! predecessor's scheduled-wake re-arming was macOS-only (`pmset repeat`)
+//! and is deliberately NOT ported.
 //!
 //! Why this exists: desktop idle-suspend kills running agent sessions.
 //! While any lane is "live" — its cache would be: 5m or 1h past its last
@@ -14,26 +14,26 @@
 //!
 //! Sources, ported:
 //!
-//! - `decide_awake` — ctp `decideAwake`, awake.mjs:27-47 (pure: live
-//!   lanes + in-flight → want-to-hold; ping lanes excluded — a ping
+//! - `decide_awake` — pure: live lanes + in-flight → want-to-hold
+//!   (ping lanes excluded — a ping
 //!   opens a quota window on a timer, and its cache holding the machine
 //!   up for an hour would keep a laptop that woke only to ping awake
 //!   with nobody at it);
-//! - `inhibit_command` / `on_path` — ctp `inhibitCommand` / `onPath`,
-//!   inhibit.mjs:19-57 (the platform table; GNOME's idle suspend is
-//!   gsd-power's, and gsd-power reads the session manager's inhibitors,
+//! - `inhibit_command` / `on_path` — the platform table (GNOME's idle
+//!   suspend is gsd-power's, and gsd-power reads the session manager's
+//!   inhibitors,
 //!   so on GNOME the lock goes where gsd-power is known to look);
-//! - the detached-child pattern — ctp inhibit.mjs:93: the child watches
+//! - the detached-child pattern — the child watches
 //!   the proxy's PID (`tail --pid=OWNER -f /dev/null`) in its own
 //!   process group with null stdio, so the inhibitor lives exactly as
 //!   long as the proxy however it dies, and release can take the waiting
 //!   child down with the wrapper;
-//! - the 5-minute retry backoff — ctp `RETRY_MS`, inhibit.mjs:64:
+//! - the 5-minute retry backoff —
 //!   evaluation runs on every response, and without this a missing
 //!   session bus would spawn a process per request;
-//! - `AwakeState::evaluate` — ctp's `createInhibitor` hold/release (the
+//! - `AwakeState::evaluate` — the hold/release state machine (the
 //!   backoff, the once-per-spell complaint, the kill-on-release) plus
-//!   the proxy's flip bookkeeping (`evaluateAwake`, proxy.mjs:465-482):
+//!   the flip bookkeeping:
 //!   a row only on a held flip, because the row is what separates
 //!   "released because the sessions went quiet" from "the lock quietly
 //!   stopped working" — `want` differing from `held` is a lock that
@@ -50,25 +50,27 @@ use crate::store::Lane;
 use super::cold::ttl_of;
 
 /// How long to wait before trying again after a lock failed to take or
-/// died (ctp `RETRY_MS`, inhibit.mjs:64).
+/// died: evaluation runs on every response, and without this backoff a
+/// missing session bus would spawn a process per request.
 pub const RETRY_MS: i64 = 5 * 60_000;
 
-/// How often the lock is re-evaluated on the wall clock (ctp
-/// proxy.mjs:490: `setInterval(evaluateAwake, 60_000)`, unref'd).
+/// How often the lock is re-evaluated on the wall clock: once a minute,
+/// ticking without holding the process open.
 pub const AWAKE_TICK_MS: u64 = 60_000;
 
 /// The identity the lock shows up under in `systemd-inhibit --who=` /
-/// `gnome-session-inhibit --app-id` (ctp: `who: "claude-token-proxy"`).
+/// `gnome-session-inhibit --app-id` (the predecessor showed up under its
+/// own product name; toker signs its own).
 pub const INHIBIT_WHO: &str = "toker";
 
-/// What the lock says it is for (ctp: `why: "Claude Code sessions are
-/// live"`).
+/// What the lock says it is for (the predecessor's wording, adjusted to
+/// the sessions toker actually holds: "Claude Code sessions are live").
 pub const INHIBIT_WHY: &str = "agent sessions are live";
 
-// ── the decision (ctp decideAwake) ────────────────────────────────────
+// ── the decision ──────────────────────────────────────────────────────
 
-/// Whether the machine may idle-suspend right now (ctp `decideAwake`'s
-/// `{hold, until, reason}`). Pure; the server owns the lock itself.
+/// Whether the machine may idle-suspend right now
+/// (`{hold, until, reason}`). Pure; the server owns the lock itself.
 ///
 /// `until` is when the latest live lane's cache expires, epoch
 /// milliseconds — or `None` where the hold rests on something without an
@@ -78,16 +80,16 @@ pub struct AwakeDecision {
     /// A live lane or an in-flight request says: hold the lock.
     pub hold: bool,
     /// When the latest live lane expires; `None` for an in-flight-only
-    /// hold (ctp: null — it rests on something without an expiry) and for
+    /// hold (the row spells it `null` — it rests on something without an
+    /// expiry) and for
     /// no hold.
     pub until: Option<i64>,
-    /// The count the hold rests on, ctp's exact wording (the fixture pins
-    /// it: `"1 live lane"`, `"no live lanes"`).
+    /// The count the hold rests on, in the row's frozen wording (the
+    /// parity fixture pins it: `"1 live lane"`, `"no live lanes"`).
     pub reason: String,
 }
 
-/// Hold or release, from the lane table and the in-flight count (ctp
-/// `decideAwake`, awake.mjs:27-47).
+/// Hold or release, from the lane table and the in-flight count.
 ///
 /// "In use" is read off the lane table rather than a request clock, for
 /// the reason every other view here uses lanes: one session interleaves
@@ -111,13 +113,13 @@ pub fn decide_awake(lanes: &[Lane], in_flight: u64, now: i64) -> AwakeDecision {
         }
         let at = lane.updated_ms;
         // A future timestamp is a clock that moved, and would hold
-        // forever (ctp awake.mjs:37).
+        // forever if trusted.
         if at > now {
             continue;
         }
-        // ctp `ttlOf` (cold.mjs:44, via awake.mjs's import): anything not
-        // the 5-minute tier reads as the hour — guessing short would
-        // sleep the machine under lanes whose cache is still live.
+        // Anything not the 5-minute tier reads as the hour — guessing
+        // short would sleep the machine under lanes whose cache is
+        // still live.
         let expires = at.saturating_add(ttl_of(lane));
         if expires <= now {
             continue;
@@ -149,9 +151,9 @@ pub fn decide_awake(lanes: &[Lane], in_flight: u64, now: i64) -> AwakeDecision {
     }
 }
 
-// ── the platform command table (ctp inhibitCommand / onPath) ───────────
+// ── the platform command table ────────────────────────────────────────
 
-/// One platform's lock-holding command (ctp `inhibitCommand`'s result):
+/// One platform's lock-holding command:
 /// the inhibitor plus the PID-watching child that makes the lock die
 /// with its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,9 +162,8 @@ pub struct InhibitCommand {
     pub args: Vec<String>,
 }
 
-/// Whether `bin` is an executable on `PATH` (ctp `onPath`,
-/// inhibit.mjs:19-25): each directory checked for an executable file of
-/// that name; empty entries skipped, like ctp's `if (!dir) continue`.
+/// Whether `bin` is an executable on `PATH`: each directory checked for
+/// an executable file of that name; empty entries skipped.
 pub fn on_path(bin: &str, path: Option<&str>) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let Some(path) = path else {
@@ -175,8 +176,8 @@ pub fn on_path(bin: &str, path: Option<&str>) -> bool {
         let Ok(metadata) = std::fs::metadata(std::path::Path::new(dir).join(bin)) else {
             continue;
         };
-        // ctp checks access(X_OK); any execute bit is the same question
-        // in mode form.
+        // Any execute bit is the same question as access(X_OK), in mode
+        // form.
         if metadata.permissions().mode() & 0o111 != 0 {
             return true;
         }
@@ -185,9 +186,8 @@ pub fn on_path(bin: &str, path: Option<&str>) -> bool {
 }
 
 /// The command that holds the lock until the process `owner_pid` exits,
-/// or `None` where this platform offers none (ctp `inhibitCommand`,
-/// inhibit.mjs:31-57). Pure: `exists` answers whether a binary is
-/// available.
+/// or `None` where this platform offers none. Pure: `exists` answers
+/// whether a binary is available.
 ///
 /// Linux only in toker v1 (the darwin/`caffeinate` branch is not ported).
 /// The child waits on the process that owns it — `tail --pid=OWNER -f
@@ -215,7 +215,7 @@ pub fn inhibit_command(
     // GNOME's idle suspend is gsd-power's, and gsd-power reads the
     // session manager's inhibitors — flag 8, "suspend when idle", the
     // one the Caffeine extension takes. Whether it also honours a
-    // logind idle lock is not something ctp was able to confirm, so on
+    // logind idle lock was never confirmed, so on
     // GNOME the lock goes where gsd-power is known to look.
     // `XDG_CURRENT_DESKTOP` is a colon-separated list (a
     // "ubuntu:GNOME" style union), so membership is per component.
@@ -257,8 +257,7 @@ pub fn inhibit_command(
 }
 
 /// The lock command this host offers, probed from the real environment
-/// (what ctp's `createInhibitor` builds for itself, inhibit.mjs:70-74:
-/// the platform, the desktop, PATH, and the owning PID).
+/// (the platform, the desktop, PATH, and the owning PID).
 pub fn platform_command(who: &str, why: &str) -> Option<InhibitCommand> {
     let path = std::env::var_os("PATH").map(|p| p.to_string_lossy().into_owned());
     inhibit_command(
@@ -271,37 +270,36 @@ pub fn platform_command(who: &str, why: &str) -> Option<InhibitCommand> {
     )
 }
 
-// ── taking the lock (ctp createInhibitor) ─────────────────────────────
+// ── taking the lock ───────────────────────────────────────────────────
 
 /// A taken lock, as the state machine sees it: a trait so tests inject
 /// doubles; the real implementation is the detached inhibitor child.
 pub trait InhibitLock: Send {
-    /// Release the lock (ctp `release`, inhibit.mjs:106-113): SIGTERM the
+    /// Release the lock: SIGTERM the
     /// child's **whole process group** so the waiting `tail` goes down
     /// with the wrapper — gnome-session-inhibit kills its child on
     /// SIGTERM, and nothing promises the others do, so an orphaned tail
     /// per release would accumulate for as long as the proxy runs.
     fn kill(&mut self);
 
-    /// Whether the child exited since the last look (ctp's `exit`
-    /// listener, inhibit.mjs:99-100): a lock that ended on its own — the
+    /// Whether the child exited since the last look: a lock that ended
+    /// on its own — the
     /// session bus went away, or someone killed it — is gone. A
     /// deliberate release clears the child first, so it never reads as
     /// an exit.
     fn exited(&mut self) -> bool;
 }
 
-/// How the lock is taken (ctp's `spawn`, inhibit.mjs:93: detached, stdio
-/// ignored). The seam tests inject a fake through; the real one spawns a
-/// process.
+/// How the lock is taken: detached, stdio ignored. The seam tests inject
+/// a fake through; the real one spawns a process.
 pub trait LockSpawner: Send {
-    /// Spawn the inhibitor. `Err` carries the failure's message, ctp's
-    /// `sleep lock unavailable: ${err.message}`.
+    /// Spawn the inhibitor. `Err` carries the failure's message, prefixed
+    /// `sleep lock unavailable:`.
     fn spawn(&mut self, command: &InhibitCommand) -> Result<Box<dyn InhibitLock>, String>;
 }
 
-/// The real spawner: the inhibitor in **its own process group** (ctp
-/// `detached: true`) with all stdio nulled (ctp `stdio: "ignore"`) — its
+/// The real spawner: the inhibitor in **its own process group** with all
+/// stdio nulled — its
 /// own group so release can take the waiting child down with the wrapper,
 /// null stdio so a chatty failure cannot write to the proxy's terminal
 /// forever, and no shell anywhere in between.
@@ -352,10 +350,10 @@ impl InhibitLock for ProcessLock {
     }
 }
 
-// ── the state machine (ctp createInhibitor + evaluateAwake) ──────────
+// ── the state machine ─────────────────────────────────────────────────
 
-/// One held/want flip worth a row — ctp's awake row shape
-/// `{held, want, until, reason}` (proxy.mjs:472-479), carried to the
+/// One held/want flip worth a row — the awake row shape
+/// `{held, want, until, reason}`, carried to the
 /// ledger by the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwakeTransition {
@@ -367,33 +365,31 @@ pub struct AwakeTransition {
     /// When the hold expires, epoch ms; `None` for an in-flight-only hold
     /// or no hold.
     pub until: Option<i64>,
-    /// The count the hold rests on, ctp's exact wording.
+    /// The count the hold rests on, in the row's frozen wording.
     pub reason: String,
 }
 
 /// The lock's state: the taken child, the retry backoff, and the
-/// last-logged held state (ctp `createInhibitor`'s closure plus the
-/// proxy's `awakeHeld`). Never panics its way out of a request: a failure
+/// last-logged held state. Never panics its way out of a request: a failure
 /// is logged once per spell and the lock reads as not held.
 pub struct AwakeState {
     /// The spawn/kill seam. The real one spawns the detached inhibitor;
     /// tests inject fakes that take no real lock.
     spawner: Box<dyn LockSpawner>,
-    /// This platform's lock command, or `None` where none exists (ctp
-    /// `command`: `available` is `command !== null`).
+    /// This platform's lock command, or `None` where none exists.
     command: Option<InhibitCommand>,
-    /// The held lock, if any (ctp `child`).
+    /// The held lock, if any.
     child: Option<Box<dyn InhibitLock>>,
     /// When the last spawn attempt failed or the last child died on its
-    /// own (ctp `failedAt`) — the retry backoff's clock.
+    /// own — the retry backoff's clock.
     failed_at: Option<i64>,
-    /// Whether the current failure spell has already been logged (ctp
-    /// `complained`: logged once per spell, re-armed by a release that
-    /// lasted until we let go).
+    /// Whether the current failure spell has already been logged —
+    /// logged once per spell, re-armed by a release that
+    /// lasted until we let go.
     complained: bool,
-    /// The held state as last written to the ledger (ctp `awakeHeld`,
+    /// The held state as last written to the ledger,
     /// starting false: the first evaluate of a live proxy flips it and
-    /// writes the startup row).
+    /// writes the startup row.
     logged_held: bool,
     /// The latest decision's want (for inspection; the transitions carry
     /// it).
@@ -402,7 +398,7 @@ pub struct AwakeState {
 
 impl AwakeState {
     /// The lock over `command`, taken through `spawner`. `command: None`
-    /// is ctp's unavailable platform: `hold` is a permanent no-op and
+    /// is the unavailable platform: `hold` is a permanent no-op and
     /// the caller warns once at startup.
     pub fn new(command: Option<InhibitCommand>, spawner: Box<dyn LockSpawner>) -> AwakeState {
         AwakeState {
@@ -416,22 +412,22 @@ impl AwakeState {
         }
     }
 
-    /// Whether the lock is held right now (ctp `held`: `child !== null`).
+    /// Whether the lock is held right now (the child exists).
     pub fn held(&self) -> bool {
         self.child.is_some()
     }
 
-    /// Whether this platform offers a lock at all (ctp `available`).
+    /// Whether this platform offers a lock at all.
     pub fn available(&self) -> bool {
         self.command.is_some()
     }
 
     /// Take or drop the lock to match `decision`, and report the
-    /// transition that needs a row — only on a held flip (ctp
-    /// `evaluateAwake`, proxy.mjs:465-482). `want` differing from `held`
+    /// transition that needs a row — only on a held flip.
+    /// `want` differing from `held`
     /// is itself row-worthy: it is a lock that could not be taken.
     pub fn evaluate(&mut self, decision: &AwakeDecision, now: i64) -> Option<AwakeTransition> {
-        // ctp's exit listener, polled at evaluation time: a child that
+        // The exit check, polled at evaluation time: a child that
         // ended on its own while still wanted means the lock is gone.
         // Our own release clears `child` first, so it never lands here.
         if let Some(child) = self.child.as_mut()
@@ -439,8 +435,9 @@ impl AwakeState {
         {
             self.child = None;
             self.failed_at = Some(now);
-            // ctp names the signal or exit code; the trait does not carry
-            // it, so the spell reads the same message every time.
+            // The predecessor named the signal or exit code; the trait
+            // does not carry it, so the spell reads the same message
+            // every time.
             self.complain("sleep lock ended on its own");
         }
 
@@ -464,7 +461,7 @@ impl AwakeState {
         })
     }
 
-    /// Take the lock (ctp `hold`, inhibit.mjs:85-105): a no-op while
+    /// Take the lock: a no-op while
     /// held or unavailable, and inside the retry backoff after a
     /// failure — evaluation runs on every response, and without the
     /// backoff a missing session bus would spawn a process per request.
@@ -491,7 +488,7 @@ impl AwakeState {
         }
     }
 
-    /// Release the lock (ctp `release`, inhibit.mjs:106-113). A lock that
+    /// Release the lock. A lock that
     /// lasted until we let go re-arms the once-per-spell complaint, so
     /// the next failure is news again.
     fn release(&mut self) {
@@ -501,7 +498,7 @@ impl AwakeState {
         }
     }
 
-    /// Log a failure once per spell (ctp `failed` + `complained`).
+    /// Log a failure once per spell.
     fn complain(&mut self, message: &str) {
         if self.complained {
             return;
@@ -526,7 +523,7 @@ mod tests {
     const FIVE_MINUTES: i64 = 300_000;
     const HOUR: i64 = 3_600_000;
 
-    /// A lane for the decision, ctp's shape: `at`, a TTL tier, a ping flag.
+    /// A lane for the decision: an `at`, a TTL tier, a ping flag.
     fn lane(at_ms: i64, ttl: Option<i64>, ping: bool) -> Lane {
         Lane {
             key: format!("ses-{at_ms}|t"),
@@ -559,7 +556,7 @@ mod tests {
         }
     }
 
-    // ── decide_awake (ctp decideAwake) ─────────────────────────────
+    // ── decide_awake ──────────────────────────────────────────────
 
     #[test]
     fn a_lane_is_live_for_its_ttl_tier_past_its_last_response() {
@@ -573,7 +570,7 @@ mod tests {
                 reason: "1 live lane".to_owned(),
             }
         );
-        // The boundary: expires == now is gone (ctp `expires <= now`).
+        // The boundary: at expires == now the lane is already gone.
         let expired_5m = lane(NOW - FIVE_MINUTES, Some(Ttl::FiveMinutes.as_ms()), false);
         assert!(!decide_awake(&[expired_5m], 0, NOW).hold);
         // One tick before the boundary: still live.
@@ -584,9 +581,9 @@ mod tests {
         );
         assert!(decide_awake(&[almost], 0, NOW).hold);
 
-        // 1-hour tier, and the unrecorded tier reads as the hour (ctp
-        // ttlOf: anything not "5m" is the long one — guessing short would
-        // sleep the machine under lanes whose cache is still live).
+        // 1-hour tier, and the unrecorded tier reads as the hour —
+        // anything not "5m" is the long one; guessing short would
+        // sleep the machine under lanes whose cache is still live.
         for ttl in [Some(Ttl::Hour.as_ms()), None, Some(123_456)] {
             let lane = lane(NOW - FIVE_MINUTES - 1_000, ttl, false);
             assert_eq!(
@@ -611,7 +608,7 @@ mod tests {
                 until: None,
                 reason: "no live lanes".to_owned(),
             },
-            "ctp awake.mjs:37 — a future `at` would hold forever"
+            "a future `at` would hold forever if trusted"
         );
     }
 
@@ -636,7 +633,7 @@ mod tests {
 
     #[test]
     fn anything_in_flight_holds_even_with_no_live_lanes() {
-        // ctp awake.mjs:44: in-flight is checked first, and its `until`
+        // In-flight is checked first, and its `until`
         // is null — the hold rests on something without an expiry, even
         // when live lanes exist alongside.
         let live = lane(NOW - 1_000, Some(Ttl::Hour.as_ms()), false);
@@ -707,7 +704,7 @@ mod tests {
                 "-f".to_owned(),
                 "/dev/null".to_owned(),
             ],
-            "the inhibitor plus the PID-watching child, ctp inhibit.mjs:45-48"
+            "the inhibitor plus the PID-watching child"
         );
     }
 
@@ -757,7 +754,7 @@ mod tests {
                 "-f".to_owned(),
                 "/dev/null".to_owned(),
             ],
-            "idle-only, block mode, ctp inhibit.mjs:50-55"
+            "idle-only, block mode"
         );
 
         // GNOME without the binary falls through to the same command.
@@ -776,7 +773,7 @@ mod tests {
     #[test]
     fn no_tail_no_lock_and_no_darwin_in_v1() {
         // The PID-watching child is the mechanism; without tail there is
-        // no lock to take (ctp inhibit.mjs:35).
+        // no lock to take.
         assert_eq!(
             inhibit_command(
                 "linux",
@@ -792,7 +789,7 @@ mod tests {
             inhibit_command("linux", None, nothing_exists, "w", "y", 1),
             None
         );
-        // ctp's darwin/caffeinate branch is macOS-only and not ported.
+        // The darwin/caffeinate branch is macOS-only and not ported.
         assert_eq!(
             inhibit_command("darwin", Some("GNOME"), everything_exists, "w", "y", 1),
             None,
@@ -800,7 +797,7 @@ mod tests {
         );
     }
 
-    // ── on_path (ctp onPath) ──────────────────────────────────────
+    // ── on_path ───────────────────────────────────────────────────
 
     #[test]
     fn path_probe_finds_executables_and_skips_the_rest() {
@@ -815,11 +812,10 @@ mod tests {
 
         let path = dir.to_string_lossy().into_owned();
         assert!(on_path("fake-inhibitor", Some(&path)));
-        // An existing but non-executable file is not on PATH (ctp checks
-        // X_OK).
+        // An existing but non-executable file is not on PATH.
         assert!(!on_path("plain-file", Some(&path)));
         assert!(!on_path("missing", Some(&path)));
-        // Empty entries are skipped, ctp `if (!dir) continue`.
+        // Empty entries are skipped.
         let sparse = format!(":{path}::");
         assert!(on_path("fake-inhibitor", Some(&sparse)));
         assert!(!on_path("fake-inhibitor", None), "no PATH is no lock");
@@ -848,7 +844,7 @@ mod tests {
         }
     }
 
-    // ── the state machine (ctp createInhibitor + evaluateAwake) ───
+    // ── the state machine ────────────────────────────────────────
 
     /// A spawner whose results the test scripts, with its counters
     /// shared so the test keeps handles while the state owns the box.
@@ -867,7 +863,7 @@ mod tests {
         }
 
         /// Kill the current fake child where it stands: the next
-        /// `exited` poll sees it, like ctp's exit listener firing.
+        /// `exited` poll sees it, like the real child ending on its own.
         fn die(&self) {
             self.dead.store(true, Ordering::SeqCst);
         }
@@ -925,7 +921,7 @@ mod tests {
     fn a_row_only_on_a_held_flip_and_no_double_spawn_while_held() {
         let fake = FakeSpawner::default();
         let mut state = AwakeState::new(Some(command()), Box::new(fake.clone()));
-        // Nothing wanted, nothing held: no row (ctp's awakeHeld starts
+        // Nothing wanted, nothing held: no row (the logged state starts
         // false and stays there).
         assert_eq!(state.evaluate(&release(), NOW), None);
         assert_eq!(state.evaluate(&release(), NOW + 1), None);
@@ -946,8 +942,7 @@ mod tests {
         );
         assert_eq!(fake.attempts(), 1, "the hold spawns exactly one child");
 
-        // Still wanted: no second spawn (ctp `if (child || !command)
-        // return`), no second row.
+        // Still wanted: no second spawn while held, no second row.
         assert_eq!(
             state.evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 30_000),
             None
@@ -974,7 +969,8 @@ mod tests {
         let mut state = AwakeState::new(Some(command()), Box::new(fake.clone()));
 
         // The spawn fails: held never flipped off its initial false, so
-        // no row — ctp logs the flip of the ACTUAL lock, and an untaken
+        // no row — the ledger records the flip of the ACTUAL lock, and
+        // an untaken
         // lock reads as not held. (A `want` ≠ `held` row exists only
         // where a previously-held lock was lost and could not be retaken
         // — the child-death test covers that one.)
@@ -987,7 +983,7 @@ mod tests {
         assert_eq!(state.failed_at, Some(NOW));
 
         // Evaluation runs on every response; the backoff keeps a missing
-        // session bus from becoming a process per request (ctp RETRY_MS).
+        // session bus from becoming a process per request.
         assert_eq!(
             state.evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 60_000),
             None,
@@ -1025,7 +1021,7 @@ mod tests {
         assert!(row.held);
 
         // The session bus goes away; the child exits. The next
-        // evaluation sees it (ctp's exit listener, polled here) and the
+        // evaluation sees it (the exit check, polled here) and the
         // lock reads as lost — with the same five-minute backoff as a
         // failed spawn, and the dead child is NOT killed (it is already
         // gone; release was never called).
@@ -1073,7 +1069,7 @@ mod tests {
         assert!(state.complained, "still the same spell");
 
         // A lock that lasts until we let go re-arms the complaint, so the
-        // next failure is news again (ctp: release sets complained=false).
+        // next failure is news again (release clears the latch).
         let row = state
             .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 2 * RETRY_MS)
             .expect("takes the lock");
@@ -1094,7 +1090,8 @@ mod tests {
         let fake = FakeSpawner::default();
         let mut state = AwakeState::new(None, Box::new(fake.clone()));
         assert!(!state.available());
-        // ctp: `if (child || !command) return` — wanted forever, the lock
+        // With no command there is nothing to spawn — wanted forever, the
+        // lock
         // never exists, and held never flips off its initial false, so no
         // row ever lands.
         for offset in [0, RETRY_MS, 10 * RETRY_MS] {

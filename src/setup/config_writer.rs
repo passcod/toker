@@ -91,7 +91,7 @@ mod tests {
     /// verbatim (comments included — they are the documented trade).
     const REAL_MACHINE_TOML: &str = r#"# toker — local config (this machine). Claude drives the codex sub
 # through toker's translation; opencode drives openrouter unchanged.
-# The family map is ctp's own: claude's model names → codex slugs.
+# The family map (inherited from the predecessor): claude's model names → codex slugs.
 default_backend_anthropic = "codex_sub"
 
 [providers.codex_sub.model_map]

@@ -82,8 +82,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     };
 
-    // A request being served holds the machine awake (ctp
-    // proxy.mjs:1126-1132): a lane's `at` moves only when a response
+    // A request being served holds the machine awake: a lane's
+    // `updated_ms` moves only when a response
     // finishes, and one long turn can outlast a 5-minute tier. The
     // openai path has no ping lanes — the window pinger tags anthropic
     // lanes — so every chat completion counts. The guard's Drop is the
@@ -189,7 +189,8 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
 /// endpoint mapping and the credential rules; `session_header_names` is
 /// the strip list for [`upstream_request_headers`] — the openai path
 /// passes the configured attribution headers, the anthropic path passes
-/// an empty slice (ctp forwards claude's session header verbatim).
+/// an empty slice (the predecessor forwarded claude's session header
+/// verbatim).
 pub(crate) async fn send_upstream(
     server: &Server,
     provider: &dyn Provider,
@@ -225,8 +226,9 @@ pub(crate) async fn send_upstream(
 /// compression / status / content-type. `record` is the chat-path
 /// completion context; `None` means pure transparent forwarding.
 /// `in_flight` is the request's sleep-lock hold: it rides the SSE
-/// stream (dropping when axum drops the body — ctp's `close`, "however
-/// the exchange ends") and drops at the end of this function on every
+/// stream (dropping when axum drops the body — the stream-close
+/// semantics, "however the exchange ends") and drops at the end of this
+/// function on every
 /// other branch, after whatever row was owed has landed.
 pub(crate) async fn forward_upstream(
     upstream: reqwest::Response,
@@ -333,7 +335,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// configured session-attribution header names.
 ///
 /// The session-name strip is the caller's choice: the openai path strips
-/// them all, while the anthropic path passes `&[]` — ctp parity, since
+/// them all, while the anthropic path passes `&[]` — row parity, since
 /// claude's `x-claude-code-session-id` is forwarded verbatim by the proxy
 /// toker replaces and the upstream already receives it in production.
 /// `x-toker-*` is stripped unconditionally either way: those headers are
@@ -469,8 +471,8 @@ struct ObservedStream {
     ctx: Option<RecordCtx>,
     /// The request's sleep-lock hold, riding the stream: it drops when
     /// axum drops the body — natural completion or client hangup — so the
-    /// in-flight count never leaks on a streamed response (ctp's
-    /// `res.on("close")`).
+    /// in-flight count never leaks on a streamed response (the
+    /// body-close event).
     in_flight: Option<InFlightGuard>,
     status: u16,
 }
@@ -516,8 +518,9 @@ impl Stream for ObservedStream {
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
-                // The exchange is over however it ended (ctp: `close`
-                // fires on failure too): the in-flight hold goes with it.
+                // The exchange is over however it ended (the close
+                // event fires on failure too): the in-flight hold goes
+                // with it.
                 drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
@@ -537,7 +540,7 @@ impl Stream for ObservedStream {
                     record_measurement(&ctx, capture.as_ref(), this.status);
                 }
                 // The response is done, so the in-flight hold ends now —
-                // ctp's `res.on("close")` fires at stream end, and a
+                // the body-close event fires at stream end, and a
                 // hung-up stream ends it in Drop instead.
                 drop(this.in_flight.take());
                 std::task::Poll::Ready(None)

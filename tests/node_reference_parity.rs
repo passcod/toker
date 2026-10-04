@@ -1,6 +1,6 @@
-//! The vendored ctp parity contract, dispatched: each case in
-//! `tests/fixtures/ctp/node-reference-v1.json` (a verbatim copy of
-//! claude-token-proxy's fixture) names one pure decision interface and
+//! The vendored parity contract, dispatched: each case in
+//! `tests/fixtures/ctp/node-reference-v1.json` (a verbatim copy of the
+//! predecessor proxy's fixture) names one pure decision interface and
 //! the exact normalised result. This harness drives the **quota gate's**
 //! operations (`quota-decision`, `quota-release`), the **cold gate's**
 //! (`cold-decision`, `compaction-decision`), the **model map's**
@@ -74,7 +74,8 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
 
         match operation {
             // decideCold(): notice or forward. The fixture's `now` is
-            // epoch milliseconds; the lane carries ctp's `at`/`prompt`/
+            // epoch milliseconds; the lane carries the fixture's
+            // `at`/`prompt`/
             // `ttl` shape, remapped onto the store's lane row. No
             // outlook is offered (the fixture pins the cheap phase's
             // verdict, outlook null).
@@ -156,8 +157,8 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
             // retargetCompaction(), over the fixture's synthetic body (a
             // model, one cache_control breakpoint on a system block, one
             // user message): rewrite or decline, with the effective model
-            // and the strip count — exactly the fields node-reference.mjs
-            // builds its oracle from.
+            // and the strip count — exactly the fields the fixture's
+            // oracle builds on.
             "compaction-decision" => {
                 let model = input
                     .get("model")
@@ -234,7 +235,8 @@ fn quota_gate_cases_pass_against_the_vendored_contract() {
 
         match operation {
             // decide(): block or forward, and which meter / reset. The
-            // fixture's `now` is epoch milliseconds (ctp's Date.now());
+            // fixture's `now` is epoch milliseconds (a `Date.now()`-style
+            // instant);
             // meter resets are epoch seconds — the Rust port keeps both
             // units. Read per-arm: other operations carry other inputs.
             "quota-decision" => {
@@ -344,9 +346,10 @@ fn awake_cases_pass_against_the_vendored_contract() {
         match operation {
             // decideAwake(): hold or release, off the lane table. The
             // fixture's `now` is epoch milliseconds and its lanes carry
-            // ctp's `at`/`prompt`/`ttl`/`ping` shape, remapped onto the
-            // store's lane row (`inFlight` defaults to 0, ctp's own
-            // default).
+            // the fixture's `at`/`prompt`/`ttl`/`ping` shape, remapped
+            // onto the
+            // store's lane row (`inFlight` defaults to 0, the fixture's
+            // own default).
             "awake-decision" => {
                 let now_ms = input.get("now").and_then(Value::as_i64).expect("case now");
                 let in_flight = input.get("inFlight").and_then(Value::as_u64).unwrap_or(0);
@@ -365,7 +368,7 @@ fn awake_cases_pass_against_the_vendored_contract() {
                                     .and_then(Value::as_i64)
                                     .expect("lane at"),
                                 prompt_tokens: lane.get("prompt").and_then(Value::as_i64),
-                                // ctp `ttlOf`: only the exact "5m" is the
+                                // TTL: only the exact "5m" is the
                                 // short tier; everything else (including
                                 // "1h" here) reads as the hour.
                                 ttl: match lane.get("ttl").and_then(Value::as_str) {
@@ -390,7 +393,7 @@ fn awake_cases_pass_against_the_vendored_contract() {
                 assert_eq!(
                     decision.until,
                     expected.get("until").and_then(Value::as_i64),
-                    "case {id}: until (epoch ms, ctp's own unit for it)"
+                    "case {id}: until (epoch ms, the fixture's own unit for it)"
                 );
                 assert_eq!(
                     decision.reason,
@@ -435,8 +438,9 @@ fn model_map_cases_pass_against_the_vendored_contract() {
             // routeIdentity(): the routing identity contract — the model
             // the client asked for, the model the map sends upstream, and
             // the model that served stay three distinct things. The
-            // fixture's map is stringified and re-parsed exactly as
-            // node-reference.mjs does (`JSON.stringify(input.modelMap)`),
+            // fixture's map is stringified and re-parsed
+            // (a `JSON.stringify` round-trip, as the fixture's own oracle
+            // ran it),
             // and the synthetic body carries only a model — no prompt,
             // completion, system, or tool content enters the fixture.
             "route-identity" => {

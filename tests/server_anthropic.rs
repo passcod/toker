@@ -596,7 +596,7 @@ async fn sse_messages_pass_through_byte_identically_and_ledger() {
             .get("x-claude-code-session-id")
             .and_then(|v| v.to_str().ok()),
         Some("ccses-42"),
-        "ctp parity: claude's session header is forwarded, not swallowed by the proxy"
+        "parity with the predecessor: claude's session header is forwarded, not swallowed by the proxy"
     );
     assert!(
         !captured[0].headers.contains_key("x-api-key"),
@@ -639,7 +639,7 @@ async fn sse_messages_pass_through_byte_identically_and_ledger() {
         Some(r#"["context-1m-2025-08-07","fast-mode-2025-09-preview"]"#),
         "the request's anthropic-beta flags, as a JSON array"
     );
-    // The response's own meter snapshot, in the stable ctp shape.
+    // The response's own meter snapshot, in the stable wire shape.
     assert_eq!(row.rate_limits, Some(expected_rate_limits("0.4127")));
     // Plan-equivalent: list-price "what the plan is worth", never billed.
     assert_eq!(row.cost_kind, Some(CostKind::PlanEquivalent));
@@ -942,7 +942,8 @@ async fn non_2xx_forwards_the_body_and_records_a_lean_error_row_that_still_feeds
     assert_eq!(row.effective_model.as_deref(), Some("err-401"));
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
     // Lean, like the openai error rows: never priced, no usage, no
-    // rate_limits (the deliberate divergence from ctp, documented in the
+    // rate_limits (the deliberate divergence from the predecessor,
+    // documented in the
     // record module).
     assert_eq!(row.cost_usd, None);
     assert_eq!(row.cost_kind, None);
@@ -952,7 +953,7 @@ async fn non_2xx_forwards_the_body_and_records_a_lean_error_row_that_still_feeds
     assert_eq!(row.usage_raw, None);
 
     // …but the meters_state table took the response's snapshot anyway
-    // (ctp rule: feed from every response, not just accounted ones).
+    // (feed from every response, not just accounted ones).
     let meters = store
         .load_meters("anthropic_sub")
         .expect("meters")
@@ -1048,7 +1049,7 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
 
     // Nothing recorded on any batch path.
     assert_no_rows(&store).await;
-    // The meters fed from the background poll — ctp's "not just accounted
+    // The meters fed from the background poll — the "not just accounted
     // ones" rule.
     let meters = store
         .load_meters("anthropic_sub")
@@ -1121,7 +1122,7 @@ async fn unknown_models_price_to_null_with_no_cost_kind() {
     assert_eq!(row.input, Some(9));
     assert_eq!(
         row.cost_usd, None,
-        "…cost left null for an unknown model — never a guess (ctp's one-time warning fired)"
+        "…cost left null for an unknown model — never a guess (the one-time warning fired)"
     );
     assert_eq!(row.cost_kind, None);
 }
@@ -1142,7 +1143,7 @@ async fn row_model_is_normalised_and_raw_model_is_verbatim() {
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
-    // ctp: `model` is the normalised identity, `raw_model` the wire form.
+    // `model` is the normalised identity, `raw_model` the wire form.
     assert_eq!(row.model.as_deref(), Some("claude-haiku-4-5"));
     assert_eq!(row.raw_model.as_deref(), Some("claude-haiku-4-5-20251001"));
     // …and the snapshot suffix folded to a priced identity.
@@ -1252,7 +1253,7 @@ fn contains_marker(bytes: &[u8]) -> bool {
 
 /// Poison the meters_state snapshot: a 5-hour window at `util5h` with its
 /// reset `offset_secs` from now, a healthy 7-day one. The snapshot is the
-/// stable ctp shape `parse_rate_limits` stores, so the gate reads it
+/// stable wire shape `parse_rate_limits` stores, so the gate reads it
 /// exactly as it reads a real one. Returns the 5h reset and the snapshot.
 fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
     let now_ms = jiff::Timestamp::now().as_millisecond();
@@ -1316,7 +1317,7 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     assert_eq!(
         bytes.as_ref(),
         expected.as_slice(),
-        "the synthetic SSE turn, ctp's exact event shape"
+        "the synthetic SSE turn, the exact event shape"
     );
 
     // Upstream NEVER hit: the gate is the only thing that may stop a
@@ -1335,7 +1336,7 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
     assert_eq!(row.gate_on, Some(true));
     assert!(row.duration_ms.is_some());
-    // ctp parity: the stale snapshot the block was decided on.
+    // Parity: the stale snapshot the block was decided on.
     assert_eq!(row.rate_limits, Some(snapshot));
     assert_eq!(
         row.extra.as_ref().and_then(|extra| extra.get("meter")),
@@ -1354,7 +1355,8 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
             .is_some_and(|extra| extra.get("context_tokens") == Some(&Value::Null)),
         "not recorded yet — never printed as a zero"
     );
-    // A proxy-written row: no usage, no model, never priced (ctp's blocked
+    // A proxy-written row: no usage, no model, never priced (the
+    // predecessor's blocked
     // row carries no model either).
     assert_eq!(row.model, None);
     assert_eq!(row.requested_model, None);
@@ -1511,7 +1513,7 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
     assert_eq!(
         released.rate_limits,
         Some(snapshot.clone()),
-        "ctp parity: the stale snapshot the grant rested on"
+        "parity: the stale snapshot the grant rested on"
     );
     assert_eq!(
         released
@@ -1531,7 +1533,7 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
     );
     assert_eq!(
         released.duration_ms, None,
-        "ctp omits duration on released rows"
+        "no duration on released rows — ported behaviour"
     );
     assert!(
         rows.iter().any(|row| row.kind.is_none()),
@@ -1564,8 +1566,8 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
 #[tokio::test]
 async fn marker_stripping_is_unconditional_and_a_healthy_release_still_records() {
     // No poisoning at all: meters_state absent (cold start), unknown
-    // meters forward — and ctp still grants and records the release
-    // (proxy.mjs:1136 fires on marker + session, not on exhaustion), with
+    // meters forward — and the release is still granted and recorded
+    // (the release fires on marker + session, not on exhaustion), with
     // null reset values, because a release that left no trace could never
     // explain later spending.
     let (mock, upstream) = spawn_mock().await;
@@ -1590,7 +1592,7 @@ async fn marker_stripping_is_unconditional_and_a_healthy_release_still_records()
     let released = rows
         .iter()
         .find(|row| row.kind == Some(RowKind::Released))
-        .expect("ctp records the release even when nothing is exhausted");
+        .expect("the release is recorded even when nothing is exhausted");
     assert_eq!(
         released
             .extra
@@ -1622,8 +1624,9 @@ async fn marker_stripping_is_unconditional_and_a_healthy_release_still_records()
 
 #[tokio::test]
 async fn a_disabled_gate_forwards_but_the_strip_stays_on() {
-    // The toggle arms the gate and the release recording (ctp's LIMIT_ON,
-    // proxy.mjs:1136/1195) — but never the strip: the marker rule is a
+    // The toggle arms the gate and the release recording
+    // (gate-on plus the release/gate checks) — but never the strip: the
+    // marker rule is a
     // frozen public API, and gating it on the flag would change the cached
     // prefix of every conversation carrying a marker.
     let (mock, upstream) = spawn_mock().await;
@@ -1643,8 +1646,8 @@ async fn a_disabled_gate_forwards_but_the_strip_stays_on() {
     assert_eq!(response.status(), StatusCode::OK, "the gate is off");
     assert_eq!(mock.captured().len(), 1);
 
-    // …and a marker run strips but records no released row (ctp gates the
-    // release on LIMIT_ON too).
+    // …and a marker run strips but records no released row (the release
+    // is gated on the gate toggle too).
     let body = serde_json::to_vec(&json!({
         "model": "claude-opus-5",
         "messages": [{"role": "user", "content": "$#$BURN$#$ go on"}],
@@ -1721,7 +1724,7 @@ async fn count_tokens_and_the_api_backend_never_gate() {
 
 #[tokio::test]
 async fn an_unparseable_body_on_the_gated_path_still_gates() {
-    // ctp decides on `gated` alone (proxy.mjs:1195), not on the body's
+    // The decision is on `gated` alone, not on the body's
     // parseability — a broken client must not be able to duck under a
     // spent quota. `clientWants` reads model/stream independently and
     // falls back to null/false on a JSON failure, so the answer is the
@@ -1941,7 +1944,7 @@ async fn ping_tagged_requests_record_the_lane_but_flag_it() {
     assert_eq!(
         rows[0].ping,
         Some(true),
-        "ctp parity: only a ping request says so"
+        "parity: only a ping request says so"
     );
     let lane = the_lane(wait_for_lanes(&store, 1).await);
     assert_eq!(lane.ping, Some(true), "recorded, so restarts remember it");
@@ -1985,8 +1988,9 @@ async fn lanes_reseed_on_restart_from_the_requests_table() {
     let reopened = Store::open(&config.db_path).expect("reopen store");
     assert_eq!(reopened.load_lanes().expect("lanes").len(), 1);
 
-    // Lose the table entirely (the state ctp's restart-before-flush could
-    // lose) — a restart must rebuild it from the ledger, exactly the
+    // Lose the table entirely (the state a restart-before-flush could
+    // lose in the predecessor) — a restart must rebuild it from the
+    // ledger, exactly the
     // sessions that went quiet before it.
     {
         let conn = rusqlite::Connection::open(&config.db_path).expect("wipe connection");
@@ -1998,7 +2002,7 @@ async fn lanes_reseed_on_restart_from_the_requests_table() {
     );
 
     // Restart: a new Server over the same database reseeds from the
-    // requests table (ctp lanesFromRows), last-wins by ts.
+    // requests table, last-wins by ts.
     let (_addr2, store2) = spawn_toker(config).await;
     let lanes = store2.load_lanes().expect("lanes");
     assert_eq!(lanes.len(), 1, "the lane is rebuilt, not invented");
@@ -2125,11 +2129,11 @@ async fn models_merge_endpoint_merges_served_models_and_moves_the_election() {
 }
 
 #[tokio::test]
-async fn models_merge_endpoint_gates_like_ctp_and_validates_the_body() {
+async fn models_merge_endpoint_gates_and_validates_the_body() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
-    // ctp controlMerge proxy.mjs:1076-1079: a wrong verb, method, or
+    // Control-merge gating: a wrong verb, method, or
     // content type is 403 "not a control request" — the two halves (custom
     // header + JSON content type) are what keep a web page out.
     for headers in [
@@ -2149,7 +2153,7 @@ async fn models_merge_endpoint_gates_like_ctp_and_validates_the_body() {
         );
     }
 
-    // Right gate, unparseable store: ctp's 400.
+    // Right gate, unparseable store: the 400.
     let response = client()
         .post(toker_url(addr, "/_toker/models/merge"))
         .header("x-toker-control", "models-merge")
@@ -2163,7 +2167,7 @@ async fn models_merge_endpoint_gates_like_ctp_and_validates_the_body() {
     assert_eq!(body["error"], json!("unparseable store"));
 
     // Parseable but not a valid entry (no days array): the same 400 —
-    // ctp pruneSeen drops what does not validate rather than guessing.
+    // The merge drops what does not validate rather than guessing.
     for body in [
         json!({"days": []}),
         json!({"model": "claude-opus-5", "days": "2026-10-01"}),

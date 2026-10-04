@@ -139,7 +139,8 @@ impl Request {
     }
 }
 
-/// `sha256(data)`, truncated to its first 12 hex chars — ctp's `shortHash`.
+/// `sha256(data)`, truncated to its first 12 hex chars — the row digest
+/// shape the ledger has always used.
 /// Digests and lengths only, never content (invariant 1).
 pub(crate) fn short_hash(data: &[u8]) -> String {
     let digest = Sha256::digest(data);

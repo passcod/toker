@@ -204,7 +204,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
                 .parse()
                 .expect("codex refresh url"),
         },
-        // ctp's defaults: the force rewrite ON, the cold gate ON (a
+        // The measured defaults: the force rewrite ON, the cold gate ON (a
         // poisoned prompt below the 175k bar keeps its notice out of the
         // way, isolating this unit's rewrite).
         gates: GatesConfig::default(),
@@ -270,7 +270,7 @@ async fn wait_for_rows(store: &Store, count: usize) -> Vec<RequestRow> {
 // The fixtures: a seeded store, a poisoned lane, an asked-for body
 // ---------------------------------------------------------------------------
 
-/// Nine days of history (ctp test/models-force.mjs's `SEEN`): comfortably
+/// Nine days of history: comfortably
 /// above the election bar (needed = 4.5).
 const D: [&str; 9] = [
     "2026-09-01",

@@ -222,8 +222,8 @@ impl Store {
 
     /// Age and cap the lanes table (see `state::prune_lanes`): future-dated
     /// rows, rows older than `max_age_ms`, and everything beyond the
-    /// newest `max_lanes` go. The caller owns the cadence — ctp prunes on
-    /// its 30-second flush, never per request.
+    /// newest `max_lanes` go. The caller owns the cadence — the prune
+    /// runs on the 30-second flush, never per request.
     pub fn prune_lanes(&self, now_ms: i64, max_lanes: usize, max_age_ms: i64) -> Result<u64> {
         state::prune_lanes(&*self.conn()?, now_ms, max_lanes, max_age_ms)
     }
@@ -949,7 +949,8 @@ mod tests {
         // blocked row. The proxy-written kinds must never reach the
         // walk — a notice row has no system hash, and read as a lane
         // predecessor it attributes the next rebuild to a changed
-        // system prompt (live.mjs:212-215).
+        // system prompt (a proxy-written row is not evidence about any
+        // prompt).
         for ts in [100, 300, 200] {
             store
                 .record_request(&rebuild_row(ts, "ses-a"))
@@ -1661,7 +1662,7 @@ mod tests {
         store
             .upsert_lane(&lane("fresh", now - 1_000))
             .expect("upsert");
-        // Exactly 30 days old: kept (ctp drops strictly older).
+        // Exactly 30 days old: kept (the age window drops strictly older).
         store.upsert_lane(&lane("edge", now - age)).expect("upsert");
         // A day past the window: gone.
         store
@@ -1685,8 +1686,8 @@ mod tests {
             .collect();
         assert_eq!(keys, vec!["edge".to_owned(), "fresh".to_owned()]);
 
-        // The cap keeps the NEWEST rows (ctp pruneLanes sorts by `at`
-        // descending and slices), not the first-inserted.
+        // The cap keeps the NEWEST rows (sorted by `updated_ms`
+        // descending and sliced), not the first-inserted.
         let store = mem_store();
         for i in 0..6 {
             store

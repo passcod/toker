@@ -496,19 +496,20 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 /// the token buckets it sums are input, cache_read and output alone —
 /// `reasoning` and `cache_write_total` are other consumers' columns.
 ///
-/// The phase-5 growth (ctp live.mjs parity) adds five columns, each a
+/// The phase-5 growth (display parity with the reference dashboard) adds
+/// five columns, each a
 /// scalar fetched for exactly one panel read:
 ///
 /// - `req_messages`, `compact_generations` — the sessions table's
-///   `msgs`/`cmpct` columns, the latest row's values (live.mjs:356,388).
+///   `msgs`/`cmpct` columns, the latest row's values.
 ///   Two INTEGERs.
 /// - `forced_to` — the `↑` marker's evidence (bright on the latest row,
-///   dim when only an earlier one was rewritten, live.mjs:367). A TEXT
+///   dim when only an earlier one was rewritten). A TEXT
 ///   column, but written only on the rare rewrite row and read as one
 ///   short string per row.
 /// - `cache_write_5m`, `cache_write_1h` — the tokens panel's two
-///   write tiers and the hit-rate denominator's second term
-///   (live.mjs:438-504). Two more INTEGERs. The context-occupancy sums
+///   write tiers and the hit-rate denominator's second term.
+///   Two more INTEGERs. The context-occupancy sums
 ///   read them too: anthropic's `input_tokens` excludes cache writes,
 ///   so a prompt without its write share understates the context.
 ///   `cache_write_total` alone would not do — the tokens panel
@@ -542,7 +543,7 @@ pub struct DisplayRow {
     /// Output token bucket.
     pub output: Option<i64>,
     /// Reasoning token bucket — the tokens panel's reasoning row (an
-    /// INTEGER; live.mjs:471-475 renders it when the provider reports
+    /// INTEGER; rendered when the provider reports
     /// thinking tokens).
     pub reasoning: Option<i64>,
     /// Cost in USD, in the kind below.
@@ -636,7 +637,8 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 /// [`DisplayRow`]): the classifier's actual reads, nothing else. The
 /// walk runs on the TUI's QUOTA cadence (60 s), not the display tick —
 /// a lane walk needs the 24 h tail that provides each lane's
-/// pre-window predecessor (the anti-phantom rule, ctp lanes.md), and
+/// pre-window predecessor (the anti-phantom rule, as the lane
+/// docs state it), and
 /// that tail is an order of magnitude more rows than the display
 /// window holds. Adding a field here is therefore a per-60 s cost
 /// decision across up to the rebuild tail's 20 000-row cap.
@@ -647,7 +649,8 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 ///   localisation pass, and the tie-break the walk's order relies on.
 /// - `ts_ms` — windowing and the idle-gap measurement.
 /// - `session_id`, `tools_hash` — the lane key (`session | tools_hash`;
-///   `None` hashes share one lane, ctp live.mjs's `?` lane).
+///   `None` hashes share one lane, the shared `?` lane the predecessor's
+///   walk used).
 /// - `system_hash`, `system_chars`, `system_blocks` — the
 ///   system-prompt-change test and the "which block changed" half of
 ///   its localisation. `system_blocks` is the row's ONLY JSON column:
@@ -656,19 +659,21 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 ///   The heavy ones — the ladders — stay behind the targeted second
 ///   query ([`localisation_rows`]).
 /// - `req_messages` — the subagent-started collapse test
-///   (summarise.mjs:474-480).
+///   (at most ~8 messages after a much larger predecessor).
 /// - `compact_generations` — the compaction test, a fact not an
-///   inference (summarise.mjs:468-470).
+///   inference (a compaction continues a session, so its first message
+///   carries the continuation preamble).
 /// - `summarising` — carried but deliberately NOT consulted by the
 ///   cause rules: the same prompt shape serves Claude Code's routine
 ///   background summaries, so treating it as a compaction would fire
-///   constantly (summarise.mjs:481-483). It rides the row for the
+///   constantly. It rides the row for the
 ///   report path, which prices compaction passes.
 /// - `cache_write_total` — the rewritten-token measure against the
-///   panel's `REBUILD_MIN` cutoff (tui::rebuilds). ctp's walk sums the
-///   two TTL shares (live.mjs:227-231); the capture folds those shares
+///   panel's `REBUILD_MIN` cutoff (tui::rebuilds). The predecessor's
+///   walk summed the
+///   two TTL shares; the capture folds those shares
 ///   to this total and the import stores all three, so the one column
-///   carries the same number the ctp walk computes.
+///   carries the same number the predecessor's walk computes.
 /// - `cache_read`, `input` — the rebuild's prompt shape, for the
 ///   panel's detail lines.
 /// - `model` — the lane's served model, for the detail lines.
@@ -677,7 +682,8 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 /// because a lane's predecessor must be a request the API served — a
 /// proxy-written row has no system hash, and read as a predecessor it
 /// attributes the next rebuild to a changed system prompt
-/// (live.mjs:212-215). Absence stays absence on every other column
+/// (a proxy-written row is not evidence about any prompt).
+/// Absence stays absence on every other column
 /// (invariant 3): a NULL `cache_write_total` is an unmeasurable
 /// rewrite, counted as such, never a zero.
 #[derive(Debug, Clone, PartialEq)]
@@ -773,9 +779,9 @@ fn read_rebuild_row(row: &rusqlite::Row<'_>) -> Result<RebuildRow> {
 /// so they are fetched only for the rows a system-prompt change was
 /// actually attributed to (typically none at all; the handful at most).
 ///
-/// `system_change` rides the same query: ctp's capture-time
-/// localisation (proxy.mjs:652-710), which imported rows carry
-/// precomputed. The reference walk prefers it (summarise.mjs:385-387)
+/// `system_change` rides the same query: the predecessor's capture-time
+/// localisation, which imported rows carry
+/// precomputed. The reference walk prefers it
 /// and re-derives from the ladders only where it is absent — toker
 /// itself never writes the column (the lane middleware has not landed),
 /// but the imported history carries it, and a localisation that
@@ -787,7 +793,7 @@ pub struct LocalisationRow {
     /// Cumulative system-text digests every 2 KiB, oldest first.
     pub system_ladder: Option<Vec<String>>,
     /// Digests of the system text's last 8…256 bytes in 8-byte steps,
-    /// then 320…1024 in 64-byte steps (ctp `tailOffsets`).
+    /// then 320…1024 in 64-byte steps.
     pub system_tail: Option<Vec<String>>,
     /// The capture-time localisation as JSON (`{delta, where}`), when
     /// the row carries one.

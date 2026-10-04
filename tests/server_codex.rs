@@ -433,7 +433,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(headers.get("chatgpt-account-id").unwrap(), "acc_test_1");
 
     // The row: the response's own slug is the model, the map's target is
-    // the effective one, buckets follow the join.mjs three-way split, the
+    // the effective one, buckets follow the openai three-way split, the
     // write charges the 1h tier conservatively, cost stays NULL.
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -588,7 +588,8 @@ async fn an_http_error_maps_through_the_error_table() {
     assert_eq!(rows[0].kind, Some(RowKind::Error));
     assert_eq!(rows[0].status, Some(401), "the real upstream status");
     assert_eq!(rows[0].error_type.as_deref(), Some("authentication_error"));
-    // The meters still fed from the error response (ctp: every response).
+    // The meters still fed from the error response (every response feeds
+    // them).
     assert!(store.load_meters("codex_sub").expect("load").is_some());
 }
 

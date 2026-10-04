@@ -491,7 +491,8 @@ impl Capabilities {
     /// - `system_in_messages: false` — the backend refuses
     ///   system-role input items ("System messages are not allowed");
     ///   its system content rides `instructions` (leading) and the
-    ///   preceding-user merge (mid-conversation, ctp's pattern).
+    ///   preceding-user merge (mid-conversation, the same merge the
+    ///   predecessor proxy used).
     /// - `thinking_replay: false` — protocol-forced out:
     ///   cross-provider reasoning is opaque (claude's thinking blocks
     ///   carry no `encrypted_content` legible to the codex wire);

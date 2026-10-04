@@ -46,15 +46,17 @@ enum Command {
     Setup,
     /// Show configuration and backend status (plan: Credentials).
     Status,
-    /// Ingest ctp's usage.jsonl into the ledger (plan: Storage).
+    /// Ingest the predecessor proxy's usage.jsonl into the ledger (plan:
+    /// Storage).
     Import {
-        /// The ctp usage.jsonl to import.
+        /// The predecessor proxy's usage.jsonl to import.
         #[arg(long = "from", value_name = "PATH")]
         from: PathBuf,
         /// Ledger path; TOKER_DB env or the config default when omitted.
         #[arg(long = "db", value_name = "PATH")]
         db: Option<PathBuf>,
-        /// Cost semantics for imported costUsd (plan: Storage); ctp priced
+        /// Cost semantics for imported costUsd (plan: Storage); the
+        /// predecessor priced
         /// at list rates on a subscription, so plan-equivalent is the
         /// default and api-era logs want `estimated`.
         #[arg(long = "cost-kind", default_value = "plan_equivalent")]

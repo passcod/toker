@@ -16,7 +16,7 @@
 //! | --- | --- | --- |
 //! | thinking-block replay (`thinking_replay`) | forced: cross-provider reasoning is opaque — claude's blocks carry no `encrypted_content`, so they cannot ride the codex wire | reasoning itself: summaries and reasoning items, its own `encrypted_content` — the thinking **request** maps to the reasoning effort ([`effort_of`]) |
 //! | sampling — `temperature`, `top_p`, `max_tokens`, `stop_sequences` (`sampling`) | refused: verified live ("Unsupported parameter: temperature"); the codex client sends none | its own defaults, echoed in every response |
-//! | system-role input items (`system_in_messages`) | refused: verified live ("System messages are not allowed") | system content via `instructions` (leading) and the preceding-user merge (mid-conversation, ctp's pattern) |
+//! | system-role input items (`system_in_messages`) | refused: verified live ("System messages are not allowed") | system content via `instructions` (leading) and the preceding-user merge (mid-conversation, the same merge the predecessor proxy used) |
 //!
 //! A future backend whose upstream supports these keeps them in ITS
 //! adapter; the drops above are THIS backend's costs, not toker
@@ -141,7 +141,8 @@ pub fn codex_from_canonical(
 ///
 /// Mid-conversation system messages (claude Code's reminders) merge
 /// into the PRECEDING user turn's item as `[PROMPT_INJECTION]`-prefixed
-/// text parts — ctp's exact transform for the same problem (sonnet 5
+/// text parts — the same transform the predecessor proxy used for the
+/// same problem (sonnet 5
 /// refuses system entries in `messages[]`; the codex backend refuses
 /// system-role input items — live-verified: "System messages are not
 /// allowed", the `system_in_messages: false` capability). With no
@@ -215,7 +216,7 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
 }
 
 /// The most recent user message item, mutably — the merge target for a
-/// mid-conversation system message (ctp's preceding-user rule).
+/// mid-conversation system message (the preceding-user rule).
 fn last_user_item_mut(items: &mut [Item]) -> Option<&mut Item> {
     items.iter_mut().rev().find(|item| {
         item.0.get("type").and_then(Value::as_str) == Some("message")
@@ -679,7 +680,7 @@ mod tests {
     fn a_midstream_system_message_merges_into_the_preceding_user_turn() {
         // The capability declaration the merge enforces: the codex
         // backend refuses system-role input items (live-verified:
-        // "System messages are not allowed"). ctp's transform: merge
+        // "System messages are not allowed"). The transform: merge
         // into the preceding user turn, role sequence unchanged.
         let caps = Capabilities::CODEX;
         assert!(!caps.system_in_messages);

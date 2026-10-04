@@ -421,8 +421,9 @@ async fn a_live_lane_holds_the_lock_and_writes_one_row() {
 
     // A live lane: its cache would survive an hour past its last
     // response. The evaluation that first finds it must run with
-    // NOTHING in flight — in ctp a request's own arrival would read
-    // "1 in flight" first (ctp awake.mjs:44 checks inFlight before
+    // NOTHING in flight — in the decision a request's own arrival would
+    // read
+    // "1 in flight" first (the in-flight check runs before
     // lanes), so the trigger here is a ping request on a second lane:
     // its response marks its own lane and re-evaluates at zero
     // in-flight, and the LIVE lane's name is what lands in the row.
@@ -485,8 +486,8 @@ async fn lane_expiry_with_nothing_in_flight_releases_the_lock() {
     assert_eq!(rows.len(), 1);
     assert_eq!(probe.spawns(), 1);
 
-    // The lane goes quiet for two hours. Nothing re-poisons it in ctp
-    // either — the table just ages.
+    // The lane goes quiet for two hours. Nothing re-poisons it —
+    // the table just ages.
     poison_lane(&store, &body, now_ms() - 2 * HOUR, false);
 
     // An openai request, session-tagged but lane-less: it is in flight
@@ -533,7 +534,7 @@ async fn an_in_flight_anthropic_request_holds_with_no_live_lanes() {
     assert_eq!(
         rows,
         vec![
-            // ctp awake.mjs:44: an in-flight hold has no `until` — it
+            // An in-flight hold has no `until` — it
             // rests on something without an expiry.
             (true, true, None, "1 in flight".to_owned()),
             (false, false, None, "no live lanes".to_owned()),
@@ -577,7 +578,7 @@ async fn a_ping_lane_never_holds_the_lock() {
 
     // A LIVE ping lane, one second old on the hour tier — and a ping
     // request that refreshes it. A ping opens a quota window on a timer;
-    // its cache must not keep the machine up (ctp awake.mjs:22).
+    // its cache must not keep the machine up.
     let body = main_tools_body();
     poison_lane(&store, &body, now_ms() - 1_000, true);
 
@@ -609,7 +610,7 @@ async fn awake_off_never_holds_never_spawns_never_records() {
     let (addr, store, probe) = spawn_toker(config).await;
 
     // A live lane AND a request in flight, and the machinery stays
-    // absent: `awake = false` is ctp's CTP_AWAKE=off — sleepLock null.
+    // absent: `awake = false` is the off switch — no lock, ever.
     let body = main_tools_body();
     poison_lane(&store, &body, now_ms() - 1_000, false);
     let response = post_messages(addr, &body, false).await;

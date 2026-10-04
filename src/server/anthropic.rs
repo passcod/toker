@@ -2,14 +2,15 @@
 //!
 //! Routes, all served by the anthropic backends ([`crate::providers`]):
 //!
-//! - `POST /v1/messages` — **the usage path** (ctp: `req.url.split("?")[0]
-//!   === "/v1/messages"` — exactly, query stripped; axum matches on the
+//! - `POST /v1/messages` — **the usage path** (exactly:
+//!   the path alone matches, query stripped; axum matches on the
 //!   path alone, so the route IS the gate's path check, and
 //!   `count_tokens`/`batches` can never land in it). Fully recorded, and
 //!   **the quota gate's only target**: on the anthropic_sub backend (the
 //!   sole meter source), a spent meter is answered 200 with a synthetic
-//!   assistant turn instead of forwarding — never an error status (ctp
-//!   measured it on 2026-09-10: 529 retries silently, 429 mislabels, 403
+//!   assistant turn instead of forwarding — never an error status
+//!   (measured with the predecessor proxy on 2026-09-10: 529 retries
+//!   silently, 429 mislabels, 403
 //!   looks like broken credentials). The release marker is read from the
 //!   ORIGINAL body, then stripped unconditionally (the frozen marker rule
 //!   runs on this path for every backend and regardless of the gate's
@@ -20,22 +21,25 @@
 //!   routing → forward → tee → record), but they are **never gated**
 //!   (blocking them protects no quota, only breaks the client). Their
 //!   responses carry no usage, so they record nothing in
-//!   practice — their error and drift rows are real, ctp logs those too.
+//!   practice — their error and drift rows are real, as the predecessor's
+//!   were.
 //! - The batch-result GETs and cancel — transparent forwarding, like the
 //!   openai path's `/v1/models`: no recording, no observation.
 //!
 //! The pipeline mirrors the openai chat path ([`super::proxy`]) step for
 //! step, with the anthropic observer ([`AnthropicObserver`]) riding the
-//! stream instead of the OpenAI one, and two ctp rules the openai path has
+//! stream instead of the OpenAI one, and two rules the openai path has
 //! no analogue for:
 //!
-//! 1. **The meters feed from every response** (ctp: "Feed the gate from
+//! 1. **The meters feed from every response** ("Feed the gate from
 //!    every response, not just accounted ones: a 429 or a background call
-//!    still reports the meters, and the gate must not go stale"). Only a
+//!    still reports the meters, and the gate must not go stale" — the
+//!    predecessor's rule). Only a
 //!    meter-source backend feeds it — anthropic sub today; the plain
 //!    API's RPM headers are not quota meters and must never overwrite
 //!    the gate's snapshot.
-//! 2. **Session headers pass through** — ctp forwards claude's
+//! 2. **Session headers pass through** — the predecessor forwards
+//!    claude's
 //!    `x-claude-code-session-id` to the upstream verbatim (it strips
 //!    hop-by-hop only), and this path must behave the same. Only toker's
 //!    own `x-toker-*` headers are proxy-addressed and stripped.
@@ -151,9 +155,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     };
 
-    // A gated non-ping request is in flight (ctp proxy.mjs:1129-1132:
-    // `if (gated && !isPing(req.headers))` — count_tokens and batches are
-    // never `gated`, ctp's exact-path match, so they do not count): a
+    // A gated non-ping request is in flight
+    // (count_tokens and batches are
+    // never `gated` — the exact-path match — so they do not count): a
     // request being served holds the machine awake, pings aside. The
     // guard's Drop is the decrement, so no early return — a blocked
     // answer, a cold notice, a 502 — can leak the count; for a streamed
@@ -165,22 +169,21 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut record = None;
     // The parsed IR outlives the block below: the compaction retarget —
     // the only middleware transform that changes model-visible prompt
-    // structure — runs after the gates and rewrites it (ctp re-serialises
-    // its `body` variable for the same reason).
+    // structure — runs after the gates and rewrites it (the body is
+    // re-serialised for the same reason).
     let mut parsed: Option<IrRequest> = None;
     // The request's own shape, kept past the record context (which takes
     // a clone): the cold gate and the retarget read it, and the row's
-    // shape fields stay the PRE-transform shape's, ctp's ordering.
+    // shape fields stay the PRE-transform shape's, in the same order.
     let mut gate_shape: Option<AnthropicShape> = None;
     let mut backend = server.default_anthropic().clone();
-    // ctp `clientWants` (proxy.mjs:1047-1054): the client's own model and
+    // The client's own wants: the client's own model and
     // whether it explicitly asked for a plain JSON Message — both read
     // BEFORE any transform, because the blocked answer renders the model
     // the client named and in the shape it asked for.
     let mut client_model: Option<String> = None;
     let mut stream_explicitly_false = false;
-    // The model about to be sent upstream, for the served-model mark
-    // (ctp `servedModel`, proxy.mjs:1549).
+    // The model about to be sent upstream, for the served-model mark.
     let mut served_model: Option<String> = None;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
@@ -214,7 +217,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             transformed = true;
         }
 
-        // ── the quota gate + release marker, ctp proxy.mjs:1135-1241 ──
+        // ── the quota gate + release marker ──
         //
         // Sequence (every step's order is measured, not stylistic):
         // release check on the ORIGINAL body → grant/record → the
@@ -236,9 +239,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
         if path == "/v1/messages" {
             // A release: grant/refresh an allowance for the
-            // currently-exhausted meters only, and record it. ctp gates
-            // this on the marker + the session id + the toggle
-            // (proxy.mjs:1136) — a sessionless request cannot hold an
+            // currently-exhausted meters only, and record it. The gate
+            // fires on the marker + the session id + the toggle
+            // — a sessionless request cannot hold an
             // allowance.
             if gate_armed
                 && let Some(session) = session_id.as_deref()
@@ -261,7 +264,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         tracing::error!(%error, "allowance record failed");
                     }
                 }
-                // ctp merges, never replaces (proxy.mjs:1137-1147): a fresh
+                // The grant merges, never replaces: a fresh
                 // null for a meter defers to the allowance already held,
                 // so a release while only the 5-hour window is spent must
                 // not wipe an existing 7-day allowance.
@@ -286,7 +289,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // backend and regardless of the gate's toggle, because the
             // marker rule is a frozen public API and a toggled strip would
             // change the cached prefix of every conversation carrying a
-            // marker (invariant 4; ctp proxy.mjs:1166-1177). Record
+            // marker (invariant 4; the marker rule's own contract). Record
             // nothing for the strip itself: the released row is the
             // user-visible event, and the strip is the API's own rule.
             let pre_strip = ir.serialise();
@@ -333,13 +336,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         parsed = Some(ir);
     }
 
-    // ── the gate decision (after the strip, ctp proxy.mjs:1195) ──
+    // ── the gate decision (after the strip) ──
     //
     // Runs on the exact `/v1/messages` path, only for the anthropic_sub
     // backend (the sole meter source), and only when the gate is enabled —
     // for every other backend this whole block is a no-op that never even
-    // reads meters. It runs for unparseable bodies too (ctp decides on
-    // `gated` alone): a client that cannot parse an event stream still
+    // reads meters. It runs for unparseable bodies too (the decision is
+    // on `gated` alone): a client that cannot parse an event stream still
     // gets the SSE turn, since `streamFalse` could not be read.
     let gate_armed = path == "/v1/messages"
         && server.config.gates.quota_enabled
@@ -409,17 +412,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the cold-cache notice, after the quota gate (ctp
-    //    proxy.mjs:1246-1377) ──
+    // ── the cold-cache notice, after the quota gate ──
     //
     // If both would fire, the harder stop wins (the quota block returned
     // above). This one is advisory: it fires once per idle spell and
     // re-arms, and has no release marker, because sending the request
-    // again IS the override. Like ctp's `COLD_ON && gated` it is not
+    // again IS the override. Like the predecessor's
+    // "cold on AND gated" it is not
     // restricted to the meter-source backend — the cold gate needs only
     // idle time and prompt size per lane, which the IR always has — and
     // it is skipped for unparseable bodies, which have neither a shape
-    // nor a lane (the same verdict ctp reaches via its `?`-lane miss).
+    // nor a lane (the same verdict the `?`-lane miss reaches).
     // Every failure below is "a lost notice, never a lost request": a
     // store error reads as absence and the request forwards.
     let cold_armed = path == "/v1/messages" && server.config.gates.cold_enabled;
@@ -435,7 +438,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let now = now_ms();
         let min_idle_ms = cold_idle_ms(gates);
         let summarising = gate_shape.as_ref().is_some_and(|shape| shape.summarising);
-        // Twice, deliberately (ctp proxy.mjs:1259-1267): the first call is
+        // Twice, deliberately: the first call is
         // the cheap one and decides whether anything would fire at all;
         // only then is the outlook worth measuring — a weight refit over
         // the recent ledger is nothing against a request about to be
@@ -507,8 +510,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 prompt,
                 outlook,
             } => {
-                // The compact model is resolved, not assumed (ctp
-                // proxy.mjs:1309-1317): the notice names the model a
+                // The compact model is resolved, not assumed:
+                // the notice names the model a
                 // cheap `/compact` would actually run on, and stays
                 // silent about it when there is none.
                 let compact_on = server
@@ -575,11 +578,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the compaction retarget (ctp proxy.mjs:1379-1442) ──
+    // ── the compaction retarget ──
     //
     // A cold compaction, rewritten onto a cheaper model with its cache
-    // writes removed. Deliberately NOT gated on cold_enabled (ctp gates
-    // this on the path and `isCompaction` alone): the cold licence is the
+    // writes removed. Deliberately NOT gated on cold_enabled (gated on
+    // the path and the compaction test alone): the cold licence is the
     // lane's, not the notice toggle's. Coldness is judged on `at`, which
     // the notice above does not move — so the compaction the user runs
     // after reading the notice is still seen as cold. And the notice
@@ -651,7 +654,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the force-newest rewrite (ctp proxy.mjs:1444-1500) ──
+    // ── the force-newest rewrite ──
     //
     // Use the newest version of whatever model was asked for — but only
     // where no cache can be lost by it. A known lane that is cold has
@@ -664,8 +667,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // that cache is on the new model now, and sending the client's
     // choice through would rebuild it on the old one.
     //
-    // Never runs after a compaction retarget that moved the model (ctp's
-    // `!downgradedFrom`): that rewrite already chose the model this
+    // Never runs after a compaction retarget that moved the model
+    // (`!downgradedFrom`): that rewrite already chose the model this
     // compaction will run on. The only body edit is set_model — every
     // cache_control survives, unlike the retarget, because this rewrite
     // STARTS a conversation that should cache its prefix on the model it
@@ -679,12 +682,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .is_none_or(|ctx| ctx.downgraded_from.is_none())
         && let Some(ir) = parsed.as_mut()
     {
-        // ctp `asked` (proxy.mjs:1469): the model the body names as it
+        // The asked model: the model the body names as it
         // stands at this point — after routing, after any retarget —
         // which is `served_model`'s reading here. The lane is the same
         // record the cold gate loaded; the shape is the request's own,
-        // pre-transform (ctp's ordering: the row's shape fields are).
-        // The map preview (ctp `previewMappedModel`, model-map.mjs:143):
+        // pre-transform (the row's shape fields are).
+        // The map preview:
         // recency reads the identity the request would be MAPPED to,
         // never the asked model — without this, a claimed model (only
         // ever served as its target) would always read as idle.
@@ -715,14 +718,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 ctx.forced_from = Some(forced.from.clone());
                 ctx.forced_to = Some(forced.to.clone());
             }
-            // ctp `servedModel = target` (proxy.mjs:1495): the mark below
+            // The served-model mark
             // must see the model actually being sent.
             served_model = Some(forced.to.clone());
             tracing::info!("model: {} → {}", forced.from, forced.to);
         }
     }
 
-    // ── the model routing map (ctp proxy.mjs:1511-1541, the FINAL
+    // ── the model routing map (the FINAL
     // routing stage) ──
     //
     // A provider carrying `[providers.<id>.model_map]` rewrites the
@@ -731,7 +734,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // the spliced bytes are the point, and the fidelity compare ran on
     // the pre-transform body, so a mapped model can never surface as
     // drift. Matching is exact-identity first, then family; unmatched
-    // requests keep their exact bytes (ctp `unchanged`). Applies AFTER
+    // requests keep their exact bytes (the unchanged path). Applies AFTER
     // force-newest (which previewed through the map above), and BEFORE
     // the served-model mark — the mark must see what is actually sent.
     if let Some(map) = backend.model_map() {
@@ -739,7 +742,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if rewrite.mapped {
             forward = Bytes::from(rewrite.body);
             if let Some(effective) = rewrite.effective_model.clone() {
-                // Provenance (ctp `requestedModel`/`effectiveModel`): the
+                // Provenance (requested/effective pair): the
                 // row's requested model keeps its first reading (what the
                 // frontend asked, routing prefixes included); the
                 // effective one becomes the mapped target.
@@ -747,7 +750,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.effective_model = Some(effective.clone());
                     if rewrite.models.len() > 1 {
                         // Batch provenance rides the row's model_mappings
-                        // (ctp's per-request list); the top-level position
+                        // (the per-request list); the top-level position
                         // is the requested/effective pair above.
                         ctx.model_mappings = Some(
                             rewrite
@@ -774,14 +777,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the served-model mark, BEFORE the request goes (ctp
-    // proxy.mjs:1544-1551) ──
+    // ── the served-model mark, BEFORE the request goes ──
     //
     // Not after: a lane deciding while this one is still in flight must see
     // the final effective model as in use. The response may later name a
     // different served identity; that remains authoritative for
-    // observations and accounting. In-memory and infallible, like ctp's
-    // map. Gated to the exact `/v1/messages` path, ctp's `gated`.
+    // observations and accounting. In-memory and infallible, like an
+    // in-memory map. Gated to the exact `/v1/messages` path.
     if path == "/v1/messages" {
         server.models.note_served(served_model.as_deref(), now_ms());
     }
@@ -825,7 +827,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     }
 
     // 6. Upstream; 7.-9. in forward_response. Session headers pass
-    // through (ctp parity — see the module docs), so the strip list is
+    // through (see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.
     match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
         Ok(upstream) => forward_response(server, backend, upstream, record, in_flight).await,
@@ -841,9 +843,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     }
 }
 
-/// The session's stored allowances, or none for a sessionless request (ctp
-/// proxy.mjs:1196 passes `allowances.get(sessionId)`, which is undefined
-/// without a session — decide then sees no allowances). A store error
+/// The session's stored allowances, or none for a sessionless request
+/// (a sessionless lookup is undefined — the gate then sees no
+/// allowances). A store error
 /// loses the allowances, never the request (invariant 6): the gate
 /// treats it as "nothing held", the conservative reading.
 fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allowance> {
@@ -865,8 +867,8 @@ fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allo
         })
 }
 
-/// The live prior allowance a session holds for one meter (ctp's merge
-/// rule, proxy.mjs:1141: `fresh ?? prior`). ctp stores one value per
+/// The live prior allowance a session holds for one meter (the merge
+/// rule: `fresh ?? prior`). The predecessor stored one value per
 /// meter per session; the store's reset-value keying can hold several
 /// across rolled windows, and the one still in force is the live
 /// (future-reset) row with the greatest reset — a rolled window's rows
@@ -883,8 +885,8 @@ fn prior_live(server: &Server, session: &str, meter: &str, now_ms: i64) -> Optio
         .max()
 }
 
-/// The cold gate's idle floor override, in ms (ctp `COLD_IDLE_MS`,
-/// proxy.mjs:125-127: minutes, deliberately fractional — unset follows
+/// The cold gate's idle floor override, in ms
+/// (minutes, deliberately fractional — unset follows
 /// the TTL tier the lane was last seen writing). Config validation
 /// already rejects the negative.
 fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
@@ -893,7 +895,7 @@ fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
         .map(|minutes| (minutes * 60_000.0) as i64)
 }
 
-/// The compaction retarget's model spec (ctp `COMPACT_SPEC`, proxy.mjs:135):
+/// The compaction retarget's model spec:
 /// a family name resolved against what is actually in use (the default,
 /// "sonnet" — not Haiku: its window is 200k and the lanes this fires on
 /// routinely hold three times that), an explicit model id, or "off".
@@ -907,9 +909,9 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// Transparent forwarding (the batch-result paths): routed to the default
 /// anthropic backend, auth rules applied, bytes both ways untouched — no
 /// recording, no observation, like the openai `/v1/models` path. The
-/// meters still feed: a background batch poll is exactly the call ctp's
-/// "not just accounted ones" rule names. No in-flight hold either — ctp
-/// counts only the exact `/v1/messages` path.
+/// meters still feed: a background batch poll is exactly the call the
+/// "not just accounted ones" rule names. No in-flight hold either — the
+/// count is only on the exact `/v1/messages` path.
 async fn transparent(server: Server, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -955,8 +957,8 @@ fn strip_anthropic_prefix<'a>(
     }
 }
 
-/// The `anthropic-beta` request header, split into its flags (ctp
-/// `requestBetas`): a comma-separated list of feature flags and nothing
+/// The `anthropic-beta` request header, split into its flags:
+/// a comma-separated list of feature flags and nothing
 /// else, read by name only (invariant 2). Worth recording because flags
 /// change what a request costs and how it is bounded. `None` when the
 /// header is absent — absent ≠ empty; a present-but-empty header is a
@@ -982,7 +984,7 @@ fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
 /// `forward_upstream`, plus the meter feed. `record` is the usage-path
 /// completion context; `None` means transparent forwarding. `in_flight` is
 /// the request's sleep-lock hold: it rides the SSE stream (dropping when
-/// axum drops the body — ctp's `close`, "however the exchange ends") and
+/// axum drops the body — the close semantics, "however the exchange ends") and
 /// drops at the end of this function on every other branch, after
 /// whatever row was owed has landed.
 async fn forward_response(
@@ -995,7 +997,7 @@ async fn forward_response(
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
 
-    // ctp rule: feed the meters from EVERY response, not just accounted
+    // Feed the meters from EVERY response, not just accounted
     // ones — a 429, a count_tokens, a background batch poll still report
     // the meters, and the gate must not go stale. Only a meter-source
     // backend has meters to report (the sub; the API's RPM headers are
@@ -1100,8 +1102,8 @@ struct AnthropicObservedStream {
     rate_limits: Option<serde_json::Value>,
     /// The request's sleep-lock hold, riding the stream: it drops when
     /// axum drops the body — natural completion or client hangup — so the
-    /// in-flight count never leaks on a streamed response (ctp's
-    /// `res.on("close")`).
+    /// in-flight count never leaks on a streamed response (the
+    /// body-close event).
     in_flight: Option<InFlightGuard>,
     status: u16,
 }
@@ -1149,8 +1151,9 @@ impl Stream for AnthropicObservedStream {
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
-                // The exchange is over however it ended (ctp: `close`
-                // fires on failure too): the in-flight hold goes with it.
+                // The exchange is over however it ended (the close
+                // event fires on failure too): the in-flight hold goes
+                // with it.
                 drop(this.in_flight.take());
                 std::task::Poll::Ready(None)
             }
@@ -1176,7 +1179,7 @@ impl Stream for AnthropicObservedStream {
                     );
                 }
                 // The response is done, so the in-flight hold ends now —
-                // ctp's `res.on("close")` fires at stream end, and a
+                // the body-close event fires at stream end, and a
                 // hung-up stream ends it in Drop instead.
                 drop(this.in_flight.take());
                 std::task::Poll::Ready(None)

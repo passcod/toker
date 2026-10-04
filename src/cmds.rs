@@ -109,7 +109,8 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     crate::tui::run(&db_path, window_mins, &config.transcript_roots)
 }
 
-/// `import`: ingest ctp's usage.jsonl into the ledger (plan: Storage).
+/// `import`: ingest the predecessor proxy's usage.jsonl into the ledger
+/// (plan: Storage).
 /// `--db` overrides the path; otherwise `TOKER_DB` and the config default
 /// apply (Config::load already layered env over file).
 pub fn import(

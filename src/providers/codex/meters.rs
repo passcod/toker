@@ -15,9 +15,9 @@
 //! Any **other** `x-<id>-primary-used-percent` is another limit family
 //! (the codex backend meters per-model limits this way) — each family
 //! is kept under its id in `other`, never dropped, the same
-//! known-keys-plus-catch-all split the anthropic meters port (the ctp
-//! lesson: the unknown headers turned out to be the signals that
-//! matter).
+//! known-keys-plus-catch-all split the anthropic meters port (the
+//! predecessor's lesson: the unknown headers turned out to be the
+//! signals that matter).
 //!
 //! The shape, stable for the ledger like the anthropic meter's:
 //!

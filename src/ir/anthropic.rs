@@ -12,16 +12,16 @@
 //! The shape extraction ([`AnthropicBody::shape`]) and the release-marker
 //! semantics ([`SENTINEL`], [`AnthropicBody::carries_release`],
 //! [`AnthropicBodyMut::strip_release`]) are ports of the measured
-//! production behaviours of claude-token-proxy, ctp — the Node proxy this
+//! production behaviours of the predecessor proxy, ctp — the Node proxy this
 //! toolsuite replaces. They are ported, not improved: the behaviours were
 //! measured over weeks of live traffic, and the marker rule is a frozen
-//! public API (invariant 4). Sources:
+//! public API (invariant 4). The ported pieces:
 //!
-//! - `requestShape` — ctp proxy.mjs:853-897 (shape), 591-640 (ladders),
-//!   811-851 (compaction markers), 758-797 (detection helpers);
-//! - `carriesRelease` / `stripSentinel` — ctp limit.mjs:8, 22-54, 78-125;
-//! - `isCompaction` — ctp cold.mjs:701-706;
-//! - field semantics — ctp docs/internals/log-schema.md.
+//! - the request shape (counts, lengths, digests) and the prefix ladders,
+//!   compaction markers, and detection helpers behind it;
+//! - the release-marker carriage test and strip;
+//! - the compaction-vs-summariser test;
+//! - the field semantics the reference parity fixture pins.
 //!
 //! The `/v1/messages/count_tokens` and `/v1/messages/batches` bodies nest
 //! their payloads differently (batches under `requests[].params`), so the
@@ -37,7 +37,7 @@ use serde_json::Value;
 use super::openai_chat::Content;
 use super::{Request, short_hash};
 
-/// The quota-gate release marker. **A frozen public API** (ctp limit.mjs:8):
+/// The quota-gate release marker. **A frozen public API**:
 /// users type it into a conversation to override a quota block, and the
 /// rule that removes it must stay byte-stable forever — the literal lands
 /// in user messages, which the client replays on every later turn, so a
@@ -45,19 +45,20 @@ use super::{Request, short_hash};
 /// prefix is a full rebuild on every live conversation.
 pub const SENTINEL: &str = "$#$BURN$#$";
 
-// ctp proxy.mjs:758-763 — fixed strings Claude Code itself emits around a
+// Fixed strings Claude Code itself emits around a
 // compaction. Only whether they matched is recorded, never the surrounding
 // text (invariant 1). The instruction is matched by the opening all three
 // compaction wordings share, and the tool-refusal preamble every one of
 // them carries, independently: a rewording of one does not take the
-// detection with it. Either is enough (ctp docs/internals/compaction.md).
+// detection with it. Either is enough (measured against the predecessor's
+// documented detection rules).
 const COMPACT_PERFORMING: &[&str] = &[
     "Your task is to create a detailed summary of",
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
 ];
 const COMPACT_RESUMED: &str = "This session is being continued from a previous conversation";
 
-// ctp proxy.mjs:591, 612-615 — ladder geometry. `pub(crate)`: the TUI's
+// Ladder geometry. `pub(crate)`: the TUI's
 // rebuild localisation re-derives rung offsets from the same geometry the
 // stored rungs were cut to (the walk stores digests, never offsets).
 pub(crate) const LADDER_STEP: usize = 8192;
@@ -107,11 +108,11 @@ impl<'a> AnthropicBody<'a> {
         self.request.value.get("stream") == Some(&Value::Bool(true))
     }
 
-    /// `stream` is **explicitly** `false` (ctp `clientWants`'s
-    /// `streamFalse`, proxy.mjs:1050: `parsed?.stream === false`). Not the
+    /// `stream` is **explicitly** `false`
+    /// (`parsed?.stream === false`). Not the
     /// negation of [`AnthropicBody::stream`]: a client that omitted the
     /// field cannot be assumed to parse a plain JSON body, so the gates
-    /// answer everyone else with the SSE turn (ctp proxy.mjs:1210-1219).
+    /// answer everyone else with the SSE turn.
     pub fn stream_explicitly_false(&self) -> bool {
         self.request.value.get("stream") == Some(&Value::Bool(false))
     }
@@ -141,28 +142,30 @@ impl<'a> AnthropicBody<'a> {
         Tools::over(&self.request.value)
     }
 
-    /// The content-free request shape for the ledger and lanes (ctp
-    /// `requestShape`, proxy.mjs:853-897): counts, lengths, and digests
+    /// The content-free request shape for the ledger and lanes:
+    /// counts, lengths, and digests
     /// only, never prompt, message, or tool text (invariant 1).
     ///
-    /// ctp gates this on `POST` + `/v1/messages*`; that is the server's
+    /// The predecessor gates this on `POST` + `/v1/messages*`; that is the
+    /// server's
     /// routing decision, not the body's — the extraction itself is pure
     /// and callable on any body, including `count_tokens` and `batches`
     /// bodies, whose top-level `messages` is absent by design.
     ///
-    /// **Unit parity:** lengths count UTF-16 code units, because ctp
-    /// measures JS strings and the ledger must stay comparable with ctp's
-    /// imported rows (`toker import`, phase 2). An astral character
-    /// (emoji, 𝄞) counts as two units, exactly as in ctp.
+    /// **Unit parity:** lengths count UTF-16 code units, because a JS
+    /// proxy measures JS strings and the ledger must stay comparable with
+    /// the predecessor's imported rows (`toker import`, phase 2). An
+    /// astral character
+    /// (emoji, 𝄞) counts as two units, exactly as in a JS string.
     pub fn shape(&self) -> AnthropicShape {
         let value = &self.request.value;
         let messages = self.messages();
         let tools = self.tools();
 
-        // ctp requestShape's `blocks`: the system text pieces, in order.
+        // The system text pieces, in order.
         // A string system is one piece; a block array contributes each
         // string element and each block's `text` ("" when absent or not a
-        // string — the API requires `text` to be a string, so ctp's JS
+        // string — the API requires `text` to be a string, so a JS
         // stringification of non-string values is a malformed-body
         // artefact toker does not reproduce).
         let pieces = system_pieces(value);
@@ -191,14 +194,14 @@ impl<'a> AnthropicBody<'a> {
 
         AnthropicShape {
             req_bytes: self.request.req_bytes,
-            // ctp parity: null when `messages` is missing or not an array,
+            // Row parity: null when `messages` is missing or not an array,
             // not zero (absence ≠ zero, invariant 3).
             req_messages: value
                 .get("messages")
                 .and_then(Value::as_array)
                 .map(|messages| messages.len() as u64),
             req_tools: tool_names.len() as u64,
-            // ctp hashed the empty join to a constant; toker records None
+            // The predecessor hashed the empty join to a constant; toker records None
             // for an empty tool list instead (the same deliberate
             // divergence as the openai view — see
             // `openai_chat::Shape::tools_hash`; lane behaviour is
@@ -207,7 +210,7 @@ impl<'a> AnthropicBody<'a> {
             tools_hash: (!tool_names.is_empty())
                 .then(|| short_hash(tool_names.join("\0").as_bytes())),
             system_chars: system_units.len() as u64,
-            // Always present, even for an empty system (ctp parity: the
+            // Always present, even for an empty system (row parity: the
             // digest of "" is a valid, comparable identity).
             system_hash: short_hash(&system_bytes),
             system_blocks,
@@ -219,8 +222,7 @@ impl<'a> AnthropicBody<'a> {
         }
     }
 
-    /// Does this request carry a fresh release marker? (ctp
-    /// `carriesRelease`, limit.mjs:48-54.)
+    /// Does this request carry a fresh release marker?
     ///
     /// Anchored to the request, not to the string: the marker must OPEN
     /// the last user message's first text block. That fires on exactly
@@ -270,22 +272,22 @@ impl AnthropicBodyMut<'_> {
     }
 
     /// Remove the release marker from position 0 of user text blocks, so
-    /// the model never sees it. (ctp `stripSentinel`, limit.mjs:78-125 —
-    /// the frozen public API: this rule stays byte-stable forever.)
+    /// the model never sees it.
+    /// The rule is a frozen public API: it stays byte-stable forever.
     ///
-    /// **Byte equivalence with ctp's splice.** ctp byte-splices the raw
-    /// buffer because Node's `JSON.stringify` may reorder keys and
+    /// **Byte equivalence with a raw splice.** The predecessor
+    /// byte-spliced the raw buffer because Node's `JSON.stringify` may reorder keys and
     /// renormalise escapes. toker's IR round-trip is byte-exact for
     /// canonical input (proven per fixture by the fidelity corpus, and
     /// per request in production by the fidelity monitor), and the marker
     /// contains no characters JSON escapes — so removing it from the
     /// parsed text blocks and re-serialising produces the identical bytes
-    /// to ctp's splice, with key order and every other byte preserved.
+    /// to a raw splice, with key order and every other byte preserved.
     /// The tests pin this equivalence against a hand-done splice.
     ///
     /// **On any ambiguity, the body is left untouched** — the cost is that
     /// the model sees the marker once; the alternative is corrupting a
-    /// request. The three guards, in ctp's order:
+    /// request. The three guards, in order:
     ///
     /// - a block the marker would empty (the API rejects empty AND
     ///   whitespace-only text blocks, and the message persists in
@@ -296,16 +298,16 @@ impl AnthropicBodyMut<'_> {
     ///   echo, an escaped quote — means we cannot say which bytes to
     ///   remove);
     /// - a `messages` that is absent or not an array (nothing to iterate;
-    ///   ctp's guard against the non-iterable that once took the whole
+    ///   the guard against the non-iterable that once took the whole
     ///   listener down).
     ///
     /// A marker not at position 0 is never stripped, in either
     /// implementation: anything else would rewrite pasted code —
     /// `if (!burn) x()` would have become `if () x()`.
     pub fn strip_release(&mut self) {
-        // Phase 1 — ctp's parsed decision, as mutation targets (message
+        // Phase 1 — the parsed decision, as mutation targets (message
         // index, block index; a string-content message has no block
-        // index, mirroring ctp's synthesised `{type: "text"}` block).
+        // index, mirroring the synthesised `{type: "text"}` block).
         let mut targets: Vec<(usize, Option<usize>)> = Vec::new();
         if let Some(messages) = self.request.value.get("messages").and_then(Value::as_array) {
             for (message_index, message) in messages.iter().enumerate() {
@@ -340,7 +342,7 @@ impl AnthropicBodyMut<'_> {
             return; // nothing to strip: body untouched
         }
 
-        // ctp's raw scan: the marker needs no JSON escaping, so at
+        // The raw scan: the marker needs no JSON escaping, so at
         // position 0 of a string it is always preceded by the opening
         // quote — that is what makes the scan unambiguous. The scan runs
         // over the serialised bytes, which are the wire bytes for the
@@ -453,7 +455,7 @@ impl<'a> Message<'a> {
         }
     }
 
-    /// Plain text of the message (ctp `messageText`, proxy.mjs:772-779):
+    /// Plain text of the message:
     /// string content is itself; an array contributes each block's
     /// `text` ("" for string elements, the element itself) joined on
     /// `\n`; anything else is "". The newline join is load-bearing — it
@@ -477,9 +479,9 @@ impl<'a> Message<'a> {
     }
 
     /// The first text block's text, for a message whose content may be a
-    /// string (ctp `firstText`, limit.mjs:31-37). A content array yields
+    /// string. A content array yields
     /// its FIRST `text`-typed block's `text` — and nothing if that block
-    /// has no string `text`: like ctp's `find`, this does not keep
+    /// has no string `text`: this does not keep
     /// searching past it.
     pub fn first_text(&self) -> Option<&'a str> {
         match self.content() {
@@ -493,8 +495,8 @@ impl<'a> Message<'a> {
         }
     }
 
-    /// Whether the message carries a `tool_result` block (ctp
-    /// `hasToolResult`, proxy.mjs:786-789). A turn carrying a tool
+    /// Whether the message carries a `tool_result` block.
+    /// A turn carrying a tool
     /// result is a continuation, never a summarisation prompt — Claude
     /// Code builds the compaction request's last message from the prompt
     /// string alone, so this can only exclude the wrong thing.
@@ -556,10 +558,10 @@ pub struct Tool<'a> {
 }
 
 impl<'a> Tool<'a> {
-    /// The tool's name (ctp `requestShape`'s extraction, proxy.mjs:865-867):
+    /// The tool's name:
     /// `name`, then `type`, then a constant `?`. A tool never reads as
     /// absent — the `?` keeps the count and the join aligned the way
-    /// ctp's did.
+    /// the predecessor's did.
     pub fn name(&self) -> &'a str {
         self.value
             .get("name")
@@ -569,13 +571,13 @@ impl<'a> Tool<'a> {
     }
 }
 
-/// The content-free request shape for the ledger and lanes (ctp
-/// `requestShape`, proxy.mjs:853-897): counts, lengths, and digests only —
+/// The content-free request shape for the ledger and lanes:
+/// counts, lengths, and digests only —
 /// never prompt, message, or tool text (invariant 1). The server unit
 /// copies these into the `requests` row.
 ///
-/// Length unit parity with ctp: JS strings are UTF-16, and the ledger must
-/// stay comparable with ctp's imported rows, so every `chars`/`chars`
+/// Length unit parity: JS strings are UTF-16, and the ledger must
+/// stay comparable with the predecessor's imported rows, so every `chars`
 /// count here is UTF-16 code units (see [`AnthropicBody::shape`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicShape {
@@ -584,49 +586,49 @@ pub struct AnthropicShape {
     /// Message count; `None` when `messages` is missing or not an array
     /// (absence ≠ zero, invariant 3) — including batches bodies.
     pub req_messages: Option<u64>,
-    /// Tool count (0 when `tools` is absent — ctp parity).
+    /// Tool count (0 when `tools` is absent — row parity).
     pub req_tools: u64,
     /// Digest of the tool-name list joined with `\0`, in order (order
     /// matters as much as membership: tools render first, so any
     /// reordering invalidates the entire prefix). `None` when the tool
-    /// list is empty — the same deliberate divergence from ctp's
+    /// list is empty — the same deliberate divergence from the
     /// hash-of-empty-join as `openai_chat::Shape::tools_hash`.
     pub tools_hash: Option<String>,
-    /// Total system text length in UTF-16 code units (ctp `systemChars`).
+    /// Total system text length in UTF-16 code units.
     pub system_chars: u64,
     /// Digest of the concatenated system text; always present, even when
-    /// empty (ctp parity).
+    /// empty (row parity).
     pub system_hash: String,
-    /// Per-block digests/lengths: one per system piece, in order (ctp
-    /// `systemBlocks`). Localises a system-prompt change to a block; the
+    /// Per-block digests/lengths: one per system piece, in order.
+    /// Localises a system-prompt change to a block; the
     /// ladders localise it further.
     pub system_blocks: Vec<SystemBlockDigest>,
     /// How many mid-conversation `system` messages the request carries —
     /// a count, never the text. Recorded because it decides whether the
     /// compaction rewrite can send a conversation to Sonnet untouched.
-    /// `None` when zero (ctp omits the field, so rows that carry none are
-    /// unchanged).
+    /// `None` when zero (the row omits the field, so rows that carry none
+    /// are unchanged).
     pub system_messages: Option<u64>,
     /// Compaction generations: occurrences of the continuation preamble in
-    /// the FIRST message's text (ctp `compactGenerations`). Scoped to the
+    /// the FIRST message's text. Scoped to the
     /// first message, not anchored to its start — Claude Code prepends
     /// system-reminder blocks, so requiring offset zero missed every real
     /// case. `None` when zero.
     pub compact_generations: Option<u64>,
     /// Whether the LAST message begins a line with a summarisation
-    /// instruction (ctp `summarising`). NOT a compaction flag: Claude Code
+    /// instruction. NOT a compaction flag: Claude Code
     /// issues the same summarisation prompt for session titles and
     /// resume metadata, on a small model with no tools, several times a
     /// minute. Which kind it is takes the tool set too — ask
     /// [`AnthropicShape::is_compaction`], never this field alone.
     pub summarising: bool,
-    /// Cumulative system-text digests every 2 KiB (ctp `systemLadder`):
+    /// Cumulative system-text digests every 2 KiB:
     /// the first rung that differs between two requests bounds the
     /// change to a 2 KiB window. Complete steps only, so the final
     /// partial step is unmeasured — the tail ladder covers that gap.
     pub system_ladder: Vec<String>,
     /// Digests of the system text's last 8, 16, … 256 bytes (8-byte
-    /// steps), then 320, 384, … 1024 (64-byte steps) (ctp `systemTail`):
+    /// steps), then 320, 384, … 1024 (64-byte steps):
     /// every observed system-prompt change landed within the last few
     /// hundred bytes, so resolution is spent there. Suffixes are compared
     /// by length, so this survives the prompt changing size.
@@ -634,8 +636,7 @@ pub struct AnthropicShape {
 }
 
 impl AnthropicShape {
-    /// Whether this request is a real compaction (ctp `isCompaction`,
-    /// cold.mjs:701-706).
+    /// Whether this request is a real compaction.
     ///
     /// The separator between a compaction and the routine summariser is
     /// not size, which would be a threshold to tune: a compaction
@@ -644,7 +645,8 @@ impl AnthropicShape {
     /// standalone one-shot that cannot call a tool and is sent with none.
     /// Measured, the two do not overlap.
     ///
-    /// ctp answers `null` where `reqTools` is absent, because its log
+    /// The predecessor answered `null` where `reqTools` is absent, because
+    /// its log
     /// rows predate the field; a freshly extracted shape always knows its
     /// tool count, so the three-valued logic collapses to a bool here
     /// (the historical-row case is `toker import`'s concern, phase 2).
@@ -656,16 +658,16 @@ impl AnthropicShape {
 /// One system block's digest and length (no content — invariant 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemBlockDigest {
-    /// The block's length in UTF-16 code units (ctp parity — JS strings).
+    /// The block's length in UTF-16 code units (unit parity — JS strings).
     pub chars: u64,
     /// The block's sha256/12 digest.
     pub hash: String,
 }
 
-// ── ctp ports, private ─────────────────────────────────────────────────────
+// ── predecessor ports, private ────────────────────────────────────────
 
-/// The system text pieces, in order (ctp `requestShape`'s `blocks`,
-/// proxy.mjs:858-862): a string system is one piece; a block array
+/// The system text pieces, in order:
+/// (a string system is one piece; a block array
 /// contributes each string element and each block's `text`.
 fn system_pieces(value: &Value) -> Vec<&str> {
     match value.get("system") {
@@ -681,8 +683,8 @@ fn system_pieces(value: &Value) -> Vec<&str> {
     }
 }
 
-/// Compaction markers, anchored by position rather than presence (ctp
-/// `compactionOf`, proxy.mjs:811-851). Searching the whole body is wrong:
+/// Compaction markers, anchored by position rather than presence.
+/// Searching the whole body is wrong:
 /// any conversation that *discusses* compaction contains the marker text
 /// and reports itself as compacted. Claude Code puts the continuation
 /// preamble in the first message and the summarisation instruction in the
@@ -693,8 +695,9 @@ fn compaction_of(messages: &[Value]) -> (Option<u64>, bool) {
     let Some(first) = messages.first() else {
         return (None, false);
     };
-    // Known ctp limitation, carried over: a first message that quotes the
-    // preamble (its own summary) over-counts. The first message is the
+    // A first message that quotes the preamble (its own summary)
+    // over-counts — a limitation carried over from the predecessor. The
+    // first message is the
     // tightest scope that still works.
     let generations = count_of(&Message { value: first }.text(), COMPACT_RESUMED);
     let compact_generations = (generations > 0).then_some(generations);
@@ -710,7 +713,7 @@ fn compaction_of(messages: &[Value]) -> (Option<u64>, bool) {
     (compact_generations, summarising)
 }
 
-/// Non-overlapping occurrence count (ctp `countOf`, proxy.mjs:765-769).
+/// Non-overlapping occurrence count.
 fn count_of(haystack: &str, needle: &str) -> u64 {
     let mut count = 0u64;
     let mut from = 0;
@@ -721,8 +724,8 @@ fn count_of(haystack: &str, needle: &str) -> u64 {
     count
 }
 
-/// `needle` at the start of `hay`, or at the start of a line within it
-/// (ctp `beginsLine`, proxy.mjs:792-797). In the assembled prompt the
+/// `needle` at the start of `hay`, or at the start of a line within it.
+/// In the assembled prompt the
 /// preamble is at offset 0 and the instruction follows a blank line, so
 /// both begin a line; quoted prose and listings carry them mid-line. The
 /// line anchor survives blocks being prepended — [`Message::text`] joins
@@ -740,8 +743,8 @@ fn begins_line(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Cumulative digests every 2 KiB of UTF-16 text (ctp `prefixLadder`,
-/// proxy.mjs:602-608). Rungs at complete steps only (`end < length`), so
+/// Cumulative digests every 2 KiB of UTF-16 text. Rungs at complete steps
+/// only (`end < length`), so
 /// an exact multiple contributes no rung for its final step.
 fn prefix_ladder(units: &[u16]) -> Vec<String> {
     let mut rungs = Vec::new();
@@ -753,12 +756,12 @@ fn prefix_ladder(units: &[u16]) -> Vec<String> {
     rungs
 }
 
-/// The tail-ladder offsets for a text of `text_length` UTF-16 units (ctp
-/// `tailOffsets`, proxy.mjs:630-636): fine steps close to the end, coarser
+/// The tail-ladder offsets for a text of `text_length` UTF-16 units:
+/// fine steps close to the end, coarser
 /// further back — every observed change has been within the last few
 /// hundred bytes, so resolution is spent there. Offsets longer than the
 /// text are dropped. `pub(crate)`: the rebuild localisation walks the
-/// stored rungs by these offsets (proxy.mjs:694-700's `offs[ti]`).
+/// stored rungs by these offsets.
 pub(crate) fn tail_offsets(text_length: usize) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(44);
     let mut len = TAIL_FINE_STEP;
@@ -766,7 +769,9 @@ pub(crate) fn tail_offsets(text_length: usize) -> Vec<usize> {
         offsets.push(len);
         len += TAIL_FINE_STEP;
     }
-    // ctp's conditional start (`TAIL_SPAN >= TAIL_FINE_SPAN ? …`) holds
+    // The conditional start
+    // (coarse run beginning right after the fine span only when
+    // `TAIL_SPAN >= TAIL_FINE_SPAN`) holds
     // for these constants, so the coarse run begins right after the fine
     // span.
     let mut len = TAIL_FINE_SPAN + TAIL_STEP;
@@ -778,8 +783,7 @@ pub(crate) fn tail_offsets(text_length: usize) -> Vec<usize> {
     offsets
 }
 
-/// Digests of the last 8, 16, … bytes of the system text (ctp
-/// `suffixLadder`, proxy.mjs:638-640).
+/// Digests of the last 8, 16, … bytes of the system text.
 fn suffix_ladder(units: &[u16]) -> Vec<String> {
     let total = units.len();
     tail_offsets(total)
@@ -788,15 +792,15 @@ fn suffix_ladder(units: &[u16]) -> Vec<String> {
         .collect()
 }
 
-/// The UTF-8 bytes of a UTF-16 slice, with ctp's Node semantics: an
+/// The UTF-8 bytes of a UTF-16 slice, with Node semantics: an
 /// unpaired surrogate (a rung boundary that splits an astral character)
 /// encodes as U+FFFD, exactly as Node's `Buffer.from` does.
 fn utf16_bytes(units: &[u16]) -> Vec<u8> {
     String::from_utf16_lossy(units).into_bytes()
 }
 
-/// Whether a text block starting with the marker can lose it (ctp's
-/// would-empty-it test, limit.mjs:99): the remainder must survive `trim`
+/// Whether a text block starting with the marker can lose it
+/// (the would-empty-it test): the remainder must survive `trim`
 /// non-empty, because the API rejects empty AND whitespace-only text
 /// blocks. JS `trim` removes Unicode White_Space plus U+FEFF;
 /// `char::is_whitespace` covers every member but U+FEFF.
@@ -819,8 +823,8 @@ mod tests {
         Request::parse(body).expect("test body parses")
     }
 
-    /// A canonical body with the given messages (ctp limit-sentinel.mjs's
-    /// `body`/`userText` helpers).
+    /// A canonical body with the given messages
+    /// (`body`/`userText` helper shape).
     fn body_of(messages: impl Into<serde_json::Value>) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "model": "claude-opus-5", "messages": messages.into()
@@ -844,7 +848,7 @@ mod tests {
         serde_json::json!({"role": "system", "content": [{"type": "text", "text": text}]})
     }
 
-    // ── release marker: detection (limit-sentinel.mjs ports) ────────────
+    // ── release marker: detection ─────────────────────────────────────
 
     #[test]
     fn the_marker_literal_is_unchanged() {
@@ -910,7 +914,7 @@ mod tests {
         assert!(parse(&body).anthropic().carries_release());
     }
 
-    // ctp's `firstText` stops at the first text-typed block: a marker in
+    // The first-text read stops at the first text-typed block: a marker in
     // a later block of the same message never fires.
     #[test]
     fn only_the_first_text_block_of_the_last_user_message_is_read() {
@@ -919,8 +923,8 @@ mod tests {
             {"type": "text", "text": SENTINEL},
         ]})]);
         assert!(!parse(&body).anthropic().carries_release());
-        // …and a text-typed block without string text ends the search the
-        // same way ctp's `find` does.
+        // …and a text-typed block without string text ends the search
+        // the same way a first-match find does.
         let body = body_of(vec![serde_json::json!({"role": "user", "content": [
             {"type": "text", "text": 5},
             {"type": "text", "text": SENTINEL},
@@ -938,7 +942,7 @@ mod tests {
         assert!(!parse(br#""body""#).anthropic().carries_release());
     }
 
-    // ── release marker: stripping (limit-sentinel.mjs ports) ────────────
+    // ── release marker: stripping ─────────────────────────────────────
 
     #[test]
     fn strips_at_position_zero_and_is_byte_equal_to_a_hand_splice() {
@@ -1049,8 +1053,9 @@ mod tests {
         assert_eq!(request.serialise(), original);
     }
 
-    // The regression that took ctp down: a truthy non-array `messages`
-    // reached a bare `for...of` and severed every in-flight session.
+    // The regression that took the predecessor down: a truthy non-array
+    // `messages` reached a bare `for...of` and severed every in-flight
+    // session.
     #[test]
     fn a_non_array_messages_field_returns_the_body_unchanged() {
         for body in [
@@ -1088,7 +1093,7 @@ mod tests {
         assert_eq!(view.messages().get(3).unwrap().first_text(), Some(" third"));
     }
 
-    // ── compaction detection (proxy.mjs / cold.mjs ports) ───────────────
+    // ── compaction detection ──────────────────────────────────────────
 
     const RESUMED: &str = "This session is being continued from a previous conversation";
     const PERFORMING: &str = "Your task is to create a detailed summary of";
@@ -1181,7 +1186,7 @@ mod tests {
 
     #[test]
     fn is_compaction_needs_the_tool_set_not_just_the_wording() {
-        // cold.mjs: a compaction continues a session, so it carries that
+        // A compaction continues a session, so it carries that
         // session's tools; the routine title summariser is a standalone
         // one-shot with none.
         let compaction = serde_json::json!({
@@ -1216,7 +1221,7 @@ mod tests {
 
     #[test]
     fn stream_true_and_explicitly_false_are_distinct_from_an_omitted_field() {
-        // ctp `clientWants` (proxy.mjs:1050): `streamFalse` is
+        // `streamFalse` is
         // `stream === false` — only an explicit false. The gates use it to
         // pick the synthetic turn's rendering: a client that omitted the
         // field gets SSE, not a JSON body it may not parse.
@@ -1289,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn lengths_count_utf16_units_like_ctps_js_strings() {
+    fn lengths_count_utf16_units_like_js_strings() {
         // An astral character is two units, as in JS.
         let body = serde_json::to_vec(&serde_json::json!({
             "model": "m", "system": "🎉a", "messages": [],
@@ -1301,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_names_follow_ctps_fallback_chain_in_order() {
+    fn tool_names_follow_the_fallback_chain_in_order() {
         let body = br#"{"model":"m","tools":[{"name":"a"},{"type":"custom"},{"weird":true}],"messages":[]}"#;
         let shape = parse(body).anthropic().shape();
         assert_eq!(shape.req_tools, 3);
@@ -1347,7 +1352,7 @@ mod tests {
 
     #[test]
     fn the_prefix_ladder_covers_complete_steps_only() {
-        // Exactly one step: no rung (ctp's `end < length`).
+        // Exactly one step: no rung (`end < length`).
         let exact = "x".repeat(8192);
         let body = format!(r#"{{"model":"m","system":"{exact}","messages":[]}}"#);
         assert!(
@@ -1370,7 +1375,7 @@ mod tests {
     #[test]
     fn a_rung_boundary_that_splits_an_astral_character_hashes_the_replacement() {
         // 8191 ASCII units plus one two-unit astral character: the first
-        // rung boundary splits the pair, and both ctp's Node
+        // rung boundary splits the pair, and both Node
         // (`Buffer.from` on a lone surrogate) and this port hash the
         // U+FFFD replacement.
         let prefix = "x".repeat(8191);

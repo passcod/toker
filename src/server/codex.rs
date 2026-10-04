@@ -19,7 +19,7 @@
 //! in `usage_raw`, cost NULL — there is no honest per-token price for
 //! codex slugs, never guessed), an error row on a failed one. The
 //! codex meters (`x-codex-*` headers) feed the per-backend meter slot
-//! on EVERY response, ctp's "not just accounted ones" rule.
+//! on EVERY response — the "not just accounted ones" rule.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

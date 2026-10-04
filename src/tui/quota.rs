@@ -1,24 +1,24 @@
 //! The rate & quota panel's aggregation (plan: TUI — "rate & quota"), a
-//! faithful port of the ctp pieces `live.mjs` renders that panel from:
+//! faithful port of the predecessor pieces that panel rendered from:
 //!
-//! - `METERS` (ctp forecast.mjs:31-35) — the three panel meters. The
+//! - the three panel meters. The
 //!   burn specs already live in [crate::middleware::cold]
 //!   ([`METER_5H`]/[`METER_7D`]/[`METER_OVERAGE`], ported for the cold
 //!   outlook), so this module adds only the fields rendering reads
 //!   (label, status key);
-//! - `burnRate` / `projectTo` — REUSED from
+//! - the burn ladder and projection — REUSED from
 //!   [crate::middleware::cold], not duplicated: the four-state burn,
 //!   the window-restart fall detection, the zero-reading anchor, the
 //!   day-scale-span rule (a reset more than a day out is measured
 //!   across at least a full day, which carries the duty cycle without
 //!   modelling it) and the five verdicts are all there;
-//! - `meterUsed` / `periods` / `readingsOf` (ctp forecast.mjs:290-425) —
+//! - the span totals —
 //!   a span TOTAL rather than a rate, measured from the reading BEFORE
 //!   the span (the first in-span reading already includes that
 //!   request's consumption, so measuring from it silently drops a
 //!   request's worth of spend);
-//! - the gate-aware target and the newest-reading pick (ctp live.mjs
-//!   537-626): `stops` counts down to the gate's threshold where `out`
+//! - the gate-aware target and the newest-reading pick:
+//!   `stops` counts down to the gate's threshold where `out`
 //!   counts down to exhaustion, a spent reading stops counting once its
 //!   window's reset passes ([`exhausted_meters`] carries `now`), and
 //!   the `?` marks a gate state assumed from rows predating `gate_on`.
@@ -46,15 +46,15 @@ use crate::middleware::cold::{
 use crate::middleware::quota::{Meters, THRESHOLD, exhausted_meters};
 use crate::store::MeterRow;
 
-/// One ctp `METERS` entry for the panel: the burn spec plus the fields
-/// only rendering reads. Order is ctp's render order (5h, 7d, overage).
+/// One panel meter: the burn spec plus the fields
+/// only rendering reads. Order is the render order (5h, 7d, overage).
 struct PanelMeter {
-    /// ctp `meter.key` — also the spelling of the gate's `gone` set.
+    /// The meter key — also the spelling of the gate's `gone` set.
     key: &'static str,
-    /// ctp `meter.label` — the line's left-aligned name.
+    /// The line's left-aligned name.
     label: &'static str,
     spec: &'static MeterSpec,
-    /// ctp `meter.status` — the per-window status field (`allowed` is
+    /// The per-window status field (`allowed` is
     /// the non-event and never renders).
     status_key: &'static str,
 }
@@ -85,7 +85,7 @@ const PANEL_METERS: [PanelMeter; 3] = [
 /// rather than zeros (invariant 3's per-backend panel rule).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QuotaAgg {
-    /// The meters the newest reading carries, in ctp's render order.
+    /// The meters the newest reading carries, in render order.
     /// A meter the reading does not carry is absent, not zero-filled.
     pub meters: Vec<MeterPanel>,
     /// Overage allowance points spent since the start of the local day
@@ -94,15 +94,15 @@ pub(crate) struct QuotaAgg {
     pub spent_today: Option<Spent>,
     /// Overage points spent over the running display window.
     pub spent_window: Option<Spent>,
-    /// The representative-claim — which limit is in force (ctp's
+    /// The representative-claim — which limit is in force (the
     /// `binding` line). `None` when the reading carried none.
     pub binding: Option<String>,
     /// Whether the newest reading already draws on overage rather than
-    /// plan quota (ctp `overageInUse`, read through the same typed view
+    /// plan quota (`overageInUse`, read through the same typed view
     /// the gate decides on).
     pub overage_in_use: bool,
     /// Whether the quota gate is armed: the newest `gate_on` reading,
-    /// or ctp's default of armed when no row carries one.
+    /// or armed by default when no row carries one.
     pub gate_on: bool,
     /// No row in the lookback carries `gate_on`: the state above was
     /// assumed, not observed, and a gate-aware countdown renders `?`.
@@ -112,9 +112,9 @@ pub(crate) struct QuotaAgg {
 /// One meter's line: the newest reading's figures plus the forecast.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MeterPanel {
-    /// ctp `METERS[key]` — "5h", "7d", "overage".
+    /// The meter key — "5h", "7d", "overage".
     pub key: &'static str,
-    /// The line's label (ctp `meter.label`).
+    /// The line's label.
     pub label: &'static str,
     /// The reading's utilisation, as reported.
     pub util: f64,
@@ -123,23 +123,23 @@ pub(crate) struct MeterPanel {
     pub reset_s: Option<i64>,
     /// The reading's per-window status field, when it carried one.
     pub status: Option<String>,
-    /// Whether the gate counts this meter exhausted right now (ctp's
+    /// Whether the gate counts this meter exhausted right now (the
     /// `gone` set): a reading whose window's reset has passed stops
     /// counting, so a stale spent figure can never wedge the panel.
     pub exhausted: bool,
     /// Whether the gate's threshold applies to this meter (armed gate,
-    /// and not the overage window — ctp `gated`).
+    /// and not the overage window).
     pub gated: bool,
     /// The wall the forecast counts down to: the gate's threshold when
     /// armed and not already past it, real exhaustion otherwise.
     pub target: f64,
-    /// When the burn reaches `target`, against the reset (ctp
-    /// `projectTo`; [`Verdict::Runout`] carries the instant).
+    /// When the burn reaches `target`, against the reset
+    /// ([`Verdict::Runout`] carries the instant).
     pub verdict: Verdict,
 }
 
-/// One `spent` span's answer (ctp `meterUsed`'s states — the five the
-/// README's `spent` table names, mapped to what renders them).
+/// One `spent` span's answer — the five display states the `spent`
+/// table names, mapped to what renders them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Spent {
     /// No reading for the meter at all — "no data", not the same as
@@ -160,7 +160,7 @@ pub(crate) enum Spent {
 /// store's meter-lookback read returns. `today_start_ms` is the local
 /// day's start and `window_since_ms` the display window's start — both
 /// inputs, so the model stays pure over its rows. `None` when no row
-/// carries a meter snapshot (ctp live.mjs:537's `if (lastRl)`).
+/// carries a meter snapshot.
 pub(crate) fn aggregate(
     rows: &[MeterRow],
     now_ms: i64,
@@ -173,9 +173,10 @@ pub(crate) fn aggregate(
     sorted.sort_by_key(|row| row.ts_ms);
 
     // The newest rate-limit reading, from every row that carries one,
-    // proxy-written kinds included (ctp live.mjs:273: "Error and
+    // proxy-written kinds included — "Error and
     // blocked rows carry the headers too, and are as good an
-    // observation as any" — after a block the stale copy is the only
+    // observation as any" (the predecessor's rule; after a block the
+    // stale copy is the only
     // row there is, and its reset value is what says whether the
     // window is still live).
     let last_rl = sorted
@@ -184,7 +185,7 @@ pub(crate) fn aggregate(
         .find_map(|row| row.rate_limits.as_ref())?;
 
     // The gate's state is logged per row because it cannot be worked
-    // out here (ctp live.mjs:279-280): the newest `gateOn` reading
+    // out here: the newest `gate_on` reading
     // wins, and a lookback with none falls back to the default of
     // armed — marked assumed, because a gate that is assumed must not
     // read the same as one that was observed.
@@ -193,8 +194,8 @@ pub(crate) fn aggregate(
     let gate_assumed = gate_seen.is_none();
 
     // Which meters the gate counts as exhausted right now, gate armed
-    // only (ctp live.mjs:541: `gone = gateOn ? exhaustedMeters(...) :
-    // []`). `exhausted_meters` takes `now`, so a reading whose window
+    // only (`gone = gateOn ? exhaustedMeters(...) : []`).
+    // `exhausted_meters` takes `now`, so a reading whose window
     // has rolled stops counting as exhaustion — without it the line
     // would read "gated · window rolled over", asserting a current
     // state from a reading it has just called stale.
@@ -211,7 +212,7 @@ pub(crate) fn aggregate(
         .iter()
         .filter_map(|panel| {
             // A meter the newest reading does not carry renders
-            // nothing (ctp q(): `if (v == null) return null`).
+            // nothing (an absent utilisation skips the line).
             let util = last_rl.get(panel.spec.util_key)?.as_f64()?;
             let reset_s = last_rl.get(panel.spec.reset_key).and_then(Value::as_i64);
             let status = last_rl
@@ -245,7 +246,7 @@ pub(crate) fn aggregate(
     // `spent` answers what the overage bar cannot — a meter sitting at
     // 64% says nothing about whether it got there this morning or a
     // week ago — and is the overage meter's line, rendered only where
-    // that meter rendered (ctp live.mjs:602).
+    // that meter rendered.
     let (spent_today, spent_window) = if meters.iter().any(|m| m.key == "overage") {
         (
             Some(meter_used(rows, &METER_OVERAGE, today_start_ms, now_ms)),
@@ -269,7 +270,7 @@ pub(crate) fn aggregate(
     })
 }
 
-// ── the span total (ctp meterUsed / periods / readingsOf) ────────────────
+// ── the span total ───────────────────────────────────────────────────
 
 /// The burn's samples for one meter over the narrow lookback: every row
 /// that carries the meter's fields, proxy-written kinds included —
@@ -296,9 +297,10 @@ fn burn_samples(rows: &[MeterRow], spec: &MeterSpec) -> Vec<MeterSample> {
 /// `rate_limits` is this process's last-seen copy rather than a
 /// response header — an old figure wearing a fresh timestamp, harmless
 /// as the newest reading of a rate and ruinous as the baseline of a
-/// total. (ctp `readingsOf`, forecast.mjs:290-304: excluded by the
+/// total. (Excluded by the
 /// presence of `kind`, never by listing the kinds — listing them is how
-/// `released` slipped into the quota fit.)
+/// a `released` row once slipped into a quota fit, a bug the predecessor
+/// had to learn the hard way.)
 fn readings_of(rows: &[MeterRow], spec: &MeterSpec) -> Vec<MeterSample> {
     let mut out: Vec<MeterSample> = rows
         .iter()
@@ -318,8 +320,7 @@ fn readings_of(rows: &[MeterRow], spec: &MeterSpec) -> Vec<MeterSample> {
 
 /// One accounting period: a stretch over which the meter counted up
 /// from a single start. Two things end one, and the difference between
-/// them is the whole point of the split (ctp `periods`,
-/// forecast.mjs:326-364):
+/// them is the whole point of the split:
 ///
 /// - a changed reset value: the window rolled, and the new period
 ///   opened at zero at the OLD window's reset instant — reconstructable,
@@ -337,7 +338,7 @@ struct Period {
 
 /// See [`Period`].
 fn periods(readings: &[MeterSample], spec: &MeterSpec) -> Vec<Period> {
-    // Phase 1 — split at reset changes (ctp `byReset`). The first
+    // Phase 1 — split at reset changes. The first
     // period's start is known only where the window has a known length
     // (the burn's anchor rule); a later one opened at the previous
     // window's reset instant.
@@ -393,8 +394,8 @@ fn periods(readings: &[MeterSample], spec: &MeterSpec) -> Vec<Period> {
     out
 }
 
-/// How much of `meter` was spent between `since_ms` and `now_ms` (ctp
-/// `meterUsed`, forecast.mjs:392-425 — ported step for step). A total,
+/// How much of `meter` was spent between `since_ms` and `now_ms`
+/// (ported step for step). A total,
 /// not a rate, so it comes from the lookback rather than the display
 /// window: the baseline for a span is the last reading BEFORE it, and
 /// "before midnight" is usually older than the window. `delta` can be
@@ -581,7 +582,7 @@ mod tests {
         assert!(snap.gate_on);
         assert!(!snap.gate_assumed);
         // overageInUse with both plan windows healthy counts as the 5h
-        // meter being gone (ctp's rule), so the gate's wall applies.
+        // meter being gone, so the gate's wall applies.
         assert!(five.exhausted);
         assert!(five.gated);
         assert_eq!(
@@ -708,7 +709,7 @@ mod tests {
             json!({"util5h": 0.30, "reset5h": (NOW + HOUR) / 1000}),
         )];
         let snap = quota(&rows).expect("reading exists");
-        assert!(snap.gate_on, "ctp's default is armed");
+        assert!(snap.gate_on, "the default is armed");
         assert!(snap.gate_assumed);
         let five = snap.meters.iter().find(|m| m.key == "5h").expect("5h");
         assert!(five.gated && five.target < 1.0);
@@ -741,7 +742,7 @@ mod tests {
         assert_eq!(five.verdict, Verdict::Reached);
     }
 
-    // ── the span totals (ctp meterUsed) ──────────────────────────────
+    // ── the span totals ────────────────────────────────────────────
 
     #[test]
     fn spent_no_data_idle_and_the_quantised_floor() {
@@ -926,7 +927,7 @@ mod tests {
     fn proxy_written_rows_never_baseline_a_total_but_do_read_as_the_newest() {
         // The blocked row's `rate_limits` is this process's last-seen
         // copy — an old figure wearing a fresh timestamp. The panel's
-        // newest reading still comes from it (ctp: after a block it is
+        // newest reading still comes from it (after a block it is
         // the only row there is), but a span total excludes it: picked
         // as a baseline, it would date an hour-old reading to the start
         // of the span and inflate the answer.
@@ -947,8 +948,8 @@ mod tests {
             0.02,
             false,
         );
-        // The newest reading: the blocked row's stale copy, per ctp's
-        // own rule — its reset value is what says whether the window
+        // The newest reading: the blocked row's stale copy, by the
+        // panel's own rule — its reset value is what says whether the window
         // is still live.
         let snap = quota(&rows).expect("rows carry snapshots");
         let overage = snap
@@ -1225,7 +1226,7 @@ mod tests {
     #[test]
     #[ignore = "a timing probe, not a correctness gate: seeds a scratch \
                 ledger at production scale (~25 000 rows, the shape the \
-                ctp import left) and times 100 refreshes of both meter-\
+                imported history left) and times 100 refreshes of both meter-\
                 lookback paths in the debug build; run deliberately with \
                 --ignored"]
     fn meter_lookback_timing_narrow_read_vs_full_row_read() {

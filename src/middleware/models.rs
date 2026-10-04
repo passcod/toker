@@ -10,25 +10,27 @@
 //! [`crate::catalog::windows`], already ported). The two meet at
 //! [`MergeIncoming`]/[`ModelEntry::context_window_json`]: a provider
 //! declaration may round-trip through the store, but the hand-verified
-//! catalogue wins at read time (ctp `contextWindowOf`'s precedence, held by
+//! catalogue wins at read time (a precedence held by
 //! [`crate::catalog::windows::resolve_context_window`] instead of being
 //! copied into learned entries on every write).
 //!
-//! A faithful port of ctp's `models.mjs`, measured over weeks of production
-//! traffic — ported, not improved. Sources:
+//! A faithful port of the predecessor proxy's learned model store, measured
+//! over weeks of production
+//! traffic — ported, not improved. Pieces:
 //!
-//! - `familyOf` / `newerThan` — models.mjs:223-253;
+//! - the family split and version comparison ([`family_of`],
+//!   [`newer_than`]);
 //! - `requirement` / `activeDaysOf` / `newestInFamily` (the day-based
-//!   election) — models.mjs:255-302;
-//! - `noteSeen` (local-day union, maxPrompt max) — models.mjs:381-392;
-//! - `mergeSeen` with `only: true` (the control endpoint's semantics) —
-//!   models.mjs:348-371;
+//!   election);
+//! - [`ModelStore::note_seen`] (local-day union, maxPrompt max);
+//! - `mergeSeen` with `only: true` (the control endpoint's semantics);
 //! - `controlMerge` (the endpoint's validation and reply) —
-//!   proxy.mjs:1068-1099, wired in [`crate::server::control`];
-//! - the in-memory recently-served map (`noteServed`, `servedOn`) —
-//!   proxy.mjs:264-269, seeded from the log tail at proxy.mjs:269.
+//!   wired in [`crate::server::control`];
+//! - the in-memory recently-served map ([`ModelStore::note_served`] /
+//!   [`ModelStore::last_served`], seeded from the ledger tail at startup).
 //!
-//! Days are **local calendar days** (ctp: `toLocaleDateString("en-CA")` —
+//! Days are **local calendar days** (a `toLocaleDateString("en-CA")`-style
+//! local day —
 //! "seen on seven separate days" is a statement about how someone works,
 //! not about UTC), so the timezone is an input to [`ModelStore::note_seen`],
 //! and tests pin it; the server passes the system zone.
@@ -45,12 +47,11 @@ use jiff::tz::TimeZone;
 use crate::catalog::windows::model_identity;
 use crate::store::{ModelEntry, RequestRow, Store};
 
-/// The ceiling on the requirement: a fortnight of daily use proves enough
-/// (ctp `MAX_REQUIRED_DAYS`, models.mjs:256).
+/// The ceiling on the requirement: a fortnight of daily use proves enough.
 pub const MAX_REQUIRED_DAYS: f64 = 7.0;
 
 /// A model id split into the family it belongs to and the version within
-/// it (ctp `familyOf`, models.mjs:223-234).
+/// it.
 ///
 /// The family is the non-numeric remainder and the version is the trailing
 /// numbers, so `claude-opus-4-8` is opus [4, 8] and `claude-opus-5` is opus
@@ -64,8 +65,7 @@ pub struct Family {
     pub version: Vec<u64>,
 }
 
-/// Is `a` a strictly newer version than `b`, within the same family? (ctp
-/// `newerThan`, models.mjs:244-253.)
+/// Is `a` a strictly newer version than `b`, within the same family?
 ///
 /// Segment-wise and numeric, because string order gets this wrong twice
 /// over: `claude-opus-5` sorts before `claude-opus-4-8`, and `4-10` sorts
@@ -79,7 +79,7 @@ pub fn newer_than(a: &str, b: &str) -> bool {
         return false;
     }
     for i in 0..fa.version.len().max(fb.version.len()) {
-        // ctp's `?? -1`: a missing segment is lower than any present one.
+        // A missing segment is lower than any present one.
         let x = fa.version.get(i).map(|&v| v as i64).unwrap_or(-1);
         let y = fb.version.get(i).map(|&v| v as i64).unwrap_or(-1);
         if x != y {
@@ -89,9 +89,8 @@ pub fn newer_than(a: &str, b: &str) -> bool {
     false
 }
 
-/// An id ending in a dated suffix ctp's alias table does not know: an
-/// *unpublished* snapshot. ctp `isUnpublishedClaudeSnapshot`
-/// (models.mjs:145-148) — matched only after alias folding, so a published
+/// An id ending in a dated suffix the alias table does not know: an
+/// *unpublished* snapshot. Matched only after alias folding, so a published
 /// dated identity like `claude-3-7-sonnet-20250219` folds to its dateless
 /// form and keeps its family.
 fn is_unpublished_claude_snapshot(model: &str) -> bool {
@@ -107,8 +106,8 @@ fn is_unpublished_claude_snapshot(model: &str) -> bool {
     }
 }
 
-/// The family a model belongs to (ctp `familyOf`, models.mjs:223-234 —
-/// ported exactly over the normalised identity; unknown stays `None`,
+/// The family a model belongs to
+/// (ported exactly over the normalised identity; unknown stays `None`,
 /// never guessed).
 pub fn family_of(model: &str) -> Option<Family> {
     if is_unpublished_claude_snapshot(model) {
@@ -119,7 +118,7 @@ pub fn family_of(model: &str) -> Option<Family> {
     let mut name = Vec::new();
     let mut version = Vec::new();
     for part in stripped.split('-') {
-        // ctp's /^\d+$/: only a run of digits is a version segment.
+        // Only a run of digits is a version segment.
         if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
             version.push(part.parse::<u64>().unwrap_or(u64::MAX));
         } else {
@@ -136,8 +135,7 @@ pub fn family_of(model: &str) -> Option<Family> {
 }
 
 /// How many days a model must have been seen on to be trusted as its
-/// family's newest, given how many days there are to judge against (ctp
-/// `requirement`, models.mjs:274).
+/// family's newest, given how many days there are to judge against.
 ///
 /// Scaled rather than absolute: an absolute bar asks a young log for
 /// evidence it cannot possibly contain — on a fresh install nothing would
@@ -153,8 +151,8 @@ pub fn requirement(active_days: usize) -> f64 {
 
 /// The parsed days of a learned entry: the JSON column's strings, deduped
 /// and sorted. Duplicates would inflate the count that clears the gate, so
-/// a single busy day could stand in for a week of use (ctp `pruneSeen`'s
-/// dedupe). A non-array or absent column reads as no days.
+/// a single busy day could stand in for a week of use. A non-array or
+/// absent column reads as no days.
 pub fn days_of(entry: &ModelEntry) -> Vec<String> {
     let Some(days) = entry.days_json.as_ref().and_then(|value| value.as_array()) else {
         return Vec::new();
@@ -170,7 +168,7 @@ pub fn days_of(entry: &ModelEntry) -> Vec<String> {
 }
 
 /// Days on which the log saw any traffic at all — the denominator of the
-/// election's bar (ctp `activeDaysOf`, models.mjs:277-281): the union of
+/// election's bar: the union of
 /// every model's days.
 pub fn active_days_of(entries: &[ModelEntry]) -> usize {
     let mut days = BTreeSet::new();
@@ -180,14 +178,15 @@ pub fn active_days_of(entries: &[ModelEntry]) -> usize {
     days.len()
 }
 
-/// The newest model in a family that has proven itself, or `None` (ctp
-/// `newestInFamily`, models.mjs:291-302 — without ctp's optional `accept`
+/// The newest model in a family that has proven itself, or `None`
+/// (without the optional `accept`
 /// hook; see [`newest_in_family_accepting`]).
 pub fn newest_in_family(entries: &[ModelEntry], family: &str) -> Option<String> {
     newest_in_family_accepting(entries, family, None)
 }
 
-/// [`newest_in_family`] with ctp's `accept` hook (models.mjs:298): a
+/// [`newest_in_family`] with the `accept` hook:
+/// a
 /// caller refuses a candidate it cannot use — the compaction retarget
 /// needs a model it can price, and an unpriced newcomer must fall back to
 /// the newest priced version rather than silently switching the feature
@@ -225,14 +224,14 @@ pub fn newest_in_family_accepting(
 }
 
 /// Has a model been observed holding a conversation at least `prompt`
-/// tokens? (ctp `fitsContext`, models.mjs:403 — a learned context check:
+/// tokens? (a learned context check:
 /// an unproven model declines, which costs an upgrade where the
 /// alternative costs a failed request at the worst possible moment.)
 /// Absence reads as zero, never a free pass.
 ///
 /// Shared by the two rewrites that need it: the compaction retarget
 /// ([`compaction_target_of`]) and the force-newest move
-/// ([`crate::middleware::force_newest`]) — ctp's one `fitsContext`.
+/// ([`crate::middleware::force_newest`]) — one shared check, both callers.
 pub(crate) fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> bool {
     entries
         .iter()
@@ -244,11 +243,10 @@ pub(crate) fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> 
 
 /// The model a cold compaction should be rewritten onto, from a spec that
 /// is either a family name (`"sonnet"`), an explicit id
-/// (`"claude-sonnet-5"`), or `"off"` (ctp `compactionTarget`,
-/// models.mjs:498-507). A family is resolved through the same election as
+/// (`"claude-sonnet-5"`), or `"off"`. A family is resolved through the same election as
 /// everything else, so the target follows what is actually in use rather
 /// than being pinned to a literal that goes stale the day a newer Sonnet
-/// ships. The price filter is ctp's `accept`: a candidate the table
+/// ships. The price filter is the `accept` hook: a candidate the table
 /// cannot price is no use to a rewrite that decides "cheaper" from it.
 pub fn compaction_target_of(entries: &[ModelEntry], spec: &str, prompt: u64) -> Option<String> {
     if spec.is_empty() || spec == "off" {
@@ -272,7 +270,7 @@ pub fn compaction_target_of(entries: &[ModelEntry], spec: &str, prompt: u64) -> 
 }
 
 /// The local calendar day of an epoch-millisecond timestamp, `YYYY-MM-DD`
-/// (ctp `noteSeen`'s `toLocaleDateString("en-CA")`). The timezone is the
+/// (the same shape an `en-CA` locale day renders as). The timezone is the
 /// caller's, so the grouping is a pure function of its inputs; the server
 /// passes the system zone, and tests pin theirs.
 pub fn local_day(at_ms: i64, tz: &TimeZone) -> Option<String> {
@@ -282,13 +280,13 @@ pub fn local_day(at_ms: i64, tz: &TimeZone) -> Option<String> {
     Some(zoned.date().to_string())
 }
 
-/// One incoming entry for a control-merge (ctp `mergeSeen`'s `from` side,
+/// One incoming entry for a control-merge (the merge's `from` side,
 /// already validated by the endpoint): days to union in, and a maxPrompt to
 /// max in, for one exact model identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeIncoming {
     pub model_id: String,
-    /// Days the log already has, granted as-is (ctp `planPromotion` grants
+    /// Days the log already has, granted as-is (a promotion grants
     /// only days the log already holds — inventing dates would also enlarge
     /// `activeDaysOf`, the denominator of the bar being cleared).
     pub days: Vec<String>,
@@ -310,7 +308,7 @@ pub enum MergeOutcome {
         entry: Box<ModelEntry>,
         target: Option<String>,
     },
-    /// The model has never been served: refused, never invented (ctp's
+    /// The model has never been served: refused, never invented (the
     /// `only: true`). The worst an outsider can do is what promote-model
     /// does on purpose — a typo here must not redirect a whole family's
     /// traffic to an id the API rejects.
@@ -324,14 +322,14 @@ pub enum MergeOutcome {
 pub struct ModelStore {
     store: Arc<Store>,
     /// Exact model identity → when it was last sent upstream, from any
-    /// session (ctp `servedOn`). Kept apart from the lane table because it
+    /// session. Kept apart from the lane table because it
     /// must never forget within the hour it answers for: the table is
     /// capped and moves only on a served response; this is a handful of
     /// entries, moved when a request is sent, so a request still in flight
     /// counts.
     served_on: Mutex<BTreeMap<String, i64>>,
     /// How far back `served_on` vouches: `None` when it was seeded from the
-    /// whole ledger (ctp's `-Infinity`); else the ts of the oldest seed row
+    /// whole ledger; else the ts of the oldest seed row
     /// (the tail cut a beginning off, and silence before it counts for
     /// nothing unless the record reaches back past the TTL).
     covered_since: Option<i64>,
@@ -339,8 +337,7 @@ pub struct ModelStore {
 
 impl ModelStore {
     /// Build the store, seeding the recently-served map from the ledger
-    /// tail (ctp proxy.mjs:269: `for (const r of seedRows) noteServed(...)`).
-    /// `covered` is [`Self::covered_since`]'s input: `None` when `rows` is
+    /// tail. `covered` is [`Self::covered_since`]'s input: `None` when `rows` is
     /// the whole ledger, else the tail's oldest ts.
     pub fn seeded(store: Arc<Store>, rows: &[RequestRow], covered: Option<i64>) -> ModelStore {
         let mut served_on = BTreeMap::new();
@@ -363,13 +360,13 @@ impl ModelStore {
         }
     }
 
-    /// Remember that `model` is being sent upstream **now** (ctp
-    /// `noteServed`, proxy.mjs:265-268 — called BEFORE the request goes
+    /// Remember that `model` is being sent upstream **now**
+    /// (called BEFORE the request goes
     /// upstream, so a lane deciding while this one is still in flight sees
     /// the model as in use; the response may later name a different served
     /// identity, and that remains authoritative for observations).
     ///
-    /// In-memory and infallible, exactly like ctp's map. `model` is
+    /// In-memory and infallible, exactly like an in-memory map. `model` is
     /// normalised to the exact identity first.
     pub fn note_served(&self, model: Option<&str>, at_ms: i64) {
         let Some(id) = model.and_then(model_identity) else {
@@ -382,7 +379,7 @@ impl ModelStore {
     }
 
     /// When `model` was last sent upstream, when this process or its seed
-    /// knows (ctp `servedOn.get`). The identity is normalised first.
+    /// knows. The identity is normalised first.
     pub fn last_served(&self, model: &str) -> Option<i64> {
         let id = model_identity(model)?;
         self.served_on.lock().ok()?.get(&id).copied()
@@ -390,13 +387,13 @@ impl ModelStore {
 
     /// How far back the served map vouches: `None` = the whole ledger was
     /// seeded (never forgets); `Some(ts)` = the tail cut a beginning off at
-    /// `ts` (ctp `servedCoveredSince`).
+    /// `ts`.
     pub fn covered_since(&self) -> Option<i64> {
         self.covered_since
     }
 
     /// Record that `model` served a request of `prompt` tokens at `at_ms`
-    /// (ctp `noteSeen`, models.mjs:381-392 — "a model is *seen* when a
+    /// ("a model is *seen* when a
     /// response named it").
     ///
     /// The day is the LOCAL calendar day of `at_ms` in `tz`; the prompt
@@ -435,7 +432,7 @@ impl ModelStore {
 
     /// The day-based election over the store's learned entries: the newest
     /// model in `family` that has been served on more than
-    /// `min(7, activeDays/2)` distinct days (ctp `newestInFamily`, with
+    /// `min(7, activeDays/2)` distinct days (with
     /// `activeDays` the union of the days the whole store holds).
     pub fn family_newest(&self, family: &str) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
@@ -443,8 +440,8 @@ impl ModelStore {
     }
 
     /// The model a cold compaction should be rewritten onto, resolved per
-    /// request against what is actually in use (ctp `compactionTarget`
-    /// over `seen`; see [`compaction_target_of`]). The size guard needs
+    /// request against what is actually in use
+    /// (see [`compaction_target_of`]). The size guard needs
     /// the prompt this lane is carrying. A store error propagates; the
     /// caller loses the target, never the request (invariant 6).
     pub fn compaction_target(
@@ -457,8 +454,8 @@ impl ModelStore {
     }
 
     /// The strictly-newer learned member of `model`'s family that a
-    /// request could be rewritten onto, proven at `prompt` (ctp
-    /// `forceTarget`, models.mjs:415-422 — the decision core lives in
+    /// request could be rewritten onto, proven at `prompt`
+    /// (the decision core lives in
     /// [`crate::middleware::force_newest::force_target_of`], where the
     /// sequencing that calls it is ported). A store error propagates; the
     /// caller loses the upgrade, never the request (invariant 6).
@@ -480,8 +477,8 @@ impl ModelStore {
             .collect())
     }
 
-    /// The models-merge semantics (ctp `mergeSeen(into, from, {only:
-    /// true})`, models.mjs:348-371 — the control endpoint's one power):
+    /// The models-merge semantics
+    /// (`mergeSeen(into, from, {only: true})` — the control endpoint's one power):
     /// **only adds** days and maxPrompt for a model **already served**,
     /// never creates one. Days union; the maxPrompt keeps the higher of
     /// the two, so neither side can erase what the other has seen — which
@@ -490,8 +487,8 @@ impl ModelStore {
     ///
     /// The stored context-window declaration survives a merge untouched:
     /// the hand-verified catalogue wins at read time anyway
-    /// ([`crate::catalog::windows::resolve_context_window`]), and ctp's
-    /// "never creates or widens declared context capability" holds here
+    /// ([`crate::catalog::windows::resolve_context_window`]), and the
+    /// "never creates or widens declared context capability" rule holds here
     /// because nothing here touches it.
     pub fn merge(&self, incoming: &MergeIncoming) -> crate::store::Result<MergeOutcome> {
         let Some(mut entry) = self.store.load_model(&incoming.model_id)? else {
@@ -620,7 +617,7 @@ mod tests {
         TimeZone::fixed(jiff::tz::Offset::from_hours(13).expect("offset"))
     }
 
-    // ── family parsing (ctp familyOf) ────────────────────────────────
+    // ── family parsing ──────────────────────────────────────────────
 
     #[test]
     fn families_parse_from_normalised_ids() {
@@ -663,7 +660,7 @@ mod tests {
         assert_eq!(
             family("gpt-5.6-sol"),
             Some(("gpt-5.6-sol".to_owned(), vec![])),
-            "5.6 is not a pure digit run: it stays family, ctp's /^\\d+$/"
+            "5.6 is not a pure digit run: it stays family, not a version segment"
         );
         // Published snapshots fold to their dateless form and keep a family.
         assert_eq!(
@@ -693,7 +690,7 @@ mod tests {
         assert!(!newer_than("no-family-at-all", "claude-opus-5"));
     }
 
-    // ── the election bar (ctp requirement / newestInFamily) ───────────
+    // ── the election bar ────────────────────────────────────────────
 
     #[test]
     fn the_bar_scales_with_the_log_both_sides() {
@@ -768,7 +765,7 @@ mod tests {
         );
     }
 
-    // ── local-day grouping (ctp noteSeen) ────────────────────────────
+    // ── local-day grouping ──────────────────────────────────────────
 
     #[test]
     fn days_group_by_local_calendar_day_never_utc() {
@@ -844,7 +841,7 @@ mod tests {
         );
     }
 
-    // ── the recently-served map (ctp noteServed / servedOn) ───────────
+    // ── the recently-served map ─────────────────────────────────────
 
     #[test]
     fn note_served_takes_the_latest_and_normalises_the_identity() {
@@ -881,7 +878,7 @@ mod tests {
         );
     }
 
-    // ── merge (ctp mergeSeen with only: true) ─────────────────────────
+    // ── merge (only: true) ──────────────────────────────────────────
 
     #[test]
     fn merge_only_adds_for_models_already_served_and_never_invents() {
@@ -1039,11 +1036,11 @@ mod tests {
         );
     }
 
-    // ── the compaction target (ctp compactionTarget) ──────────────────
+    // ── the compaction target ───────────────────────────────────────
 
     #[test]
     fn compaction_target_resolves_family_pin_and_context() {
-        // ctp compactionTarget (models.mjs:498-507), over the learned
+        // The compaction target, over the learned
         // store: a family name follows what is actually in use, an
         // explicit id is a pin, "off"/empty is nothing, and an unproven
         // context window declines — a failed request at the worst moment.
@@ -1071,7 +1068,7 @@ mod tests {
             compaction_target_of(&entries, "claude-sonnet-4-6", 150_000),
             Some("claude-sonnet-4-6".to_owned())
         );
-        // "off" and "" are nothing (ctp's falsy spec).
+        // "off" and "" are nothing (a falsy spec).
         assert_eq!(compaction_target_of(&entries, "off", 1), None);
         assert_eq!(compaction_target_of(&entries, "", 1), None);
         // A family nothing served has no target, and an unknown name has
@@ -1079,7 +1076,7 @@ mod tests {
         assert_eq!(compaction_target_of(&entries, "haiku", 1), None);
         assert_eq!(compaction_target_of(&entries, "gpt-5.6-sol", 1), None);
 
-        // The price filter (ctp's `accept`): a family whose elected
+        // The price filter (the `accept` hook): a family whose elected
         // newest cannot be priced is no use to a rewrite that judges
         // "cheaper" from the price table — it falls back to nothing
         // rather than switching the feature off on an unpriced candidate.

@@ -7,34 +7,32 @@
 //! serialises the result. There is no passthrough code path — passthrough is
 //! what the IR produces when nothing transforms it.
 //!
-//! The decision middlewares, each a faithful ctp port:
+//! The decision middlewares, each a faithful port of the predecessor proxy:
 //!
-//! - [`quota`] — the quota gate (ctp limit.mjs): meters → block-or-forward,
+//! - [`quota`] — the quota gate: meters → block-or-forward,
 //!   the release marker, the synthetic assistant turn a block is answered
 //!   with;
-//! - [`cold`] — the cold-cache gate and the compaction retarget (ctp
-//!   cold.mjs plus the burn/fit pieces its outlook calls): the
+//! - [`cold`] — the cold-cache gate and the compaction retarget (plus
+//!   the burn/fit pieces its outlook calls): the
 //!   once-per-idle-spell notice, the quota outlook that can withhold it,
 //!   and the only transform that changes model-visible prompt structure;
-//! - [`lanes`] — the lane table (`sessionId|toolsHash`, ctp docs/internals/
-//!   lanes.md's lane rule) with its TTL stickiness, ping tagging, prune
+//! - [`lanes`] — the lane table (`sessionId|toolsHash`, the lane rule
+//!   as the predecessor's internal docs stated it) with its TTL stickiness, ping tagging, prune
 //!   policy, and restart reseed — the substrate both gates read;
-//! - [`awake`] — the idle-sleep lock (ctp awake.mjs + inhibit.mjs + the
-//!   `evaluateAwake` wiring): live lanes + in-flight want-to-hold, the
+//! - [`awake`] — the idle-sleep lock: live lanes + in-flight want-to-hold, the
 //!   platform command table (GNOME → `gnome-session-inhibit`, other
 //!   Linux → `systemd-inhibit --what=idle --mode=block`), the detached
 //!   PID-watching child, the 5-minute retry backoff, and the held/want
 //!   flip bookkeeping — Linux v1, idle-only on purpose;
-//! - [`models`] — the learned model store (days served + maxPrompt, ctp
-//!   models.mjs's family parsing and day-based newest election) and the
+//! - [`models`] — the learned model store (days served + maxPrompt — the
+//!   family parsing and day-based newest election) and the
 //!   in-memory recently-served map, plus the merge semantics the
 //!   `/_toker/models/merge` control endpoint carries;
-//! - [`force_newest`] — the force-newest model rewrite (ctp
-//!   models.mjs's `forceTarget`/`stickyTarget` plus the proxy.mjs block
-//!   that sequences them): move a request onto its family's learned
+//! - [`force_newest`] — the force-newest model rewrite (the
+//!   target decision plus the block that sequences it): move a request onto its family's learned
 //!   newest, only where no cache can be lost, never down, sticky once
 //!   moved;
-//! - [`model_map`] — the model routing map (ctp model-map.mjs): opaque
+//! - [`model_map`] — the model routing map: opaque
 //!   operator routing policy, the pure parse/match/rewrite interface the
 //!   `route-identity` parity case pins (config and server wiring are the
 //!   model-routing unit's).
