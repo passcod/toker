@@ -1,5 +1,5 @@
-//! `toker setup` — the wizard's library half: the tested modules the
-//! interactive unit composes (plan: "Setup wizard", phase 5).
+//! `toker setup` — the wizard's library half plus the wizard itself
+//! (plan: "Setup wizard", phase 5).
 //!
 //! `toker setup` is idempotent — re-run it to change anything — and its
 //! steps are fixed in [`plan`], which is also the documentation of WHY
@@ -16,16 +16,17 @@
 //! - [`verify`] — [`verify::await_service_ready`], the empty-body-POST
 //!   wiring check the wizard runs after the units are up and before
 //!   any frontend is pointed at toker.
-//!
-//! The interactive unit (the prompting, the auth flows, the systemd
-//! unit installation) fills [`Step`] in; everything file-touching it
-//! needs is here and tested against scratch fixtures shaped like the
-//! real files on this machine.
+//! - [`wizard`] — the interactive flow: the questions, the systemd
+//!   unit installation, and the report, all behind testable seams
+//!   ([`wizard::Prompt`], [`wizard::SystemRunner`], [`wizard::Paths`])
+//!   so the whole wizard runs as a script in tests. `cmds::setup` is
+//!   the only place the seams meet the real world.
 
 pub mod atomic;
 pub mod config_writer;
 pub mod patchers;
 pub mod verify;
+pub mod wizard;
 
 /// One `toker setup` step, in execution order (see [`plan`]). The
 /// skeleton the interactive unit fills; every step is re-runnable.

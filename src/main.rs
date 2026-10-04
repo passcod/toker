@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             .block_on(cmds::serve()),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Report => not_implemented("report"),
-        Command::Setup => not_implemented("setup"),
+        Command::Setup => cmds::setup(),
         Command::Status => cmds::status(),
         Command::Import {
             from,

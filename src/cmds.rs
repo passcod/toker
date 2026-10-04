@@ -3,10 +3,10 @@
 //! The timer verbs serve the systemd wake/hold/ping units (plan: "Sleep
 //! lock, wake, ping") and are registered as hidden subcommands so they are
 //! reachable by the units but not part of the everyday CLI surface.
-//! `serve`, `status`, and `tui` are the wired commands: config → store →
-//! server; the resolved-config/ledger summary (plan: Credentials — status
-//! reports which key sources are in use, never the values); and the
-//! ratatui dashboard (plan: TUI).
+//! `serve`, `setup`, `status`, and `tui` are the wired commands: config →
+//! store → server; the interactive wizard; the resolved-config/ledger
+//! summary (plan: Credentials — status reports which key sources are in
+//! use, never the values); and the ratatui dashboard (plan: TUI).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +27,29 @@ pub async fn serve() -> anyhow::Result<()> {
         config.db_path.display()
     );
     Server::new(config, store)?.serve().await
+}
+
+/// `setup`: the interactive wizard (plan: "Setup wizard") — the ONLY
+/// place the wizard's seams meet the real world: the inquire prompt,
+/// the process systemctl runner, and this user's HOME-derived paths
+/// ([`crate::setup::wizard::Paths::real`]). Everything with logic runs
+/// scripted in [`crate::setup::wizard`]'s tests; everything here is
+/// wiring. The wizard prints its own state summary and report.
+pub fn setup() -> anyhow::Result<()> {
+    use crate::setup::wizard::{InquirePrompt, Paths, ProcessRunner, VERIFY_TIMEOUT, Wizard};
+
+    use anyhow::Context as _;
+
+    let paths = Paths::real()?;
+    let runner = ProcessRunner::new(paths.units_dir.clone());
+    let mut prompt = InquirePrompt;
+    let mut out = std::io::stdout();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the setup wizard's runtime")?
+        .block_on(Wizard::new(&mut prompt, &runner, &paths, &mut out, VERIFY_TIMEOUT).run())?;
+    Ok(())
 }
 
 /// `status`: the resolved config (sans secrets) plus ledger summary.
