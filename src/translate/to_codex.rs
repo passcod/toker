@@ -461,25 +461,16 @@ fn tool_choice_of(body: &Value) -> Result<&'static str, TranslateError> {
 /// verbatim. All three ride in `extra`, after the pinned fields.
 /// `stop_sequences` and `top_k` are dropped (no Responses equivalent —
 /// the parent module's docs).
-fn sampling_of(body: &Value, extra: &mut Map<String, Value>) -> Result<(), TranslateError> {
-    if let Some(max_tokens) = body.get("max_tokens").filter(|value| !value.is_null()) {
-        let max_tokens = max_tokens
-            .as_u64()
-            .ok_or_else(|| TranslateError::Malformed {
-                reason: "max_tokens is not a non-negative integer".to_owned(),
-            })?;
-        extra.insert("max_output_tokens".to_owned(), json!(max_tokens));
-    }
-    for (source, target) in [("temperature", "temperature"), ("top_p", "top_p")] {
-        if let Some(value) = body.get(source).filter(|value| !value.is_null()) {
-            if !value.is_number() {
-                return Err(TranslateError::Malformed {
-                    reason: format!("{source} is not a number"),
-                });
-            }
-            extra.insert(target.to_owned(), value.clone());
-        }
-    }
+/// Sampling parameters (`max_tokens`, `temperature`, `top_p`) are a
+/// **translation cost, dropped loudly**: the codex backend rejects them
+/// outright (verified live: `"Unsupported parameter: temperature"`),
+/// and its client never sends any — the `temperature`/`top_p` a codex
+/// response echoes are the backend's own defaults, not accepted knobs.
+/// The drop is documented beside the thinking-block drop in the module
+/// docs; nothing is silently mangled, the parameters just do not cross
+/// this protocol. They still land in the request's SHAPE record via
+/// the row's `req_bytes`, and claude's own retry budget is unchanged.
+fn sampling_of(_body: &Value, _extra: &mut Map<String, Value>) -> Result<(), TranslateError> {
     Ok(())
 }
 
@@ -576,9 +567,9 @@ mod tests {
                    "strict": false,
                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}})
         );
-        assert_eq!(request.extra.get("max_output_tokens"), Some(&json!(512)));
-        assert_eq!(request.extra.get("temperature"), Some(&json!(0.2)));
-        assert_eq!(request.extra.get("top_p"), Some(&json!(0.9)));
+        // Sampling does not cross (the live-verified drop): the body
+        // carried max_tokens/temperature/top_p, the request carries none.
+        assert!(request.extra.is_empty());
     }
 
     #[test]
@@ -1067,7 +1058,12 @@ mod tests {
     }
 
     #[test]
-    fn sampling_maps_max_tokens_temperature_top_p_and_drops_the_rest() {
+    fn sampling_parameters_do_not_cross_this_protocol() {
+        // Verified live: "Unsupported parameter: temperature" — the
+        // backend rejects them, its client sends none, and the values a
+        // response echoes are the backend's own defaults. All sampling
+        // knobs are a documented translation cost, dropped like
+        // thinking blocks — loudly in the docs, absent from the wire.
         let body = json!({
             "model": "claude-opus-5",
             "max_tokens": 4096,
@@ -1080,45 +1076,16 @@ mod tests {
             "messages": [{"role": "user", "content": "Hi"}],
         });
         let request = to_codex(&body, MODEL, KEY).expect("translates");
-        assert_eq!(request.extra.get("max_output_tokens"), Some(&json!(4096)));
-        assert_eq!(request.extra.get("temperature"), Some(&json!(0.3)));
-        assert_eq!(request.extra.get("top_p"), Some(&json!(0.95)));
-        assert_eq!(request.extra.len(), 3, "exactly the three sampling fields");
-        // The dropped fields (the parent module's docs): none of them
-        // ride along anywhere in the request.
+        assert!(request.extra.is_empty(), "no sampling fields cross");
+        // None of the dropped fields ride along anywhere in the request.
         let bytes = serde_json::to_string(&request).expect("serialise");
+        assert!(!bytes.contains("max_output_tokens"));
+        assert!(!bytes.contains("temperature"));
+        assert!(!bytes.contains("top_p"));
         assert!(!bytes.contains("stop_sequences"));
         assert!(!bytes.contains("top_k"));
         assert!(!bytes.contains("user_id"));
         assert!(!bytes.contains("budget_tokens"));
-
-        // Omitted max_tokens stays omitted — the codex client itself
-        // sends none (the wire's own ceiling governs).
-        let omitted = json!({
-            "model": "claude-opus-5",
-            "messages": [{"role": "user", "content": "Hi"}],
-        });
-        let request = to_codex(&omitted, MODEL, KEY).expect("translates");
-        assert!(request.extra.get("max_output_tokens").is_none());
-        assert!(request.extra.is_empty());
-
-        // Non-numbers are reported, not coerced.
-        let malformed = json!({
-            "model": "m", "max_tokens": "4096",
-            "messages": [{"role": "user", "content": "Hi"}],
-        });
-        assert!(matches!(
-            to_codex(&malformed, MODEL, KEY),
-            Err(TranslateError::Malformed { .. })
-        ));
-        let malformed = json!({
-            "model": "m", "temperature": "0.3",
-            "messages": [{"role": "user", "content": "Hi"}],
-        });
-        assert!(matches!(
-            to_codex(&malformed, MODEL, KEY),
-            Err(TranslateError::Malformed { .. })
-        ));
     }
 
     #[test]
@@ -1130,12 +1097,11 @@ mod tests {
             "temperature": 0.3,
             "messages": [{"role": "user", "content": "Hi"}],
         });
-        // The source order is top_p, max_tokens, temperature — the
-        // translated order is fixed regardless (purity, and a stable
-        // prefix for the fields after `input`).
+        // The source order is top_p, max_tokens, temperature — none of
+        // them cross now (the sampling drop), so the request is exactly
+        // the pinned fields, in their fixed order.
         let request = to_codex(&body, MODEL, KEY).expect("translates");
-        let keys: Vec<&str> = request.extra.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["max_output_tokens", "temperature", "top_p"]);
+        assert!(request.extra.is_empty());
         let value = serde_json::to_value(&request).expect("serialise");
         let keys: Vec<&str> = value
             .as_object()
@@ -1144,9 +1110,9 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(
-            &keys[keys.len() - 3..],
-            &["max_output_tokens", "temperature", "top_p"],
-            "the sampling fields ride last, after the pinned fields"
+            keys.last(),
+            Some(&"prompt_cache_key"),
+            "the pinned fields end at the cache key; no sampling fields follow"
         );
     }
 

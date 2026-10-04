@@ -113,8 +113,7 @@ fn minimal_translates_and_pins_the_full_request_bytes() {
             r#"{"model":"gpt-5.2-codex","stream":true,"instructions":"You are a careful assistant.","#,
             r#""input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Summarise the current state."}]}],"#,
             r#""tools":[],"tool_choice":"auto","parallel_tool_calls":false,"reasoning":{"effort":null},"#,
-            r#""store":false,"include":["reasoning.encrypted_content"],"prompt_cache_key":"corpus-cache-key","#,
-            r#""max_output_tokens":1024,"temperature":0.3}"#
+            r#""store":false,"include":["reasoning.encrypted_content"],"prompt_cache_key":"corpus-cache-key"}"#
         )
     );
     // And the same pin as a value, for the table.
@@ -134,8 +133,6 @@ fn minimal_translates_and_pins_the_full_request_bytes() {
             "store": false,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": KEY,
-            "max_output_tokens": 1024,
-            "temperature": 0.3,
         })
     );
 }
@@ -326,7 +323,9 @@ fn the_unicode_ladder_carries_the_system_verbatim() {
              "content": [{"type": "input_text", "text": "Begin."}]},
         ])
     );
-    assert_eq!(value["max_output_tokens"], json!(4096));
+    // Sampling never crosses (the live-verified drop): the fixture
+    // carries max_tokens 4096, the translated request carries nothing.
+    assert!(value.get("max_output_tokens").is_none());
 }
 
 #[test]
