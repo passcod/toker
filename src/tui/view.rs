@@ -635,7 +635,13 @@ mod tests {
         unpriced.input = Some(500);
         rows.push(unpriced);
         rows.push(kind_row(NOW - 10_000, RowKind::Error));
-        model::aggregate(&rows, &rows, 30, NOW, 523, TODAY)
+        {
+            // The view tests build the quota section once, the way the
+            // loop does, and reuse it across sizes.
+            let quota =
+                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
+        }
     }
 
     /// The shared synthetic quota rows: real-shaped anthropic meter
@@ -697,7 +703,13 @@ mod tests {
 
     fn quota_snapshot() -> model::Snapshot {
         let rows = quota_rows(true);
-        model::aggregate(&rows, &rows, 30, NOW, 523, TODAY)
+        {
+            // The view tests build the quota section once, the way the
+            // loop does, and reuse it across sizes.
+            let quota =
+                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
+        }
     }
 
     fn rendered(snap: &model::Snapshot, width: u16, height: u16) -> String {
@@ -743,7 +755,7 @@ mod tests {
 
     #[test]
     fn empty_window_renders_absence_not_zero() {
-        let snap = model::aggregate(&[], &[], 30, NOW, 523, TODAY);
+        let snap = model::aggregate(&[], None, 30, NOW, 523);
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
@@ -756,7 +768,7 @@ mod tests {
 
     #[test]
     fn truly_empty_ledger_says_ledger_empty() {
-        let snap = model::aggregate(&[], &[], 30, NOW, 0, TODAY);
+        let snap = model::aggregate(&[], None, 30, NOW, 0);
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("ledger empty"));
         assert!(text.contains("no requests in window"));
@@ -922,7 +934,13 @@ mod tests {
         // countdown says so — an assumed gate must not read the same
         // as an observed one.
         let rows = quota_rows(false);
-        let snap = model::aggregate(&rows, &rows, 30, NOW, 523, TODAY);
+        let snap = {
+            // The view tests build the quota section once, the way the
+            // loop does, and reuse it across sizes.
+            let quota =
+                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
+        };
         assert!(snap.quota.as_ref().expect("readings exist").gate_assumed);
         let text = rendered(&snap, 200, 30);
         assert!(text.contains("gated · on track?"), "{text}");

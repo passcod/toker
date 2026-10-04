@@ -138,24 +138,23 @@ pub(crate) struct MinuteBucket {
 
 /// The pre-refresh placeholder: an empty window of the right shape.
 pub(crate) fn empty(window_mins: u64) -> Snapshot {
-    aggregate(&[], &[], window_mins, 0, 0, 0)
+    aggregate(&[], None, window_mins, 0, 0)
 }
 
 /// Aggregate one window of ledger rows into a [`Snapshot`]. `now_ms` is
 /// the frame's reference time (bucket edges anchor to it); `total_requests` is
 /// the ledger's total row count, kept distinct from the window so the
-/// header can show both. `quota_rows` is the meter lookback (the
-/// 7-day read; a superset of the window) and `today_start_ms` the local
-/// day's start — the quota section's `spent today` span anchors there,
-/// passed in so the model stays pure over its inputs. Rows may arrive
+/// header can show both. `quota` is the PRECOMPUTED quota section (the
+/// meter lookback aggregation, [`super::quota::aggregate`] over the
+/// 7-day read), built on its own slower cadence — passing it in keeps
+/// this function pure over cheap inputs. Rows may arrive
 /// in any order — "latest" is decided by `ts_ms` throughout.
 pub(crate) fn aggregate(
     rows: &[RequestRow],
-    quota_rows: &[RequestRow],
+    quota: Option<&QuotaAgg>,
     window_mins: u64,
     now_ms: i64,
     total_requests: i64,
-    today_start_ms: i64,
 ) -> Snapshot {
     let window_mins = window_mins.max(1) as usize;
 
@@ -291,12 +290,10 @@ pub(crate) fn aggregate(
         },
         errors,
         drift,
-        quota: super::quota::aggregate(
-            quota_rows,
-            now_ms,
-            today_start_ms,
-            now_ms.saturating_sub(window_mins.max(1) as i64 * 60_000),
-        ),
+        // Precomputed by the caller on the QUOTA cadence — the meter
+        // lookback's 20k-row read and its aggregation are far too heavy
+        // for the display tick (the spin this split fixed).
+        quota: quota.cloned(),
     }
 }
 
@@ -326,8 +323,14 @@ mod tests {
     fn agg(rows: &[RequestRow], total: i64) -> Snapshot {
         // The meter lookback is a superset of the window; the tests pass
         // the same rows, which is the shape of a real window that fits
-        // inside the lookback.
-        super::aggregate(rows, rows, WINDOW, NOW, total, NOW - 12 * 60 * 60_000)
+        // inside the lookback — precomputed the way the loop now does.
+        let quota = super::super::quota::aggregate(
+            rows,
+            NOW,
+            NOW - 12 * 60 * 60_000,
+            NOW.saturating_sub(WINDOW as i64 * 60_000),
+        );
+        super::aggregate(rows, quota.as_ref(), WINDOW, NOW, total)
     }
 
     /// A measurement row a given number of minutes before `NOW`.
@@ -630,7 +633,7 @@ mod tests {
 
     #[test]
     fn zero_window_mins_clamps_to_one() {
-        let snap = super::aggregate(&[bare(NOW)], &[], 0, NOW, 1, NOW);
+        let snap = super::aggregate(&[bare(NOW)], None, 0, NOW, 1);
         assert_eq!(snap.window_mins, 1);
         assert_eq!(snap.rate.buckets.len(), 1);
         assert_eq!(snap.rate.buckets[0].requests, 1);
@@ -648,13 +651,19 @@ mod tests {
         let mut older_reading = bare(mins_ago(60));
         older_reading.rate_limits = Some(json!({"util5h": 0.30, "reset5h": 123}));
 
+        let lookback = [older_reading, in_window];
+        let quota_section = super::super::quota::aggregate(
+            &lookback,
+            NOW,
+            NOW - 12 * 60 * 60_000,
+            NOW.saturating_sub(WINDOW as i64 * 60_000),
+        );
         let snap = super::aggregate(
-            &[in_window.clone()],
-            &[older_reading, in_window],
+            &[lookback[1].clone()],
+            quota_section.as_ref(),
             WINDOW,
             NOW,
             2,
-            NOW - 12 * 60 * 60_000,
         );
         let quota = snap.quota.expect("the lookback carries meter snapshots");
         assert_eq!(quota.meters.len(), 1, "only the 5h meter is carried");
@@ -664,14 +673,14 @@ mod tests {
         assert_eq!(quota.binding.as_deref(), Some("five_hour"));
 
         // A lookback of rows without meters: no section at all.
-        let snap = super::aggregate(
-            &[bare(mins_ago(1))],
-            &[bare(mins_ago(90))],
-            WINDOW,
+        let meterless = [bare(mins_ago(90))];
+        let quota_section = super::super::quota::aggregate(
+            &meterless,
             NOW,
-            2,
             NOW,
+            NOW.saturating_sub(WINDOW as i64 * 60_000),
         );
+        let snap = super::aggregate(&[bare(mins_ago(1))], quota_section.as_ref(), WINDOW, NOW, 2);
         assert_eq!(snap.quota, None);
     }
 

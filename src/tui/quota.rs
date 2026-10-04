@@ -980,13 +980,18 @@ mod tests {
 
         // The whole snapshot must aggregate over real rows without
         // panicking, whatever the ledger holds.
+        let quota = crate::tui::quota::aggregate(
+            &rows,
+            now_ms,
+            today_start_ms,
+            now_ms.saturating_sub(30 * 60_000),
+        );
         let snap = crate::tui::model::aggregate(
             &window_rows,
-            &rows,
+            quota.as_ref(),
             30,
             now_ms,
             store.count_requests().expect("count"),
-            today_start_ms,
         );
 
         let quota = snap.quota;

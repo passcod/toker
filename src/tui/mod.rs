@@ -34,8 +34,19 @@ use std::time::{Duration, Instant};
 use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
 use crate::store::Store;
 
-/// Refresh cadence: the plan's "~2 s refresh from SQLite".
+/// Refresh cadence: the plan's "~2 s refresh from SQLite" — for the
+/// DISPLAY window (sessions, spend, rate), which is a small, cheap read.
 const REFRESH: Duration = Duration::from_secs(2);
+
+/// The meter-lookback cadence. The quota section reads a 7-day,
+/// 20 000-row window and aggregates burn rates over it — far heavier
+/// than the display read, and nothing about it changes on a 2-second
+/// scale: meters move on the upstream's window scale (hours), and ctp
+/// itself refit its quota model every 30 MINUTES (QUOTA_REFIT_MS).
+/// Refreshing it at the display cadence made the loop spin: the read
+/// overran the tick, the next deadline landed in the past, and
+/// `event::poll(0)` never blocked — 80% of a core, fixed here.
+const QUOTA_REFRESH: Duration = Duration::from_secs(60);
 
 /// Per-refresh row cap. `requests_since` keeps the newest rows; a 30-minute
 /// single-user window is nowhere near this, so the cap only guards a
@@ -55,19 +66,33 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
     // The system zone, read once: every local clock the panels render
     // (the quota resets and runout labels) anchors here.
     let tz = jiff::tz::TimeZone::system();
-    let mut next_refresh = Instant::now(); // first pass refreshes immediately
+    // Both deadlines start in the past: the first pass refreshes
+    // immediately. Every reschedule below anchors at the COMPLETION of
+    // the work, never its start — a read that overruns its interval
+    // delays the next one instead of collapsing the loop into a
+    // back-to-back refresh spin.
+    let mut next_display = Instant::now();
+    let mut next_quota = Instant::now();
+    let mut quota: Option<quota::QuotaAgg> = None;
     let mut snapshot = model::empty(window_mins);
     loop {
         let now = Instant::now();
-        if now >= next_refresh {
-            snapshot = refresh(&store, window_mins)?;
-            next_refresh = now + REFRESH;
+        if now >= next_quota {
+            quota = quota_snapshot(&store, window_mins)?;
+            next_quota = Instant::now() + QUOTA_REFRESH;
+        }
+        if now >= next_display {
+            snapshot = refresh_display(&store, window_mins, quota.as_ref())?;
+            next_display = Instant::now() + REFRESH;
         }
         terminal.draw(|frame| view::render(frame, &snapshot, &clock(), &tz))?;
 
-        // Block until the next refresh is due or an event arrives — no
-        // busy loop.
-        let timeout = next_refresh.saturating_duration_since(Instant::now());
+        // Block until the sooner of the two deadlines or an input event
+        // — no busy loop, by construction (both deadlines are in the
+        // future after the reschedules above).
+        let timeout = next_display
+            .min(next_quota)
+            .saturating_duration_since(Instant::now());
         if !crossterm::event::poll(timeout)? {
             continue;
         }
@@ -89,8 +114,12 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
                 {
                     break;
                 }
-                // r forces an immediate refresh on the next pass.
-                crossterm::event::KeyCode::Char('r') => next_refresh = Instant::now(),
+                // r forces an immediate refresh on the next pass — both
+                // cadences, so a full reload is one keypress away.
+                crossterm::event::KeyCode::Char('r') => {
+                    next_display = Instant::now();
+                    next_quota = Instant::now();
+                }
                 _ => {}
             }
         }
@@ -98,30 +127,37 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Reload the window's rows and total, then aggregate. Errors propagate —
-/// with WAL and the store's 5 s busy timeout a read failure is real
-/// trouble, not a blip worth hiding behind a stale frame.
-///
-/// Two reads: the display window's rows (sessions, spend, rate) and
-/// the meter lookback (quota) — a burn rate and a spent span need
-/// history a display window cannot hold, ctp's "readings are taken from
-/// every row read, not just the windowed ones" (live.mjs:269-272). The
-/// lookback reuses the cold outlook's constants: same 7-day span, same
-/// row cap.
-fn refresh(store: &Store, window_mins: u64) -> anyhow::Result<model::Snapshot> {
+/// Reload the display window's rows and total, then aggregate with the
+/// CACHED quota section. Errors propagate — with WAL and the store's
+/// 5 s busy timeout a read failure is real trouble, not a blip worth
+/// hiding behind a stale frame.
+fn refresh_display(
+    store: &Store,
+    window_mins: u64,
+    quota: Option<&quota::QuotaAgg>,
+) -> anyhow::Result<model::Snapshot> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
     let rows = store.requests_since(since, ROW_CAP)?;
     let total = store.count_requests()?;
+    Ok(model::aggregate(&rows, quota, window_mins, now_ms, total))
+}
+
+/// Reload the meter lookback and aggregate the quota section — the
+/// heavy read, on its own cadence. A burn rate and a spent span need
+/// history a display window cannot hold, ctp's "readings are taken
+/// from every row read, not just the windowed ones" (live.mjs:269-272);
+/// the lookback reuses the cold outlook's constants: same 7-day span,
+/// same row cap.
+fn quota_snapshot(store: &Store, window_mins: u64) -> anyhow::Result<Option<quota::QuotaAgg>> {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
     let quota_rows =
         store.requests_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)?;
-    Ok(model::aggregate(
-        &rows,
+    Ok(quota::aggregate(
         &quota_rows,
-        window_mins,
         now_ms,
-        total,
         local_day_start_ms(now_ms),
+        now_ms.saturating_sub(window_mins.max(1) as i64 * 60_000),
     ))
 }
 
