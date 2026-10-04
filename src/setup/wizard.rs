@@ -392,11 +392,13 @@ MemoryDenyWriteExecute=true
 /// (a powered-off machine stays off). Root-level on purpose: the user
 /// manager lacks `CAP_WAKE_ALARM`, so this is the only unit toker
 /// installs into the system manager. `toker wake-arm` is the
-/// documented no-op pointing here.
+/// documented no-op pointing here. The schedule is **weekday-only**
+/// (Mon–Fri): the pattern this serves is a work machine that wakes on
+/// work days.
 pub fn wake_system_unit(slots: &[String]) -> String {
     let mut on_calendar = String::new();
     for slot in slots {
-        on_calendar.push_str(&format!("OnCalendar={slot}\n"));
+        on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
     }
     format!(
         r#"[Unit]
@@ -425,7 +427,7 @@ WantedBy=timers.target
 pub fn hold_user_units(slots: &[String], exe: &Path) -> (String, String) {
     let mut on_calendar = String::new();
     for slot in slots {
-        on_calendar.push_str(&format!("OnCalendar={slot}\n"));
+        on_calendar.push_str(&format!("OnCalendar=Mon..Fri {slot}\n"));
     }
     let timer = format!(
         r#"[Unit]
@@ -489,6 +491,14 @@ pub fn ping_user_units(slots: &[String], exe: &Path) -> Vec<PingUnits> {
         .filter_map(|slot| {
             let parsed = timers::parse_slot(slot)?;
             let fire = timers::slot_plus_minutes(&parsed, PING_DELAY_MINUTES).hhmm();
+            // A wrapped fire time lands the day AFTER a weekday slot —
+            // Friday 23:55's ping fires Saturday 00:06 — so its mask
+            // covers the following days (Tue..Sat) rather than the
+            // slot's own (Mon..Fri).
+            let wrapped =
+                (parsed.hour as i64 * 60 + parsed.minute as i64 + PING_DELAY_MINUTES as i64)
+                    >= 24 * 60;
+            let mask = if wrapped { "Tue..Sat" } else { "Mon..Fri" };
             let stem = ping_unit_stem(slot);
             let timer = format!(
                 r#"[Unit]
@@ -499,7 +509,7 @@ Description=toker ping timer (opens the {slot} quota window, {PING_DELAY_MINUTES
 # the hold still has 4 m left to run. Persistent=false deliberately —
 # a ping re-run hours late would open a mostly-spent window, and the
 # verb's lateness guard refuses those anyway.
-OnCalendar={fire}
+OnCalendar={mask} {fire}
 Persistent=false
 
 [Install]
@@ -1609,7 +1619,7 @@ impl<'a> Wizard<'a> {
     fn ask_slots(&mut self) -> Result<Vec<String>> {
         for _ in 0..3 {
             let answer = self.prompt.text(
-                "Wake/hold/ping slots (hh:mm, comma- or space-separated; empty for none)",
+                "Weekday (Mon..Fri) wake/hold/ping slots (hh:mm, comma- or space-separated; empty for none)",
                 None,
                 false,
             )?;
@@ -2519,8 +2529,8 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 # the system manager and `toker setup` enables it through sudo. Wakes
 # from suspend only — a machine that is powered off stays off.
 WakeSystem=true
-OnCalendar=09:00
-OnCalendar=23:55
+OnCalendar=Mon..Fri 09:00
+OnCalendar=Mon..Fri 23:55
 
 [Install]
 WantedBy=timers.target
@@ -2539,8 +2549,8 @@ Description=toker hold timer (holds the idle-sleep lock 15m after each wake slot
 # At the wake slots themselves: a timer that elapses while the machine
 # is suspended fires on resume, and the hold then keeps the machine up
 # for its span so the ping (11 m after the slot) can fire.
-OnCalendar=09:00
-OnCalendar=23:55
+OnCalendar=Mon..Fri 09:00
+OnCalendar=Mon..Fri 23:55
 
 # A hold re-run hours after a missed slot would hold the machine up for
 # nothing — the ping it protects never fires that late either.
@@ -2584,7 +2594,7 @@ Description=toker ping timer (opens the 09:00 quota window, 11 m after the slot)
 # the hold still has 4 m left to run. Persistent=false deliberately —
 # a ping re-run hours late would open a mostly-spent window, and the
 # verb's lateness guard refuses those anyway.
-OnCalendar=09:11
+OnCalendar=Mon..Fri 09:11
 Persistent=false
 
 [Install]
@@ -2611,7 +2621,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         // The wrapped slot: 23:55 + 11 m = 00:06, still paired with
         // --slot=23:55.
         assert_eq!(pings[1].timer_name, "toker-ping-2355.timer");
-        assert!(pings[1].timer.contains("OnCalendar=00:06"));
+        assert!(pings[1].timer.contains("OnCalendar=Tue..Sat 00:06"));
         assert!(pings[1].timer.contains("opens the 23:55 quota window"));
         assert!(pings[1].service.contains("--slot=23:55"));
 
@@ -2754,7 +2764,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(
             asked
                 .last()
-                .is_some_and(|asked| asked.message.contains("Wake/hold/ping slots")),
+                .is_some_and(|asked| asked.message.contains("wake/hold/ping slots")),
             "the slots question: {asked:?}"
         );
         assert!(!out.contains("toker-hold"), "{out}");

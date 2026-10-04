@@ -184,8 +184,9 @@ pub fn parse_slot_list(text: &str) -> std::result::Result<Vec<String>, String> {
 }
 
 /// The slot's clock time plus `minutes`, wrapping past midnight (the
-/// timers are daily `OnCalendar` values, so a wrapped time fires the
-/// next day — exactly 11 m after the 23:55 slot).
+/// timers are weekday `OnCalendar` values, so a wrapped time fires
+/// the NEXT day — a Friday 23:55 slot's ping fires Saturday 00:06,
+/// which is why its timer's mask runs Tue..Sat).
 pub fn slot_plus_minutes(slot: &Slot, minutes: i64) -> Slot {
     let total = (slot.hour as i64 * 60 + slot.minute as i64 + minutes).rem_euclid(24 * 60);
     Slot {
@@ -194,15 +195,21 @@ pub fn slot_plus_minutes(slot: &Slot, minutes: i64) -> Slot {
     }
 }
 
-/// The most recent occurrence of the slot's wall-clock time
-/// at-or-before `now`, in `tz`. Before the slot's first occurrence of
-/// the local day, that is yesterday's — an early run for today's slot
-/// reads as very late for yesterday's, which the guard refuses.
+/// The most recent WEEKDAY (Mon–Fri) occurrence of the slot's
+/// wall-clock time at-or-before `now`, in `tz` — the schedule is
+/// weekday-only, matching the work pattern it serves. A weekend day
+/// has no occurrence of its own: Saturday and Sunday resolve to
+/// Friday's slot, and the lateness guard then refuses a weekend run
+/// as long past (weekends have no ping, by design). Before the slot's
+/// first occurrence of the local day, the resolution steps to the
+/// previous weekday — an early run for today's slot reads as very
+/// late for Friday's, which the guard refuses.
 ///
 /// A slot inside a DST gap or fold resolves by jiff's compatible
-/// strategy (the gap folds forward); a daily clock slot has no
+/// strategy (the gap folds forward); a weekday clock slot has no
 /// meaningful finer answer.
 pub fn last_occurrence_ms(now_ms: i64, slot: &Slot, tz: &TimeZone) -> Option<i64> {
+    use jiff::civil::Weekday;
     let now = jiff::Timestamp::from_millisecond(now_ms).ok()?;
     let zoned = now.to_zoned(tz.clone());
     let time = jiff::civil::Time::constant(slot.hour as i8, slot.minute as i8, 0, 0);
@@ -215,11 +222,19 @@ pub fn last_occurrence_ms(now_ms: i64, slot: &Slot, tz: &TimeZone) -> Option<i64
                 .as_millisecond(),
         )
     };
-    let today = at(zoned.date())?;
-    if today <= now_ms {
-        return Some(today);
+    // Start at today; step back until the weekday whose slot has
+    // occurred. Weekends never resolve to themselves — the timers do
+    // not fire Sat/Sun, so a weekend keeps walking to Friday.
+    let mut date = zoned.date();
+    if at(date)? > now_ms {
+        date = date.yesterday().ok()?;
     }
-    at(zoned.date().yesterday().ok()?)
+    loop {
+        match date.weekday() {
+            Weekday::Saturday | Weekday::Sunday => date = date.yesterday().ok()?,
+            _ => return at(date),
+        }
+    }
 }
 
 /// When a slot's ping is scheduled to fire: the occurrence plus
@@ -580,7 +595,9 @@ mod tests {
     // ── occurrence, fire, boundary ─────────────────────────────────
 
     #[test]
-    fn the_most_recent_occurrence_wins_and_yesterday_fills_before_the_slot() {
+    fn the_most_recent_occurrence_wins_and_weekdays_fill_before_the_slot() {
+        // The fixed day is 2026-10-05, a MONDAY — the weekday walk
+        // shows in every before-the-slot case.
         let slot = parse_slot("09:00").expect("slot");
         // After today's slot: today's.
         assert_eq!(
@@ -592,16 +609,53 @@ mod tests {
             last_occurrence_ms(utc_ms(9, 0), &slot, &utc()),
             Some(utc_ms(9, 0))
         );
-        // Before today's slot: yesterday's.
+        // Before today's slot: the previous WEEKDAY's — Sunday and
+        // Saturday are skipped (the timers never fire then).
         assert_eq!(
             last_occurrence_ms(utc_ms(8, 59), &slot, &utc()),
-            Some(utc_ms(9, 0) - 86_400_000)
+            Some(utc_ms(9, 0) - 3 * 86_400_000),
+            "Monday 08:59 resolves FRIDAY's 09:00"
         );
         // Midnight edge: the day's first minute.
         let midnight = parse_slot("00:00").expect("slot");
         assert_eq!(
             last_occurrence_ms(utc_ms(0, 0), &midnight, &utc()),
             Some(utc_ms(0, 0))
+        );
+    }
+
+    #[test]
+    fn weekends_resolve_to_fridays_slot() {
+        // 2026-10-03 is a Saturday, 2026-10-04 a Sunday, 2026-10-02 the
+        // Friday they walk back to. A weekend run has no occurrence of
+        // its own — the guard reads it as long past for Friday's
+        // slot, which is exactly right: weekends have no ping.
+        let slot = parse_slot("09:00").expect("slot");
+        let day = |d: i8, h: i8, m: i8| {
+            jiff::civil::date(2026, 10, d)
+                .at(h, m, 0, 0)
+                .to_zoned(utc())
+                .expect("valid")
+                .timestamp()
+                .as_millisecond()
+        };
+        assert_eq!(
+            last_occurrence_ms(day(3, 10, 0), &slot, &utc()),
+            Some(day(2, 9, 0))
+        );
+        assert_eq!(
+            last_occurrence_ms(day(4, 23, 0), &slot, &utc()),
+            Some(day(2, 9, 0))
+        );
+        // Friday itself: its own slot, once past.
+        assert_eq!(
+            last_occurrence_ms(day(2, 10, 0), &slot, &utc()),
+            Some(day(2, 9, 0))
+        );
+        // Early Friday (before the slot): THURSDAY's.
+        assert_eq!(
+            last_occurrence_ms(day(2, 8, 0), &slot, &utc()),
+            Some(day(1, 9, 0))
         );
     }
 
@@ -655,7 +709,9 @@ mod tests {
             Some(auckland_ms(9, 0))
         );
         // The same instant in UTC resolves the same wall-clock slot to
-        // a different occurrence — the zone is a real input.
+        // a different occurrence — the zone is a real input. In UTC it
+        // is still Monday morning, before the slot, so the walk goes
+        // to the previous weekday: FRIDAY's 09:00.
         let now_utc = jiff::Timestamp::from_millisecond(now)
             .expect("valid")
             .to_zoned(utc())
@@ -663,7 +719,7 @@ mod tests {
             .as_millisecond();
         assert_eq!(
             last_occurrence_ms(now_utc, &slot, &utc()),
-            Some(utc_ms(9, 0) - 86_400_000)
+            Some(utc_ms(9, 0) - 3 * 86_400_000)
         );
     }
 
