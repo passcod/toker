@@ -1179,6 +1179,7 @@ mod tests {
             &window_rows,
             quota.as_ref(),
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
             None,
             30,
             now_ms,

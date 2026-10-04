@@ -294,6 +294,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         // a REAL idle-sleep lock on the host running the suite. The awake
         // suite (server_awake.rs) injects a fake spawner and turns it on.
         awake: false,
+        transcript_roots: Vec::new(),
     }
 }
 

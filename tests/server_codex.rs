@@ -276,6 +276,7 @@ fn test_config(
         },
         gates: toker::config::GatesConfig::default(),
         awake: false,
+        transcript_roots: Vec::new(),
     }
 }
 

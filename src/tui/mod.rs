@@ -12,6 +12,9 @@
 //! - [model]: narrow display rows in, dashboard snapshot out. No
 //!   terminal types — testable against synthetic [`crate::store::DisplayRow`]
 //!   sets alone (the store's display-window projection, invariant 7).
+//! - [labels]: session names from Claude Code's own transcripts — ctp's
+//!   transcript.mjs ported. Read-only, tail-only, newest-wins; a session
+//!   with no name keeps its id.
 //! - [quota]: the rate & quota section of that snapshot — ctp's meter
 //!   forecasting, ported from forecast.mjs/live.mjs.
 //! - [rebuilds]: the CACHE REBUILDS section — ctp's lane walk and cause
@@ -27,12 +30,13 @@
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
 
+mod labels;
 mod model;
 mod quota;
 mod rebuilds;
 mod view;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
@@ -86,7 +90,15 @@ const ROW_CAP: u64 = 10_000;
 /// `ratatui::try_init` (alternate screen, raw mode, a panic hook that
 /// restores first) plus the [`RestoreGuard`] below, so raw mode is restored
 /// on every exit path — `?` returns, `q`, and panics via the guard's drop.
-pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
+///
+/// `extra_transcript_roots` is the config's `transcript_roots` — the
+/// harness config directories whose transcripts the session labels also
+/// look under (see [labels]; ctp's `CTP_TRANSCRIPTS`).
+pub fn run(
+    db_path: &Path,
+    window_mins: u64,
+    extra_transcript_roots: &[PathBuf],
+) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
     let mut terminal = ratatui::try_init()?;
     let _restore = RestoreGuard;
@@ -94,6 +106,9 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
     // The system zone, read once: every local clock the panels render
     // (the quota resets and runout labels) anchors here.
     let tz = jiff::tz::TimeZone::system();
+    // The transcript roots, resolved once: session labels read only
+    // these, read-only, one tail per session per display tick.
+    let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
     // Both deadlines start in the past: the first pass refreshes
     // immediately. Every reschedule below anchors at the COMPLETION of
     // the work, never its start — a read that overruns its interval
@@ -119,6 +134,7 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
                 quota.as_ref(),
                 &released,
                 rebuilds.as_ref(),
+                &mut labels,
             )?;
             next_display = Instant::now() + REFRESH;
         }
@@ -173,21 +189,40 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
 /// per row, every 2 s (invariant 7). Errors propagate — with WAL and
 /// the store's 5 s busy timeout a read failure is real trouble, not a
 /// blip worth hiding behind a stale frame.
+///
+/// Session labels resolve here, once per session per display tick
+/// ([`labels::Labels`], live.mjs's economics: its 2-second render
+/// re-reads each tail so a title that regenerates mid-session stays
+/// current) — never per render, which is why the label state is loop
+/// state passed in rather than a fresh read per frame.
 fn refresh_display(
     store: &Store,
     window_mins: u64,
     quota: Option<&quota::QuotaAgg>,
     released: &std::collections::HashSet<String>,
     rebuilds: Option<&rebuilds::RebuildAgg>,
+    labels: &mut labels::Labels,
 ) -> anyhow::Result<model::Snapshot> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
     let rows = store.display_rows_since(since, ROW_CAP)?;
     let total = store.count_requests()?;
+    labels.start_refresh();
+    let mut session_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for session_id in rows.iter().filter_map(|row| row.session_id.as_deref()) {
+        session_ids.insert(session_id);
+    }
+    let mut resolved = std::collections::HashMap::new();
+    for session_id in session_ids {
+        if let Some(label) = labels.resolve(session_id) {
+            resolved.insert(session_id.to_owned(), label);
+        }
+    }
     Ok(model::aggregate(
         &rows,
         quota,
         released,
+        &resolved,
         rebuilds.cloned(),
         window_mins,
         now_ms,
@@ -654,7 +689,7 @@ mod tests {
 
     use std::collections::{HashMap, HashSet};
 
-    use crate::store::Store;
+    use crate::store::{Store, is_api_measurement};
 
     /// The whole ledger as the probe's window: every imported row
     /// classified, every figure summed. The caps sit above the
@@ -683,6 +718,7 @@ mod tests {
             &display,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             None,
             window_mins,
             now_ms,
@@ -794,6 +830,88 @@ mod tests {
                 event.session,
                 event.detail.as_deref().unwrap_or("")
             );
+        }
+    }
+
+    /// The real-transcripts probe: the 5 newest anthropic sessions in
+    /// the production ledger, resolved against the REAL `~/.claude`
+    /// (and `$CLAUDE_CONFIG_DIR`) on this machine — read-only, the
+    /// same tail-only reads the dashboard's own display tick performs.
+    /// Prints only what the dashboard itself would show (whether a
+    /// label was found, and its cwd/title strings — the user's own
+    /// session names, as they render in their own TUI), never
+    /// transcript content.
+    #[test]
+    #[ignore = "reads the REAL ~/.claude transcripts (read-only, the \
+                same tail-only read the TUI's display tick performs) \
+                plus the live production ledger's newest rows; prints \
+                only the labels' own cwd/title strings, never \
+                transcript content; run deliberately with --ignored"]
+    fn the_newest_production_sessions_resolve_real_transcript_labels() {
+        let path = crate::store::default_db_path().expect("resolve the data home");
+        assert!(path.exists(), "no production ledger at {path:?}");
+        let store = Store::open(&path).expect("open the production ledger");
+        let rows = store
+            .display_rows_since(0, EVERYTHING)
+            .expect("read the display window");
+
+        // The anthropic sessions, newest first: Claude Code names its
+        // own sessions in transcripts, and it speaks the anthropic
+        // protocol — those are the ids a transcript can exist for.
+        let mut latest: HashMap<&str, i64> = HashMap::new();
+        for row in &rows {
+            let Some(session_id) = row.session_id.as_deref() else {
+                continue;
+            };
+            if !is_api_measurement(row.kind) {
+                continue;
+            }
+            if !row
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.starts_with("anthropic"))
+            {
+                continue;
+            }
+            latest.insert(session_id, row.ts_ms); // rows arrive ts-ascending
+        }
+        let mut sessions: Vec<(&str, i64)> = latest.into_iter().collect();
+        sessions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+        let roots = crate::tui::labels::transcript_roots(&[]);
+        eprintln!("== the real-transcripts label probe ==");
+        eprintln!("roots: {}", {
+            let mut text = String::new();
+            for root in &roots {
+                text.push_str(&format!("\n  {}", root.display()));
+            }
+            text
+        });
+        if sessions.is_empty() {
+            eprintln!("no anthropic sessions in the ledger");
+            return;
+        }
+        eprintln!(
+            "{} anthropic sessions in the ledger; the 5 newest:",
+            sessions.len()
+        );
+        let mut labels = crate::tui::labels::Labels::new(roots);
+        for (session_id, latest_ts_ms) in sessions.iter().take(5) {
+            let when = jiff::Timestamp::from_millisecond(*latest_ts_ms)
+                .map(|ts| ts.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|_| latest_ts_ms.to_string());
+            let found = match labels.resolve(session_id) {
+                Some(label) => match (&label.cwd, &label.title) {
+                    (Some(cwd), Some(title)) => {
+                        format!("found cwd+title — {cwd} · {title}")
+                    }
+                    (Some(cwd), None) => format!("found cwd only — {cwd}"),
+                    (None, Some(title)) => format!("found title only — {title}"),
+                    (None, None) => "found prompt only".to_owned(),
+                },
+                None => "no transcript".to_owned(),
+            };
+            eprintln!("  {session_id} (latest row {when}): {found}");
         }
     }
 }

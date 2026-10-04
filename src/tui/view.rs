@@ -41,6 +41,7 @@ use ratatui::{
     widgets::{Block, Cell, Paragraph, Row, Table},
 };
 
+use super::labels::short_dir;
 use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
 use super::quota::{MeterPanel, Spent};
 use super::rebuilds::REBUILD_MIN;
@@ -66,6 +67,11 @@ const IDLE_SECS: i64 = 180;
 /// occupancy is a claim about a conversation, and two rows say nothing
 /// yet (ctp live.mjs:400's `main.length < 3`).
 const CONTEXT_MIN_REQUESTS: usize = 3;
+
+/// The least width a session NAME renders in (ctp live.mjs:333-334's
+/// `labelW >= 12`): whatever is left over after the table, ctp gives to
+/// the label, and less than this is noise — the id renders instead.
+const LABEL_MIN_W: u16 = 12;
 
 /// The rebuild panel's localised detail lines: the newest
 /// system-prompt changes, so a change is diagnosable at a glance
@@ -319,11 +325,17 @@ fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 
     let inner = block.inner(area);
     let (headers, widths) = session_plan(inner.width);
+    // The SESSION column's width is the label's budget — the leftover
+    // width the table plan hands that column (live.mjs's `labelW`).
+    let session_w = match widths.first() {
+        Some(ratatui::layout::Constraint::Length(width)) => *width,
+        _ => 0,
+    };
     let header = Row::new(headers.iter().map(|h| (*h).to_string())).style(Style::new().bold());
     let rows = snap
         .sessions
         .iter()
-        .map(|s| Row::new(session_cells(s, snap.now_ms, headers.len())));
+        .map(|s| Row::new(session_cells(s, snap.now_ms, headers.len(), session_w)));
     frame.render_widget(Table::new(rows, widths).header(header).block(block), area);
 }
 
@@ -363,15 +375,21 @@ fn session_plan(available: u16) -> (Vec<&'static str>, Vec<Constraint>) {
 /// and dim once it has been at some point in the window but the latest
 /// turn was not (live.mjs:362-367); the `$` marks a session released
 /// past the armed quota gate for the window now running. Idle ages dim
-/// past [`IDLE_SECS`], like live.mjs's idle column.
-fn session_cells(session: &SessionAgg, now_ms: i64, count: usize) -> Vec<Cell<'static>> {
+/// past [`IDLE_SECS`], like live.mjs's idle column. `session_w` is the
+/// SESSION column's width — the label's budget (see [`session_cell`]).
+fn session_cells(
+    session: &SessionAgg,
+    now_ms: i64,
+    count: usize,
+    session_w: u16,
+) -> Vec<Cell<'static>> {
     let mut cells: Vec<Cell<'static>> = Vec::with_capacity(count);
     let mut push_if = |n: usize, cell: Cell<'static>| {
         if n < count {
             cells.push(cell);
         }
     };
-    push_if(0, Cell::new(session.session.clone()));
+    push_if(0, session_cell(session, session_w));
     push_if(1, ctx_cell(session.ctx));
     push_if(2, model_cell(session));
     push_if(3, Cell::new(session.requests.to_string()));
@@ -410,6 +428,39 @@ fn session_cells(session: &SessionAgg, now_ms: i64, count: usize) -> Vec<Cell<'s
         },
     );
     cells
+}
+
+/// The SESSION cell: the session's name — its working directory and the
+/// title the frontend gave it (live.mjs:376-381's label, `shortDir(cwd)
+/// · title ?? prompt`, the directory cyan and the separator dim) — where
+/// the column is wide enough for a name ([`LABEL_MIN_W`], live.mjs:334's
+/// "too narrow a name is noise"), else the session id. An absent label
+/// — no transcript, an unreadable one, a tail with nothing usable — is
+/// the id, never an empty cell: the row never loses its name, and
+/// "unlabelled" stays visibly different from "absent" (invariant 3).
+/// The cell clips at the column's width, which grows with the terminal
+/// exactly like live.mjs's leftover label column.
+fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
+    if let Some(label) = &session.label
+        && width >= LABEL_MIN_W
+    {
+        let dir = short_dir(label.cwd.as_deref());
+        let what = label.title.clone().or_else(|| label.prompt.clone());
+        if dir.is_some() || what.is_some() {
+            let mut spans = Vec::with_capacity(3);
+            if let Some(dir) = dir {
+                spans.push(Span::styled(dir, Style::new().fg(Color::Cyan)));
+            }
+            if let Some(what) = what {
+                if !spans.is_empty() {
+                    spans.push(Span::styled(" · ", Style::new().dim()));
+                }
+                spans.push(Span::raw(what));
+            }
+            return Cell::new(Line::from(spans));
+        }
+    }
+    Cell::new(session.session.clone())
 }
 
 /// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
@@ -1220,7 +1271,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    use super::super::labels::Label;
 
     const NOW: i64 = 1_769_000_000_000;
     const MIN: i64 = 60_000;
@@ -1229,6 +1282,12 @@ mod tests {
     /// The test frame's local-day start: 2026-01-21T12:53:20Z minus
     /// twelve hours, arbitrary but stable.
     const TODAY: i64 = NOW - 12 * HOUR;
+
+    /// The tests' shared "no transcript labels" input — the absent
+    /// state, never a fabricated one.
+    fn no_labels() -> HashMap<String, Label> {
+        HashMap::new()
+    }
 
     /// A fixed zone keeps the pinned clock strings independent of the
     /// machine running the tests; UTC keeps them readable.
@@ -1274,7 +1333,16 @@ mod tests {
         unpriced.input = Some(500);
         rows.push(unpriced);
         rows.push(display_kind_row(NOW - 10_000, RowKind::Error));
-        model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523)
+        model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            523,
+        )
     }
 
     /// The shared synthetic quota rows: real-shaped anthropic meter
@@ -1351,6 +1419,7 @@ mod tests {
                 &as_display_rows(&rows),
                 quota.as_ref(),
                 &HashSet::new(),
+                &no_labels(),
                 None,
                 30,
                 NOW,
@@ -1482,7 +1551,16 @@ mod tests {
 
         let mut released = HashSet::new();
         released.insert("ses-free".to_owned());
-        model::aggregate(&rows, None, &released, Some(rebuilds), 30, NOW, 523)
+        model::aggregate(
+            &rows,
+            None,
+            &released,
+            &no_labels(),
+            Some(rebuilds),
+            30,
+            NOW,
+            523,
+        )
     }
 
     fn rendered(snap: &model::Snapshot, width: u16, height: u16) -> String {
@@ -1528,7 +1606,7 @@ mod tests {
 
     #[test]
     fn empty_window_renders_absence_not_zero() {
-        let snap = model::aggregate(&[], None, &HashSet::new(), None, 30, NOW, 523);
+        let snap = model::aggregate(&[], None, &HashSet::new(), &no_labels(), None, 30, NOW, 523);
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
@@ -1541,7 +1619,7 @@ mod tests {
 
     #[test]
     fn truly_empty_ledger_says_ledger_empty() {
-        let snap = model::aggregate(&[], None, &HashSet::new(), None, 30, NOW, 0);
+        let snap = model::aggregate(&[], None, &HashSet::new(), &no_labels(), None, 30, NOW, 0);
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("ledger empty"));
         assert!(text.contains("no requests in window"));
@@ -1748,6 +1826,7 @@ mod tests {
                 &as_display_rows(&rows),
                 quota.as_ref(),
                 &HashSet::new(),
+                &no_labels(),
                 None,
                 30,
                 NOW,
@@ -1843,6 +1922,116 @@ mod tests {
         assert!(text.contains("   -"), "a dash, never a zero:\n{text}");
     }
 
+    /// The session NAME: working directory and title in the SESSION
+    /// cell where the column fits a name (live.mjs:376-381's
+    /// `shortDir(cwd) · title ?? prompt`, the directory cyan), the
+    /// session id where it does not — too narrow (live.mjs:334's
+    /// 12-cell rule) or no label at all. An absent label is the id,
+    /// never an empty cell.
+    #[test]
+    fn labeled_sessions_render_their_names_and_others_fall_back_to_the_id() {
+        // One request each: under the CONTEXT panel's three-request
+        // rule, so the ids appear nowhere but the SESSIONS table and
+        // the wide render's "the labeled id is replaced" is provable.
+        let mut rows = Vec::new();
+        for (at, sid) in [
+            (4, "ses-named"),
+            (3, "ses-dir"),
+            (2, "ses-prompt"),
+            (1, "ses-bare"),
+        ] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some(sid.into());
+            row.model = Some("claude-opus-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(1_000);
+            row.cache_read = Some(2_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            rows.push(row);
+        }
+        let mut labels = HashMap::new();
+        labels.insert(
+            "ses-named".to_owned(),
+            Label {
+                cwd: Some("/home/u/code/toker".into()),
+                title: Some("TUI session labels".into()),
+                prompt: None,
+            },
+        );
+        labels.insert(
+            "ses-dir".to_owned(),
+            // A worktree: `repo/.../worktrees/x` reads `repo/x`.
+            Label {
+                cwd: Some("/home/u/code/toker/worktrees/labels".into()),
+                title: None,
+                prompt: None,
+            },
+        );
+        labels.insert(
+            "ses-prompt".to_owned(),
+            // No cwd, no title: the last prompt stands in, live.mjs's
+            // `title ?? prompt`.
+            Label {
+                cwd: None,
+                title: None,
+                prompt: Some("the last prompt".into()),
+            },
+        );
+        let snap = model::aggregate(&rows, None, &HashSet::new(), &labels, None, 30, NOW, 523);
+
+        // 120 wide: the SESSION column takes the slack — the names
+        // render in full, the labeled ids are gone, and the session
+        // with no label keeps its id.
+        let wide = rendered(&snap, 120, 40);
+        assert!(
+            wide.contains("toker · TUI session labels"),
+            "dir · title:\n{wide}"
+        );
+        assert!(
+            wide.contains("toker/labels"),
+            "a worktree names repo/tree:\n{wide}"
+        );
+        assert!(
+            wide.contains("the last prompt"),
+            "the prompt stands in:\n{wide}"
+        );
+        assert!(wide.contains("ses-bare"), "no label → the id:\n{wide}");
+        assert!(
+            !wide.contains("ses-named"),
+            "the labeled id is replaced:\n{wide}"
+        );
+        assert!(
+            !wide.contains("ses-dir"),
+            "the labeled id is replaced:\n{wide}"
+        );
+        assert!(
+            !wide.contains("ses-prompt"),
+            "the labeled id is replaced:\n{wide}"
+        );
+
+        // 13 wide: the sessions panel keeps 11 inner cells, under the
+        // 12 a name needs — the ids everywhere, the labels never, and
+        // nothing panics.
+        let narrow = rendered(&snap, 13, 40);
+        assert!(
+            narrow.contains("ses-named"),
+            "too narrow → the id:\n{narrow}"
+        );
+        assert!(
+            narrow.contains("ses-bare"),
+            "too narrow → the id:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("TUI session labels"),
+            "no name at that width:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains("the last prompt"),
+            "no name at that width:\n{narrow}"
+        );
+    }
+
     #[test]
     fn context_panel_renders_occupancy_ceilings_and_idle() {
         let snap = full_snapshot();
@@ -1890,7 +2079,16 @@ mod tests {
             row.cache_write_5m = Some(0);
             rows.push(row);
         }
-        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let snap = model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            523,
+        );
         let text = rendered(&snap, 120, 40);
         assert!(
             text.contains("no session with enough history yet"),
@@ -1916,7 +2114,16 @@ mod tests {
             row.cache_write_5m = Some(0);
             rows.push(row);
         }
-        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let snap = model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            523,
+        );
         let text = rendered(&snap, 120, 40);
         assert!(text.contains("? / 1M"), "the unknown-prompt line:\n{text}");
         // …and no share on that line: the `?` is the whole claim.
@@ -1948,7 +2155,16 @@ mod tests {
             row.output = Some(200);
             rows.push(row);
         }
-        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let snap = model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            523,
+        );
         let text = rendered(&snap, 120, 40);
         assert!(
             text.contains("3,000  share unknown"),
@@ -2120,7 +2336,7 @@ mod tests {
             5,
             0.1,
         ));
-        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 5);
+        let snap = model::aggregate(&rows, None, &HashSet::new(), &no_labels(), None, 30, NOW, 5);
         for (width, height) in [
             (1u16, 1u16),
             (2, 2),

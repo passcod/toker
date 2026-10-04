@@ -115,6 +115,16 @@ pub struct Config {
     /// (see [`crate::middleware::awake`]). Off → never hold, never
     /// spawn, never write awake rows.
     pub awake: bool,
+    /// Extra transcript roots for the dashboard's session labels (ctp's
+    /// `CTP_TRANSCRIPTS`, ctp README "Transcripts are looked for under
+    /// `~/.claude` and `$CLAUDE_CONFIG_DIR`… list those
+    /// colon-separated"): those two are always searched, and these add
+    /// harnesses that run their agents under a config directory of
+    /// their own — Workhorse does — whose transcripts this shell's
+    /// environment cannot see. A leading `~/` expands at lookup time.
+    /// Transcripts are only ever READ, at view time; nothing from them
+    /// reaches the ledger (invariant 1).
+    pub transcript_roots: Vec<PathBuf>,
 }
 
 /// The `[gates]` block, resolved (plan: Middleware — route-scoped toggles,
@@ -544,6 +554,10 @@ impl Config {
             },
             // ctp's `CTP_AWAKE !== "off"`: on unless disabled.
             awake: file.awake.unwrap_or(true),
+            transcript_roots: file
+                .transcript_roots
+                .map(|roots| roots.into_iter().map(PathBuf::from).collect())
+                .unwrap_or_default(),
         };
 
         // Env overrides (config file loses).
@@ -638,6 +652,9 @@ struct FileConfig {
     default_backend_anthropic: Option<String>,
     /// The idle-sleep lock toggle (ctp `CTP_AWAKE`).
     awake: Option<bool>,
+    /// Extra transcript roots for the TUI's session labels, before `~`
+    /// expansion (see [`Config::transcript_roots`]).
+    transcript_roots: Option<Vec<String>>,
     providers: FileProviders,
     gates: FileGates,
 }
@@ -882,6 +899,10 @@ mod tests {
         // a proxy that silently stopped holding the machine awake is a
         // proxy whose sessions die to idle-suspend.
         assert!(config.awake);
+        // No extra transcript roots by default: the labels look under
+        // ~/.claude and $CLAUDE_CONFIG_DIR, and only a configured
+        // harness adds more.
+        assert!(config.transcript_roots.is_empty());
         assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
@@ -1341,6 +1362,41 @@ quota_enabled = false
         assert!(
             load("port = 19999\n").expect("absent key parses").awake,
             "absent awake = default = on"
+        );
+    }
+
+    #[test]
+    fn transcript_roots_are_read_and_a_config_without_them_parses() {
+        // The harness-root list, ctp's `CTP_TRANSCRIPTS`: the file names
+        // the extra config directories whose transcripts the session
+        // labels also look under. `~` is NOT expanded at load — it
+        // expands at lookup, against whatever home is running the view.
+        let dir = test_dir("transcript-roots");
+        let load = |text: &str| {
+            let _guard = env_lock().lock().unwrap();
+            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+            fs::write(dir.join("toker.toml"), text).expect("write config");
+            super::Config::load()
+        };
+
+        let config = load(r#"transcript_roots = ["/harness/repos/.claude", "~/elsewhere"]"#)
+            .expect("transcript roots load");
+        assert_eq!(
+            config.transcript_roots,
+            vec![
+                PathBuf::from("/harness/repos/.claude"),
+                PathBuf::from("~/elsewhere"),
+            ],
+            "~ expands at lookup, not at load"
+        );
+
+        // A config without the key parses with the empty default — the
+        // pre-existing configs parse untouched.
+        assert!(
+            load("port = 19999\n")
+                .expect("phase-1 config parses")
+                .transcript_roots
+                .is_empty()
         );
     }
 

@@ -1,0 +1,9 @@
+{"parentUuid":null,"sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"user","cwd":"/home/u/code/old-place","message":{"role":"user","content":"read the config module"}}
+{"parentUuid":"a1","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{"file_path":"/home/u/code/old-place/src/config.rs"}}]}}
+{"parentUuid":"a2","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"{\"type\":\"ai-title\"} — a tool result quoting a record's shape, not a record of its own"}]}}
+{"parentUuid":"a3","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"ai-title","aiTitle":"Old title"}
+{"parentUuid":"a4","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"last-prompt","lastPrompt":"fix the\n  thing"}
+{"parentUuid":"a5","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"user","cwd":"/home/u/code/toker","message":{"role":"user","content":"port the transcript reader"}}
+{"parentUuid":"a6","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reading transcript.mjs first"}]}}
+{"parentUuid":"a7","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"ai-title","aiTitle":"TUI session labels from transcripts"}
+{"parentUuid":"a8","sessionId":"018f2b7c-1111-4a55-9a11-000000000001","type":"last-prompt","lastPrompt":"port the transcript reader from transcript.mjs"}

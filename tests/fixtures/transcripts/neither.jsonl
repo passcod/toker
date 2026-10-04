@@ -1,0 +1,3 @@
+{"parentUuid":null,"sessionId":"018f2b7c-2222-4a55-9a22-000000000002","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a session with nothing usable in its tail"}]}}
+{"parentUuid":"b1","sessionId":"018f2b7c-2222-4a55-9a22-000000000002","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","content":"{\"cwd\":\"/not/a/top-level/field\"} — escaped text inside a tool result, not a field of the record"}]}}
+{"parentUuid":"b2","sessionId":"018f2b7c-2222-4a55-9a22-000000000002","type":"assistant","cwd":null,"message":{"role":"assistant","content":"done"}}

@@ -132,6 +132,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         },
         gates: toker::config::GatesConfig::default(),
         awake: false,
+        transcript_roots: Vec::new(),
     }
 }
 

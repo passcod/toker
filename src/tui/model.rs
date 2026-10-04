@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::labels::Label;
 use super::quota::QuotaAgg;
 use super::rebuilds::RebuildAgg;
 use crate::catalog::windows::{ContextWindow, resolve_context_window};
@@ -132,6 +133,12 @@ pub(crate) struct SessionAgg {
     /// the gpt-5.6-sol/luna 872k declarations, so this is a pure lookup
     /// with no extra read.
     pub ctx: ContextWindow,
+    /// The session's name from Claude Code's own transcript (see
+    /// [super::labels]): the working directory and title the tail
+    /// carries, newest-wins, read-only at view time and never stored
+    /// (invariant 1). `None` when no transcript carries one — the view
+    /// falls back to the session id, never an empty cell.
+    pub label: Option<Label>,
     /// Newest row timestamp (epoch ms).
     pub latest_ts_ms: i64,
 }
@@ -297,7 +304,16 @@ pub(crate) enum HitRate {
 
 /// The pre-refresh placeholder: an empty window of the right shape.
 pub(crate) fn empty(window_mins: u64) -> Snapshot {
-    aggregate(&[], None, &HashSet::new(), None, window_mins, 0, 0)
+    aggregate(
+        &[],
+        None,
+        &HashSet::new(),
+        &HashMap::new(),
+        None,
+        window_mins,
+        0,
+        0,
+    )
 }
 
 /// Aggregate one window of display rows (the narrow projection the
@@ -307,17 +323,23 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// header can show both. `quota` is the PRECOMPUTED quota section (the
 /// meter lookback aggregation, [`super::quota::aggregate`] over the
 /// 7-day read), `rebuilds` the precomputed cache-rebuild section (the
-/// lane walk over the 24 h tail, [`super::rebuilds`]), and `released`
+/// lane walk over the 24 h tail, [`super::rebuilds`]), `released`
 /// the sessions holding a live allowance for the window now running
 /// (read from the allowances table against the quota section's
-/// current resets, live.mjs:287-296) — all three built on their own
-/// slower cadences, passed in to keep this function pure over cheap
-/// inputs. Rows may arrive in any order — "latest" is decided by
-/// `ts_ms` throughout.
+/// current resets, live.mjs:287-296), and `labels` the
+/// transcript-derived session labels resolved by the display tick
+/// (one read per session per refresh, [`super::labels::Labels`]) —
+/// all built on their own slower cadences or the tick itself, passed
+/// in to keep this function pure over cheap inputs. Eight positional
+/// parameters is the honest shape of a frame's inputs: the rows plus
+/// the precomputed/resolved sections and the window anchors. Rows may
+/// arrive in any order — "latest" is decided by `ts_ms` throughout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate(
     rows: &[DisplayRow],
     quota: Option<&QuotaAgg>,
     released: &HashSet<String>,
+    labels: &HashMap<String, Label>,
     rebuilds: Option<RebuildAgg>,
     window_mins: u64,
     now_ms: i64,
@@ -384,13 +406,13 @@ pub(crate) fn aggregate(
 
         // Sessions: group by id (NULL under the dash), accumulate per row
         // in ts order so the last write is the latest row's value.
-        let label = row
+        let key = row
             .session_id
             .clone()
             .unwrap_or_else(|| NO_SESSION.to_owned());
-        let slot = *index.entry(label.clone()).or_insert_with(|| {
+        let slot = *index.entry(key.clone()).or_insert_with(|| {
             sessions.push(SessionAgg {
-                session: label.clone(),
+                session: key.clone(),
                 requests: 0,
                 model: None,
                 input_now: None,
@@ -400,8 +422,9 @@ pub(crate) fn aggregate(
                 compact_generations: None,
                 forced_latest: false,
                 forced_any: false,
-                released: released.contains(&label),
+                released: released.contains(&key),
                 ctx: ContextWindow::Unknown,
+                label: labels.get(&key).cloned(),
                 latest_ts_ms: row.ts_ms,
             });
             sessions.len() - 1
@@ -590,12 +613,27 @@ mod tests {
         std::collections::HashSet::new()
     }
 
+    /// The tests' shared "no transcript labels" input — the absent
+    /// state, never a fabricated one.
+    fn no_labels() -> std::collections::HashMap<String, super::Label> {
+        std::collections::HashMap::new()
+    }
+
     fn agg(rows: &[DisplayRow], total: i64) -> Snapshot {
         // The tests' display rows carry no meter snapshots (the narrow
         // display shape has none to carry), so the loop's quota
         // section over this window is None — absence, not zeros. The
         // precomputed-section wiring has its own test below.
-        super::aggregate(rows, None, &no_sections(), None, WINDOW, NOW, total)
+        super::aggregate(
+            rows,
+            None,
+            &no_sections(),
+            &no_labels(),
+            None,
+            WINDOW,
+            NOW,
+            total,
+        )
     }
 
     /// A measurement row a given number of minutes before `NOW`.
@@ -898,7 +936,16 @@ mod tests {
 
     #[test]
     fn zero_window_mins_clamps_to_one() {
-        let snap = super::aggregate(&[display_bare(NOW)], None, &no_sections(), None, 0, NOW, 1);
+        let snap = super::aggregate(
+            &[display_bare(NOW)],
+            None,
+            &no_sections(),
+            &no_labels(),
+            None,
+            0,
+            NOW,
+            1,
+        );
         assert_eq!(snap.window_mins, 1);
         assert_eq!(snap.rate.buckets.len(), 1);
         assert_eq!(snap.rate.buckets[0].requests, 1);
@@ -927,6 +974,7 @@ mod tests {
             &as_display_rows(&[lookback[1].clone()]),
             quota_section.as_ref(),
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -951,6 +999,7 @@ mod tests {
             &[display_bare(mins_ago(1))],
             quota_section.as_ref(),
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1214,6 +1263,7 @@ mod tests {
             &as_display_rows(&full),
             quota.as_ref(),
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1232,6 +1282,7 @@ mod tests {
             &narrow,
             quota.as_ref(),
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1370,6 +1421,7 @@ mod tests {
             &as_display_rows(&store.requests_since(NOW, 10).expect("old read")),
             None,
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1379,6 +1431,7 @@ mod tests {
             &store.display_rows_since(NOW, 10).expect("narrow read"),
             None,
             &no_sections(),
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1548,6 +1601,7 @@ mod tests {
                 &as_display_rows(&full),
                 None,
                 &no_sections(),
+                &no_labels(),
                 None,
                 30,
                 now_ms,
@@ -1568,7 +1622,16 @@ mod tests {
                 .expect("narrow read");
             new_read += t.elapsed();
             let t = Instant::now();
-            let snap = super::aggregate(&narrow, None, &no_sections(), None, 30, now_ms, total);
+            let snap = super::aggregate(
+                &narrow,
+                None,
+                &no_sections(),
+                &no_labels(),
+                None,
+                30,
+                now_ms,
+                total,
+            );
             new_refresh += t.elapsed();
             std::hint::black_box(&snap);
         }
@@ -1580,6 +1643,7 @@ mod tests {
                 .expect("narrow read"),
             None,
             &no_sections(),
+            &no_labels(),
             None,
             30,
             now_ms,
@@ -1723,6 +1787,7 @@ mod tests {
             &[latest, earlier_only, after, released_row],
             None,
             &released,
+            &no_labels(),
             None,
             WINDOW,
             NOW,
@@ -1741,6 +1806,57 @@ mod tests {
         );
         assert!(session("ses-free").released);
         assert!(!session("ses-live").released);
+    }
+
+    /// Session labels arrive as data, keyed by session id exactly like
+    /// the released set: a label names its session, an id with no label
+    /// stays label-less (absence, never a fabricated name), and the
+    /// NULL-session group never gets one — it is not a session, and the
+    /// id the view would fall back to is the dash.
+    #[test]
+    fn labels_attach_by_session_id_and_absence_stays_absent() {
+        let mut rows = Vec::new();
+        for at in [3, 2] {
+            let mut row = display_bare(mins_ago(at));
+            row.session_id = Some("ses-named".into());
+            row.model = Some("claude-opus-5".into());
+            rows.push(row);
+        }
+        let mut bare = display_bare(mins_ago(1));
+        bare.session_id = Some("ses-plain".into());
+        rows.push(bare);
+        rows.push(display_bare(mins_ago(4))); // the NULL-session group
+
+        let mut labels = std::collections::HashMap::new();
+        labels.insert(
+            "ses-named".to_owned(),
+            super::Label {
+                cwd: Some("/home/u/code/toker".into()),
+                title: Some("TUI session labels".into()),
+                prompt: None,
+            },
+        );
+        let snap = super::aggregate(&rows, None, &no_sections(), &labels, None, WINDOW, NOW, 4);
+        let session = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+        };
+        assert_eq!(
+            session("ses-named").label,
+            Some(super::Label {
+                cwd: Some("/home/u/code/toker".into()),
+                title: Some("TUI session labels".into()),
+                prompt: None,
+            })
+        );
+        assert_eq!(session("ses-plain").label, None);
+        assert_eq!(
+            session(NO_SESSION).label,
+            None,
+            "the NULL-session group never carries a name"
+        );
     }
 
     /// The TOKENS buckets and their three hit-rate states: a real rate

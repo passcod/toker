@@ -83,7 +83,7 @@ pub fn status() -> anyhow::Result<()> {
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
     let db_path = db.unwrap_or(config.db_path);
-    crate::tui::run(&db_path, window_mins)
+    crate::tui::run(&db_path, window_mins, &config.transcript_roots)
 }
 
 /// `import`: ingest ctp's usage.jsonl into the ledger (plan: Storage).

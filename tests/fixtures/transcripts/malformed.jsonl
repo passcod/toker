@@ -1,0 +1,5 @@
+{"parentUuid":null,"sessionId":"018f2b7c-3333-4a55-9a33-000000000003","type":"user","cwd":"/home/u/code/toker","message":{"role":"user","content":"first turn"}}
+{"parentUuid":"c1","sessionId":"018f2b7c-3333-4a55-9a33-000000000003","type":"ai-title","aiTitle":"The good title"}
+{"parentUuid":"c2","sessionId":"018f2b7c-3333-4a55-9a33-000000000003","type":"last-prompt","lastPrompt":"the good prompt"}
+{"parentUuid":"c3","sessionId":"018f2b7c-3333-4a55-9a33-000000000003","type":"user","cwd":"/home/u/code/bro
+{"parentUuid":"c4","sessionId":"018f2b7c-3333-4a55-9a33-000000000003","type":"ai-title","aiTitle":"Broken

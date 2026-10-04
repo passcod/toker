@@ -236,6 +236,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
         },
         gates: GatesConfig::default(),
         awake,
+        transcript_roots: Vec::new(),
     }
 }
 
