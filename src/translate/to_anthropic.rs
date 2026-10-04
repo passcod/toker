@@ -440,7 +440,7 @@ fn usage_json(usage: &Usage) -> Value {
 /// A Responses error payload → the anthropic error event's data JSON
 /// (the error table). The message passes through verbatim, standing in
 /// on the code, then the kind, then the constant — never invented.
-fn error_event_data(error: &ResponseError) -> Value {
+pub fn error_event_data(error: &ResponseError) -> Value {
     let kind = anthropic_error_type(error);
     let message = error
         .message
@@ -462,7 +462,7 @@ fn error_event_data(error: &ResponseError) -> Value {
 }
 
 /// The error table: `code` first, then `kind`; first match wins.
-fn anthropic_error_type(error: &ResponseError) -> &'static str {
+pub fn anthropic_error_type(error: &ResponseError) -> &'static str {
     let code = error.code.as_deref().unwrap_or("").to_ascii_lowercase();
     if code.contains("rate_limit") {
         return "rate_limit_error";

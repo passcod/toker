@@ -72,6 +72,7 @@ use crate::store::{Allowance, MetersSnapshot};
 
 use super::InFlightGuard;
 use super::Server;
+use super::codex;
 use super::proxy::{
     MAX_ERROR_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_BUFFER, UpstreamBody, buffer_up_to,
     buffered_body, build_response, is_compressed, is_event_stream, plain_status, response_headers,
@@ -83,6 +84,7 @@ use super::record_anthropic::{
     record_anthropic_cold, record_anthropic_cold_quiet, record_anthropic_error,
     record_anthropic_measurement, record_anthropic_released,
 };
+use crate::middleware::model_map;
 
 /// `POST /v1/messages` — the anthropic usage path, and the quota gate's
 /// only target.
@@ -325,6 +327,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             system_merged: None,
             forced_from: None,
             forced_to: None,
+            model_mappings: None,
         });
         gate_shape = Some(shape);
         parsed = Some(ir);
@@ -681,14 +684,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // which is `served_model`'s reading here. The lane is the same
         // record the cold gate loaded; the shape is the request's own,
         // pre-transform (ctp's ordering: the row's shape fields are).
+        // The map preview (ctp `previewMappedModel`, model-map.mjs:143):
+        // recency reads the identity the request would be MAPPED to,
+        // never the asked model — without this, a claimed model (only
+        // ever served as its target) would always read as idle.
+        let asked = served_model.clone();
+        let served_as = match (backend.model_map(), asked.as_deref()) {
+            (Some(map), Some(model)) => model_map::preview_mapped_model(Some(map), model),
+            _ => None,
+        };
         let decision = force_newest::decide(
             &force_newest::ForceContext {
                 model: served_model.as_deref(),
-                // The map preview (ctp: recency reads the identity the
-                // request would be MAPPED to, never the asked model).
-                // None until the model-map application below feeds it —
-                // the semantics of "no map configured".
-                served_as: None,
+                served_as,
                 lane: cold_lane.as_ref(),
                 req_messages: gate_shape.as_ref().and_then(|shape| shape.req_messages),
                 compaction: gate_shape
@@ -714,6 +722,58 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
+    // ── the model routing map (ctp proxy.mjs:1511-1541, the FINAL
+    // routing stage) ──
+    //
+    // A provider carrying `[providers.<id>.model_map]` rewrites the
+    // model positions in the serialised body: top-level on /v1/messages
+    // and /count_tokens, per-request in batches. A deliberate transform —
+    // the spliced bytes are the point, and the fidelity compare ran on
+    // the pre-transform body, so a mapped model can never surface as
+    // drift. Matching is exact-identity first, then family; unmatched
+    // requests keep their exact bytes (ctp `unchanged`). Applies AFTER
+    // force-newest (which previewed through the map above), and BEFORE
+    // the served-model mark — the mark must see what is actually sent.
+    if let Some(map) = backend.model_map() {
+        let rewrite = model_map::rewrite_mapped_models(Some(map), &forward, "POST", path);
+        if rewrite.mapped {
+            forward = Bytes::from(rewrite.body);
+            if let Some(effective) = rewrite.effective_model.clone() {
+                // Provenance (ctp `requestedModel`/`effectiveModel`): the
+                // row's requested model keeps its first reading (what the
+                // frontend asked, routing prefixes included); the
+                // effective one becomes the mapped target.
+                if let Some(ctx) = record.as_mut() {
+                    ctx.effective_model = Some(effective.clone());
+                    if rewrite.models.len() > 1 {
+                        // Batch provenance rides the row's model_mappings
+                        // (ctp's per-request list); the top-level position
+                        // is the requested/effective pair above.
+                        ctx.model_mappings = Some(
+                            rewrite
+                                .models
+                                .iter()
+                                .map(|position| {
+                                    serde_json::json!({
+                                        "requestIndex": position.request_index,
+                                        "requestedModel": position.pre_map_model,
+                                        "effectiveModel": position.effective_model,
+                                    })
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                served_model = Some(effective);
+                tracing::info!(
+                    "model map: {} → {}",
+                    rewrite.pre_map_model.as_deref().unwrap_or("?"),
+                    served_model.as_deref().unwrap_or("?")
+                );
+            }
+        }
+    }
+
     // ── the served-model mark, BEFORE the request goes (ctp
     // proxy.mjs:1544-1551) ──
     //
@@ -724,6 +784,44 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // map. Gated to the exact `/v1/messages` path, ctp's `gated`.
     if path == "/v1/messages" {
         server.models.note_served(served_model.as_deref(), now_ms());
+    }
+
+    // ── the codex branch: translate instead of byte-forward ──
+    //
+    // The codex backend speaks the Responses dialect, not Anthropic's:
+    // a request routed here goes through the translation unit (both
+    // directions), never byte-forwarded. count_tokens and batches have
+    // no codex equivalent (the CLI defines none) — those paths answer
+    // with a typed anthropic error instead of forwarding JSON the
+    // backend would only reject.
+    if backend.id() == "codex_sub" {
+        if path == "/v1/messages" {
+            return codex::turn(codex::CodexTurn {
+                server,
+                backend: backend.clone(),
+                parsed,
+                gate_shape,
+                record,
+                in_flight,
+                session_id,
+                served_model,
+                stream_explicitly_false,
+            })
+            .await;
+        }
+        // count_tokens and batches have no codex equivalent (the codex
+        // client defines none): a typed anthropic error, never a
+        // byte-forward of JSON the backend would only reject. No row —
+        // the status is toker's own (the 502 rule: a proxy-generated
+        // status is never a fabricated provider measurement). These
+        // paths are JSON-only by definition (no stream flag exists on
+        // them), so the error renders as the JSON object.
+        return codex::anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "this backend does not support count_tokens or batch requests",
+            false,
+        );
     }
 
     // 6. Upstream; 7.-9. in forward_response. Session headers pass

@@ -60,6 +60,16 @@ pub trait Provider: Send + Sync {
     /// verification of the wiring (ledger-proxy lesson).
     fn inject_auth(&self, outgoing: &mut HeaderMap);
 
+    /// The operator's model routing map for this backend, when one is
+    /// configured (`[providers.<id>.model_map]`, ctp's `CTP_MODEL_MAP`
+    /// pattern): the final routing stage consults it, and force-newest
+    /// previews through it (recency reads the identity a request would be
+    /// mapped to, never the asked model). `None` — the default — for
+    /// providers without a map.
+    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
+        None
+    }
+
     /// Parse this provider's meter snapshot from one upstream response's
     /// headers, when this provider is a **meter source** (plan: quota
     /// gate — "Anthropic sub is the only meter source today. The meter

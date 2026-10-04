@@ -467,10 +467,7 @@ fn meter_line(
             spans.push(Span::styled(resets.to_owned(), Style::new().dim()));
         }
         if meter.exhausted {
-            spans.push(Span::styled(
-                gated_prefix.clone(),
-                Style::new().fg(Color::Yellow),
-            ));
+            spans.push(Span::styled(gated_prefix, Style::new().fg(Color::Yellow)));
         }
         spans.push(Span::styled(verdict_text.clone(), verdict_style));
         if !assumed_suffix.is_empty() {

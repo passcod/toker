@@ -42,13 +42,23 @@ const X_API_KEY: header::HeaderName = header::HeaderName::from_static("x-api-key
 /// response headers.
 pub struct AnthropicSub {
     upstream: Url,
+    /// The operator's model routing map, when one is configured
+    /// (`[providers.anthropic_sub.model_map]`) — ctp's `CTP_MODEL_MAP`
+    /// on this backend.
+    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicSub {
     /// Build the provider. `upstream` is the API root (no `/v1` prefix —
     /// frontend paths carry their own, unlike openrouter's base).
-    pub fn new(upstream: Url) -> AnthropicSub {
-        AnthropicSub { upstream }
+    pub fn new(
+        upstream: Url,
+        model_map: Option<crate::middleware::model_map::ModelMap>,
+    ) -> AnthropicSub {
+        AnthropicSub {
+            upstream,
+            model_map,
+        }
     }
 }
 
@@ -61,12 +71,22 @@ pub struct AnthropicApi {
     /// literal — see [`crate::config::AnthropicApiConfig::api_key`]). Never
     /// logged, never in the ledger (invariant 2).
     api_key: Option<String>,
+    /// The operator's model routing map (see [`AnthropicSub::model_map`]).
+    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicApi {
     /// Build the provider. `api_key` is the already-resolved key.
-    pub fn new(upstream: Url, api_key: Option<String>) -> AnthropicApi {
-        AnthropicApi { upstream, api_key }
+    pub fn new(
+        upstream: Url,
+        api_key: Option<String>,
+        model_map: Option<crate::middleware::model_map::ModelMap>,
+    ) -> AnthropicApi {
+        AnthropicApi {
+            upstream,
+            api_key,
+            model_map,
+        }
     }
 }
 
@@ -85,6 +105,10 @@ fn endpoint_of(upstream: &Url, path: &str) -> Url {
 impl Provider for AnthropicSub {
     fn id(&self) -> &str {
         "anthropic_sub"
+    }
+
+    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
+        self.model_map.as_ref()
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -110,6 +134,10 @@ impl Provider for AnthropicSub {
 impl Provider for AnthropicApi {
     fn id(&self) -> &str {
         "anthropic_api"
+    }
+
+    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
+        self.model_map.as_ref()
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -248,13 +276,17 @@ mod tests {
     use serde_json::json;
 
     fn sub() -> AnthropicSub {
-        AnthropicSub::new("https://api.anthropic.com".parse().expect("upstream url"))
+        AnthropicSub::new(
+            "https://api.anthropic.com".parse().expect("upstream url"),
+            None,
+        )
     }
 
     fn api() -> AnthropicApi {
         AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
             Some("sk-ant-test-key".to_owned()),
+            None,
         )
     }
 
@@ -305,7 +337,7 @@ mod tests {
                 "https://api.anthropic.com/v1/messages/batches?limit=10&after=3"
             );
         }
-        let slashed = AnthropicSub::new("http://localhost:9/".parse().expect("upstream url"));
+        let slashed = AnthropicSub::new("http://localhost:9/".parse().expect("upstream url"), None);
         assert_eq!(
             slashed.endpoint("/v1/messages").as_str(),
             "http://localhost:9/v1/messages",
@@ -378,6 +410,7 @@ mod tests {
 
         let keyless = AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
+            None,
             None,
         );
         let mut outgoing = HeaderMap::new();

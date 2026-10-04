@@ -103,6 +103,9 @@ pub(crate) struct AnthropicRecordCtx {
     /// that should cache its prefix on the model it will actually use.
     pub(crate) forced_from: Option<String>,
     pub(crate) forced_to: Option<String>,
+    /// Batch model-map provenance (ctp `modelMappings`): the per-request
+    /// from→to list, when the request was a batch the map claimed.
+    pub(crate) model_mappings: Option<Value>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -468,7 +471,7 @@ fn measurement_row(
         // line), and only when it did.
         cache_stripped: ctx.cache_stripped,
         system_merged: ctx.system_merged,
-        model_mappings: None,
+        model_mappings: ctx.model_mappings.clone(),
         drift_digest: None,
         status: None,
         error_type: None,
@@ -1152,4 +1155,242 @@ mod tests {
         assert_eq!(ladder_json(&[]), None, "no rungs = nothing localised");
         assert_eq!(i64_of(u64::MAX), i64::MAX, "saturated, never wrapped");
     }
+}
+
+// ── the codex translation branch's rows ──────────────────────────────────
+
+/// Record a completed codex turn (kind `None` = a real API measurement).
+///
+/// Buckets follow the join.mjs parity rule already used on the openai
+/// path: fresh input = input_tokens − cached − cache-write, clamped at
+/// zero (never a negative fabricated). The codex usage object has no
+/// TTL tiers — one `cache_write_tokens` figure — so the conservative
+/// ctp split applies: the whole write charges to the 1-hour tier with
+/// `ttl_split_known = false`, never a silent guess at a cheaper split.
+///
+/// The usage object rides `usage_raw` verbatim (the codex `Usage`
+/// serialises every member the wire carried, unknown ones included —
+/// the same ledger-parity rule openrouter's cost enjoys). Cost is NULL
+/// with no kind: there is no honest per-token price for codex slugs —
+/// the subscription insight lives in the meter snapshot, not a
+/// fabricated number.
+pub(crate) fn record_codex_measurement(
+    ctx: &AnthropicRecordCtx,
+    capture: &crate::providers::codex::TurnCapture,
+    meters: Option<Value>,
+    _status: u16,
+) {
+    let ts_ms = now_ms();
+    let duration_ms = elapsed_ms(ctx.started);
+    let usage = capture.usage();
+    let shape = ctx.shape.as_ref();
+
+    // The join.mjs three-way subtraction, clamped (never negative).
+    let cached = usage
+        .and_then(|usage| usage.input_tokens_details.as_ref())
+        .and_then(|details| details.cached_tokens);
+    let written = usage
+        .and_then(|usage| usage.input_tokens_details.as_ref())
+        .and_then(|details| details.cache_write_tokens);
+    let reasoning = usage
+        .and_then(|usage| usage.output_tokens_details.as_ref())
+        .and_then(|details| details.reasoning_tokens);
+    let (input, cache_read, cache_write_total) = match usage {
+        Some(usage) => {
+            let fresh = usage
+                .input_tokens
+                .saturating_sub(cached.unwrap_or(0))
+                .saturating_sub(written.unwrap_or(0));
+            (Some(i64_of(fresh)), cached.map(i64_of), written.map(i64_of))
+        }
+        None => (None, None, None),
+    };
+
+    // The presence map: which metrics the usage object actually carried
+    // (invariant 3 — reported zero ≠ absent).
+    let mut presence = serde_json::Map::new();
+    if usage.is_some() {
+        presence.insert("input".to_owned(), json!(true));
+        presence.insert("output".to_owned(), json!(true));
+        presence.insert("cache_read".to_owned(), json!(cached.is_some()));
+        presence.insert("cache_write_total".to_owned(), json!(written.is_some()));
+        presence.insert("cache_write_1h".to_owned(), json!(written.is_some()));
+        presence.insert("reasoning".to_owned(), json!(reasoning.is_some()));
+    }
+
+    let row = RequestRow {
+        id: None,
+        ts_ms,
+        duration_ms: Some(duration_ms),
+        kind: None,
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(ctx.backend.id().to_owned()),
+        route: Some(route_of(ctx)),
+        session_id: ctx.session_id.clone(),
+        ping: ctx.ping.then_some(true),
+        // The response's own slug is authoritative (the routing unit's
+        // `model` capture); the effective model — map and all — is the
+        // fallback when the response did not name itself.
+        model: capture
+            .model()
+            .map(str::to_owned)
+            .or_else(|| ctx.effective_model.clone()),
+        raw_model: capture.model().map(str::to_owned),
+        requested_model: ctx.requested_model.clone(),
+        effective_model: ctx.effective_model.clone(),
+        input,
+        cache_read,
+        cache_write_total,
+        cache_write_5m: None,
+        cache_write_1h: cache_write_total,
+        output: usage.map(|usage| i64_of(usage.output_tokens)),
+        reasoning: reasoning.map(i64_of),
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: cache_write_total.is_some().then_some(false),
+        usage_presence: (!presence.is_empty()).then(|| Value::Object(presence)),
+        usage_raw: usage.and_then(|usage| serde_json::to_string(usage).ok()),
+        // No honest price for a codex slug — never guessed (invariant 3).
+        cost_usd: None,
+        cost_kind: None,
+        // This response's own meter snapshot, parsed from its headers.
+        rate_limits: meters,
+        req_bytes: shape.map(|s| i64_of(s.req_bytes)),
+        req_messages: shape.and_then(|s| s.req_messages.map(i64_of)),
+        req_tools: shape.map(|s| i64_of(s.req_tools)),
+        tools_hash: shape.and_then(|s| s.tools_hash.clone()),
+        system_chars: shape.map(|s| i64_of(s.system_chars)),
+        system_hash: shape.map(|s| s.system_hash.clone()),
+        system_blocks: shape.map(|s| {
+            Value::Array(
+                s.system_blocks
+                    .iter()
+                    .map(|block| json!({"hash": block.hash, "chars": i64_of(block.chars)}))
+                    .collect(),
+            )
+        }),
+        system_messages: shape.and_then(|s| s.system_messages.map(i64_of)),
+        compact_generations: shape.and_then(|s| s.compact_generations.map(i64_of)),
+        summarising: shape.map(|s| s.summarising),
+        system_change: None,
+        system_ladder: shape.and_then(|s| ladder_json(&s.system_ladder)),
+        system_tail: shape.and_then(|s| ladder_json(&s.system_tail)),
+        gate_on: Some(ctx.server.config.gates.quota_enabled),
+        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        forced_from: ctx.forced_from.clone(),
+        forced_to: ctx.forced_to.clone(),
+        downgraded_from: ctx.downgraded_from.clone(),
+        downgraded_to: ctx.downgraded_to.clone(),
+        cache_stripped: ctx.cache_stripped,
+        system_merged: ctx.system_merged,
+        model_mappings: ctx.model_mappings.clone(),
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: None,
+        betas: ctx.betas.clone().map(|betas| betas.to_string()),
+        geo: None,
+        fast: None,
+    };
+    insert(ctx, row);
+    let model = capture.model().unwrap_or("?");
+    tracing::info!(
+        "POST {} → {} ledgered=yes model={} provider={} ({:.1}s)",
+        ctx.path,
+        _status,
+        model,
+        ctx.backend.id(),
+        ctx.started.elapsed().as_secs_f64(),
+    );
+}
+
+/// Record a failed codex turn: lean like every error row — status (the
+/// real HTTP status, or 200 for an in-band `response.failed` mid-stream),
+/// the mapped anthropic error type, the message in `extra`. `resets_at`
+/// is an ABSOLUTE epoch the upstream reports; it rides `extra` as-is —
+/// the `retry_after_ms` column means a duration and would misread it.
+pub(crate) fn record_codex_error(
+    ctx: &AnthropicRecordCtx,
+    status: u16,
+    error_type: &str,
+    message: &str,
+    resets_at: Option<i64>,
+) {
+    let mut extra = serde_json::Map::new();
+    extra.insert("error_message".to_owned(), json!(message));
+    if let Some(resets_at) = resets_at {
+        extra.insert("resets_at".to_owned(), json!(resets_at));
+    }
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(ctx.started)),
+        kind: Some(RowKind::Error),
+        frontend: Some("anthropic".to_owned()),
+        provider: Some(ctx.backend.id().to_owned()),
+        route: Some(route_of(ctx)),
+        session_id: ctx.session_id.clone(),
+        ping: ctx.ping.then_some(true),
+        model: None,
+        raw_model: None,
+        requested_model: ctx.requested_model.clone(),
+        effective_model: ctx.effective_model.clone(),
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: Some(ctx.server.config.gates.quota_enabled),
+        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: Some(status as i64),
+        error_type: Some(error_type.to_owned()),
+        retry_after_ms: None,
+        extra: Some(Value::Object(extra)),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    insert(ctx, row);
+    tracing::info!(
+        "POST {} → {} ledgered=error type={} provider={} ({:.1}s)",
+        ctx.path,
+        status,
+        error_type,
+        ctx.backend.id(),
+        ctx.started.elapsed().as_secs_f64(),
+    );
 }

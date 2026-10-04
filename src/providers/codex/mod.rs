@@ -111,6 +111,10 @@ pub struct CodexSub {
     /// a second turn that waited adopts the refreshed login instead of
     /// refreshing again with an already-rotated token.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// The operator's model routing map
+    /// (`[providers.codex_sub.model_map]`): claude asks for
+    /// `claude-opus-5`, the codex backend receives `gpt-5.6-sol`.
+    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl CodexSub {
@@ -124,6 +128,7 @@ impl CodexSub {
         originator: String,
         auth_path: PathBuf,
         refresh_url: Url,
+        model_map: Option<crate::middleware::model_map::ModelMap>,
     ) -> anyhow::Result<CodexSub> {
         let auth = CodexAuth::load(&auth_path)
             .with_context(|| format!("loading {}", auth_path.display()))?;
@@ -134,6 +139,7 @@ impl CodexSub {
             refresh_url,
             auth: Mutex::new(auth),
             refresh_lock: tokio::sync::Mutex::new(()),
+            model_map,
         })
     }
 
@@ -288,6 +294,10 @@ impl Provider for CodexSub {
         "codex_sub"
     }
 
+    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
+        self.model_map.as_ref()
+    }
+
     fn endpoint(&self, path: &str) -> Url {
         endpoint_of(&self.upstream, path)
     }
@@ -335,6 +345,7 @@ mod tests {
             "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("refresh url"),
+            None,
         )
         .expect("provider builds")
     }
@@ -358,6 +369,7 @@ mod tests {
             "codex_cli_rs".to_owned(),
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
+            None,
         )
         .expect("provider builds");
         assert_eq!(
@@ -515,6 +527,7 @@ mod tests {
             "my_tools_proxy".to_owned(),
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
+            None,
         )
         .expect("provider builds");
         let headers = provider.turn_headers(None, "k", "t", "r");
@@ -573,6 +586,7 @@ mod tests {
             "codex_cli_rs".to_owned(),
             dir.clone(),
             url,
+            None,
         )
         .expect("provider builds");
         let stale_now = now + 400_000; // past the fixture's exp

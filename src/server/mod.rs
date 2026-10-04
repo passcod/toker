@@ -36,6 +36,7 @@
 //! decisions never consult runtime state.
 
 pub(crate) mod anthropic;
+pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod proxy;
 mod record;
@@ -54,7 +55,7 @@ use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
-use crate::providers::{AnthropicApi, AnthropicSub, OpenRouter, Provider};
+use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenRouter, Provider};
 use crate::store::Store;
 
 use record::now_ms;
@@ -87,6 +88,14 @@ pub struct Server {
     pub(crate) anthropic_sub: Arc<dyn Provider>,
     /// The anthropic API backend.
     pub(crate) anthropic_api: Arc<dyn Provider>,
+    /// The codex subscription backend, as routing sees it (the trait
+    /// object: prefix routing and the protocol default resolve by id).
+    pub(crate) codex_sub: Arc<dyn Provider>,
+    /// The codex subscription backend, concretely — the translation
+    /// branch needs [`crate::providers::codex::CodexSub`]'s own methods
+    /// (auth-for-turn, the codex header block) that the trait does not
+    /// carry. Same allocation as [`Server::codex_sub`].
+    pub(crate) codex_turn: Arc<CodexSub>,
     /// In-flight usage-path requests (the anthropic `/v1/messages`
     /// non-ping ones and the openai chat completions — a running request
     /// holds the machine awake regardless of protocol): the sleep lock's
@@ -127,7 +136,7 @@ impl Server {
         }
         if !matches!(
             config.default_backend_anthropic.as_str(),
-            "anthropic_sub" | "anthropic_api"
+            "anthropic_sub" | "anthropic_api" | "codex_sub"
         ) {
             bail!(
                 "no anthropic backend named {:?} is wired",
@@ -143,11 +152,23 @@ impl Server {
             config.openrouter.upstream.clone(),
             config.openrouter.api_key(),
         ));
-        let anthropic_sub = Arc::new(AnthropicSub::new(config.anthropic_sub.upstream.clone()));
+        let anthropic_sub = Arc::new(AnthropicSub::new(
+            config.anthropic_sub.upstream.clone(),
+            config.anthropic_sub.model_map.clone(),
+        ));
         let anthropic_api = Arc::new(AnthropicApi::new(
             config.anthropic_api.upstream.clone(),
             config.anthropic_api.api_key(),
+            config.anthropic_api.model_map.clone(),
         ));
+        let codex_turn = Arc::new(CodexSub::new(
+            config.codex_sub.upstream.clone(),
+            config.codex_sub.originator.clone(),
+            config.codex_sub.auth_path.clone(),
+            config.codex_sub.refresh_url.clone(),
+            config.codex_sub.model_map.clone(),
+        )?);
+        let codex_sub: Arc<dyn Provider> = codex_turn.clone();
 
         // ctp proxy.mjs:440-454: the lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
@@ -183,6 +204,8 @@ impl Server {
             openrouter,
             anthropic_sub,
             anthropic_api,
+            codex_sub,
+            codex_turn,
             models,
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
@@ -196,6 +219,7 @@ impl Server {
         match name {
             "anthropic_sub" => Some(&self.anthropic_sub),
             "anthropic_api" => Some(&self.anthropic_api),
+            "codex_sub" => Some(&self.codex_sub),
             _ => None,
         }
     }

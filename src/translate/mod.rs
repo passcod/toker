@@ -152,7 +152,7 @@
 pub mod to_anthropic;
 pub mod to_codex;
 
-pub use to_anthropic::{AnthropicStream, message_from_capture};
+pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::to_codex;
 
 /// A translation failure, typed: the CALLER (unit C) decides policy —
