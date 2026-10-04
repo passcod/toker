@@ -1178,6 +1178,8 @@ mod tests {
         let snap = crate::tui::model::aggregate(
             &window_rows,
             quota.as_ref(),
+            &std::collections::HashSet::new(),
+            None,
             30,
             now_ms,
             store.count_requests().expect("count"),

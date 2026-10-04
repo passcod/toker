@@ -478,12 +478,12 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 }
 
 /// The narrow projection of a `requests` row for the display tick (the
-/// sessions/spend/rate refresh): the ten columns the dashboard's
-/// aggregation consumes, nothing else. Like [`MeterRow`], it exists so
-/// that read CANNOT regress into materialising full rows — the
-/// full-row reader casts 59 columns and parses six JSON values per
+/// sessions/spend/rate/context/tokens refresh): the fifteen columns the
+/// dashboard's aggregation consumes, nothing else. Like [`MeterRow`], it
+/// exists so that read CANNOT regress into materialising full rows —
+/// the full-row reader casts 59 columns and parses six JSON values per
 /// row, while the display read parses none (no JSON column is among
-/// the ten) — so adding a field to this type must be justified
+/// the fifteen) — so adding a field to this type must be justified
 /// against the per-refresh cost of fetching it across up to the
 /// display window's 10 000-row cap, on the TUI's 2-second cadence: a
 /// field added here is a per-tick cost decision, made in the open.
@@ -496,8 +496,29 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 /// the token buckets it sums are input, cache_read and output alone —
 /// `reasoning` and `cache_write_total` are other consumers' columns.
 ///
+/// The phase-5 growth (ctp live.mjs parity) adds five columns, each a
+/// scalar fetched for exactly one panel read:
+///
+/// - `req_messages`, `compact_generations` — the sessions table's
+///   `msgs`/`cmpct` columns, the latest row's values (live.mjs:356,388).
+///   Two INTEGERs.
+/// - `forced_to` — the `↑` marker's evidence (bright on the latest row,
+///   dim when only an earlier one was rewritten, live.mjs:367). A TEXT
+///   column, but written only on the rare rewrite row and read as one
+///   short string per row.
+/// - `cache_write_5m`, `cache_write_1h` — the tokens panel's two
+///   write tiers and the hit-rate denominator's second term
+///   (live.mjs:438-504). Two more INTEGERs. The context-occupancy sums
+///   read them too: anthropic's `input_tokens` excludes cache writes,
+///   so a prompt without its write share understates the context.
+///   `cache_write_total` alone would not do — the tokens panel
+///   renders the TTL tiers separately.
+///
 /// Absence stays absence (invariant 3): every field except `ts_ms`
-/// round-trips NULL as `None`, never as zero or `""`.
+/// round-trips NULL as `None`, never as zero or `""`. That includes
+/// `cache_write_*` — an openai-chat backend has no cache-write metric,
+/// and a NULL there is an explicit "not reported", which the
+/// aggregation renders as unknown, never as a zero write.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayRow {
     /// Epoch milliseconds — the window column, from the shared index.
@@ -514,12 +535,22 @@ pub struct DisplayRow {
     pub input: Option<i64>,
     /// Cache-read token bucket.
     pub cache_read: Option<i64>,
+    /// 5-minute-TTL cache-write share (the tokens panel's write tier).
+    pub cache_write_5m: Option<i64>,
+    /// 1-hour-TTL cache-write share (the tokens panel's write tier).
+    pub cache_write_1h: Option<i64>,
     /// Output token bucket.
     pub output: Option<i64>,
     /// Cost in USD, in the kind below.
     pub cost_usd: Option<f64>,
     /// Which of the three cost semantics produced `cost_usd`.
     pub cost_kind: Option<CostKind>,
+    /// Message count in the request (the sessions panel's `msgs`).
+    pub req_messages: Option<i64>,
+    /// Compaction generation count (the sessions panel's `cmpct`).
+    pub compact_generations: Option<i64>,
+    /// Force-newest rewrite target — the `↑` marker's evidence.
+    pub forced_to: Option<String>,
 }
 
 /// The display tick's window read ([`DisplayRow`]s): every row with
@@ -549,7 +580,8 @@ pub(super) fn display_rows_since(
         conn,
         "SELECT * FROM (
             SELECT id, ts_ms, kind, session_id, model, provider,
-                   input, cache_read, output, cost_usd, cost_kind
+                   input, cache_read, cache_write_5m, cache_write_1h, output,
+                   cost_usd, cost_kind, req_messages, compact_generations, forced_to
             FROM requests
             WHERE ts_ms >= ?1
             ORDER BY ts_ms DESC, id DESC LIMIT ?2
@@ -578,6 +610,8 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
         provider: row.get("provider")?,
         input: row.get("input")?,
         cache_read: row.get("cache_read")?,
+        cache_write_5m: row.get("cache_write_5m")?,
+        cache_write_1h: row.get("cache_write_1h")?,
         output: row.get("output")?,
         cost_usd: row.get("cost_usd")?,
         cost_kind: parse_stored(
@@ -585,7 +619,227 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
             row.get::<_, Option<String>>("cost_kind")?,
             CostKind::parse,
         )?,
+        req_messages: row.get("req_messages")?,
+        compact_generations: row.get("compact_generations")?,
+        forced_to: row.get("forced_to")?,
     })
+}
+
+/// The narrow projection of a `requests` row for the cache-rebuilds
+/// walk (the TUI's third narrow row, beside [`MeterRow`] and
+/// [`DisplayRow`]): the classifier's actual reads, nothing else. The
+/// walk runs on the TUI's QUOTA cadence (60 s), not the display tick —
+/// a lane walk needs the 24 h tail that provides each lane's
+/// pre-window predecessor (the anti-phantom rule, ctp lanes.md), and
+/// that tail is an order of magnitude more rows than the display
+/// window holds. Adding a field here is therefore a per-60 s cost
+/// decision across up to the rebuild tail's 20 000-row cap.
+///
+/// Field-by-field, against the classifier's reads:
+///
+/// - `id` — the row's identity: the lane predecessor reference for the
+///   localisation pass, and the tie-break the walk's order relies on.
+/// - `ts_ms` — windowing and the idle-gap measurement.
+/// - `session_id`, `tools_hash` — the lane key (`session | tools_hash`;
+///   `None` hashes share one lane, ctp live.mjs's `?` lane).
+/// - `system_hash`, `system_chars`, `system_blocks` — the
+///   system-prompt-change test and the "which block changed" half of
+///   its localisation. `system_blocks` is the row's ONLY JSON column:
+///   a handful of `{hash, chars}` objects, the lightest of the three
+///   localisation columns, needed on every system-change rebuild.
+///   The heavy ones — the ladders — stay behind the targeted second
+///   query ([`localisation_rows`]).
+/// - `req_messages` — the subagent-started collapse test
+///   (summarise.mjs:474-480).
+/// - `compact_generations` — the compaction test, a fact not an
+///   inference (summarise.mjs:468-470).
+/// - `summarising` — carried but deliberately NOT consulted by the
+///   cause rules: the same prompt shape serves Claude Code's routine
+///   background summaries, so treating it as a compaction would fire
+///   constantly (summarise.mjs:481-483). It rides the row for the
+///   report path, which prices compaction passes.
+/// - `cache_write_total` — the rewritten-token measure against the
+///   panel's `REBUILD_MIN` cutoff (tui::rebuilds). ctp's walk sums the
+///   two TTL shares (live.mjs:227-231); the capture folds those shares
+///   to this total and the import stores all three, so the one column
+///   carries the same number the ctp walk computes.
+/// - `cache_read`, `input` — the rebuild's prompt shape, for the
+///   panel's detail lines.
+/// - `model` — the lane's served model, for the detail lines.
+///
+/// `kind` is absent by construction: the read filters `kind IS NULL`,
+/// because a lane's predecessor must be a request the API served — a
+/// proxy-written row has no system hash, and read as a predecessor it
+/// attributes the next rebuild to a changed system prompt
+/// (live.mjs:212-215). Absence stays absence on every other column
+/// (invariant 3): a NULL `cache_write_total` is an unmeasurable
+/// rewrite, counted as such, never a zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RebuildRow {
+    /// Row id — never NULL on a read (assigned at insert).
+    pub id: i64,
+    /// Epoch milliseconds — the window column, from the shared index.
+    pub ts_ms: i64,
+    /// Frontend-provided session identity, when known.
+    pub session_id: Option<String>,
+    /// Digest of the tool list — the lane key's second half.
+    pub tools_hash: Option<String>,
+    /// Digest of the full system prompt.
+    pub system_hash: Option<String>,
+    /// System prompt length in characters (digest/length only).
+    pub system_chars: Option<i64>,
+    /// Per-block system digests/lengths as JSON — the row's only JSON
+    /// column; parsed once here, never re-serialised.
+    pub system_blocks: Option<Value>,
+    /// Message count in the request.
+    pub req_messages: Option<i64>,
+    /// Compaction generation count for the lane.
+    pub compact_generations: Option<i64>,
+    /// Request was a summarisation pass (compaction), 0/1 — carried,
+    /// never a cause (see the struct docs).
+    pub summarising: Option<bool>,
+    /// Cache-read token bucket (the rebuild's prompt shape).
+    pub cache_read: Option<i64>,
+    /// Total cache-write tokens — the rewritten-token measure.
+    pub cache_write_total: Option<i64>,
+    /// Input token bucket (the rebuild's prompt shape).
+    pub input: Option<i64>,
+    /// Model as reported back by the provider.
+    pub model: Option<String>,
+}
+
+/// The rebuild walk's tail read ([`RebuildRow`]s): measurement rows
+/// (`kind IS NULL`) with `ts_ms >= ts_ms`, oldest first, cap keeping
+/// the newest exactly like [`requests_since`].
+///
+/// The kind filter is the only filter, and it is load-bearing (see
+/// [`RebuildRow`]'s docs). The tail must reach back before the display
+/// window so every lane whose predecessor predates the window gets
+/// its real predecessor — the anti-phantom rule; the caller owns the
+/// tail length (the TUI uses 24 h against a ≤ 24 h display window).
+pub(super) fn rebuild_rows_since(
+    conn: &Connection,
+    ts_ms: i64,
+    limit: i64,
+) -> Result<Vec<RebuildRow>> {
+    rows_of(
+        conn,
+        "SELECT * FROM (
+            SELECT id, ts_ms, session_id, tools_hash, system_hash, system_chars,
+                   system_blocks, req_messages, compact_generations, summarising,
+                   cache_read, cache_write_total, input, model
+            FROM requests
+            WHERE ts_ms >= ?1 AND kind IS NULL
+            ORDER BY ts_ms DESC, id DESC LIMIT ?2
+        ) ORDER BY ts_ms ASC, id ASC",
+        [ts_ms, limit],
+        read_rebuild_row,
+    )
+}
+
+/// Read one narrow rebuild row by column name. No enum columns to
+/// guard (the kind filter fixed the only one); the JSON column parses
+/// or errors — a corrupted `system_blocks` must fail the walk rather
+/// than silently degrading every localisation.
+fn read_rebuild_row(row: &rusqlite::Row<'_>) -> Result<RebuildRow> {
+    Ok(RebuildRow {
+        id: row.get("id")?,
+        ts_ms: row.get("ts_ms")?,
+        session_id: row.get("session_id")?,
+        tools_hash: row.get("tools_hash")?,
+        system_hash: row.get("system_hash")?,
+        system_chars: row.get("system_chars")?,
+        system_blocks: super::opt_json_from_text(row.get("system_blocks")?)?,
+        req_messages: row.get("req_messages")?,
+        compact_generations: row.get("compact_generations")?,
+        summarising: row.get("summarising")?,
+        cache_read: row.get("cache_read")?,
+        cache_write_total: row.get("cache_write_total")?,
+        input: row.get("input")?,
+        model: row.get("model")?,
+    })
+}
+
+/// One row of the targeted localisation fetch: the heavy text columns
+/// the rebuild walk refuses to carry per row. Ladders and tails are
+/// JSON arrays of digests kept at rung-per-2 KiB / rung-per-8-to-64
+/// byte density — roughly 1.7 KB per row against a ~0.4 KB block map —
+/// so they are fetched only for the rows a system-prompt change was
+/// actually attributed to (typically none at all; the handful at most).
+///
+/// `system_change` rides the same query: ctp's capture-time
+/// localisation (proxy.mjs:652-710), which imported rows carry
+/// precomputed. The reference walk prefers it (summarise.mjs:385-387)
+/// and re-derives from the ladders only where it is absent — toker
+/// itself never writes the column (the lane middleware has not landed),
+/// but the imported history carries it, and a localisation that
+/// ignored it would throw away the one bound the data actually has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalisationRow {
+    /// The row id the fetch was keyed on.
+    pub id: i64,
+    /// Cumulative system-text digests every 2 KiB, oldest first.
+    pub system_ladder: Option<Vec<String>>,
+    /// Digests of the system text's last 8…256 bytes in 8-byte steps,
+    /// then 320…1024 in 64-byte steps (ctp `tailOffsets`).
+    pub system_tail: Option<Vec<String>>,
+    /// The capture-time localisation as JSON (`{delta, where}`), when
+    /// the row carries one.
+    pub system_change: Option<Value>,
+}
+
+/// Fetch the localisation columns for a specific set of row ids — the
+/// rebuild panel's second, targeted query. Rows are returned in the
+/// order SQLite visits them; the caller indexes by `id`. Ids that do
+/// not exist (or whose columns are NULL) either read back with `None`
+/// fields or are absent from the result; the caller treats both as "no
+/// rungs", never as evidence of no change.
+pub(super) fn localisation_rows(conn: &Connection, ids: &[i64]) -> Result<Vec<LocalisationRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // ids come from row ids the store itself assigned, so they are
+    // integers by construction — interpolated as parameters, never
+    // formatted into the SQL.
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, system_ladder, system_tail, system_change
+         FROM requests WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = rusqlite::params_from_iter(ids.iter());
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let ladder = super::opt_json_from_text(row.get::<_, Option<String>>("system_ladder")?)?;
+        let tail = super::opt_json_from_text(row.get::<_, Option<String>>("system_tail")?)?;
+        let change = super::opt_json_from_text(row.get::<_, Option<String>>("system_change")?)?;
+        out.push(LocalisationRow {
+            id: row.get("id")?,
+            // A rung list that is not an array of strings is a broken
+            // ladder: it localises nothing, so it reads as absent — the
+            // line then claims no position rather than a wrong one
+            // (invariant 3). Invalid JSON already failed the read above.
+            system_ladder: string_array(ladder).ok().flatten(),
+            system_tail: string_array(tail).ok().flatten(),
+            system_change: change,
+        });
+    }
+    Ok(out)
+}
+
+/// A stored rung list: JSON `null` stays `None`; a JSON array of
+/// strings reads as the rungs; anything else is an error (bad shape),
+/// which the callers above deliberately degrade to absence.
+fn string_array(
+    value: Option<Value>,
+) -> std::result::Result<Option<Vec<String>>, serde_json::Error> {
+    match value {
+        None => Ok(None),
+        Some(value) => Ok(Some(serde_json::from_value(value)?)),
+    }
 }
 
 /// Total row count — cheap enough for the TUI footer and `toker status`.

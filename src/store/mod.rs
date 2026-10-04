@@ -30,8 +30,8 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, DisplayRow, MeterRow, RequestRow, RowKind, SessionCostGroup, SessionSummary,
-    is_api_measurement,
+    CostKind, DisplayRow, LocalisationRow, MeterRow, RebuildRow, RequestRow, RowKind,
+    SessionCostGroup, SessionSummary, is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
 
@@ -160,16 +160,35 @@ impl Store {
         ledger::meter_rows_since(&*self.conn()?, ts_ms, limit)
     }
 
-    /// The display tick's window read (sessions/spend/rate): every row
-    /// with `ts_ms >= ts_ms` as narrow [`DisplayRow`]s, oldest first;
-    /// when the window holds more than `limit` rows the newest `limit`
-    /// are kept. See `ledger::display_rows_since` for why there is no
-    /// kind filter: the display aggregation consumes every row kind in
-    /// the window, including the kinds whose only contribution is
-    /// existing (`window_empty`).
+    /// The display tick's window read (sessions/spend/rate/context/
+    /// tokens): every row with `ts_ms >= ts_ms` as narrow [`DisplayRow`]s,
+    /// oldest first; when the window holds more than `limit` rows the
+    /// newest `limit` are kept. See `ledger::display_rows_since` for why
+    /// there is no kind filter: the display aggregation consumes every
+    /// row kind in the window, including the kinds whose only
+    /// contribution is existing (`window_empty`).
     pub fn display_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<DisplayRow>> {
         let limit = limit.min(i64::MAX as u64) as i64;
         ledger::display_rows_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The rebuild walk's tail read (the TUI's quota cadence):
+    /// measurement rows (`kind IS NULL`) with `ts_ms >= ts_ms` as
+    /// narrow [`RebuildRow`]s, oldest first, cap keeping the newest.
+    /// See `ledger::rebuild_rows_since` for the kind filter and the
+    /// tail-length rule — the tail must reach back before the display
+    /// window so lanes get their real predecessors (anti-phantom).
+    pub fn rebuild_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<RebuildRow>> {
+        let limit = limit.min(i64::MAX as u64) as i64;
+        ledger::rebuild_rows_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The rebuild panel's targeted second query: the heavy
+    /// localisation columns (ladders, tails, the capture-time
+    /// `system_change`) for a specific set of row ids — fetched only
+    /// for the rows a system-prompt change was attributed to.
+    pub fn localisation_rows(&self, ids: &[i64]) -> Result<Vec<LocalisationRow>> {
+        ledger::localisation_rows(&*self.conn()?, ids)
     }
 
     /// Total ledger row count.
@@ -804,11 +823,16 @@ mod tests {
                 provider: Some("openrouter".to_string()),
                 input: Some(12_345),
                 cache_read: Some(100_000),
+                cache_write_5m: Some(3_000),
+                cache_write_1h: Some(2_000),
                 output: Some(678),
                 cost_usd: Some(0.00213),
                 cost_kind: Some(CostKind::Billed),
+                req_messages: Some(42),
+                compact_generations: Some(1),
+                forced_to: Some("z-ai/glm-5.3".to_string()),
             },
-            "the ten display columns round-trip; the rest never cross"
+            "the fifteen display columns round-trip; the rest never cross"
         );
 
         // A bare row's absence stays absence on every one of the ten.
@@ -824,9 +848,14 @@ mod tests {
                 provider: None,
                 input: None,
                 cache_read: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
                 output: None,
                 cost_usd: None,
                 cost_kind: None,
+                req_messages: None,
+                compact_generations: None,
+                forced_to: None,
             }
         );
     }
@@ -883,6 +912,165 @@ mod tests {
             vec![300, 400, 500],
             "cap keeps the newest rows, still oldest-first"
         );
+    }
+
+    /// A rebuild-walk row carrying the classifier's full shape: a lane,
+    /// a system prompt with blocks, a compaction generation, and a
+    /// ≥-threshold rewrite.
+    fn rebuild_row(ts_ms: i64, session: &str) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.session_id = Some(session.to_owned());
+        row.tools_hash = Some("sha256:tools-1".to_owned());
+        row.system_hash = Some("sha256:sys-1".to_owned());
+        row.system_chars = Some(43_696);
+        row.system_blocks = Some(json!([
+            {"hash": "sha256:b1", "chars": 1_000},
+            {"hash": "sha256:b2", "chars": 42_696},
+        ]));
+        row.req_messages = Some(42);
+        row.req_tools = Some(17);
+        row.compact_generations = Some(1);
+        row.summarising = Some(false);
+        row.cache_read = Some(66_944);
+        row.cache_write_total = Some(60_000);
+        row.cache_write_5m = Some(0);
+        row.cache_write_1h = Some(60_000);
+        row.input = Some(673);
+        row.model = Some("claude-opus-5".to_owned());
+        row
+    }
+
+    #[test]
+    fn rebuild_rows_since_filters_measurements_windows_and_caps() {
+        let store = mem_store();
+        // Out of order, mixed kinds: measurements, an error row, a
+        // blocked row. The proxy-written kinds must never reach the
+        // walk — a notice row has no system hash, and read as a lane
+        // predecessor it attributes the next rebuild to a changed
+        // system prompt (live.mjs:212-215).
+        for ts in [100, 300, 200] {
+            store
+                .record_request(&rebuild_row(ts, "ses-a"))
+                .expect("record");
+        }
+        let mut error = bare_row(150);
+        error.kind = Some(RowKind::Error);
+        store.record_request(&error).expect("record");
+        let mut blocked = bare_row(250);
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
+
+        let rows = store.rebuild_rows_since(0, 100).expect("read");
+        assert_eq!(rows.len(), 3, "measurements only, kinds never cross");
+        assert_eq!(
+            rows.iter().map(|row| row.ts_ms).collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "oldest first, (ts, id) tie-break"
+        );
+        let row = &rows[0];
+        assert_eq!(row.id, 1, "the row id rides the narrow read");
+        assert_eq!(row.session_id.as_deref(), Some("ses-a"));
+        assert_eq!(row.tools_hash.as_deref(), Some("sha256:tools-1"));
+        assert_eq!(row.system_hash.as_deref(), Some("sha256:sys-1"));
+        assert_eq!(row.system_chars, Some(43_696));
+        assert_eq!(
+            row.system_blocks,
+            Some(json!([
+                {"hash": "sha256:b1", "chars": 1_000},
+                {"hash": "sha256:b2", "chars": 42_696},
+            ])),
+            "the one JSON column parses once, here"
+        );
+        assert_eq!(row.req_messages, Some(42));
+        assert_eq!(row.compact_generations, Some(1));
+        assert_eq!(row.summarising, Some(false));
+        assert_eq!(row.cache_read, Some(66_944));
+        assert_eq!(row.cache_write_total, Some(60_000));
+        assert_eq!(row.input, Some(673));
+        assert_eq!(row.model.as_deref(), Some("claude-opus-5"));
+
+        // The window is inclusive; the cap keeps the newest.
+        assert_eq!(
+            store
+                .rebuild_rows_since(200, 100)
+                .expect("window")
+                .iter()
+                .map(|row| row.ts_ms)
+                .collect::<Vec<_>>(),
+            vec![200, 300]
+        );
+        assert_eq!(
+            store
+                .rebuild_rows_since(0, 2)
+                .expect("capped")
+                .iter()
+                .map(|row| row.ts_ms)
+                .collect::<Vec<_>>(),
+            vec![200, 300],
+            "cap keeps the newest measurement rows"
+        );
+
+        // A bare row's absence stays absence on every column — an
+        // unknown rewrite is counted as such by the walk, never zero.
+        store.record_request(&bare_row(400)).expect("record");
+        let rows = store.rebuild_rows_since(350, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_write_total, None);
+        assert_eq!(rows[0].system_blocks, None);
+        assert_eq!(rows[0].tools_hash, None);
+    }
+
+    #[test]
+    fn localisation_rows_fetch_only_the_asked_ids() {
+        let store = mem_store();
+        // Three shaped rows; the middle one carries ladders, a tail,
+        // and a capture-time change.
+        let first = rebuild_row(100, "ses-a");
+        store.record_request(&first).expect("record");
+        let mut changed = rebuild_row(200, "ses-a");
+        changed.system_hash = Some("sha256:sys-2".to_owned());
+        changed.system_ladder = Some(r#"["r1","r2"]"#.to_owned());
+        changed.system_tail = Some(r#"["t1","t2"]"#.to_owned());
+        changed.system_change =
+            Some(json!({"delta": 105, "where": "block 1, in the last 8 bytes"}));
+        store.record_request(&changed).expect("record");
+        let third = rebuild_row(300, "ses-a");
+        store.record_request(&third).expect("record");
+        let ids: Vec<i64> = store
+            .rebuild_rows_since(0, 10)
+            .expect("rows")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+
+        // The targeted fetch: only the asked ids come back, keyed by
+        // id, heavy columns parsed.
+        let rows = store
+            .localisation_rows(&[ids[1], ids[2]])
+            .expect("localise");
+        assert_eq!(rows.len(), 2);
+        let by_id: std::collections::HashMap<_, _> =
+            rows.into_iter().map(|row| (row.id, row)).collect();
+        let changed = by_id.get(&ids[1]).expect("the changed row");
+        assert_eq!(
+            changed.system_ladder,
+            Some(vec!["r1".to_owned(), "r2".to_owned()])
+        );
+        assert_eq!(
+            changed.system_tail,
+            Some(vec!["t1".to_owned(), "t2".to_owned()])
+        );
+        assert_eq!(
+            changed.system_change,
+            Some(json!({"delta": 105, "where": "block 1, in the last 8 bytes"}))
+        );
+        let third = by_id.get(&ids[2]).expect("the third row");
+        assert_eq!(third.system_ladder, None);
+        assert_eq!(third.system_tail, None);
+        assert_eq!(third.system_change, None);
+
+        // Empty ids ask for nothing and get nothing.
+        assert!(store.localisation_rows(&[]).expect("empty").is_empty());
     }
 
     #[test]

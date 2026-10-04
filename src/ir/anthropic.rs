@@ -57,8 +57,10 @@ const COMPACT_PERFORMING: &[&str] = &[
 ];
 const COMPACT_RESUMED: &str = "This session is being continued from a previous conversation";
 
-// ctp proxy.mjs:591, 612-615 — ladder geometry.
-const LADDER_STEP: usize = 8192;
+// ctp proxy.mjs:591, 612-615 — ladder geometry. `pub(crate)`: the TUI's
+// rebuild localisation re-derives rung offsets from the same geometry the
+// stored rungs were cut to (the walk stores digests, never offsets).
+pub(crate) const LADDER_STEP: usize = 8192;
 const TAIL_FINE_STEP: usize = 8;
 const TAIL_FINE_SPAN: usize = 256;
 const TAIL_STEP: usize = 64;
@@ -755,8 +757,9 @@ fn prefix_ladder(units: &[u16]) -> Vec<String> {
 /// `tailOffsets`, proxy.mjs:630-636): fine steps close to the end, coarser
 /// further back — every observed change has been within the last few
 /// hundred bytes, so resolution is spent there. Offsets longer than the
-/// text are dropped.
-fn tail_offsets(text_length: usize) -> Vec<usize> {
+/// text are dropped. `pub(crate)`: the rebuild localisation walks the
+/// stored rungs by these offsets (proxy.mjs:694-700's `offs[ti]`).
+pub(crate) fn tail_offsets(text_length: usize) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(44);
     let mut len = TAIL_FINE_STEP;
     while len <= TAIL_FINE_SPAN {

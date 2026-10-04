@@ -38,11 +38,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Row, Table},
+    widgets::{Block, Cell, Paragraph, Row, Table},
 };
 
-use super::model::{NO_SESSION, Snapshot};
+use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
 use super::quota::{MeterPanel, Spent};
+use super::rebuilds::REBUILD_MIN;
+use crate::catalog::windows::ContextWindow;
 use crate::middleware::cold::{Verdict, alongside, reset_label};
 
 /// Bottom panel row height while no quota section exists: SPEND and
@@ -56,16 +58,38 @@ const BOTTOM_HEIGHT: u16 = 9;
 /// letting the line wrap or the verdict clip.
 const BAR_WIDTH: u16 = 22;
 
+/// Past this a session is not mid-turn; the context list goes quiet
+/// about it (ctp live.mjs:200's `IDLE_SEC`).
+const IDLE_SECS: i64 = 180;
+
+/// The context panel lists sessions with at least this many requests —
+/// occupancy is a claim about a conversation, and two rows say nothing
+/// yet (ctp live.mjs:400's `main.length < 3`).
+const CONTEXT_MIN_REQUESTS: usize = 3;
+
+/// The rebuild panel's localised detail lines: the newest
+/// system-prompt changes, so a change is diagnosable at a glance
+/// without leaving the dashboard for `toker report`.
+const REBUILD_DETAIL_LINES: usize = 3;
+
+/// The tokens panel's label and amount column widths (live.mjs's
+/// `padEnd(15)` / `padStart(13)`).
+const TOKENS_LABEL_W: usize = 15;
+const TOKENS_AMOUNT_W: usize = 13;
+
 /// The sessions table's columns, left to right, with their base widths.
 /// When the terminal is too narrow the *rightmost* columns shed first
 /// (see [`session_plan`]) — columns never wrap and never squeeze.
-const SESSION_COLUMNS: [(&str, u16); 7] = [
+const SESSION_COLUMNS: [(&str, u16); 10] = [
     ("SESSION", 18),
+    ("CTX", 5),
     ("MODEL", 22),
     ("REQS", 5),
-    ("IN NOW", 8),
-    ("PEAK", 8),
-    ("OUT", 7),
+    ("IN NOW", 10),
+    ("PEAK", 10),
+    ("MSGS", 5),
+    ("CMPCT", 6),
+    ("OUT", 8),
     ("LAST", 8),
 ];
 
@@ -75,27 +99,162 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// The whole frame. `clock` is the preformatted HH:MM:SS string and
 /// `tz` the zone the quota labels render in, both passed in so tests
 /// stay deterministic.
+///
+/// The panels stack in ctp live.mjs's order — SESSIONS / CONTEXT /
+/// TOKENS / CACHE REBUILDS, then the bottom strip holding the
+/// toker-only SPEND beside RATE & QUOTA — into a height budget
+/// computed from the snapshot ([`panel_areas`]): lists grow into
+/// slack, and a short terminal sheds panel rows from the top of the
+/// middle (sessions first) rather than ever letting the quota block
+/// scroll off the bottom, "the part worth watching" (live.mjs:660-679).
 pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone) {
-    let [header, sessions, bottom] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(bottom_height(snap)),
-    ])
-    .areas(frame.area());
+    let [header, sessions, context, tokens, rebuilds, bottom] = panel_areas(snap, frame.area());
 
     render_header(frame, header, snap, clock);
     render_sessions(frame, sessions, snap);
+    render_context(frame, context, snap);
+    render_tokens(frame, tokens, snap);
+    render_rebuilds(frame, rebuilds, snap);
     let [spend, rate] =
         Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(bottom);
     render_spend(frame, spend, snap);
     render_rate(frame, rate, snap, tz);
 }
 
+/// The frame's panel areas, from the snapshot's content and the frame's
+/// height: the header and the bottom strip are pinned, the four middle
+/// panels get their natural heights plus any slack (the sessions list
+/// grows into it, live.mjs's two lists doing the same), and a deficit
+/// sheds rows top-first among the middle panels — down to each panel's
+/// scaffold (borders and a title row) before the scaffolds give way,
+/// so the quota block never scrolls (live.mjs's final guard).
+fn panel_areas(snap: &Snapshot, frame: Rect) -> [Rect; 6] {
+    let bottom = bottom_height(snap);
+    let room = frame.height.saturating_sub(1 + bottom);
+    let [sessions, context, tokens, rebuilds] = middle_heights(snap, room);
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(sessions),
+        Constraint::Length(context),
+        Constraint::Length(tokens),
+        Constraint::Length(rebuilds),
+        Constraint::Length(bottom),
+    ])
+    .areas(frame)
+}
+
+/// The four middle panels' heights within `room` rows. Natural heights
+/// come from the snapshot; a deficit sheds from the top (sessions
+/// first, then context, tokens, rebuilds — live.mjs's middle cut keeps
+/// the tail), each panel keeping its scaffold while it can; slack goes
+/// to the sessions list. The result always sums to exactly `room`, so
+/// the layout never wraps and never leaves a gap.
+fn middle_heights(snap: &Snapshot, room: u16) -> [u16; 4] {
+    let natural = [
+        sessions_height(snap),
+        context_height(snap),
+        tokens_height(snap),
+        rebuilds_height(snap),
+    ];
+    // Borders plus a title row: the least a panel can be and still
+    // say what it is.
+    let scaffold = [3u16, 2, 2, 2];
+    let mut out = natural;
+    let mut over = out.iter().sum::<u16>().saturating_sub(room);
+    for (height, floor) in out.iter_mut().zip(scaffold) {
+        let cut = (*height).saturating_sub(floor).min(over);
+        *height -= cut;
+        over -= cut;
+        if over == 0 {
+            break;
+        }
+    }
+    // Still short: the scaffolds give way bottom-first — the rebuild
+    // and tokens panels fold before the context list, and the sessions
+    // panel's title last, matching live.mjs's guard keeping its `top`
+    // (header plus the SESSIONS scaffold) over the middle.
+    for (height, floor) in out.iter_mut().zip(scaffold).rev() {
+        let cut = (*height).min(floor).min(over);
+        *height -= cut;
+        over -= cut;
+        if over == 0 {
+            break;
+        }
+    }
+    debug_assert_eq!(over, 0, "the floors sum to more than any real room");
+    // Slack: the sessions list takes what is left, like live.mjs's
+    // lists sharing the page.
+    let used: u16 = out.iter().sum();
+    out[0] += room.saturating_sub(used);
+    out
+}
+
+/// The sessions panel's natural height: borders, the table header, one
+/// row per session — or its explicit empty-state line.
+fn sessions_height(snap: &Snapshot) -> u16 {
+    2 + 1 + snap.sessions.len().max(1) as u16
+}
+
+/// The CONTEXT panel's natural height.
+fn context_height(snap: &Snapshot) -> u16 {
+    2 + context_rows(snap).max(1) as u16
+}
+
+/// The TOKENS panel's natural height: the four input buckets, output,
+/// and the hit-rate lines the data supports (live.mjs renders no
+/// hit-rate line at all when nothing was reused).
+fn tokens_height(snap: &Snapshot) -> u16 {
+    if snap.window_empty {
+        return 2 + 1;
+    }
+    let mut lines = 4 + 1; // input buckets + output
+    if !matches!(
+        snap.tokens.hit_rate(),
+        super::model::HitRate::NothingReusable
+    ) {
+        lines += 2; // hit rate + missed
+    }
+    2 + lines
+}
+
+/// The CACHE REBUILDS panel's natural height.
+fn rebuilds_height(snap: &Snapshot) -> u16 {
+    2 + rebuilds_lines(snap).max(1) as u16
+}
+
+/// The middle panels' line counts (heights minus borders).
+fn context_rows(snap: &Snapshot) -> usize {
+    snap.sessions
+        .iter()
+        .filter(|session| session.requests >= CONTEXT_MIN_REQUESTS)
+        .count()
+}
+
+/// The rebuild panel's content lines: the summary, the cause table (or
+/// its explicit none-line), and the newest localised detail lines.
+fn rebuilds_lines(snap: &Snapshot) -> usize {
+    let Some(rebuilds) = snap.rebuilds.as_ref() else {
+        return 1;
+    };
+    if snap.window_empty {
+        return 1;
+    }
+    let mut lines = 1 + rebuilds.causes.len().max(1);
+    lines += rebuilds
+        .events
+        .iter()
+        .filter(|event| event.cause == super::rebuilds::Cause::SystemPrompt)
+        .count()
+        .min(REBUILD_DETAIL_LINES);
+    lines
+}
+
 /// The bottom row's height: the fixed [`BOTTOM_HEIGHT`] floor, grown to
 /// fit the quota section's lines when one exists — ctp drops from the
 /// middle rather than let the quota block scroll off the bottom
-/// ("the part worth watching", live.mjs:660-679); here the sessions
-/// panel yields the rows instead.
+/// ("the part worth watching", live.mjs:660-679); here the middle
+/// panels shed their rows first ([`middle_heights`]) and the bottom
+/// strip is pinned at whatever it needs.
 fn bottom_height(snap: &Snapshot) -> u16 {
     let Some(quota) = &snap.quota else {
         return BOTTOM_HEIGHT;
@@ -140,10 +299,14 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     );
 }
 
-/// The sessions table. Column shedding is a width-fallback chain: keep the
-/// leftmost columns that fit, give the leftover width to SESSION.
+/// The sessions table (live.mjs's SESSIONS block). Column shedding is a
+/// width-fallback chain: keep the leftmost columns that fit, give the
+/// leftover width to SESSION.
 fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let block = Block::bordered().title_top("SESSIONS");
+    if area.height == 0 {
+        return;
+    }
     if snap.sessions.is_empty() {
         let message = if snap.window_empty {
             "no requests in window"
@@ -195,26 +358,99 @@ fn session_plan(available: u16) -> (Vec<&'static str>, Vec<Constraint>) {
 
 /// One table row for a session; cells are produced only for the surviving
 /// columns so shedding never leaves stray data.
-fn session_cells(session: &super::model::SessionAgg, now_ms: i64, count: usize) -> Vec<String> {
-    let mut cells = Vec::with_capacity(count);
-    let mut push_if = |n: usize, value: String| {
+///
+/// The `↑` is bright while the conversation is being served upgraded
+/// and dim once it has been at some point in the window but the latest
+/// turn was not (live.mjs:362-367); the `$` marks a session released
+/// past the armed quota gate for the window now running. Idle ages dim
+/// past [`IDLE_SECS`], like live.mjs's idle column.
+fn session_cells(session: &SessionAgg, now_ms: i64, count: usize) -> Vec<Cell<'static>> {
+    let mut cells: Vec<Cell<'static>> = Vec::with_capacity(count);
+    let mut push_if = |n: usize, cell: Cell<'static>| {
         if n < count {
-            cells.push(value);
+            cells.push(cell);
         }
     };
-    push_if(0, session.session.clone());
-    push_if(1, session.model.clone().unwrap_or_else(|| "?".into()));
-    push_if(2, session.requests.to_string());
-    push_if(3, unknown_or(session.input_now));
-    push_if(4, unknown_or(session.input_peak));
-    push_if(5, unknown_or(session.output_total));
-    push_if(6, rel_age(now_ms - session.latest_ts_ms));
+    push_if(0, Cell::new(session.session.clone()));
+    push_if(1, ctx_cell(session.ctx));
+    push_if(2, model_cell(session));
+    push_if(3, Cell::new(session.requests.to_string()));
+    push_if(4, Cell::new(unknown_or_grouped(session.input_now)));
+    push_if(5, Cell::new(unknown_or_grouped(session.input_peak)));
+    push_if(
+        6,
+        Cell::new(
+            session
+                .req_messages
+                .map(|messages| messages.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ),
+    );
+    push_if(
+        7,
+        Cell::new(
+            // live.mjs:389's `String(gens || "-")`: the latest generation,
+            // and zero/absent renders as a dash.
+            session
+                .compact_generations
+                .filter(|generations| *generations > 0)
+                .map(|generations| generations.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ),
+    );
+    push_if(8, Cell::new(unknown_or_grouped(session.output_total)));
+    let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
+    let last = rel_age(now_ms - session.latest_ts_ms);
+    push_if(
+        9,
+        if idle {
+            Cell::new(last).dim()
+        } else {
+            Cell::new(last)
+        },
+    );
     cells
 }
 
-/// Unknown token counts render as `?`, never as a fake zero.
-fn unknown_or(value: Option<i64>) -> String {
-    value.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+/// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
+/// none — green and bright for a native exact 1M, yellow otherwise
+/// (live.mjs's `contextName` colouring, 358-361).
+fn ctx_cell(ctx: ContextWindow) -> Cell<'static> {
+    match ctx {
+        ContextWindow::Unknown => Cell::new("?").dim(),
+        ContextWindow::Exact { tokens } if tokens >= 1_000_000 => {
+            Cell::new(short_tokens(tokens)).fg(Color::Green).bold()
+        }
+        ContextWindow::Exact { tokens } | ContextWindow::Declared { tokens } => {
+            Cell::new(short_tokens(tokens)).fg(Color::Yellow)
+        }
+    }
+}
+
+/// The MODEL cell with its `↑`/`$` markers, coloured per marker.
+fn model_cell(session: &SessionAgg) -> Cell<'static> {
+    let model = session.model.clone().unwrap_or_else(|| "?".into());
+    let mut line = vec![Span::raw(model)];
+    if session.forced_any {
+        let style = if session.forced_latest {
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Green).dim()
+        };
+        line.push(Span::styled(" ↑", style));
+    }
+    if session.released {
+        line.push(Span::styled(" $", Style::new().fg(Color::Yellow)));
+    }
+    Cell::new(Line::from(line))
+}
+
+/// Unknown token counts render as `?`, never as a fake zero; known ones
+/// comma-grouped like ctp's `n()`.
+fn unknown_or_grouped(value: Option<i64>) -> String {
+    value
+        .map(|n| super::rebuilds::grouped(Some(n)))
+        .unwrap_or_else(|| "?".into())
 }
 
 /// Rough relative age for the LAST column.
@@ -229,6 +465,402 @@ fn rel_age(delta_ms: i64) -> String {
     } else {
         format!("{}h", secs / 3_600)
     }
+}
+
+/// CONTEXT: per-session occupancy against the known ceilings
+/// (live.mjs's context block, 396-434) — a bar and a percentage only
+/// where both the prompt and the ceiling are known; an unknown prompt
+/// or an unknown ceiling claims nothing (`? / 1M`, `136,260 / ?`),
+/// and an idle session is dimmed, because a session that is not about
+/// to do anything is not about to compact either. Past 80% a live
+/// session's bar turns red with the marker that says why.
+fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+    let block = Block::bordered().title_top("CONTEXT");
+    if area.height == 0 {
+        return;
+    }
+    if snap.window_empty {
+        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        return;
+    }
+    let width = block.inner(area).width as usize;
+
+    let mut lines = Vec::new();
+    let mut listed = 0;
+    for session in &snap.sessions {
+        if session.requests < CONTEXT_MIN_REQUESTS {
+            continue;
+        }
+        listed += 1;
+        let idle = snap.now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
+        let idle_note = idle.then(|| {
+            Line::from(Span::styled(
+                format!("  idle {}", rel_age(snap.now_ms - session.latest_ts_ms)),
+                Style::new().dim(),
+            ))
+        });
+
+        let ctx = match session.ctx {
+            ContextWindow::Unknown => None,
+            known => Some((
+                short_tokens(known.tokens().unwrap_or(0)),
+                known.tokens().unwrap_or(1),
+            )),
+        };
+        let Some(prompt) = session.input_now else {
+            // Unknown prompt: no bar, no share — an explicit `?`.
+            let mut spans = vec![
+                Span::raw(format!("  {:<18}", session.session)),
+                Span::raw(format!("{:>13} / ", "?")),
+            ];
+            match ctx {
+                Some((label, _)) => spans.push(ctx_span(&label, session.ctx)),
+                None => spans.push(Span::styled("?".to_owned(), Style::new().dim())),
+            }
+            if let Some(note) = idle_note {
+                spans.extend(note.spans);
+            }
+            lines.push(Line::from(spans));
+            continue;
+        };
+        let Some((ctx_label, ceiling)) = ctx else {
+            // Known prompt, unknown ceiling: the number is real, the
+            // share is not claimable.
+            let mut spans = vec![
+                Span::raw(format!("  {:<18}", session.session)),
+                Span::raw(format!("{:>13} / ", grouped(Some(prompt)))),
+                Span::styled("?".to_owned(), Style::new().dim()),
+            ];
+            if let Some(note) = idle_note {
+                spans.extend(note.spans);
+            }
+            lines.push(Line::from(spans));
+            continue;
+        };
+
+        // Both known: the occupancy claim.
+        let frac = (prompt as f64 / ceiling as f64).clamp(0.0, 1.0);
+        let near = frac > 0.8 && !idle;
+        // The bar budgets for the line's fixed text AND the trailing
+        // note — the "← compacts soon" marker or the idle label —
+        // exactly live.mjs's `Math.max(10, WIDTH - 52)`, which leaves
+        // room for its own marker at its shorter fixed text.
+        let bar_width = width.saturating_sub(66).max(10) as u16;
+        let bar_style = if idle {
+            Style::new().dim()
+        } else if near {
+            Style::new().fg(Color::Red)
+        } else {
+            Style::new().fg(Color::Cyan)
+        };
+        let mut spans = vec![
+            Span::raw(format!("  {:<18}", session.session)),
+            Span::styled(bar(frac, bar_width), bar_style),
+            Span::raw(format!(
+                " {:>13} / {:<4} {:>3}%",
+                grouped(Some(prompt)),
+                ctx_label,
+                (frac * 100.0).round() as i64
+            )),
+        ];
+        if near {
+            spans.push(Span::styled(
+                "  ← compacts soon".to_owned(),
+                Style::new().fg(Color::Red),
+            ));
+        } else if let Some(note) = idle_note {
+            spans.extend(note.spans);
+        }
+        lines.push(Line::from(spans));
+    }
+    if listed == 0 {
+        lines.push(Line::from(Span::styled(
+            "no session with enough history yet".to_owned(),
+            Style::new().dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The ceiling label's span, coloured like the sessions table's CTX
+/// cell (live.mjs:358-361).
+fn ctx_span(label: &str, ctx: ContextWindow) -> Span<'static> {
+    let style = match ctx {
+        ContextWindow::Unknown => Style::new().dim(),
+        ContextWindow::Exact { tokens } if tokens >= 1_000_000 => {
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        }
+        _ => Style::new().fg(Color::Yellow),
+    };
+    Span::styled(label.to_owned(), style)
+}
+
+/// TOKENS: where the window's input went (live.mjs's TOKENS block,
+/// 436-504). Shares are computed only when no input bucket is missing
+/// rows; a bucket with unavailable rows renders as a floor (`≥`) with
+/// the reason, and the hit rate is over the REUSABLE prefix — hits
+/// plus rewrites, never all input (fresh input was never going to be a
+/// hit). Absence renders as absence throughout: `?` rates, `≥` floors,
+/// "N req unknown" counts — never confident zeros.
+fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+    let block = Block::bordered().title_top("TOKENS");
+    if area.height == 0 {
+        return;
+    }
+    if snap.window_empty {
+        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        return;
+    }
+    let width = block.inner(area).width as usize;
+    let tokens = &snap.tokens;
+
+    let mut lines = Vec::new();
+    let incomplete = tokens.input_incomplete();
+    let total = tokens.input_total().max(1);
+    let label = |text: &str| format!("  {text:<TOKENS_LABEL_W$}");
+    let amount = |bucket: &super::model::BucketAgg| {
+        format!(
+            "{:>TOKENS_AMOUNT_W$}",
+            format!(
+                "{}{}",
+                if bucket.unavailable > 0 { "≥" } else { "" },
+                grouped(Some(bucket.value))
+            )
+        )
+    };
+    for (name, bucket) in [
+        ("fresh input", &tokens.fresh_input),
+        ("cache read", &tokens.cache_read),
+        ("cache write 1h", &tokens.write_1h),
+        ("cache write 5m", &tokens.write_5m),
+    ] {
+        if incomplete {
+            // live.mjs:453-459 — a missing bucket hides every share,
+            // because the total is not a total; each line says why.
+            let why = if bucket.unavailable > 0 {
+                format!("{} req unknown", bucket.unavailable)
+            } else {
+                "share unknown".to_owned()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(label(name)),
+                Span::raw(amount(bucket)),
+                Span::raw("  "),
+                Span::styled(why, Style::new().dim()),
+            ]));
+            continue;
+        }
+        let frac = bucket.value as f64 / total as f64;
+        let bar = fill_bar(frac, width.saturating_sub(48).max(6), "▬", " ");
+        lines.push(Line::from(vec![
+            Span::raw(label(name)),
+            Span::raw(amount(bucket)),
+            Span::raw("  "),
+            Span::styled(bar, Style::new().dim()),
+            Span::raw(format!(" {:>3}%", (frac * 100.0).round() as i64)),
+        ]));
+    }
+
+    // Output: no shared denominator with the input buckets, so no bar
+    // (live.mjs:464-470) — just the total and the per-request average.
+    let output_note = if tokens.output.unavailable > 0 {
+        format!("{} req unknown", tokens.output.unavailable)
+    } else {
+        format!(
+            "{}/req",
+            if tokens.requests > 0 {
+                (tokens.output.value as f64 / tokens.requests as f64).round() as i64
+            } else {
+                0
+            }
+        )
+    };
+    lines.push(Line::from(vec![
+        Span::raw(label("output")),
+        Span::raw(amount(&tokens.output)),
+        Span::raw("  "),
+        Span::styled(output_note, Style::new().dim()),
+    ]));
+
+    // Hit rate over the reusable prefix, and the missed line beside it.
+    match tokens.hit_rate() {
+        HitRate::Unknown => {
+            lines.push(Line::from(vec![
+                Span::raw(label("hit rate")),
+                Span::raw(format!("{:>TOKENS_AMOUNT_W$}", "?")),
+                Span::raw("  "),
+                Span::styled(
+                    format!("cache metrics unavailable for {} req", tokens.cache_unknown),
+                    Style::new().dim(),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw(label("missed")),
+                Span::raw(format!(
+                    "{:>TOKENS_AMOUNT_W$}",
+                    format!("≥{}", grouped(Some(tokens.written())))
+                )),
+                Span::raw("  "),
+                Span::styled("known cache writes only".to_owned(), Style::new().dim()),
+            ]));
+        }
+        HitRate::Rate(hit) => {
+            let style = if hit > 0.95 {
+                Style::new().fg(Color::Green)
+            } else if hit > 0.8 {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new().fg(Color::Red)
+            };
+            let note = if width >= 72 {
+                " of reusable prefix"
+            } else {
+                ""
+            };
+            let bar_width = width.saturating_sub(34 + note.len()).max(6);
+            lines.push(Line::from(vec![
+                Span::raw(label("hit rate")),
+                Span::raw(format!(
+                    "{:>TOKENS_AMOUNT_W$}",
+                    format!("{:.1}%", hit * 100.0)
+                )),
+                Span::raw("  "),
+                Span::styled(bar(hit, bar_width as u16), style),
+                Span::styled(note.to_owned(), Style::new().dim()),
+            ]));
+            let per_req = if tokens.requests > 0 {
+                (tokens.written() as f64 / tokens.requests as f64).round() as i64
+            } else {
+                0
+            };
+            lines.push(Line::from(vec![
+                Span::raw(label("missed")),
+                Span::raw(format!(
+                    "{:>TOKENS_AMOUNT_W$}",
+                    grouped(Some(tokens.written()))
+                )),
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "rewritten · {}/req · {} of {} req reused nothing",
+                        grouped(Some(per_req)),
+                        tokens.cold,
+                        tokens.requests
+                    ),
+                    Style::new().dim(),
+                ),
+            ]));
+        }
+        // Nothing was read or rewritten: no rate is claimable either
+        // way, and live.mjs renders no line at all.
+        HitRate::NothingReusable => {}
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// CACHE REBUILDS: the panel to watch (live.mjs's rebuild block,
+/// 507-522) — rewrites over the threshold, by cause, and the newest
+/// localised system-prompt changes. The panel never vanishes: no
+/// rebuilds is a verdict ("none — every prefix held"), not an absence
+/// of data, and unknown rewrites are counted, never guessed.
+fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+    let block = Block::bordered().title_top("CACHE REBUILDS");
+    if area.height == 0 {
+        return;
+    }
+    let Some(rebuilds) = snap.rebuilds.as_ref() else {
+        // The loop computes the section before the first draw; this is
+        // the pre-refresh placeholder's shape, and it says so.
+        frame.render_widget(
+            Paragraph::new("no rebuild data yet").dim().block(block),
+            area,
+        );
+        return;
+    };
+    if snap.window_empty {
+        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let threshold = grouped(Some(REBUILD_MIN));
+    // The denominator is the walk's own window count (`measured` +
+    // `unmeasured`), not the display aggregation's: the rebuild read
+    // is capped separately, and a fraction must be honest about its
+    // own denominator (live.mjs's `usage.length` is its walk's too).
+    let walked = rebuilds.measured + rebuilds.unmeasured;
+    if rebuilds.unmeasured > 0 {
+        lines.push(Line::from(format!(
+            "  {} of {} measured requests rewrote ≥{} tokens · {} unknown",
+            rebuilds.rebuilds, rebuilds.measured, threshold, rebuilds.unmeasured
+        )));
+    } else {
+        lines.push(Line::from(format!(
+            "  {} of {} requests rewrote ≥{} tokens",
+            rebuilds.rebuilds, walked, threshold
+        )));
+    }
+    if rebuilds.causes.is_empty() {
+        let verdict = if rebuilds.unmeasured > 0 {
+            "none among measured requests"
+        } else {
+            "none — every prefix held"
+        };
+        lines.push(Line::from(Span::styled(
+            format!("    {verdict}"),
+            Style::new().dim(),
+        )));
+    }
+    for (cause, count) in &rebuilds.causes {
+        lines.push(Line::from(vec![
+            Span::raw(format!("    {:<24}{:>4}  ", cause.label(), count)),
+            Span::styled("▬".repeat((*count).min(30)), Style::new().dim()),
+        ]));
+    }
+    // The newest localised system-prompt changes (summarise.mjs's
+    // per-rebuild line, the part that makes a change diagnosable).
+    for event in rebuilds
+        .events
+        .iter()
+        .filter(|event| event.cause == super::rebuilds::Cause::SystemPrompt)
+        .take(REBUILD_DETAIL_LINES)
+    {
+        let session: String = event.session.chars().take(8).collect();
+        let detail = event.detail.as_deref().unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            format!("  · {session} — system prompt changed ({detail})"),
+            Style::new().dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// ctp's `shortTokens` (live.mjs:180-184): round thousands and millions
+/// abbreviate; anything else renders comma-grouped.
+fn short_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        grouped(Some(tokens as i64))
+    }
+}
+
+/// Comma-grouped counts, ctp `n()`'s rendering (shared with the
+/// rebuild panel's detail lines).
+fn grouped(value: Option<i64>) -> String {
+    super::rebuilds::grouped(value)
+}
+
+/// The TOKENS panel's bucket bars (ctp live.mjs:461's `bar` with
+/// `▬` fill and space pad — a share bar, visually distinct from the
+/// occupancy and meter bars).
+fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
+    let frac = frac.clamp(0.0, 1.0);
+    let filled = (frac * width as f64).round() as usize;
+    let filled = filled.min(width);
+    fill.repeat(filled) + &pad.repeat(width.saturating_sub(filled))
 }
 
 /// SPEND: billed total, per-provider·model breakdown, and the never-dropped
@@ -588,6 +1220,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
+    use std::collections::HashSet;
 
     const NOW: i64 = 1_769_000_000_000;
     const MIN: i64 = 60_000;
@@ -641,7 +1274,7 @@ mod tests {
         unpriced.input = Some(500);
         rows.push(unpriced);
         rows.push(display_kind_row(NOW - 10_000, RowKind::Error));
-        model::aggregate(&rows, None, 30, NOW, 523)
+        model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523)
     }
 
     /// The shared synthetic quota rows: real-shaped anthropic meter
@@ -714,8 +1347,142 @@ mod tests {
                 TODAY,
                 NOW.saturating_sub(30 * 60_000),
             );
-            model::aggregate(&as_display_rows(&rows), quota.as_ref(), 30, NOW, 523)
+            model::aggregate(
+                &as_display_rows(&rows),
+                quota.as_ref(),
+                &HashSet::new(),
+                None,
+                30,
+                NOW,
+                523,
+            )
         }
+    }
+
+    /// The phase-5 panels' shared synthetic window: the anthropic-sub
+    /// shape the new panels exist for — cache metrics on every row,
+    /// prompts that carry their write share, known ceilings, a
+    /// released session, a rewrite, an idle session — built the way
+    /// the loop builds a frame (aggregate + precomputed rebuild
+    /// section + released set).
+    ///
+    /// - `ses-hot`: claude-opus-5, native 1M, three turns a minute
+    ///   apart, prompt 467,893 → the 47% occupancy bar; a system
+    ///   rewrite on the latest turn (dim `↑`… bright, actually — the
+    ///   latest row carries it).
+    /// - `ses-crowded`: claude-haiku-4-5 (200k), idle ten minutes, its
+    ///   prompt at 85% → the dimmed bar and the idle note.
+    /// - `ses-mystery`: gpt-5.6-terra — outside the catalogue, ceiling
+    ///   `?`, and its latest row reports no cache_read → the prompt is
+    ///   unknown too: the `? / ?` context line.
+    /// - `ses-free`: released past the gate → the `$`.
+    fn full_snapshot() -> model::Snapshot {
+        let mut rows = Vec::new();
+        // ses-hot: three turns, cache metrics on every one — the last
+        // pushed is the newest, so the latest turn is the lean one
+        // (1 500 fresh + 449 393 read + 20 000 written = 470 893).
+        for (input, read, write_1h, write_5m) in [
+            (15_161, 400_000, 30_000, 10_000),
+            (2_000, 440_000, 30_000, 0),
+            (1_500, 449_393, 20_000, 0),
+        ] {
+            let mut row = display_bare(NOW - (3 - rows.len() as i64) * 60_000 - 30_000);
+            row.session_id = Some("ses-hot".into());
+            row.model = Some("claude-opus-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(input);
+            row.cache_read = Some(read);
+            row.cache_write_1h = Some(write_1h);
+            row.cache_write_5m = Some(write_5m);
+            row.output = Some(768);
+            row.req_messages = Some(75 + rows.len() as i64);
+            row.compact_generations = Some(1);
+            rows.push(row);
+        }
+        // The latest turn of ses-hot was served upgraded.
+        rows.last_mut().expect("ses-hot").forced_to = Some("claude-opus-5-5".into());
+
+        // ses-crowded: one idle turn at 85% of a 200k window.
+        let mut crowded = display_bare(NOW - 10 * 60_000);
+        crowded.session_id = Some("ses-crowded".into());
+        crowded.model = Some("claude-haiku-4-5".into());
+        crowded.provider = Some("anthropic_sub".into());
+        crowded.input = Some(3_000);
+        crowded.cache_read = Some(160_000);
+        crowded.cache_write_1h = Some(7_000);
+        crowded.cache_write_5m = Some(0);
+        crowded.output = Some(100);
+        rows.push(crowded);
+        // …and two earlier turns, because occupancy is a claim about a
+        // conversation (the three-request rule). The oldest read
+        // nothing from cache — one cold request for the tokens panel.
+        for (at, read) in [(11, 150_000), (12, 0)] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-crowded".into());
+            row.model = Some("claude-haiku-4-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(3_000);
+            row.cache_read = Some(read);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            rows.push(row);
+        }
+
+        // ses-mystery: no catalogue entry — the ceiling is `?`, and the
+        // context line renders the prompt against it, claiming no
+        // share. Three turns, because occupancy is a claim about a
+        // conversation.
+        for (at, input) in [(4, 100), (3, 100), (2, 2_132)] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-mystery".into());
+            row.model = Some("gpt-5.6-terra".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(input);
+            row.cache_read = Some(1_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            row.output = Some(if at == 2 { 40 } else { 0 });
+            rows.push(row);
+        }
+
+        // ses-free: released past the gate for the window now running.
+        for at in [6, 5, 1] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-free".into());
+            row.model = Some("claude-sonnet-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(500);
+            row.cache_read = Some(2_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            row.output = Some(if at == 1 { 60 } else { 0 });
+            rows.push(row);
+        }
+
+        // The precomputed rebuild section, the way the loop's quota
+        // cadence builds it: two rewrites over the threshold, one of
+        // them a localised system-prompt change.
+        let rebuilds = crate::tui::rebuilds::RebuildAgg {
+            rebuilds: 2,
+            measured: 9,
+            unmeasured: 0,
+            causes: vec![
+                (crate::tui::rebuilds::Cause::SystemPrompt, 1),
+                (crate::tui::rebuilds::Cause::NewPrefix, 1),
+            ],
+            events: vec![crate::tui::rebuilds::RebuildEvent {
+                ts_ms: NOW - 30_000,
+                session: "ses-hot".into(),
+                cause: crate::tui::rebuilds::Cause::SystemPrompt,
+                detail: Some("43,696 → 43,801 chars; block 1, in the last 8 bytes".into()),
+                rewritten: 20_000,
+                system: None,
+            }],
+        };
+
+        let mut released = HashSet::new();
+        released.insert("ses-free".to_owned());
+        model::aggregate(&rows, None, &released, Some(rebuilds), 30, NOW, 523)
     }
 
     fn rendered(snap: &model::Snapshot, width: u16, height: u16) -> String {
@@ -761,7 +1528,7 @@ mod tests {
 
     #[test]
     fn empty_window_renders_absence_not_zero() {
-        let snap = model::aggregate(&[], None, 30, NOW, 523);
+        let snap = model::aggregate(&[], None, &HashSet::new(), None, 30, NOW, 523);
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
@@ -774,7 +1541,7 @@ mod tests {
 
     #[test]
     fn truly_empty_ledger_says_ledger_empty() {
-        let snap = model::aggregate(&[], None, 30, NOW, 0);
+        let snap = model::aggregate(&[], None, &HashSet::new(), None, 30, NOW, 0);
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("ledger empty"));
         assert!(text.contains("no requests in window"));
@@ -784,32 +1551,42 @@ mod tests {
     fn narrow_terminal_sheds_rightmost_columns() {
         let snap = snapshot();
         // 100 wide: the full column set, model included.
-        let wide = rendered(&snap, 100, 30);
+        let wide = rendered(&snap, 100, 36);
         assert!(wide.contains("z-ai/glm-5.3"));
         assert!(wide.contains("MODEL"));
         assert!(wide.contains("PEAK"));
 
-        // 40 wide (sessions block ≈ 24 inner cells): the chain sheds down
-        // to the SESSION column alone — the id survives, the model and
-        // token columns do not (clipped, not wrapped).
-        let narrow = rendered(&snap, 40, 20);
+        // 40 wide (sessions block ≈ 38 inner cells): the chain sheds
+        // down to SESSION + CTX — the id and its ceiling survive, the
+        // model and token columns do not (clipped, not wrapped).
+        let narrow = rendered(&snap, 40, 36);
         assert!(narrow.contains("ses-abc"), "session ids always survive");
         assert!(!narrow.contains("z-ai/glm-5.3"), "model column is shed");
         assert!(!narrow.contains("PEAK"), "rightmost columns are shed");
 
         // 80 wide: an intermediate level — model kept, LAST shed.
-        let mid = rendered(&snap, 80, 24);
+        let mid = rendered(&snap, 80, 36);
         assert!(mid.contains("z-ai/glm-5.3"));
         assert!(mid.contains("MODEL"));
         assert!(!mid.contains("LAST"));
+
+        // 20 rows tall: the height budget sheds the sessions LIST
+        // before anything else — the panel keeps its scaffold (title
+        // and header), the rows go, and nothing wraps or panics.
+        let short = rendered(&snap, 40, 20);
+        assert!(short.contains("SESSIONS"), "the scaffold survives");
+        assert!(!short.contains("ses-abc"), "the list rows are shed");
     }
 
     #[test]
     fn tiny_terminal_does_not_panic_and_keeps_the_session_column() {
         let snap = snapshot();
-        // Height 12 leaves the sessions panel only its borders below the
-        // header and the fixed bottom row; width 16 is barely enough for
-        // the panel titles. The point: no panic, panel titles survive.
+        // Height 12 leaves the middle panels two rows between the
+        // header and the fixed bottom row; the sessions scaffold keeps
+        // them (ctp's guard keeps its top — the SESSIONS scaffold and
+        // the quota block — over everything else). Width 16 is barely
+        // enough for the panel titles. The point: no panic, and the
+        // two panels that matter survive.
         let text = rendered(&snap, 16, 12);
         assert!(text.contains("SESSIONS"));
         assert!(text.contains("RATE"));
@@ -818,34 +1595,50 @@ mod tests {
     #[test]
     fn column_chain_sheds_in_order() {
         let plan = |width: u16| super::session_plan(width).0.to_vec();
-        // Full set: 76 + 6 spacing = 82 cells needed.
+        // Full set: 97 + 9 spacing = 106 cells needed.
         assert_eq!(
-            plan(82),
-            ["SESSION", "MODEL", "REQS", "IN NOW", "PEAK", "OUT", "LAST"]
+            plan(106),
+            [
+                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT", "LAST"
+            ]
         );
         assert_eq!(
-            plan(100),
-            ["SESSION", "MODEL", "REQS", "IN NOW", "PEAK", "OUT", "LAST"]
+            plan(120),
+            [
+                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT", "LAST"
+            ]
         );
         // Each step down sheds exactly the rightmost surviving column.
         assert_eq!(
-            plan(81),
-            ["SESSION", "MODEL", "REQS", "IN NOW", "PEAK", "OUT"]
+            plan(105),
+            [
+                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT"
+            ]
         );
         assert_eq!(
-            plan(73),
-            ["SESSION", "MODEL", "REQS", "IN NOW", "PEAK", "OUT"]
+            plan(96),
+            [
+                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT"
+            ]
         );
-        assert_eq!(plan(72), ["SESSION", "MODEL", "REQS", "IN NOW", "PEAK"]);
-        assert_eq!(plan(64), ["SESSION", "MODEL", "REQS", "IN NOW"]);
-        assert_eq!(plan(55), ["SESSION", "MODEL", "REQS"]);
-        assert_eq!(plan(45), ["SESSION", "MODEL"]);
+        assert_eq!(
+            plan(87),
+            ["SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS"]
+        );
+        assert_eq!(
+            plan(80),
+            ["SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK"]
+        );
+        assert_eq!(plan(70), ["SESSION", "CTX", "MODEL", "REQS", "IN NOW"]);
+        assert_eq!(plan(59), ["SESSION", "CTX", "MODEL", "REQS"]);
+        assert_eq!(plan(48), ["SESSION", "CTX", "MODEL"]);
+        assert_eq!(plan(24), ["SESSION", "CTX"]);
         assert_eq!(plan(18), ["SESSION"]);
         // Degenerate: never empty, pinned to whatever exists.
         assert_eq!(plan(5), ["SESSION"]);
-        // Leftover width lands on SESSION: at 90 cells, 82 are needed.
-        let (_, widths) = super::session_plan(90);
-        assert_eq!(widths[0], ratatui::layout::Constraint::Length(18 + 8));
+        // Leftover width lands on SESSION: at 110 cells, 106 are needed.
+        let (_, widths) = super::session_plan(110);
+        assert_eq!(widths[0], ratatui::layout::Constraint::Length(18 + 4));
     }
 
     // ── the rate & quota panel ────────────────────────────────────────
@@ -951,7 +1744,15 @@ mod tests {
                 TODAY,
                 NOW.saturating_sub(30 * 60_000),
             );
-            model::aggregate(&as_display_rows(&rows), quota.as_ref(), 30, NOW, 523)
+            model::aggregate(
+                &as_display_rows(&rows),
+                quota.as_ref(),
+                &HashSet::new(),
+                None,
+                30,
+                NOW,
+                523,
+            )
         };
         assert!(snap.quota.as_ref().expect("readings exist").gate_assumed);
         let text = rendered(&snap, 200, 30);
@@ -1013,5 +1814,330 @@ mod tests {
         let text = rendered(&snap, 40, 12);
         assert!(text.contains("RATE"));
         assert!(text.contains("SESSIONS"));
+    }
+
+    // ── the phase-5 panels ───────────────────────────────────────────
+
+    #[test]
+    fn sessions_table_renders_ctx_msgs_cmpct_and_the_markers() {
+        let snap = full_snapshot();
+        // 120 wide: every column survives; 40 tall: every panel fits.
+        let text = rendered(&snap, 120, 40);
+        for expected in [
+            "CTX", "MSGS", "CMPCT", "1M",   // ses-hot's native ceiling, bright green
+            "200k", // ses-crowded's fixed window
+            "?",    // gpt-5.6-terra: outside the catalogue
+            "77",   // ses-hot's latest message count
+        ] {
+            assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
+        }
+        // The `↑` (ses-hot's latest turn was served upgraded) and the
+        // `$` (ses-free is released past the gate) — the markers live
+        // in the model column.
+        assert!(text.contains("↑"), "the upgrade marker:\n{text}");
+        assert!(text.contains("$"), "the released marker:\n{text}");
+        // The prompt sums the write share: 1 500 + 449 393 + 20 000.
+        assert!(text.contains("470,893"), "the grouped prompt:\n{text}");
+        // `msgs` renders `-` where no row carried a count: ses-crowded
+        // never did.
+        assert!(text.contains("   -"), "a dash, never a zero:\n{text}");
+    }
+
+    #[test]
+    fn context_panel_renders_occupancy_ceilings_and_idle() {
+        let snap = full_snapshot();
+        let text = rendered(&snap, 120, 40);
+        assert!(text.contains("CONTEXT"), "the panel stays:\n{text}");
+        // The occupancy claim: the bar, the prompt, the ceiling, the
+        // share. 470,893 of 1M is 47%.
+        assert!(
+            text.contains("470,893 / 1M"),
+            "the known-ceiling line:\n{text}"
+        );
+        assert!(text.contains("47%"), "the share:\n{text}");
+        assert!(
+            text.contains("170,000 / 200k"),
+            "the idle session still claims its occupancy:\n{text}"
+        );
+        assert!(text.contains("85%"), "its share:\n{text}");
+        assert!(text.contains("idle 10m"), "the idle note:\n{text}");
+        // Known prompt, unknown ceiling: the number is real, the share
+        // is not claimable.
+        assert!(
+            text.contains("3,132 / ?"),
+            "the unknown-ceiling line:\n{text}"
+        );
+        // The bar itself renders for the claimable sessions.
+        assert!(text.contains("█"), "occupancy bars:\n{text}");
+        assert!(text.contains("░"), "occupancy pads:\n{text}");
+    }
+
+    #[test]
+    fn context_panel_says_so_when_no_session_has_enough_history() {
+        // Occupancy is a claim about a conversation: a window whose
+        // sessions never reach the three-request rule gets the explicit
+        // line, never a vanishing panel (live.mjs's
+        // "(no session with enough history yet)").
+        let mut rows = Vec::new();
+        for at in [2, 4] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-short".into());
+            row.model = Some("claude-opus-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(1_000);
+            row.cache_read = Some(2_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            rows.push(row);
+        }
+        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let text = rendered(&snap, 120, 40);
+        assert!(
+            text.contains("no session with enough history yet"),
+            "the empty state:\n{text}"
+        );
+    }
+
+    #[test]
+    fn context_panel_renders_an_unknown_prompt_against_a_known_ceiling() {
+        // The latest row reports no input: the prompt is unknown, so
+        // the context line claims no occupancy — an explicit `?`
+        // against the model's known 1M, never a zero (the ceiling is
+        // not the thing in doubt; the size is).
+        let mut rows = Vec::new();
+        for at in [3, 2, 1] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-blank".into());
+            row.model = Some("claude-opus-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = if at == 1 { None } else { Some(1_000) };
+            row.cache_read = Some(2_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            rows.push(row);
+        }
+        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let text = rendered(&snap, 120, 40);
+        assert!(text.contains("? / 1M"), "the unknown-prompt line:\n{text}");
+        // …and no share on that line: the `?` is the whole claim.
+        let line = text
+            .lines()
+            .find(|line| line.contains("ses-blank"))
+            .expect("the context line");
+        assert!(
+            !line.contains('%'),
+            "no percentage beside an unknown prompt:\n{line}"
+        );
+    }
+
+    #[test]
+    fn tokens_panel_renders_floors_and_an_unknown_rate_for_openai_windows() {
+        // The openai shape: no cache-write metrics on any row. Every
+        // bucket the rows DO report renders as a floor with the reason
+        // — a complete bucket beside incomplete ones says "share
+        // unknown", because the total is not a total — and the hit
+        // rate is an explicit `?`, never a guessed figure.
+        let mut rows = Vec::new();
+        for at in [3, 2, 1] {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-openai".into());
+            row.model = Some("z-ai/glm-5.3".into());
+            row.provider = Some("openrouter".into());
+            row.input = Some(1_000);
+            row.cache_read = Some(30_000);
+            row.output = Some(200);
+            rows.push(row);
+        }
+        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 523);
+        let text = rendered(&snap, 120, 40);
+        assert!(
+            text.contains("3,000  share unknown"),
+            "the complete bucket names the total's gap:\n{text}"
+        );
+        assert!(
+            text.contains("≥0  3 req unknown"),
+            "the write tiers are floors:\n{text}"
+        );
+        assert!(
+            text.contains("cache metrics unavailable for 3 req"),
+            "the unknown-rate line:\n{text}"
+        );
+        assert!(
+            text.contains("known cache writes only"),
+            "the missed floor:\n{text}"
+        );
+        // No share bars where the total is not a total.
+        assert!(!text.contains("▬"), "no share bars:\n{text}");
+    }
+
+    #[test]
+    fn tokens_panel_renders_buckets_the_hit_rate_and_the_missed_line() {
+        let snap = full_snapshot();
+        let text = rendered(&snap, 120, 40);
+        for expected in [
+            "fresh input",
+            "cache read",
+            "cache write 1h",
+            "cache write 5m",
+            "output",
+            "hit rate",
+            "of reusable prefix",
+            "missed",
+        ] {
+            assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
+        }
+        // The figures: every bucket complete, so shares render with
+        // bars; the hit rate is over the reusable prefix —
+        // 1 608 393 / (1 608 393 + 97 000) = 94.3%.
+        assert!(text.contains("1,608,393"), "the cache-read total:\n{text}");
+        assert!(text.contains("94.3%"), "the hit rate:\n{text}");
+        assert!(text.contains("97,000"), "the rewritten total:\n{text}");
+        assert!(
+            text.contains("rewritten · 8,083/req · 1 of 12 req reused nothing"),
+            "the missed line:\n{text}"
+        );
+        assert!(
+            text.contains("▬"),
+            "the share bars are ▬, not the occupancy █:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rebuilds_panel_renders_counts_causes_and_localisations() {
+        let snap = full_snapshot();
+        let text = rendered(&snap, 120, 40);
+        for expected in [
+            "CACHE REBUILDS",
+            "2 of 9 requests rewrote ≥50,000 tokens",
+            "system prompt changed",
+            "new prefix / first turn",
+            "· ses-hot — system prompt changed (43,696 → 43,801 chars; block 1, in the last 8 bytes)",
+        ] {
+            assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
+        }
+        // The cause rows' count bars.
+        assert!(text.contains("▬"), "the cause bars:\n{text}");
+    }
+
+    #[test]
+    fn rebuilds_panel_without_rebuilds_says_so_rather_than_vanishing() {
+        // No rewrites over the threshold: the panel keeps its place and
+        // its verdict. With unknown rewrites the verdict is scoped to
+        // the measured requests, exactly live.mjs's two none-lines.
+        let none = crate::tui::rebuilds::RebuildAgg {
+            rebuilds: 0,
+            measured: 12,
+            unmeasured: 0,
+            causes: vec![],
+            events: vec![],
+        };
+        let mut snap = full_snapshot();
+        snap.rebuilds = Some(none);
+        let text = rendered(&snap, 120, 40);
+        assert!(text.contains("0 of 12 requests rewrote ≥50,000 tokens"));
+        assert!(text.contains("none — every prefix held"), "{text}");
+
+        let unknowns = crate::tui::rebuilds::RebuildAgg {
+            rebuilds: 0,
+            measured: 3,
+            unmeasured: 9,
+            causes: vec![],
+            events: vec![],
+        };
+        snap.rebuilds = Some(unknowns);
+        let text = rendered(&snap, 120, 40);
+        assert!(
+            text.contains("0 of 3 measured requests rewrote ≥50,000 tokens · 9 unknown"),
+            "{text}"
+        );
+        assert!(text.contains("none among measured requests"), "{text}");
+
+        // Before the quota cadence's first pass there is no section at
+        // all — and that renders as its own state too.
+        snap.rebuilds = None;
+        let text = rendered(&snap, 120, 40);
+        assert!(text.contains("no rebuild data yet"), "{text}");
+        assert!(
+            text.contains("CACHE REBUILDS"),
+            "the panel never vanishes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_height_budget_grows_the_sessions_list_and_sheds_from_the_top() {
+        let snap = full_snapshot();
+        // Comfortable: everything at natural height and the slack goes
+        // to the sessions list (its rows render).
+        let text = rendered(&snap, 120, 44);
+        assert!(
+            text.contains("ses-hot"),
+            "sessions rows at natural height:\n{text}"
+        );
+        assert!(text.contains("CACHE REBUILDS"), "{text}");
+
+        // Short: the middle sheds from the top — the sessions LIST
+        // rows go first (the scaffold keeps its title), and the quota
+        // block at the bottom never scrolls off.
+        let text = rendered(&snap, 120, 24);
+        assert!(text.contains("SESSIONS"), "the sessions scaffold:\n{text}");
+        assert!(
+            !text.contains("claude-opus-5"),
+            "the list rows are shed (the id also rides the rebuild detail line, the model cell does not):\n{text}"
+        );
+        assert!(
+            text.contains("RATE & QUOTA"),
+            "the quota block stays:\n{text}"
+        );
+        assert!(
+            text.contains("CACHE REBUILDS"),
+            "the panel to watch stays:\n{text}"
+        );
+    }
+    #[test]
+    fn degenerate_terminal_sizes_render_without_panicking() {
+        // The height budget's floor: a frame too short for the header
+        // and the bottom strip still renders — panels clip, nothing
+        // panics, and a one-row frame is not a crash.
+        let mut rows = Vec::new();
+        for at in 1..=4 {
+            let mut row = display_bare(NOW - at * 60_000);
+            row.session_id = Some("ses-x".into());
+            row.model = Some("claude-opus-5".into());
+            row.provider = Some("anthropic_sub".into());
+            row.input = Some(1_000);
+            row.cache_read = Some(2_000);
+            row.cache_write_1h = Some(0);
+            row.cache_write_5m = Some(0);
+            rows.push(row);
+        }
+        rows.push(display_billed(
+            NOW - 30_000,
+            Some("ses-x"),
+            "claude-opus-5",
+            "anthropic_sub",
+            10,
+            20,
+            5,
+            0.1,
+        ));
+        let snap = model::aggregate(&rows, None, &HashSet::new(), None, 30, NOW, 5);
+        for (width, height) in [
+            (1u16, 1u16),
+            (2, 2),
+            (3, 3),
+            (5, 4),
+            (8, 6),
+            (10, 3),
+            (16, 2),
+            (40, 5),
+            (60, 8),
+            (200, 1),
+            (1, 40),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| super::render(frame, &snap, "12:34:56", &utc()))
+                .expect("draw");
+        }
     }
 }

@@ -20,9 +20,11 @@
 //! deliberate zero is the count of requests without cost data: a count
 //! over known rows is a real number.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::quota::QuotaAgg;
+use super::rebuilds::RebuildAgg;
+use crate::catalog::windows::{ContextWindow, resolve_context_window};
 use crate::store::{CostKind, DisplayRow, RowKind, is_api_measurement};
 
 /// The label for rows grouped without a session id (NULL `session_id`).
@@ -49,6 +51,12 @@ pub(crate) struct Snapshot {
     pub spend: SpendAgg,
     /// Request-rate aggregation over the window's measurements.
     pub rate: RateAgg,
+    /// Where the window's input tokens went (the TOKENS panel).
+    pub tokens: TokensAgg,
+    /// The cache-rebuild section, from the quota-cadence lane walk over
+    /// the 24 h tail — `None` until that pass has run, never a
+    /// zero-filled stand-in (the panel says so instead).
+    pub rebuilds: Option<RebuildAgg>,
     /// `kind = error` rows in the window (any row kind counts, not just
     /// measurements — proxy-written rows are the only source).
     pub errors: usize,
@@ -65,6 +73,18 @@ pub(crate) struct Snapshot {
 /// One session's aggregate over the window. All "latest" values are by
 /// `ts_ms`, not input order — the ledger is insert-only and rows arrive
 /// slightly out of order.
+///
+/// One deliberate deviation from live.mjs, scoped and priced: ctp picks
+/// each session's MAIN lane (the largest by prompt size, cold.mjs's
+/// `mainLane`) and reads `ctx`/`msgs`/`cmpct`/prompt off its latest row;
+/// this aggregation is session-scoped, reading the latest row of the
+/// session. Lane-picking needs `tools_hash` plus the write share on the
+/// narrow read — a text column on the 2-second tick — and a subagent's
+/// turn landing after the main lane's would move every "latest" to it,
+/// where ctp's would stay on the main conversation. On the single-lane
+/// sessions that dominate real traffic the two read identically; on
+/// multi-lane ones the ctp behaviour lands with `toker report`, whose
+/// full-row reads can afford the lane walk.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SessionAgg {
     /// The session id, or [`NO_SESSION`] for the NULL-session group.
@@ -73,14 +93,45 @@ pub(crate) struct SessionAgg {
     pub requests: usize,
     /// The latest non-NULL model; `None` when no row reported one.
     pub model: Option<String>,
-    /// The latest row's `input + cache_read`. `None` unless that row has
-    /// both buckets — a missing operand is unknown, not zero.
+    /// The latest row's prompt — `input + cache_read + cache writes`,
+    /// the measure ctp's "prompt now" and the CONTEXT bars share
+    /// (live.mjs:170-175's `PROMPT_FIELDS`). `None` unless every
+    /// operand is known: anthropic's `input_tokens` excludes cache
+    /// writes, so a row without its write share does not understate
+    /// the context — it refuses to guess it (see [`prompt_of`]).
     pub input_now: Option<i64>,
-    /// The high-water mark of `input + cache_read` over the rows where both
-    /// buckets are known; `None` when none are.
+    /// The high-water mark of [`SessionAgg::input_now`] over the rows
+    /// where the whole prompt is known; `None` when none are.
     pub input_peak: Option<i64>,
     /// Sum of reported output tokens; `None` when no row reported output.
     pub output_total: Option<i64>,
+    /// The latest row's message count — the `msgs` column
+    /// (live.mjs:388's `last.reqMessages`); `None` when no row carried
+    /// one (`?`, never zero).
+    pub req_messages: Option<i64>,
+    /// The latest row's compaction generation — the `cmpct` column.
+    /// live.mjs:356 reads the lane's LATEST marker, not a count over
+    /// the window, and renders zero/absent as `-`; `None` and zero
+    /// stay distinct here and render the same.
+    pub compact_generations: Option<i64>,
+    /// The latest row was served on a rewritten (newer) model — the
+    /// bright `↑` (live.mjs:367).
+    pub forced_latest: bool,
+    /// Some row in the window was — the dim `↑` when not the latest.
+    pub forced_any: bool,
+    /// The session holds a live allowance for the quota window now
+    /// running — the `$` marker (live.mjs:287-296): released past the
+    /// armed gate, spending overage where the others stop. Decided by
+    /// the caller from the allowances table against the current meter
+    /// resets, and passed in as a set.
+    pub released: bool,
+    /// The context ceiling of the latest model, from the hand-verified
+    /// catalogue ([`resolve_context_window`] of the model, as of the
+    /// latest row) — `Unknown` renders as `?`, never a guess. The
+    /// catalogue carries the claude native-1M/fixed-200k identities and
+    /// the gpt-5.6-sol/luna 872k declarations, so this is a pure lookup
+    /// with no extra read.
+    pub ctx: ContextWindow,
     /// Newest row timestamp (epoch ms).
     pub latest_ts_ms: i64,
 }
@@ -137,9 +188,116 @@ pub(crate) struct MinuteBucket {
     pub errors: usize,
 }
 
+/// One TOKENS-panel bucket (live.mjs's `sumUsage`, 445-447): a sum over
+/// the rows that reported the metric, plus how many did not. A sum of
+/// zero over rows that all reported is a real zero; the same sum with
+/// `unavailable > 0` is a floor, and the panel renders it with the `≥`
+/// that says so — never as a complete figure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BucketAgg {
+    /// Sum of the reported values.
+    pub value: i64,
+    /// Measurement rows that did not report the metric.
+    pub unavailable: usize,
+}
+
+impl BucketAgg {
+    /// Add one row's reading: reported values sum, absent ones count.
+    fn add(&mut self, value: Option<i64>) {
+        match value {
+            Some(value) => self.value += value,
+            None => self.unavailable += 1,
+        }
+    }
+}
+
+/// Where the window's input tokens went (live.mjs's TOKENS panel,
+/// 436-504): the four input buckets, output, and the cache-metric
+/// counters the hit-rate lines need. `requests` is the window's
+/// measurement-row count — the per-request averages' denominator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TokensAgg {
+    /// Fresh input: the new turn's content, never a cache hit.
+    pub fresh_input: BucketAgg,
+    /// Cache read: the reusable prefix, served from cache.
+    pub cache_read: BucketAgg,
+    /// Cache write, 1-hour TTL — the tier Claude Code uses.
+    pub write_1h: BucketAgg,
+    /// Cache write, 5-minute TTL.
+    pub write_5m: BucketAgg,
+    /// Output tokens (no shared denominator with the input buckets —
+    /// a bar against them would be meaningless).
+    pub output: BucketAgg,
+    /// The window's measurement rows — the averages' denominator.
+    pub requests: usize,
+    /// Rows missing any cache metric (read, either write tier):
+    /// hit-rate lines cannot be computed over them (live.mjs:483-489).
+    pub cache_unknown: usize,
+    /// Rows whose cache read was not above zero — "reused nothing"
+    /// (live.mjs:493's `!(r.cacheRead > 0)`).
+    pub cold: usize,
+}
+
+impl TokensAgg {
+    /// Total rewritten tokens: the two write tiers' known sums.
+    pub(crate) fn written(&self) -> i64 {
+        self.write_1h.value + self.write_5m.value
+    }
+
+    /// The input buckets' total — the shares' denominator. Sums the
+    /// known values only; the panel renders shares only when nothing
+    /// is missing, so this is never a guessed denominator.
+    pub(crate) fn input_total(&self) -> i64 {
+        self.fresh_input.value + self.cache_read.value + self.write_1h.value + self.write_5m.value
+    }
+
+    /// Whether any input bucket has unavailable rows — the panel then
+    /// replaces every share with the reason it cannot be computed
+    /// (live.mjs:449-459: "N req unknown" / "share unknown").
+    pub(crate) fn input_incomplete(&self) -> bool {
+        self.fresh_input.unavailable > 0
+            || self.cache_read.unavailable > 0
+            || self.write_1h.unavailable > 0
+            || self.write_5m.unavailable > 0
+    }
+
+    /// The hit rate over the REUSABLE prefix — hits plus rewrites, not
+    /// all input: fresh input is the new turn's content, which was
+    /// never going to be a hit, so including it would drag the rate
+    /// down permanently and make an improving cache look static
+    /// (live.mjs:478-481).
+    ///
+    /// Three states, all explicit: [`HitRate::Unknown`] when rows are
+    /// missing cache metrics (rendered `?`, never a rate);
+    /// [`HitRate::NothingReusable`] when nothing was read or rewritten
+    /// (live.mjs renders no line at all — no denominator, no claim);
+    /// [`HitRate::Rate`] otherwise.
+    pub(crate) fn hit_rate(&self) -> HitRate {
+        if self.cache_unknown > 0 {
+            return HitRate::Unknown;
+        }
+        let reusable = self.cache_read.value + self.written();
+        if reusable == 0 {
+            return HitRate::NothingReusable;
+        }
+        HitRate::Rate(self.cache_read.value as f64 / reusable as f64)
+    }
+}
+
+/// The hit rate's three explicit states (see [`TokensAgg::hit_rate`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum HitRate {
+    /// Some row is missing a cache metric — `?`, never a rate.
+    Unknown,
+    /// Nothing was read or rewritten — no line, no claim.
+    NothingReusable,
+    /// `cache read / (cache read + written)`.
+    Rate(f64),
+}
+
 /// The pre-refresh placeholder: an empty window of the right shape.
 pub(crate) fn empty(window_mins: u64) -> Snapshot {
-    aggregate(&[], None, window_mins, 0, 0)
+    aggregate(&[], None, &HashSet::new(), None, window_mins, 0, 0)
 }
 
 /// Aggregate one window of display rows (the narrow projection the
@@ -148,12 +306,19 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// the ledger's total row count, kept distinct from the window so the
 /// header can show both. `quota` is the PRECOMPUTED quota section (the
 /// meter lookback aggregation, [`super::quota::aggregate`] over the
-/// 7-day read), built on its own slower cadence — passing it in keeps
-/// this function pure over cheap inputs. Rows may arrive
-/// in any order — "latest" is decided by `ts_ms` throughout.
+/// 7-day read), `rebuilds` the precomputed cache-rebuild section (the
+/// lane walk over the 24 h tail, [`super::rebuilds`]), and `released`
+/// the sessions holding a live allowance for the window now running
+/// (read from the allowances table against the quota section's
+/// current resets, live.mjs:287-296) — all three built on their own
+/// slower cadences, passed in to keep this function pure over cheap
+/// inputs. Rows may arrive in any order — "latest" is decided by
+/// `ts_ms` throughout.
 pub(crate) fn aggregate(
     rows: &[DisplayRow],
     quota: Option<&QuotaAgg>,
+    released: &HashSet<String>,
+    rebuilds: Option<RebuildAgg>,
     window_mins: u64,
     now_ms: i64,
     total_requests: i64,
@@ -176,6 +341,10 @@ pub(crate) fn aggregate(
     };
     let mut breakdown_index: HashMap<(Option<String>, Option<String>), usize> = HashMap::new();
     let mut buckets = vec![MinuteBucket::default(); window_mins];
+    let mut tokens = TokensAgg {
+        requests: 0,
+        ..TokensAgg::default()
+    };
     let mut errors = 0;
     let mut drift = 0;
     let mut window_requests = 0;
@@ -197,6 +366,22 @@ pub(crate) fn aggregate(
         window_requests += 1;
         buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
 
+        // TOKENS: every measurement row reports into the buckets it
+        // carries and counts against the ones it does not.
+        tokens.requests += 1;
+        tokens.fresh_input.add(row.input);
+        tokens.cache_read.add(row.cache_read);
+        tokens.write_1h.add(row.cache_write_1h);
+        tokens.write_5m.add(row.cache_write_5m);
+        tokens.output.add(row.output);
+        if row.cache_read.is_none() || row.cache_write_1h.is_none() || row.cache_write_5m.is_none()
+        {
+            tokens.cache_unknown += 1;
+        }
+        if !row.cache_read.is_some_and(|read| read > 0) {
+            tokens.cold += 1;
+        }
+
         // Sessions: group by id (NULL under the dash), accumulate per row
         // in ts order so the last write is the latest row's value.
         let label = row
@@ -211,6 +396,12 @@ pub(crate) fn aggregate(
                 input_now: None,
                 input_peak: None,
                 output_total: None,
+                req_messages: None,
+                compact_generations: None,
+                forced_latest: false,
+                forced_any: false,
+                released: released.contains(&label),
+                ctx: ContextWindow::Unknown,
                 latest_ts_ms: row.ts_ms,
             });
             sessions.len() - 1
@@ -223,11 +414,8 @@ pub(crate) fn aggregate(
         {
             session.model = row.model.clone();
         }
-        // input + cache_read needs both buckets; missing operand = unknown.
-        session.input_now = match (row.input, row.cache_read) {
-            (Some(input), Some(cache_read)) => Some(input + cache_read),
-            _ => None,
-        };
+        // The prompt needs every operand; a missing one is unknown.
+        session.input_now = prompt_of(row);
         if let Some(now) = session.input_now
             && session.input_peak.is_none_or(|peak| now > peak)
         {
@@ -236,6 +424,12 @@ pub(crate) fn aggregate(
         if let Some(output) = row.output {
             session.output_total = Some(session.output_total.unwrap_or(0) + output);
         }
+        // The latest row decides `msgs`, `cmpct`, and the bright `↑`;
+        // any row's rewrite lights the dim one (live.mjs:356-367).
+        session.req_messages = row.req_messages;
+        session.compact_generations = row.compact_generations;
+        session.forced_latest = row.forced_to.is_some();
+        session.forced_any |= row.forced_to.is_some();
 
         // Cost: billed sums, everything else stays explicit (above).
         match (row.cost_usd, row.cost_kind) {
@@ -259,6 +453,14 @@ pub(crate) fn aggregate(
             (Some(_), _) => spend.other_cost_kinds += 1,
             (None, _) => spend.no_cost_data += 1,
         }
+    }
+
+    // The context ceiling is a pure catalogue lookup off each session's
+    // latest model, resolved as of the latest row (live.mjs's `ctxOf`
+    // passes `at: r.ts`, so a phased capability resolves to the phase
+    // that applied, never to today's against historical rows).
+    for session in &mut sessions {
+        session.ctx = session_ctx(session.model.as_deref(), session.latest_ts_ms);
     }
 
     // Most-recent-first; session name breaks ties for a stable order.
@@ -290,6 +492,10 @@ pub(crate) fn aggregate(
             per_minute: window_requests as f64 / window_mins as f64,
             buckets,
         },
+        tokens,
+        // Precomputed by the caller on the QUOTA cadence — the lane
+        // walk's 24 h read is far too heavy for the display tick.
+        rebuilds,
         errors,
         drift,
         // Precomputed by the caller on the QUOTA cadence — the meter
@@ -297,6 +503,57 @@ pub(crate) fn aggregate(
         // for the display tick (the spin this split fixed).
         quota: quota.cloned(),
     }
+}
+
+/// One row's prompt size — the measure the sessions panel's prompt
+/// columns and the CONTEXT bars share: `input + cache_read + cache
+/// writes` (live.mjs:167-175's `PROMPT_FIELDS`). `None` unless every
+/// operand is known — a missing operand is unknown, not zero.
+///
+/// The write share is protocol arithmetic, and the row's provider
+/// carries the protocol: anthropic's `input_tokens` EXCLUDES both
+/// cache buckets, so a row from an anthropic backend that reports no
+/// write has an unknown prompt — a write may have gone unreported.
+/// The openai-chat family has no cache-write metric at all
+/// (`input + cache_read` already is the whole `prompt_tokens`), so a
+/// NULL write there is structural, and the prompt is complete without
+/// it. Anything not identifiable as an anthropic backend gets the
+/// openai-chat arithmetic; a future anthropic-shaped backend must
+/// carry the `anthropic` prefix to keep its prompts honest here.
+fn prompt_of(row: &DisplayRow) -> Option<i64> {
+    let input = row.input?;
+    let cache_read = row.cache_read?;
+    let writes = match (row.cache_write_5m, row.cache_write_1h) {
+        (Some(five), Some(one)) => five + one,
+        (None, None) if anthropic_shaped(row.provider.as_deref()) => return None,
+        (None, None) => 0,
+        _ => return None,
+    };
+    Some(input + cache_read + writes)
+}
+
+/// Whether a provider speaks the anthropic usage shape, whose
+/// `input_tokens` excludes the cache buckets (see [`prompt_of`]).
+fn anthropic_shaped(provider: Option<&str>) -> bool {
+    provider.is_some_and(|provider| provider.starts_with("anthropic"))
+}
+
+/// The session's context ceiling: the catalogue lookup of its latest
+/// model, resolved as of the latest row (live.mjs:177-179's `ctxOf`
+/// with `at: r.ts`). No betas and no learned declaration: the
+/// hand-verified catalogue carries the exact identities that matter
+/// (claude native-1M/fixed-200k, the gpt-5.6-sol/luna 872k
+/// declarations), a beta-selectable phase without captured betas stays
+/// `Unknown` exactly as ctp leaves it, and a model outside the
+/// catalogue renders `?` rather than inheriting a family's ceiling.
+fn session_ctx(model: Option<&str>, latest_ts_ms: i64) -> ContextWindow {
+    let Some(model) = model else {
+        return ContextWindow::Unknown;
+    };
+    let at = jiff::Timestamp::from_millisecond(latest_ts_ms)
+        .ok()
+        .map(|ts| ts.strftime("%Y-%m-%d").to_string());
+    resolve_context_window(model, None, None, at.as_deref())
 }
 
 /// The minute bucket a timestamp falls into: index `window_mins - 1` is the
@@ -325,12 +582,20 @@ mod tests {
     const NOW: i64 = 1_769_000_000_000;
     const WINDOW: u64 = 30;
 
+    /// The tests' shared "no precomputed sections" inputs: no quota
+    /// section, no rebuild section, no released sessions — absence, not
+    /// zeros, exactly what the loop passes before the quota cadence's
+    /// first pass.
+    fn no_sections() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     fn agg(rows: &[DisplayRow], total: i64) -> Snapshot {
         // The tests' display rows carry no meter snapshots (the narrow
         // display shape has none to carry), so the loop's quota
         // section over this window is None — absence, not zeros. The
         // precomputed-section wiring has its own test below.
-        super::aggregate(rows, None, WINDOW, NOW, total)
+        super::aggregate(rows, None, &no_sections(), None, WINDOW, NOW, total)
     }
 
     /// A measurement row a given number of minutes before `NOW`.
@@ -633,7 +898,7 @@ mod tests {
 
     #[test]
     fn zero_window_mins_clamps_to_one() {
-        let snap = super::aggregate(&[display_bare(NOW)], None, 0, NOW, 1);
+        let snap = super::aggregate(&[display_bare(NOW)], None, &no_sections(), None, 0, NOW, 1);
         assert_eq!(snap.window_mins, 1);
         assert_eq!(snap.rate.buckets.len(), 1);
         assert_eq!(snap.rate.buckets[0].requests, 1);
@@ -661,6 +926,8 @@ mod tests {
         let snap = super::aggregate(
             &as_display_rows(&[lookback[1].clone()]),
             quota_section.as_ref(),
+            &no_sections(),
+            None,
             WINDOW,
             NOW,
             2,
@@ -683,6 +950,8 @@ mod tests {
         let snap = super::aggregate(
             &[display_bare(mins_ago(1))],
             quota_section.as_ref(),
+            &no_sections(),
+            None,
             WINDOW,
             NOW,
             2,
@@ -817,12 +1086,17 @@ mod tests {
                 let mut row = bare(mins_ago(10));
                 row.session_id = Some("ses-c".to_owned());
                 row.model = Some("m-first".to_owned());
+                row.req_messages = Some(3);
+                row.compact_generations = Some(1);
                 row // id 6 — same ts as the next row
             },
             {
                 let mut row = bare(mins_ago(10));
                 row.session_id = Some("ses-c".to_owned());
                 row.model = Some("m-second".to_owned());
+                row.req_messages = Some(4);
+                row.compact_generations = Some(1);
+                row.forced_to = Some("z-ai/glm-5.3".to_owned());
                 row // id 7 — the id tie-break makes this the later row
             },
             {
@@ -846,7 +1120,11 @@ mod tests {
                 row.provider = Some("anthropic_sub".to_owned());
                 row.input = Some(5_000);
                 row.cache_read = Some(2_000);
+                row.cache_write_5m = Some(100);
+                row.cache_write_1h = Some(200);
                 row.output = Some(300);
+                row.req_messages = Some(31);
+                row.compact_generations = Some(2);
                 row.cost_usd = Some(9.0);
                 row.cost_kind = Some(CostKind::PlanEquivalent);
                 row // id 9
@@ -864,7 +1142,11 @@ mod tests {
                 row.provider = Some("anthropic_sub".to_owned());
                 row.input = Some(6_000);
                 row.cache_read = Some(3_000);
+                row.cache_write_5m = Some(0);
+                row.cache_write_1h = Some(400);
                 row.output = Some(400);
+                row.req_messages = Some(67);
+                row.compact_generations = Some(1);
                 row.cost_usd = Some(1.7);
                 row.cost_kind = Some(CostKind::PlanEquivalent);
                 row.gate_on = Some(true);
@@ -906,6 +1188,8 @@ mod tests {
                 row.input = Some(10);
                 row.cache_read = Some(10);
                 row.output = Some(5);
+                row.req_messages = Some(5);
+                row.compact_generations = Some(0);
                 row.cost_usd = Some(3.5);
                 row.cost_kind = Some(CostKind::Billed);
                 row // id 15 — NULL provider AND model: the dash group
@@ -926,7 +1210,15 @@ mod tests {
         let full = store.requests_since(0, 10_000).expect("full-row read");
         assert_eq!(full.len(), rows.len(), "the fixture is under the cap");
         let quota = quota_of(&store);
-        let via_old = super::aggregate(&as_display_rows(&full), quota.as_ref(), WINDOW, NOW, total);
+        let via_old = super::aggregate(
+            &as_display_rows(&full),
+            quota.as_ref(),
+            &no_sections(),
+            None,
+            WINDOW,
+            NOW,
+            total,
+        );
 
         // NEW path: the narrow read the display cadence now uses —
         // ten columns, no JSON parse.
@@ -936,7 +1228,15 @@ mod tests {
             full.len(),
             "no filter: the display read keeps every row kind"
         );
-        let via_new = super::aggregate(&narrow, quota.as_ref(), WINDOW, NOW, total);
+        let via_new = super::aggregate(
+            &narrow,
+            quota.as_ref(),
+            &no_sections(),
+            None,
+            WINDOW,
+            NOW,
+            total,
+        );
 
         assert_eq!(
             via_old, via_new,
@@ -1006,6 +1306,44 @@ mod tests {
             Some(1_000),
             "a zero cache_read is a real zero"
         );
+        // The phase-5 columns survived the narrow read too: the
+        // latest row decides `msgs`/`cmpct`/the bright `↑` (id 7 wins
+        // the equal-ts pair for the model; id 15 is later still, so
+        // ses-c's `msgs` is ITS value and the `↑` goes dim — an
+        // earlier rewrite, not the latest turn), the prompt sums the
+        // anthropic write share (id 9: 5 000 + 2 000 + 100 + 200),
+        // and the context ceiling is the catalogue's native-1M for
+        // claude-opus-5.
+        assert_eq!(snap.sessions[3].req_messages, Some(5));
+        assert_eq!(snap.sessions[3].compact_generations, Some(0));
+        assert!(!snap.sessions[3].forced_latest);
+        assert!(snap.sessions[3].forced_any);
+        assert_eq!(snap.sessions[2].input_now, Some(7_300));
+        assert_eq!(snap.sessions[2].req_messages, Some(31));
+        assert_eq!(snap.sessions[2].compact_generations, Some(2));
+        assert_eq!(snap.sessions[0].input_now, Some(9_400));
+        assert_eq!(
+            snap.sessions[0].ctx,
+            crate::catalog::windows::ContextWindow::Exact { tokens: 1_000_000 }
+        );
+        assert_eq!(
+            snap.sessions[3].ctx,
+            crate::catalog::windows::ContextWindow::Unknown
+        );
+        // Where the TOKENS panel's numbers come from: every
+        // measurement row's buckets, absence counted not zeroed.
+        let tokens = &snap.tokens;
+        assert_eq!(tokens.requests, 14);
+        assert_eq!(tokens.fresh_input.value, 39_060);
+        assert_eq!(tokens.cache_read.value, 17_460);
+        assert_eq!(tokens.write_1h.value, 600);
+        assert_eq!(tokens.write_5m.value, 100);
+        assert_eq!(tokens.fresh_input.unavailable, 3);
+        assert_eq!(tokens.cache_read.unavailable, 4);
+        assert_eq!(
+            tokens.cache_unknown, 12,
+            "only the two anthropic rows carry every cache metric"
+        );
         // The error row flagged its own minute's bucket and added no
         // request there.
         assert_eq!(
@@ -1031,12 +1369,16 @@ mod tests {
         let via_old = super::aggregate(
             &as_display_rows(&store.requests_since(NOW, 10).expect("old read")),
             None,
+            &no_sections(),
+            None,
             WINDOW,
             NOW,
             total,
         );
         let via_new = super::aggregate(
             &store.display_rows_since(NOW, 10).expect("narrow read"),
+            None,
+            &no_sections(),
             None,
             WINDOW,
             NOW,
@@ -1202,7 +1544,15 @@ mod tests {
             let full = store.requests_since(since_ms, CAP).expect("full read");
             old_read += t.elapsed();
             let t = Instant::now();
-            let snap = super::aggregate(&as_display_rows(&full), None, 30, now_ms, total);
+            let snap = super::aggregate(
+                &as_display_rows(&full),
+                None,
+                &no_sections(),
+                None,
+                30,
+                now_ms,
+                total,
+            );
             old_refresh += t.elapsed();
             std::hint::black_box(&snap);
         }
@@ -1218,7 +1568,7 @@ mod tests {
                 .expect("narrow read");
             new_read += t.elapsed();
             let t = Instant::now();
-            let snap = super::aggregate(&narrow, None, 30, now_ms, total);
+            let snap = super::aggregate(&narrow, None, &no_sections(), None, 30, now_ms, total);
             new_refresh += t.elapsed();
             std::hint::black_box(&snap);
         }
@@ -1228,6 +1578,8 @@ mod tests {
             &store
                 .display_rows_since(since_ms, CAP)
                 .expect("narrow read"),
+            None,
+            &no_sections(),
             None,
             30,
             now_ms,
@@ -1258,5 +1610,196 @@ mod tests {
             ms(old_read + old_refresh),
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the phase-5 panels' aggregation rules ─────────────────────
+
+    /// The prompt's write share is protocol arithmetic: an anthropic
+    /// backend's `input_tokens` excludes the cache buckets, so a row
+    /// without its write share refuses to guess the prompt; an
+    /// openai-chat backend has no cache-write metric at all, so the
+    /// NULL there is structural and `input + cache_read` is already
+    /// the whole prompt.
+    #[test]
+    fn the_prompt_sums_writes_only_where_the_protocol_has_them() {
+        // anthropic: writes known → summed in; unknown → the prompt is
+        // unknown, never understated.
+        let mut writes = display_bare(mins_ago(3));
+        writes.session_id = Some("ses-anthropic".into());
+        writes.provider = Some("anthropic_sub".into());
+        writes.input = Some(5_000);
+        writes.cache_read = Some(2_000);
+        writes.cache_write_5m = Some(100);
+        writes.cache_write_1h = Some(200);
+        let mut no_writes = display_bare(mins_ago(2));
+        no_writes.session_id = Some("ses-anthropic".into());
+        no_writes.provider = Some("anthropic_sub".into());
+        no_writes.input = Some(5_000);
+        no_writes.cache_read = Some(2_000);
+        // openai-chat: NULL writes are the metric not existing.
+        let mut openai = display_bare(mins_ago(1));
+        openai.session_id = Some("ses-openai".into());
+        openai.provider = Some("openrouter".into());
+        openai.input = Some(1_000);
+        openai.cache_read = Some(3_000);
+
+        let snap = agg(&[writes, no_writes, openai], 3);
+        let by_session = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+        };
+        assert_eq!(by_session("ses-anthropic").input_peak, Some(7_300));
+        assert_eq!(
+            by_session("ses-anthropic").input_now,
+            None,
+            "the latest row's unreported write makes the prompt unknown"
+        );
+        assert_eq!(
+            by_session("ses-openai").input_now,
+            Some(4_000),
+            "input + cache_read is the whole openai-chat prompt"
+        );
+    }
+
+    /// The context ceiling is a catalogue lookup of the latest model —
+    /// exact, declared, or explicitly unknown — resolved as of the
+    /// latest row, and never a family guess.
+    #[test]
+    fn ctx_ceilings_resolve_exact_declared_and_unknown() {
+        use crate::catalog::windows::ContextWindow;
+        let mut opus = display_bare(mins_ago(4));
+        opus.session_id = Some("ses-opus".into());
+        opus.model = Some("claude-opus-5".into());
+        let mut sol = display_bare(mins_ago(3));
+        sol.session_id = Some("ses-sol".into());
+        sol.model = Some("gpt-5.6-sol".into());
+        let mut unknown = display_bare(mins_ago(2));
+        unknown.session_id = Some("ses-unknown".into());
+        unknown.model = Some("gpt-5.6-terra".into());
+        let mut modelless = display_bare(mins_ago(1));
+        modelless.session_id = Some("ses-modelless".into());
+
+        let snap = agg(&[opus, sol, unknown, modelless], 4);
+        let ctx_of = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+                .ctx
+        };
+        assert_eq!(
+            ctx_of("ses-opus"),
+            ContextWindow::Exact { tokens: 1_000_000 }
+        );
+        assert_eq!(
+            ctx_of("ses-sol"),
+            ContextWindow::Declared { tokens: 872_000 }
+        );
+        assert_eq!(ctx_of("ses-unknown"), ContextWindow::Unknown);
+        assert_eq!(ctx_of("ses-modelless"), ContextWindow::Unknown);
+    }
+
+    /// The `↑` marks rewrites (bright on the latest row, dim when only
+    /// an earlier one) and the `$` marks a released session — both
+    /// from inputs the loop owns, passed in as data.
+    #[test]
+    fn markers_follow_the_latest_row_and_the_allowance_set() {
+        let mut latest = display_bare(mins_ago(2));
+        latest.session_id = Some("ses-live".into());
+        latest.forced_to = Some("z-ai/glm-5.3".into());
+        let mut earlier_only = display_bare(mins_ago(5));
+        earlier_only.session_id = Some("ses-dim".into());
+        earlier_only.forced_to = Some("z-ai/glm-5.3".into());
+        let mut after = display_bare(mins_ago(1));
+        after.session_id = Some("ses-dim".into());
+        let mut released_row = display_bare(mins_ago(3));
+        released_row.session_id = Some("ses-free".into());
+
+        let mut released = std::collections::HashSet::new();
+        released.insert("ses-free".to_owned());
+        let snap = super::aggregate(
+            &[latest, earlier_only, after, released_row],
+            None,
+            &released,
+            None,
+            WINDOW,
+            NOW,
+            4,
+        );
+        let session = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+        };
+        assert!(session("ses-live").forced_latest && session("ses-live").forced_any);
+        assert!(
+            !session("ses-dim").forced_latest && session("ses-dim").forced_any,
+            "an earlier rewrite, not the latest turn"
+        );
+        assert!(session("ses-free").released);
+        assert!(!session("ses-live").released);
+    }
+
+    /// The TOKENS buckets and their three hit-rate states: a real rate
+    /// over the reusable prefix, `?` when cache metrics are missing,
+    /// and no line at all when nothing was reused.
+    #[test]
+    fn tokens_buckets_sums_unknowns_and_the_three_hit_rate_states() {
+        use super::HitRate;
+        let mut hit = display_bare(mins_ago(2));
+        hit.session_id = Some("ses-a".into());
+        hit.input = Some(1_000);
+        hit.cache_read = Some(9_000);
+        hit.cache_write_1h = Some(1_000);
+        hit.cache_write_5m = Some(0);
+        hit.output = Some(500);
+
+        let snap = agg(&[hit], 1);
+        let tokens = &snap.tokens;
+        assert_eq!(tokens.fresh_input.value, 1_000);
+        assert_eq!(tokens.cache_read.value, 9_000);
+        assert_eq!(tokens.write_1h.value, 1_000);
+        assert_eq!(tokens.write_5m.value, 0);
+        assert_eq!(tokens.output.value, 500);
+        assert_eq!(tokens.requests, 1);
+        assert_eq!(tokens.cache_unknown, 0);
+        assert_eq!(tokens.cold, 0, "the one row reused its prefix");
+        assert!(!tokens.input_incomplete());
+        assert_eq!(tokens.input_total(), 11_000);
+        assert_eq!(tokens.written(), 1_000);
+        match tokens.hit_rate() {
+            HitRate::Rate(rate) => assert!((rate - 0.9).abs() < 1e-12),
+            other => panic!("expected a rate, got {other:?}"),
+        }
+
+        // The openai shape: no cache-write metrics on any row — the
+        // buckets are floors and the rate is a `?`, never a guess.
+        let mut openai = display_bare(mins_ago(1));
+        openai.session_id = Some("ses-b".into());
+        openai.provider = Some("openrouter".into());
+        openai.input = Some(1_000);
+        openai.cache_read = Some(3_000);
+        openai.output = Some(100);
+        let snap = agg(&[openai], 1);
+        let tokens = &snap.tokens;
+        assert_eq!(tokens.cache_unknown, 1);
+        assert!(tokens.input_incomplete());
+        assert_eq!(tokens.write_1h.unavailable, 1);
+        assert_eq!(tokens.hit_rate(), HitRate::Unknown);
+
+        // Nothing read, nothing written, everything reported: no rate
+        // is claimable either way — live.mjs renders no line.
+        let mut cold = display_bare(mins_ago(1));
+        cold.session_id = Some("ses-c".into());
+        cold.input = Some(1_000);
+        cold.cache_read = Some(0);
+        cold.cache_write_1h = Some(0);
+        cold.cache_write_5m = Some(0);
+        let snap = agg(&[cold], 1);
+        assert_eq!(snap.tokens.cold, 1);
+        assert_eq!(snap.tokens.hit_rate(), HitRate::NothingReusable);
     }
 }
