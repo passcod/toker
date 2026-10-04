@@ -66,6 +66,7 @@ pub struct UsageCapture {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     cached_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     cost: Option<f64>,
     cost_details: Option<String>,
@@ -109,6 +110,16 @@ impl UsageCapture {
     /// `usage.prompt_tokens_details.cached_tokens`.
     pub fn cached_tokens(&self) -> Option<u64> {
         self.cached_tokens
+    }
+
+    /// `usage.prompt_tokens_details.cache_write_tokens` — openrouter's
+    /// cache-creation accounting (mostly zero; nonzero on the requests
+    /// that ESTABLISH a cache entry, the expensive moments). Dropped
+    /// before this field existed; the doc
+    /// openrouter.ai/docs/guides/best-practices/prompt-caching names it
+    /// and the live ledger's `usage_raw` carries it.
+    pub fn cache_write_tokens(&self) -> Option<u64> {
+        self.cache_write_tokens
     }
 
     /// `usage.completion_tokens_details.reasoning_tokens`.
@@ -214,6 +225,9 @@ impl UsageObserver {
         self.capture.cached_tokens = usage
             .get("prompt_tokens_details")
             .and_then(|details| u64_at(details, "cached_tokens"));
+        self.capture.cache_write_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| u64_at(details, "cache_write_tokens"));
         self.capture.reasoning_tokens = usage
             .get("completion_tokens_details")
             .and_then(|details| u64_at(details, "reasoning_tokens"));

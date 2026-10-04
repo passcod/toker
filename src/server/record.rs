@@ -271,6 +271,8 @@ pub(crate) struct TokenBuckets {
     pub output: Option<i64>,
     /// `cached_tokens`, unclamped.
     pub cache_read: Option<i64>,
+    /// `cache_write_tokens`, unclamped — the cache-creation count.
+    pub cache_write_total: Option<i64>,
     /// `reasoning_tokens`, unclamped.
     pub reasoning: Option<i64>,
     /// metric → reported? Distinguishes "reported zero" from "absent".
@@ -283,20 +285,23 @@ pub(crate) fn token_buckets(capture: &UsageCapture) -> TokenBuckets {
     // join.mjs's num(): a missing sub-metric contributes 0 to the
     // arithmetic of a metric that *is* present.
     let cached = capture.cached_tokens().unwrap_or(0);
+    let written = capture.cache_write_tokens().unwrap_or(0);
     let reasoning = capture.reasoning_tokens().unwrap_or(0);
     TokenBuckets {
         input: capture
             .prompt_tokens()
-            .map(|prompt| i64_of(prompt.saturating_sub(cached))),
+            .map(|prompt| i64_of(prompt.saturating_sub(cached).saturating_sub(written))),
         output: capture
             .completion_tokens()
             .map(|completion| i64_of(completion.saturating_sub(reasoning))),
         cache_read: capture.cached_tokens().map(i64_of),
+        cache_write_total: capture.cache_write_tokens().map(i64_of),
         reasoning: capture.reasoning_tokens().map(i64_of),
         usage_presence: json!({
             "prompt_tokens": capture.prompt_tokens().is_some(),
             "completion_tokens": capture.completion_tokens().is_some(),
             "cached_tokens": capture.cached_tokens().is_some(),
+            "cache_write_tokens": capture.cache_write_tokens().is_some(),
             "reasoning_tokens": capture.reasoning_tokens().is_some(),
             "cost": capture.cost().is_some(),
         }),
@@ -347,16 +352,18 @@ fn measurement_row(
         effective_model: ctx.effective_model.clone(),
         input: buckets.input,
         cache_read: buckets.cache_read,
-        // openrouter reports no cache writes and no TTL split.
-        cache_write_total: None,
+        // The wire has no TTL tiers: the conservative apportionment
+        // charges the whole write to the 1-hour tier, flagged as an
+        // apportioned guess — never a silent cheaper split.
+        cache_write_total: buckets.cache_write_total,
         cache_write_5m: None,
-        cache_write_1h: None,
+        cache_write_1h: buckets.cache_write_total,
         output: buckets.output,
         reasoning: buckets.reasoning,
         iterations: None,
         web_searches: None,
         code_execs: None,
-        ttl_split_known: None,
+        ttl_split_known: buckets.cache_write_total.is_some().then_some(false),
         usage_presence: Some(buckets.usage_presence),
         usage_raw: capture.usage_raw().map(str::to_owned),
         cost_usd: cost,
@@ -602,19 +609,21 @@ mod tests {
         let b = buckets(json!({
             "prompt_tokens": 100,
             "completion_tokens": 50,
-            "prompt_tokens_details": {"cached_tokens": 40},
+            "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 5},
             "completion_tokens_details": {"reasoning_tokens": 10},
             "cost": 0.001
         }));
-        assert_eq!(b.input, Some(60), "100 - 40 cached");
+        assert_eq!(b.input, Some(55), "100 - 40 cached - 5 written");
         assert_eq!(b.output, Some(40), "50 - 10 reasoning");
         assert_eq!(b.cache_read, Some(40));
+        assert_eq!(b.cache_write_total, Some(5));
         assert_eq!(b.reasoning, Some(10));
         assert_eq!(
             b.usage_presence,
             json!({
                 "prompt_tokens": true, "completion_tokens": true,
-                "cached_tokens": true, "reasoning_tokens": true, "cost": true,
+                "cached_tokens": true, "cache_write_tokens": true,
+                "reasoning_tokens": true, "cost": true,
             })
         );
     }
@@ -644,14 +653,33 @@ mod tests {
         assert_eq!(b.input, Some(100));
         assert_eq!(b.output, Some(4));
         assert_eq!(b.cache_read, None, "the bucket's own metric is absent");
+        assert_eq!(b.cache_write_total, None);
         assert_eq!(b.reasoning, None);
         assert_eq!(
             b.usage_presence,
             json!({
                 "prompt_tokens": true, "completion_tokens": true,
-                "cached_tokens": false, "reasoning_tokens": false, "cost": false,
+                "cached_tokens": false, "cache_write_tokens": false,
+                "reasoning_tokens": false, "cost": false,
             })
         );
+    }
+
+    #[test]
+    fn a_cache_write_subtracts_from_input_and_charges_the_1h_tier() {
+        // The three-way join.mjs subtraction, and the conservative
+        // apportionment: no TTL tiers on this wire, so the whole write
+        // lands on the 1-hour tier, flagged as an apportioned guess.
+        let b = buckets(json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 300, "cache_write_tokens": 250},
+        }));
+        assert_eq!(b.input, Some(450));
+        assert_eq!(b.cache_read, Some(300));
+        assert_eq!(b.cache_write_total, Some(250));
+        // The 1-hour apportionment and ttl_split_known land on the ROW
+        // (measurement_row) — pinned by the integration suite.
     }
 
     #[test]

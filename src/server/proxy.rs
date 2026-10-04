@@ -140,7 +140,10 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         server.openrouter.as_ref(),
         &parts,
         forward,
-        &server.config.session_header_names,
+        // Sticky routing: openrouter consumes the session headers as its
+        // cache-affinity key, so they ride upstream, not into the strip
+        // list (see send_upstream's docs).
+        &[],
     )
     .await
     {
@@ -172,15 +175,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
             );
         }
     };
-    match send_upstream(
-        &server,
-        server.openrouter.as_ref(),
-        &parts,
-        body,
-        &server.config.session_header_names,
-    )
-    .await
-    {
+    match send_upstream(&server, server.openrouter.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => forward_upstream(upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");

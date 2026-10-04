@@ -337,6 +337,9 @@ async fn post_chat(addr: SocketAddr, body: &[u8]) -> reqwest::Response {
     client()
         .post(toker_url(addr, "/v1/chat/completions"))
         .header("x-toker-session", "ses-test-1")
+        // opencode's native session id — the sticky-routing key that
+        // rides upstream.
+        .header("x-session-id", "ses-opencode-7f")
         .header(header::CONTENT_TYPE, "application/json")
         .body(body.to_vec())
         .send()
@@ -399,6 +402,15 @@ async fn sse_completions_pass_through_byte_identically_and_ledger() {
         !captured[0].headers.contains_key(header::AUTHORIZATION),
         "no key configured → no auth injected, openrouter-shaped 401s verify the wiring"
     );
+    assert!(
+        captured[0]
+            .headers
+            .get("x-session-id")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("ses-opencode")),
+        "the session id rides upstream: openrouter's sticky-routing key \
+         (conversation → same endpoint → warm caches). It carries no secret."
+    );
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -429,7 +441,8 @@ async fn sse_completions_pass_through_byte_identically_and_ledger() {
         row.usage_presence,
         Some(serde_json::json!({
             "prompt_tokens": true, "completion_tokens": true,
-            "cached_tokens": false, "reasoning_tokens": false, "cost": true,
+            "cached_tokens": false, "cache_write_tokens": false,
+            "reasoning_tokens": false, "cost": true,
         }))
     );
     assert_eq!(
