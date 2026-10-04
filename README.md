@@ -36,4 +36,4 @@ Compaction management is also important. If cache is hot, a compaction is basica
 
 New models come out regularly, but harnesses don't always follow suit. Toker learns which model families you use, and transparently upgrades requests to newer versions of your models once you'vetried out the latest versions for a little while, and you can also promote a model version manually.
 
-When using opencode, two custom sidebar and footer plugins augment the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and show the provider breakdown when using a router.
+When using opencode, a custom sidebar and footer plugin augments the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and shows the provider breakdown when using a router.
