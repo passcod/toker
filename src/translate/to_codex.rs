@@ -37,8 +37,20 @@ pub fn to_codex(
     prompt_cache_key: &str,
 ) -> Result<ResponsesRequest, TranslateError> {
     let mut request = ResponsesRequest::new(model, prompt_cache_key);
-    request.instructions = instructions_of(body)?;
-    request.input = input_of(body)?;
+    let (input, leading_system) = input_of(body)?;
+    let mut instructions = instructions_of(body)?;
+    // Leading system-role messages (before any dialogue) belong with
+    // the system prompt: the codex backend takes system content ONLY
+    // via `instructions` (verified live: a system-role input item is
+    // refused with "System messages are not allowed").
+    for text in leading_system {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&text);
+    }
+    request.instructions = instructions;
+    request.input = input;
     request.tools = tools_of(body)?;
     request.tool_choice = tool_choice_of(body)?.to_owned();
     sampling_of(body, &mut request.extra)?;
@@ -76,18 +88,30 @@ fn instructions_of(body: &Value) -> Result<String, TranslateError> {
 
 // ── messages → input items ─────────────────────────────────────────
 
-/// `messages` → the input item list, in order. Grouping rule:
+/// `messages` → the input item list, in order, plus any LEADING
+/// system-role message texts (see [`to_codex`] — the codex backend
+/// accepts system content only via `instructions`). Grouping rule:
 /// consecutive text/image blocks of one message become ONE message
 /// item; `tool_use`/`tool_result` become their own items, and text
 /// after them opens a new message item (order preserved at item
 /// granularity).
-fn input_of(body: &Value) -> Result<Vec<Item>, TranslateError> {
+///
+/// Mid-conversation system messages (claude Code's reminders) merge
+/// into the PRECEDING user turn's item as `[PROMPT_INJECTION]`-prefixed
+/// text parts — ctp's exact transform for the same problem (sonnet 5
+/// refuses system entries in `messages[]`; the codex backend refuses
+/// system-role input items), which keeps the role sequence the
+/// conversation already had. With no preceding user item, the text
+/// falls back to the leading set (instructions) — never dropped, never
+/// a system item.
+fn input_of(body: &Value) -> Result<(Vec<Item>, Vec<String>), TranslateError> {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return Err(TranslateError::Malformed {
             reason: "messages is missing or not an array (not a /v1/messages body)".to_owned(),
         });
     };
-    let mut items = Vec::with_capacity(messages.len());
+    let mut items: Vec<Item> = Vec::with_capacity(messages.len());
+    let mut leading_system: Vec<String> = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
         let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
             TranslateError::Malformed {
@@ -100,6 +124,21 @@ fn input_of(body: &Value) -> Result<Vec<Item>, TranslateError> {
                     "messages[{message_index}]: role {role:?} is not user, assistant, or system"
                 ),
             });
+        }
+        if role == "system" {
+            for text in system_texts_of(message, message_index)? {
+                if let Some(user_item) = last_user_item_mut(&mut items) {
+                    user_item
+                        .0
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
+                        .expect("a message item's content is an array")
+                        .push(text_part(&format!("[PROMPT_INJECTION] {text}"), false));
+                } else {
+                    leading_system.push(text);
+                }
+            }
+            continue;
         }
         let content = message
             .get("content")
@@ -136,10 +175,10 @@ fn input_of(body: &Value) -> Result<Vec<Item>, TranslateError> {
                                 })?;
                             parts.push(text_part(text, role == "assistant"));
                         }
-                        ("user" | "system", "image") => {
+                        ("user", "image") => {
                             parts.push(image_part(block, &at)?);
                         }
-                        ("user" | "system", "tool_result") => {
+                        ("user", "tool_result") => {
                             let tool_use_id = block
                                 .get("tool_use_id")
                                 .and_then(Value::as_str)
@@ -212,7 +251,66 @@ fn input_of(body: &Value) -> Result<Vec<Item>, TranslateError> {
             }
         }
     }
-    Ok(items)
+    Ok((items, leading_system))
+}
+
+/// A system-role message's text pieces, in order. String content is
+/// the one piece; a block array contributes each text block's `text`.
+/// Non-text blocks are unsupported on this route — a system message
+/// carrying one is a body toker refuses to translate rather than
+/// silently truncating.
+fn system_texts_of(message: &Value, index: usize) -> Result<Vec<String>, TranslateError> {
+    match message.get("content") {
+        Some(Value::String(text)) => Ok(vec![text.clone()]),
+        Some(Value::Array(blocks)) => {
+            let mut texts = Vec::new();
+            for (block_index, block) in blocks.iter().enumerate() {
+                let kind = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    TranslateError::Malformed {
+                        reason: format!(
+                            "messages[{index}] block {block_index}: \
+                             a system block has no type"
+                        ),
+                    }
+                })?;
+                if kind != "text" {
+                    return Err(TranslateError::UnsupportedBlock {
+                        kind: kind.to_owned(),
+                    });
+                }
+                texts.push(
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| TranslateError::Malformed {
+                            reason: format!(
+                                "messages[{index}] block {block_index}: \
+                                     text is missing or not a string"
+                            ),
+                        })?
+                        .to_owned(),
+                );
+            }
+            Ok(texts)
+        }
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(other) => Err(TranslateError::Malformed {
+            reason: format!(
+                "messages[{index}]: system content is neither a string nor a \
+                 text-block array ({})",
+                json_kind(other)
+            ),
+        }),
+    }
+}
+
+/// The most recent user message item, mutably — the merge target for a
+/// mid-conversation system message (ctp's preceding-user rule).
+fn last_user_item_mut(items: &mut [Item]) -> Option<&mut Item> {
+    items.iter_mut().rev().find(|item| {
+        item.0.get("type").and_then(Value::as_str) == Some("message")
+            && item.0.get("role").and_then(Value::as_str) == Some("user")
+    })
 }
 
 /// Flush the pending text/image parts of one message into its message
@@ -799,9 +897,13 @@ mod tests {
     }
 
     #[test]
-    fn system_role_messages_translate_to_system_message_items() {
-        // claude Code's mid-conversation system reminders: the
-        // Responses wire accepts system-role input messages.
+    fn mid_conversation_system_messages_merge_into_the_preceding_user_turn() {
+        // claude Code's mid-conversation system reminders: the codex
+        // backend takes system content ONLY via `instructions` (a
+        // system-role input item is refused with "System messages are
+        // not allowed" — verified live). ctp's transform for the same
+        // problem: merge into the preceding user turn, role sequence
+        // unchanged.
         let body = json!({
             "model": "claude-opus-5",
             "messages": [
@@ -810,12 +912,52 @@ mod tests {
             ],
         });
         let request = to_codex(&body, MODEL, KEY).expect("translates");
-        assert_eq!(request.input.len(), 2);
+        assert_eq!(request.input.len(), 1, "no separate system item");
         assert_eq!(
-            item_of(&request, 1),
-            json!({"type": "message", "role": "system",
-                   "content": [{"type": "input_text", "text": "reminder"}]})
+            item_of(&request, 0),
+            json!({"type": "message", "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Earlier work."},
+                {"type": "input_text", "text": "[PROMPT_INJECTION] reminder"},
+            ]})
         );
+    }
+
+    #[test]
+    fn leading_system_messages_ride_the_instructions() {
+        let body = json!({
+            "model": "claude-opus-5",
+            "system": "Base prompt.",
+            "messages": [
+                {"role": "system", "content": "Preamble."},
+                {"role": "user", "content": "Hi"},
+            ],
+        });
+        let request = to_codex(&body, MODEL, KEY).expect("translates");
+        assert_eq!(request.instructions, "Base prompt.\n\nPreamble.");
+        assert_eq!(
+            request.input.len(),
+            1,
+            "the leading system item is not input"
+        );
+        assert_eq!(item_of(&request, 0)["role"], "user");
+    }
+
+    #[test]
+    fn a_system_message_after_only_assistant_turns_falls_back_to_instructions() {
+        let body = json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "assistant", "content": "Hello."},
+                {"role": "system", "content": "reminder"},
+            ],
+        });
+        let request = to_codex(&body, MODEL, KEY).expect("translates");
+        assert_eq!(
+            request.instructions, "reminder",
+            "no user item to merge into"
+        );
+        assert_eq!(request.input.len(), 1);
     }
 
     #[test]
