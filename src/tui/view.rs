@@ -580,7 +580,7 @@ fn usd(value: f64) -> String {
 mod tests {
     use super::super::model;
     use super::super::quota::Spent;
-    use super::super::testrows::{bare, billed, kind_row, metered};
+    use super::super::testrows::{as_meter_rows, bare, billed, kind_row, metered_full};
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -637,9 +637,14 @@ mod tests {
         rows.push(kind_row(NOW - 10_000, RowKind::Error));
         {
             // The view tests build the quota section once, the way the
-            // loop does, and reuse it across sizes.
-            let quota =
-                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            // loop does (the meter lookback projected onto the narrow
+            // read's shape), and reuse it across sizes.
+            let quota = crate::tui::quota::aggregate(
+                &as_meter_rows(&rows),
+                NOW,
+                TODAY,
+                NOW.saturating_sub(30 * 60_000),
+            );
             model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
         }
     }
@@ -669,21 +674,21 @@ mod tests {
         let reset7d = (NOW + 4 * DAY) / 1000;
         let reset_overage = (NOW + 20 * DAY) / 1000;
         let mut rows = vec![
-            metered(NOW - 2 * DAY, json!({"util7d": 0.10, "reset7d": reset7d})),
-            metered(NOW - DAY, json!({"util7d": 0.80, "reset7d": reset7d})),
-            metered(
+            metered_full(NOW - 2 * DAY, json!({"util7d": 0.10, "reset7d": reset7d})),
+            metered_full(NOW - DAY, json!({"util7d": 0.80, "reset7d": reset7d})),
+            metered_full(
                 NOW - 13 * HOUR,
                 json!({"utilOverage": 0.58, "resetOverage": reset_overage}),
             ),
-            metered(NOW - 90 * MIN, json!({"util5h": 0.10, "reset5h": reset5h})),
-            metered(
+            metered_full(NOW - 90 * MIN, json!({"util5h": 0.10, "reset5h": reset5h})),
+            metered_full(
                 NOW - 45 * MIN,
                 json!({
                     "util5h": 0.30, "reset5h": reset5h,
                     "utilOverage": 0.64, "resetOverage": reset_overage,
                 }),
             ),
-            metered(
+            metered_full(
                 NOW - 10 * MIN,
                 json!({
                     "util5h": 0.32, "reset5h": reset5h,
@@ -706,8 +711,12 @@ mod tests {
         {
             // The view tests build the quota section once, the way the
             // loop does, and reuse it across sizes.
-            let quota =
-                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            let quota = crate::tui::quota::aggregate(
+                &as_meter_rows(&rows),
+                NOW,
+                TODAY,
+                NOW.saturating_sub(30 * 60_000),
+            );
             model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
         }
     }
@@ -937,8 +946,12 @@ mod tests {
         let snap = {
             // The view tests build the quota section once, the way the
             // loop does, and reuse it across sizes.
-            let quota =
-                crate::tui::quota::aggregate(&rows, NOW, TODAY, NOW.saturating_sub(30 * 60_000));
+            let quota = crate::tui::quota::aggregate(
+                &as_meter_rows(&rows),
+                NOW,
+                TODAY,
+                NOW.saturating_sub(30 * 60_000),
+            );
             model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
         };
         assert!(snap.quota.as_ref().expect("readings exist").gate_assumed);

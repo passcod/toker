@@ -339,12 +339,20 @@ fn min_span_for(reset_ms: i64, now_ms: i64) -> i64 {
 }
 
 /// One reading of a meter: when, the utilisation, and the window it
-/// describes (reset in epoch seconds, the wire form).
+/// describes (reset in epoch seconds, the wire form). The narrow shape
+/// every consumer of the burn math extracts — the cold gate's outlook
+/// from full ledger rows ([`burn_rate`]), the TUI's quota panel from
+/// its meter-only read ([`burn_rate_samples`]) — so the ladder below
+/// and the panel's span totals share one sample type, never a wider
+/// row.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Reading {
-    at_ms: i64,
-    util: f64,
-    reset_s: i64,
+pub struct MeterSample {
+    /// When the reading was taken, epoch milliseconds.
+    pub at_ms: i64,
+    /// The meter's utilisation, as reported.
+    pub util: f64,
+    /// The window's reset, epoch seconds.
+    pub reset_s: i64,
 }
 
 /// How fast a meter is being consumed (ctp `burnRate`, forecast.mjs:109 —
@@ -508,18 +516,39 @@ impl Burn {
 /// forecast.mjs:109-236, ported step for step — the window-restart fall
 /// detection, the zero-reading anchor, the envelope over late-arriving
 /// readings, and the shortest-clearing rung).
+///
+/// This is the row-taking entry the cold gate's outlook calls; the
+/// ladder itself lives in [`burn_rate_samples`], shared with the TUI's
+/// quota panel.
 pub fn burn_rate(rows: &[RequestRow], spec: &MeterSpec, now_ms: i64) -> Burn {
-    let mut readings: Vec<Reading> = rows
-        .iter()
+    burn_rate_samples(&samples_of(rows, spec), spec, now_ms)
+}
+
+/// [`burn_rate`]'s per-row extraction: one sample per row that carries
+/// the meter's fields, kinds included (see [`burn_rate`] for why ctp
+/// keeps those rows).
+fn samples_of(rows: &[RequestRow], spec: &MeterSpec) -> Vec<MeterSample> {
+    rows.iter()
         .filter_map(|row| {
             let limits = row.rate_limits.as_ref()?;
-            Some(Reading {
+            Some(MeterSample {
                 at_ms: row.ts_ms,
                 util: limits.get(spec.util_key)?.as_f64()?,
                 reset_s: limits.get(spec.reset_key)?.as_i64()?,
             })
         })
-        .collect();
+        .collect()
+}
+
+/// The burn ladder over pre-extracted samples — the entry the TUI's
+/// quota panel uses. Its meter lookback reads the ledger through the
+/// store's narrow meter row (four columns, one JSON parse), extracts
+/// each meter's samples at the call boundary, and feeds them here, so
+/// the ladder stays one copy of the math shared with the cold gate's
+/// outlook ([`burn_rate`] is the same ladder over full rows). `spec`
+/// supplies the window's length for the zero-reading anchor.
+pub fn burn_rate_samples(samples: &[MeterSample], spec: &MeterSpec, now_ms: i64) -> Burn {
+    let mut readings: Vec<MeterSample> = samples.to_vec();
     if readings.is_empty() {
         return Burn::None;
     }
@@ -540,7 +569,7 @@ pub fn burn_rate(rows: &[RequestRow], spec: &MeterSpec, now_ms: i64) -> Burn {
     // that never comes back and has outlasted reordering (both halves are
     // needed — the fall alone is jitter, "never returns" alone walks the
     // start forward to the last row).
-    let same_window: Vec<Reading> = readings
+    let same_window: Vec<MeterSample> = readings
         .iter()
         .filter(|reading| reading.reset_s == latest.reset_s)
         .copied()
@@ -2083,8 +2112,9 @@ pub fn retarget_compaction(
 mod tests {
     use super::{
         Burn, ColdBlocking, ColdDecision, DEFAULT_MIN_TOKENS, METER_5H, Outlook, RetargetOutcome,
-        Verdict, burn_rate, coldness, decide_cold, fit_quota_model, human_idle, lane_is_cold,
-        outlook_of, outlook_target, project_to, quota_outlook, retarget_compaction, ttl_of,
+        Verdict, burn_rate, burn_rate_samples, coldness, decide_cold, fit_quota_model, human_idle,
+        lane_is_cold, outlook_of, outlook_target, project_to, quota_outlook, retarget_compaction,
+        ttl_of,
     };
     use crate::ir::Request;
     use crate::middleware::notice::NoticeStyle;
@@ -2573,6 +2603,45 @@ mod tests {
     }
 
     // ── the burn ladder (ctp burnRate / projectTo) ─────────────────────
+
+    #[test]
+    fn the_samples_entry_is_the_same_ladder_as_the_rows_entry() {
+        // burn_rate = extract + burn_rate_samples; the TUI's quota panel
+        // feeds the samples entry from the narrow meter row, so the two
+        // must be the same ladder over the same readings or the panel
+        // and the cold outlook disagree about the same window.
+        let rows = vec![
+            served_row(
+                NOW - 4 * HOUR,
+                "claude-opus-5",
+                1,
+                Some(0.10),
+                Some((NOW + HOUR) / 1000),
+            ),
+            bare_row(NOW - 3 * HOUR), // no meters: no sample either way
+            served_row(
+                NOW - 2 * HOUR,
+                "claude-opus-5",
+                1,
+                Some(0.30),
+                Some((NOW + HOUR) / 1000),
+            ),
+            served_row(
+                NOW - MIN,
+                "claude-opus-5",
+                1,
+                Some(0.52),
+                Some((NOW + HOUR) / 1000),
+            ),
+        ];
+        let samples = super::samples_of(&rows, &METER_5H);
+        assert_eq!(samples.len(), 3, "the meter-less row yields no sample");
+        assert_eq!(
+            burn_rate_samples(&samples, &METER_5H, NOW),
+            burn_rate(&rows, &METER_5H, NOW),
+            "both entries are the same ladder over the same samples"
+        );
+    }
 
     #[test]
     fn burn_rate_states_none_stale_insufficient_and_the_anchor() {

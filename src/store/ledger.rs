@@ -384,6 +384,35 @@ pub(super) fn insert_batch(
     Ok((first_id, Some(last_id)))
 }
 
+/// The narrow projection of a `requests` row for the quota panel's
+/// meter lookback: the four columns the aggregation consumes, nothing
+/// else. It exists so that read CANNOT regress into materialising full
+/// rows — the full-row reader casts 59 columns and parses six JSON
+/// values per row, while the meter read parses one, once, here — so
+/// adding a field to this type must be justified against the
+/// per-refresh cost of fetching and parsing it across up to the quota
+/// lookback's 20 000-row cap (the read runs on the TUI's quota
+/// cadence). If the aggregation needs another column, widen it
+/// consciously and say why.
+///
+/// Absence stays absence (invariant 3): the gate-flag arm of the
+/// filter fetches rows that carry no snapshot at all, so `rate_limits`
+/// is `None` there — never an empty object — and the scalars round-trip
+/// NULL as `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeterRow {
+    /// Epoch milliseconds — the window column, from the shared index.
+    pub ts_ms: i64,
+    /// Proxy-written kind; `None` marks a real API measurement.
+    pub kind: Option<RowKind>,
+    /// Quota-gate state when the row was written.
+    pub gate_on: Option<bool>,
+    /// Parsed meter snapshot as of the response; `None` on rows the
+    /// gate-flag arm of the filter fetches. Parsed once here and never
+    /// re-serialised.
+    pub rate_limits: Option<Value>,
+}
+
 /// Rows with `ts_ms >= ts_ms`, oldest first. When the window holds more
 /// than `limit` rows, the *newest* `limit` are kept — a caller refreshing a
 /// recent window never wants its newest rows silently truncated away.
@@ -397,6 +426,55 @@ pub(super) fn requests_since(conn: &Connection, ts_ms: i64, limit: i64) -> Resul
         [ts_ms, limit],
         read_row,
     )
+}
+
+/// The meter lookback's narrow read ([`MeterRow`]s): rows within the
+/// window that carry a meter snapshot OR a gate flag, oldest first, cap
+/// keeping the newest exactly like [`requests_since`].
+///
+/// The OR is load-bearing, and the aggregation's own rules fix it:
+/// a meter-bearing row needs no other column to contribute (a reading
+/// is the snapshot plus `ts_ms`, and `kind` only ever decides whether a
+/// *snapshot-carrying* row may baseline a span total), while the
+/// gate-seen rule reads `gate_on` from ANY row in the lookback — and
+/// the rows that carry the flag without a snapshot are exactly the
+/// proxy-written ones (cold notices, releases). A
+/// `rate_limits IS NOT NULL` filter would flip an observed gate back
+/// to the assumed default. Rows with neither field contribute nothing
+/// the aggregation can read, so the filter skips them and the cap
+/// keeps the newest rows of what the aggregation can actually consume.
+pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Result<Vec<MeterRow>> {
+    // The inner projection carries `id` only so the outer re-sort can
+    // tie-break equal timestamps the same way `requests_since` does;
+    // the row reader never reads it.
+    rows_of(
+        conn,
+        "SELECT * FROM (
+            SELECT id, ts_ms, kind, gate_on, rate_limits FROM requests
+            WHERE ts_ms >= ?1 AND (rate_limits IS NOT NULL OR gate_on IS NOT NULL)
+            ORDER BY ts_ms DESC, id DESC LIMIT ?2
+        ) ORDER BY ts_ms ASC, id ASC",
+        [ts_ms, limit],
+        read_meter_row,
+    )
+}
+
+/// Read one narrow meter row by column name. Unknown `kind` values are
+/// an error, not a silent `None` — the kind column drives the span
+/// total's proxy-row exclusion, and a corrupted value must never
+/// reclassify a row as an API measurement (invariant 3), same as the
+/// full-row read.
+fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
+    Ok(MeterRow {
+        ts_ms: row.get("ts_ms")?,
+        kind: parse_stored(
+            "kind",
+            row.get::<_, Option<String>>("kind")?,
+            RowKind::parse,
+        )?,
+        gate_on: row.get("gate_on")?,
+        rate_limits: super::opt_json_from_text(row.get("rate_limits")?)?,
+    })
 }
 
 /// Total row count — cheap enough for the TUI footer and `toker status`.

@@ -39,13 +39,15 @@ use crate::store::Store;
 const REFRESH: Duration = Duration::from_secs(2);
 
 /// The meter-lookback cadence. The quota section reads a 7-day,
-/// 20 000-row window and aggregates burn rates over it — far heavier
-/// than the display read, and nothing about it changes on a 2-second
-/// scale: meters move on the upstream's window scale (hours), and ctp
-/// itself refit its quota model every 30 MINUTES (QUOTA_REFIT_MS).
-/// Refreshing it at the display cadence made the loop spin: the read
-/// overran the tick, the next deadline landed in the past, and
-/// `event::poll(0)` never blocked — 80% of a core, fixed here.
+/// 20 000-row window through the store's narrow meter projection (four
+/// columns, one JSON parse per row — see [`quota_snapshot`]) and
+/// aggregates burn rates over it — far heavier than the display read,
+/// and nothing about it changes on a 2-second scale: meters move on
+/// the upstream's window scale (hours), and ctp itself refit its quota
+/// model every 30 MINUTES (QUOTA_REFIT_MS). Refreshing it at the
+/// display cadence made the loop spin: the read overran the tick, the
+/// next deadline landed in the past, and `event::poll(0)` never
+/// blocked — 80% of a core, fixed here.
 const QUOTA_REFRESH: Duration = Duration::from_secs(60);
 
 /// Per-refresh row cap. `requests_since` keeps the newest rows; a 30-minute
@@ -149,10 +151,23 @@ fn refresh_display(
 /// from every row read, not just the windowed ones" (live.mjs:269-272);
 /// the lookback reuses the cold outlook's constants: same 7-day span,
 /// same row cap.
+///
+/// The read is the store's narrow meter projection
+/// ([`Store::meter_rows_since`]): rows that carry neither a snapshot
+/// nor a gate flag never reach the aggregation (a row without
+/// `rate_limits` contributes no reading, and only the gate flag is
+/// read off meter-less rows — the gate-seen rule reads it from any row
+/// in the lookback). Semantics change against the old full-row read,
+/// documented here deliberately: the [`OUTLOOK_ROWS`] cap now applies
+/// to the snapshot-or-flag rows the aggregation can consume, so in an
+/// over-cap lookback the newest 20 000 such rows are kept rather than
+/// the newest 20 000 rows of any kind — strictly more of the lookback's
+/// signal fits under the cap, and the rows the filter skips are
+/// exactly the ones the old aggregation read and could not use.
 fn quota_snapshot(store: &Store, window_mins: u64) -> anyhow::Result<Option<quota::QuotaAgg>> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let quota_rows =
-        store.requests_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)?;
+        store.meter_rows_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)?;
     Ok(quota::aggregate(
         &quota_rows,
         now_ms,
@@ -204,7 +219,7 @@ pub(crate) mod testrows {
     //! the store deliberately has no `Default`, so the full field list
     //! lives once, here.
 
-    use crate::store::{CostKind, RequestRow, RowKind};
+    use crate::store::{CostKind, MeterRow, RequestRow, RowKind};
 
     /// A measurement row with every optional column NULL, at `ts_ms`.
     pub(crate) fn bare(ts_ms: i64) -> RequestRow {
@@ -297,19 +312,62 @@ pub(crate) mod testrows {
         row
     }
 
+    /// A meter-lookback row with every field absent — the shape of a
+    /// ledger row the narrow read would fetch only for its gate flag
+    /// (or not at all), and the base every meter fixture below builds
+    /// on.
+    pub(crate) fn meter_bare(ts_ms: i64) -> MeterRow {
+        MeterRow {
+            ts_ms,
+            kind: None,
+            gate_on: None,
+            rate_limits: None,
+        }
+    }
+
+    /// A meter-lookback row carrying an anthropic meter snapshot at
+    /// `ts_ms` — ctp's `rateLimits` shape (util/reset per window plus
+    /// the status/claim/overage fields), for the quota panel's tests.
+    /// The quota aggregation's native input: the narrow read returns
+    /// these, so its tests build them directly.
+    pub(crate) fn metered(ts_ms: i64, limits: serde_json::Value) -> MeterRow {
+        let mut row = meter_bare(ts_ms);
+        row.rate_limits = Some(limits);
+        row
+    }
+
+    /// A FULL ledger row carrying an anthropic meter snapshot at
+    /// `ts_ms` — for fixtures that feed BOTH the quota aggregation (via
+    /// [`as_meter_rows`]) and the display aggregation, which needs the
+    /// whole [`RequestRow`].
+    pub(crate) fn metered_full(ts_ms: i64, limits: serde_json::Value) -> RequestRow {
+        let mut row = bare(ts_ms);
+        row.rate_limits = Some(limits);
+        row
+    }
+
+    /// Project full ledger rows onto the meter lookback's narrow
+    /// shape, keeping EVERY row (no filter). The parity bridge: the
+    /// old quota path materialised full rows and read these four fields
+    /// off them, so aggregating this projection of a full-row read must
+    /// equal aggregating the narrow read — including over rows the
+    /// narrow read's filter skips, which is exactly what the parity
+    /// test proves the aggregation is insensitive to.
+    pub(crate) fn as_meter_rows(rows: &[RequestRow]) -> Vec<MeterRow> {
+        rows.iter()
+            .map(|row| MeterRow {
+                ts_ms: row.ts_ms,
+                kind: row.kind,
+                gate_on: row.gate_on,
+                rate_limits: row.rate_limits.clone(),
+            })
+            .collect()
+    }
+
     /// A proxy-written row of `kind` at `ts_ms` (never an API measurement).
     pub(crate) fn kind_row(ts_ms: i64, kind: RowKind) -> RequestRow {
         let mut row = bare(ts_ms);
         row.kind = Some(kind);
-        row
-    }
-
-    /// A measurement row carrying an anthropic meter snapshot at
-    /// `ts_ms` — ctp's `rateLimits` shape (util/reset per window plus
-    /// the status/claim/overage fields), for the quota panel's tests.
-    pub(crate) fn metered(ts_ms: i64, limits: serde_json::Value) -> RequestRow {
-        let mut row = bare(ts_ms);
-        row.rate_limits = Some(limits);
         row
     }
 }

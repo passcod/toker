@@ -30,7 +30,7 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
+    CostKind, MeterRow, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
 
@@ -147,6 +147,16 @@ impl Store {
     pub fn requests_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<RequestRow>> {
         let limit = limit.min(i64::MAX as u64) as i64;
         ledger::requests_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The quota panel's meter lookback: rows with `ts_ms >= ts_ms` that
+    /// carry a meter snapshot or a gate flag, as narrow [`MeterRow`]s,
+    /// oldest first; when more than `limit` match, the newest `limit` are
+    /// kept. See `ledger::meter_rows_since` for why the filter reads both
+    /// columns — the gate-seen rule needs `gate_on` off meter-less rows.
+    pub fn meter_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<MeterRow>> {
+        let limit = limit.min(i64::MAX as u64) as i64;
+        ledger::meter_rows_since(&*self.conn()?, ts_ms, limit)
     }
 
     /// Total ledger row count.
@@ -608,6 +618,155 @@ mod tests {
             "window past the newest row is empty"
         );
         assert_eq!(store.count_requests().expect("count"), 5);
+    }
+
+    /// A row carrying only a gate flag (the cold-notice/release shape:
+    /// those rows are written with `gate_on` and no `rate_limits`).
+    fn gate_only_row(ts_ms: i64, gate_on: bool) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.gate_on = Some(gate_on);
+        row
+    }
+
+    /// A row carrying only a meter snapshot (a measurement whose
+    /// backend reports meters; `gate_on` predates it or was NULL).
+    fn meter_only_row(ts_ms: i64, limits: serde_json::Value) -> RequestRow {
+        let mut row = bare_row(ts_ms);
+        row.rate_limits = Some(limits);
+        row
+    }
+
+    #[test]
+    fn meter_rows_since_filters_to_snapshot_or_gate_rows() {
+        let store = mem_store();
+        // Out of order, mixed: bare rows (neither field), gate-only
+        // rows, meter-only rows, and one carrying both.
+        for ts in [100, 200, 300, 400, 500, 600] {
+            store.record_request(&bare_row(ts)).expect("record");
+        }
+        store
+            .record_request(&gate_only_row(150, false))
+            .expect("record");
+        store
+            .record_request(&meter_only_row(250, json!({"util5h": 0.4})))
+            .expect("record");
+        store
+            .record_request(&gate_only_row(350, true))
+            .expect("record");
+        store
+            .record_request(&meter_only_row(450, json!({"util7d": 0.8})))
+            .expect("record");
+        let mut both = meter_only_row(550, json!({"utilOverage": 0.6}));
+        both.gate_on = Some(true);
+        store.record_request(&both).expect("record");
+
+        let rows = store.meter_rows_since(0, 100).expect("read");
+        // Every fetched row carries a snapshot or a flag; the six bare
+        // rows never reach the read.
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.rate_limits.is_some() || row.gate_on.is_some())
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.ts_ms).collect::<Vec<_>>(),
+            vec![150, 250, 350, 450, 550],
+            "oldest first, boundary inclusive"
+        );
+        // The gate-only rows keep their absence: no snapshot was
+        // invented for them (invariant 3).
+        assert_eq!(rows[0].rate_limits, None);
+        assert_eq!(rows[0].gate_on, Some(false));
+        assert_eq!(rows[1].rate_limits, Some(json!({"util5h": 0.4})));
+        assert_eq!(rows[1].gate_on, None);
+
+        // The window filters the same way the full read does.
+        let rows = store.meter_rows_since(250, 100).expect("window");
+        assert_eq!(
+            rows.iter().map(|row| row.ts_ms).collect::<Vec<_>>(),
+            vec![250, 350, 450, 550]
+        );
+        assert!(
+            store.meter_rows_since(700, 10).expect("empty").is_empty(),
+            "window past the newest row is empty"
+        );
+
+        // The cap keeps the NEWEST matching rows, still oldest-first —
+        // `requests_since`'s semantics over the filtered set.
+        let rows = store.meter_rows_since(0, 3).expect("capped");
+        assert_eq!(
+            rows.iter().map(|row| row.ts_ms).collect::<Vec<_>>(),
+            vec![350, 450, 550],
+            "cap keeps the newest snapshot-or-flag rows"
+        );
+    }
+
+    #[test]
+    fn meter_rows_round_trip_kinds_flags_and_snapshots() {
+        let store = mem_store();
+        // One row of every shape the aggregation reads: a blocked stale
+        // copy (kind + snapshot, no flag), a cold row (kind + flag, no
+        // snapshot — the production shape from `record_anthropic`), and
+        // a plain measurement (snapshot only).
+        let mut blocked = meter_only_row(100, json!({"util5h": 0.99, "claim": "five_hour"}));
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
+        let mut cold = bare_row(200);
+        cold.kind = Some(RowKind::Cold);
+        cold.gate_on = Some(true);
+        store.record_request(&cold).expect("record");
+        store
+            .record_request(&meter_only_row(
+                300,
+                json!({"util7d": 0.21, "overageInUse": true}),
+            ))
+            .expect("record");
+
+        let rows = store.meter_rows_since(0, 10).expect("read");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].ts_ms, 100);
+        assert_eq!(rows[0].kind, Some(RowKind::Blocked));
+        assert_eq!(rows[0].gate_on, None);
+        assert_eq!(
+            rows[0].rate_limits,
+            Some(json!({"util5h": 0.99, "claim": "five_hour"}))
+        );
+        assert_eq!(rows[1].ts_ms, 200);
+        assert_eq!(rows[1].kind, Some(RowKind::Cold));
+        assert_eq!(rows[1].gate_on, Some(true));
+        assert_eq!(
+            rows[1].rate_limits, None,
+            "the flag-only row's absence stays absence"
+        );
+        assert_eq!(
+            rows[2].kind, None,
+            "a measurement's kind round-trips as None"
+        );
+        assert_eq!(
+            rows[2].rate_limits,
+            Some(json!({"util7d": 0.21, "overageInUse": true}))
+        );
+    }
+
+    #[test]
+    fn meter_rows_reject_unknown_stored_kinds() {
+        // Same rule as the full read: a corrupted kind must error, not
+        // silently reclassify the row as an API measurement — the kind
+        // column decides which snapshot-carrying rows may baseline a
+        // span total.
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO requests (ts_ms, kind, rate_limits) VALUES (1, 'mystery', '{}')",
+                [],
+            )
+            .expect("insert bogus kind");
+        }
+        match store.meter_rows_since(0, 10) {
+            Err(Error::UnknownDbValue { column: "kind", .. }) => {}
+            other => panic!("unknown kind must error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -313,7 +313,7 @@ fn bucket_of(ts_ms: i64, now_ms: i64, window_mins: usize) -> usize {
 mod tests {
     use super::{NO_SESSION, Snapshot};
     use crate::store::{CostKind, RequestRow, RowKind};
-    use crate::tui::testrows::{bare, billed, kind_row};
+    use crate::tui::testrows::{as_meter_rows, bare, billed, kind_row};
     use serde_json::json;
 
     /// A fixed frame time: 2026-01-21T22:13:20Z-ish, arbitrary but stable.
@@ -323,9 +323,10 @@ mod tests {
     fn agg(rows: &[RequestRow], total: i64) -> Snapshot {
         // The meter lookback is a superset of the window; the tests pass
         // the same rows, which is the shape of a real window that fits
-        // inside the lookback — precomputed the way the loop now does.
+        // inside the lookback — precomputed the way the loop now does,
+        // over the lookback's narrow projection of them.
         let quota = super::super::quota::aggregate(
-            rows,
+            &as_meter_rows(rows),
             NOW,
             NOW - 12 * 60 * 60_000,
             NOW.saturating_sub(WINDOW as i64 * 60_000),
@@ -653,7 +654,7 @@ mod tests {
 
         let lookback = [older_reading, in_window];
         let quota_section = super::super::quota::aggregate(
-            &lookback,
+            &as_meter_rows(&lookback),
             NOW,
             NOW - 12 * 60 * 60_000,
             NOW.saturating_sub(WINDOW as i64 * 60_000),
@@ -675,7 +676,7 @@ mod tests {
         // A lookback of rows without meters: no section at all.
         let meterless = [bare(mins_ago(90))];
         let quota_section = super::super::quota::aggregate(
-            &meterless,
+            &as_meter_rows(&meterless),
             NOW,
             NOW,
             NOW.saturating_sub(WINDOW as i64 * 60_000),

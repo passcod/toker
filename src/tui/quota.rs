@@ -27,15 +27,24 @@
 //! without meter snapshots produce no section at all — nothing renders,
 //! never zeros — which is also the per-backend panel rule (an openai
 //! window has no quota meters and no quota panel).
+//!
+//! The aggregation runs over [`MeterRow`]s — the store's narrow
+//! meter-lookback projection (timestamp, kind, gate flag, snapshot),
+//! four columns where the full row carries 59 and one JSON parse where
+//! the full row carries six — so the quota refresh cannot quietly
+//! regress into materialising full rows. The burn math stays shared
+//! with the cold gate: this module extracts each meter's
+//! [`MeterSample`]s at the call boundary and feeds the same ladder
+//! ([`burn_rate_samples`]) the cold outlook runs over full rows.
 
 use serde_json::Value;
 
 use crate::middleware::cold::{
-    EPS, METER_5H, METER_7D, METER_OVERAGE, MeterSpec, QUANTUM, REORDER_MS, Verdict, burn_rate,
-    project_to,
+    EPS, METER_5H, METER_7D, METER_OVERAGE, MeterSample, MeterSpec, QUANTUM, REORDER_MS, Verdict,
+    burn_rate_samples, project_to,
 };
 use crate::middleware::quota::{Meters, THRESHOLD, exhausted_meters};
-use crate::store::RequestRow;
+use crate::store::MeterRow;
 
 /// One ctp `METERS` entry for the panel: the burn spec plus the fields
 /// only rendering reads. Order is ctp's render order (5h, 7d, overage).
@@ -147,19 +156,20 @@ pub(crate) enum Spent {
 
 /// Aggregate the quota section over the meter lookback (the display
 /// window's rows are a subset of it, but a burn needs a span a display
-/// window cannot provide). `today_start_ms` is the local day's start
-/// and `window_since_ms` the display window's start — both inputs, so
-/// the model stays pure over its rows. `None` when no row carries a
-/// meter snapshot (ctp live.mjs:537's `if (lastRl)`).
+/// window cannot provide). `rows` are the narrow [`MeterRow`]s the
+/// store's meter-lookback read returns. `today_start_ms` is the local
+/// day's start and `window_since_ms` the display window's start — both
+/// inputs, so the model stays pure over its rows. `None` when no row
+/// carries a meter snapshot (ctp live.mjs:537's `if (lastRl)`).
 pub(crate) fn aggregate(
-    rows: &[RequestRow],
+    rows: &[MeterRow],
     now_ms: i64,
     today_start_ms: i64,
     window_since_ms: i64,
 ) -> Option<QuotaAgg> {
     // Latest-by-timestamp, as everywhere in the model: the ledger is
     // insert-only and rows arrive slightly out of order.
-    let mut sorted: Vec<&RequestRow> = rows.iter().collect();
+    let mut sorted: Vec<&MeterRow> = rows.iter().collect();
     sorted.sort_by_key(|row| row.ts_ms);
 
     // The newest rate-limit reading, from every row that carries one,
@@ -216,7 +226,7 @@ pub(crate) fn aggregate(
             // session is already stopping and the question becomes how
             // long the released overage lasts.
             let target = if gated && !exhausted { THRESHOLD } else { 1.0 };
-            let burn = burn_rate(rows, panel.spec, now_ms);
+            let burn = burn_rate_samples(&burn_samples(rows, panel.spec), panel.spec, now_ms);
             let verdict = project_to(&burn, target, now_ms);
             Some(MeterPanel {
                 key: panel.key,
@@ -261,30 +271,41 @@ pub(crate) fn aggregate(
 
 // ── the span total (ctp meterUsed / periods / readingsOf) ────────────────
 
-/// One reading of a meter, at the moment the response was served.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Reading {
-    at_ms: i64,
-    util: f64,
-    reset_s: i64,
+/// The burn's samples for one meter over the narrow lookback: every row
+/// that carries the meter's fields, proxy-written kinds included —
+/// cold's `burn_rate` extracts the same set from full rows (after a
+/// block the stale copy is the only row there is, and its reset value
+/// is what says whether the window is still live). Feeds
+/// [`burn_rate_samples`], the ladder shared with the cold outlook.
+fn burn_samples(rows: &[MeterRow], spec: &MeterSpec) -> Vec<MeterSample> {
+    rows.iter()
+        .filter_map(|row| {
+            let limits = row.rate_limits.as_ref()?;
+            Some(MeterSample {
+                at_ms: row.ts_ms,
+                util: limits.get(spec.util_key)?.as_f64()?,
+                reset_s: limits.get(spec.reset_key)?.as_i64()?,
+            })
+        })
+        .collect()
 }
 
 /// The readings for one meter, oldest first — deliberately unlike the
-/// burn's own extraction in one respect: rows the proxy wrote about
-/// itself are dropped. A `blocked` row's `rate_limits` is this
-/// process's last-seen copy rather than a response header — an old
-/// figure wearing a fresh timestamp, harmless as the newest reading of
-/// a rate and ruinous as the baseline of a total. (ctp `readingsOf`,
-/// forecast.mjs:290-304: excluded by the presence of `kind`, never by
-/// listing the kinds — listing them is how `released` slipped into the
-/// quota fit.)
-fn readings_of(rows: &[RequestRow], spec: &MeterSpec) -> Vec<Reading> {
-    let mut out: Vec<Reading> = rows
+/// burn's own extraction ([`burn_samples`]) in one respect: rows the
+/// proxy wrote about itself are dropped. A `blocked` row's
+/// `rate_limits` is this process's last-seen copy rather than a
+/// response header — an old figure wearing a fresh timestamp, harmless
+/// as the newest reading of a rate and ruinous as the baseline of a
+/// total. (ctp `readingsOf`, forecast.mjs:290-304: excluded by the
+/// presence of `kind`, never by listing the kinds — listing them is how
+/// `released` slipped into the quota fit.)
+fn readings_of(rows: &[MeterRow], spec: &MeterSpec) -> Vec<MeterSample> {
+    let mut out: Vec<MeterSample> = rows
         .iter()
         .filter(|row| row.kind.is_none())
         .filter_map(|row| {
             let limits = row.rate_limits.as_ref()?;
-            Some(Reading {
+            Some(MeterSample {
                 at_ms: row.ts_ms,
                 util: limits.get(spec.util_key)?.as_f64()?,
                 reset_s: limits.get(spec.reset_key)?.as_i64()?,
@@ -308,19 +329,19 @@ fn readings_of(rows: &[RequestRow], spec: &MeterSpec) -> Vec<Reading> {
 ///   where the period began is exactly what is not known — no opening
 ///   instant, and a span resting on it can only give a floor.
 struct Period {
-    rows: Vec<Reading>,
+    rows: Vec<MeterSample>,
     /// When this period provably opened, where that is known; `None`
     /// for a restart, and for a first window of unknown length.
     opens_at_ms: Option<i64>,
 }
 
 /// See [`Period`].
-fn periods(readings: &[Reading], spec: &MeterSpec) -> Vec<Period> {
+fn periods(readings: &[MeterSample], spec: &MeterSpec) -> Vec<Period> {
     // Phase 1 — split at reset changes (ctp `byReset`). The first
     // period's start is known only where the window has a known length
     // (the burn's anchor rule); a later one opened at the previous
     // window's reset instant.
-    let mut by_reset: Vec<(i64, Vec<Reading>)> = Vec::new();
+    let mut by_reset: Vec<(i64, Vec<MeterSample>)> = Vec::new();
     for reading in readings {
         match by_reset.last_mut() {
             Some((reset, rows)) if *reset == reading.reset_s => rows.push(*reading),
@@ -380,12 +401,7 @@ fn periods(readings: &[Reading], spec: &MeterSpec) -> Vec<Period> {
 /// a legitimate zero — the figure is quantised to 1%, so a busy span
 /// may not move it; the caller renders that as `<1%`, distinct from
 /// the explicit idle and no-data states.
-pub(crate) fn meter_used(
-    rows: &[RequestRow],
-    spec: &MeterSpec,
-    since_ms: i64,
-    now_ms: i64,
-) -> Spent {
+pub(crate) fn meter_used(rows: &[MeterRow], spec: &MeterSpec, since_ms: i64, now_ms: i64) -> Spent {
     let readings = readings_of(rows, spec);
     if readings.is_empty() {
         return Spent::NoData;
@@ -461,8 +477,8 @@ mod tests {
     use super::{
         METER_5H, METER_OVERAGE, QuotaAgg, Spent, THRESHOLD, Verdict, aggregate, meter_used,
     };
-    use crate::store::{RequestRow, RowKind};
-    use crate::tui::testrows::{bare, metered};
+    use crate::store::{MeterRow, RowKind};
+    use crate::tui::testrows::{meter_bare, metered};
     use serde_json::{Value, json};
 
     /// A fixed frame time, arbitrary but stable (the cold module's
@@ -479,7 +495,7 @@ mod tests {
     /// default frame tests).
     const WINDOW_SINCE: i64 = NOW - 30 * MIN;
 
-    fn quota(rows: &[RequestRow]) -> Option<QuotaAgg> {
+    fn quota(rows: &[MeterRow]) -> Option<QuotaAgg> {
         aggregate(rows, NOW, TODAY, WINDOW_SINCE)
     }
 
@@ -506,7 +522,10 @@ mod tests {
         // Rows without meter snapshots: no section at all — the panel
         // renders nothing, never zero-filled meters (invariant 3's
         // per-backend panel rule: an openai window has no quota panel).
-        assert_eq!(quota(&[bare(NOW - MIN), bare(NOW - 2 * MIN)]), None);
+        assert_eq!(
+            quota(&[meter_bare(NOW - MIN), meter_bare(NOW - 2 * MIN)]),
+            None
+        );
 
         // A snapshot with no meter fields is a section with no meters:
         // present (the reading exists) but empty, and `spent`/`binding`
@@ -945,6 +964,171 @@ mod tests {
         );
     }
 
+    // ── the narrow read vs the full-row read (the refactor's proof) ───
+
+    #[test]
+    fn the_narrow_read_aggregates_identically_to_the_full_row_read() {
+        use crate::store::Store;
+        use crate::tui::testrows::{as_meter_rows, bare, kind_row, metered_full};
+
+        let store = Store::open(":memory:").expect("scratch store");
+        // A mixed ledger, every rule the aggregation has:
+        // - overage readings across a reset (two accounting periods,
+        //   the second opening inside the today span);
+        // - a released stale copy and a blocked stale copy as proxy
+        //   kinds (the newest reading comes from the blocked one; the
+        //   span totals must exclude both);
+        // - a cold row carrying the gate flag and NO snapshot — the
+        //   production shape from `record_anthropic`, and the newest
+        //   gate flag in the set;
+        // - meter-less rows with and without kinds, which the narrow
+        //   read's filter skips entirely.
+        let overage_old = (NOW - 4 * HOUR) / 1000;
+        let overage_now = (NOW + 30 * DAY) / 1000;
+        let reset_5h = (NOW + 3 * HOUR) / 1000;
+        let rows = vec![
+            {
+                let mut row = metered_full(
+                    NOW - 6 * HOUR,
+                    json!({"utilOverage": 0.20, "resetOverage": overage_old}),
+                );
+                row.gate_on = Some(true);
+                row
+            },
+            {
+                let mut row = metered_full(
+                    NOW - 4 * HOUR + 5 * MIN,
+                    json!({"utilOverage": 0.30, "resetOverage": overage_old}),
+                );
+                row.gate_on = Some(true);
+                row
+            },
+            {
+                let mut row = metered_full(
+                    NOW - 3 * HOUR,
+                    json!({"utilOverage": 0.05, "resetOverage": overage_now}),
+                );
+                row.gate_on = Some(true);
+                row
+            },
+            {
+                let mut row =
+                    metered_full(NOW - 2 * HOUR, json!({"util5h": 0.30, "reset5h": reset_5h}));
+                row.gate_on = Some(true);
+                row
+            },
+            bare(NOW - 40 * MIN), // meter-less, flag-less: filtered out
+            {
+                let mut row = kind_row(NOW - 20 * MIN, RowKind::Error);
+                row.status = Some(500);
+                row // meter-less kind: filtered out
+            },
+            bare(NOW - 15 * MIN), // meter-less, flag-less: filtered out
+            {
+                let mut row =
+                    metered_full(NOW - 10 * MIN, json!({"util5h": 0.42, "reset5h": reset_5h}));
+                row.kind = Some(RowKind::Released);
+                row
+            },
+            {
+                let mut row = bare(NOW - 5 * MIN);
+                row.kind = Some(RowKind::Cold);
+                row.gate_on = Some(false); // the flag-only production shape
+                row
+            },
+            metered_full(
+                NOW - MIN,
+                json!({"utilOverage": 0.15, "resetOverage": overage_now}),
+            ),
+            {
+                let mut row = metered_full(
+                    NOW - MIN / 2,
+                    json!({
+                        "util5h": 0.42, "reset5h": reset_5h,
+                        "utilOverage": 0.99, "resetOverage": overage_now,
+                        "claim": "five_hour",
+                    }),
+                );
+                row.kind = Some(RowKind::Blocked);
+                row
+            },
+        ];
+        store
+            .record_requests(&rows)
+            .expect("seed the scratch ledger");
+
+        // OLD shape: the full-row materialisation the quota refresh
+        // used to pay, projected onto the four fields the aggregation
+        // reads — meter-less rows included, which is the point.
+        let full = store.requests_since(0, 10_000).expect("full-row read");
+        assert_eq!(full.len(), rows.len(), "the fixture is under the cap");
+        let via_old = aggregate(&as_meter_rows(&full), NOW, TODAY, WINDOW_SINCE);
+
+        // NEW path: the narrow read the quota cadence now uses.
+        let narrow = store.meter_rows_since(0, 10_000).expect("narrow read");
+        assert!(
+            narrow
+                .iter()
+                .all(|row| row.rate_limits.is_some() || row.gate_on.is_some())
+        );
+        assert!(
+            narrow.len() < full.len(),
+            "the meter-less flag-less rows are filtered out of the narrow read"
+        );
+        let via_new = aggregate(&narrow, NOW, TODAY, WINDOW_SINCE);
+
+        assert_eq!(
+            via_old, via_new,
+            "the narrow read must aggregate identically to the full-row read"
+        );
+
+        // Spot figures pinning WHICH rules had to survive the switch —
+        // equal-but-wrong would still fail here.
+        let agg = via_new.expect("readings exist");
+        assert!(
+            !agg.gate_on && !agg.gate_assumed,
+            "the gate flag was read off the meter-less cold row — a \
+             rate_limits-only filter would flip it to the assumed default"
+        );
+        let overage = agg
+            .meters
+            .iter()
+            .find(|meter| meter.key == "overage")
+            .expect("the overage meter renders");
+        assert!(
+            (overage.util - 0.99).abs() < 1e-9,
+            "the blocked stale copy is the newest reading"
+        );
+        assert_eq!(agg.binding.as_deref(), Some("five_hour"));
+        // The span totals: the second period opened inside the today
+        // span (anchored at zero, +0.15) on top of the first period's
+        // +0.10 floor; the window span baselines off the reading before
+        // it. Proxy kinds never baseline either total.
+        assert_spent(
+            agg.spent_today.expect("the overage meter renders"),
+            0.25,
+            true,
+        );
+        assert_spent(
+            agg.spent_window.expect("the overage meter renders"),
+            0.10,
+            false,
+        );
+
+        // The absent case is parity too: no snapshots anywhere, both
+        // reads leave the section absent.
+        let store = Store::open(":memory:").expect("scratch store");
+        store.record_request(&bare(NOW - MIN)).expect("record");
+        let full = store.requests_since(0, 10).expect("full read");
+        let narrow = store.meter_rows_since(0, 10).expect("narrow read");
+        assert!(narrow.is_empty(), "a row with neither field is not fetched");
+        assert_eq!(
+            aggregate(&as_meter_rows(&full), NOW, TODAY, WINDOW_SINCE),
+            aggregate(&narrow, NOW, TODAY, WINDOW_SINCE),
+            "absence stays absence on both reads"
+        );
+    }
+
     // ── against the live production ledger ─────────────────────────
 
     #[test]
@@ -962,8 +1146,10 @@ mod tests {
         let store = Store::open(&path).expect("open the production ledger");
 
         let now_ms = jiff::Timestamp::now().as_millisecond();
+        // The narrow meter-lookback read the loop's quota cadence now
+        // uses — same window, same cap, four columns.
         let rows = store
-            .requests_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)
+            .meter_rows_since(now_ms.saturating_sub(OUTLOOK_LOOKBACK_MS), OUTLOOK_ROWS)
             .expect("read the meter lookback");
         let today_start_ms = jiff::Timestamp::from_millisecond(now_ms)
             .ok()
@@ -974,6 +1160,8 @@ mod tests {
                     .map(|day| day.timestamp().as_millisecond())
             })
             .unwrap_or(now_ms);
+        // The display window stays on the full-row read — the display
+        // aggregate consumes its session/model/token columns.
         let window_rows = store
             .requests_since(now_ms.saturating_sub(30 * 60_000), 10_000)
             .expect("read the display window");
@@ -996,7 +1184,7 @@ mod tests {
 
         let quota = snap.quota;
         eprintln!(
-            "{} rows in the lookback, {} in the window; quota section: {quota:#?}",
+            "{} meter rows in the lookback, {} in the window; quota section: {quota:#?}",
             rows.len(),
             window_rows.len(),
         );
@@ -1026,5 +1214,189 @@ mod tests {
                 meter.util
             );
         }
+    }
+
+    // ── the read's cost, measured ─────────────────────────────────────
+
+    #[test]
+    #[ignore = "a timing probe, not a correctness gate: seeds a scratch \
+                ledger at production scale (~25 000 rows, the shape the \
+                ctp import left) and times 100 refreshes of both meter-\
+                lookback paths in the debug build; run deliberately with \
+                --ignored"]
+    fn meter_lookback_timing_narrow_read_vs_full_row_read() {
+        use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
+        use crate::store::{RequestRow, Store};
+        use crate::tui::testrows::{as_meter_rows, billed, kind_row, metered_full};
+        use std::time::{Duration, Instant};
+
+        const ITERATIONS: u32 = 100;
+        const SEED: i64 = 25_000;
+        const STEP_MS: i64 = OUTLOOK_LOOKBACK_MS / SEED; // one row ~24 s apart
+        const HOUR_MS: i64 = 60 * 60_000;
+        const DAY_MS: i64 = 24 * HOUR_MS;
+
+        // A scratch ledger under /tmp/opencode — a file DB, WAL on disk,
+        // the shape the loop actually reads. Never the live one.
+        let dir = std::path::PathBuf::from("/tmp/opencode")
+            .join(format!("toker-meter-bench-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(dir.join("bench.db")).expect("open the scratch ledger");
+
+        // Production shape: 20 000 anthropic measurement rows carrying
+        // full meter snapshots — a 1%-quantised 5-hour sawtooth that
+        // rolls every 5 h, a creeping 7-day meter, a monthly overage —
+        // as FULL rows (session, model, tokens, cost: the columns the
+        // old read materialised), every fourth gate flag set; plus
+        // meter-less flag-less rows the narrow read filters out
+        // (openai-route measurements and error rows carry neither).
+        let now_ms = 2_000_000_000_000;
+        let since_ms = now_ms - OUTLOOK_LOOKBACK_MS;
+        let reset_7d = (now_ms + 5 * DAY_MS) / 1000;
+        let reset_overage = (now_ms + 30 * DAY_MS) / 1000;
+        let mut batch: Vec<RequestRow> = Vec::new();
+        for i in 0..SEED {
+            let ts_ms = since_ms + i * STEP_MS;
+            let row = if i % 5 == 4 {
+                if i % 25 == 24 {
+                    let mut row = kind_row(ts_ms, RowKind::Error);
+                    row.status = Some(500);
+                    row.error_type = Some("upstream".to_owned());
+                    row
+                } else {
+                    billed(
+                        ts_ms,
+                        Some("ses-openai"),
+                        "openai/gpt-5.2",
+                        "openrouter",
+                        900,
+                        4_000,
+                        250,
+                        0.004,
+                    )
+                }
+            } else {
+                // ~741 rows fit in one 5-hour window at this spacing.
+                let in_window = i % 741;
+                let window_start = since_ms + (i / 741) * 5 * HOUR_MS;
+                let q = |util: f64| (util * 100.0).round() / 100.0;
+                let mut row = metered_full(
+                    ts_ms,
+                    json!({
+                        "util5h": q(in_window as f64 / 741.0 * 0.95),
+                        "reset5h": (window_start + 5 * HOUR_MS) / 1000,
+                        "util7d": q(0.10 + i as f64 / SEED as f64 * 0.60),
+                        "reset7d": reset_7d,
+                        "utilOverage": q(0.55 + i as f64 / SEED as f64 * 0.10),
+                        "resetOverage": reset_overage,
+                        "status5h": "allowed", "status7d": "allowed",
+                        "claim": "five_hour", "overageInUse": false,
+                    }),
+                );
+                row.session_id = Some("ses-bench".to_owned());
+                row.model = Some("claude-opus-5".to_owned());
+                row.provider = Some("anthropic_sub".to_owned());
+                row.input = Some(120_000);
+                row.cache_read = Some(80_000);
+                row.output = Some(2_000);
+                row.cost_usd = Some(1.5);
+                row.cost_kind = Some(crate::store::CostKind::PlanEquivalent);
+                row.gate_on = Some(true);
+                row
+            };
+            batch.push(row);
+            if batch.len() == 2_500 {
+                store.record_requests(&batch).expect("seed a batch");
+                batch.clear();
+            }
+        }
+        store.record_requests(&batch).expect("seed the tail batch");
+        let total = store.count_requests().expect("count");
+        assert_eq!(total, SEED, "the seed is complete");
+
+        let today = now_ms - 12 * HOUR_MS;
+        let window_since = now_ms - 30 * 60_000;
+
+        // Warm both paths once — page cache and statement cache — so
+        // the timed iterations measure the steady state.
+        std::hint::black_box(
+            store
+                .requests_since(since_ms, OUTLOOK_ROWS)
+                .expect("warm old"),
+        );
+        std::hint::black_box(
+            store
+                .meter_rows_since(since_ms, OUTLOOK_ROWS)
+                .expect("warm new"),
+        );
+
+        // OLD: the full-row materialisation the quota refresh used to
+        // pay — 59 columns, six JSON parses per row — plus the
+        // aggregation over its projection. The projection is test
+        // scaffolding the real path never ran (it read the fields off
+        // the full rows directly), so this total is an UPPER bound on
+        // the old refresh.
+        let mut old_read = Duration::ZERO;
+        let mut old_refresh = Duration::ZERO;
+        for _ in 0..ITERATIONS {
+            let t = Instant::now();
+            let full = store
+                .requests_since(since_ms, OUTLOOK_ROWS)
+                .expect("full read");
+            old_read += t.elapsed();
+            let t = Instant::now();
+            let agg = aggregate(&as_meter_rows(&full), now_ms, today, window_since);
+            old_refresh += t.elapsed();
+            std::hint::black_box(&agg);
+        }
+
+        // NEW: the narrow read the quota cadence now pays — four
+        // columns, one JSON parse per row — plus the same aggregation.
+        let mut new_read = Duration::ZERO;
+        let mut new_refresh = Duration::ZERO;
+        for _ in 0..ITERATIONS {
+            let t = Instant::now();
+            let narrow = store
+                .meter_rows_since(since_ms, OUTLOOK_ROWS)
+                .expect("narrow read");
+            new_read += t.elapsed();
+            let t = Instant::now();
+            let agg = aggregate(&narrow, now_ms, today, window_since);
+            new_refresh += t.elapsed();
+            std::hint::black_box(&agg);
+        }
+        assert!(
+            aggregate(
+                &store
+                    .meter_rows_since(since_ms, OUTLOOK_ROWS)
+                    .expect("narrow read"),
+                now_ms,
+                today,
+                window_since
+            )
+            .is_some(),
+            "the seeded lookback must carry meter snapshots"
+        );
+
+        let ms = |total: Duration| total.as_secs_f64() * 1000.0 / ITERATIONS as f64;
+        eprintln!(
+            "meter lookback over {SEED} rows, {ITERATIONS} iterations, debug build:\n  \
+             old read (requests_since)                 {:8.3} ms/refresh\n  \
+             old read + aggregation (upper bound)      {:8.3} ms/refresh\n  \
+             new read (meter_rows_since)               {:8.3} ms/refresh\n  \
+             new read + aggregation (the refresh)      {:8.3} ms/refresh",
+            ms(old_read),
+            ms(old_read + old_refresh),
+            ms(new_read),
+            ms(new_read + new_refresh),
+        );
+        assert!(
+            new_read + new_refresh < old_read + old_refresh,
+            "the narrow refresh must beat the full-row refresh: \
+             {:.3} vs {:.3} ms",
+            ms(new_read + new_refresh),
+            ms(old_read + old_refresh),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
