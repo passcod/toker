@@ -826,13 +826,14 @@ mod tests {
                 cache_write_5m: Some(3_000),
                 cache_write_1h: Some(2_000),
                 output: Some(678),
+                reasoning: Some(90),
                 cost_usd: Some(0.00213),
                 cost_kind: Some(CostKind::Billed),
                 req_messages: Some(42),
                 compact_generations: Some(1),
                 forced_to: Some("z-ai/glm-5.3".to_string()),
             },
-            "the fifteen display columns round-trip; the rest never cross"
+            "the sixteen display columns round-trip; the rest never cross"
         );
 
         // A bare row's absence stays absence on every one of the ten.
@@ -851,6 +852,7 @@ mod tests {
                 cache_write_5m: None,
                 cache_write_1h: None,
                 output: None,
+                reasoning: None,
                 cost_usd: None,
                 cost_kind: None,
                 req_messages: None,

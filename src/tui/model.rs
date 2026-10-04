@@ -235,6 +235,9 @@ pub(crate) struct TokensAgg {
     /// Output tokens (no shared denominator with the input buckets —
     /// a bar against them would be meaningless).
     pub output: BucketAgg,
+    /// Reasoning/thinking tokens — the panel's reasoning row (an
+    /// output-side bucket like output: no input-denominator bar).
+    pub reasoning: BucketAgg,
     /// The window's measurement rows — the averages' denominator.
     pub requests: usize,
     /// Rows missing any cache metric (read, either write tier):
@@ -396,6 +399,7 @@ pub(crate) fn aggregate(
         tokens.write_1h.add(row.cache_write_1h);
         tokens.write_5m.add(row.cache_write_5m);
         tokens.output.add(row.output);
+        tokens.reasoning.add(row.reasoning);
         if row.cache_read.is_none() || row.cache_write_1h.is_none() || row.cache_write_5m.is_none()
         {
             tokens.cache_unknown += 1;
@@ -1915,6 +1919,22 @@ mod tests {
         cold.cache_write_1h = Some(0);
         cold.cache_write_5m = Some(0);
         let snap = agg(&[cold], 1);
+        assert_eq!(snap.tokens.cold, 1);
+        assert_eq!(snap.tokens.hit_rate(), HitRate::NothingReusable);
+
+        // All-zero and all-reported: zeros, not absence — the total
+        // is a real zero, no bucket is missing, and nothing
+        // reusable means NO rate (the view's `max(total, 1)` guard),
+        // never a zero rate claimed over nothing.
+        let mut zeroed = display_bare(mins_ago(1));
+        zeroed.session_id = Some("ses-d".into());
+        zeroed.input = Some(0);
+        zeroed.cache_read = Some(0);
+        zeroed.cache_write_1h = Some(0);
+        zeroed.cache_write_5m = Some(0);
+        let snap = agg(&[zeroed], 1);
+        assert_eq!(snap.tokens.input_total(), 0);
+        assert!(!snap.tokens.input_incomplete());
         assert_eq!(snap.tokens.cold, 1);
         assert_eq!(snap.tokens.hit_rate(), HitRate::NothingReusable);
     }

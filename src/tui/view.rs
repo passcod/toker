@@ -83,6 +83,27 @@ const REBUILD_DETAIL_LINES: usize = 3;
 const TOKENS_LABEL_W: usize = 15;
 const TOKENS_AMOUNT_W: usize = 13;
 
+/// The least width a tokens bar renders at — live.mjs:461's and 499's
+/// shared `Math.max(6, …)` floor.
+const TOKENS_BAR_MIN_W: usize = 6;
+
+/// The share percentage's rendered width: `" NNN%"` (live.mjs:462).
+const TOKENS_PCT_W: usize = 5;
+
+/// The least inner width a bucket row's bar and percentage render in:
+/// indent, label, amount, gap, the least bar, and the percentage.
+/// Below this the pair sheds whole — the counts are the information,
+/// the bar is the shape, and a bar clipped mid-glyph is neither
+/// (live.mjs lets the final `clamp` cut the line; the panel here
+/// drops the column pair cleanly instead, the quota meter's rule).
+const TOKENS_SHARE_MIN_W: usize =
+    2 + TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W + TOKENS_PCT_W;
+
+/// The least inner width the hit-rate bar renders in: indent, label,
+/// amount, gap, bar. The rate itself rides in the amount column, so
+/// the number survives the shed and only the shape goes.
+const TOKENS_RATE_BAR_MIN_W: usize = 2 + TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W;
+
 /// The sessions table's columns, left to right, with their base widths.
 /// When the terminal is too narrow the *rightmost* columns shed first
 /// (see [`session_plan`]) — columns never wrap and never squeeze.
@@ -207,13 +228,20 @@ fn context_height(snap: &Snapshot) -> u16 {
 }
 
 /// The TOKENS panel's natural height: the four input buckets, output,
-/// and the hit-rate lines the data supports (live.mjs renders no
-/// hit-rate line at all when nothing was reused).
+/// the reasoning row when a provider reported thinking tokens (it is
+/// rendered only then), and the hit-rate lines the data supports
+/// (live.mjs renders no hit-rate line at all when nothing was reused).
 fn tokens_height(snap: &Snapshot) -> u16 {
     if snap.window_empty {
         return 2 + 1;
     }
     let mut lines = 4 + 1; // input buckets + output
+    if snap.tokens.reasoning.value > 0
+        || (snap.tokens.reasoning.unavailable > 0
+            && snap.tokens.reasoning.unavailable < snap.tokens.requests)
+    {
+        lines += 1;
+    }
     if !matches!(
         snap.tokens.hit_rate(),
         super::model::HitRate::NothingReusable
@@ -668,6 +696,9 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let mut lines = Vec::new();
     let incomplete = tokens.input_incomplete();
     let total = tokens.input_total().max(1);
+    // The bar/percentage pair is the row's shape; shape sheds before
+    // information, and the fixed-width counts always fit.
+    let show_shares = width >= TOKENS_SHARE_MIN_W;
     let label = |text: &str| format!("  {text:<TOKENS_LABEL_W$}");
     let amount = |bucket: &super::model::BucketAgg| {
         format!(
@@ -702,14 +733,21 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             continue;
         }
         let frac = bucket.value as f64 / total as f64;
-        let bar = fill_bar(frac, width.saturating_sub(48).max(6), "▬", " ");
-        lines.push(Line::from(vec![
-            Span::raw(label(name)),
-            Span::raw(amount(bucket)),
-            Span::raw("  "),
-            Span::styled(bar, Style::new().dim()),
-            Span::raw(format!(" {:>3}%", (frac * 100.0).round() as i64)),
-        ]));
+        let mut row = vec![Span::raw(label(name)), Span::raw(amount(bucket))];
+        if show_shares {
+            row.push(Span::raw("  "));
+            row.push(Span::styled(
+                fill_bar(
+                    frac,
+                    width.saturating_sub(48).max(TOKENS_BAR_MIN_W),
+                    "▬",
+                    " ",
+                ),
+                Style::new().dim(),
+            ));
+            row.push(Span::raw(format!(" {:>3}%", (frac * 100.0).round() as i64)));
+        }
+        lines.push(Line::from(row));
     }
 
     // Output: no shared denominator with the input buckets, so no bar
@@ -732,6 +770,33 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         Span::raw("  "),
         Span::styled(output_note, Style::new().dim()),
     ]));
+
+    // Reasoning: rendered only when a provider reported thinking
+    // tokens (live.mjs:471-475) — an output-side bucket, so the note
+    // carries the per-request average like the output row's. A window
+    // where EVERY row lacks reasoning has nothing to say: live.mjs
+    // renders nothing, and so does this (absence across the board is
+    // the provider's silence, not unknown data).
+    let reasoning_partial =
+        tokens.reasoning.unavailable > 0 && tokens.reasoning.unavailable < tokens.requests;
+    if tokens.reasoning.value > 0 || reasoning_partial {
+        let reasoning_note = if tokens.reasoning.unavailable > 0 {
+            format!("{} req unknown", tokens.reasoning.unavailable)
+        } else if tokens.requests > 0 {
+            format!(
+                "{}/req",
+                (tokens.reasoning.value as f64 / tokens.requests as f64).round() as i64
+            )
+        } else {
+            "0/req".to_owned()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(label("reasoning")),
+            Span::raw(amount(&tokens.reasoning)),
+            Span::raw("  "),
+            Span::styled(reasoning_note, Style::new().dim()),
+        ]));
+    }
 
     // Hit rate over the reusable prefix, and the missed line beside it.
     match tokens.hit_rate() {
@@ -768,17 +833,29 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             } else {
                 ""
             };
-            let bar_width = width.saturating_sub(34 + note.len()).max(6);
-            lines.push(Line::from(vec![
+            let mut row = vec![
                 Span::raw(label("hit rate")),
                 Span::raw(format!(
                     "{:>TOKENS_AMOUNT_W$}",
                     format!("{:.1}%", hit * 100.0)
                 )),
-                Span::raw("  "),
-                Span::styled(bar(hit, bar_width as u16), style),
-                Span::styled(note.to_owned(), Style::new().dim()),
-            ]));
+            ];
+            // The bar sheds below its least width; the rate rides in
+            // the amount column and survives. The note annotates the
+            // bar, so it sheds with it — and only ever renders at
+            // widths where the bar does.
+            if width >= TOKENS_RATE_BAR_MIN_W {
+                row.push(Span::raw("  "));
+                row.push(Span::styled(
+                    bar(
+                        hit,
+                        width.saturating_sub(34 + note.len()).max(TOKENS_BAR_MIN_W) as u16,
+                    ),
+                    style,
+                ));
+                row.push(Span::styled(note.to_owned(), Style::new().dim()));
+            }
+            lines.push(Line::from(row));
             let per_req = if tokens.requests > 0 {
                 (tokens.written() as f64 / tokens.requests as f64).round() as i64
             } else {
@@ -2174,6 +2251,25 @@ mod tests {
             text.contains("≥0  3 req unknown"),
             "the write tiers are floors:\n{text}"
         );
+        // The two absent shapes pinned, at inner width 118: the
+        // complete bucket beside incomplete ones keeps its plain
+        // sum and says the share cannot be known; the missing bucket
+        // renders its floor and its count. Neither borrows the
+        // zero-share row's bar — there is nothing to draw one of.
+        assert!(
+            text.contains(&format!(
+                "  fresh input{}3,000  share unknown",
+                " ".repeat(12)
+            )),
+            "the complete-bucket row:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  cache write 1h{}≥0  3 req unknown",
+                " ".repeat(12)
+            )),
+            "the absent bucket's row:\n{text}"
+        );
         assert!(
             text.contains("cache metrics unavailable for 3 req"),
             "the unknown-rate line:\n{text}"
@@ -2215,6 +2311,244 @@ mod tests {
         assert!(
             text.contains("▬"),
             "the share bars are ▬, not the occupancy █:\n{text}"
+        );
+    }
+
+    /// The TOKENS panel's pinning fixture: one complete anthropic row
+    /// — 1,000 fresh, 9,000 read, 1,000 written 1h, nothing written
+    /// 5m — so the shares are 9% / 82% / 9% / 0% of the 11,000-token
+    /// input side (output excluded: it shares no denominator with the
+    /// buckets), the 5m row is the zero-share case (a real zero with
+    /// a bar, not the absent state with its reason), and the hit
+    /// rate is 9,000 / 10,000 = 90.0% over the reusable prefix. One
+    /// request, no rebuild section, no three-request session: no
+    /// other panel renders a bar glyph, so the width assertions see
+    /// this panel alone.
+    fn tokens_snapshot() -> model::Snapshot {
+        let mut row = display_bare(NOW - 30_000);
+        row.session_id = Some("ses-tokens".into());
+        row.model = Some("claude-opus-5".into());
+        row.provider = Some("anthropic_sub".into());
+        row.input = Some(1_000);
+        row.cache_read = Some(9_000);
+        row.cache_write_1h = Some(1_000);
+        row.cache_write_5m = Some(0);
+        row.output = Some(100);
+        model::aggregate(
+            &[row],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            1,
+        )
+    }
+
+    #[test]
+    fn tokens_panel_pins_bar_widths_and_percentages_at_a_wide_terminal() {
+        // Inner width 118 → the share bar is 70 wide (live.mjs:461's
+        // WIDTH − 48) and the row keeps its 11 of slack. The space
+        // counts below are the pins: label padEnd(15) + amount
+        // padStart(13), the fill `round(share × 70)`, the empty the
+        // rest, the percentage `round(share × 100)` in " NNN%".
+        let text = rendered(&tokens_snapshot(), 120, 30);
+        // fresh input: 1/11 → round(6.36) = 6 filled of 70.
+        assert!(
+            text.contains(&format!(
+                "  fresh input{}1,000  {}{}   9%",
+                " ".repeat(12),
+                "▬".repeat(6),
+                " ".repeat(64)
+            )),
+            "the fresh-input row:\n{text}"
+        );
+        // cache read: 9/11 → round(57.27) = 57 filled of 70.
+        assert!(
+            text.contains(&format!(
+                "  cache read{}9,000  {}{}  82%",
+                " ".repeat(13),
+                "▬".repeat(57),
+                " ".repeat(13)
+            )),
+            "the cache-read row:\n{text}"
+        );
+        // cache write 1h: 1/11 again.
+        assert!(
+            text.contains(&format!(
+                "  cache write 1h{}1,000  {}{}   9%",
+                " ".repeat(9),
+                "▬".repeat(6),
+                " ".repeat(64)
+            )),
+            "the 1h-write row:\n{text}"
+        );
+        // The zero-share row: a full-width BLANK bar and a real 0% —
+        // never the absent state's reason.
+        assert!(
+            text.contains(&format!(
+                "  cache write 5m{}0  {}   0%",
+                " ".repeat(13),
+                " ".repeat(70)
+            )),
+            "the zero-share row:\n{text}"
+        );
+        // Output: no denominator shared with the input buckets, so
+        // no bar — the total plus the per-request average.
+        assert!(
+            text.contains(&format!("  output{}100  100/req", " ".repeat(19))),
+            "the output row:\n{text}"
+        );
+        // Hit rate: 90.0% in the amount column, then the bar — inner
+        // 118 → 65 wide, round(0.9 × 65) = 59 filled — and the note.
+        assert!(
+            text.contains(&format!(
+                "  hit rate{}90.0%  {}░░░░░░ of reusable prefix",
+                " ".repeat(15),
+                "█".repeat(59)
+            )),
+            "the hit-rate row:\n{text}"
+        );
+        // The missed line: rewrites, per request, and the cold count.
+        assert!(
+            text.contains(&format!(
+                "  missed{}1,000  rewritten · 1,000/req · 0 of 1 req reused nothing",
+                " ".repeat(17)
+            )),
+            "the missed row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tokens_panel_pins_bar_widths_at_a_narrower_terminal() {
+        // Inner width 78 → the share bar 30 wide, the hit-rate bar 25
+        // (max(6, 78 − 34 − 19)) — the same shape, rescaled.
+        let text = rendered(&tokens_snapshot(), 80, 30);
+        assert!(
+            text.contains(&format!(
+                "  fresh input{}1,000  {}{}   9%",
+                " ".repeat(12),
+                "▬".repeat(3),
+                " ".repeat(27)
+            )),
+            "the fresh-input row:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  cache read{}9,000  {}{}  82%",
+                " ".repeat(13),
+                "▬".repeat(25),
+                " ".repeat(5)
+            )),
+            "the cache-read row:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  cache write 5m{}0  {}   0%",
+                " ".repeat(13),
+                " ".repeat(30)
+            )),
+            "the zero-share row:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  hit rate{}90.0%  {}░░ of reusable prefix",
+                " ".repeat(15),
+                "█".repeat(23)
+            )),
+            "the hit-rate row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tokens_panel_sheds_the_bar_columns_before_the_counts() {
+        let snap = tokens_snapshot();
+        // Inner 40: the counts fit (32 columns), the least
+        // bar-plus-percentage pair does not (43) — the pair sheds
+        // whole, no stub bar, no clipped percentage. The hit-rate
+        // bar needs only 38, so it stays.
+        let text = rendered(&snap, 42, 30);
+        let fresh = text
+            .lines()
+            .find(|line| line.contains("fresh input"))
+            .expect("the fresh-input row");
+        // Strip the panel's right border, then the padding: what is
+        // left is the row itself, and it must be the counts alone.
+        let row = fresh.trim_end_matches('│').trim_end();
+        assert_eq!(
+            row, "│  fresh input            1,000",
+            "the counts survive the shed, and only the counts"
+        );
+        assert!(
+            !text.contains('▬'),
+            "the bucket bars are gone entirely, not clipped:\n{text}"
+        );
+        assert!(
+            text.contains("90.0%  █████░"),
+            "the hit-rate bar fits at 38 and stays:\n{text}"
+        );
+
+        // Inner 34: even the hit-rate bar sheds; the rate itself
+        // rides in the amount column and survives.
+        let text = rendered(&snap, 36, 30);
+        let hit = text
+            .lines()
+            .find(|line| line.contains("hit rate"))
+            .expect("the hit-rate row");
+        assert_eq!(
+            hit.trim_end_matches('│').trim_end(),
+            "│  hit rate               90.0%",
+            "the rate survives its bar"
+        );
+    }
+
+    #[test]
+    fn tokens_panel_renders_zero_traffic_as_zero_shares_not_absence() {
+        // Every bucket reported, every bucket zero: real zeros, so
+        // the shares render — blank bars, 0% — and nothing says
+        // "unknown". The absent state (a NULL metric) renders its
+        // reasons instead; the two must never converge.
+        let mut row = display_bare(NOW - 30_000);
+        row.session_id = Some("ses-zero".into());
+        row.model = Some("claude-opus-5".into());
+        row.provider = Some("anthropic_sub".into());
+        row.input = Some(0);
+        row.cache_read = Some(0);
+        row.cache_write_1h = Some(0);
+        row.cache_write_5m = Some(0);
+        row.output = Some(0);
+        let snap = model::aggregate(
+            &[row],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            None,
+            30,
+            NOW,
+            1,
+        );
+        let text = rendered(&snap, 120, 30);
+        // The max(total, 1) denominator (live.mjs:460) makes each
+        // share 0/1 — a 0% with a blank bar, not a crash and not a
+        // reason.
+        assert!(
+            text.contains(&format!(
+                "  fresh input{}0  {}   0%",
+                " ".repeat(16),
+                " ".repeat(70)
+            )),
+            "a reported zero renders a real 0%:\n{text}"
+        );
+        assert!(
+            !text.contains("unknown"),
+            "nothing is unknown — everything was reported:\n{text}"
+        );
+        // Nothing was read or rewritten: live.mjs renders no
+        // hit-rate line at all.
+        assert!(
+            !text.contains("hit rate"),
+            "no rate over an empty prefix:\n{text}"
         );
     }
 

@@ -541,6 +541,10 @@ pub struct DisplayRow {
     pub cache_write_1h: Option<i64>,
     /// Output token bucket.
     pub output: Option<i64>,
+    /// Reasoning token bucket — the tokens panel's reasoning row (an
+    /// INTEGER; live.mjs:471-475 renders it when the provider reports
+    /// thinking tokens).
+    pub reasoning: Option<i64>,
     /// Cost in USD, in the kind below.
     pub cost_usd: Option<f64>,
     /// Which of the three cost semantics produced `cost_usd`.
@@ -581,6 +585,7 @@ pub(super) fn display_rows_since(
         "SELECT * FROM (
             SELECT id, ts_ms, kind, session_id, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
+                   reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to
             FROM requests
             WHERE ts_ms >= ?1
@@ -613,6 +618,7 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
         cache_write_5m: row.get("cache_write_5m")?,
         cache_write_1h: row.get("cache_write_1h")?,
         output: row.get("output")?,
+        reasoning: row.get("reasoning")?,
         cost_usd: row.get("cost_usd")?,
         cost_kind: parse_stored(
             "cost_kind",
