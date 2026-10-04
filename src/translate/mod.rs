@@ -1,9 +1,14 @@
-//! Cross-protocol translation, layered: **frontend adapters** parse
-//! a frontend wire body into the canonical IR
-//! ([`crate::ir::canonical`]); **backend adapters** render the
-//! canonical onto a backend's wire. A pair is the composition of
-//! the two — adding a frontend or a backend is one adapter, not a
-//! new pair. Same-protocol routes never come through here at all:
+//! Cross-protocol translation, layered, in BOTH directions:
+//! **frontend adapters** speak a frontend's wire and the canonical
+//! IR; **backend adapters** speak a backend's wire and the canonical
+//! IR. Request side, the frontend adapter parses the wire body INTO
+//! the canonical ([`crate::ir::canonical`]) and the backend adapter
+//! renders the canonical OUT onto its wire; response side, the
+//! backend adapter interprets its wire's turn INTO the canonical
+//! and the frontend adapter renders the canonical OUT onto its
+//! wire. A pair is the composition of the two adapters — adding a
+//! frontend or a backend is one adapter, not a new pair, in either
+//! direction. Same-protocol routes never come through here at all:
 //! they keep the [`Value`-wrapped protocol IR](crate::ir) and its
 //! byte-exact passthrough; translation is the cross-protocol
 //! machinery only.
@@ -22,15 +27,18 @@
 //!
 //! ## The request direction (composed today: anthropic → codex)
 //!
-//! - [`from_anthropic`]: the frontend adapter — one Anthropic
-//!   Messages body → one [`CanonicalRequest`]. Wire-shape problems
-//!   are ITS domain ([`TranslateError::Malformed`] for shape
+//! - [`from_anthropic`](crate::translate::anthropic_frontend): the
+//!   frontend adapter — one Anthropic Messages body → one
+//!   [`CanonicalRequest`](crate::ir::canonical::CanonicalRequest).
+//!   Wire-shape problems are ITS domain
+//!   ([`TranslateError::Malformed`] for shape
 //!   violations, [`TranslateError::UnsupportedBlock`] for a block
 //!   with no faithful parse) — and nothing backend-shaped happens
 //!   there: system-role messages stay messages, thinking blocks stay
 //!   blocks, sampling rides as specs.
 //! - [`codex_backend::codex_from_canonical`]: the backend adapter —
-//!   one [`CanonicalRequest`] → one
+//!   one [`CanonicalRequest`](crate::ir::canonical::CanonicalRequest)
+//!   → one
 //!   [`ResponsesRequest`](crate::providers::codex::ResponsesRequest).
 //!   What this backend refuses is its declared property
 //!   ([`Capabilities`](crate::ir::canonical::Capabilities)); its
@@ -76,7 +84,7 @@
 //! ### Dropped, loudly — per-BACKEND costs, not toker policy
 //!
 //! What a backend refuses is its declared property
-//! ([`Capabilities`]), enforced in its adapter and documented there
+//! ([`Capabilities`](crate::ir::canonical::Capabilities)), enforced in its adapter and documented there
 //! (the codex backend's cost table lives in [`codex_backend`]). The
 //! canonical IR carries the intent — thinking blocks, sampling
 //! specs, system-role messages — so a backend that supports a thing
@@ -114,17 +122,38 @@
 //!   ([`crate::ir::AnthropicBodyMut::strip_release`]), which runs
 //!   before translation in the pipeline.
 //!
-//! ## The response direction (Responses → Anthropic SSE)
+//! ## The response direction (composed today: codex → anthropic)
 //!
-//! [`to_anthropic`] is this direction today: a responses-dialect
-//! turn → Anthropic SSE — [`AnthropicStream`] fed
-//! [`ResponseEvent`](crate::providers::codex::ResponseEvent)s — or
-//! the complete non-streaming message JSON,
-//! [`message_from_capture`] over unit A's
-//! [`TurnCapture`](crate::providers::codex::TurnCapture). It splits
-//! the same way in its upcoming unit — codex→canonical (a codex
-//! frontend adapter) + canonical→anthropic (an anthropic backend
-//! adapter).
+//! The mirrored layering — the backend adapter interprets, the
+//! frontend adapter renders:
+//!
+//! - [`codex_backend::CanonStream`]: the backend adapter's
+//!   interpretation half — the codex wire's
+//!   [`ResponseEvent`](crate::providers::codex::ResponseEvent)s →
+//!   the canonical turn model
+//!   ([`CanonEvent`](crate::ir::canonical::CanonEvent) — the
+//!   interpretation table lives in its module docs), plus unit A's
+//!   [`TurnCapture`](crate::providers::codex::TurnCapture) → the
+//!   canonical final turn
+//!   ([`CanonTurn`](crate::ir::canonical::CanonTurn)) for the
+//!   non-streaming path, and the error table's interpretation half
+//!   (the upstream's `code`/`kind` → the canonical error).
+//! - [`anthropic_frontend`]: the frontend adapter's rendering half —
+//!   canonical turn events → Anthropic SSE (the
+//!   [`AnthropicRenderer`](crate::translate::anthropic_frontend::AnthropicRenderer)
+//!   block-index state machine), the canonical final turn → the
+//!   complete non-streaming Message JSON, and the error table's
+//!   rendering half (the canonical error kind → anthropic's
+//!   `error.type`).
+//! - [`to_anthropic`]: the composition of the two — the public entry
+//!   the server calls (unit C):
+//!   [`AnthropicStream`] fed
+//!   [`ResponseEvent`](crate::providers::codex::ResponseEvent)s,
+//!   [`message_from_capture`] over the capture, and the composed
+//!   error mapping.
+//!
+//! The tables below describe the COMPOSED pair — what a codex turn
+//! renders as on the anthropic wire.
 //!
 //! | Responses event | Anthropic events |
 //! |---|---|
@@ -137,21 +166,26 @@
 //! | `response.failed` / `error` | `error` event; no `message_stop` (anthropic error streams end at the error, mid-block, exactly like toker's own captured fixture 06) |
 //! | `output_item.added`, unknown kinds | nothing (never dropped bytes — they simply have no anthropic shape) |
 //!
-//! Stop reasons: any completed `function_call` → `tool_use`; otherwise
-//! `end_turn`. Incomplete: `max_output_tokens` → `max_tokens`,
-//! `content_filter` → `refusal`, anything else → `max_tokens` (an
-//! incomplete turn stopped at its budget — the only budget-shaped
-//! anthropic stop reason). No `ping` events — claude tolerates their
-//! absence and nothing upstream produces them.
+//! Stop reasons, through the composition: any completed
+//! `function_call` → `tool_use`; otherwise `end_turn`. Incomplete:
+//! `max_output_tokens` → `max_tokens`, `content_filter` → `refusal`,
+//! anything else → `max_tokens` (an incomplete turn stopped at its
+//! budget — the only budget-shaped anthropic stop reason). No `ping`
+//! events — claude tolerates their absence and nothing upstream
+//! produces them.
 //!
 //! ### Usage table
 //!
-//! | Responses | Anthropic |
-//! |---|---|
-//! | `input_tokens` | `input_tokens` |
-//! | `input_tokens_details.cached_tokens` | `cache_read_input_tokens` |
-//! | `input_tokens_details.cache_write_tokens` | `cache_creation_input_tokens` |
-//! | `output_tokens` | `output_tokens` |
+//! The canonical buckets (the backend fills them; `raw` rides the
+//! backend's own usage object verbatim for whoever wants the wire's
+//! shape) → the anthropic field names:
+//!
+//! | Responses | canonical bucket | Anthropic |
+//! |---|---|---|
+//! | `input_tokens` | `input` | `input_tokens` |
+//! | `input_tokens_details.cached_tokens` | `cache_read` | `cache_read_input_tokens` |
+//! | `input_tokens_details.cache_write_tokens` | `cache_write` | `cache_creation_input_tokens` |
+//! | `output_tokens` | `output` | `output_tokens` |
 //!
 //! Absent stays absent (invariant 3): a detail the upstream did not
 //! carry is omitted, never zeroed. **Translation note on reasoning
@@ -163,7 +197,12 @@
 //!
 //! ## The error table (Responses errors → Anthropic error events)
 //!
-//! Best-effort, first match wins:
+//! Best-effort, first match wins. The table is split with the layers:
+//! the interpretation half (upstream `code`/`kind` → the canonical
+//! [`CanonErrorKind`](crate::ir::canonical::CanonErrorKind), plus the
+//! message's stand-in chain resolved on the backend's own fields)
+//! lives in [`codex_backend`]; the rendering half (canonical kind →
+//! anthropic's `error.type`) lives in [`anthropic_frontend`].
 //!
 //! | upstream (`code`, then `kind`) | anthropic `error.type` |
 //! |---|---|
@@ -176,15 +215,16 @@
 //! The error `message` passes through verbatim; when the upstream sent
 //! none, the `code` then the `kind` stands in, else the constant
 //! `"upstream error"` (the anthropic shape requires a message — the
-//! placeholder says nothing the upstream did not).
+//! placeholder says nothing the upstream did not; the chain resolves
+//! backend-side, where the wire's own fields live).
 
+pub mod anthropic_frontend;
 pub mod codex_backend;
-pub mod from_anthropic;
 pub mod to_anthropic;
 pub mod to_codex;
 
+pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::codex_from_canonical;
-pub use from_anthropic::from_anthropic;
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::to_codex;
 

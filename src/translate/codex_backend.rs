@@ -1,5 +1,7 @@
-//! The backend adapter: one [`CanonicalRequest`] → one codex
-//! [`ResponsesRequest`] (unit A's wire types).
+//! The backend adapter, both directions: one [`CanonicalRequest`] →
+//! one codex [`ResponsesRequest`] (the request render), and the
+//! codex wire's turn → the canonical turn model (the response
+//! interpretation — unit A's wire types both ways).
 //!
 //! Everything this module drops or reshapes is a fact about the
 //! **codex backend** — verified against it, not assumed — declared
@@ -27,13 +29,59 @@
 //! its only [`TranslateError`] is a tool-choice intent this wire
 //! cannot express (reported with the pair module's exact reason,
 //! byte-identical, because the string rides the client error body).
+//!
+//! # The response direction (interpretation)
+//!
+//! [`CanonStream`] folds the turn's [`ResponseEvent`]s into
+//! [`CanonEvent`]s — the backend's own event dialect read INTO the
+//! canonical turn model — and
+//! [`canonical_turn_from_capture`] folds unit A's whole-turn
+//! [`TurnCapture`] into the canonical final ([`CanonTurn`]) for the
+//! non-streaming path. The interpretation table (what the codex
+//! dialect's events MEAN canonically):
+//!
+//! | codex event | canonical event |
+//! |---|---|
+//! | `response.created` | [`TurnStarted`](CanonEvent::TurnStarted) — the response id, when the event named one |
+//! | `response.output_text.delta` | [`TextDelta`](CanonEvent::TextDelta) |
+//! | `response.reasoning_summary_text.delta` | [`ThinkingDelta`](CanonEvent::ThinkingDelta) — `part` is the summary index, the backend's own part identity |
+//! | `output_item.done` of a `message` | [`TextEnded`](CanonEvent::TextEnded) — the text part completed |
+//! | `output_item.done` of a `reasoning` item | [`ThinkingEnded`](CanonEvent::ThinkingEnded) — the reasoning part completed |
+//! | `output_item.done` of a `function_call` | [`ToolCall`](CanonEvent::ToolCall), COMPLETE — the done item carries the whole arguments; a call whose fields do not fit the typed view is skipped, never corrupted into the stream (invariant 6) |
+//! | `output_item.done` of any other kind | nothing |
+//! | `response.completed` | [`TurnEnded`](CanonEvent::TurnEnded) — `tool_use` when any function call completed, else `end_turn`; the usage → [`CanonicalUsage`] |
+//! | `response.incomplete` | [`TurnEnded`](CanonEvent::TurnEnded) — `content_filter` reads as the refusal, anything else as the incomplete stop reason (verbatim) |
+//! | `response.failed` | [`TurnFailed`](CanonEvent::TurnFailed) — terminal |
+//! | a top-level `error` | [`Error`](CanonEvent::Error) — not terminal |
+//! | `output_item.added`, unknown kinds | nothing (they never had a canonical shape) |
+//!
+//! ## The error table's interpretation half
+//!
+//! The upstream's error fields → [`CanonError`]. `code` first, then
+//! `kind`; first match wins:
+//!
+//! | upstream (`code`, then `kind`) | canonical kind |
+//! |---|---|
+//! | `code` containing `rate_limit`, or `kind` `rate_limit_error` | [`RateLimit`](CanonErrorKind::RateLimit) — `resets_at` rides when carried |
+//! | `code` containing `context_length` | [`InvalidRequest`](CanonErrorKind::InvalidRequest) |
+//! | `code` containing `quota` or `usage_limit` | [`InvalidRequest`](CanonErrorKind::InvalidRequest) |
+//! | `kind` already one of anthropic's own type names | the typed variant that renders it |
+//! | anything else | [`Api`](CanonErrorKind::Api) |
+//!
+//! The message resolves HERE, on the backend's own wire fields
+//! (the canonical carries the result, never the fallback chain):
+//! the wire's message, standing in on the `code`, then the `kind`,
+//! then the constant `"upstream error"` — never invented.
 
 use serde_json::{Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest, ThinkingSpec,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonRole, CanonStopReason, CanonTool,
+    CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest, CanonicalUsage, ThinkingSpec,
 };
-use crate::providers::codex::{Item, ResponsesRequest, Tool};
+use crate::providers::codex::{
+    Item, ResponseError, ResponseEvent, ResponsesRequest, Tool, TurnCapture, Usage,
+};
 use crate::translate::TranslateError;
 
 /// Render one canonical request onto the codex wire.
@@ -261,13 +309,250 @@ fn wire_role(role: CanonRole) -> &'static str {
     }
 }
 
+// ── the response direction: interpretation ───────────────────────────
+
+/// The response-direction interpreter: feed it the turn's
+/// [`ResponseEvent`]s (in arrival order), collect the
+/// [`CanonEvent`]s they mean (the interpretation table lives in the
+/// module docs). One stream per turn.
+///
+/// The interpretation is stateful in exactly one fact — whether any
+/// function call completed, the `completed` stop reason's input.
+/// Everything else is a pure function of the event under
+/// interpretation (invariant 4).
+#[derive(Debug, Clone, Default)]
+pub struct CanonStream {
+    /// Whether any `function_call` item completed with a typed view
+    /// (the tool_use stop reason) — a call whose fields did not fit
+    /// the typed view was skipped, so it does not count.
+    function_calls: bool,
+}
+
+impl CanonStream {
+    /// A fresh interpreter for one turn.
+    pub fn new() -> CanonStream {
+        CanonStream::default()
+    }
+
+    /// Feed one Responses event; every canonical event it means, in
+    /// arrival order. Never fails — an event with no canonical shape
+    /// (an `output_item.added`, an unknown kind, a `function_call`
+    /// whose fields do not fit the typed view) produces nothing
+    /// rather than corrupting the stream (invariant 6).
+    pub fn feed(&mut self, event: &ResponseEvent) -> Vec<CanonEvent> {
+        let mut out = Vec::new();
+        match event {
+            ResponseEvent::Created { response_id, .. } => {
+                out.push(CanonEvent::TurnStarted {
+                    turn_id: response_id.clone(),
+                });
+            }
+            ResponseEvent::OutputTextDelta { delta } => {
+                out.push(CanonEvent::TextDelta {
+                    delta: delta.clone(),
+                });
+            }
+            ResponseEvent::ReasoningSummaryDelta {
+                delta,
+                summary_index,
+            } => {
+                // The summary index IS the part identity, and the
+                // cast is the identity for every index the wire
+                // really carries (array positions, non-negative); the
+                // two's-complement bit pattern stays injective even
+                // for a negative index an exotic upstream invented,
+                // so part distinctness never collapses.
+                out.push(CanonEvent::ThinkingDelta {
+                    part: *summary_index as u64,
+                    delta: delta.clone(),
+                });
+            }
+            ResponseEvent::OutputItemDone { item } => self.item_done(item, &mut out),
+            ResponseEvent::Completed { response } => {
+                out.push(CanonEvent::TurnEnded {
+                    stop_reason: if self.function_calls {
+                        CanonStopReason::ToolUse
+                    } else {
+                        CanonStopReason::EndTurn
+                    },
+                    usage: response.usage.as_ref().map(canonical_usage),
+                });
+            }
+            ResponseEvent::Incomplete { reason } => {
+                out.push(CanonEvent::TurnEnded {
+                    stop_reason: match reason.as_deref() {
+                        // The only reason vocabulary this wire's
+                        // refusal has; anything else stopped at a
+                        // budget and carries its own reason.
+                        Some("content_filter") => CanonStopReason::Refusal,
+                        other => CanonStopReason::Incomplete(other.unwrap_or_default().to_owned()),
+                    },
+                    usage: None,
+                });
+            }
+            ResponseEvent::Failed { error } => {
+                out.push(CanonEvent::TurnFailed {
+                    error: canon_error_from_response(error),
+                });
+            }
+            ResponseEvent::Error { error } => {
+                out.push(CanonEvent::Error {
+                    error: canon_error_from_response(error),
+                });
+            }
+            ResponseEvent::OutputItemAdded { .. } | ResponseEvent::Unknown { .. } => {}
+        }
+        out
+    }
+
+    /// One `output_item.done`: a message item's text part completed
+    /// (its deltas already streamed); a reasoning item's part
+    /// completed; a function-call item is a COMPLETE tool call —
+    /// the arguments arrive whole here (unit A's parser buffers them
+    /// from the done item), and the call counts for the stop reason
+    /// only when its fields fit the typed view.
+    fn item_done(&mut self, item: &Item, out: &mut Vec<CanonEvent>) {
+        match item.kind() {
+            Some("message") => out.push(CanonEvent::TextEnded),
+            Some("reasoning") => out.push(CanonEvent::ThinkingEnded),
+            Some("function_call") => {
+                if let Some(call) = item.as_function_call() {
+                    self.function_calls = true;
+                    out.push(CanonEvent::ToolCall(CanonToolCall {
+                        id: call.call_id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One Responses usage → the canonical buckets, with the raw usage
+/// carried verbatim (every member the wire carried, re-serialised).
+fn canonical_usage(usage: &Usage) -> CanonicalUsage {
+    CanonicalUsage {
+        input: Some(usage.input_tokens),
+        cache_read: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        cache_write: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_write_tokens),
+        output: Some(usage.output_tokens),
+        reasoning: usage
+            .output_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens),
+        raw: serde_json::to_value(usage).expect("a parsed Usage always serialises"),
+    }
+}
+
+/// A Responses error payload → the canonical error (the
+/// interpretation half of the error table — the module docs). The
+/// message resolves here, on the backend's own wire fields: the
+/// wire's message, standing in on the `code`, then the `kind`, then
+/// the constant — never invented.
+pub fn canon_error_from_response(error: &ResponseError) -> CanonError {
+    let kind = canon_error_kind(error);
+    let message = error
+        .message
+        .clone()
+        .or_else(|| error.code.clone())
+        .or_else(|| error.kind.clone())
+        .unwrap_or_else(|| "upstream error".to_owned());
+    CanonError {
+        kind,
+        message,
+        resets_at: error.resets_at,
+    }
+}
+
+/// The error table's interpretation half: `code` first (lowercased —
+/// case spellings still match), then `kind`; first match wins.
+fn canon_error_kind(error: &ResponseError) -> CanonErrorKind {
+    let code = error.code.as_deref().unwrap_or("").to_ascii_lowercase();
+    if code.contains("rate_limit") {
+        return CanonErrorKind::RateLimit;
+    }
+    if code.contains("context_length") {
+        return CanonErrorKind::InvalidRequest;
+    }
+    if code.contains("quota") || code.contains("usage_limit") {
+        return CanonErrorKind::InvalidRequest;
+    }
+    // Kinds that are already anthropic's own type names read as the
+    // typed variant that renders them — verbatim through the table,
+    // without a passthrough shape (see the canonical's docs).
+    match error.kind.as_deref() {
+        Some("rate_limit_error") => CanonErrorKind::RateLimit,
+        Some("invalid_request_error") => CanonErrorKind::InvalidRequest,
+        Some("authentication_error") => CanonErrorKind::Authentication,
+        Some("permission_error") => CanonErrorKind::Permission,
+        Some("not_found_error") => CanonErrorKind::NotFound,
+        Some("request_too_large") => CanonErrorKind::TooLarge,
+        Some("overloaded_error") => CanonErrorKind::Overloaded,
+        _ => CanonErrorKind::Api,
+    }
+}
+
+/// Unit A's whole-turn [`TurnCapture`] → the canonical final
+/// ([`CanonTurn`]) — the non-streaming path's fold. The capture
+/// already holds the turn's own facts (its response id, its items,
+/// its text, its summaries, its usage, its first error); this reads
+/// them into the canonical with the same stop-reason logic the
+/// streaming fold applies: the incomplete reason first (its
+/// `content_filter` reads as the refusal), then any completed
+/// function call (the tool_use stop reason), else the natural end.
+pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
+    CanonTurn {
+        turn_id: capture.response_id().map(str::to_owned),
+        stop_reason: match capture.incomplete_reason() {
+            Some("content_filter") => CanonStopReason::Refusal,
+            Some(other) => CanonStopReason::Incomplete(other.to_owned()),
+            None if !capture.function_calls().is_empty() => CanonStopReason::ToolUse,
+            None => CanonStopReason::EndTurn,
+        },
+        usage: capture.usage().map(canonical_usage),
+        error: capture.error().map(canon_error_from_response),
+        tool_calls: capture
+            .function_calls()
+            .into_iter()
+            .map(|call| CanonToolCall {
+                id: call.call_id,
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
+        text: capture.text().to_owned(),
+        thinking: capture
+            .reasoning_summaries()
+            .iter()
+            .map(|(part, text)| (*part as u64, text.clone()))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
     use super::super::TranslateError;
     use super::super::codex_backend::codex_from_canonical;
+    use super::{CanonStream, canon_error_from_response, canonical_turn_from_capture};
     use crate::ir::canonical::{
-        CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest,
-        Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
+        CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole,
+        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest,
+        CanonicalUsage, Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
+    };
+    use crate::providers::codex::{
+        CompletedResponse, ContentPart, Item, ResponseError, ResponseEvent, ResponsesSse,
+        TurnCapture,
     };
     use serde_json::{Value, json};
 
@@ -813,5 +1098,528 @@ mod tests {
             .expect("serialise");
             assert_eq!(first, again);
         }
+    }
+
+    // ── the response direction: interpretation ────────────────────
+
+    fn fixtures_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_sse")
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        fs::read(fixtures_dir().join(name)).expect("fixture exists")
+    }
+
+    /// Parse a fixture's whole event stream (unit A's parser first —
+    /// the same plumbing the server wires), then interpret every
+    /// event through one fresh canon stream.
+    fn canon_of(bytes: &[u8]) -> Vec<CanonEvent> {
+        let mut parser = ResponsesSse::new();
+        let mut events = parser.feed(bytes);
+        if let Some(tail) = parser.finish() {
+            events.push(tail);
+        }
+        let mut stream = CanonStream::new();
+        let mut canon = Vec::new();
+        for event in &events {
+            canon.extend(stream.feed(event));
+        }
+        canon
+    }
+
+    #[test]
+    fn the_tool_call_fixture_interprets_to_the_canon_event_sequence() {
+        // The ignorable kinds (output_item.added, the function_call
+        // argument deltas) produce nothing; the message's done is
+        // the text part's end; the call arrives complete.
+        assert_eq!(
+            canon_of(&fixture("01_tool_call_turn.sse")),
+            vec![
+                CanonEvent::TurnStarted {
+                    turn_id: Some("resp_6f3c9a".to_owned()),
+                },
+                CanonEvent::ThinkingDelta {
+                    part: 0,
+                    delta: "Reading the ".to_owned(),
+                },
+                CanonEvent::ThinkingDelta {
+                    part: 0,
+                    delta: "thread files.".to_owned(),
+                },
+                CanonEvent::TextDelta {
+                    delta: "I'll read the files, then ".to_owned(),
+                },
+                CanonEvent::TextDelta {
+                    delta: "café.".to_owned(),
+                },
+                CanonEvent::TextEnded,
+                CanonEvent::ToolCall(CanonToolCall {
+                    id: "call_read1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                }),
+                CanonEvent::TurnEnded {
+                    stop_reason: CanonStopReason::ToolUse,
+                    usage: Some(CanonicalUsage {
+                        input: Some(1234),
+                        cache_read: Some(512),
+                        cache_write: Some(64),
+                        output: Some(210),
+                        reasoning: Some(96),
+                        raw: json!({
+                            "input_tokens": 1234,
+                            "input_tokens_details": {"cached_tokens": 512, "cache_write_tokens": 64},
+                            "output_tokens": 210,
+                            "output_tokens_details": {"reasoning_tokens": 96},
+                            "total_tokens": 1444,
+                        }),
+                    }),
+                },
+            ],
+            "the fixture's whole turn, interpreted"
+        );
+    }
+
+    #[test]
+    fn the_incomplete_fixture_interprets_to_an_incomplete_turn_ended() {
+        // The CRLF-framed fixture parses (unit A) and interprets
+        // identically to an LF stream; the message item never
+        // completed, so there is no TextEnded — the turn's own end
+        // is the boundary. The incomplete reason carries, and no
+        // usage: the event carried none (absence ≠ zero).
+        assert_eq!(
+            canon_of(&fixture("02_incomplete_crlf.sse")),
+            vec![
+                CanonEvent::TurnStarted {
+                    turn_id: Some("resp_trunc".to_owned()),
+                },
+                CanonEvent::TextDelta {
+                    delta: "A partial answer runs out of room when the ".to_owned(),
+                },
+                CanonEvent::TextDelta {
+                    delta: "output budget is spent.".to_owned(),
+                },
+                CanonEvent::TurnEnded {
+                    stop_reason: CanonStopReason::Incomplete("max_output_tokens".to_owned()),
+                    usage: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_failed_fixture_interprets_both_errors_to_canon_errors() {
+        // The mid-turn error event is non-terminal in the canon too;
+        // response.failed is. The first latches on the capture side
+        // of unit A — this layer reports both, in arrival order.
+        assert_eq!(
+            canon_of(&fixture("03_failed.sse")),
+            vec![
+                CanonEvent::TurnStarted {
+                    turn_id: Some("resp_fail".to_owned()),
+                },
+                CanonEvent::Error {
+                    error: CanonError {
+                        kind: CanonErrorKind::Api,
+                        message: "Upstream overloaded.".to_owned(),
+                        resets_at: None,
+                    },
+                },
+                CanonEvent::TurnFailed {
+                    error: CanonError {
+                        kind: CanonErrorKind::RateLimit,
+                        message: "Rate limit reached for gpt-5.2-codex on weekly limits. \
+                             Please try again in 900s."
+                            .to_owned(),
+                        resets_at: Some(1_800_000_900),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn each_event_kind_interprets_to_its_canon_shape() {
+        let mut stream = CanonStream::new();
+        // created: the response id verbatim, when named — never
+        // invented.
+        assert_eq!(
+            stream.feed(&ResponseEvent::Created {
+                response_id: None,
+                model: Some("gpt-5.2-codex".to_owned()),
+            }),
+            vec![CanonEvent::TurnStarted { turn_id: None }]
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::Created {
+                response_id: Some("resp_1".to_owned()),
+                model: None,
+            }),
+            vec![CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned())
+            }],
+            "every created says so; the FRONTEND renders start once"
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputTextDelta {
+                delta: "text".to_owned()
+            }),
+            vec![CanonEvent::TextDelta {
+                delta: "text".to_owned()
+            }]
+        );
+        // The summary index is the part identity.
+        assert_eq!(
+            stream.feed(&ResponseEvent::ReasoningSummaryDelta {
+                delta: "thought".to_owned(),
+                summary_index: 2,
+            }),
+            vec![CanonEvent::ThinkingDelta {
+                part: 2,
+                delta: "thought".to_owned(),
+            }]
+        );
+        // Item dones: message → the text part ended, reasoning →
+        // the thinking part ended, unknown kinds → nothing.
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputItemDone {
+                item: Item::message("assistant", vec![ContentPart::output_text("text")]),
+            }),
+            vec![CanonEvent::TextEnded]
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputItemDone {
+                item: Item::reasoning(vec!["thought".to_owned()], None),
+            }),
+            vec![CanonEvent::ThinkingEnded]
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputItemDone {
+                item: Item(json!({"type": "web_search_call", "id": "ws_1"})),
+            }),
+            Vec::<CanonEvent>::new()
+        );
+        // A function_call whose fields do not fit the typed view is
+        // skipped, never corrupted — and does not count as a call.
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputItemDone {
+                item: Item(json!({"type": "function_call", "name": 5})),
+            }),
+            Vec::<CanonEvent>::new()
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::Completed {
+                response: CompletedResponse::default(),
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            }],
+            "the skipped call does not read as tool_use"
+        );
+        // The unmappable kinds: nothing.
+        assert_eq!(
+            stream.feed(&ResponseEvent::OutputItemAdded {
+                item: Item::message("assistant", vec![]),
+            }),
+            Vec::<CanonEvent>::new()
+        );
+        assert_eq!(
+            stream.feed(&ResponseEvent::Unknown {
+                kind: "response.new_thing".to_owned(),
+                data: json!({"weird": true}),
+            }),
+            Vec::<CanonEvent>::new()
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_reads_its_stop_reason_from_the_items() {
+        let call = || ResponseEvent::OutputItemDone {
+            item: Item::function_call("read_file", r#"{"a":1}"#, "call_1"),
+        };
+        // No call: the natural end.
+        let mut stream = CanonStream::new();
+        assert_eq!(
+            stream.feed(&ResponseEvent::Completed {
+                response: CompletedResponse::default(),
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            }]
+        );
+        // One call: tool_use, with the usage folded.
+        let mut stream = CanonStream::new();
+        stream.feed(&call());
+        assert_eq!(
+            stream.feed(&ResponseEvent::Completed {
+                response: CompletedResponse {
+                    id: Some("resp_1".to_owned()),
+                    usage: Some(
+                        serde_json::from_value(json!({
+                            "input_tokens": 10,
+                            "input_tokens_details": {"cached_tokens": 4},
+                            "output_tokens": 5,
+                            "total_tokens": 15,
+                        }))
+                        .expect("usage parses"),
+                    ),
+                    end_turn: Some(false),
+                },
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                // The usage buckets: the cached tokens read, the
+                // cache write absent (absence ≠ zero), the reasoning
+                // absent, the raw carried verbatim.
+                usage: Some(CanonicalUsage {
+                    input: Some(10),
+                    cache_read: Some(4),
+                    cache_write: None,
+                    output: Some(5),
+                    reasoning: None,
+                    raw: json!({
+                        "input_tokens": 10,
+                        "input_tokens_details": {"cached_tokens": 4},
+                        "output_tokens": 5,
+                        // The absent detail serialises as the wire's
+                        // explicit null (unit A's own shape), not an
+                        // omitted key.
+                        "output_tokens_details": null,
+                        "total_tokens": 15,
+                    }),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_incomplete_reasons_map_to_the_canonical_stop_reasons() {
+        let mut stream = CanonStream::new();
+        assert_eq!(
+            stream.feed(&ResponseEvent::Incomplete {
+                reason: Some("content_filter".to_owned()),
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::Refusal,
+                usage: None,
+            }],
+            "content_filter is the refusal"
+        );
+        for (reason, expected) in [
+            (
+                Some("max_output_tokens"),
+                CanonStopReason::Incomplete("max_output_tokens".to_owned()),
+            ),
+            (
+                Some("something_new"),
+                CanonStopReason::Incomplete("something_new".to_owned()),
+            ),
+            (None, CanonStopReason::Incomplete(String::new())),
+        ] {
+            let mut stream = CanonStream::new();
+            assert_eq!(
+                stream.feed(&ResponseEvent::Incomplete {
+                    reason: reason.map(str::to_owned),
+                }),
+                vec![CanonEvent::TurnEnded {
+                    stop_reason: expected,
+                    usage: None,
+                }],
+                "the incomplete reason carries: {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_error_table_interprets_to_canon_errors() {
+        let error = |kind: Option<&str>,
+                     code: Option<&str>,
+                     message: Option<&str>,
+                     resets_at: Option<i64>| ResponseError {
+            kind: kind.map(str::to_owned),
+            code: code.map(str::to_owned),
+            message: message.map(str::to_owned),
+            resets_at,
+        };
+        let canon = |error: ResponseError| canon_error_from_response(&error);
+
+        // rate_limit codes → RateLimit, the reset riding when carried.
+        assert_eq!(
+            canon(error(
+                None,
+                Some("rate_limit_exceeded"),
+                Some("Rate limit reached."),
+                Some(1_800_000_900)
+            )),
+            CanonError {
+                kind: CanonErrorKind::RateLimit,
+                message: "Rate limit reached.".to_owned(),
+                resets_at: Some(1_800_000_900),
+            }
+        );
+        assert_eq!(
+            canon(error(
+                None,
+                Some("rate_limit_exceeded"),
+                Some("Rate limit reached."),
+                None
+            ))
+            .resets_at,
+            None
+        );
+        // Case spellings still match (the code is lowercased first).
+        assert_eq!(
+            canon(error(None, Some("RATE_LIMIT_EXCEEDED"), Some("m"), None)).kind,
+            CanonErrorKind::RateLimit
+        );
+        // The kind alone maps too.
+        assert_eq!(
+            canon(error(Some("rate_limit_error"), None, Some("m"), None)).kind,
+            CanonErrorKind::RateLimit
+        );
+        // Context length and quota/usage limits → InvalidRequest.
+        assert_eq!(
+            canon(error(
+                None,
+                Some("context_length_exceeded"),
+                Some("m"),
+                None
+            ))
+            .kind,
+            CanonErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            canon(error(None, Some("usage_limit_reached"), Some("m"), None)).kind,
+            CanonErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            canon(error(None, Some("monthly_quota_reached"), Some("m"), None)).kind,
+            CanonErrorKind::InvalidRequest
+        );
+        // Kinds that are already anthropic type names → the typed
+        // variant that renders them.
+        assert_eq!(
+            canon(error(Some("invalid_request_error"), None, Some("m"), None)).kind,
+            CanonErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            canon(error(Some("overloaded_error"), None, Some("m"), None)).kind,
+            CanonErrorKind::Overloaded
+        );
+        assert_eq!(
+            canon(error(None, Some("server_error"), Some("m"), None)).kind,
+            CanonErrorKind::Api
+        );
+        // The message stands in on the code, then the kind, then the
+        // constant — resolved HERE, on the backend's own fields.
+        assert_eq!(
+            canon(error(None, Some("server_error"), None, None)).message,
+            "server_error"
+        );
+        assert_eq!(
+            canon(error(Some("overloaded_error"), None, None, None)),
+            CanonError {
+                kind: CanonErrorKind::Overloaded,
+                message: "overloaded_error".to_owned(),
+                resets_at: None,
+            }
+        );
+        assert_eq!(
+            canon(ResponseError::default()),
+            CanonError {
+                kind: CanonErrorKind::Api,
+                message: "upstream error".to_owned(),
+                resets_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_capture_folds_to_the_canonical_turn() {
+        let capture_of = |name: &str| {
+            let mut parser = ResponsesSse::new();
+            let mut events = parser.feed(&fixture(name));
+            if let Some(tail) = parser.finish() {
+                events.push(tail);
+            }
+            let mut capture = TurnCapture::new();
+            for event in &events {
+                capture.observe(event);
+            }
+            capture
+        };
+
+        // The tool-call fixture: everything the turn was.
+        assert_eq!(
+            canonical_turn_from_capture(&capture_of("01_tool_call_turn.sse")),
+            CanonTurn {
+                turn_id: Some("resp_6f3c9a".to_owned()),
+                stop_reason: CanonStopReason::ToolUse,
+                usage: Some(CanonicalUsage {
+                    input: Some(1234),
+                    cache_read: Some(512),
+                    cache_write: Some(64),
+                    output: Some(210),
+                    reasoning: Some(96),
+                    raw: json!({
+                        "input_tokens": 1234,
+                        "input_tokens_details": {"cached_tokens": 512, "cache_write_tokens": 64},
+                        "output_tokens": 210,
+                        "output_tokens_details": {"reasoning_tokens": 96},
+                        "total_tokens": 1444,
+                    }),
+                }),
+                error: None,
+                tool_calls: vec![CanonToolCall {
+                    id: "call_read1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                }],
+                text: "I'll read the files, then café.".to_owned(),
+                thinking: [(0, "Reading the thread files.".to_owned())].into(),
+            }
+        );
+
+        // The incomplete fixture: the reason carried, no usage.
+        let turn = canonical_turn_from_capture(&capture_of("02_incomplete_crlf.sse"));
+        assert_eq!(turn.turn_id.as_deref(), Some("resp_trunc"));
+        assert_eq!(
+            turn.stop_reason,
+            CanonStopReason::Incomplete("max_output_tokens".to_owned())
+        );
+        assert_eq!(turn.usage, None);
+        assert_eq!(
+            turn.text,
+            "A partial answer runs out of room when the output budget is spent."
+        );
+
+        // The failed fixture: the FIRST error latched (unit A), read
+        // as the canonical error.
+        let turn = canonical_turn_from_capture(&capture_of("03_failed.sse"));
+        assert_eq!(
+            turn.error,
+            Some(CanonError {
+                kind: CanonErrorKind::Api,
+                message: "Upstream overloaded.".to_owned(),
+                resets_at: None,
+            })
+        );
+
+        // An empty capture: nothing invented — no id, the natural
+        // end, no usage, no content.
+        assert_eq!(
+            canonical_turn_from_capture(&TurnCapture::new()),
+            CanonTurn {
+                turn_id: None,
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+                error: None,
+                tool_calls: Vec::new(),
+                text: String::new(),
+                thinking: [].into(),
+            }
+        );
     }
 }

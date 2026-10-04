@@ -2,8 +2,8 @@
 //! [`ResponsesRequest`], in two layers (the request table lives in
 //! the parent module's docs).
 //!
-//! - [`from_anthropic`](super::from_anthropic) — the frontend
-//!   adapter: the anthropic wire body → the canonical IR
+//! - [`from_anthropic`](super::anthropic_frontend::from_anthropic) —
+//!   the frontend adapter: the anthropic wire body → the canonical IR
 //!   ([`CanonicalRequest`](crate::ir::canonical)). Wire-shape
 //!   reporting is ITS domain.
 //! - [`codex_from_canonical`](super::codex_backend) — the backend
@@ -27,8 +27,8 @@ use serde_json::Value;
 
 use crate::providers::codex::ResponsesRequest;
 use crate::translate::TranslateError;
+use crate::translate::anthropic_frontend::from_anthropic;
 use crate::translate::codex_backend::codex_from_canonical;
-use crate::translate::from_anthropic::from_anthropic;
 
 /// Translate one Anthropic Messages request body into a codex
 /// [`ResponsesRequest`]: the frontend adapter

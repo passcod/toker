@@ -1,8 +1,10 @@
-//! The canonical IR: the protocol-neutral request model that
-//! frontend adapters parse INTO and backend adapters render OUT OF
-//! ([`crate::translate`] is the layer description; the request
-//! direction's composition is
-//! [`to_codex`](crate::translate::to_codex)).
+//! The canonical IR — both directions, protocol-neutral: the request
+//! model that frontend adapters parse INTO and backend adapters
+//! render OUT OF, and the turn model that backend adapters
+//! interpret INTO and frontend adapters render OUT OF
+//! ([`crate::translate`] is the layer description; the compositions
+//! are [`to_codex`](crate::translate::to_codex) and
+//! [`to_anthropic`](crate::translate::to_anthropic)).
 //!
 //! ## When canonical engages — and when it never does
 //!
@@ -38,13 +40,15 @@
 //! kinds) keeps its raw-JSON string form instead — byte preservation
 //! outranks typing, always.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 /// A canonical request: one cross-protocol turn, wire-agnostic.
 ///
 /// Built by a frontend adapter (today:
-/// [`from_anthropic`](crate::translate::from_anthropic)), rendered by
-/// a backend adapter (today:
+/// [`from_anthropic`](crate::translate::anthropic_frontend::from_anthropic)),
+/// rendered by a backend adapter (today:
 /// [`codex_from_canonical`](crate::translate::codex_from_canonical)).
 /// The model slug and prompt-cache key are CALLER-derived facts and
 /// stay out of the canonical: they are explicit parameters of the
@@ -250,6 +254,211 @@ pub struct ThinkingSpec {
     /// how a backend maps it (the codex effort ladder) is backend
     /// policy.
     pub budget_tokens: u64,
+}
+
+// ── the turn model (the response direction) ─────────────────────────
+
+/// One complete tool call, as the canonical carries it in both the
+/// stream ([`CanonEvent::ToolCall`]) and the final turn
+/// ([`CanonTurn::tool_calls`]): the id, the name, and the **whole**
+/// arguments — the canonical contract. The codex backend's reality
+/// (arguments arrive complete via `output_item.done`) becomes the
+/// model's law: a backend whose wire streams them in pieces buffers
+/// them before emitting, and a frontend renders one whole-arguments
+/// event (anthropic's single `input_json_delta`).
+///
+/// `arguments` is the backend's own JSON-string form, verbatim — a
+/// frontend that wants the object parses it, and a string that does
+/// not parse is the frontend's degradation to report, never a
+/// canonical guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Why the turn ended. The codex backend's reading of its wire: any
+/// completed function call →
+/// [`ToolUse`](CanonStopReason::ToolUse), else
+/// [`EndTurn`](CanonStopReason::EndTurn); an incomplete turn's
+/// `content_filter` → [`Refusal`](CanonStopReason::Refusal), any
+/// other incompleteness →
+/// [`Incomplete`](CanonStopReason::Incomplete) with the reason
+/// carried. A backend whose wire speaks a stop reason natively
+/// (anthropic's own `max_tokens`) emits
+/// [`MaxTokens`](CanonStopReason::MaxTokens) directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonStopReason {
+    /// The turn ran to its natural end.
+    EndTurn,
+    /// The turn ended on completed tool calls, expecting results.
+    ToolUse,
+    /// The turn stopped at a token budget.
+    MaxTokens,
+    /// The turn was refused (content filtering).
+    Refusal,
+    /// The turn stopped short, for the reason this carries — the
+    /// backend's own reason string, verbatim. A frontend with no
+    /// shape for it renders its own budget-shaped default
+    /// (anthropic's is `max_tokens`: an incomplete turn stopped at
+    /// its budget, the only budget-shaped stop reason that wire
+    /// has).
+    Incomplete(String),
+}
+
+/// The canonical usage buckets of one turn: the numbers every
+/// protocol's usage MEANS, plus the backend's raw usage JSON carried
+/// verbatim alongside — a frontend renders the buckets, and `raw`
+/// is for whoever wants the wire's own shape (the ledger's verbatim
+/// column, a future frontend that passes usage through).
+///
+/// Absence ≠ zero (invariant 3): every bucket is an `Option`
+/// because a backend may not report it — the codex wire always
+/// carries `input`/`output` as plain numbers, but the canonical
+/// never assumes any backend's reporting shape. `reasoning` rides
+/// INSIDE `output` on both the anthropic and codex protocols (the
+/// rendered usage does not break it out — see the pair docs); the
+/// canonical carries it as a bucket for whoever wants the split.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalUsage {
+    pub input: Option<u64>,
+    pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
+    pub output: Option<u64>,
+    pub reasoning: Option<u64>,
+    /// The backend's own usage object, re-serialised verbatim (every
+    /// member the wire carried, modelled and unmodelled alike).
+    pub raw: Value,
+}
+
+/// The canonical error taxonomy — the kinds every protocol's error
+/// table maps onto.
+///
+/// The current table's "verbatim" kinds are already anthropic's own
+/// type names (`overloaded_error`, `request_too_large`, …), so each
+/// has a typed variant that renders to the identical string — no
+/// passthrough variant is needed. A future upstream kind that must
+/// pass VERBATIM without a typed rendering is the case that adds a
+/// `Backend(String)` variant, and the `&'static str` rendering
+/// signatures that today forbid it get revisited then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonErrorKind {
+    /// A rate limit — the only kind that carries a reset
+    /// ([`CanonError::resets_at`]).
+    RateLimit,
+    /// A request the upstream refused as malformed.
+    InvalidRequest,
+    /// A credential the upstream rejected.
+    Authentication,
+    /// A permission the upstream withheld.
+    Permission,
+    /// A thing the upstream does not have.
+    NotFound,
+    /// A request beyond the upstream's size limits.
+    TooLarge,
+    /// An upstream at capacity.
+    Overloaded,
+    /// Everything else — the generic.
+    Api,
+}
+
+/// One canonical error: the kind, the message, and — for a rate
+/// limit — the reset. The message is already RESOLVED when it gets
+/// here: the backend stands its wire's own message in on its code,
+/// then its kind, then the constant, so the fallback chain never
+/// crosses the canonical boundary and the message renders verbatim
+/// downstream. `resets_at` is the **absolute** reset epoch, verbatim
+/// — a relative retry-after would need a clock, and translation is
+/// pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonError {
+    pub kind: CanonErrorKind,
+    pub message: String,
+    /// Unix seconds: when the rate limit resets, when the upstream
+    /// named it.
+    pub resets_at: Option<i64>,
+}
+
+/// One canonical turn event — the response direction's streaming
+/// unit: a backend adapter interprets its wire's turn into these,
+/// in stream order; a frontend adapter renders them onto its wire
+/// (the composition of the two is
+/// [`to_anthropic`](crate::translate::to_anthropic)).
+/// Protocol-neutral and frontend-agnostic: no SSE, no
+/// `message_start`, no content blocks — a text part is a text part,
+/// wherever it streams to. Everything is a pure function of the
+/// events the backend emits (invariant 4): no ids minted, no parts
+/// invented, no ordering but the arrival order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonEvent {
+    /// The turn opened. `turn_id` is the backend's own response id,
+    /// when it named one — never invented; a stream that never named
+    /// one leaves it `None` and a frontend renders its own
+    /// placeholder, never a minted id (purity).
+    TurnStarted { turn_id: Option<String> },
+    /// One text delta, in stream order. One text part streams at a
+    /// time — [`CanonEvent::TextEnded`] is the boundary that closes
+    /// it, so a renderer knows a new part began when the next delta
+    /// arrives after one.
+    TextDelta { delta: String },
+    /// One reasoning delta, of the part `part` names — the
+    /// BACKEND's own part identity (codex's `summary_index`): the
+    /// semantic "which reasoning part" is canonical even if backends
+    /// number their parts differently, and a renderer groups by it.
+    /// Deltas of one part continue it; a different part is a new
+    /// one.
+    ThinkingDelta { part: u64, delta: String },
+    /// A COMPLETE tool call — the arguments whole (see
+    /// [`CanonToolCall`]).
+    ToolCall(CanonToolCall),
+    /// The current text part completed — no more
+    /// [`CanonEvent::TextDelta`]s belong to it.
+    TextEnded,
+    /// The current reasoning part completed — no more
+    /// [`CanonEvent::ThinkingDelta`]s belong to it.
+    ThinkingEnded,
+    /// The turn ended — normally or short — with the stop reason and
+    /// the usage when the turn reported one (absent stays absent,
+    /// never zeroed — invariant 3).
+    TurnEnded {
+        stop_reason: CanonStopReason,
+        usage: Option<CanonicalUsage>,
+    },
+    /// The turn FAILED — a terminal error; the stream ends here.
+    TurnFailed { error: CanonError },
+    /// A non-terminal error mid-turn; the stream continues (a
+    /// backend whose error ENDS the turn emits
+    /// [`CanonEvent::TurnFailed`] instead).
+    Error { error: CanonError },
+}
+
+/// One canonical turn, complete — the non-streaming path's unit: a
+/// backend adapter folds its whole turn into this (today: the codex
+/// backend, from unit A's `TurnCapture`); a frontend adapter renders
+/// the complete response (today: the anthropic message JSON).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonTurn {
+    /// The backend's own turn id, when it named one — never invented.
+    pub turn_id: Option<String>,
+    /// Why the turn ended. An errored turn carries the stop reason it
+    /// would have had; a renderer that answers the error instead
+    /// never reads it.
+    pub stop_reason: CanonStopReason,
+    /// The usage, when the turn reported one.
+    pub usage: Option<CanonicalUsage>,
+    /// The first error the turn hit, when it errored — an errored
+    /// turn renders as the error, never a partial message.
+    pub error: Option<CanonError>,
+    /// The complete tool calls, in completion order, arguments whole.
+    pub tool_calls: Vec<CanonToolCall>,
+    /// The assistant text, the deltas joined.
+    pub text: String,
+    /// The reasoning parts, keyed by the backend's part identity,
+    /// each part's deltas joined. Ordered by that identity — the
+    /// codex summary indices are non-negative array positions, so
+    /// the order is the arrival order.
+    pub thinking: BTreeMap<u64, String>,
 }
 
 /// What a backend supports — the BACKEND property, declared per

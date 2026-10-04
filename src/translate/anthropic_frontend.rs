@@ -1,10 +1,13 @@
-//! The frontend adapter: one Anthropic Messages body → one
-//! [`CanonicalRequest`] (the canonical IR —
-//! [`crate::ir::canonical`]).
+//! The frontend adapter, both directions: one Anthropic Messages
+//! body → one [`CanonicalRequest`] (the request parse, below), and
+//! the canonical turn model → Anthropic SSE / the complete message
+//! JSON (the response render — see "The response direction" at the
+//! bottom of these docs).
 //!
-//! This file's domain is the FRONTEND WIRE and nothing else: the
-//! role table (which role may carry which block kind), the block
-//! parses, the string-or-blocks readings, and the shape reporting —
+//! This file's domain is the ANTHROPIC WIRE and the canonical, and
+//! nothing else. Request side: the role table (which role may carry
+//! which block kind), the block parses, the string-or-blocks
+//! readings, and the shape reporting —
 //! [`TranslateError::Malformed`] for shape violations,
 //! [`TranslateError::UnsupportedBlock`] for a block with no faithful
 //! parse. NO backend knowledge lives here: nothing is merged,
@@ -23,13 +26,59 @@
 //! then tools, then tool choice, then thinking, the order the pair
 //! module read them in (see [`tool_choice_of`] for the one
 //! doubly-malformed corner that order cannot keep).
+//!
+//! # The response direction (rendering)
+//!
+//! [`AnthropicRenderer`] is the streamed path: a small explicit
+//! state machine over canonical [`CanonEvent`]s — which content
+//! block is open (thinking or text, at which index), the next block
+//! index, whether the turn ended. Everything it emits is a pure
+//! function of the events it has been fed and the model echo — no
+//! clock, no counters, nothing else (invariant 4). Claude Code's
+//! event names, exactly: `message_start`, `content_block_start`,
+//! `content_block_delta`, `content_block_stop`, `message_delta`,
+//! `message_stop`, `error` — no `ping` (claude tolerates its absence;
+//! nothing upstream produces one).
+//!
+//! The message id is the backend's own turn id, verbatim — the one
+//! identity the turn actually has. A turn that never named one gets
+//! the constant `"msg"`: purity forbids minting a fresh id (a random
+//! or clock-derived id would break byte-stability for nothing).
+//!
+//! The `message_start` usage is **zeroed** — anthropic's own shape for
+//! a provisional snapshot, which this is: the real usage only exists
+//! at the turn's end and rides the `message_delta`. A turn that ends
+//! without one (the canonical `TurnEnded` may carry no usage) leaves
+//! the zeros provisional, exactly like anthropic's own start usage;
+//! the authoritative `message_delta` usage replaces it whenever it
+//! arrives.
+//!
+//! [`anthropic_from_canonical`] is the `stream:false` sibling: the
+//! same content assembly over the canonical final ([`CanonTurn`]),
+//! producing the complete non-streaming Anthropic message JSON. Its
+//! content order is categorical — thinking parts (by the backend's
+//! part identity), text, then the tool calls (in completion order) —
+//! the turn carries no cross-category arrival order; for real turns
+//! the categories arrive in exactly that order anyway, and the SSE
+//! path emits true arrival order for whatever interleaving the
+//! upstream sends.
+//!
+//! Error events render from [`CanonError`]: the kind → anthropic's
+//! `error.type` (the table's rendering half — the interpretation
+//! half lives in the backend adapter), the message verbatim (the
+//! backend resolved its own stand-in chain before the canonical),
+//! and `retry_after` only for rate limits — the absolute reset
+//! epoch, verbatim (a relative retry-after would need a clock, and
+//! this is pure).
 
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest,
-    SamplingSpec, ThinkingSpec, ToolResultContent,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonTool, CanonToolChoice, CanonTurn, CanonicalRequest, CanonicalUsage, SamplingSpec,
+    ThinkingSpec, ToolResultContent,
 };
+use crate::observe::sse::SseEvent;
 use crate::translate::TranslateError;
 
 /// Parse one Anthropic Messages request body into the canonical IR.
@@ -600,14 +649,420 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
+// ── the response direction: rendering ───────────────────────────────
+
+/// The message id for a turn that never named one — a constant, not
+/// a minted id (purity).
+const UNNAMED_MESSAGE: &str = "msg";
+
+/// The Anthropic SSE state machine for one streamed turn: feed it the
+/// turn's [`CanonEvent`]s (in arrival order), collect the emitted
+/// [`SseEvent`]s. One stream per turn — the response-direction
+/// counterpart of the request parse: canonical in, anthropic out.
+#[derive(Debug, Clone)]
+pub struct AnthropicRenderer {
+    /// The model echo — the model the caller wants the client to see
+    /// (the requested anthropic model, post-middleware).
+    model: String,
+    /// Whether the turn started ([`CanonEvent::TurnStarted`] seen —
+    /// `message_start` is emitted exactly once).
+    started: bool,
+    /// The backend's own turn id, latched from the first
+    /// [`CanonEvent::TurnStarted`].
+    message_id: Option<String>,
+    /// The index the next opened content block gets.
+    next_index: usize,
+    /// The currently open content block, if any.
+    open: Option<OpenBlock>,
+    /// Whether the turn's final-state event passed through.
+    ended: bool,
+}
+
+/// The content block under assembly: its kind (which stream feeds it)
+/// and its index.
+#[derive(Debug, Clone, Copy)]
+enum OpenBlock {
+    Thinking { index: usize, part: u64 },
+    Text { index: usize },
+}
+
+/// The identity of a content block: text continues text; a reasoning
+/// part continues the thinking block of the same part.
+#[derive(Debug, Clone, Copy)]
+enum BlockKind {
+    Thinking { part: u64 },
+    Text,
+}
+
+impl OpenBlock {
+    /// Whether `other` continues this block.
+    fn continues(&self, other: &BlockKind) -> bool {
+        match (self, other) {
+            (OpenBlock::Text { .. }, BlockKind::Text) => true,
+            (OpenBlock::Thinking { part: a, .. }, BlockKind::Thinking { part: b }) => a == b,
+            _ => false,
+        }
+    }
+
+    fn index(&self) -> usize {
+        match self {
+            OpenBlock::Thinking { index, .. } | OpenBlock::Text { index } => *index,
+        }
+    }
+}
+
+impl AnthropicRenderer {
+    /// A fresh renderer for one turn, echoing `model` in the
+    /// `message_start` (the streaming path — non-streaming turns go
+    /// through [`anthropic_from_canonical`]).
+    pub fn new(model: &str) -> AnthropicRenderer {
+        AnthropicRenderer {
+            model: model.to_owned(),
+            started: false,
+            message_id: None,
+            next_index: 0,
+            open: None,
+            ended: false,
+        }
+    }
+
+    /// Feed one canonical turn event; every Anthropic SSE event it
+    /// produced, in anthropic event order. Never fails — an event
+    /// with no anthropic shape produces nothing (invariant 6).
+    pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
+        let mut out = Vec::new();
+        match event {
+            CanonEvent::TurnStarted { turn_id } => {
+                if !self.started {
+                    self.started = true;
+                    if self.message_id.is_none() {
+                        self.message_id.clone_from(turn_id);
+                    }
+                    out.push(sse_event(
+                        "message_start",
+                        json!({
+                            "type": "message_start",
+                            "message": {
+                                "id": self.message_id_or_default(),
+                                "type": "message",
+                                "role": "assistant",
+                                "model": self.model,
+                                "content": [],
+                                "usage": {
+                                    "input_tokens": 0,
+                                    "cache_creation_input_tokens": 0,
+                                    "cache_read_input_tokens": 0,
+                                    "output_tokens": 0,
+                                },
+                            },
+                        }),
+                    ));
+                }
+            }
+            CanonEvent::TextDelta { delta } => {
+                let index = self.ensure_open(BlockKind::Text, &mut out);
+                out.push(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": delta},
+                    }),
+                ));
+            }
+            CanonEvent::ThinkingDelta { part, delta } => {
+                let block = BlockKind::Thinking { part: *part };
+                let index = self.ensure_open(block, &mut out);
+                out.push(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": delta},
+                    }),
+                ));
+            }
+            // The complete tool call: the arguments arrive whole on
+            // the canonical, so ONE input_json_delta carries them
+            // all — a tool_use block opened, filled, and closed.
+            CanonEvent::ToolCall(call) => {
+                self.close_open(&mut out);
+                let index = self.next_index;
+                self.next_index += 1;
+                out.push(sse_event(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": {},
+                        },
+                    }),
+                ));
+                out.push(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": call.arguments,
+                        },
+                    }),
+                ));
+                out.push(sse_event(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": index}),
+                ));
+            }
+            // A completed text part closes whatever block is open —
+            // the pair module's message-item done closed
+            // unconditionally, and this keeps that.
+            CanonEvent::TextEnded => self.close_open(&mut out),
+            // A completed reasoning part closes its thinking block
+            // if one is open; a text block stays (the pair module's
+            // reasoning-item done did the same).
+            CanonEvent::ThinkingEnded => {
+                if matches!(self.open, Some(OpenBlock::Thinking { .. })) {
+                    self.close_open(&mut out);
+                }
+            }
+            CanonEvent::TurnEnded { stop_reason, usage } => {
+                self.close_open(&mut out);
+                let mut data = Map::new();
+                data.insert("type".to_owned(), json!("message_delta"));
+                data.insert(
+                    "delta".to_owned(),
+                    json!({"stop_reason": stop_reason_of(stop_reason), "stop_sequence": null}),
+                );
+                if let Some(usage) = usage {
+                    data.insert("usage".to_owned(), usage_json(usage));
+                }
+                out.push(sse_event("message_delta", Value::Object(data)));
+                out.push(sse_event("message_stop", json!({"type": "message_stop"})));
+                self.ended = true;
+            }
+            CanonEvent::TurnFailed { error } => {
+                // No message_delta, no message_stop: anthropic error
+                // streams end at the error, mid-block if one was
+                // open (toker's own captured fixture 06 is the
+                // shape).
+                out.push(sse_event("error", anthropic_error_event_data(error)));
+                self.ended = true;
+            }
+            CanonEvent::Error { error } => {
+                out.push(sse_event("error", anthropic_error_event_data(error)));
+            }
+        }
+        out
+    }
+
+    /// Whether the turn's final-state event passed through — the
+    /// caller's "the accounting is final" signal.
+    pub fn turn_ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Open a block of `kind` unless it continues the open one; the
+    /// block's index (the open block's, or the freshly assigned one).
+    fn ensure_open(&mut self, kind: BlockKind, out: &mut Vec<SseEvent>) -> usize {
+        if !matches!(self.open, Some(open) if open.continues(&kind)) {
+            self.close_open(out);
+            out.push(self.open_block(kind));
+        }
+        match self.open {
+            Some(open) => open.index(),
+            None => unreachable!("the block was just opened"),
+        }
+    }
+
+    /// Open a content block: assign its index, emit the start.
+    fn open_block(&mut self, kind: BlockKind) -> SseEvent {
+        let index = self.next_index;
+        self.next_index += 1;
+        self.open = Some(match kind {
+            BlockKind::Thinking { part } => OpenBlock::Thinking { index, part },
+            BlockKind::Text => OpenBlock::Text { index },
+        });
+        let content_block = match kind {
+            BlockKind::Thinking { .. } => json!({"type": "thinking", "thinking": ""}),
+            BlockKind::Text => json!({"type": "text", "text": ""}),
+        };
+        sse_event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": content_block,
+            }),
+        )
+    }
+
+    /// Close the open content block, if any (emits its stop).
+    fn close_open(&mut self, out: &mut Vec<SseEvent>) {
+        if let Some(block) = self.open.take() {
+            out.push(sse_event(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": block.index()}),
+            ));
+        }
+    }
+
+    fn message_id_or_default(&self) -> &str {
+        self.message_id.as_deref().unwrap_or(UNNAMED_MESSAGE)
+    }
+}
+
+/// The `stream:false` sibling: the canonical final turn
+/// ([`CanonTurn`]) → the complete non-streaming Anthropic message
+/// JSON — the same content assembly and usage mapping as the streamed
+/// path. An errored turn yields the anthropic error body instead (no
+/// content: anthropic's non-streaming errors carry none).
+pub fn anthropic_from_canonical(model: &str, turn: &CanonTurn) -> Value {
+    if let Some(error) = &turn.error {
+        return anthropic_error_event_data(error);
+    }
+
+    let mut content: Vec<Value> = Vec::new();
+    for summary in turn.thinking.values() {
+        content.push(json!({"type": "thinking", "thinking": summary}));
+    }
+    if !turn.text.is_empty() {
+        content.push(json!({"type": "text", "text": turn.text}));
+    }
+    for call in &turn.tool_calls {
+        // The arguments are a JSON string on the canonical (the
+        // backend's whole-arguments form); anthropic's tool_use.input
+        // is the object. A string that does not parse is a degraded
+        // upstream — the empty object keeps the shape valid rather
+        // than inventing content.
+        let input: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+        content.push(json!({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": input,
+        }));
+    }
+
+    let mut message = Map::new();
+    message.insert(
+        "id".to_owned(),
+        json!(turn.turn_id.as_deref().unwrap_or(UNNAMED_MESSAGE)),
+    );
+    message.insert("type".to_owned(), json!("message"));
+    message.insert("role".to_owned(), json!("assistant"));
+    message.insert("model".to_owned(), json!(model));
+    message.insert("content".to_owned(), Value::Array(content));
+    message.insert(
+        "stop_reason".to_owned(),
+        json!(stop_reason_of(&turn.stop_reason)),
+    );
+    message.insert("stop_sequence".to_owned(), Value::Null);
+    if let Some(usage) = &turn.usage {
+        message.insert("usage".to_owned(), usage_json(usage));
+    }
+    Value::Object(message)
+}
+
+// ── the response direction: the rendering helpers ───────────────────
+
+/// The canonical stop reason → anthropic's: the natural ends and the
+/// budget carry directly; an unknown incompleteness stops at the
+/// budget — `max_tokens`, the only budget-shaped anthropic stop
+/// reason.
+fn stop_reason_of(reason: &CanonStopReason) -> &'static str {
+    match reason {
+        CanonStopReason::EndTurn => "end_turn",
+        CanonStopReason::ToolUse => "tool_use",
+        CanonStopReason::MaxTokens => "max_tokens",
+        CanonStopReason::Refusal => "refusal",
+        CanonStopReason::Incomplete(_) => "max_tokens",
+    }
+}
+
+/// The canonical usage buckets → the anthropic field names (the usage
+/// table). Absent stays absent (invariant 3); reasoning tokens ride
+/// inside `output_tokens` on both protocols and are not broken out
+/// (the pair module's translation note).
+fn usage_json(usage: &CanonicalUsage) -> Value {
+    let mut map = Map::new();
+    if let Some(input) = usage.input {
+        map.insert("input_tokens".to_owned(), json!(input));
+    }
+    if let Some(cache_write) = usage.cache_write {
+        map.insert("cache_creation_input_tokens".to_owned(), json!(cache_write));
+    }
+    if let Some(cache_read) = usage.cache_read {
+        map.insert("cache_read_input_tokens".to_owned(), json!(cache_read));
+    }
+    if let Some(output) = usage.output {
+        map.insert("output_tokens".to_owned(), json!(output));
+    }
+    Value::Object(map)
+}
+
+/// A canonical error → the anthropic error event's data JSON (the
+/// error table's rendering half): the kind → the type, the message
+/// verbatim (already resolved backend-side), `retry_after` only for
+/// rate limits.
+pub fn anthropic_error_event_data(error: &CanonError) -> Value {
+    let kind = anthropic_error_type(error);
+    let mut error_object = Map::new();
+    error_object.insert("type".to_owned(), json!(kind));
+    error_object.insert("message".to_owned(), json!(error.message));
+    if matches!(error.kind, CanonErrorKind::RateLimit)
+        && let Some(resets_at) = error.resets_at
+    {
+        // The absolute reset epoch, verbatim — a relative
+        // retry-after would need a clock, and this is pure.
+        error_object.insert("retry_after".to_owned(), json!(resets_at));
+    }
+    json!({"type": "error", "error": Value::Object(error_object)})
+}
+
+/// The error table's rendering half: the canonical kind → anthropic's
+/// `error.type`. The interpretation half (the upstream's `code`
+/// then `kind` → the canonical kind) lives in the backend adapter.
+pub fn anthropic_error_type(error: &CanonError) -> &'static str {
+    match error.kind {
+        CanonErrorKind::RateLimit => "rate_limit_error",
+        CanonErrorKind::InvalidRequest => "invalid_request_error",
+        CanonErrorKind::Authentication => "authentication_error",
+        CanonErrorKind::Permission => "permission_error",
+        CanonErrorKind::NotFound => "not_found_error",
+        CanonErrorKind::TooLarge => "request_too_large",
+        CanonErrorKind::Overloaded => "overloaded_error",
+        CanonErrorKind::Api => "api_error",
+    }
+}
+
+/// One emitted Anthropic SSE event: the event name on its `event:`
+/// line's value, the JSON on its single `data:` line.
+fn sse_event(name: &str, data: Value) -> SseEvent {
+    SseEvent {
+        data_lines: vec![serde_json::to_string(&data).expect("a built Value always serialises")],
+        event: Some(name.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::super::TranslateError;
+    use super::anthropic_from_canonical;
     use super::from_anthropic;
+    use super::{AnthropicRenderer, anthropic_error_event_data, anthropic_error_type};
     use crate::ir::canonical::{
-        CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, SamplingSpec,
-        ThinkingSpec, ToolResultContent,
+        CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole,
+        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalUsage,
+        SamplingSpec, ThinkingSpec, ToolResultContent,
     };
+    use crate::observe::sse::SseEvent;
     use serde_json::{Value, json};
 
     // ── what the pair module used to decide early, now carried ────
@@ -1285,6 +1740,755 @@ mod tests {
                 from_anthropic(&body),
                 Err(TranslateError::Malformed { .. })
             ));
+        }
+    }
+
+    // ── the response direction: rendering ─────────────────────────
+    //
+    // The renderer's tests feed HAND-BUILT canon events — the
+    // interpretation that produces them is the backend adapter's,
+    // tested there; the end-to-end bytes (fixture in, anthropic SSE
+    // out) are the composition's, tested in to_anthropic.
+
+    /// The SSE wire bytes of one emitted event: the `event:` line, the
+    /// `data:` line, the blank separator.
+    fn render_one(event: &SseEvent) -> String {
+        let mut out = String::new();
+        out.push_str("event: ");
+        out.push_str(event.event.as_deref().unwrap_or(""));
+        out.push('\n');
+        for line in &event.data_lines {
+            out.push_str("data: ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+        out
+    }
+
+    /// The expected wire bytes of an (event name, data JSON) sequence.
+    fn wire(pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+            .collect()
+    }
+
+    /// Feed every canon event through one fresh renderer; the
+    /// rendered wire bytes.
+    fn stream_bytes(model: &str, events: &[CanonEvent]) -> String {
+        let mut renderer = AnthropicRenderer::new(model);
+        let mut out = String::new();
+        for event in events {
+            for emitted in renderer.feed(event) {
+                out.push_str(&render_one(&emitted));
+            }
+        }
+        out
+    }
+
+    /// The start of message_start's message object, for the pins.
+    fn message_start(id: &str, model: &str) -> String {
+        format!(
+            r#"{{"type":"message_start","message":{{"id":"{id}","type":"message","role":"assistant","model":"{model}","content":[],"usage":{{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn text_after_tool_use_takes_the_next_index() {
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::TextDelta {
+                delta: "Part one.".to_owned(),
+            },
+            CanonEvent::TextEnded,
+            CanonEvent::ToolCall(CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"a":1}"#.to_owned(),
+            }),
+            CanonEvent::TextDelta {
+                delta: "Part two.".to_owned(),
+            },
+            CanonEvent::TextEnded,
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("resp_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Part one."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Part two."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
+    fn thinking_after_text_takes_the_next_index() {
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::TextDelta {
+                delta: "First.".to_owned(),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "Thought.".to_owned(),
+            },
+            CanonEvent::TextDelta {
+                delta: "Last.".to_owned(),
+            },
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("resp_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"First."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"Thought."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"Last."}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
+    fn summary_indexes_open_separate_thinking_blocks() {
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "A".to_owned(),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "B".to_owned(),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 1,
+                delta: "C".to_owned(),
+            },
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("resp_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"A"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"B"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"C"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
+    fn a_completed_reasoning_part_closes_only_a_thinking_block() {
+        // ThinkingEnded closes the open thinking block; a TEXT block
+        // under a reasoning completion stays open (the pair module's
+        // reasoning-item done did the same).
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "thought".to_owned(),
+            },
+            CanonEvent::ThinkingEnded,
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("resp_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thought"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+
+        let events = vec![
+            CanonEvent::TurnStarted { turn_id: None },
+            CanonEvent::TextDelta {
+                delta: "text".to_owned(),
+            },
+            CanonEvent::ThinkingEnded,
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("msg", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"text"}}"#,
+            ),
+            // No content_block_stop: a reasoning completion does not
+            // close a text block; the turn's end does.
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
+    fn a_completed_text_part_closes_whatever_block_was_open() {
+        // TextEnded closes unconditionally — the pair module's
+        // message-item done closed any open block, and this keeps
+        // that, even the exotic thinking-block-open-under-a-text-end.
+        let events = vec![
+            CanonEvent::TurnStarted { turn_id: None },
+            CanonEvent::ThinkingDelta {
+                part: 3,
+                delta: "orphaned".to_owned(),
+            },
+            CanonEvent::TextEnded,
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("msg", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"orphaned"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
+    fn a_mid_stream_error_does_not_close_the_open_block() {
+        // toker's own captured fixture 06 is the shape: anthropic
+        // error events cut the stream mid-block, no
+        // content_block_stop, no message_delta, no message_stop.
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::TextDelta {
+                delta: "half a reply".to_owned(),
+            },
+            CanonEvent::Error {
+                error: CanonError {
+                    kind: CanonErrorKind::Overloaded,
+                    message: "Overloaded".to_owned(),
+                    resets_at: None,
+                },
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("resp_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half a reply"}}"#,
+            ),
+            (
+                "error",
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            ),
+        ]);
+        let mut renderer = AnthropicRenderer::new("claude-opus-5");
+        let mut rendered = String::new();
+        for event in &events {
+            for emitted in renderer.feed(event) {
+                rendered.push_str(&render_one(&emitted));
+            }
+        }
+        assert_eq!(rendered, expected);
+        assert!(
+            !renderer.turn_ended(),
+            "a mid-turn error is not the turn's end"
+        );
+
+        // TurnFailed IS the turn's end.
+        let mut renderer = AnthropicRenderer::new("claude-opus-5");
+        renderer.feed(&CanonEvent::TurnFailed {
+            error: CanonError {
+                kind: CanonErrorKind::Api,
+                message: "upstream error".to_owned(),
+                resets_at: None,
+            },
+        });
+        assert!(renderer.turn_ended());
+    }
+
+    #[test]
+    fn message_start_renders_exactly_once_and_the_id_is_never_invented() {
+        // The turn's id latches from the FIRST TurnStarted; a later
+        // one changes nothing. A turn that never named one keeps the
+        // constant placeholder — never a minted id (purity).
+        let mut renderer = AnthropicRenderer::new("claude-opus-5");
+        let emitted = renderer.feed(&CanonEvent::TurnStarted {
+            turn_id: Some("resp_1".to_owned()),
+        });
+        assert_eq!(emitted.len(), 1);
+        let again = renderer.feed(&CanonEvent::TurnStarted {
+            turn_id: Some("resp_2".to_owned()),
+        });
+        assert!(again.is_empty(), "message_start is emitted exactly once");
+        let data = emitted[0].data();
+        assert!(
+            data.contains(r#""id":"resp_1""#),
+            "the first id latches: {data}"
+        );
+
+        let mut renderer = AnthropicRenderer::new("claude-opus-5");
+        let emitted = renderer.feed(&CanonEvent::TurnStarted { turn_id: None });
+        assert!(emitted[0].data().contains(r#""id":"msg""#));
+    }
+
+    #[test]
+    fn the_canonical_stop_reasons_render_to_the_anthropic_names() {
+        for (reason, stop) in [
+            (CanonStopReason::EndTurn, "end_turn"),
+            (CanonStopReason::ToolUse, "tool_use"),
+            (CanonStopReason::MaxTokens, "max_tokens"),
+            (CanonStopReason::Refusal, "refusal"),
+            (CanonStopReason::Incomplete(String::new()), "max_tokens"),
+            (
+                CanonStopReason::Incomplete("something_new".to_owned()),
+                "max_tokens",
+            ),
+        ] {
+            let rendered = stream_bytes(
+                "claude-opus-5",
+                &[CanonEvent::TurnEnded {
+                    stop_reason: reason.clone(),
+                    usage: None,
+                }],
+            );
+            assert!(
+                rendered.contains(&format!(r#""stop_reason":"{stop}""#)),
+                "{reason:?} renders {stop}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_canonical_usage_renders_the_anthropic_fields_in_order() {
+        // The buckets → the anthropic field names, in the table's
+        // order; absent stays absent (invariant 3); the reasoning
+        // bucket rides inside output_tokens and is never broken out.
+        let usage = CanonicalUsage {
+            input: Some(1234),
+            cache_read: Some(512),
+            cache_write: Some(64),
+            output: Some(210),
+            reasoning: Some(96),
+            raw: json!({"input_tokens": 1234}),
+        };
+        let rendered = stream_bytes(
+            "claude-opus-5",
+            &[CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: Some(usage),
+            }],
+        );
+        assert!(rendered.contains(
+            r#""usage":{"input_tokens":1234,"cache_creation_input_tokens":64,"cache_read_input_tokens":512,"output_tokens":210}"#
+        ));
+
+        // A usage without the details omits the cache keys entirely.
+        let partial = CanonicalUsage {
+            input: Some(10),
+            cache_read: None,
+            cache_write: None,
+            output: Some(5),
+            reasoning: None,
+            raw: json!({}),
+        };
+        let rendered = stream_bytes(
+            "claude-opus-5",
+            &[CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: Some(partial),
+            }],
+        );
+        assert!(
+            rendered.contains(r#""usage":{"input_tokens":10,"output_tokens":5}"#),
+            "absent details are omitted, never zeroed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_error_table_renders_canon_errors_per_kind() {
+        let error_event = |error: CanonError| {
+            let mut renderer = AnthropicRenderer::new("claude-opus-5");
+            let emitted = renderer.feed(&CanonEvent::Error { error });
+            assert_eq!(emitted.len(), 1);
+            let event = &emitted[0];
+            assert_eq!(event.event.as_deref(), Some("error"));
+            serde_json::from_str::<Value>(&event.data()).expect("data is JSON")
+        };
+        let canon = |kind: CanonErrorKind, message: &str, resets_at: Option<i64>| CanonError {
+            kind,
+            message: message.to_owned(),
+            resets_at,
+        };
+
+        // Every kind renders its anthropic type name.
+        for (kind, type_name) in [
+            (CanonErrorKind::RateLimit, "rate_limit_error"),
+            (CanonErrorKind::InvalidRequest, "invalid_request_error"),
+            (CanonErrorKind::Authentication, "authentication_error"),
+            (CanonErrorKind::Permission, "permission_error"),
+            (CanonErrorKind::NotFound, "not_found_error"),
+            (CanonErrorKind::TooLarge, "request_too_large"),
+            (CanonErrorKind::Overloaded, "overloaded_error"),
+            (CanonErrorKind::Api, "api_error"),
+        ] {
+            assert_eq!(anthropic_error_type(&canon(kind, "m", None)), type_name);
+        }
+        // retry_after rides ONLY for rate limits, and only when the
+        // reset was carried — the absolute epoch, verbatim.
+        assert_eq!(
+            error_event(canon(
+                CanonErrorKind::RateLimit,
+                "Rate limit reached.",
+                Some(1_800_000_900)
+            )),
+            json!({"type": "error", "error": {
+                "type": "rate_limit_error",
+                "message": "Rate limit reached.",
+                "retry_after": 1_800_000_900,
+            }})
+        );
+        assert_eq!(
+            error_event(canon(CanonErrorKind::RateLimit, "m", None)),
+            json!({"type": "error", "error": {
+                "type": "rate_limit_error",
+                "message": "m",
+            }}),
+            "no reset time, no retry_after"
+        );
+        assert_eq!(
+            error_event(canon(CanonErrorKind::Api, "m", Some(5))),
+            json!({"type": "error", "error": {
+                "type": "api_error",
+                "message": "m",
+            }}),
+            "a non-rate-limit never carries retry_after"
+        );
+        // The message renders verbatim — the backend resolved any
+        // stand-in chain before the canonical boundary.
+        assert_eq!(
+            anthropic_error_event_data(&canon(CanonErrorKind::Api, "server_error", None)),
+            json!({"type": "error", "error": {"type": "api_error", "message": "server_error"}})
+        );
+    }
+
+    #[test]
+    fn the_canonical_turn_renders_the_complete_message() {
+        // The categorical content order: thinking parts (by the
+        // backend's part identity), text, the tool calls (in
+        // completion order); usage when the turn reported one.
+        let turn = CanonTurn {
+            turn_id: Some("resp_1".to_owned()),
+            stop_reason: CanonStopReason::ToolUse,
+            usage: Some(CanonicalUsage {
+                input: Some(1234),
+                cache_read: Some(512),
+                cache_write: Some(64),
+                output: Some(210),
+                reasoning: Some(96),
+                raw: json!({}),
+            }),
+            error: None,
+            tool_calls: vec![CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+            }],
+            text: "I'll read the files.".to_owned(),
+            thinking: [
+                (0, "Reading the thread files.".to_owned()),
+                (1, "More thought.".to_owned()),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&anthropic_from_canonical("claude-opus-5", &turn))
+                .expect("serialise"),
+            concat!(
+                r#"{"id":"resp_1","type":"message","role":"assistant","model":"claude-opus-5","#,
+                r#""content":[{"type":"thinking","thinking":"Reading the thread files."},"#,
+                r#"{"type":"thinking","thinking":"More thought."},"#,
+                r#"{"type":"text","text":"I'll read the files."},"#,
+                r#"{"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"src/main.rs"}}],"#,
+                r#""stop_reason":"tool_use","stop_sequence":null,"#,
+                r#""usage":{"input_tokens":1234,"cache_creation_input_tokens":64,"cache_read_input_tokens":512,"output_tokens":210}}"#
+            ),
+            "byte-pinned non-streaming message"
+        );
+    }
+
+    #[test]
+    fn unparseable_arguments_aggregate_to_the_empty_input_object() {
+        let turn = CanonTurn {
+            turn_id: None,
+            stop_reason: CanonStopReason::ToolUse,
+            usage: None,
+            error: None,
+            tool_calls: vec![CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "not json at all".to_owned(),
+            }],
+            text: String::new(),
+            thinking: BTreeMap::new(),
+        };
+        let message = anthropic_from_canonical("claude-opus-5", &turn);
+        assert_eq!(
+            message["content"],
+            json!([{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {}}])
+        );
+        assert_eq!(message["stop_reason"], json!("tool_use"));
+    }
+
+    #[test]
+    fn an_errored_canonical_turn_renders_the_error_body() {
+        let turn = CanonTurn {
+            turn_id: Some("resp_fail".to_owned()),
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: Some(CanonError {
+                kind: CanonErrorKind::Api,
+                message: "Upstream overloaded.".to_owned(),
+                resets_at: None,
+            }),
+            tool_calls: Vec::new(),
+            text: "partial".to_owned(),
+            thinking: BTreeMap::new(),
+        };
+        // The error body carries no content: anthropic's
+        // non-streaming errors carry none.
+        assert_eq!(
+            anthropic_from_canonical("claude-opus-5", &turn),
+            json!({"type": "error",
+                   "error": {"type": "api_error", "message": "Upstream overloaded."}})
+        );
+    }
+
+    #[test]
+    fn an_empty_canonical_turn_renders_the_empty_message() {
+        // No turn facts at all: the placeholder id (purity forbids
+        // minting one), no content, end_turn, no usage key.
+        let turn = CanonTurn {
+            turn_id: None,
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: None,
+            tool_calls: Vec::new(),
+            text: String::new(),
+            thinking: BTreeMap::new(),
+        };
+        assert_eq!(
+            anthropic_from_canonical("claude-opus-5", &turn),
+            json!({
+                "id": "msg",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+            })
+        );
+    }
+
+    #[test]
+    fn rendering_is_pure() {
+        let events = [
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "thought".to_owned(),
+            },
+            CanonEvent::TextDelta {
+                delta: "text".to_owned(),
+            },
+            CanonEvent::ToolCall(CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            }),
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                usage: Some(CanonicalUsage {
+                    input: Some(1),
+                    cache_read: None,
+                    cache_write: None,
+                    output: Some(2),
+                    reasoning: None,
+                    raw: json!({}),
+                }),
+            },
+        ];
+        let first = stream_bytes("claude-opus-5", &events);
+        for _ in 0..3 {
+            assert_eq!(stream_bytes("claude-opus-5", &events), first);
         }
     }
 }
