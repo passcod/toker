@@ -27,6 +27,19 @@ struct Cli {
 enum Command {
     /// Run the proxy server (plan: Server core).
     Serve,
+    /// Grant a served model the days to become its family's rewrite
+    /// target early (the promote-model handover).
+    Promote {
+        /// The exact model identity, as the ledger recorded it.
+        #[arg(long = "model")]
+        model: String,
+        /// How many local days of service to grant, ending today.
+        #[arg(long = "days", default_value_t = 7)]
+        days: u32,
+        /// A prompt ceiling to grant alongside the days, in tokens.
+        #[arg(long = "max-prompt")]
+        max_prompt: Option<u64>,
+    },
     /// Run the ratatui dashboard (plan: TUI).
     Tui {
         /// Dashboard window length in minutes. Default 60: the
@@ -108,6 +121,11 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?
             .block_on(cmds::serve()),
+        Command::Promote {
+            model,
+            days,
+            max_prompt,
+        } => cmds::promote(model, days, max_prompt),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Report => not_implemented("report"),
         Command::Setup => cmds::setup(),

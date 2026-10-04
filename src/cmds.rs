@@ -18,6 +18,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::server::Server;
 use crate::store::{CostKind, Store};
+use anyhow::{Context as _, bail};
 
 /// `serve`: config → store → server, with tracing on.
 pub async fn serve() -> anyhow::Result<()> {
@@ -205,6 +206,65 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
 /// installs and enables. The predecessor's one-shot `pmset schedule
 /// wake` was macOS-only and has no counterpart here; the wizard never
 /// installs anything for this verb.
+/// `toker promote` — the promote-model handover (the control
+/// endpoint is the same one the predecessor's promote script used):
+/// grant a served model the days (and optionally the prompt ceiling)
+/// to become its family's rewrite target early. `days` local dates
+/// ending today — the default of 7 clears the election bar at any log
+/// age (the bar caps at 7), so promote is a deliberate override, not a
+/// measurement.
+pub fn promote(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(promote_run(model, days, max_prompt))
+}
+
+async fn promote_run(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let body = crate::middleware::models::promote_request_body(&model, days, max_prompt);
+    let url = format!("http://127.0.0.1:{}/_toker/models/merge", config.port);
+    let client = reqwest::Client::builder().build()?;
+    let response = client
+        .post(&url)
+        .header("x-toker-control", "models-merge")
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("posting to {url} — is toker serving?"))?;
+    let status = response.status();
+    let reply: serde_json::Value = response.json().await.unwrap_or_default();
+    if status.is_success() {
+        let targets = reply
+            .get("targets")
+            .and_then(|targets| targets.as_object())
+            .cloned()
+            .unwrap_or_default();
+        for (family, target) in targets {
+            println!("{family} → {target}");
+        }
+        return Ok(());
+    }
+    if let Some("unseen") = reply.get("error").and_then(serde_json::Value::as_str) {
+        let known = reply
+            .get("known")
+            .and_then(|known| known.as_array())
+            .map(|known| {
+                known
+                    .iter()
+                    .filter_map(|model| model.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        bail!(
+            "{model:?} has never served — the merge only promotes models \
+         the ledger has seen. Known: {}",
+            known.join(", ")
+        );
+    }
+    bail!("the merge refused: {} {}", status.as_u16(), reply)
+}
+
 pub fn wake_arm() -> anyhow::Result<()> {
     println!("{}", crate::timers::WAKE_ARM_NOTE);
     Ok(())

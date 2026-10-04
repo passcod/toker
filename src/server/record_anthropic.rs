@@ -1203,6 +1203,7 @@ pub(crate) fn record_codex_measurement(
         presence.insert("reasoning".to_owned(), json!(reasoning.is_some()));
     }
 
+    let held_input = input;
     let row = RequestRow {
         id: None,
         ts_ms,
@@ -1280,6 +1281,61 @@ pub(crate) fn record_codex_measurement(
         fast: None,
     };
     insert(ctx, row);
+
+    // The same lane-and-model note the anthropic measurement path makes
+    // (a translated request is still an anthropic-frontend turn): the
+    // learned store grows, the lane clock moves, and the sleep lock
+    // re-evaluates — a codex-served conversation keeps a live lane
+    // warm exactly like a native one.
+    let usage = capture.usage();
+    let cached = usage
+        .and_then(|usage| usage.input_tokens_details.as_ref())
+        .and_then(|details| details.cached_tokens);
+    let written = usage
+        .and_then(|usage| usage.input_tokens_details.as_ref())
+        .and_then(|details| details.cache_write_tokens);
+    let held = held_input.unwrap_or(0)
+        + i64::try_from(cached.unwrap_or(0)).unwrap_or(i64::MAX)
+        + i64::try_from(written.unwrap_or(0)).unwrap_or(i64::MAX);
+    let model = capture
+        .model()
+        .map(str::to_owned)
+        .or_else(|| ctx.effective_model.clone());
+    if let Some(model) = model.as_deref() {
+        let tz = jiff::tz::TimeZone::system();
+        if let Err(error) =
+            ctx.server
+                .models
+                .note_seen(model, ts_ms, u64::try_from(held).unwrap_or(u64::MAX), &tz)
+        {
+            tracing::error!(%error, "learned model update failed");
+        }
+    }
+    let compaction = ctx
+        .shape
+        .as_ref()
+        .is_some_and(AnthropicShape::is_compaction);
+    if let Err(error) = lanes::note_lane_response(
+        &ctx.server.store,
+        lanes::LaneResponse {
+            session_id: ctx.session_id.as_deref(),
+            tools_hash: ctx
+                .shape
+                .as_ref()
+                .and_then(|shape| shape.tools_hash.as_deref()),
+            at_ms: ts_ms,
+            prompt: held,
+            write_5m: 0,
+            write_1h: written.unwrap_or(0),
+            ping: ctx.ping,
+            forced: None,
+            compaction,
+        },
+    ) {
+        tracing::error!(%error, "lane update failed");
+    }
+    ctx.server.evaluate_awake();
+
     let model = capture.model().unwrap_or("?");
     tracing::info!(
         "POST {} → {} ledgered=yes model={} provider={} ({:.1}s)",

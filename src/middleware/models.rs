@@ -280,6 +280,31 @@ pub fn local_day(at_ms: i64, tz: &TimeZone) -> Option<String> {
     Some(zoned.date().to_string())
 }
 
+/// The promote verb's request body: the model identity, `days` as
+/// local dates ending today (the endpoint's shape — a sorted, deduped
+/// YYYY-MM-DD array — is built here so the verb is a thin POST), and
+/// `maxPrompt` only when a ceiling was asked for.
+pub fn promote_request_body(model: &str, days: u32, max_prompt: Option<u64>) -> serde_json::Value {
+    let tz = TimeZone::system();
+    let now = jiff::Zoned::now().with_time_zone(tz.clone());
+    let mut dates: Vec<String> = Vec::with_capacity(days as usize);
+    for back in 0..days as i64 {
+        // Day arithmetic cannot fail for a bounded span; a failure
+        // reads as one fewer granted day, never a wrong date.
+        if let Ok(date) = now
+            .date()
+            .checked_sub(jiff::SignedDuration::from_hours(24 * back))
+        {
+            dates.push(date.to_string());
+        }
+    }
+    let mut body = serde_json::json!({ "model": model, "days": dates });
+    if let Some(max_prompt) = max_prompt {
+        body["maxPrompt"] = serde_json::json!(max_prompt);
+    }
+    body
+}
+
 /// One incoming entry for a control-merge (the merge's `from` side,
 /// already validated by the endpoint): days to union in, and a maxPrompt to
 /// max in, for one exact model identity.
@@ -353,10 +378,70 @@ impl ModelStore {
                 served_on.insert(id, row.ts_ms);
             }
         }
-        ModelStore {
+        let models = ModelStore {
             store,
             served_on: Mutex::new(served_on),
             covered_since: covered,
+        };
+        models.reseed_days(rows);
+        models
+    }
+
+    /// Rebuild the durable learned entries from the ledger rows: union
+    /// the days, max the maxPrompt — never invent either. The election
+    /// reads the TABLE (its days are the bar's denominator), so an
+    /// imported ledger keeps its learning on the very first start, and
+    /// the table can never drift below what the ledger provably holds.
+    /// Idempotent: unions and maxes only add.
+    fn reseed_days(&self, rows: &[RequestRow]) {
+        let tz = TimeZone::system();
+        // (days, max_prompt) per identity, accumulated in memory first —
+        // one upsert per model at the end, not one per row.
+        let mut learned: BTreeMap<String, (BTreeSet<String>, i64)> = BTreeMap::new();
+        for row in rows {
+            // Proxy-written rows are not measurements.
+            if row.kind.is_some() {
+                continue;
+            }
+            let Some(model) = row.raw_model.as_deref().or(row.model.as_deref()) else {
+                continue;
+            };
+            let Some(id) = model_identity(model) else {
+                continue;
+            };
+            let Some(day) = local_day(row.ts_ms, &tz) else {
+                continue;
+            };
+            let held = row.input.unwrap_or(0)
+                + row.cache_read.unwrap_or(0)
+                + row.cache_write_total.unwrap_or(0);
+            let entry = learned.entry(id).or_insert_with(|| (BTreeSet::new(), 0));
+            entry.0.insert(day);
+            entry.1 = entry.1.max(held);
+        }
+        for (id, (days, max_prompt)) in learned {
+            let mut entry = self
+                .store
+                .load_model(&id)
+                .ok()
+                .flatten()
+                .unwrap_or(ModelEntry {
+                    model_id: id.clone(),
+                    days_json: None,
+                    max_prompt: None,
+                    context_window_json: None,
+                });
+            let mut day_set: BTreeSet<String> = days_of(&entry).into_iter().collect();
+            day_set.extend(days);
+            entry.days_json = Some(serde_json::Value::Array(
+                day_set.into_iter().map(serde_json::Value::String).collect(),
+            ));
+            entry.max_prompt = Some(entry.max_prompt.unwrap_or(0).max(max_prompt));
+            if let Err(error) = self.store.upsert_model(&entry) {
+                // Losing one model's reseed is the honest failure to
+                // log; the seed must not take the server down.
+                tracing::warn!(%error, "learned model reseed failed for {id}");
+            }
         }
     }
 
