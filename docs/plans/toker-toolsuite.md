@@ -1,7 +1,7 @@
 # toker — unified local proxy toolsuite
 
 Date: 2026-10-03
-Status: phase 1 + phase 2 shipped (see Phases); dogfooding live via opencode → openrouter; anthropic side awaiting first claude wiring
+Status: phases 1-2 shipped; codex_sub backend + anthropic→codex translation shipped and live (claude → toker → codex sub); the Responses FRONTEND endpoint (/v1/responses for driving toker from the codex CLI) is phase 3's remaining half. Dogfooding live: opencode → openrouter and claude → codex_sub, both through one toker.
 
 ## Purpose
 
@@ -192,8 +192,13 @@ Each phase usable standalone; dogfood-first ordering:
 
 ## Verify at implementation (known unknowns)
 
+- ~~Whether opencode supports per-provider custom headers for session attribution~~ **Resolved 2026-10-03: opencode sends `x-session-id` natively** (toker's default header list picks it up) — attribution is server-side and exact; no join plugin needed.
+
 - Codex sub's usage-limit reporting shape (headers vs response body).
 - Whether lunaroute exposes per-request cost or only dashboard usage reports.
-- ~~Whether opencode supports per-provider custom headers for session attribution~~ **Resolved 2026-10-03: opencode sends `x-session-id` natively** (toker's default header list picks it up) — attribution is server-side and exact; no join plugin needed.
+- ~~Codex sub's usage-limit reporting shape (headers vs response body)~~ **Resolved 2026-10-04, verified live**: `x-codex-{primary,secondary}-used-percent` headers on every /responses response (percent + window-minutes + reset-at, plus credits) — parsed and stored per-backend; a real meter source.
+- ~~Anthropic's cache granularity vs re-serialisation in practice~~ **Zero drift rows on live traffic so far**; the fidelity monitor keeps watching.
+- ~~System-role messages on the codex wire~~ **Resolved live**: the backend refuses system-role input items ("System messages are not allowed") — leading text goes to `instructions`, mid-conversation merges into the preceding user turn (ctp's pattern).
+- ~~Sampling parameters~~ **Dropped as a translation cost**: the backend rejects them ("Unsupported parameter: temperature"); its client sends none.
+- The `version` header gates models (a 400 "requires a newer version of Codex") — toker identifies with the installed CLI's tracked version from `~/.codex/version.json`.
 - claude CLI's Linux credential store location and refresh mechanics for the anthropic-sub signing path (still pending — matters when a non-claude frontend drives anthropic sub).
-- Anthropic's cache granularity vs re-serialisation in practice (the fidelity monitor answers this in production; corpus tests answer it beforehand — zero drift rows observed on live openai traffic so far).
