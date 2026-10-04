@@ -1,7 +1,9 @@
 //! The idle-sleep lock — the predecessor proxy's awake subsystem (plan:
-//! "Lane tracking + sleep lock"), ported faithfully. Linux v1: the
-//! predecessor's scheduled-wake re-arming was macOS-only (`pmset repeat`)
-//! and is deliberately NOT ported.
+//! "Lane tracking + sleep lock"), ported faithfully. The scheduled-wake
+//! half of that subsystem is the systemd timer set
+//! ([`crate::timers`] + the wizard's wake/hold/ping units): the
+//! predecessor's re-arming was macOS `pmset repeat`, whose Linux
+//! counterpart is `WakeSystem=true`.
 //!
 //! Why this exists: desktop idle-suspend kills running agent sessions.
 //! While any lane is "live" — its cache would be: 5m or 1h past its last

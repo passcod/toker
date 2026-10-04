@@ -38,9 +38,16 @@
 //! output, never into a unit file. Tests pin the rule with a scripted
 //! key and an output scan.
 //!
-//! Deferred on purpose: the wake/hold/ping timers (plan: "Sleep lock,
-//! wake, ping") are a following unit — the wizard says they are not
-//! yet available rather than stubbing a toggle that controls nothing.
+//! The wake/hold/ping timers (plan: "Sleep lock, wake, ping") are a
+//! real offer in the toggles step: a free-form `hh:mm` slot list
+//! (strictly validated; the default, empty, skips silently), the hold
+//! and per-slot ping USER units through the ordinary user-manager
+//! path, and the wake SYSTEM timer — the only root-level piece —
+//! staged into the units dir and enabled by path through
+//! [`SystemRunner::systemctl_system`], which production runs as
+//! `sudo systemctl` (it says so first: sudo will be asked). Every
+//! timers failure is non-fatal with manual commands printed — a
+//! machine that never sleeps-or-wakes still pings fine while up.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +67,7 @@ use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
 use crate::setup::{Step, plan};
+use crate::timers::{self, HOLD_UNIT_FOR, PING_DELAY_MINUTES};
 
 /// The enabled unit (the socket). The service is never enabled
 /// directly — the socket starts it on demand.
@@ -67,6 +75,19 @@ pub const SOCKET_UNIT: &str = "toker.socket";
 
 /// The socket-activated service unit.
 pub const SERVICE_UNIT: &str = "toker.service";
+
+/// The wake SYSTEM timer's name (plan: "Sleep lock, wake, ping") —
+/// the only root-level piece. Staged into the user units dir (the one
+/// place the wizard can write without root) and enabled by path into
+/// the system manager through sudo; `WakeSystem=true` needs
+/// `CAP_WAKE_ALARM`, which the user manager lacks.
+pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
+
+/// The hold USER timer's name (same name, timer + service pair).
+pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
+
+/// The hold USER service's name.
+pub const HOLD_SERVICE_UNIT: &str = "toker-hold.service";
 
 /// How long [`Step::VerifyService`] waits for the listener to answer
 /// both usage paths: a cold socket-activated start (SQLite open,
@@ -137,6 +158,12 @@ pub trait SystemRunner {
     /// Run `systemctl --user <args>` to completion.
     fn systemctl_user(&self, args: &[&str]) -> Result<Output>;
 
+    /// Run `systemctl <args>` against the SYSTEM manager, as root —
+    /// production goes through `sudo systemctl` (say so before
+    /// calling: sudo will ask). The wake timer's enable is the only
+    /// call the wizard makes here.
+    fn systemctl_system(&self, args: &[&str]) -> Result<Output>;
+
     /// Install a unit file into the user units dir, returning the path
     /// written. Declarative: the same contents install cleanly over an
     /// earlier install of the same unit.
@@ -164,6 +191,16 @@ impl SystemRunner for ProcessRunner {
             .args(args)
             .output()
             .with_context(|| format!("running systemctl --user {}", args.join(" ")))
+    }
+
+    fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
+        // sudo, so the wizard says so before every call: the wake
+        // timer's enable is the only root-level action toker takes.
+        std::process::Command::new("sudo")
+            .arg("systemctl")
+            .args(args)
+            .output()
+            .with_context(|| format!("running sudo systemctl {}", args.join(" ")))
     }
 
     fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
@@ -349,6 +386,160 @@ MemoryDenyWriteExecute=true
     )
 }
 
+/// `toker-wake.timer` — the SYSTEM unit (plan: "Sleep lock, wake,
+/// ping"): one `OnCalendar=` per user-chosen slot plus
+/// `WakeSystem=true`, which wakes the machine **from suspend only**
+/// (a powered-off machine stays off). Root-level on purpose: the user
+/// manager lacks `CAP_WAKE_ALARM`, so this is the only unit toker
+/// installs into the system manager. `toker wake-arm` is the
+/// documented no-op pointing here.
+pub fn wake_system_unit(slots: &[String]) -> String {
+    let mut on_calendar = String::new();
+    for slot in slots {
+        on_calendar.push_str(&format!("OnCalendar={slot}\n"));
+    }
+    format!(
+        r#"[Unit]
+Description=toker wake timer (wakes the machine at the chosen slots)
+
+[Timer]
+# The only root-level piece toker installs: WakeSystem=true needs
+# CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
+# the system manager and `toker setup` enables it through sudo. Wakes
+# from suspend only — a machine that is powered off stays off.
+WakeSystem=true
+{on_calendar}
+[Install]
+WantedBy=timers.target
+"#
+    )
+}
+
+/// `toker-hold.timer` + `toker-hold.service` — the hold USER units
+/// (plan: "Sleep lock, wake, ping"): a timer at the wake slots running
+/// the hold verb for the pinned 15 m. A timer that elapses while the
+/// machine is suspended fires on resume, and the hold then keeps the
+/// machine up those 15 minutes so the ping (11 m after the slot) can
+/// fire; `Persistent=false` keeps a missed slot from re-running hours
+/// late — the ping's own lateness guard refuses those anyway.
+pub fn hold_user_units(slots: &[String], exe: &Path) -> (String, String) {
+    let mut on_calendar = String::new();
+    for slot in slots {
+        on_calendar.push_str(&format!("OnCalendar={slot}\n"));
+    }
+    let timer = format!(
+        r#"[Unit]
+Description=toker hold timer (holds the idle-sleep lock {HOLD_UNIT_FOR} after each wake slot)
+
+[Timer]
+# At the wake slots themselves: a timer that elapses while the machine
+# is suspended fires on resume, and the hold then keeps the machine up
+# for its span so the ping ({PING_DELAY_MINUTES} m after the slot) can fire.
+{on_calendar}
+# A hold re-run hours after a missed slot would hold the machine up for
+# nothing — the ping it protects never fires that late either.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+"#,
+    );
+    let service = format!(
+        r#"[Unit]
+Description=toker hold service (holds the idle-sleep lock for its span)
+
+[Service]
+Type=oneshot
+# The verb takes the lock independently of the daemon's own — both
+# hold, both release on their own. The start timeout is off: a hold is
+# exactly as long as its --for, and must not be killed at the 90 s
+# default.
+TimeoutStartSec=0
+ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
+"#,
+        exe = exe.display(),
+    );
+    (timer, service)
+}
+
+/// One slot's ping pair — [`ping_user_units`] returns one per slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingUnits {
+    /// The slot this pair serves, `hh:mm`.
+    pub slot: String,
+    /// The timer unit's name.
+    pub timer_name: String,
+    /// The timer unit's contents.
+    pub timer: String,
+    /// The service unit's name.
+    pub service_name: String,
+    /// The service unit's contents.
+    pub service: String,
+}
+
+/// The ping USER units (plan: "Sleep lock, wake, ping") — **one
+/// timer+service pair per slot**, the timer at slot+11 m and the
+/// service running the ping verb **for that slot**. Per-slot because
+/// the `--slot` argument must match its timer's clock time: a shared
+/// service cannot know which slot fired. The slots must already be
+/// validated `hh:mm` (the wizard validates before calling).
+pub fn ping_user_units(slots: &[String], exe: &Path) -> Vec<PingUnits> {
+    slots
+        .iter()
+        .filter_map(|slot| {
+            let parsed = timers::parse_slot(slot)?;
+            let fire = timers::slot_plus_minutes(&parsed, PING_DELAY_MINUTES).hhmm();
+            let stem = ping_unit_stem(slot);
+            let timer = format!(
+                r#"[Unit]
+Description=toker ping timer (opens the {slot} quota window, {PING_DELAY_MINUTES} m after the slot)
+
+[Timer]
+# {PING_DELAY_MINUTES} m after the slot: the machine has woken and settled, and
+# the hold still has 4 m left to run. Persistent=false deliberately —
+# a ping re-run hours late would open a mostly-spent window, and the
+# verb's lateness guard refuses those anyway.
+OnCalendar={fire}
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+"#,
+            );
+            let service = format!(
+                r#"[Unit]
+Description=toker ping service (opens the {slot} quota window)
+
+[Service]
+Type=oneshot
+# claude -p as a CLIENT of toker: the request lands on the ledger with
+# ping: true — on-ledger, and never holding the sleep lock. User
+# services start with a minimal environment, so the common user-local
+# bin dirs ride along on PATH. A real start timeout, generous for a
+# tiny request: a hung child must not suppress the next slot's ping.
+Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+TimeoutStartSec=10m
+ExecStart="{exe}" ping-window --slot={slot}
+"#,
+                exe = exe.display(),
+            );
+            Some(PingUnits {
+                slot: slot.clone(),
+                timer_name: format!("{stem}.timer"),
+                timer,
+                service_name: format!("{stem}.service"),
+                service,
+            })
+        })
+        .collect()
+}
+
+/// The per-slot ping unit stem: `toker-ping-0900` for the 09:00 slot
+/// (a unit name cannot carry the colon).
+pub fn ping_unit_stem(slot: &str) -> String {
+    format!("toker-ping-{}", slot.replace(':', ""))
+}
+
 // ── detection ───────────────────────────────────────────────────────────
 
 /// What one frontend's config file says about its base URL. The
@@ -527,6 +718,23 @@ pub struct RunReport {
     pub plugin_installed: Option<PathBuf>,
     /// The plugin was offered and declined.
     pub plugin_declined: bool,
+    /// The wake/hold/ping slots chosen this run (plan: "Sleep lock,
+    /// wake, ping"); empty means none were chosen, in which case no
+    /// timer unit was touched and existing timers (if any) were left
+    /// exactly as they were.
+    pub timer_slots: Vec<String>,
+    /// The timer units installed this run: the hold pair, the per-slot
+    /// ping pairs, and the staged wake system timer.
+    pub timers_installed: Vec<String>,
+    /// Every user-timer install, daemon-reload and enable succeeded.
+    pub timers_ok: bool,
+    /// Manual commands for the user timers when [`RunReport::timers_ok`]
+    /// is false.
+    pub timers_manual: Vec<String>,
+    /// The wake SYSTEM timer was enabled through sudo this run.
+    pub wake_enabled: bool,
+    /// Manual commands for the wake timer when not enabled.
+    pub wake_manual: Vec<String>,
 }
 
 // ── the wizard ──────────────────────────────────────────────────────────
@@ -1331,12 +1539,11 @@ impl<'a> Wizard<'a> {
 
     /// The plan's optional toggles, after the frontends: the awake
     /// report (asked at the backends step — it is config), the
-    /// history import offer (when the source exists: the existing
-    /// `toker
-    /// import` logic, in-process, into the ledger the config names),
-    /// and the deferred timers' note — the wake/hold/ping verbs are a
-    /// following unit, so the wizard says they are not yet available
-    /// rather than stubbing a toggle that controls nothing.
+    /// wake/hold/ping slot question (empty = skip silently; slots
+    /// install the hold and ping user timers and attempt the wake
+    /// system timer through sudo), and the history import offer (when
+    /// the source exists: the existing `toker import` logic,
+    /// in-process, into the ledger the config names).
     fn toggles_step(
         &mut self,
         detected: &Detected,
@@ -1349,10 +1556,13 @@ impl<'a> Wizard<'a> {
             "  awake (idle-sleep lock while sessions are live): {}",
             on_off(current.awake)
         ))?;
-        self.say(
-            "  wake timer, hold, ping windows: not yet available in toker \
-             (a following unit)",
-        )?;
+        let slots = self.ask_slots()?;
+        if !slots.is_empty() {
+            self.timers_step(&slots, report)?;
+        }
+        // Empty slots skip silently: nothing printed, nothing
+        // installed — and any timers a previous run left standing stay
+        // exactly as they are.
         if !detected.ctp_usage {
             self.say("  predecessor history: none to import")?;
             return Ok(());
@@ -1389,6 +1599,195 @@ impl<'a> Wizard<'a> {
                     self.paths.ctp_usage.display()
                 ))?;
             }
+        }
+        Ok(())
+    }
+
+    /// The wake/hold/ping slot question: a free-form `hh:mm` list,
+    /// strictly validated (a bad token is named and re-asked); the
+    /// default — empty — is no slots, skipped silently.
+    fn ask_slots(&mut self) -> Result<Vec<String>> {
+        for _ in 0..3 {
+            let answer = self.prompt.text(
+                "Wake/hold/ping slots (hh:mm, comma- or space-separated; empty for none)",
+                None,
+                false,
+            )?;
+            if answer.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            match timers::parse_slot_list(&answer) {
+                Ok(slots) => return Ok(slots),
+                Err(bad) => self.say(&format!("  {bad:?} is not a hh:mm slot — try again"))?,
+            }
+        }
+        bail!("no valid slots were given")
+    }
+
+    /// The timers proper, once slots are chosen (plan: "Sleep lock,
+    /// wake, ping"). The hold and per-slot ping units go through the
+    /// ordinary user-manager path (`install_unit`, `daemon-reload`,
+    /// `enable --now` per timer); the wake SYSTEM timer follows in
+    /// [`Wizard::wake_step`]. Every failure here is non-fatal with the
+    /// manual commands printed.
+    fn timers_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
+        let exe = std::env::current_exe().context("resolving the running binary's own path")?;
+        report.timer_slots = slots.to_vec();
+
+        // The user units: one hold pair, plus one ping pair per slot.
+        let (hold_timer, hold_service) = hold_user_units(slots, &exe);
+        let mut units = vec![
+            (HOLD_TIMER_UNIT.to_owned(), hold_timer),
+            (HOLD_SERVICE_UNIT.to_owned(), hold_service),
+        ];
+        let pings = ping_user_units(slots, &exe);
+        for pair in &pings {
+            units.push((pair.timer_name.clone(), pair.timer.clone()));
+            units.push((pair.service_name.clone(), pair.service.clone()));
+        }
+
+        let mut ok = true;
+        for (name, contents) in &units {
+            match self.runner.install_unit(name, contents) {
+                Ok(path) => {
+                    self.say(&format!("installed {} ({})", name, path.display()))?;
+                    report.timers_installed.push(name.clone());
+                }
+                Err(error) => {
+                    ok = false;
+                    self.say(&format!("installing {name} failed: {error:#}"))?;
+                    self.say("  the unit contents, to place by hand:")?;
+                    for line in contents.lines() {
+                        self.say(&format!("    | {line}"))?;
+                    }
+                    report.timers_manual.push(format!(
+                        "write {name} into {}",
+                        self.paths.units_dir.join(name).display()
+                    ));
+                }
+            }
+        }
+
+        let mut timer_names = vec![HOLD_TIMER_UNIT.to_owned()];
+        timer_names.extend(pings.iter().map(|pair| pair.timer_name.clone()));
+        if ok {
+            match self.runner.systemctl_user(&["daemon-reload"]) {
+                Ok(output) if output.status.success() => {
+                    self.say("systemctl --user daemon-reload — ok")?
+                }
+                other => {
+                    ok = false;
+                    self.say(&format!(
+                        "systemctl --user daemon-reload failed: {}",
+                        stderr_of(&other)
+                    ))?;
+                }
+            }
+        }
+        if ok {
+            for timer in &timer_names {
+                match self.runner.systemctl_user(&["enable", "--now", timer]) {
+                    Ok(output) if output.status.success() => {
+                        self.say(&format!("systemctl --user enable --now {timer} — ok"))?
+                    }
+                    other => {
+                        ok = false;
+                        self.say(&format!(
+                            "systemctl --user enable --now {timer} failed: {}",
+                            stderr_of(&other)
+                        ))?;
+                    }
+                }
+            }
+        }
+        if !ok {
+            report
+                .timers_manual
+                .push("systemctl --user daemon-reload".to_owned());
+            for timer in &timer_names {
+                report
+                    .timers_manual
+                    .push(format!("systemctl --user enable --now {timer}"));
+            }
+            self.say("the user timers did not all come up — the wake timer is still attempted")?;
+            self.say("finish the user timers by hand:")?;
+            for command in &report.timers_manual {
+                self.say(&format!("  {command}"))?;
+            }
+        }
+        report.timers_ok = ok;
+
+        // The wake SYSTEM timer: independent of the user timers' fate
+        // (a machine that never wakes still holds and pings fine while
+        // it is up).
+        self.wake_step(slots, report)
+    }
+
+    /// The wake SYSTEM timer — the only root-level piece. The unit is
+    /// staged where the wizard can write (the user units dir), then
+    /// enabled **by path** through `sudo systemctl enable --now`:
+    /// systemctl links a unit file outside the search paths into
+    /// `/etc/systemd/system` itself. Where the staging filesystem is
+    /// one the system manager refuses to link from (or sudo is
+    /// declined), the failure is non-fatal and the manual commands —
+    /// a plain copy into `/etc/systemd/system`, then enable by name —
+    /// are printed.
+    fn wake_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
+        let contents = wake_system_unit(slots);
+        let staged = match self.runner.install_unit(WAKE_TIMER_UNIT, &contents) {
+            Ok(path) => {
+                self.say(&format!("staged {} ({})", WAKE_TIMER_UNIT, path.display()))?;
+                report.timers_installed.push(WAKE_TIMER_UNIT.to_owned());
+                path
+            }
+            Err(error) => {
+                report.wake_manual.push(format!(
+                    "write {WAKE_TIMER_UNIT} into /etc/systemd/system (contents below)"
+                ));
+                self.say(&format!("staging {WAKE_TIMER_UNIT} failed: {error:#}"))?;
+                self.say("  the unit contents, to place by hand into /etc/systemd/system:")?;
+                for line in contents.lines() {
+                    self.say(&format!("    | {line}"))?;
+                }
+                self.say_wake_manual(report)?;
+                return Ok(());
+            }
+        };
+
+        self.say(
+            "enabling the wake system timer — sudo will be asked \
+             (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)",
+        )?;
+        let by_path = staged.display().to_string();
+        match self.runner.systemctl_system(&["enable", "--now", &by_path]) {
+            Ok(output) if output.status.success() => {
+                self.say(&format!("sudo systemctl enable --now {by_path} — ok"))?;
+                report.wake_enabled = true;
+            }
+            other => {
+                self.say(&format!(
+                    "enabling the wake system timer failed: {}",
+                    stderr_of(&other)
+                ))?;
+                report.wake_manual = vec![
+                    format!("sudo cp {by_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
+                    format!(
+                        "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+                    ),
+                ];
+                self.say_wake_manual(report)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The wake failure's report: what is not working and the one or
+    /// two commands that finish it by hand.
+    fn say_wake_manual(&mut self, report: &RunReport) -> Result<()> {
+        self.say("the wake timer is NOT enabled — the machine will not wake for its slots;")?;
+        self.say("finish by hand:")?;
+        for command in &report.wake_manual {
+            self.say(&format!("  {command}"))?;
         }
         Ok(())
     }
@@ -1453,6 +1852,27 @@ impl<'a> Wizard<'a> {
             None => "not imported".to_owned(),
         };
         self.say(&format!("  ledger    : {ledger}"))?;
+        let timers = if report.timer_slots.is_empty() {
+            "none chosen this run".to_owned()
+        } else {
+            let mut manual = Vec::new();
+            manual.extend(report.timers_manual.iter().cloned());
+            manual.extend(report.wake_manual.iter().cloned());
+            if report.timers_ok && report.wake_enabled {
+                format!(
+                    "slots {} — hold+ping user timers installed and enabled; \
+                     wake system timer enabled",
+                    report.timer_slots.join(", ")
+                )
+            } else {
+                format!(
+                    "slots {} — NOT fully up — finish by hand: {}",
+                    report.timer_slots.join(", "),
+                    manual.join(" && ")
+                )
+            }
+        };
+        self.say(&format!("  timers    : {timers}"))?;
         self.say("re-run `toker setup` any time to change anything.")?;
         Ok(())
     }
@@ -1702,15 +2122,18 @@ mod tests {
     // ── the recording fake runner ─────────────────────────────────
 
     /// The fake runner: scripted systemctl outcomes in call order,
-    /// every call and every unit install recorded. Install writes the
-    /// scratch units dir so a run's files exist like they would for
-    /// real. NO systemctl is ever executed — the machine's live
-    /// toker.socket is enabled and serving while these tests run.
+    /// every call and every unit install recorded (user and sudo
+    /// systemctl recorded separately). Install writes the scratch
+    /// units dir so a run's files exist like they would for real.
+    /// NO systemctl is ever executed — user or system — the machine's
+    /// live toker.socket is enabled and serving while these tests run.
     #[derive(Clone, Default)]
     struct FakeRunner {
         units_dir: PathBuf,
         outcomes: Arc<Mutex<VecDeque<Result<Output>>>>,
+        system_outcomes: Arc<Mutex<VecDeque<Result<Output>>>>,
         calls: Arc<Mutex<Vec<Vec<String>>>>,
+        system_calls: Arc<Mutex<Vec<Vec<String>>>>,
         installed: Arc<Mutex<Vec<(String, String)>>>,
     }
 
@@ -1719,13 +2142,19 @@ mod tests {
             FakeRunner {
                 units_dir,
                 outcomes: Arc::new(Mutex::new(outcomes.into())),
+                system_outcomes: Arc::new(Mutex::new(VecDeque::new())),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                system_calls: Arc::new(Mutex::new(Vec::new())),
                 installed: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn system_calls(&self) -> Vec<Vec<String>> {
+            self.system_calls.lock().unwrap().clone()
         }
 
         fn installed(&self) -> Vec<(String, String)> {
@@ -1744,6 +2173,18 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| panic!("no scripted systemctl outcome for {args:?}"))
+        }
+
+        fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
+            self.system_calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|arg| arg.to_string()).collect());
+            self.system_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| panic!("no scripted sudo systemctl outcome for {args:?}"))
         }
 
         fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
@@ -1809,6 +2250,15 @@ mod tests {
                 runner: FakeRunner::new(units_dir, systemctl),
                 out: Vec::new(),
             }
+        }
+
+        /// Script the sudo outcomes (the wake timer's enables). A run
+        /// without any scripted sudo outcome panics if it reaches a
+        /// `systemctl_system` call — the wake leg must be scripted
+        /// deliberately.
+        fn with_system(self, system: Vec<Result<Output>>) -> Rig {
+            *self.runner.system_outcomes.lock().unwrap() = system.into();
+            self
         }
 
         async fn run(&mut self, timeout: Duration) -> Result<RunReport> {
@@ -1971,9 +2421,10 @@ default_backend_anthropic = "codex_sub"
     // ── the scripted answers ──────────────────────────────────────
 
     /// A full fresh-machine run: anthropic_sub, openrouter via env,
-    /// awake on, the given port, and yes to every detected frontend
+    /// awake on, the given port, yes to every detected frontend
     /// (claude, [workhorse,] opencode, shell rc — the caller splices
-    /// the workhorse confirm in where detection found it).
+    /// the workhorse confirm in where detection found it), and no
+    /// wake/hold/ping slots (the silent default).
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
             select(0),               // anthropic backend: anthropic_sub
@@ -1986,23 +2437,8 @@ default_backend_anthropic = "codex_sub"
             confirm(true),           // opencode
             confirm(true),           // shell rc
             confirm(true),           // the opencode plugin (opt-out, on)
+            text(""),                // wake/hold/ping slots: none
         ]
-    }
-
-    /// The fresh script plus the workhorse confirm, between the
-    /// claude and opencode confirms.
-    fn answers_fresh_with_workhorse(port: u16) -> Vec<Answer> {
-        let mut answers = answers_fresh(port);
-        answers.insert(7, confirm(true));
-        answers
-    }
-
-    /// The fresh script with openrouter's key stored as a literal.
-    fn answers_literal_key(port: u16, key: &str) -> Vec<Answer> {
-        let mut answers = answers_fresh(port);
-        answers[2] = select(1); // key source: literal in toker.toml
-        answers[3] = text(key); // the key itself, masked in the real UI
-        answers
     }
 
     // ── the tests ──────────────────────────────────────────────────
@@ -2061,6 +2497,127 @@ WantedBy=sockets.target
             !service.contains("18082") && !service.contains("18123"),
             "no hardcoded port in the service unit"
         );
+    }
+
+    #[test]
+    fn the_timer_unit_templates_are_pinned() {
+        let exe = Path::new("/opt/toker/toker");
+        let slots = ["09:00".to_owned(), "23:55".to_owned()];
+
+        // The wake SYSTEM unit: one OnCalendar= per slot, WakeSystem,
+        // timers.target — and nothing else (no Persistent: a wake
+        // timer's default is what the semantics want).
+        let wake = wake_system_unit(&slots);
+        assert_eq!(
+            wake,
+            r#"[Unit]
+Description=toker wake timer (wakes the machine at the chosen slots)
+
+[Timer]
+# The only root-level piece toker installs: WakeSystem=true needs
+# CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
+# the system manager and `toker setup` enables it through sudo. Wakes
+# from suspend only — a machine that is powered off stays off.
+WakeSystem=true
+OnCalendar=09:00
+OnCalendar=23:55
+
+[Install]
+WantedBy=timers.target
+"#
+        );
+
+        // The hold pair: the slots verbatim, Persistent=false, and the
+        // verb with the pinned 15 m span.
+        let (hold_timer, hold_service) = hold_user_units(&slots, exe);
+        assert_eq!(
+            hold_timer,
+            r#"[Unit]
+Description=toker hold timer (holds the idle-sleep lock 15m after each wake slot)
+
+[Timer]
+# At the wake slots themselves: a timer that elapses while the machine
+# is suspended fires on resume, and the hold then keeps the machine up
+# for its span so the ping (11 m after the slot) can fire.
+OnCalendar=09:00
+OnCalendar=23:55
+
+# A hold re-run hours after a missed slot would hold the machine up for
+# nothing — the ping it protects never fires that late either.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+"#
+        );
+        assert_eq!(
+            hold_service,
+            r#"[Unit]
+Description=toker hold service (holds the idle-sleep lock for its span)
+
+[Service]
+Type=oneshot
+# The verb takes the lock independently of the daemon's own — both
+# hold, both release on their own. The start timeout is off: a hold is
+# exactly as long as its --for, and must not be killed at the 90 s
+# default.
+TimeoutStartSec=0
+ExecStart="/opt/toker/toker" hold --for=15m
+"#
+        );
+
+        // The ping pairs: ONE per slot, the timer at slot+11 m — the
+        // 23:55 slot wraps to 00:06, which a daily OnCalendar reads as
+        // the next day, exactly 11 m later — and the service carrying
+        // ITS OWN slot. Per-slot unit names (no colon in unit names).
+        let pings = ping_user_units(&slots, exe);
+        assert_eq!(pings.len(), 2, "one timer+service pair per slot");
+        assert_eq!(pings[0].timer_name, "toker-ping-0900.timer");
+        assert_eq!(pings[0].service_name, "toker-ping-0900.service");
+        assert_eq!(
+            pings[0].timer,
+            r#"[Unit]
+Description=toker ping timer (opens the 09:00 quota window, 11 m after the slot)
+
+[Timer]
+# 11 m after the slot: the machine has woken and settled, and
+# the hold still has 4 m left to run. Persistent=false deliberately —
+# a ping re-run hours late would open a mostly-spent window, and the
+# verb's lateness guard refuses those anyway.
+OnCalendar=09:11
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+"#
+        );
+        assert_eq!(
+            pings[0].service,
+            r#"[Unit]
+Description=toker ping service (opens the 09:00 quota window)
+
+[Service]
+Type=oneshot
+# claude -p as a CLIENT of toker: the request lands on the ledger with
+# ping: true — on-ledger, and never holding the sleep lock. User
+# services start with a minimal environment, so the common user-local
+# bin dirs ride along on PATH. A real start timeout, generous for a
+# tiny request: a hung child must not suppress the next slot's ping.
+Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+TimeoutStartSec=10m
+ExecStart="/opt/toker/toker" ping-window --slot=09:00
+"#
+        );
+        // The wrapped slot: 23:55 + 11 m = 00:06, still paired with
+        // --slot=23:55.
+        assert_eq!(pings[1].timer_name, "toker-ping-2355.timer");
+        assert!(pings[1].timer.contains("OnCalendar=00:06"));
+        assert!(pings[1].timer.contains("opens the 23:55 quota window"));
+        assert!(pings[1].service.contains("--slot=23:55"));
+
+        // The stems munge the colon away.
+        assert_eq!(ping_unit_stem("09:00"), "toker-ping-0900");
+        assert_eq!(ping_unit_stem("23:55"), "toker-ping-2355");
     }
 
     #[tokio::test]
@@ -2190,9 +2747,23 @@ WantedBy=sockets.target
         assert!(out.contains("[4/6] verify the service answers"), "{out}");
         assert!(out.contains("[5/6] wire the frontends"), "{out}");
         assert!(out.contains("[6/6] done"), "{out}");
+        // The slots question was asked (the last question of the run)
+        // and the empty answer skipped silently: no timer unit was
+        // installed, no enable attempted, nothing printed about wake.
+        let asked = rig.prompt.asked();
         assert!(
-            out.contains("not yet available in toker"),
-            "the deferred timers' note: {out}"
+            asked
+                .last()
+                .is_some_and(|asked| asked.message.contains("Wake/hold/ping slots")),
+            "the slots question: {asked:?}"
+        );
+        assert!(!out.contains("toker-hold"), "{out}");
+        assert!(!out.contains("toker-ping"), "{out}");
+        assert!(!out.contains("toker-wake"), "{out}");
+        assert!(!out.contains("sudo"), "{out}");
+        assert!(
+            out.contains("timers    : none chosen this run"),
+            "the summary names the silent skip: {out}"
         );
 
         // The fixture seeds were what the files said before the run —
@@ -2235,10 +2806,17 @@ WantedBy=sockets.target
         let rc_once = std::fs::read(root.join(".bashrc")).expect("read the rc");
         let units_once = rig.runner.installed();
 
-        // Run two, same root: keep the config, leave every frontend.
+        // Run two, same root: keep the config, leave every frontend,
+        // and no slots (the silent default).
         let mut rerun = Rig::at(
             root.clone(),
-            vec![select(0), confirm(true), confirm(true), confirm(true)],
+            vec![
+                select(0),     // keep the config
+                confirm(true), // claude: already wired
+                confirm(true), // opencode: already wired
+                confirm(true), // the shell rc: already wired
+                text(""),      // wake/hold/ping slots: none
+            ],
             vec![active(), ok_empty(), ok_empty()],
         );
         let report = rerun
@@ -2276,14 +2854,11 @@ WantedBy=sockets.target
         assert!(report.verified.is_some());
         assert!(report.units_ok);
         // The transcript pin: run two's first question was the
-        // keep-vs-reconfigure select, and the frontend questions were
-        // confirms.
-        assert_eq!(rerun.prompt.asked()[0].kind, "select");
-        assert!(
-            rerun.prompt.asked()[1..]
-                .iter()
-                .all(|asked| asked.kind == "confirm")
-        );
+        // keep-vs-reconfigure select, the frontend questions were
+        // confirms, and the last question was the slots text (empty —
+        // the silent default).
+        let kinds: Vec<&str> = rerun.prompt.asked().iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["select", "confirm", "confirm", "confirm", "text"]);
 
         // The re-run detected everything and said so.
         let out = rerun.out();
@@ -2366,6 +2941,7 @@ WantedBy=sockets.target
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
+                text(""),                // wake/hold/ping slots: none
             ],
             vec![active(), ok_empty(), ok_empty()],
         );
@@ -2439,7 +3015,20 @@ WantedBy=sockets.target
         );
         let mut with = Rig::at(
             with_dir.clone(),
-            answers_fresh_with_workhorse(port),
+            // The fresh script up to the port, the workhorse confirm
+            // (the only frontend detected here — no user-level claude,
+            // no opencode, no shell rc, so no plugin offer), then no
+            // slots.
+            vec![
+                select(0),               // anthropic backend: anthropic_sub
+                confirm(true),           // openrouter on
+                select(0),               // key source: env
+                text(""),                // env name: keep the default
+                confirm(true),           // awake
+                text(&port.to_string()), // the listener port
+                confirm(true),           // workhorse
+                text(""),                // wake/hold/ping slots: none
+            ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
         let report = with
@@ -2501,7 +3090,7 @@ WantedBy=sockets.target
         let mut rig = Rig::new(
             "import",
             // The fresh script without frontend confirms (nothing
-            // detected), plus the import yes.
+            // detected), no slots, plus the import yes.
             vec![
                 select(0),
                 confirm(true),
@@ -2509,6 +3098,7 @@ WantedBy=sockets.target
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
+                text(""),      // wake/hold/ping slots: none
                 confirm(true), // import the predecessor's history
             ],
             vec![inactive(), ok_empty(), ok_empty()],
@@ -2557,7 +3147,16 @@ WantedBy=sockets.target
         const KEY: &str = "sk-or-v1-this-must-never-appear-in-output";
         let mut rig = Rig::new(
             "secret",
-            answers_literal_key(port, KEY),
+            // The literal-key script with no frontends detected: the
+            // questions end at the port, then the slots text.
+            {
+                let mut answers = answers_fresh(port);
+                answers[2] = select(1); // key source: literal in toker.toml
+                answers[3] = text(KEY); // the key itself, masked in the real UI
+                answers.truncate(6); // nothing past the port is asked
+                answers.push(text("")); // wake/hold/ping slots: none
+                answers
+            },
             vec![inactive(), ok_empty(), ok_empty()],
         );
 
@@ -2770,5 +3369,257 @@ WantedBy=sockets.target
             "{\"name\":\"hand-tuned\"}",
             "the hand edit survived"
         );
+    }
+
+    // ── the wake/hold/ping timers ─────────────────────────────────
+
+    /// The full slots leg: the hold pair and both ping pairs install
+    /// and enable through the user manager, the wake unit is staged
+    /// into the units dir and enabled by path through sudo.
+    #[tokio::test]
+    async fn slots_install_and_enable_the_hold_ping_and_wake_timers() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-slots",
+            {
+                let mut answers = answers_fresh(port);
+                answers[10] = text("09:00, 12:30"); // the slots
+                answers
+            },
+            vec![
+                inactive(), // is-active
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // daemon-reload (timers)
+                ok_empty(), // enable --now toker-hold.timer
+                ok_empty(), // enable --now toker-ping-0900.timer
+                ok_empty(), // enable --now toker-ping-1230.timer
+            ],
+        )
+        .with_system(vec![ok_empty()]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("the slots run completes");
+
+        let exe = std::env::current_exe().expect("this test binary's path");
+        let slots = ["09:00".to_owned(), "12:30".to_owned()];
+        let pings = ping_user_units(&slots, &exe);
+        let (hold_timer, hold_service) = hold_user_units(&slots, &exe);
+
+        // The units installed, in order, byte-for-byte the generators'
+        // output — including the staged wake system timer.
+        assert_eq!(
+            rig.runner.installed(),
+            vec![
+                (SOCKET_UNIT.to_owned(), socket_unit(port)),
+                (
+                    SERVICE_UNIT.to_owned(),
+                    service_unit(&exe, &rig.paths().state_dir)
+                ),
+                (HOLD_TIMER_UNIT.to_owned(), hold_timer),
+                (HOLD_SERVICE_UNIT.to_owned(), hold_service),
+                (pings[0].timer_name.clone(), pings[0].timer.clone()),
+                (pings[0].service_name.clone(), pings[0].service.clone()),
+                (pings[1].timer_name.clone(), pings[1].timer.clone()),
+                (pings[1].service_name.clone(), pings[1].service.clone()),
+                (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
+            ],
+            "socket, service, hold pair, one ping pair per slot, staged wake"
+        );
+
+        // The user-manager calls, in the wizard's exact order.
+        assert_eq!(
+            rig.runner.calls(),
+            vec![
+                vec!["is-active", SOCKET_UNIT],
+                vec!["daemon-reload"],
+                vec!["enable", "--now", SOCKET_UNIT],
+                vec!["daemon-reload"],
+                vec!["enable", "--now", HOLD_TIMER_UNIT],
+                vec!["enable", "--now", "toker-ping-0900.timer"],
+                vec!["enable", "--now", "toker-ping-1230.timer"],
+            ]
+            .into_iter()
+            .map(|call| call.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        );
+
+        // The wake enable: one sudo call, by path, into the system
+        // manager.
+        let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
+        assert_eq!(
+            rig.runner.system_calls(),
+            vec![vec![
+                "enable".to_owned(),
+                "--now".to_owned(),
+                staged.display().to_string(),
+            ]],
+            "sudo systemctl enable --now <the staged unit's path>"
+        );
+
+        assert_eq!(report.timer_slots, slots);
+        assert!(report.timers_ok, "the user timers came up");
+        assert!(report.wake_enabled, "the wake timer was sudo-enabled");
+        assert!(report.units_ok, "the main spine is unaffected");
+
+        // The transcript: the sudo warning appears before the call,
+        // and the summary reports all three timers.
+        let out = rig.out();
+        assert!(
+            out.contains("sudo will be asked"),
+            "the sudo prompt is in the transcript: {out}"
+        );
+        assert!(
+            out.contains("CAP_WAKE_ALARM"),
+            "the sudo warning says why: {out}"
+        );
+        assert!(
+            out.contains(&format!("sudo systemctl enable --now {}", staged.display())),
+            "{out}"
+        );
+        assert!(
+            out.contains("timers    : slots 09:00, 12:30 — hold+ping user timers installed and enabled; wake system timer enabled"),
+            "the summary's timers line: {out}"
+        );
+    }
+
+    /// The sudo-failure leg: the wake enable fails, and the user
+    /// timers it leaves standing are still installed and enabled —
+    /// the manual commands carry the copy into /etc and the enable by
+    /// name.
+    #[tokio::test]
+    async fn a_failed_sudo_keeps_the_user_timers_and_prints_manual_commands() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-sudo-fail",
+            {
+                let mut answers = answers_fresh(port);
+                answers[10] = text("09:00"); // one slot
+                answers
+            },
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // daemon-reload (timers)
+                ok_empty(), // enable --now toker-hold.timer
+                ok_empty(), // enable --now toker-ping-0900.timer
+            ],
+        )
+        // sudo cannot run at all on this leg.
+        .with_system(vec![Err(anyhow::anyhow!("sudo: command not found"))]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("a failed wake enable is non-fatal");
+
+        // The user timers stand on their own.
+        assert!(report.timers_ok, "the user timers came up");
+        assert_eq!(
+            report
+                .timers_installed
+                .iter()
+                .filter(|name| name.starts_with("toker-ping"))
+                .count(),
+            2,
+            "the ping pair is installed: {:?}",
+            report.timers_installed
+        );
+        assert!(!report.wake_enabled);
+        let out = rig.out();
+        assert!(
+            out.contains("enabling the wake system timer failed: sudo: command not found"),
+            "{out}"
+        );
+        assert!(
+            out.contains("the wake timer is NOT enabled — the machine will not wake for its slots"),
+            "{out}"
+        );
+        // The manual commands: the copy into /etc, then the enable by
+        // name — and they ride the summary too.
+        let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
+        let cp = format!(
+            "sudo cp {} /etc/systemd/system/{WAKE_TIMER_UNIT}",
+            staged.display()
+        );
+        assert!(out.contains(&cp), "the copy command: {out}");
+        assert!(
+            out.contains(&format!(
+                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+            )),
+            "the enable-by-name command: {out}"
+        );
+        assert!(
+            out.contains("NOT fully up"),
+            "the summary carries it: {out}"
+        );
+        assert!(report.wake_manual.len() == 2, "{:?}", report.wake_manual);
+    }
+
+    /// The user-timers-failure leg: a failed daemon-reload after the
+    /// timer installs leaves the enables unrun, the manual commands
+    /// printed — and the wake attempt still happens (independent
+    /// pieces, independent failures).
+    #[tokio::test]
+    async fn a_failed_user_timer_step_still_attempts_the_wake_timer() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-user-fail",
+            {
+                let mut answers = answers_fresh(port);
+                answers[10] = text("09:00"); // one slot
+                answers
+            },
+            vec![
+                inactive(),
+                ok_empty(),     // daemon-reload (units)
+                ok_empty(),     // enable --now socket
+                reload_fails(), // daemon-reload (timers) — the user manager is gone
+            ],
+        )
+        .with_system(vec![ok_empty()]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("a failed timers step is non-fatal");
+
+        assert!(!report.timers_ok, "the user timers did not come up");
+        // The enables were never called after the reload failed
+        // (no further scripted user outcomes remain).
+        assert_eq!(
+            rig.runner.calls().last().map(|call| call.join(" ")),
+            Some("daemon-reload".to_owned()),
+            "enable was never called after the reload failed"
+        );
+        assert!(
+            report
+                .timers_manual
+                .contains(&"systemctl --user enable --now toker-hold.timer".to_owned()),
+            "the manual commands: {:?}",
+            report.timers_manual
+        );
+        assert!(
+            rig.out().contains(
+                "the user timers did not all come up — the wake timer is still attempted"
+            ),
+            "{}",
+            rig.out()
+        );
+        // The wake attempt still ran, and succeeded.
+        assert!(report.wake_enabled);
+        assert_eq!(rig.runner.system_calls().len(), 1);
     }
 }

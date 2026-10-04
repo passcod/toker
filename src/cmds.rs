@@ -2,7 +2,11 @@
 //!
 //! The timer verbs serve the systemd wake/hold/ping units (plan: "Sleep
 //! lock, wake, ping") and are registered as hidden subcommands so they are
-//! reachable by the units but not part of the everyday CLI surface.
+//! reachable by the units but not part of the everyday CLI surface. The
+//! verbs' logic lives in [`crate::timers`] behind seams (the spawner, the
+//! claude client, the readback pacing); everything here is wiring — this
+//! is the only place those seams meet the real world, exactly like
+//! `setup` is the wizard's.
 //! `serve`, `setup`, `status`, and `tui` are the wired commands: config →
 //! store → server; the interactive wizard; the resolved-config/ledger
 //! summary (plan: Credentials — status reports which key sources are in
@@ -147,20 +151,61 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-/// `wake-arm`: arm the wake timer's quota window.
+/// `hold --for=<mins>` (the hold timers' verb): hold the idle-sleep
+/// lock for the span, then release — independently of the daemon's own
+/// lock. The span parses strictly (minutes, fractional OK, optional
+/// trailing `m`).
+pub fn hold(for_arg: String) -> anyhow::Result<()> {
+    let Some(minutes) = crate::timers::parse_hold_minutes(&for_arg) else {
+        anyhow::bail!(
+            "--for must be minutes — a number, fractional OK, optionally suffixed m — got {for_arg:?}"
+        );
+    };
+    let mut spawner = crate::middleware::awake::ProcessSpawner;
+    let mut out = std::io::stdout();
+    crate::timers::hold_lock(
+        &mut out,
+        minutes,
+        crate::middleware::awake::platform_command(
+            crate::middleware::awake::INHIBIT_WHO,
+            crate::timers::HOLD_WHY,
+        ),
+        &mut spawner,
+        &mut |span| std::thread::sleep(span),
+    )
+}
+
+/// `ping-window --slot=hh:mm` (the ping timers' verb): open a fresh
+/// quota window with one tiny client request, then confirm the ping
+/// row landed on the ledger. The lateness guard refuses a slot more
+/// than 10 minutes past its fire time, with the reason and a non-zero
+/// exit.
+pub fn ping_window(slot: String) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let ping = crate::timers::PingConfig {
+        db_path: &config.db_path,
+        port: config.port,
+        ping_header: &config.ping_header_name,
+    };
+    let mut out = std::io::stdout();
+    let now = jiff::Timestamp::now().as_millisecond();
+    crate::timers::ping_window(
+        &mut out,
+        &ping,
+        &slot,
+        now,
+        &jiff::tz::TimeZone::system(),
+        &crate::timers::ProcessCommandRunner,
+        &mut |span| std::thread::sleep(span),
+    )
+}
+
+/// `wake-arm`: a documented no-op — on Linux, wake is owned by the
+/// systemd system timer (`WakeSystem=true`), which `toker setup`
+/// installs and enables. The predecessor's one-shot `pmset schedule
+/// wake` was macOS-only and has no counterpart here; the wizard never
+/// installs anything for this verb.
 pub fn wake_arm() -> anyhow::Result<()> {
-    eprintln!("not implemented yet: wake-arm");
-    Ok(())
-}
-
-/// `hold`: extend the user hold timer by 15 minutes.
-pub fn hold() -> anyhow::Result<()> {
-    eprintln!("not implemented yet: hold");
-    Ok(())
-}
-
-/// `ping-window`: open a ping quota window via `claude -p`.
-pub fn ping_window() -> anyhow::Result<()> {
-    eprintln!("not implemented yet: ping-window");
+    println!("{}", crate::timers::WAKE_ARM_NOTE);
     Ok(())
 }

@@ -1058,9 +1058,8 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             .iter()
             .find(|session| session.session == event.session)
             .map(|session| {
-                let spans = session_name_spans(session)
-                    .unwrap_or_else(|| vec![Span::raw(session.session.clone())]);
-                spans
+                session_name_spans(session)
+                    .unwrap_or_else(|| vec![Span::raw(session.session.clone())])
             })
             .unwrap_or_else(|| vec![Span::raw(event.session.clone())]);
         let name_text = name
@@ -2381,6 +2380,7 @@ mod tests {
         assert_eq!(text.matches("ses-crowded").count(), 2);
     }
 
+    #[test]
     fn context_panel_says_so_when_no_session_has_enough_history() {
         // Occupancy is a claim about a conversation: a window whose
         // sessions never reach the three-request rule gets the explicit

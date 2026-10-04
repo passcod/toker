@@ -76,16 +76,29 @@ enum Command {
     /// Emit the ledger as JSONL for greppability (plan: Storage).
     Export,
 
-    /// Arm the wake timer's quota window (plan: Sleep lock, wake, ping).
+    /// A documented no-op: wake is owned by the systemd system timer
+    /// (plan: Sleep lock, wake, ping). The predecessor's one-shot
+    /// `pmset` arm was macOS-only.
     #[command(hide = true)]
     WakeArm,
-    /// Extend the user hold timer, 15 m (plan: Sleep lock, wake, ping).
+    /// Hold the idle-sleep lock for a span (the hold timers' verb; the
+    /// unit passes 15m). Fractional minutes accepted; parsed strictly.
     #[command(hide = true)]
-    Hold,
-    /// Open a ping quota window, lateness guard >10 min
-    /// (plan: Sleep lock, wake, ping).
+    Hold {
+        /// The span in minutes: a number, fractional OK, an optional
+        /// trailing `m`.
+        #[arg(long = "for", value_name = "MINUTES")]
+        for_: String,
+    },
+    /// Open a ping quota window with one tiny client request (the ping
+    /// timers' verb); refuses a slot more than 10 minutes past its
+    /// fire time (plan: Sleep lock, wake, ping).
     #[command(hide = true)]
-    PingWindow,
+    PingWindow {
+        /// The slot whose window this ping opens, `hh:mm`.
+        #[arg(long = "slot", value_name = "HH:MM")]
+        slot: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -108,8 +121,8 @@ fn main() -> anyhow::Result<()> {
         } => cmds::import(from, db, cost_kind, force, dry_run),
         Command::Export => not_implemented("export"),
         Command::WakeArm => cmds::wake_arm(),
-        Command::Hold => cmds::hold(),
-        Command::PingWindow => cmds::ping_window(),
+        Command::Hold { for_ } => cmds::hold(for_),
+        Command::PingWindow { slot } => cmds::ping_window(slot),
     }
 }
 
