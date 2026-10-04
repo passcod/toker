@@ -30,7 +30,8 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, MeterRow, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
+    CostKind, DisplayRow, MeterRow, RequestRow, RowKind, SessionCostGroup, SessionSummary,
+    is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
 
@@ -157,6 +158,18 @@ impl Store {
     pub fn meter_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<MeterRow>> {
         let limit = limit.min(i64::MAX as u64) as i64;
         ledger::meter_rows_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The display tick's window read (sessions/spend/rate): every row
+    /// with `ts_ms >= ts_ms` as narrow [`DisplayRow`]s, oldest first;
+    /// when the window holds more than `limit` rows the newest `limit`
+    /// are kept. See `ledger::display_rows_since` for why there is no
+    /// kind filter: the display aggregation consumes every row kind in
+    /// the window, including the kinds whose only contribution is
+    /// existing (`window_empty`).
+    pub fn display_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<DisplayRow>> {
+        let limit = limit.min(i64::MAX as u64) as i64;
+        ledger::display_rows_since(&*self.conn()?, ts_ms, limit)
     }
 
     /// Total ledger row count.
@@ -316,8 +329,8 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, CostKind, Error, Lane, MetersSnapshot, ModelEntry, PingRecord, RequestRow,
-        RowKind, SessionCostGroup, Store, is_api_measurement,
+        Allowance, CostKind, DisplayRow, Error, Lane, MetersSnapshot, ModelEntry, PingRecord,
+        RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -766,6 +779,147 @@ mod tests {
         match store.meter_rows_since(0, 10) {
             Err(Error::UnknownDbValue { column: "kind", .. }) => {}
             other => panic!("unknown kind must error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_rows_round_trip_the_narrow_projection() {
+        let store = mem_store();
+        // A full row — including an `extra` payload (the production
+        // openrouter shape) and every other column the narrow read
+        // does not carry.
+        let mut row = full_row();
+        row.extra = Some(json!({"serving_provider": "Relace"}));
+        store.record_request(&row).expect("record");
+
+        let rows = store.display_rows_since(0, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            DisplayRow {
+                ts_ms: row.ts_ms,
+                kind: None, // full_row is a measurement
+                session_id: Some("ses-abc".to_string()),
+                model: Some("z-ai/glm-5.3".to_string()),
+                provider: Some("openrouter".to_string()),
+                input: Some(12_345),
+                cache_read: Some(100_000),
+                output: Some(678),
+                cost_usd: Some(0.00213),
+                cost_kind: Some(CostKind::Billed),
+            },
+            "the ten display columns round-trip; the rest never cross"
+        );
+
+        // A bare row's absence stays absence on every one of the ten.
+        store.record_request(&bare_row(9_999)).expect("record");
+        let rows = store.display_rows_since(9_999, 10).expect("read");
+        assert_eq!(
+            rows[0],
+            DisplayRow {
+                ts_ms: 9_999,
+                kind: None,
+                session_id: None,
+                model: None,
+                provider: None,
+                input: None,
+                cache_read: None,
+                output: None,
+                cost_usd: None,
+                cost_kind: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_rows_since_keeps_every_kind_windows_and_caps_like_requests_since() {
+        let store = mem_store();
+        // Out of order, mixed kinds: bare measurements, an error row,
+        // a fidelity-drift row. The display read keeps EVERY kind (no
+        // filter — `window_empty` needs them all), orders oldest-first
+        // with the id tie-break, windows inclusively, and caps keeping
+        // the newest — `requests_since`'s semantics over the same set.
+        for ts in [100, 300, 200, 500, 400] {
+            store.record_request(&bare_row(ts)).expect("record");
+        }
+        let mut error = bare_row(150);
+        error.kind = Some(RowKind::Error);
+        store.record_request(&error).expect("record");
+        let mut drift = bare_row(250);
+        drift.kind = Some(RowKind::FidelityDrift);
+        drift.session_id = Some("ses-x".to_owned());
+        drift.model = Some("z-ai/glm-5.3".to_owned());
+        drift.provider = Some("openrouter".to_owned());
+        drift.input = Some(7);
+        drift.cache_read = Some(3);
+        drift.output = Some(1);
+        drift.cost_usd = Some(1.0);
+        drift.cost_kind = Some(CostKind::Billed);
+        store.record_request(&drift).expect("record");
+
+        let ts = |rows: Vec<DisplayRow>| rows.into_iter().map(|r| r.ts_ms).collect::<Vec<_>>();
+        assert_eq!(
+            ts(store.display_rows_since(0, 100).expect("all")),
+            vec![100, 150, 200, 250, 300, 400, 500],
+            "oldest first, every kind kept"
+        );
+        let all = store.display_rows_since(0, 100).expect("all");
+        assert_eq!(all[1].kind, Some(RowKind::Error));
+        assert_eq!(all[3].kind, Some(RowKind::FidelityDrift));
+        assert_eq!(all[3].session_id.as_deref(), Some("ses-x"));
+        assert_eq!(all[3].cost_kind, Some(CostKind::Billed));
+
+        assert_eq!(
+            ts(store.display_rows_since(250, 100).expect("window")),
+            vec![250, 300, 400, 500],
+            "window is inclusive of the boundary"
+        );
+        assert!(
+            store.display_rows_since(600, 10).expect("empty").is_empty(),
+            "window past the newest row is empty"
+        );
+        assert_eq!(
+            ts(store.display_rows_since(0, 3).expect("capped")),
+            vec![300, 400, 500],
+            "cap keeps the newest rows, still oldest-first"
+        );
+    }
+
+    #[test]
+    fn display_rows_reject_unknown_stored_enums() {
+        // Both enum columns decide classification (kind: measurement or
+        // not; cost_kind: billed or priced-but-not), so a corrupted
+        // value must error on the narrow read exactly as it does on
+        // the full-row read — never silently reclassify a row.
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO requests (ts_ms, kind) VALUES (1, 'mystery')",
+                [],
+            )
+            .expect("insert bogus kind");
+        }
+        match store.display_rows_since(0, 10) {
+            Err(Error::UnknownDbValue { column: "kind", .. }) => {}
+            other => panic!("unknown kind must error, got {other:?}"),
+        }
+
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO requests (ts_ms, cost_kind) VALUES (2, 'discounted')",
+                [],
+            )
+            .expect("insert bogus cost_kind");
+        }
+        match store.display_rows_since(0, 10) {
+            Err(Error::UnknownDbValue {
+                column: "cost_kind",
+                ..
+            }) => {}
+            other => panic!("unknown cost_kind must error, got {other:?}"),
         }
     }
 

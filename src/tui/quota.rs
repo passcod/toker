@@ -1160,10 +1160,11 @@ mod tests {
                     .map(|day| day.timestamp().as_millisecond())
             })
             .unwrap_or(now_ms);
-        // The display window stays on the full-row read — the display
-        // aggregate consumes its session/model/token columns.
+        // The display window, through the narrow read the loop's
+        // display cadence uses — the ten columns the display
+        // aggregation consumes, no JSON parse per row.
         let window_rows = store
-            .requests_since(now_ms.saturating_sub(30 * 60_000), 10_000)
+            .display_rows_since(now_ms.saturating_sub(30 * 60_000), 10_000)
             .expect("read the display window");
 
         // The whole snapshot must aggregate over real rows without

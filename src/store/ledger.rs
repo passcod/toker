@@ -477,6 +477,117 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
     })
 }
 
+/// The narrow projection of a `requests` row for the display tick (the
+/// sessions/spend/rate refresh): the ten columns the dashboard's
+/// aggregation consumes, nothing else. Like [`MeterRow`], it exists so
+/// that read CANNOT regress into materialising full rows — the
+/// full-row reader casts 59 columns and parses six JSON values per
+/// row, while the display read parses none (no JSON column is among
+/// the ten) — so adding a field to this type must be justified
+/// against the per-refresh cost of fetching it across up to the
+/// display window's 10 000-row cap, on the TUI's 2-second cadence: a
+/// field added here is a per-tick cost decision, made in the open.
+///
+/// The field set is the display aggregation's ACTUAL reads: the
+/// provider·model breakdown labels itself with the backend `provider`
+/// column verbatim (the serving-provider → backend → `unknown`
+/// fallback chain belongs to [`session_summary`]'s SQL and the
+/// `/_toker/session` endpoint, not to the display aggregation), and
+/// the token buckets it sums are input, cache_read and output alone —
+/// `reasoning` and `cache_write_total` are other consumers' columns.
+///
+/// Absence stays absence (invariant 3): every field except `ts_ms`
+/// round-trips NULL as `None`, never as zero or `""`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayRow {
+    /// Epoch milliseconds — the window column, from the shared index.
+    pub ts_ms: i64,
+    /// Proxy-written kind; `None` marks a real API measurement.
+    pub kind: Option<RowKind>,
+    /// Frontend-provided session identity, when known.
+    pub session_id: Option<String>,
+    /// Model as reported back by the provider.
+    pub model: Option<String>,
+    /// Backend provider id.
+    pub provider: Option<String>,
+    /// Input token bucket.
+    pub input: Option<i64>,
+    /// Cache-read token bucket.
+    pub cache_read: Option<i64>,
+    /// Output token bucket.
+    pub output: Option<i64>,
+    /// Cost in USD, in the kind below.
+    pub cost_usd: Option<f64>,
+    /// Which of the three cost semantics produced `cost_usd`.
+    pub cost_kind: Option<CostKind>,
+}
+
+/// The display tick's window read ([`DisplayRow`]s): every row with
+/// `ts_ms >= ts_ms`, oldest first, cap keeping the newest exactly like
+/// [`requests_since`].
+///
+/// No kind filter, deliberately — unlike [`meter_rows_since`], whose
+/// aggregation can consume only snapshot-or-flag rows. The display
+/// aggregation consumes every row in the window: measurements for the
+/// sessions/spend/rate panels, `error` rows for the error counter and
+/// their minute's sparkline flag, `fidelity-drift` rows for the drift
+/// counter — and the `window_empty` verdict (true iff the window holds
+/// no row of ANY kind) needs the remaining proxy kinds fetched too: a
+/// window holding only a cold notice is "rows that measured nothing",
+/// not "no data", and filtering those kinds would flip that verdict.
+/// So the WHERE is the window alone; the win over the full-row read is
+/// the projection, not the filter.
+pub(super) fn display_rows_since(
+    conn: &Connection,
+    ts_ms: i64,
+    limit: i64,
+) -> Result<Vec<DisplayRow>> {
+    // The inner projection carries `id` only so the outer re-sort can
+    // tie-break equal timestamps the same way `requests_since` does;
+    // the row reader never reads it.
+    rows_of(
+        conn,
+        "SELECT * FROM (
+            SELECT id, ts_ms, kind, session_id, model, provider,
+                   input, cache_read, output, cost_usd, cost_kind
+            FROM requests
+            WHERE ts_ms >= ?1
+            ORDER BY ts_ms DESC, id DESC LIMIT ?2
+        ) ORDER BY ts_ms ASC, id ASC",
+        [ts_ms, limit],
+        read_display_row,
+    )
+}
+
+/// Read one narrow display row by column name. Unknown `kind`/
+/// `cost_kind` strings are an error, not a silent `None` — the kind
+/// column decides whether a row is an API measurement at all, and the
+/// cost kind decides billed vs priced-but-not-billed, so a corrupted
+/// value must never silently reclassify a row (invariant 3); same rule
+/// as the full-row and meter reads.
+fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
+    Ok(DisplayRow {
+        ts_ms: row.get("ts_ms")?,
+        kind: parse_stored(
+            "kind",
+            row.get::<_, Option<String>>("kind")?,
+            RowKind::parse,
+        )?,
+        session_id: row.get("session_id")?,
+        model: row.get("model")?,
+        provider: row.get("provider")?,
+        input: row.get("input")?,
+        cache_read: row.get("cache_read")?,
+        output: row.get("output")?,
+        cost_usd: row.get("cost_usd")?,
+        cost_kind: parse_stored(
+            "cost_kind",
+            row.get::<_, Option<String>>("cost_kind")?,
+            CostKind::parse,
+        )?,
+    })
+}
+
 /// Total row count — cheap enough for the TUI footer and `toker status`.
 pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     let count = conn.query_row("SELECT COUNT(*) FROM requests", [], |row| {

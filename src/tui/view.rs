@@ -580,7 +580,10 @@ fn usd(value: f64) -> String {
 mod tests {
     use super::super::model;
     use super::super::quota::Spent;
-    use super::super::testrows::{as_meter_rows, bare, billed, kind_row, metered_full};
+    use super::super::testrows::{
+        as_display_rows, as_meter_rows, display_bare, display_billed, display_kind_row,
+        metered_full,
+    };
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -602,7 +605,10 @@ mod tests {
 
     /// The shared synthetic window: two sessions plus a NULL-session group,
     /// a billed spread for the sparkline, a NULL-cost request, and one
-    /// error row.
+    /// error row. Display rows in the narrow shape the tick reads; they
+    /// carry no meter snapshots, so the loop's quota section over this
+    /// window is None — the openai-route shape the no-quota-panel tests
+    /// pin (absence, never zeros).
     fn snapshot() -> model::Snapshot {
         let mut rows = Vec::new();
         // Counts 1..=8 in the eight minutes ending 1 minute ago → the
@@ -610,7 +616,7 @@ mod tests {
         // below joins the count-8 minute, the unpriced one the newest).
         for count in 1..=8 {
             for _ in 0..count {
-                let mut row = bare(NOW - (9 - count as i64) * 60_000);
+                let mut row = display_bare(NOW - (9 - count as i64) * 60_000);
                 row.session_id = Some("ses-abc".into());
                 row.model = Some("z-ai/glm-5.3".into());
                 row.provider = Some("openrouter".into());
@@ -618,7 +624,7 @@ mod tests {
             }
         }
         // A billed request and an unpriced one from the dash session.
-        rows.push(billed(
+        rows.push(display_billed(
             NOW - 90_000,
             Some("ses-abc"),
             "z-ai/glm-5.3",
@@ -628,25 +634,14 @@ mod tests {
             678,
             0.00213,
         ));
-        let mut unpriced = bare(NOW - 45_000);
+        let mut unpriced = display_bare(NOW - 45_000);
         unpriced.session_id = None;
         unpriced.model = Some("z-ai/glm-5.3".into());
         unpriced.provider = Some("openrouter".into());
         unpriced.input = Some(500);
         rows.push(unpriced);
-        rows.push(kind_row(NOW - 10_000, RowKind::Error));
-        {
-            // The view tests build the quota section once, the way the
-            // loop does (the meter lookback projected onto the narrow
-            // read's shape), and reuse it across sizes.
-            let quota = crate::tui::quota::aggregate(
-                &as_meter_rows(&rows),
-                NOW,
-                TODAY,
-                NOW.saturating_sub(30 * 60_000),
-            );
-            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
-        }
+        rows.push(display_kind_row(NOW - 10_000, RowKind::Error));
+        model::aggregate(&rows, None, 30, NOW, 523)
     }
 
     /// The shared synthetic quota rows: real-shaped anthropic meter
@@ -710,14 +705,16 @@ mod tests {
         let rows = quota_rows(true);
         {
             // The view tests build the quota section once, the way the
-            // loop does, and reuse it across sizes.
+            // loop does (over the meter lookback's narrow shape), and
+            // reuse it across sizes; the display aggregate runs over
+            // the same rows' display projection.
             let quota = crate::tui::quota::aggregate(
                 &as_meter_rows(&rows),
                 NOW,
                 TODAY,
                 NOW.saturating_sub(30 * 60_000),
             );
-            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
+            model::aggregate(&as_display_rows(&rows), quota.as_ref(), 30, NOW, 523)
         }
     }
 
@@ -945,14 +942,16 @@ mod tests {
         let rows = quota_rows(false);
         let snap = {
             // The view tests build the quota section once, the way the
-            // loop does, and reuse it across sizes.
+            // loop does (over the meter lookback's narrow shape), and
+            // reuse it across sizes; the display aggregate runs over
+            // the same rows' display projection.
             let quota = crate::tui::quota::aggregate(
                 &as_meter_rows(&rows),
                 NOW,
                 TODAY,
                 NOW.saturating_sub(30 * 60_000),
             );
-            model::aggregate(&rows, quota.as_ref(), 30, NOW, 523)
+            model::aggregate(&as_display_rows(&rows), quota.as_ref(), 30, NOW, 523)
         };
         assert!(snap.quota.as_ref().expect("readings exist").gate_assumed);
         let text = rendered(&snap, 200, 30);

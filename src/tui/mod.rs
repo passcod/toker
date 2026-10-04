@@ -9,8 +9,9 @@
 //! [view] over it exists so those panels can grow without touching
 //! terminal plumbing.
 //!
-//! - [model]: ledger rows in, dashboard snapshot out. No terminal types —
-//!   testable against synthetic [`RequestRow`] sets alone.
+//! - [model]: narrow display rows in, dashboard snapshot out. No
+//!   terminal types — testable against synthetic [`crate::store::DisplayRow`]
+//!   sets alone (the store's display-window projection, invariant 7).
 //! - [quota]: the rate & quota section of that snapshot — ctp's meter
 //!   forecasting, ported from forecast.mjs/live.mjs.
 //! - [view]: snapshot + frame in, pixels out, via ratatui. Rendering is
@@ -35,7 +36,9 @@ use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
 use crate::store::Store;
 
 /// Refresh cadence: the plan's "~2 s refresh from SQLite" — for the
-/// DISPLAY window (sessions, spend, rate), which is a small, cheap read.
+/// DISPLAY window (sessions, spend, rate), which reads the store's
+/// narrow display projection (ten columns, no JSON parse per row —
+/// see [`refresh_display`]).
 const REFRESH: Duration = Duration::from_secs(2);
 
 /// The meter-lookback cadence. The quota section reads a 7-day,
@@ -50,9 +53,9 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// blocked — 80% of a core, fixed here.
 const QUOTA_REFRESH: Duration = Duration::from_secs(60);
 
-/// Per-refresh row cap. `requests_since` keeps the newest rows; a 30-minute
-/// single-user window is nowhere near this, so the cap only guards a
-/// pathologically hot ledger.
+/// Per-refresh row cap. `display_rows_since` keeps the newest rows; a
+/// 30-minute single-user window is nowhere near this, so the cap only
+/// guards a pathologically hot ledger.
 const ROW_CAP: u64 = 10_000;
 
 /// `toker tui --window-mins <m>`: open the ledger and run the dashboard
@@ -130,9 +133,13 @@ pub fn run(db_path: &Path, window_mins: u64) -> anyhow::Result<()> {
 }
 
 /// Reload the display window's rows and total, then aggregate with the
-/// CACHED quota section. Errors propagate — with WAL and the store's
-/// 5 s busy timeout a read failure is real trouble, not a blip worth
-/// hiding behind a stale frame.
+/// CACHED quota section. The read is the store's narrow display
+/// projection ([`Store::display_rows_since`]): the ten columns the
+/// aggregation consumes, no JSON parse per row — the full-row read
+/// this path used to pay cast 59 columns and parsed six JSON values
+/// per row, every 2 s (invariant 7). Errors propagate — with WAL and
+/// the store's 5 s busy timeout a read failure is real trouble, not a
+/// blip worth hiding behind a stale frame.
 fn refresh_display(
     store: &Store,
     window_mins: u64,
@@ -140,7 +147,7 @@ fn refresh_display(
 ) -> anyhow::Result<model::Snapshot> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
-    let rows = store.requests_since(since, ROW_CAP)?;
+    let rows = store.display_rows_since(since, ROW_CAP)?;
     let total = store.count_requests()?;
     Ok(model::aggregate(&rows, quota, window_mins, now_ms, total))
 }
@@ -217,9 +224,12 @@ pub(crate) mod testrows {
     //! Shared synthetic-row builder for the model and view tests. A bare
     //! row (every optional column NULL) plus the mutators each test needs —
     //! the store deliberately has no `Default`, so the full field list
-    //! lives once, here.
+    //! lives once, here. Both narrow shapes have their own builders here
+    //! too: each aggregation's tests build its native input directly,
+    //! and the `as_*_rows` projections are the parity bridges the
+    //! narrow-read proofs run through.
 
-    use crate::store::{CostKind, MeterRow, RequestRow, RowKind};
+    use crate::store::{CostKind, DisplayRow, MeterRow, RequestRow, RowKind};
 
     /// A measurement row with every optional column NULL, at `ts_ms`.
     pub(crate) fn bare(ts_ms: i64) -> RequestRow {
@@ -338,8 +348,10 @@ pub(crate) mod testrows {
 
     /// A FULL ledger row carrying an anthropic meter snapshot at
     /// `ts_ms` — for fixtures that feed BOTH the quota aggregation (via
-    /// [`as_meter_rows`]) and the display aggregation, which needs the
-    /// whole [`RequestRow`].
+    /// [`as_meter_rows`]) and the display aggregation (via
+    /// [`as_display_rows`]): the full row is the shape the OLD reads
+    /// materialised, so the parity tests project it onto each narrow
+    /// shape.
     pub(crate) fn metered_full(ts_ms: i64, limits: serde_json::Value) -> RequestRow {
         let mut row = bare(ts_ms);
         row.rate_limits = Some(limits);
@@ -360,6 +372,80 @@ pub(crate) mod testrows {
                 kind: row.kind,
                 gate_on: row.gate_on,
                 rate_limits: row.rate_limits.clone(),
+            })
+            .collect()
+    }
+
+    /// A display-window row with every optional column NULL, at `ts_ms`
+    /// — the narrow shape the display tick reads, and the display
+    /// aggregation's native input, so its tests build these directly.
+    pub(crate) fn display_bare(ts_ms: i64) -> DisplayRow {
+        DisplayRow {
+            ts_ms,
+            kind: None,
+            session_id: None,
+            model: None,
+            provider: None,
+            input: None,
+            cache_read: None,
+            output: None,
+            cost_usd: None,
+            cost_kind: None,
+        }
+    }
+
+    /// A billed display row: session, model, provider, tokens, cost —
+    /// the same eight positional fields as the full-row builder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn display_billed(
+        ts_ms: i64,
+        session: Option<&str>,
+        model: &str,
+        provider: &str,
+        input: i64,
+        cache_read: i64,
+        output: i64,
+        cost: f64,
+    ) -> DisplayRow {
+        let mut row = display_bare(ts_ms);
+        row.session_id = session.map(str::to_string);
+        row.model = Some(model.to_string());
+        row.provider = Some(provider.to_string());
+        row.input = Some(input);
+        row.cache_read = Some(cache_read);
+        row.output = Some(output);
+        row.cost_usd = Some(cost);
+        row.cost_kind = Some(CostKind::Billed);
+        row
+    }
+
+    /// A proxy-written display row of `kind` at `ts_ms` (never an API
+    /// measurement).
+    pub(crate) fn display_kind_row(ts_ms: i64, kind: RowKind) -> DisplayRow {
+        let mut row = display_bare(ts_ms);
+        row.kind = Some(kind);
+        row
+    }
+
+    /// Project full ledger rows onto the display window's narrow
+    /// shape, keeping EVERY row (no filter — the display read has
+    /// none). The parity bridge: the old display path materialised
+    /// full rows and read these ten fields off them, so aggregating
+    /// this projection of a full-row read must equal aggregating the
+    /// narrow read.
+    pub(crate) fn as_display_rows(rows: &[RequestRow]) -> Vec<DisplayRow> {
+        rows.iter()
+            .map(|row| DisplayRow {
+                ts_ms: row.ts_ms,
+                kind: row.kind,
+                session_id: row.session_id.clone(),
+                model: row.model.clone(),
+                provider: row.provider.clone(),
+                input: row.input,
+                cache_read: row.cache_read,
+                output: row.output,
+                cost_usd: row.cost_usd,
+                cost_kind: row.cost_kind,
             })
             .collect()
     }
