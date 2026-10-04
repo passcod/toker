@@ -71,6 +71,21 @@ impl<'de> serde::Deserialize<'de> for NoticeStyle {
     }
 }
 
+impl serde::Serialize for NoticeStyle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The canonical lowercase name — the exact inverse of the
+        // case-insensitive deserialiser above, so a config value
+        // round-trips as its own example (`notice_style = "gfm"`).
+        // The setup wizard's `toker.toml` rewrite writes through here
+        // (see `crate::setup::config_writer`).
+        serializer.serialize_str(match self {
+            NoticeStyle::Insight => "insight",
+            NoticeStyle::Gfm => "gfm",
+            NoticeStyle::Plain => "plain",
+        })
+    }
+}
+
 /// Render `content` in the style. Pure: the same (style, content) pair
 /// renders the same bytes on every call, forever (invariant 4 — a gate
 /// notice enters replayed history).

@@ -199,6 +199,21 @@ pub struct ModelMap {
     families: BTreeMap<String, MapTarget>,
 }
 
+impl ModelMap {
+    /// The policy's (canonical selector, target) pairs — exact
+    /// identities first, then families, each entry's selector the
+    /// canonical `model:<id>` / `family:<name>` form — the shape the
+    /// config's `[providers.<id>.model_map]` tables serialise back to
+    /// (the write side of the wire mapping, see
+    /// `crate::config::Config::to_file`). Deterministic, per invariant 4.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.exact
+            .values()
+            .chain(self.families.values())
+            .map(|matched| (matched.selector.as_str(), matched.target.as_str()))
+    }
+}
+
 /// Parse and validate one configured value; `Ok(None)` means disabled
 /// (ctp `parseModelMap`, model-map.mjs:74-129). A present but invalid
 /// policy is an error, never a silent empty map — a typo'd startup value

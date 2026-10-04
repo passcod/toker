@@ -14,7 +14,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
@@ -82,7 +82,10 @@ pub const DEFAULT_CODEX_AUTH_PATH: &str = "~/.codex/auth.json";
 pub const DEFAULT_CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 
 /// Resolved runtime configuration: file defaults ← `toker.toml` ← env.
-#[derive(Debug, Clone)]
+/// `PartialEq` is the setup wizard's re-load-compare: a rewritten
+/// `toker.toml` must resolve back to exactly the config that was meant
+/// (see [`crate::setup::config_writer`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// The loopback listener port.
     pub port: u16,
@@ -129,7 +132,7 @@ pub struct Config {
 
 /// The `[gates]` block, resolved (plan: Middleware — route-scoped toggles,
 /// enabled per route in config).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatesConfig {
     /// The quota gate (plan: "Quota gate + release marker"). Arms only on
     /// the anthropic_sub backend — today's only meter source — where it
@@ -208,7 +211,7 @@ impl Default for GatesConfig {
 }
 
 /// The openrouter provider block, resolved.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpenRouterConfig {
     /// Upstream base including `/v1`, e.g. `https://openrouter.ai/api/v1`.
     pub upstream: reqwest::Url,
@@ -237,7 +240,7 @@ impl OpenRouterConfig {
 /// The anthropic subscription provider block, resolved. No key sources:
 /// auth is pass-through-when-present and toker has no stored sub token yet
 /// (a later credentials unit adds signing).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
@@ -250,7 +253,7 @@ pub struct AnthropicSubConfig {
 
 /// The anthropic API provider block, resolved — the same KeySources
 /// pattern as openrouter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnthropicApiConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
@@ -281,7 +284,7 @@ impl AnthropicApiConfig {
 /// auth is the shared `auth.json` login (see [`crate::providers::codex`]
 /// — always toker-signed, never pass-through), reported by presence
 /// only (invariant 2: never the values).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodexSubConfig {
     /// Upstream base — the codex backend root, no `/responses` suffix.
     pub upstream: reqwest::Url,
@@ -342,6 +345,19 @@ fn parse_model_map_table(
     model_map::parse_model_map(&raw).with_context(|| format!("providers.{provider}.model_map"))
 }
 
+/// The write-side inverse of [`parse_model_map_table`]: a parsed
+/// [`ModelMap`] back as the wire table — canonical selector → target,
+/// exact identities first then families, deterministic per invariant 4.
+/// The round-trip is exact on canonical selectors (the parse side
+/// folds non-canonical ones); see [`Config::to_file`].
+fn model_map_table(map: &ModelMap) -> toml::Table {
+    let mut table = toml::Table::new();
+    for (selector, target) in map.entries() {
+        table.insert(selector.to_owned(), toml::Value::String(target.to_owned()));
+    }
+    table
+}
+
 /// A TOML value's kind, for the non-string-target error (serde's own
 /// wording names types confusingly for config errors).
 fn toml_type_of(value: &toml::Value) -> &'static str {
@@ -389,7 +405,41 @@ impl Config {
     /// read as default.
     pub fn load() -> anyhow::Result<Config> {
         let path = config_path()?;
-        let file = match fs::read_to_string(&path) {
+        let mut config = Self::load_from(&path)?;
+
+        // Env overrides (config file loses).
+        if let Some(port) = env::var_os("TOKER_PORT") {
+            let port = port
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("TOKER_PORT is not valid UTF-8"))?
+                .parse::<u16>()
+                .context("TOKER_PORT must be a port number")?;
+            config.port = port;
+        }
+        if let Some(db) = env::var_os("TOKER_DB") {
+            config.db_path = PathBuf::from(db);
+        }
+        if let Some(upstream) = env::var_os("TOKER_UPSTREAM") {
+            let upstream = upstream
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
+            config.openrouter.upstream = parse_upstream(&upstream).context("TOKER_UPSTREAM")?;
+        }
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Load the resolved configuration from an explicit file, defaults
+    /// ← file, with **no env overrides**: the read side the setup
+    /// wizard's read-merge-rewrite runs on (see
+    /// [`crate::setup::config_writer`]), so a `TOKER_*` override
+    /// active in the wizard's environment can never be pinned into the
+    /// file by a rewrite. A missing file is the defaults; a present
+    /// file that does not parse or validate is an error — a
+    /// hand-edited typo must not be silently clobbered.
+    pub fn load_from(path: &Path) -> anyhow::Result<Config> {
+        let file = match fs::read_to_string(path) {
             Ok(text) => toml::from_str::<FileConfig>(&text)
                 .with_context(|| format!("parsing {}", path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
@@ -397,7 +447,80 @@ impl Config {
                 return Err(error).with_context(|| format!("reading {}", path.display()));
             }
         };
+        let config = Self::resolve_file(file)?;
+        config.validate()?;
+        Ok(config)
+    }
 
+    /// The write-side wire mapping — the inverse of
+    /// [`Config::resolve_file`]: this resolved config as the
+    /// `toker.toml` shape, for the setup wizard's read-merge-rewrite
+    /// (see [`crate::setup::config_writer`]). Every key the reader
+    /// understands is written explicitly — the wizard writes the file
+    /// it fully understands, defaults included. Round-trip
+    /// normalisations, deliberate and asserted there: upstream URLs in
+    /// their parsed normalised form (a bare host gains its trailing
+    /// slash), `~`-leading paths already expanded at load, model-map
+    /// selectors canonical; comments and hand formatting are not
+    /// carried.
+    pub(crate) fn to_file(&self) -> FileConfig {
+        FileConfig {
+            port: Some(self.port),
+            db_path: Some(self.db_path.to_string_lossy().into_owned()),
+            session_header_names: Some(self.session_header_names.clone()),
+            ping_header_name: Some(self.ping_header_name.clone()),
+            default_backend_openai_chat: Some(self.default_backend_openai_chat.clone()),
+            default_backend_anthropic: Some(self.default_backend_anthropic.clone()),
+            awake: Some(self.awake),
+            transcript_roots: Some(
+                self.transcript_roots
+                    .iter()
+                    .map(|root| root.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            providers: FileProviders {
+                openrouter: Some(FileOpenRouter {
+                    upstream: Some(self.openrouter.upstream.to_string()),
+                    api_key_env: Some(self.openrouter.api_key_env.clone()),
+                    api_key: self.openrouter.api_key.clone(),
+                }),
+                anthropic_sub: Some(FileAnthropicSub {
+                    upstream: Some(self.anthropic_sub.upstream.to_string()),
+                    model_map: self.anthropic_sub.model_map.as_ref().map(model_map_table),
+                }),
+                anthropic_api: Some(FileAnthropicApi {
+                    upstream: Some(self.anthropic_api.upstream.to_string()),
+                    api_key_env: Some(self.anthropic_api.api_key_env.clone()),
+                    api_key: self.anthropic_api.api_key.clone(),
+                    model_map: self.anthropic_api.model_map.as_ref().map(model_map_table),
+                }),
+                codex_sub: Some(FileCodexSub {
+                    upstream: Some(self.codex_sub.upstream.to_string()),
+                    originator: Some(self.codex_sub.originator.clone()),
+                    auth_path: Some(self.codex_sub.auth_path.to_string_lossy().into_owned()),
+                    refresh_url: Some(self.codex_sub.refresh_url.to_string()),
+                    client_version: self.codex_sub.client_version.clone(),
+                    version_probe: Some(self.codex_sub.version_probe),
+                    model_map: self.codex_sub.model_map.as_ref().map(model_map_table),
+                }),
+            },
+            gates: FileGates {
+                quota_enabled: Some(self.gates.quota_enabled),
+                notice_style: Some(self.gates.notice_style),
+                cold_enabled: Some(self.gates.cold_enabled),
+                cold_outlook: Some(self.gates.cold_outlook),
+                cold_min_tokens: Some(self.gates.cold_min_tokens),
+                cold_idle_min: self.gates.cold_idle_min,
+                compact_model: self.gates.compact_model.clone(),
+                force_newest: Some(self.gates.force_newest),
+            },
+        }
+    }
+
+    /// The file→resolved mapping shared by [`Config::load`] and
+    /// [`Config::load_from`]: every default applied, every block
+    /// parsed. No env, no validation — both are the callers' side.
+    fn resolve_file(file: FileConfig) -> anyhow::Result<Config> {
         let openrouter = OpenRouterConfig {
             upstream: parse_upstream(
                 file.providers
@@ -513,7 +636,7 @@ impl Config {
                 .unwrap_or(true),
         };
 
-        let mut config = Config {
+        let config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
             db_path: match file.db_path {
                 Some(path) => PathBuf::from(path),
@@ -559,32 +682,13 @@ impl Config {
                 .map(|roots| roots.into_iter().map(PathBuf::from).collect())
                 .unwrap_or_default(),
         };
-
-        // Env overrides (config file loses).
-        if let Some(port) = env::var_os("TOKER_PORT") {
-            let port = port
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("TOKER_PORT is not valid UTF-8"))?
-                .parse::<u16>()
-                .context("TOKER_PORT must be a port number")?;
-            config.port = port;
-        }
-        if let Some(db) = env::var_os("TOKER_DB") {
-            config.db_path = PathBuf::from(db);
-        }
-        if let Some(upstream) = env::var_os("TOKER_UPSTREAM") {
-            let upstream = upstream
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
-            config.openrouter.upstream = parse_upstream(&upstream).context("TOKER_UPSTREAM")?;
-        }
-
-        config.validate()?;
         Ok(config)
     }
 
-    /// Cross-field validation the individual pieces cannot see.
-    fn validate(&self) -> anyhow::Result<()> {
+    /// Cross-field validation the individual pieces cannot see. Also
+    /// the wizard's gate: [`crate::setup::config_writer`] re-runs it
+    /// over the wizard's changes before anything is written.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         // Session header names must be usable as header names, or the
         // per-request lookup by name would silently never match.
         for name in &self.session_header_names {
@@ -640,91 +744,137 @@ impl Config {
 }
 
 /// The `toker.toml` wire shape, serde-side. `deny_unknown_fields` so a
-/// typo'd key is an error, not a silent default.
-#[derive(Debug, Default, serde::Deserialize)]
+/// typo'd key is an error, not a silent default — the strictness the
+/// setup wizard's rewrite leans on (see [`Config::to_file`]): a key
+/// this toker does not understand refuses the load instead of being
+/// silently dropped by a rewrite. `Serialize` is the write side, with
+/// every absent `Option` simply omitted. Field order matters there:
+/// scalars before the `providers`/`gates` tables, because a TOML
+/// table must be the last thing emitted in its own.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileConfig {
+pub(crate) struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     db_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     session_header_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ping_header_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     default_backend_openai_chat: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     default_backend_anthropic: Option<String>,
     /// The idle-sleep lock toggle (ctp `CTP_AWAKE`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     awake: Option<bool>,
     /// Extra transcript roots for the TUI's session labels, before `~`
     /// expansion (see [`Config::transcript_roots`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
     transcript_roots: Option<Vec<String>>,
     providers: FileProviders,
     gates: FileGates,
 }
 
 /// The `[gates]` block of `toker.toml`, serde-side.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileGates {
+pub(crate) struct FileGates {
+    #[serde(skip_serializing_if = "Option::is_none")]
     quota_enabled: Option<bool>,
     /// Parsed by [`NoticeStyle`]'s case-insensitive deserialiser; an
     /// unknown value fails the load, like a typo'd key would.
+    #[serde(skip_serializing_if = "Option::is_none")]
     notice_style: Option<NoticeStyle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cold_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cold_outlook: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     cold_min_tokens: Option<u64>,
     /// Minutes, fractional (ctp's smoke test needs a floor it can wait
     /// out).
+    #[serde(skip_serializing_if = "Option::is_none")]
     cold_idle_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     compact_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     force_newest: Option<bool>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileProviders {
+pub(crate) struct FileProviders {
+    #[serde(skip_serializing_if = "Option::is_none")]
     openrouter: Option<FileOpenRouter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     anthropic_sub: Option<FileAnthropicSub>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     anthropic_api: Option<FileAnthropicApi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     codex_sub: Option<FileCodexSub>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileOpenRouter {
+pub(crate) struct FileOpenRouter {
+    #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileAnthropicSub {
+pub(crate) struct FileAnthropicSub {
+    #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<String>,
     /// The model routing map: selector keys → target model ids, parsed by
-    /// [`parse_model_map_table`] into the committed [`ModelMap`].
+    /// [`parse_model_map_table`] into the committed [`ModelMap`]. Written
+    /// back by [`model_map_table`]; the table goes last because a TOML
+    /// table must end its own block.
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_map: Option<toml::Table>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileAnthropicApi {
+pub(crate) struct FileAnthropicApi {
+    #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<String>,
-    model_map: Option<toml::Table>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    /// Written last (see [`FileAnthropicSub::model_map`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_map: Option<toml::Table>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct FileCodexSub {
+pub(crate) struct FileCodexSub {
+    #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     originator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auth_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     refresh_url: Option<String>,
-    model_map: Option<toml::Table>,
     /// The codex client version to identify as (see
     /// [`CodexSubConfig::client_version`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
     client_version: Option<String>,
     /// See [`CodexSubConfig::version_probe`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     version_probe: Option<bool>,
+    /// Written last (see [`FileAnthropicSub::model_map`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_map: Option<toml::Table>,
 }
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
@@ -1438,6 +1588,44 @@ quota_enabled = false
             super::Config::load().is_err(),
             "a typo'd key must fail to load"
         );
+    }
+
+    #[test]
+    fn load_from_reads_a_path_without_env_overrides() {
+        // The setup wizard's read-merge side: `load_from(path)` is
+        // env-free, so a `TOKER_*` override active in the wizard's own
+        // environment can never be read-merged and pinned into the file
+        // by a rewrite (see `crate::setup::config_writer`) — while
+        // `load()` still layers the env over the same file for the
+        // running daemon.
+        let _guard = env_lock().lock().unwrap();
+        let dir = test_dir("load-from");
+        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("write config");
+        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+        set_env("TOKER_PORT", Some("20000"));
+        set_env(
+            "TOKER_DB",
+            Some(&dir.join("elsewhere.db").to_string_lossy()),
+        );
+        set_env("TOKER_UPSTREAM", Some("http://from-env/v1"));
+
+        let config = super::Config::load_from(&dir.join("toker.toml")).expect("loads");
+        assert_eq!(config.port, 19_999, "no env override applies to load_from");
+        assert_eq!(
+            config.db_path,
+            crate::store::default_db_path().expect("default db path"),
+            "the db path is the file-or-default one, not TOKER_DB"
+        );
+        assert_ne!(config.openrouter.upstream.as_str(), "http://from-env/v1");
+
+        let loaded = super::Config::load().expect("loads");
+        assert_eq!(loaded.port, 20_000);
+        assert_eq!(loaded.db_path, dir.join("elsewhere.db"));
+        assert_eq!(loaded.openrouter.upstream.as_str(), "http://from-env/v1");
+
+        set_env("TOKER_PORT", None);
+        set_env("TOKER_DB", None);
+        set_env("TOKER_UPSTREAM", None);
     }
 
     #[test]
