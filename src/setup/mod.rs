@@ -25,6 +25,7 @@
 pub mod atomic;
 pub mod config_writer;
 pub mod patchers;
+pub mod plugin;
 pub mod verify;
 pub mod wizard;
 

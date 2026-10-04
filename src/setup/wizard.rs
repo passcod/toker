@@ -57,6 +57,7 @@ use crate::import::{self, ImportOpts};
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::config_writer::write_config;
 use crate::setup::patchers::{self, Frontend};
+use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
 use crate::setup::{Step, plan};
 
@@ -211,6 +212,9 @@ pub struct Paths {
     /// The state dir (the ledger's parent): the only path the
     /// hardened service unit may write.
     pub state_dir: PathBuf,
+    /// opencode's plugin discovery dir — the toker-cost install target
+    /// (`…/plugins/toker-cost/`; the offer is opt-out, detection-tied).
+    pub opencode_plugins_dir: PathBuf,
 }
 
 impl Paths {
@@ -234,6 +238,7 @@ impl Paths {
             ctp_usage: data_home.join("claude-token-proxy").join("usage.jsonl"),
             codex_auth: home.join(".codex").join("auth.json"),
             state_dir: data_home.join("toker"),
+            opencode_plugins_dir: config_home.join("opencode").join("plugins"),
         })
     }
 
@@ -250,6 +255,7 @@ impl Paths {
             ctp_usage: root.join(".local/share/claude-token-proxy/usage.jsonl"),
             codex_auth: root.join(".codex/auth.json"),
             state_dir: root.join(".local/share/toker"),
+            opencode_plugins_dir: root.join(".config/opencode/plugins"),
         }
     }
 
@@ -515,6 +521,12 @@ pub struct RunReport {
     pub patch_failed: Vec<String>,
     /// The predecessor log imported this run, if any.
     pub import_ran: Option<PathBuf>,
+    /// The opencode plugin installed (or confirmed) this run — its
+    /// target dir; `None` when opencode was not detected or the
+    /// operator declined the (opt-out) offer.
+    pub plugin_installed: Option<PathBuf>,
+    /// The plugin was offered and declined.
+    pub plugin_declined: bool,
 }
 
 // ── the wizard ──────────────────────────────────────────────────────────
@@ -1228,6 +1240,69 @@ impl<'a> Wizard<'a> {
         if detected.frontends.is_empty() {
             self.say("no frontends detected — nothing to wire")?;
         }
+        self.plugin_offer(detected, report)?;
+        Ok(())
+    }
+
+    /// The opencode plugin offer (opt-out): rides the frontends step,
+    /// offered only when opencode itself was detected. The bundled
+    /// plugin is the repo's own `plugins/opencode/toker-cost/`,
+    /// embedded at build time; a hand-edited install is never silently
+    /// clobbered — a differing install asks explicitly.
+    fn plugin_offer(&mut self, detected: &Detected, report: &mut RunReport) -> Result<()> {
+        let Some(opencode) = detected
+            .frontends
+            .iter()
+            .find(|fd| matches!(fd.frontend, Frontend::Opencode { .. }))
+        else {
+            return Ok(());
+        };
+        let _ = opencode;
+        let plugins_dir = self.paths.opencode_plugins_dir.clone();
+        let state = plugin::plugin_state(&plugins_dir);
+        let target = plugin::plugin_target_dir(&plugins_dir);
+        let (question, install) = match state {
+            plugin::PluginState::Absent => (
+                format!(
+                    "install the opencode sidebar plugin ({})?",
+                    target.display()
+                ),
+                true,
+            ),
+            plugin::PluginState::Installed => {
+                self.say("opencode plugin: already installed, nothing to do")?;
+                report.plugin_installed = Some(target);
+                return Ok(());
+            }
+            plugin::PluginState::Different => (
+                "the installed opencode plugin differs from this build —                  reinstall (overwrites the existing files)?"
+                    .to_owned(),
+                false,
+            ),
+        };
+        if !self.prompt.confirm(&question, install)? {
+            self.say("opencode plugin: declined")?;
+            report.plugin_declined = true;
+            return Ok(());
+        }
+        match plugin::install_plugin(&plugins_dir) {
+            Ok(()) => {
+                self.say(&format!(
+                    "opencode plugin: installed to {}",
+                    target.display()
+                ))?;
+                report.plugin_installed = Some(target);
+            }
+            Err(error) => {
+                // Non-fatal: the dashboards still work; the plugin is
+                // an enhancement, and the manual copy is one command.
+                self.say(&format!(
+                    "opencode plugin: install failed ({error:#}) — copy                      {}/plugins/opencode/toker-cost into {}",
+                    "the toker checkout",
+                    plugins_dir.display()
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -1910,6 +1985,7 @@ default_backend_anthropic = "codex_sub"
             confirm(true),           // claude
             confirm(true),           // opencode
             confirm(true),           // shell rc
+            confirm(true),           // the opencode plugin (opt-out, on)
         ]
     }
 
@@ -2031,6 +2107,18 @@ WantedBy=sockets.target
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        // The opencode plugin: installed from the embedded set, byte
+        // for byte, into the scratch plugins dir.
+        let plugin_dir = rig.paths().opencode_plugins_dir.join("toker-cost");
+        for (name, bytes) in plugin::PLUGIN_FILES {
+            assert_eq!(
+                std::fs::read(plugin_dir.join(name)).expect("the plugin file"),
+                bytes.as_bytes(),
+                "{name} installed byte-identically"
+            );
+        }
+        assert!(report.plugin_installed.is_some());
 
         // The units: exactly the templates, as functions of this
         // binary and the scratch state dir; the systemctl calls in
@@ -2603,5 +2691,84 @@ WantedBy=sockets.target
         assert!(rig.runner.installed().is_empty());
         assert_eq!(rig.runner.calls().len(), 1, "only the socket query ran");
         assert!(!rig.root.join(".claude").exists());
+    }
+
+    #[tokio::test]
+    async fn the_opencode_plugin_is_offered_with_an_opt_out() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        // Declined: the offer was asked, nothing installed.
+        let mut declined = Rig::new(
+            "plugin-declined",
+            {
+                let mut answers = answers_fresh(port);
+                answers[9] = confirm(false); // the opt-out
+                answers
+            },
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        seed_claude(&declined.root);
+        seed_opencode(&declined.root);
+        seed_rc(&declined.root);
+        let report = declined
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("the declined run completes");
+        assert!(
+            declined
+                .prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("sidebar plugin")),
+            "the offer was made: {:?}",
+            declined.prompt.asked()
+        );
+        assert!(report.plugin_installed.is_none());
+        assert!(report.plugin_declined);
+        assert!(
+            !declined
+                .paths()
+                .opencode_plugins_dir
+                .join("toker-cost")
+                .exists(),
+            "nothing was installed"
+        );
+
+        // Accepted (the fresh-machine test already pins the happy
+        // path); here: a DIFFERING install asks before overwriting,
+        // and saying no leaves the files untouched.
+        let mut guarded = Rig::new(
+            "plugin-guarded",
+            {
+                let mut answers = answers_fresh(port);
+                answers[9] = confirm(false); // the reinstall refusal
+                answers
+            },
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        seed_claude(&guarded.root);
+        seed_opencode(&guarded.root);
+        seed_rc(&guarded.root);
+        let dir = guarded.paths().opencode_plugins_dir.join("toker-cost");
+        std::fs::create_dir_all(&dir).expect("make the plugin dir");
+        std::fs::write(dir.join("package.json"), "{\"name\":\"hand-tuned\"}").expect("a hand edit");
+        let report = guarded
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("the guarded run completes");
+        assert!(
+            guarded
+                .prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("differs")),
+            "the differing install asked before overwriting: {:?}",
+            guarded.prompt.asked()
+        );
+        assert!(report.plugin_installed.is_none(), "the refusal held");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("package.json")).expect("read back"),
+            "{\"name\":\"hand-tuned\"}",
+            "the hand edit survived"
+        );
     }
 }
