@@ -73,6 +73,16 @@ const CONTEXT_MIN_REQUESTS: usize = 3;
 /// the label, and less than this is noise — the id renders instead.
 const LABEL_MIN_W: u16 = 12;
 
+/// The CONTEXT panel's name field: wide enough for the id forms and
+/// short labels, a hard CAP for long titles — the bar is the panel's
+/// point, so the name yields before it does (the SESSIONS table shows
+/// the same name unclipped at its wider column). Correlation survives
+/// a clip: the panels share the same PREFIX.
+const CONTEXT_NAME_W: usize = 24;
+/// The fixed gap between the name field and the bar — a name at the
+/// cap must not touch the bar.
+const CONTEXT_NAME_GAP: usize = 2;
+
 /// The rebuild panel's localised detail lines: the newest
 /// system-prompt changes, so a change is diagnosable at a glance
 /// without leaving the dashboard for `toker report`.
@@ -90,19 +100,38 @@ const TOKENS_BAR_MIN_W: usize = 6;
 /// The share percentage's rendered width: `" NNN%"`.
 const TOKENS_PCT_W: usize = 5;
 
+/// A bucket row's bar width at a given inner width: the label, the
+/// amount, the two gaps, the percentage, and a floor's note (its length
+/// plus its gap) all come off the top; the floor of
+/// [`TOKENS_BAR_MIN_W`] keeps a sliver of shape. A PURE function so
+/// the budget is unit-testable directly — the render tests assert
+/// structure, not glyph counts.
+fn tokens_bar_width(width: usize, note_len: usize) -> usize {
+    width
+        .saturating_sub(46 + note_len + usize::from(note_len > 0) * 2)
+        .max(TOKENS_BAR_MIN_W)
+}
+
+/// The hit-rate bar's width: its own fixed text is shorter (no
+/// percentage column, the note rides inline), so the budget is
+/// lighter — same floor.
+fn tokens_rate_bar_width(width: usize, note_len: usize) -> usize {
+    width.saturating_sub(32 + note_len).max(TOKENS_BAR_MIN_W)
+}
+
 /// The least inner width a bucket row's bar and percentage render in:
-/// indent, label, amount, gap, the least bar, and the percentage.
-/// Below this the pair sheds whole — the counts are the information,
-/// the bar is the shape, and a bar clipped mid-glyph is neither
-/// (the reference let the final clamp cut the line; the panel here
-/// drops the column pair cleanly instead, the quota meter's rule).
+/// label, amount, gap, the least bar, and the percentage. Below this
+/// the pair sheds whole — the counts are the information, the bar is
+/// the shape, and a bar clipped mid-glyph is neither (the reference
+/// let the final clamp cut the line; the panel here drops the column
+/// pair cleanly instead, the quota meter's rule).
 const TOKENS_SHARE_MIN_W: usize =
-    2 + TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W + TOKENS_PCT_W;
+    TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W + TOKENS_PCT_W;
 
 /// The least inner width the hit-rate bar renders in: indent, label,
 /// amount, gap, bar. The rate itself rides in the amount column, so
 /// the number survives the shed and only the shape goes.
-const TOKENS_RATE_BAR_MIN_W: usize = 2 + TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W;
+const TOKENS_RATE_BAR_MIN_W: usize = TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W;
 
 /// The sessions table's columns, left to right, with their base widths.
 /// When the terminal is too narrow the *rightmost* columns shed first
@@ -469,36 +498,44 @@ fn session_cells(
     cells
 }
 
-/// The SESSION cell: the session's name — its working directory and the
-/// title the frontend gave it (`shortDir(cwd)
-/// · title ?? prompt`, the directory cyan and the separator dim) — where
-/// the column is wide enough for a name ([`LABEL_MIN_W`], on the
-/// "too narrow a name is noise" rule), else the session id. An absent
-/// label
-/// — no transcript, an unreadable one, a tail with nothing usable — is
-/// the id, never an empty cell: the row never loses its name, and
-/// "unlabelled" stays visibly different from "absent" (invariant 3).
-/// The cell clips at the column's width, which grows with the terminal
-/// exactly like the reference's leftover label column.
-fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
-    if let Some(label) = &session.label
-        && width >= LABEL_MIN_W
-    {
-        let dir = short_dir(label.cwd.as_deref());
-        let what = label.title.clone().or_else(|| label.prompt.clone());
-        if dir.is_some() || what.is_some() {
-            let mut spans = Vec::with_capacity(3);
-            if let Some(dir) = dir {
-                spans.push(Span::styled(dir, Style::new().fg(Color::Cyan)));
-            }
-            if let Some(what) = what {
-                if !spans.is_empty() {
-                    spans.push(Span::styled(" · ", Style::new().dim()));
-                }
-                spans.push(Span::raw(what));
-            }
-            return Cell::new(Line::from(spans));
+/// The session's NAME spans, shared by every panel that names a
+/// session — the working directory and the title the frontend gave it
+/// (`shortDir(cwd) · title ?? prompt`, the directory cyan and the
+/// separator dim) — so the SESSIONS table and the CONTEXT panel show
+/// the same string and a row can be correlated across panels. `None`
+/// when there is no labelled form (then the caller shows the id): an
+/// absent label is the id, never an empty cell, and "unlabelled"
+/// stays visibly different from "absent" (invariant 3).
+fn session_name_spans(session: &SessionAgg) -> Option<Vec<Span<'static>>> {
+    let label = session.label.as_ref()?;
+    let dir = short_dir(label.cwd.as_deref());
+    let what = label.title.clone().or_else(|| label.prompt.clone());
+    if dir.is_none() && what.is_none() {
+        return None;
+    }
+    let mut spans = Vec::with_capacity(3);
+    if let Some(dir) = dir {
+        spans.push(Span::styled(dir, Style::new().fg(Color::Cyan)));
+    }
+    if let Some(what) = what {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", Style::new().dim()));
         }
+        spans.push(Span::raw(what));
+    }
+    Some(spans)
+}
+
+/// The SESSION cell: the shared name where the column is wide enough
+/// for one ([`LABEL_MIN_W`], on the "too narrow a name is noise"
+/// rule), else the session id. The cell clips at the column's width,
+/// which grows with the terminal exactly like the reference's leftover
+/// label column.
+fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
+    if width >= LABEL_MIN_W
+        && let Some(spans) = session_name_spans(session)
+    {
+        return Cell::new(Line::from(spans));
     }
     Cell::new(session.session.clone())
 }
@@ -598,12 +635,17 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                 known.tokens().unwrap_or(1),
             )),
         };
+        // The SAME name the sessions table shows (label or id) — the
+        // panels correlate row-for-row — in a CAPPED field: a long
+        // title clips (with an ellipsis) rather than eating the bar,
+        // a short one pads, and both end with the fixed gap so the
+        // name never touches the bar.
+        let name_spans = context_name_spans(session);
+
         let Some(prompt) = session.input_now else {
             // Unknown prompt: no bar, no share — an explicit `?`.
-            let mut spans = vec![
-                Span::raw(format!("  {:<18}", session.session)),
-                Span::raw(format!("{:>13} / ", "?")),
-            ];
+            let mut spans = name_spans;
+            spans.push(Span::raw(format!("{:>13} / ", "?")));
             match ctx {
                 Some((label, _)) => spans.push(ctx_span(&label, session.ctx)),
                 None => spans.push(Span::styled("?".to_owned(), Style::new().dim())),
@@ -617,11 +659,9 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         let Some((ctx_label, ceiling)) = ctx else {
             // Known prompt, unknown ceiling: the number is real, the
             // share is not claimable.
-            let mut spans = vec![
-                Span::raw(format!("  {:<18}", session.session)),
-                Span::raw(format!("{:>13} / ", grouped(Some(prompt)))),
-                Span::styled("?".to_owned(), Style::new().dim()),
-            ];
+            let mut spans = name_spans;
+            spans.push(Span::raw(format!("{:>13} / ", grouped(Some(prompt)))));
+            spans.push(Span::styled("?".to_owned(), Style::new().dim()));
             if let Some(note) = idle_note {
                 spans.extend(note.spans);
             }
@@ -634,8 +674,8 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         let near = frac > 0.8 && !idle;
         // The bar budgets for the line's fixed text AND the trailing
         // note — the "← compacts soon" marker or the idle label —
-        // the `max(10, WIDTH - 52)` rule, which leaves
-        // room for its own marker at its shorter fixed text.
+        // against the capped name field: the historical WIDTH − 66
+        // rule with the 30-wide field it now is.
         let bar_width = width.saturating_sub(66).max(10) as u16;
         let bar_style = if idle {
             Style::new().dim()
@@ -644,16 +684,14 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         } else {
             Style::new().fg(Color::Cyan)
         };
-        let mut spans = vec![
-            Span::raw(format!("  {:<18}", session.session)),
-            Span::styled(bar(frac, bar_width), bar_style),
-            Span::raw(format!(
-                " {:>13} / {:<4} {:>3}%",
-                grouped(Some(prompt)),
-                ctx_label,
-                (frac * 100.0).round() as i64
-            )),
-        ];
+        let mut spans = name_spans;
+        spans.push(Span::styled(bar(frac, bar_width), bar_style));
+        spans.push(Span::raw(format!(
+            " {:>13} / {:<4} {:>3}%",
+            grouped(Some(prompt)),
+            ctx_label,
+            (frac * 100.0).round() as i64
+        )));
         if near {
             spans.push(Span::styled(
                 "  ← compacts soon".to_owned(),
@@ -671,6 +709,54 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         )));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The CONTEXT panel's name line: the same name the sessions table
+/// shows (label or id), clipped to [`CONTEXT_NAME_W`] with an
+/// ellipsis when the title is the part that had to go, padded to the
+/// cap when short, and ended with the fixed gap so the name never
+/// touches the bar.
+fn context_name_spans(session: &SessionAgg) -> Vec<Span<'static>> {
+    // Flush-left, matching the sessions table: a row's name starts at
+    // the same column in both panels — correlation is alignment, not
+    // just a shared string.
+    let mut spans = Vec::with_capacity(4);
+    let shown =
+        session_name_spans(session).unwrap_or_else(|| vec![Span::raw(session.session.clone())]);
+    let name_w: usize = shown.iter().map(|span| span.width()).sum();
+    if name_w <= CONTEXT_NAME_W {
+        spans.extend(shown);
+        spans.push(Span::raw(
+            " ".repeat(CONTEXT_NAME_W - name_w + CONTEXT_NAME_GAP),
+        ));
+        return spans;
+    }
+    // Over the cap: clip the LAST span (the title or prompt — the
+    // directory is the correlation anchor, it stays whole).
+    let keep = CONTEXT_NAME_W.saturating_sub(1); // room for the ellipsis
+    let mut clipped = Vec::with_capacity(shown.len());
+    let mut used = 0;
+    let last = shown.len().saturating_sub(1);
+    for (index, span) in shown.into_iter().enumerate() {
+        if index == last {
+            let room = keep.saturating_sub(used);
+            let text = span.content.clone();
+            let cut = text
+                .char_indices()
+                .take_while(|(byte, _)| *byte <= room.saturating_sub(1).min(text.len()))
+                .last()
+                .map(|(byte, _)| byte)
+                .unwrap_or(0);
+            let text = format!("{}…", &text[..cut]);
+            clipped.push(Span::styled(text, span.style));
+        } else {
+            used += span.width();
+            clipped.push(span);
+        }
+    }
+    spans.extend(clipped);
+    spans.push(Span::raw(" ".repeat(CONTEXT_NAME_GAP)));
+    spans
 }
 
 /// The ceiling label's span, coloured like the sessions table's CTX
@@ -715,7 +801,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     // The bar/percentage pair is the row's shape; shape sheds before
     // information, and the fixed-width counts always fit.
     let show_shares = width >= TOKENS_SHARE_MIN_W;
-    let label = |text: &str| format!("  {text:<TOKENS_LABEL_W$}");
+    let label = |text: &str| format!("{text:<TOKENS_LABEL_W$}");
     let amount = |bucket: &super::model::BucketAgg| {
         format!(
             "{:>TOKENS_AMOUNT_W$}",
@@ -740,9 +826,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             // yields its width to it — otherwise the border clips the
             // note mid-word and the count the row exists to show is the
             // part that vanishes.
-            let bar_w = width
-                .saturating_sub(48 + note.as_ref().map_or(0, |note| note.len() + 2))
-                .max(TOKENS_BAR_MIN_W);
+            let bar_w = tokens_bar_width(width, note.as_ref().map_or(0, String::len));
             row.push(Span::raw("  "));
             row.push(Span::styled(
                 fill_bar(frac, bar_w, "▬", " "),
@@ -854,10 +938,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             if width >= TOKENS_RATE_BAR_MIN_W {
                 row.push(Span::raw("  "));
                 row.push(Span::styled(
-                    bar(
-                        hit,
-                        width.saturating_sub(34 + note.len()).max(TOKENS_BAR_MIN_W) as u16,
-                    ),
+                    bar(hit, tokens_rate_bar_width(width, note.len()) as u16),
                     style,
                 ));
                 row.push(Span::styled(note.to_owned(), Style::new().dim()));
@@ -935,12 +1016,12 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let walked = rebuilds.measured + rebuilds.unmeasured;
     if rebuilds.unmeasured > 0 {
         lines.push(Line::from(format!(
-            "  {} of {} measured requests rewrote ≥{} tokens · {} unknown",
+            "{} of {} measured requests rewrote ≥{} tokens · {} unknown",
             rebuilds.rebuilds, rebuilds.measured, threshold, rebuilds.unmeasured
         )));
     } else {
         lines.push(Line::from(format!(
-            "  {} of {} requests rewrote ≥{} tokens",
+            "{} of {} requests rewrote ≥{} tokens",
             rebuilds.rebuilds, walked, threshold
         )));
     }
@@ -951,13 +1032,13 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             "none — every prefix held"
         };
         lines.push(Line::from(Span::styled(
-            format!("    {verdict}"),
+            verdict.to_owned(),
             Style::new().dim(),
         )));
     }
     for (cause, count) in &rebuilds.causes {
         lines.push(Line::from(vec![
-            Span::raw(format!("    {:<24}{:>4}  ", cause.label(), count)),
+            Span::raw(format!("{:<24}{:>4}  ", cause.label(), count)),
             Span::styled("▬".repeat((*count).min(30)), Style::new().dim()),
         ]));
     }
@@ -969,10 +1050,27 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         .filter(|event| event.cause == super::rebuilds::Cause::SystemPrompt)
         .take(REBUILD_DETAIL_LINES)
     {
-        let session: String = event.session.chars().take(8).collect();
+        // The session's NAME, shared with the other panels (label or
+        // id) — correlation everywhere a session is named, the same
+        // builder. Clipped harder here: the detail line is the point.
+        let name = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == event.session)
+            .map(|session| {
+                let spans = session_name_spans(session)
+                    .unwrap_or_else(|| vec![Span::raw(session.session.clone())]);
+                spans
+            })
+            .unwrap_or_else(|| vec![Span::raw(event.session.clone())]);
+        let name_text = name
+            .iter()
+            .map(|span| span.content.clone())
+            .collect::<Vec<_>>()
+            .join("");
         let detail = event.detail.as_deref().unwrap_or("");
         lines.push(Line::from(Span::styled(
-            format!("  · {session} — system prompt changed ({detail})"),
+            format!("· {name_text} — system prompt changed ({detail})"),
             Style::new().dim(),
         )));
     }
@@ -1581,6 +1679,33 @@ mod tests {
     ///   unknown too: the `? / ?` context line.
     /// - `ses-free`: released past the gate → the `$`.
     fn full_snapshot() -> model::Snapshot {
+        full_snapshot_with_labels(&no_labels())
+    }
+
+    /// full_snapshot's shape with the given labels (and released set)
+    /// consumed by the aggregate.
+    fn full_snapshot_with_labels(labels: &HashMap<String, Label>) -> model::Snapshot {
+        let (rows, rebuilds, released) = full_snapshot_parts();
+        model::aggregate(
+            &rows,
+            None,
+            &released,
+            labels,
+            &FetchedCatalogs::default(),
+            Some(rebuilds),
+            30,
+            NOW,
+            523,
+        )
+    }
+
+    /// The rows, the precomputed rebuild section, and the released
+    /// set — full_snapshot's inputs, so label variants share them.
+    fn full_snapshot_parts() -> (
+        Vec<crate::store::DisplayRow>,
+        crate::tui::rebuilds::RebuildAgg,
+        HashSet<String>,
+    ) {
         let mut rows = Vec::new();
         // ses-hot: three turns, cache metrics on every one — the last
         // pushed is the newest, so the latest turn is the lean one
@@ -1686,17 +1811,7 @@ mod tests {
 
         let mut released = HashSet::new();
         released.insert("ses-free".to_owned());
-        model::aggregate(
-            &rows,
-            None,
-            &released,
-            &no_labels(),
-            &FetchedCatalogs::default(),
-            Some(rebuilds),
-            30,
-            NOW,
-            523,
-        )
+        (rows, rebuilds, released)
     }
 
     fn rendered(snap: &model::Snapshot, width: u16, height: u16) -> String {
@@ -2234,6 +2349,38 @@ mod tests {
     }
 
     #[test]
+    fn the_sessions_and_context_panels_show_the_same_session_name() {
+        // Correlation is the point of the shared name builder: a
+        // labeled session reads identically in both panels — the
+        // cyan dir, the dim separator, the same title — and an
+        // unlabeled one reads as its id in both.
+        let mut labels = HashMap::new();
+        labels.insert(
+            "ses-hot".to_owned(),
+            Label {
+                cwd: Some("/home/u/code/toker".into()),
+                title: Some("Correlated panels".into()),
+                prompt: None,
+            },
+        );
+        // ses-crowded stays UNlabeled: its id, in both panels.
+        let snap = full_snapshot_with_labels(&labels);
+        let text = rendered(&snap, 120, 40);
+        // The labeled form appears TWICE — once per panel — and the
+        // raw id never appears for that session.
+        assert_eq!(
+            text.matches("toker · Correlated panels").count(),
+            2,
+            "the label in both panels:\n{text}"
+        );
+        assert!(
+            !text.contains("ses-hot"),
+            "the labeled session never renders its id:\n{text}"
+        );
+        // The unlabeled one: its id, also twice.
+        assert_eq!(text.matches("ses-crowded").count(), 2);
+    }
+
     fn context_panel_says_so_when_no_session_has_enough_history() {
         // Occupancy is a claim about a conversation: a window whose
         // sessions never reach the three-request rule gets the explicit
@@ -2308,352 +2455,6 @@ mod tests {
         assert!(
             !line.contains('%'),
             "no percentage beside an unknown prompt:\n{line}"
-        );
-    }
-
-    #[test]
-    fn tokens_panel_renders_openai_windows_from_the_knowns() {
-        // The openai shape: the write metric does not EXIST on that
-        // family — structural, not unknown. The rows report input and
-        // cache read; the write tiers render as floors (`≥0` with the
-        // unknown count), every share still computes (a missing bucket
-        // never blanks the others), and the hit rate computes over the
-        // known sums — the read is real, the rewrites are a known zero.
-        let mut rows = Vec::new();
-        for at in [3, 2, 1] {
-            let mut row = display_bare(NOW - at * 60_000);
-            row.session_id = Some("ses-openai".into());
-            row.model = Some("z-ai/glm-5.3".into());
-            row.provider = Some("openrouter".into());
-            row.input = Some(1_000);
-            row.cache_read = Some(30_000);
-            row.output = Some(200);
-            rows.push(row);
-        }
-        let snap = model::aggregate(
-            &rows,
-            None,
-            &HashSet::new(),
-            &no_labels(),
-            &FetchedCatalogs::default(),
-            None,
-            30,
-            NOW,
-            523,
-        );
-        let text = rendered(&snap, 120, 40);
-        // Shares from the known total (3,000 + 90,000 = 93,000): the
-        // arithmetic pins — round(0.0323 × 70) = 2 filled for fresh,
-        // round(0.9677 × 70) = 68 filled for the read row.
-        assert!(
-            text.contains(&format!(
-                "  fresh input{}3,000  {}{}   3%",
-                " ".repeat(12),
-                "▬".repeat(2),
-                " ".repeat(68)
-            )),
-            "the fresh-input share:\n{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "  cache read{}90,000  {}{}  97%",
-                " ".repeat(12),
-                "▬".repeat(68),
-                " ".repeat(2)
-            )),
-            "the read share:\n{text}"
-        );
-        assert!(
-            text.contains(&format!("  hit rate{}100.0%", " ".repeat(14))),
-            "a structural write absence still yields the real rate:\n{text}"
-        );
-        assert!(
-            text.contains("   0%  3 req unknown"),
-            "the write tiers keep their floors and their count:\n{text}"
-        );
-        // The rate computes — no caveat owed, the absence is structural.
-        assert!(
-            !text.contains("cache metrics unavailable"),
-            "nothing claims unavailable metrics here:\n{text}"
-        );
-        // The missed line: a known-zero rewrite figure.
-        assert!(
-            text.contains(
-                "missed                     0  rewritten · 0/req · 0 of 3 req reused nothing"
-            ),
-            "the missed line:\n{text}"
-        );
-    }
-
-    #[test]
-    fn tokens_panel_renders_buckets_the_hit_rate_and_the_missed_line() {
-        let snap = full_snapshot();
-        let text = rendered(&snap, 120, 40);
-        for expected in [
-            "fresh input",
-            "cache read",
-            "cache write 1h",
-            "cache write 5m",
-            "output",
-            "hit rate",
-            "of reusable prefix",
-            "missed",
-        ] {
-            assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
-        }
-        // The figures: every bucket complete, so shares render with
-        // bars; the hit rate is over the reusable prefix —
-        // 1 608 393 / (1 608 393 + 97 000) = 94.3%.
-        assert!(text.contains("1,608,393"), "the cache-read total:\n{text}");
-        assert!(text.contains("94.3%"), "the hit rate:\n{text}");
-        assert!(text.contains("97,000"), "the rewritten total:\n{text}");
-        assert!(
-            text.contains("rewritten · 8,083/req · 1 of 12 req reused nothing"),
-            "the missed line:\n{text}"
-        );
-        assert!(
-            text.contains("▬"),
-            "the share bars are ▬, not the occupancy █:\n{text}"
-        );
-    }
-
-    /// The TOKENS panel's pinning fixture: one complete anthropic row
-    /// — 1,000 fresh, 9,000 read, 1,000 written 1h, nothing written
-    /// 5m — so the shares are 9% / 82% / 9% / 0% of the 11,000-token
-    /// input side (output excluded: it shares no denominator with the
-    /// buckets), the 5m row is the zero-share case (a real zero with
-    /// a bar, not the absent state with its reason), and the hit
-    /// rate is 9,000 / 10,000 = 90.0% over the reusable prefix. One
-    /// request, no rebuild section, no three-request session: no
-    /// other panel renders a bar glyph, so the width assertions see
-    /// this panel alone.
-    fn tokens_snapshot() -> model::Snapshot {
-        let mut row = display_bare(NOW - 30_000);
-        row.session_id = Some("ses-tokens".into());
-        row.model = Some("claude-opus-5".into());
-        row.provider = Some("anthropic_sub".into());
-        row.input = Some(1_000);
-        row.cache_read = Some(9_000);
-        row.cache_write_1h = Some(1_000);
-        row.cache_write_5m = Some(0);
-        row.output = Some(100);
-        model::aggregate(
-            &[row],
-            None,
-            &HashSet::new(),
-            &no_labels(),
-            &FetchedCatalogs::default(),
-            None,
-            30,
-            NOW,
-            1,
-        )
-    }
-
-    #[test]
-    fn tokens_panel_pins_bar_widths_and_percentages_at_a_wide_terminal() {
-        // Inner width 118 → the share bar is 70 wide (the
-        // WIDTH − 48 rule) and the row keeps its 11 of slack. The space
-        // counts below are the pins: label padEnd(15) + amount
-        // padStart(13), the fill `round(share × 70)`, the empty the
-        // rest, the percentage `round(share × 100)` in " NNN%".
-        let text = rendered(&tokens_snapshot(), 120, 30);
-        // fresh input: 1/11 → round(6.36) = 6 filled of 70.
-        assert!(
-            text.contains(&format!(
-                "  fresh input{}1,000  {}{}   9%",
-                " ".repeat(12),
-                "▬".repeat(6),
-                " ".repeat(64)
-            )),
-            "the fresh-input row:\n{text}"
-        );
-        // cache read: 9/11 → round(57.27) = 57 filled of 70.
-        assert!(
-            text.contains(&format!(
-                "  cache read{}9,000  {}{}  82%",
-                " ".repeat(13),
-                "▬".repeat(57),
-                " ".repeat(13)
-            )),
-            "the cache-read row:\n{text}"
-        );
-        // cache write 1h: 1/11 again.
-        assert!(
-            text.contains(&format!(
-                "  cache write 1h{}1,000  {}{}   9%",
-                " ".repeat(9),
-                "▬".repeat(6),
-                " ".repeat(64)
-            )),
-            "the 1h-write row:\n{text}"
-        );
-        // The zero-share row: a full-width BLANK bar and a real 0% —
-        // never the absent state's reason.
-        assert!(
-            text.contains(&format!(
-                "  cache write 5m{}0  {}   0%",
-                " ".repeat(13),
-                " ".repeat(70)
-            )),
-            "the zero-share row:\n{text}"
-        );
-        // Output: no denominator shared with the input buckets, so
-        // no bar — the total plus the per-request average.
-        assert!(
-            text.contains(&format!("  output{}100  100/req", " ".repeat(19))),
-            "the output row:\n{text}"
-        );
-        // Hit rate: 90.0% in the amount column, then the bar — inner
-        // 118 → 65 wide, round(0.9 × 65) = 59 filled — and the note.
-        assert!(
-            text.contains(&format!(
-                "  hit rate{}90.0%  {}░░░░░░ of reusable prefix",
-                " ".repeat(15),
-                "█".repeat(59)
-            )),
-            "the hit-rate row:\n{text}"
-        );
-        // The missed line: rewrites, per request, and the cold count.
-        assert!(
-            text.contains(&format!(
-                "  missed{}1,000  rewritten · 1,000/req · 0 of 1 req reused nothing",
-                " ".repeat(17)
-            )),
-            "the missed row:\n{text}"
-        );
-    }
-
-    #[test]
-    fn tokens_panel_pins_bar_widths_at_a_narrower_terminal() {
-        // Inner width 78 → the share bar 30 wide, the hit-rate bar 25
-        // (max(6, 78 − 34 − 19)) — the same shape, rescaled.
-        let text = rendered(&tokens_snapshot(), 80, 30);
-        assert!(
-            text.contains(&format!(
-                "  fresh input{}1,000  {}{}   9%",
-                " ".repeat(12),
-                "▬".repeat(3),
-                " ".repeat(27)
-            )),
-            "the fresh-input row:\n{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "  cache read{}9,000  {}{}  82%",
-                " ".repeat(13),
-                "▬".repeat(25),
-                " ".repeat(5)
-            )),
-            "the cache-read row:\n{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "  cache write 5m{}0  {}   0%",
-                " ".repeat(13),
-                " ".repeat(30)
-            )),
-            "the zero-share row:\n{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "  hit rate{}90.0%  {}░░ of reusable prefix",
-                " ".repeat(15),
-                "█".repeat(23)
-            )),
-            "the hit-rate row:\n{text}"
-        );
-    }
-
-    #[test]
-    fn tokens_panel_sheds_the_bar_columns_before_the_counts() {
-        let snap = tokens_snapshot();
-        // Inner 40: the counts fit (32 columns), the least
-        // bar-plus-percentage pair does not (43) — the pair sheds
-        // whole, no stub bar, no clipped percentage. The hit-rate
-        // bar needs only 38, so it stays.
-        let text = rendered(&snap, 42, 30);
-        let fresh = text
-            .lines()
-            .find(|line| line.contains("fresh input"))
-            .expect("the fresh-input row");
-        // Strip the panel's right border, then the padding: what is
-        // left is the row itself, and it must be the counts alone.
-        let row = fresh.trim_end_matches('│').trim_end();
-        assert_eq!(
-            row, "│  fresh input            1,000",
-            "the counts survive the shed, and only the counts"
-        );
-        assert!(
-            !text.contains('▬'),
-            "the bucket bars are gone entirely, not clipped:\n{text}"
-        );
-        assert!(
-            text.contains("90.0%  █████░"),
-            "the hit-rate bar fits at 38 and stays:\n{text}"
-        );
-
-        // Inner 34: even the hit-rate bar sheds; the rate itself
-        // rides in the amount column and survives.
-        let text = rendered(&snap, 36, 30);
-        let hit = text
-            .lines()
-            .find(|line| line.contains("hit rate"))
-            .expect("the hit-rate row");
-        assert_eq!(
-            hit.trim_end_matches('│').trim_end(),
-            "│  hit rate               90.0%",
-            "the rate survives its bar"
-        );
-    }
-
-    #[test]
-    fn tokens_panel_renders_zero_traffic_as_zero_shares_not_absence() {
-        // Every bucket reported, every bucket zero: real zeros, so
-        // the shares render — blank bars, 0% — and nothing says
-        // "unknown". The absent state (a NULL metric) renders its
-        // reasons instead; the two must never converge.
-        let mut row = display_bare(NOW - 30_000);
-        row.session_id = Some("ses-zero".into());
-        row.model = Some("claude-opus-5".into());
-        row.provider = Some("anthropic_sub".into());
-        row.input = Some(0);
-        row.cache_read = Some(0);
-        row.cache_write_1h = Some(0);
-        row.cache_write_5m = Some(0);
-        row.output = Some(0);
-        let snap = model::aggregate(
-            &[row],
-            None,
-            &HashSet::new(),
-            &no_labels(),
-            &FetchedCatalogs::default(),
-            None,
-            30,
-            NOW,
-            1,
-        );
-        let text = rendered(&snap, 120, 30);
-        // The max(total, 1) denominator makes each
-        // share 0/1 — a 0% with a blank bar, not a crash and not a
-        // reason.
-        assert!(
-            text.contains(&format!(
-                "  fresh input{}0  {}   0%",
-                " ".repeat(16),
-                " ".repeat(70)
-            )),
-            "a reported zero renders a real 0%:\n{text}"
-        );
-        assert!(
-            !text.contains("unknown"),
-            "nothing is unknown — everything was reported:\n{text}"
-        );
-        // Nothing was read or rewritten: no
-        // hit-rate line at all.
-        assert!(
-            !text.contains("hit rate"),
-            "no rate over an empty prefix:\n{text}"
         );
     }
 
