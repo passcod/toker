@@ -29,10 +29,14 @@ enum Command {
     Serve,
     /// Run the ratatui dashboard (plan: TUI).
     Tui {
-        /// Dashboard window length in minutes.
+        /// Dashboard window length in minutes. Default 60: the
+        /// anthropic cache's longest TTL is one hour, so the window
+        /// that answers "is my cache still warm" is the last hour
+        /// (openai-family caches are shorter — the window still shows
+        /// them, just with more history attached).
         #[arg(
             long = "window-mins",
-            default_value_t = 30,
+            default_value_t = 60,
             value_parser = clap::value_parser!(u64).range(1..=1440)
         )]
         window_mins: u64,

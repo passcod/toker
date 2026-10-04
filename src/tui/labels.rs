@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How much of a transcript is ever read
 /// (`TAIL_BYTES`, the reference's tail cap). Claude Code re-appends the
@@ -177,6 +177,47 @@ pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Op
         text.drain(..=first_nl);
     }
     label_from_tail(&text)
+}
+
+/// The label opencode's own session store carries: its SQLite db has
+/// a `session_v2` table with `id`, `title`, and `directory` — the same
+/// facts the claude transcripts provide, in a queryable table, no tail
+/// scanning at all. Read-only and lock-tolerant: a busy or missing
+/// store is no-label, never an error (invariant 6's spirit — the
+/// label machinery must never fail a dashboard).
+pub(crate) fn opencode_label(sid: &str, db: &Path) -> Option<Label> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // A tiny busy timeout: opencode holds WAL locks while writing; a
+    // label is not worth waiting on — miss this refresh, hit the next.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
+    let (title, directory): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT title, directory FROM session_v2 WHERE id = ?1",
+            [sid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    (title.is_some() || directory.is_some()).then_some(Label {
+        cwd: directory,
+        title,
+        prompt: None,
+    })
+}
+
+/// The opencode store's location: `$XDG_DATA_HOME/opencode/opencode.db`
+/// (the data-home default `~/.local/share/opencode/opencode.db`).
+pub(crate) fn opencode_db_default() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    let data_home = match std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(home).join(".local/share"),
+    };
+    Some(data_home.join("opencode").join("opencode.db"))
 }
 
 /// The label a transcript tail carries. Only the few small records
@@ -330,15 +371,29 @@ pub(crate) fn short_dir(cwd: Option<&str>) -> Option<String> {
 pub(crate) struct Labels {
     /// The `projects/` roots to look in, resolved once.
     roots: Vec<PathBuf>,
+    /// The opencode session store, when its default location exists.
+    opencode_db: Option<PathBuf>,
     /// Labels resolved this refresh, keyed by session id.
     resolved: HashMap<String, Option<Label>>,
 }
 
 impl Labels {
-    /// The label state over resolved roots (see [`transcript_roots`]).
+    /// The label state over resolved roots (see [`transcript_roots`])
+    /// and the opencode store's default location.
     pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
         Labels {
             roots,
+            opencode_db: opencode_db_default().filter(|db| db.is_file()),
+            resolved: HashMap::new(),
+        }
+    }
+
+    /// The test shape: roots and an explicit opencode db.
+    #[cfg(test)]
+    fn with_opencode_db(roots: Vec<PathBuf>, db: PathBuf) -> Self {
+        Labels {
+            roots,
+            opencode_db: Some(db),
             resolved: HashMap::new(),
         }
     }
@@ -352,13 +407,19 @@ impl Labels {
     }
 
     /// The session's label, reading its transcript tail once per
-    /// refresh. `None` when no transcript carries one — a row without a
-    /// name, never an error.
+    /// refresh, then opencode's session store. `None` when neither
+    /// carries one — a row without a name, never an error. The two
+    /// id shapes never overlap (claude's UUIDs vs opencode's `ses_…`),
+    /// so the order is a formality, not a precedence.
     pub(crate) fn resolve(&mut self, sid: &str) -> Option<Label> {
         if let Some(hit) = self.resolved.get(sid) {
             return hit.clone();
         }
-        let label = session_label(sid, &self.roots, TAIL_BYTES);
+        let label = session_label(sid, &self.roots, TAIL_BYTES).or_else(|| {
+            self.opencode_db
+                .as_deref()
+                .and_then(|db| opencode_label(sid, db))
+        });
         self.resolved.insert(sid.to_owned(), label.clone());
         label
     }
@@ -890,5 +951,117 @@ mod tests {
             labels.resolve(late).and_then(|label| label.title),
             Some("late title".to_owned())
         );
+    }
+    // ── the opencode store source ────────────────────────────────
+
+    /// A scratch opencode store: the session_v2 shape the query reads.
+    fn opencode_scratch(root: &Path) -> PathBuf {
+        let dir = root.join("opencode");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY, title TEXT, directory TEXT
+             );",
+        )
+        .expect("schema");
+        db
+    }
+
+    #[test]
+    fn the_opencode_store_labels_sessions_by_title_and_directory() {
+        let root = scratch("opencode-labels");
+        let db = opencode_scratch(&root);
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open");
+            conn.execute(
+                "INSERT INTO session_v2 (id, title, directory) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "ses_op_1",
+                    "Models-API fetch and cache",
+                    "/home/user/code/rust/toker"
+                ],
+            )
+            .expect("seed");
+            conn.execute(
+                "INSERT INTO session_v2 (id, title, directory) VALUES (?1, NULL, ?2)",
+                rusqlite::params!["ses_op_untitled", "/home/user/code/somewhere"],
+            )
+            .expect("seed");
+        }
+
+        let labeled = super::opencode_label("ses_op_1", &db).expect("labeled");
+        assert_eq!(labeled.title.as_deref(), Some("Models-API fetch and cache"));
+        assert_eq!(labeled.cwd.as_deref(), Some("/home/user/code/rust/toker"));
+        assert_eq!(labeled.prompt, None);
+
+        // Untitled but placed: the directory is the label.
+        let untitled = super::opencode_label("ses_op_untitled", &db).expect("labeled");
+        assert_eq!(untitled.title, None);
+        assert_eq!(untitled.cwd.as_deref(), Some("/home/user/code/somewhere"));
+
+        // Misses and failures are no-labels, never errors.
+        assert_eq!(super::opencode_label("ses_op_missing", &db), None);
+        let bogus = root.join("not-a.db");
+        assert_eq!(super::opencode_label("ses_op_1", &bogus), None);
+    }
+
+    #[test]
+    fn resolve_falls_through_transcripts_to_the_opencode_store() {
+        // No transcript roots at all: the opencode store answers.
+        let root = scratch("opencode-fallthrough");
+        let db = opencode_scratch(&root);
+        {
+            let conn = rusqlite::Connection::open(&db).expect("open");
+            conn.execute(
+                "INSERT INTO session_v2 (id, title, directory) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["ses_ft_1", "Wake hold ping timers", "/w/repo"],
+            )
+            .expect("seed");
+        }
+        let mut labels = super::Labels::with_opencode_db(Vec::new(), db);
+        let hit = labels.resolve("ses_ft_1").expect("labeled");
+        assert_eq!(hit.title.as_deref(), Some("Wake hold ping timers"));
+        assert_eq!(hit.cwd.as_deref(), Some("/w/repo"));
+        // The refresh cache: a second resolve never re-reads (the map
+        // is keyed; this pins the fall-through result cached the same).
+        assert_eq!(labels.resolve("ses_ft_1"), Some(hit));
+    }
+
+    /// The real machine's store, read-only: the newest sessions the
+    /// ledger names resolve to real titles and directories. Manual
+    /// run only (the store is the user's live data; the suite must
+    /// never depend on it existing).
+    #[test]
+    #[ignore = "reads the real opencode store; run with --ignored"]
+    fn the_real_opencode_store_resolves_real_sessions() {
+        let Some(db) = super::opencode_db_default() else {
+            panic!("no opencode store at the default location");
+        };
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open the real store read-only");
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM session_v2 ORDER BY time_created DESC LIMIT 3")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .filter_map(Result::ok)
+            .collect();
+        for id in &ids {
+            let label = super::opencode_label(id, &db);
+            println!(
+                "{id}: {}",
+                match &label {
+                    Some(label) => format!(
+                        "{} · {}",
+                        super::short_dir(label.cwd.as_deref()).unwrap_or_else(|| "-".into()),
+                        label.title.as_deref().unwrap_or("(untitled)")
+                    ),
+                    None => "no label".to_owned(),
+                }
+            );
+        }
     }
 }

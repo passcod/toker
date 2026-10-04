@@ -982,10 +982,22 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 /// Short tokens: round thousands and millions
 /// abbreviate; anything else renders comma-grouped.
 fn short_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
-        format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
-        format!("{}k", tokens / 1_000)
+    // Human-rounded, deliberately not exact: the CONTEXT panel carries
+    // the precise figure (occupancy bar + exact counts), so the table's
+    // cell answers "which league is this window in". ≥1M rounds to the
+    // nearest 0.1M (1,048,576 → `1M`, 1,050,000 → `1.1M`); ≥1k to the
+    // nearest 1k (262,144 → `262k`); below that, grouped as-is.
+    if tokens >= 1_000_000 {
+        let tenths = ((tokens as f64 / 100_000.0).round()) as u64;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac == 0 {
+            format!("{whole}M")
+        } else {
+            format!("{whole}.{frac}M")
+        }
+    } else if tokens >= 1_000 {
+        format!("{}k", ((tokens as f64 / 1_000.0).round()) as u64)
     } else {
         grouped(Some(tokens as i64))
     }
@@ -1350,6 +1362,33 @@ fn bar(frac: f64, w: u16) -> String {
 /// Dollar formatting for the spend panel.
 fn usd(value: f64) -> String {
     format!("${value:.6}")
+}
+
+#[cfg(test)]
+mod short_tokens_tests {
+    use super::short_tokens;
+
+    #[test]
+    fn large_windows_round_to_human_figures() {
+        // The CONTEXT panel carries the exact occupancy; the table's
+        // cell answers "which league". ≥1M rounds to the nearest 0.1M
+        // (trailing `.0` dropped); ≥1k to the nearest k.
+        for (tokens, shown) in [
+            (1_000_000u64, "1M"),
+            (1_048_576, "1M"),   // openrouter's binary megabyte
+            (1_050_000, "1.1M"), // gpt-6-luna's declared window
+            (1_048_576 + 40_000, "1.1M"),
+            (872_000, "872k"),
+            (262_144, "262k"),
+            (200_000, "200k"),
+            (104_857, "105k"),
+            (102_400, "102k"),
+            (999, "999"),
+            (500, "500"),
+        ] {
+            assert_eq!(short_tokens(tokens), shown, "{tokens}");
+        }
+    }
 }
 
 #[cfg(test)]
