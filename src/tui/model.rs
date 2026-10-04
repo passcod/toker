@@ -263,16 +263,6 @@ impl TokensAgg {
         self.fresh_input.value + self.cache_read.value + self.write_1h.value + self.write_5m.value
     }
 
-    /// Whether any input bucket has unavailable rows — the panel then
-    /// replaces every share with the reason it cannot be computed
-    /// ("N req unknown" / "share unknown").
-    pub(crate) fn input_incomplete(&self) -> bool {
-        self.fresh_input.unavailable > 0
-            || self.cache_read.unavailable > 0
-            || self.write_1h.unavailable > 0
-            || self.write_5m.unavailable > 0
-    }
-
     /// Hit rate over the reusable prefix: cache reads as a share of
     /// everything cache could have served — reads plus rewrites, not
     /// all input. Fresh input is the new turn's content, which was
@@ -285,11 +275,16 @@ impl TokensAgg {
     /// (no line at all — no denominator, no claim);
     /// [`HitRate::Rate`] otherwise.
     pub(crate) fn hit_rate(&self) -> HitRate {
-        if self.cache_unknown > 0 {
-            return HitRate::Unknown;
-        }
+        // Over the KNOWN sums — a floor when some rows are unknown, and
+        // the caveat rides the panel's "N req unknown" note instead of
+        // blanking the rate. Marking every figure unknown because some
+        // rows are missing data was the over-strict reading; the
+        // knowns still answer the question.
         let reusable = self.cache_read.value + self.written();
         if reusable == 0 {
+            if self.cache_unknown > 0 {
+                return HitRate::Unknown;
+            }
             return HitRate::NothingReusable;
         }
         HitRate::Rate(self.cache_read.value as f64 / reusable as f64)
@@ -402,8 +397,15 @@ pub(crate) fn aggregate(
         tokens.write_5m.add(row.cache_write_5m);
         tokens.output.add(row.output);
         tokens.reasoning.add(row.reasoning);
-        if row.cache_read.is_none() || row.cache_write_1h.is_none() || row.cache_write_5m.is_none()
-        {
+        // The structural rule matches `prompt_of`'s: (None, Some) is a
+        // KNOWN whole-write total (the apportioned 1-hour charge), and
+        // (None, None) on the openai family is structural — the metric
+        // does not exist there. Only an anthropic-shaped row with no
+        // write share at all is unknown here.
+        let writes_known = row.cache_write_5m.is_some()
+            || row.cache_write_1h.is_some()
+            || !anthropic_shaped(row.provider.as_deref());
+        if row.cache_read.is_none() || !writes_known {
             tokens.cache_unknown += 1;
         }
         if !row.cache_read.is_some_and(|read| read > 0) {
@@ -465,7 +467,16 @@ pub(crate) fn aggregate(
             (Some(cost), Some(CostKind::Billed)) => {
                 spend.billed_total = Some(spend.billed_total.unwrap_or(0.0) + cost);
                 spend.billed_requests += 1;
-                let key = (row.provider.clone(), row.model.clone());
+                // The label is the upstream endpoint the backend NAMED
+                // (openrouter's serving provider), falling back to the
+                // backend id — the provider info the panel exists to
+                // show; the model rides beside it.
+                let key = (
+                    row.serving_provider
+                        .clone()
+                        .or_else(|| row.provider.clone()),
+                    row.model.clone(),
+                );
                 let slot = *breakdown_index.entry(key.clone()).or_insert_with(|| {
                     spend.breakdown.push(ProviderModelSpend {
                         provider: key.0.clone(),
@@ -534,29 +545,37 @@ pub(crate) fn aggregate(
     }
 }
 
-/// One row's prompt size — the measure the sessions panel's prompt
-/// columns and the CONTEXT bars share: `input + cache_read + cache
-/// writes`. `None` unless every
-/// operand is known — a missing operand is unknown, not zero.
+/// The session's prompt size from one row: the fresh input, the cache
+/// read, and the cache writes, summed — `None` when any operand is
+/// unknown, because a prompt figure built on a missing operand is a
+/// guess, not a number.
 ///
-/// The write share is protocol arithmetic, and the row's provider
-/// carries the protocol: anthropic's `input_tokens` EXCLUDES both
-/// cache buckets, so a row from an anthropic backend that reports no
-/// write has an unknown prompt — a write may have gone unreported.
-/// The openai-chat family has no cache-write metric at all
+/// The write term's arity is protocol arithmetic, but the total is what
+/// matters: a row whose split is unknown charges the whole write to the
+/// 1-hour tier (the conservative apportionment, `ttl_split_known =
+/// false`), so `(None, Some(one))` is a KNOWN total — the prompt is
+/// `input + read + one`. Only a 5-minute write with no 1-hour share
+/// alongside it is uninterpretable (the fold never produces it; if it
+/// ever appears, unknown beats a guess).
+///
+/// The `(None, None)` case is protocol-keyed: anthropic's
+/// `input_tokens` EXCLUDES the cache buckets, so an anthropic-shaped
+/// row reporting no write has an unknown prompt — a write may have gone
+/// unreported. The openai-chat family has no cache-write metric at all
 /// (`input + cache_read` already is the whole `prompt_tokens`), so a
 /// NULL write there is structural, and the prompt is complete without
 /// it. Anything not identifiable as an anthropic backend gets the
-/// openai-chat arithmetic; a future anthropic-shaped backend must
-/// carry the `anthropic` prefix to keep its prompts honest here.
+/// openai-chat arithmetic; a future anthropic-shaped backend must carry
+/// the `anthropic` prefix to keep its prompts honest here.
 fn prompt_of(row: &DisplayRow) -> Option<i64> {
     let input = row.input?;
     let cache_read = row.cache_read?;
     let writes = match (row.cache_write_5m, row.cache_write_1h) {
         (Some(five), Some(one)) => five + one,
+        (None, Some(one)) => one, // the apportioned whole-write total
         (None, None) if anthropic_shaped(row.provider.as_deref()) => return None,
-        (None, None) => 0,
-        _ => return None,
+        (None, None) => 0,              // openai-shaped: structural, not unknown
+        (Some(_), None) => return None, // uninterpretable; never produced
     };
     Some(input + cache_read + writes)
 }
@@ -1326,7 +1345,10 @@ mod tests {
         // `provider` column, never `extra.serving_provider` (no
         // "Relace"/"Elsewhere"/"Kimi" anywhere).
         let breakdown = &snap.spend.breakdown;
-        assert_eq!(breakdown.len(), 4);
+        assert_eq!(breakdown.len(), 6);
+        // The label is the serving provider the backend named, not the
+        // backend id — "Kimi"/"Relace"/"Elsewhere" are openrouter's
+        // upstream endpoints, and that grouping is the panel's point.
         assert_eq!(
             (
                 breakdown[0].provider.as_deref(),
@@ -1334,22 +1356,42 @@ mod tests {
                 breakdown[0].billed,
                 breakdown[0].requests,
             ),
-            (Some("openrouter"), Some("z-ai/glm-5.3"), 4.5, 4)
+            (None, None, 3.5, 1),
+            "the NULL-provider·model row groups under the dash, largest first"
         );
         assert_eq!(
-            (breakdown[1].provider.as_deref(), breakdown[1].billed),
-            (None, 3.5),
-            "the NULL-provider·model row groups under the dash"
+            (
+                breakdown[1].provider.as_deref(),
+                breakdown[1].model.as_deref(),
+                breakdown[1].billed,
+                breakdown[1].requests,
+            ),
+            (Some("openrouter"), Some("z-ai/glm-5.3"), 2.5, 1),
+            "a billed row with no serving label falls back to the backend id"
         );
         assert_eq!(
-            breakdown[2].provider.as_deref(),
-            Some("lunaroute"),
-            "equal-cost tie-break is provider-asc"
+            (
+                breakdown[2].provider.as_deref(),
+                breakdown[2].billed,
+                breakdown[2].requests
+            ),
+            (Some("Relace"), 1.5, 2),
+            "both Relace-served rows group under their endpoint, the zero-cost one included"
         );
         assert_eq!(
             breakdown[3].provider.as_deref(),
+            Some("Elsewhere"),
+            "equal-cost tie-break is label-asc"
+        );
+        assert_eq!(
+            breakdown[4].provider.as_deref(),
             Some("openrouter"),
-            "…then model-asc within the provider"
+            "…then model-asc within the label"
+        );
+        assert_eq!(
+            breakdown[5].provider.as_deref(),
+            Some("Kimi"),
+            "…and the smallest billed group last"
         );
         // Sessions, most-recent-first, the NULL-session group under
         // the dash; ses-c's model comes from the LATER id of the
@@ -1398,8 +1440,10 @@ mod tests {
         assert_eq!(tokens.fresh_input.unavailable, 3);
         assert_eq!(tokens.cache_read.unavailable, 4);
         assert_eq!(
-            tokens.cache_unknown, 12,
-            "only the two anthropic rows carry every cache metric"
+            tokens.cache_unknown, 5,
+            "genuinely unknown cache metrics only: an absent read, or an \
+             anthropic-shaped row with no write share — the openai family's \
+             structural absence is not unknown"
         );
         // The error row flagged its own minute's bucket and added no
         // request there.
@@ -1889,7 +1933,6 @@ mod tests {
         assert_eq!(tokens.requests, 1);
         assert_eq!(tokens.cache_unknown, 0);
         assert_eq!(tokens.cold, 0, "the one row reused its prefix");
-        assert!(!tokens.input_incomplete());
         assert_eq!(tokens.input_total(), 11_000);
         assert_eq!(tokens.written(), 1_000);
         match tokens.hit_rate() {
@@ -1897,8 +1940,10 @@ mod tests {
             other => panic!("expected a rate, got {other:?}"),
         }
 
-        // The openai shape: no cache-write metrics on any row — the
-        // buckets are floors and the rate is a `?`, never a guess.
+        // The openai shape: the write metric does not EXIST on that
+        // family (structural, not unknown) — the write buckets are
+        // floors (`≥0`), the known sums carry the rate, and no caveat
+        // is owed.
         let mut openai = display_bare(mins_ago(1));
         openai.session_id = Some("ses-b".into());
         openai.provider = Some("openrouter".into());
@@ -1907,10 +1952,27 @@ mod tests {
         openai.output = Some(100);
         let snap = agg(&[openai], 1);
         let tokens = &snap.tokens;
-        assert_eq!(tokens.cache_unknown, 1);
-        assert!(tokens.input_incomplete());
-        assert_eq!(tokens.write_1h.unavailable, 1);
-        assert_eq!(tokens.hit_rate(), HitRate::Unknown);
+        assert_eq!(tokens.cache_unknown, 0, "structural absence is not unknown");
+        assert_eq!(
+            tokens.write_1h.unavailable, 1,
+            "the bucket still floors its figure"
+        );
+        match tokens.hit_rate() {
+            HitRate::Rate(rate) => assert!((rate - 1.0).abs() < 1e-12),
+            other => panic!("expected a rate over the knowns, got {other:?}"),
+        }
+
+        // An anthropic-shaped row missing its write share IS unknown:
+        // a write may have gone unreported, and with nothing reusable
+        // known either way, the rate is a `?`, never a guess.
+        let mut mystery = display_bare(mins_ago(1));
+        mystery.session_id = Some("ses-b2".into());
+        mystery.provider = Some("anthropic_sub".into());
+        mystery.input = Some(1_000);
+        mystery.cache_read = Some(0);
+        let snap = agg(&[mystery], 1);
+        assert_eq!(snap.tokens.cache_unknown, 1);
+        assert_eq!(snap.tokens.hit_rate(), HitRate::Unknown);
 
         // Nothing read, nothing written, everything reported: no rate
         // is claimable either way — no line at all.
@@ -1936,7 +1998,6 @@ mod tests {
         zeroed.cache_write_5m = Some(0);
         let snap = agg(&[zeroed], 1);
         assert_eq!(snap.tokens.input_total(), 0);
-        assert!(!snap.tokens.input_incomplete());
         assert_eq!(snap.tokens.cold, 1);
         assert_eq!(snap.tokens.hit_rate(), HitRate::NothingReusable);
     }

@@ -306,27 +306,34 @@ fn bottom_height(snap: &Snapshot) -> u16 {
     BOTTOM_HEIGHT.max((lines + 2) as u16) // + 2 border rows
 }
 
-/// Header line: `toker · live · last 30m` + window summary, clock at the
-/// right edge. An empty window says "no requests in window" — absence,
-/// not "0 requests".
+/// Header line: the window summary and the clock at the right edge —
+/// `last 60m · 3 sessions · 1 idle · 83 requests`. No title (the
+/// dashboard has one job), no "live" (there is no pause to be not-live
+/// with), no ledger total (a lifetime row count answers nothing the
+/// window does not). An empty window says "no requests in window" —
+/// absence, not "0 requests".
 fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     let [left, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(8)]).areas(area);
 
-    let mut text = format!("toker · live · last {}m", snap.window_mins);
+    let mut text = format!("last {}m", snap.window_mins);
     if snap.window_empty {
         text.push_str(" · no requests in window");
     } else {
         let sessions = snap.sessions.len();
+        let idle = snap
+            .sessions
+            .iter()
+            .filter(|session| snap.now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000)
+            .count();
         text.push_str(&format!(
-            " · {sessions} session{} · {} requests in window",
+            " · {sessions} session{}",
             if sessions == 1 { "" } else { "s" },
-            snap.window_requests
         ));
-    }
-    match snap.total_requests {
-        0 => text.push_str(" · ledger empty"),
-        total => text.push_str(&format!(" · {total} in ledger")),
+        if idle > 0 {
+            text.push_str(&format!(" · {idle} idle"));
+        }
+        text.push_str(&format!(" · {} requests", snap.window_requests));
     }
     frame.render_widget(Paragraph::new(text.bold()), left);
     frame.render_widget(
@@ -699,7 +706,11 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let tokens = &snap.tokens;
 
     let mut lines = Vec::new();
-    let incomplete = tokens.input_incomplete();
+    // Shares render per bucket from the KNOWN sums: a bucket with
+    // unknown rows is a FLOOR (the `≥` marker) and keeps its share —
+    // missing data on one row never blanks the others. The share's
+    // denominator is the known input total (max 1, so an all-zero
+    // window renders 0%, not a crash).
     let total = tokens.input_total().max(1);
     // The bar/percentage pair is the row's shape; shape sheds before
     // information, and the fixed-width counts always fit.
@@ -721,36 +732,27 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         ("cache write 1h", &tokens.write_1h),
         ("cache write 5m", &tokens.write_5m),
     ] {
-        if incomplete {
-            // A missing bucket hides every share,
-            // because the total is not a total; each line says why.
-            let why = if bucket.unavailable > 0 {
-                format!("{} req unknown", bucket.unavailable)
-            } else {
-                "share unknown".to_owned()
-            };
-            lines.push(Line::from(vec![
-                Span::raw(label(name)),
-                Span::raw(amount(bucket)),
-                Span::raw("  "),
-                Span::styled(why, Style::new().dim()),
-            ]));
-            continue;
-        }
-        let frac = bucket.value as f64 / total as f64;
+        let note = (bucket.unavailable > 0).then(|| format!("{} req unknown", bucket.unavailable));
         let mut row = vec![Span::raw(label(name)), Span::raw(amount(bucket))];
         if show_shares {
+            let frac = bucket.value as f64 / total as f64;
+            // A floor's note rides the same row as the bar, so the bar
+            // yields its width to it — otherwise the border clips the
+            // note mid-word and the count the row exists to show is the
+            // part that vanishes.
+            let bar_w = width
+                .saturating_sub(48 + note.as_ref().map_or(0, |note| note.len() + 2))
+                .max(TOKENS_BAR_MIN_W);
             row.push(Span::raw("  "));
             row.push(Span::styled(
-                fill_bar(
-                    frac,
-                    width.saturating_sub(48).max(TOKENS_BAR_MIN_W),
-                    "▬",
-                    " ",
-                ),
+                fill_bar(frac, bar_w, "▬", " "),
                 Style::new().dim(),
             ));
             row.push(Span::raw(format!(" {:>3}%", (frac * 100.0).round() as i64)));
+        }
+        if let Some(note) = note {
+            row.push(Span::raw("  "));
+            row.push(Span::styled(note, Style::new().dim()));
         }
         lines.push(Line::from(row));
     }
@@ -859,6 +861,14 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                     style,
                 ));
                 row.push(Span::styled(note.to_owned(), Style::new().dim()));
+            }
+            // A rate over known sums with unknown rows riding: the
+            // caveat travels with the rate instead of blanking it.
+            if tokens.cache_unknown > 0 {
+                row.push(Span::styled(
+                    format!("  · {} req unknown", tokens.cache_unknown),
+                    Style::new().dim(),
+                ));
             }
             lines.push(Line::from(row));
             let per_req = if tokens.requests > 0 {
@@ -1667,10 +1677,9 @@ mod tests {
     fn renders_all_panels_at_a_comfortable_size() {
         let text = rendered(&snapshot(), 100, 30);
         for expected in [
-            "toker · live · last 30m",
+            "last 30m",
             "12:34:56",
             "2 sessions",
-            "523 in ledger",
             "SESSIONS",
             "ses-abc",
             "z-ai/glm-5.3",
@@ -1693,19 +1702,25 @@ mod tests {
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
+        // The lifetime ledger count is deliberately absent from the
+        // header: it answers nothing the window does not.
+        assert!(!text.contains("in ledger"), "no lifetime count:\n{text}");
         assert!(
-            text.contains("523 in ledger"),
-            "the count query is still real"
+            !text.contains("toker ·"),
+            "no title, live or otherwise:\n{text}"
         );
         assert!(!text.contains("$"), "no dollar figure is invented");
     }
 
     #[test]
-    fn truly_empty_ledger_says_ledger_empty() {
+    fn empty_ledger_renders_the_same_empty_window_shape() {
+        // A zero-total ledger and a quiet window are indistinguishable
+        // on the dashboard now — the header shows the window only, and
+        // neither state invents anything.
         let snap = model::aggregate(&[], None, &HashSet::new(), &no_labels(), None, 30, NOW, 0);
         let text = rendered(&snap, 80, 24);
-        assert!(text.contains("ledger empty"));
         assert!(text.contains("no requests in window"));
+        assert!(!text.contains("ledger"), "no lifetime count:\n{text}");
     }
 
     #[test]
@@ -2221,12 +2236,13 @@ mod tests {
     }
 
     #[test]
-    fn tokens_panel_renders_floors_and_an_unknown_rate_for_openai_windows() {
-        // The openai shape: no cache-write metrics on any row. Every
-        // bucket the rows DO report renders as a floor with the reason
-        // — a complete bucket beside incomplete ones says "share
-        // unknown", because the total is not a total — and the hit
-        // rate is an explicit `?`, never a guessed figure.
+    fn tokens_panel_renders_openai_windows_from_the_knowns() {
+        // The openai shape: the write metric does not EXIST on that
+        // family — structural, not unknown. The rows report input and
+        // cache read; the write tiers render as floors (`≥0` with the
+        // unknown count), every share still computes (a missing bucket
+        // never blanks the others), and the hit rate computes over the
+        // known sums — the read is real, the rewrites are a known zero.
         let mut rows = Vec::new();
         for at in [3, 2, 1] {
             let mut row = display_bare(NOW - at * 60_000);
@@ -2249,43 +2265,47 @@ mod tests {
             523,
         );
         let text = rendered(&snap, 120, 40);
-        assert!(
-            text.contains("3,000  share unknown"),
-            "the complete bucket names the total's gap:\n{text}"
-        );
-        assert!(
-            text.contains("≥0  3 req unknown"),
-            "the write tiers are floors:\n{text}"
-        );
-        // The two absent shapes pinned, at inner width 118: the
-        // complete bucket beside incomplete ones keeps its plain
-        // sum and says the share cannot be known; the missing bucket
-        // renders its floor and its count. Neither borrows the
-        // zero-share row's bar — there is nothing to draw one of.
+        // Shares from the known total (3,000 + 90,000 = 93,000): the
+        // arithmetic pins — round(0.0323 × 70) = 2 filled for fresh,
+        // round(0.9677 × 70) = 68 filled for the read row.
         assert!(
             text.contains(&format!(
-                "  fresh input{}3,000  share unknown",
-                " ".repeat(12)
+                "  fresh input{}3,000  {}{}   3%",
+                " ".repeat(12),
+                "▬".repeat(2),
+                " ".repeat(68)
             )),
-            "the complete-bucket row:\n{text}"
+            "the fresh-input share:\n{text}"
         );
         assert!(
             text.contains(&format!(
-                "  cache write 1h{}≥0  3 req unknown",
-                " ".repeat(12)
+                "  cache read{}90,000  {}{}  97%",
+                " ".repeat(12),
+                "▬".repeat(68),
+                " ".repeat(2)
             )),
-            "the absent bucket's row:\n{text}"
+            "the read share:\n{text}"
         );
         assert!(
-            text.contains("cache metrics unavailable for 3 req"),
-            "the unknown-rate line:\n{text}"
+            text.contains(&format!("  hit rate{}100.0%", " ".repeat(14))),
+            "a structural write absence still yields the real rate:\n{text}"
         );
         assert!(
-            text.contains("known cache writes only"),
-            "the missed floor:\n{text}"
+            text.contains("   0%  3 req unknown"),
+            "the write tiers keep their floors and their count:\n{text}"
         );
-        // No share bars where the total is not a total.
-        assert!(!text.contains("▬"), "no share bars:\n{text}");
+        // The rate computes — no caveat owed, the absence is structural.
+        assert!(
+            !text.contains("cache metrics unavailable"),
+            "nothing claims unavailable metrics here:\n{text}"
+        );
+        // The missed line: a known-zero rewrite figure.
+        assert!(
+            text.contains(
+                "missed                     0  rewritten · 0/req · 0 of 3 req reused nothing"
+            ),
+            "the missed line:\n{text}"
+        );
     }
 
     #[test]

@@ -563,6 +563,7 @@ pub(crate) mod testrows {
             reasoning: None,
             cost_usd: None,
             cost_kind: None,
+            serving_provider: None,
             req_messages: None,
             compact_generations: None,
             forced_to: None,
@@ -621,9 +622,15 @@ pub(crate) mod testrows {
                 cache_write_5m: row.cache_write_5m,
                 cache_write_1h: row.cache_write_1h,
                 output: row.output,
-                reasoning: None,
+                reasoning: row.reasoning,
                 cost_usd: row.cost_usd,
                 cost_kind: row.cost_kind,
+                serving_provider: row
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.get("serving_provider"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 req_messages: row.req_messages,
                 compact_generations: row.compact_generations,
                 forced_to: row.forced_to.clone(),

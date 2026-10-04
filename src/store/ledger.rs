@@ -550,6 +550,11 @@ pub struct DisplayRow {
     pub cost_usd: Option<f64>,
     /// Which of the three cost semantics produced `cost_usd`.
     pub cost_kind: Option<CostKind>,
+    /// The upstream endpoint the backend named (openrouter's
+    /// `extra.serving_provider`) — the SPEND panel's per-provider
+    /// label. Extracted in SQL (one json_extract per row), so the row
+    /// never carries the whole `extra` object.
+    pub serving_provider: Option<String>,
     /// Message count in the request (the sessions panel's `msgs`).
     pub req_messages: Option<i64>,
     /// Compaction generation count (the sessions panel's `cmpct`).
@@ -587,7 +592,8 @@ pub(super) fn display_rows_since(
             SELECT id, ts_ms, kind, session_id, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
-                   cost_usd, cost_kind, req_messages, compact_generations, forced_to
+                   cost_usd, cost_kind, req_messages, compact_generations, forced_to,
+                   json_extract(extra, '$.serving_provider') AS serving_provider
             FROM requests
             WHERE ts_ms >= ?1
             ORDER BY ts_ms DESC, id DESC LIMIT ?2
@@ -620,6 +626,7 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
         cache_write_1h: row.get("cache_write_1h")?,
         output: row.get("output")?,
         reasoning: row.get("reasoning")?,
+        serving_provider: row.get("serving_provider")?,
         cost_usd: row.get("cost_usd")?,
         cost_kind: parse_stored(
             "cost_kind",
