@@ -69,7 +69,7 @@ pub use types::{
     Usage,
 };
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::Context;
@@ -81,7 +81,14 @@ use super::Provider;
 
 /// The `version` header: toker's own crate version (the codex client
 /// sends its version the same way).
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The codex client version toker identifies as. **Not toker's own
+/// crate version**: the backend gates models by this header (a request
+/// with an old version is refused with "requires a newer version of
+/// Codex"), so toker must speak a version the ecosystem recognizes.
+/// Resolved at construction: config override → the installed CLI's
+/// own `version.json` (`latest_version`, which the CLI's update check
+/// keeps current) → this floor, the newest version verified to work.
+pub const DEFAULT_CLIENT_VERSION: &str = "0.154.0";
 
 /// `ChatGPT-Account-ID` — sent when the login names an account.
 const CHATGPT_ACCOUNT_ID: HeaderName = HeaderName::from_static("chatgpt-account-id");
@@ -115,6 +122,9 @@ pub struct CodexSub {
     /// (`[providers.codex_sub.model_map]`): claude asks for
     /// `claude-opus-5`, the codex backend receives `gpt-5.6-sol`.
     model_map: Option<crate::middleware::model_map::ModelMap>,
+    /// The codex client version to identify as (see
+    /// [`DEFAULT_CLIENT_VERSION`]) — resolved once at construction.
+    client_version: String,
 }
 
 impl CodexSub {
@@ -129,9 +139,16 @@ impl CodexSub {
         auth_path: PathBuf,
         refresh_url: Url,
         model_map: Option<crate::middleware::model_map::ModelMap>,
+        client_version: Option<String>,
     ) -> anyhow::Result<CodexSub> {
         let auth = CodexAuth::load(&auth_path)
             .with_context(|| format!("loading {}", auth_path.display()))?;
+        // The version handshake reads the CLI's own records beside the
+        // shared login — resolve it before the path moves into the
+        // provider.
+        let client_version = client_version
+            .or_else(|| installed_cli_version(&auth_path))
+            .unwrap_or_else(|| DEFAULT_CLIENT_VERSION.to_owned());
         Ok(CodexSub {
             upstream,
             originator,
@@ -140,6 +157,7 @@ impl CodexSub {
             auth: Mutex::new(auth),
             refresh_lock: tokio::sync::Mutex::new(()),
             model_map,
+            client_version,
         })
     }
 
@@ -214,11 +232,15 @@ impl CodexSub {
         let mut headers = HeaderMap::new();
         auth_headers(auth, &mut headers);
         insert(&mut headers, "originator", &self.originator);
-        insert(&mut headers, "version", VERSION);
+        insert(&mut headers, "version", &self.client_version);
         insert(&mut headers, "session-id", prompt_cache_key);
         insert(&mut headers, "thread-id", thread_id);
         insert(&mut headers, "x-client-request-id", request_id);
-        insert(&mut headers, "user-agent", &user_agent(&self.originator));
+        insert(
+            &mut headers,
+            "user-agent",
+            &user_agent(&self.originator, &self.client_version),
+        );
         insert(&mut headers, "accept", "text/event-stream");
         insert(&mut headers, "content-type", "application/json");
         headers
@@ -261,12 +283,26 @@ pub fn auth_headers(auth: Option<&CodexAuth>, outgoing: &mut HeaderMap) {
 /// The `User-Agent`, built from the originator like the codex client's
 /// (`{originator}/{version} (…)`) with toker's own platform facts: the
 /// CLI's shape, honestly filled in.
-fn user_agent(originator: &str) -> String {
+fn user_agent(originator: &str, client_version: &str) -> String {
     format!(
-        "{originator}/{VERSION} ({} {}; toker)",
+        "{originator}/{client_version} ({} {}; toker)",
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+/// The installed codex CLI's own notion of the current version, from
+/// the `version.json` its update check maintains beside `auth.json`.
+/// The CLI keeps this fresh; toker reading it tracks the ecosystem
+/// without guessing. `None` when the file is absent or unreadable.
+fn installed_cli_version(auth_path: &Path) -> Option<String> {
+    let version_path = auth_path.parent()?.join("version.json");
+    let raw = std::fs::read_to_string(version_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("latest_version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Insert one header, skipping values whose bytes are not valid header
@@ -329,7 +365,8 @@ impl Provider for CodexSub {
 mod tests {
     use super::super::Provider;
     use super::{
-        CHATGPT_ACCOUNT_ID, CodexSub, VERSION, X_OPENAI_FEDRAMP, auth_headers, user_agent,
+        CHATGPT_ACCOUNT_ID, CodexSub, DEFAULT_CLIENT_VERSION, X_OPENAI_FEDRAMP, auth_headers,
+        user_agent,
     };
     use crate::providers::codex::auth::tests::{auth_file, spawn_refresh_mock};
     use axum::http::{HeaderMap, HeaderValue, header};
@@ -345,6 +382,7 @@ mod tests {
             "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("refresh url"),
+            None,
             None,
         )
         .expect("provider builds")
@@ -369,6 +407,7 @@ mod tests {
             "codex_cli_rs".to_owned(),
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
+            None,
             None,
         )
         .expect("provider builds");
@@ -451,8 +490,8 @@ mod tests {
         );
         assert_eq!(
             headers.get("version").and_then(|v| v.to_str().ok()),
-            Some(VERSION),
-            "the version header is toker's own crate version"
+            Some(DEFAULT_CLIENT_VERSION),
+            "no version.json beside the fixture auth → the built-in floor"
         );
         assert_eq!(
             headers.get("session-id").and_then(|v| v.to_str().ok()),
@@ -501,9 +540,9 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .expect("user agent present");
         assert!(
-            user_agent.starts_with(&format!("codex_cli_rs/{VERSION} ("))
+            user_agent.starts_with(&format!("codex_cli_rs/{DEFAULT_CLIENT_VERSION} ("))
                 && user_agent.ends_with("; toker)"),
-            "the user agent is built from the originator and toker's version: {user_agent}"
+            "the user agent carries the resolved client version: {user_agent}"
         );
 
         // Without a login: the same block minus the auth headers.
@@ -528,6 +567,7 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
+            None,
         )
         .expect("provider builds");
         let headers = provider.turn_headers(None, "k", "t", "r");
@@ -536,7 +576,7 @@ mod tests {
             Some("my_tools_proxy")
         );
         assert!(
-            user_agent("my_tools_proxy").starts_with("my_tools_proxy/"),
+            user_agent("my_tools_proxy", DEFAULT_CLIENT_VERSION).starts_with("my_tools_proxy/"),
             "the user agent follows the originator"
         );
     }
@@ -586,6 +626,7 @@ mod tests {
             "codex_cli_rs".to_owned(),
             dir.clone(),
             url,
+            None,
             None,
         )
         .expect("provider builds");

@@ -167,6 +167,7 @@ impl Server {
             config.codex_sub.auth_path.clone(),
             config.codex_sub.refresh_url.clone(),
             config.codex_sub.model_map.clone(),
+            config.codex_sub.client_version.clone(),
         )?);
         let codex_sub: Arc<dyn Provider> = codex_turn.clone();
 

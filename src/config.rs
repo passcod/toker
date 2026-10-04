@@ -285,6 +285,13 @@ pub struct CodexSubConfig {
     /// [`AnthropicSubConfig::model_map`]) — the anthropic→codex model
     /// pairings that make the translated route useful at all.
     pub model_map: Option<ModelMap>,
+    /// The codex client version to identify as (`version` header). The
+    /// backend gates models by this (an old version is refused with
+    /// "requires a newer version of Codex"), so toker must speak a
+    /// version the ecosystem recognizes — `None` (the default) resolves
+    /// to the installed CLI's own `version.json` `latest_version`,
+    /// falling back to the built-in floor.
+    pub client_version: Option<String>,
 }
 
 /// Resolve one provider's `[providers.<id>.model_map]` TOML table into the
@@ -476,6 +483,11 @@ impl Config {
                 },
                 None => None,
             },
+            client_version: file
+                .providers
+                .codex_sub
+                .as_ref()
+                .and_then(|p| p.client_version.clone()),
         };
 
         let mut config = Config {
@@ -678,6 +690,9 @@ struct FileCodexSub {
     auth_path: Option<String>,
     refresh_url: Option<String>,
     model_map: Option<toml::Table>,
+    /// The codex client version to identify as (see
+    /// [`CodexSubConfig::client_version`]).
+    client_version: Option<String>,
 }
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else

@@ -260,6 +260,7 @@ fn test_config(
             api_key: None,
         },
         codex_sub: CodexSubConfig {
+            client_version: Some("0.154.0".to_owned()),
             model_map: family_map.then(|| {
                 model_map::parse_model_map(r#"{"family:opus":"gpt-5.6-sol"}"#)
                     .expect("valid map")

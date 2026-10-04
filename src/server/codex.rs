@@ -296,8 +296,8 @@ async fn aggregated_turn(
 /// like every other path.
 #[allow(clippy::too_many_arguments)]
 async fn streamed_turn(
-    server: Server,
-    backend: Arc<dyn Provider>,
+    _server: Server,
+    _backend: Arc<dyn Provider>,
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: String,
@@ -426,16 +426,32 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
 }
 
 /// The upstream's HTTP error body → a typed [`ResponseError`] for the
-/// mapping table. The body is the `{"error": {...}}` wrapper — the
-/// fields live one pointer down, same shape the SSE error events carry.
-/// An unparseable body degrades to a generic error with no invented
-/// fields.
+/// mapping table. Two shapes exist on the wire (both verified live): the
+/// `{"error": {...}}` wrapper the SSE error events carry, and the
+/// FastAPI-style `{"detail": "..."}` the backend's request-validation
+/// 400s use. An unparseable body degrades to a generic error with no
+/// invented fields.
 fn parse_upstream_error(body: &[u8]) -> ResponseError {
     serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|wrapper| {
-            let error = wrapper.get("error").cloned().unwrap_or(wrapper);
-            serde_json::from_value::<ResponseError>(error).ok()
+            if let Some(error) = wrapper.get("error") {
+                return serde_json::from_value::<ResponseError>(error.clone()).ok();
+            }
+            if let Some(detail) = wrapper.get("detail").cloned() {
+                // {"detail": "..."} — the message is the whole payload.
+                if let Some(message) = detail.as_str() {
+                    return Some(ResponseError {
+                        kind: None,
+                        code: None,
+                        message: Some(message.to_owned()),
+                        resets_at: None,
+                    });
+                }
+                // A structured detail object still names a message.
+                return serde_json::from_value::<ResponseError>(detail).ok();
+            }
+            None
         })
         .unwrap_or_default()
 }
