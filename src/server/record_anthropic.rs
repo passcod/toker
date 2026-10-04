@@ -313,6 +313,9 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
             write_5m: capture.cache_write_5m().unwrap_or(0),
             write_1h: capture.cache_write_1h().unwrap_or(0),
             ping: ctx.ping,
+            // The anthropic path keeps the tier ladder (the openai
+            // path's explicit override is not its to carry).
+            ttl_ms: None,
             forced,
             compaction,
         },
@@ -901,6 +904,9 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         req_messages,
         compact_target,
         outlook,
+        // A fired notice means the exemption did not apply; the row's
+        // own existence says so.
+        writes_free: _,
         gate_on,
     } = record;
     let outlook = outlook.cloned();
@@ -1013,6 +1019,11 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) compact_target: Option<&'a str>,
     /// The quota outlook the decision rested on, when one was measured.
     pub(crate) outlook: Option<&'a Outlook>,
+    /// Whether the notice was withheld because the backend's fetched
+    /// catalogue says the model's cache writes are free — the
+    /// writes-free exemption. For an outlook-withheld row this is
+    /// `false`: the row says which reason held it back.
+    pub(crate) writes_free: bool,
     /// Whether the quota gate is armed (a view
     /// reading this row cannot infer the toggle from anywhere else).
     pub(crate) gate_on: bool,
@@ -1031,7 +1042,10 @@ pub(crate) struct ColdRecord<'a> {
 /// The `util5h` here is the MEASURED figure the decision rested on, from
 /// the burn — never the proxy's last-seen copy of the meters, which would
 /// report the proxy's own staleness as the API's. **No `rate_limits`**,
-/// for the same reason.
+/// for the same reason. The withholding reason rides `extra`:
+/// `writesFree: true` for the cache-writes-free exemption (no quota
+/// figures were measured — the exemption answered first), the quota
+/// figures for an outlook withholding.
 pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
     let ColdRecord {
         server,
@@ -1043,6 +1057,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         idle_ms,
         prompt,
         outlook,
+        writes_free,
         gate_on,
         ..
     } = record;
@@ -1106,6 +1121,10 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         extra: Some(json!({
             "idleMs": idle_ms,
             "lastPrompt": prompt,
+            // The withholding reason: writes free at the backend (the
+            // exemption, measured nothing), or the quota figures the
+            // outlook rested on.
+            "writesFree": writes_free,
             "quotaExtra": outlook.as_ref().and_then(|o| o.extra),
             "quotaBound": outlook.as_ref().and_then(|o| o.bound),
             "util5h": outlook.as_ref().and_then(|o| o.util),
@@ -1328,6 +1347,7 @@ pub(crate) fn record_codex_measurement(
             write_5m: 0,
             write_1h: written.unwrap_or(0),
             ping: ctx.ping,
+            ttl_ms: None,
             forced: None,
             compaction,
         },

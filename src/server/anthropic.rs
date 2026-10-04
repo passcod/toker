@@ -451,17 +451,42 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             now,
             None,
         );
-        let outlook = match &fired {
-            cold::ColdDecision::Notice { prompt, .. } if gates.cold_outlook => cold::outlook_over(
-                &server.store,
-                client_model.as_deref(),
-                *prompt,
-                gate_armed,
-                now,
-            ),
-            _ => None,
+        // The writes-free exemption (the README's "if cache writes are
+        // free at the backend, this doesn't apply"): a notice exists to
+        // warn about a re-read the rate-limit window will meter — when
+        // the backend's own fetched catalogue says this model's cache
+        // writes cost nothing, the re-read is free and the interruption
+        // buys nothing. Checked before the outlook: the exemption
+        // answers the question the refit would price. Only a POSITIVE
+        // free verdict exempts (Some(true)); an unknown model never
+        // does — the conservative direction for a gate that fires.
+        let writes_free = matches!(fired, cold::ColdDecision::Notice { .. })
+            && writes_free_of(&server, backend.as_ref(), served_model.as_deref());
+        let outlook = if writes_free {
+            // The exemption answered before the outlook was worth
+            // measuring — a weight refit prices a re-read the catalogue
+            // already said is free.
+            None
+        } else {
+            match &fired {
+                cold::ColdDecision::Notice { prompt, .. } if gates.cold_outlook => {
+                    cold::outlook_over(
+                        &server.store,
+                        client_model.as_deref(),
+                        *prompt,
+                        gate_armed,
+                        now,
+                    )
+                }
+                _ => None,
+            }
         };
-        let verdict = if matches!(fired, cold::ColdDecision::Notice { .. }) {
+        // The exemption is a caller-side veto, not a verdict the decision
+        // knows about: with it holding, the would-fire Notice is handled
+        // below as a withheld one and the second decision never runs.
+        let verdict = if writes_free {
+            fired
+        } else if matches!(fired, cold::ColdDecision::Notice { .. }) {
             cold::decide_cold(
                 cold_lane.as_ref(),
                 summarising,
@@ -499,7 +524,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     tools_hash: shape_for_rows(),
                     idle_ms,
                     prompt,
+                    // The outlook withholding: the measured figures ride
+                    // the row, and the writes-free flag says it was not
+                    // that exemption.
                     outlook: Some(&outlook),
+                    writes_free: false,
                     req_messages: None,
                     compact_target: None,
                     gate_on: server.config.gates.quota_enabled,
@@ -510,69 +539,96 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 prompt,
                 outlook,
             } => {
-                // The compact model is resolved, not assumed:
-                // the notice names the model a
-                // cheap `/compact` would actually run on, and stays
-                // silent about it when there is none.
-                let compact_on = server
-                    .models
-                    .compaction_target(&compact_spec(gates), prompt)
-                    .ok()
-                    .flatten();
-                let text = cold::ColdBlocking::notice(
-                    idle_ms,
-                    prompt,
-                    compact_on.as_deref(),
-                    outlook.as_ref(),
-                    now,
-                    &jiff::tz::TimeZone::system(),
-                    gates.notice_style,
-                );
-                let rendering = if stream_explicitly_false {
-                    Rendering::Json
+                // The writes-free exemption withheld this notice: no
+                // interruption, a `cold-quiet` row that says why
+                // (`writesFree`). `at` and `noticed_at` are untouched
+                // (nothing was said, nothing reached upstream), so the
+                // lane stays cold and a later request in the same idle
+                // spell is judged again — the withheld-notice discipline.
+                if writes_free {
+                    record_anthropic_cold_quiet(ColdRecord {
+                        server: &server,
+                        started,
+                        path,
+                        session_id: session_id.as_deref(),
+                        backend_id: backend.id(),
+                        tools_hash: shape_for_rows(),
+                        idle_ms,
+                        prompt,
+                        // No quota figures were measured — the exemption
+                        // answered before the outlook was worth pricing.
+                        outlook: None,
+                        writes_free: true,
+                        req_messages: None,
+                        compact_target: None,
+                        gate_on: server.config.gates.quota_enabled,
+                    });
                 } else {
-                    Rendering::Sse
-                };
-                let body = Blocking::blocked_turn(&text, client_model.as_deref(), rendering);
-                // The lane remembers it has spoken; `at` does not move —
-                // the compaction the user runs after reading the notice
-                // must still be seen as cold, which is the whole point
-                // of the two clocks.
-                if let Some(key) = &cold_lane_key
-                    && let Err(error) = cold::note_lane_notice(&server.store, key, now)
-                {
-                    tracing::error!(%error, "lane notice mark failed");
+                    // The compact model is resolved, not assumed:
+                    // the notice names the model a
+                    // cheap `/compact` would actually run on, and stays
+                    // silent about it when there is none.
+                    let compact_on = server
+                        .models
+                        .compaction_target(&compact_spec(gates), prompt)
+                        .ok()
+                        .flatten();
+                    let text = cold::ColdBlocking::notice(
+                        idle_ms,
+                        prompt,
+                        compact_on.as_deref(),
+                        outlook.as_ref(),
+                        now,
+                        &jiff::tz::TimeZone::system(),
+                        gates.notice_style,
+                    );
+                    let rendering = if stream_explicitly_false {
+                        Rendering::Json
+                    } else {
+                        Rendering::Sse
+                    };
+                    let body = Blocking::blocked_turn(&text, client_model.as_deref(), rendering);
+                    // The lane remembers it has spoken; `at` does not move —
+                    // the compaction the user runs after reading the notice
+                    // must still be seen as cold, which is the whole point
+                    // of the two clocks.
+                    if let Some(key) = &cold_lane_key
+                        && let Err(error) = cold::note_lane_notice(&server.store, key, now)
+                    {
+                        tracing::error!(%error, "lane notice mark failed");
+                    }
+                    record_anthropic_cold(ColdRecord {
+                        server: &server,
+                        started,
+                        path,
+                        session_id: session_id.as_deref(),
+                        backend_id: backend.id(),
+                        tools_hash: shape_for_rows(),
+                        idle_ms,
+                        prompt,
+                        // The message count of the stopped request: the
+                        // synthetic turn is appended to the client's
+                        // transcript, so the next request in this lane should
+                        // carry both.
+                        req_messages: gate_shape
+                            .as_ref()
+                            .and_then(|shape| shape.req_messages)
+                            .map(|messages| messages as i64),
+                        compact_target: compact_on.as_deref(),
+                        outlook: outlook.as_ref(),
+                        writes_free: false,
+                        gate_on: server.config.gates.quota_enabled,
+                    });
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        match rendering {
+                            Rendering::Sse => header::HeaderValue::from_static("text/event-stream"),
+                            Rendering::Json => header::HeaderValue::from_static("application/json"),
+                        },
+                    );
+                    return build_response(StatusCode::OK, headers, Body::from(body));
                 }
-                record_anthropic_cold(ColdRecord {
-                    server: &server,
-                    started,
-                    path,
-                    session_id: session_id.as_deref(),
-                    backend_id: backend.id(),
-                    tools_hash: shape_for_rows(),
-                    idle_ms,
-                    prompt,
-                    // The message count of the stopped request: the
-                    // synthetic turn is appended to the client's
-                    // transcript, so the next request in this lane should
-                    // carry both.
-                    req_messages: gate_shape
-                        .as_ref()
-                        .and_then(|shape| shape.req_messages)
-                        .map(|messages| messages as i64),
-                    compact_target: compact_on.as_deref(),
-                    outlook: outlook.as_ref(),
-                    gate_on: server.config.gates.quota_enabled,
-                });
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    header::CONTENT_TYPE,
-                    match rendering {
-                        Rendering::Sse => header::HeaderValue::from_static("text/event-stream"),
-                        Rendering::Json => header::HeaderValue::from_static("application/json"),
-                    },
-                );
-                return build_response(StatusCode::OK, headers, Body::from(body));
             }
             cold::ColdDecision::Forward => {}
         }
@@ -893,6 +949,32 @@ fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
     gates
         .cold_idle_min
         .map(|minutes| (minutes * 60_000.0) as i64)
+}
+
+/// Whether the backend's fetched catalogue says `model`'s cache writes
+/// are free — the cold gate's writes-free exemption, consulted only
+/// when a notice would otherwise fire. The model is the one about to
+/// be sent, previewed through the backend's model map (the map's own
+/// rewrite stage runs after the gate, so the exemption must see the
+/// identity the upstream will actually bill). Only a POSITIVE verdict
+/// exempts; unknown — no catalogue, no entry, a pricing-less entry —
+/// never does (invariant 3: a gate fires on ignorance).
+fn writes_free_of(server: &Server, backend: &dyn Provider, model: Option<&str>) -> bool {
+    let Some(model) = model.filter(|model| !model.is_empty()) else {
+        return false;
+    };
+    let effective = match backend.model_map() {
+        Some(map) => model_map::preview_mapped_model(Some(map), model),
+        None => Some(model),
+    };
+    let Some(effective) = effective else {
+        return false;
+    };
+    let catalogs = server
+        .catalogs
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    catalogs.cache_writes_free(backend.id(), effective) == Some(true)
 }
 
 /// The compaction retarget's model spec:

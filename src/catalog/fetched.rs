@@ -148,6 +148,50 @@ impl FetchedCatalog {
             .find(|entry| entry.id == model)
             .and_then(|entry| entry.context_window)
     }
+
+    /// The model's cache-write price from this listing, when it names
+    /// one: the raw entry's `pricing.input_cache_write`, exact-id match
+    /// like [`FetchedCatalog::context_window_of`]. Openrouter writes
+    /// prices as strings (`"0.0000025"`); a number reads too. `None`
+    /// covers every absence — no entry, no `pricing` object, no field —
+    /// and the free signal is exactly one of those absences, so the
+    /// caller that wants a verdict uses [`cache_writes_free`], which
+    /// distinguishes "the entry exists and charges nothing" from
+    /// "the listing says nothing at all".
+    ///
+    /// [`cache_writes_free`]: FetchedCatalog::cache_writes_free
+    pub fn cache_write_price(&self, model: &str) -> Option<f64> {
+        let entry = self.models.iter().find(|entry| entry.id == model)?;
+        price_at(entry.raw.get("pricing")?, "input_cache_write")
+    }
+
+    /// Whether this listing says the model's cache writes cost nothing:
+    /// `Some(true)` only on POSITIVE evidence — the entry exists, it
+    /// carries a `pricing` object, and that object omits
+    /// `input_cache_write` (openrouter's documented free signal: the
+    /// docs say cache writes are free for such models, and the field is
+    /// simply absent) or prices it at zero. `Some(false)` when a
+    /// positive price is named. `None` when the model is unknown to the
+    /// catalogue, its entry carries no `pricing` object to read at all
+    /// (anthropic's presence list, the codex listing), or its write
+    /// price is present but will not parse — absence is never a free
+    /// verdict (invariant 3): unknown reads as charged, the
+    /// conservative direction for a gate that fires.
+    pub fn cache_writes_free(&self, model: &str) -> Option<bool> {
+        let entry = self.models.iter().find(|entry| entry.id == model)?;
+        let pricing = entry.raw.get("pricing")?;
+        if !pricing.is_object() {
+            return None;
+        }
+        match pricing.get("input_cache_write") {
+            // The itemised object omits the write price: free.
+            None => Some(true),
+            // A price that will not parse is not a number — no verdict,
+            // never free: `Some(false)` stays a POSITIVE charge, the
+            // symmetric of the positive free verdict above.
+            Some(value) => price_of(value).map(|price| price <= 0.0),
+        }
+    }
 }
 
 /// The live set of fetched catalogues, one per source — what the
@@ -170,24 +214,41 @@ impl FetchedCatalogs {
         self.by_source.get(source)
     }
 
+    /// The cache source whose listing covers a backend by provider id:
+    /// both anthropic backends share anthropic's presence list,
+    /// openrouter and codex_sub are their own. A provider with no
+    /// source has no fetched catalogue at all.
+    fn source_of(provider: &str) -> Option<&'static str> {
+        match provider {
+            "openrouter" => Some("openrouter"),
+            "codex_sub" => Some("codex_sub"),
+            // One upstream listing covers both anthropic backends —
+            // and it carries no windows or prices either way (the
+            // presence list).
+            "anthropic_sub" | "anthropic_api" => Some("anthropic"),
+            _ => None,
+        }
+    }
+
     /// The fetched context window for a model as served by
     /// `provider` — the ledger's `provider` column value, mapped onto
-    /// the source whose listing covers that backend: both anthropic
-    /// backends share anthropic's presence list, openrouter and
-    /// codex_sub are their own. A provider with no fetched catalogue
-    /// answers `None` (no window, never a guess).
+    /// the source whose listing covers that backend. A provider with no
+    /// fetched catalogue answers `None` (no window, never a guess).
     pub fn context_window_of(&self, provider: &str, model: &str) -> Option<u64> {
-        let source = match provider {
-            "openrouter" => "openrouter",
-            "codex_sub" => "codex_sub",
-            // One upstream listing covers both anthropic backends —
-            // and it carries no windows either way (the presence list).
-            "anthropic_sub" | "anthropic_api" => "anthropic",
-            _ => return None,
-        };
         self.by_source
-            .get(source)
+            .get(Self::source_of(provider)?)
             .and_then(|catalog| catalog.context_window_of(model))
+    }
+
+    /// [`FetchedCatalog::cache_writes_free`] for a model as served by
+    /// `provider` — the same provider→source mapping
+    /// [`FetchedCatalogs::context_window_of`] uses. `None` for a
+    /// provider with no fetched catalogue or a model the listing does
+    /// not carry: unknown is never free.
+    pub fn cache_writes_free(&self, provider: &str, model: &str) -> Option<bool> {
+        self.by_source
+            .get(Self::source_of(provider)?)
+            .and_then(|catalog| catalog.cache_writes_free(model))
     }
 }
 
@@ -495,6 +556,23 @@ fn window_at(entry: &Value, key: &str) -> Option<u64> {
     entry.get(key).and_then(Value::as_u64).filter(|&v| v > 0)
 }
 
+/// One price field of a `pricing` object, parsed: openrouter writes
+/// prices as strings (`"0.0000025"`), a JSON number reads too, and
+/// anything else is absent — a price that will not parse is never a
+/// verdict.
+fn price_of(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// [`price_of`] over `pricing.<key>`.
+fn price_at(pricing: &Value, key: &str) -> Option<f64> {
+    pricing.get(key).and_then(price_of)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -715,6 +793,162 @@ mod tests {
         // ids, and not for anything else.
         assert_eq!(catalog.context_window_of("claude-opus-4-5-20251101"), None);
         assert_eq!(catalog.context_window_of("claude-opus-5"), None);
+    }
+
+    /// A pricing-shaped openrouter listing for the cache-write rule:
+    /// charged by string (the live gpt-5.6-sol figure), free by absence
+    /// (the live z-ai shape — the docs say writes are free and the
+    /// field is simply not there), free by zero, an entry with no
+    /// pricing object at all, and a non-parseable price.
+    fn pricing_listing() -> Value {
+        json!({
+            "data": [
+                {
+                    "id": "openai/gpt-5.6-sol",
+                    "context_length": 872_000,
+                    "pricing": {
+                        "prompt": "0.00000125",
+                        "completion": "0.00001",
+                        "input_cache_read": "0.000000125",
+                        "input_cache_write": "0.0000025"
+                    }
+                },
+                {
+                    "id": "z-ai/glm-5.3",
+                    "context_length": 200_000,
+                    "pricing": {
+                        "prompt": "0.00000011",
+                        "completion": "0.00000043",
+                        "input_cache_read": "0.0000000022"
+                    }
+                },
+                {
+                    "id": "zero-write/model",
+                    "context_length": 128_000,
+                    "pricing": {
+                        "prompt": "0.0000002",
+                        "input_cache_write": "0"
+                    }
+                },
+                {
+                    "id": "zero-write-number/model",
+                    "context_length": 128_000,
+                    "pricing": {
+                        "prompt": "0.0000002",
+                        "input_cache_write": 0
+                    }
+                },
+                {
+                    "id": "unpriced/model",
+                    "context_length": 64_000
+                },
+                {
+                    "id": "garbage-write/model",
+                    "context_length": 64_000,
+                    "pricing": {
+                        "prompt": "0.0000002",
+                        "input_cache_write": "free, trust me"
+                    }
+                },
+                {
+                    "id": "presence/only",
+                    "display_name": "A presence-list entry, no pricing"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn cache_write_pricing_reads_the_pricing_object_with_absence_as_free() {
+        let catalog = parse_openrouter(&pricing_listing(), NOW).expect("parse");
+
+        // Charged: a positive price, string or number, is Some(false).
+        assert_eq!(
+            catalog.cache_write_price("openai/gpt-5.6-sol"),
+            Some(0.0000025),
+            "the live openrouter figure, parsed from its string form"
+        );
+        assert_eq!(catalog.cache_writes_free("openai/gpt-5.6-sol"), Some(false));
+
+        // Free by absence: the entry exists, itemises prices, and omits
+        // the write field — the documented z-ai signal.
+        assert_eq!(
+            catalog.cache_writes_free("z-ai/glm-5.3"),
+            Some(true),
+            "absent IS the free signal for an itemised pricing object"
+        );
+        assert_eq!(
+            catalog.cache_write_price("z-ai/glm-5.3"),
+            None,
+            "the raw price lookup cannot distinguish free-by-absence from unknown"
+        );
+
+        // Free by zero, both wire forms.
+        assert_eq!(catalog.cache_writes_free("zero-write/model"), Some(true));
+        assert_eq!(catalog.cache_write_price("zero-write/model"), Some(0.0));
+        assert_eq!(
+            catalog.cache_writes_free("zero-write-number/model"),
+            Some(true)
+        );
+
+        // An entry with no pricing object says nothing about prices:
+        // unknown, never free — the anthropic presence list is exactly
+        // this shape, and anthropic does charge for cache writes.
+        assert_eq!(catalog.cache_writes_free("unpriced/model"), None);
+        assert_eq!(catalog.cache_writes_free("presence/only"), None);
+
+        // A price that will not parse is not a number, and never free.
+        assert_eq!(catalog.cache_writes_free("garbage-write/model"), None);
+        assert_eq!(catalog.cache_write_price("garbage-write/model"), None);
+
+        // Unknown to the catalogue: never treated as free.
+        assert_eq!(catalog.cache_writes_free("no/such-model"), None);
+        assert_eq!(catalog.cache_write_price("no/such-model"), None);
+        // Byte-exact, like every listing lookup.
+        assert_eq!(catalog.cache_writes_free("Z-AI/GLM-5.3"), None);
+    }
+
+    #[test]
+    fn cache_write_pricing_maps_providers_onto_sources() {
+        let mut catalogs = FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            parse_openrouter(&pricing_listing(), NOW).expect("parse"),
+        );
+        catalogs.set(
+            "anthropic",
+            parse_anthropic(&anthropic_listing(), NOW).expect("parse"),
+        );
+
+        // The openrouter backend consults its own listing.
+        assert_eq!(
+            catalogs.cache_writes_free("openrouter", "z-ai/glm-5.3"),
+            Some(true)
+        );
+        assert_eq!(
+            catalogs.cache_writes_free("openrouter", "openai/gpt-5.6-sol"),
+            Some(false)
+        );
+        // Both anthropic backends share the presence list, which carries
+        // no pricing object: unknown, never free — so the anthropic cold
+        // gate keeps firing for claude models against the real listing.
+        for provider in ["anthropic_sub", "anthropic_api"] {
+            assert_eq!(
+                catalogs.cache_writes_free(provider, "claude-opus-4-5-20251101"),
+                None,
+                "a presence entry has no prices to read"
+            );
+        }
+        // A provider with no catalogue, and per-source isolation: a
+        // codex answer never comes from the openrouter listing.
+        assert_eq!(
+            catalogs.cache_writes_free("codex_sub", "z-ai/glm-5.3"),
+            None
+        );
+        assert_eq!(
+            catalogs.cache_writes_free("lunaroute", "z-ai/glm-5.3"),
+            None
+        );
     }
 
     #[test]

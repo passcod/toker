@@ -496,8 +496,7 @@ pub fn ping_user_units(slots: &[String], exe: &Path) -> Vec<PingUnits> {
             // covers the following days (Tue..Sat) rather than the
             // slot's own (Mon..Fri).
             let wrapped =
-                (parsed.hour as i64 * 60 + parsed.minute as i64 + PING_DELAY_MINUTES as i64)
-                    >= 24 * 60;
+                (parsed.hour as i64 * 60 + parsed.minute as i64 + PING_DELAY_MINUTES) >= 24 * 60;
             let mask = if wrapped { "Tue..Sat" } else { "Mon..Fri" };
             let stem = ping_unit_stem(slot);
             let timer = format!(

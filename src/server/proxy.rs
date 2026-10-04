@@ -17,16 +17,28 @@
 //! 5. A routed request forwards the *serialised* form — a transformed
 //!    request forwards what the IR produces, and purity (invariant 4)
 //!    makes that stable. Recorded as requested vs effective model.
-//! 6. Upstream request with hop-by-hop headers stripped,
+//! 6. **The cold-cache notice** (plan: Middleware — cold gate): the openai
+//!    path's own gate, on the lane the request itself keys (session ×
+//!    tools-hash) and the post-routing model. No quota outlook — this
+//!    backend has no meter source — and a per-model writes-free
+//!    exemption: when the fetched openrouter catalogue says the model's
+//!    cache writes cost nothing, the re-read the notice warns about is
+//!    free and the gate never fires for it. On fire: 200 with a
+//!    synthetic openai turn, a `cold` row, the lane marked noticed —
+//!    never an error status; the resend IS the release (there is no
+//!    marker on this wire).
+//! 7. Upstream request with hop-by-hop headers stripped,
 //!    `accept-encoding: identity` forced (SSE observation needs plaintext),
 //!    and the stored credential injected only when the incoming request
 //!    carries no Authorization of its own (pass-through-when-present).
-//! 7. A client hangup aborts the upstream (the body stream's Drop fires
+//! 8. A client hangup aborts the upstream (the body stream's Drop fires
 //!    an [`AbortHandle`]); a hung-up stream records no row.
-//! 8. Response branches: SSE streams through with the side observation;
+//! 9. Response branches: SSE streams through with the side observation;
 //!    non-SSE bodies buffer, observe, and forward unchanged; unexpected
 //!    compression passes through untouched and unledgered.
-//! 9. Recording on completion only — [`record::RecordCtx`] → row.
+//! 10. Recording on completion only — [`record::RecordCtx`] → row, plus
+//!     the lane-table note (the openai lane's clock is openrouter's
+//!     10-minute sticky window, [`lanes::OPENAI_LANE_TTL_MS`]).
 
 use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
@@ -42,14 +54,17 @@ use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::{Stream, StreamExt};
 
-use crate::ir::{Fidelity, Request as IrRequest, compare};
+use crate::ir::{Fidelity, Request as IrRequest, Shape, compare};
+use crate::middleware::cold;
+use crate::middleware::lanes;
 use crate::observe::{SseSplitter, UsageObserver};
 use crate::providers::Provider;
 
 use super::InFlightGuard;
 use super::Server;
 use super::record::{
-    RecordCtx, parse_error_type, record_error, record_measurement, retry_after_ms,
+    ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
+    record_openai_cold, retry_after_ms,
 };
 
 /// Request bodies are buffered for gating and the fidelity check; 64 MiB
@@ -69,6 +84,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // Session identity, read by name only — request headers are never
     // captured wholesale: they carry credentials (invariant 2).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
+    // Ping tagging (plan: Middleware): a lane whose request carried the
+    // ping header is recorded but excluded from liveness — the window
+    // pinger's probe must never hold the sleep lock, on this path like
+    // the anthropic one.
+    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
 
     // 1. Buffer the request body fully.
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -84,16 +104,25 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 
     // A request being served holds the machine awake: a lane's
     // `updated_ms` moves only when a response
-    // finishes, and one long turn can outlast a 5-minute tier. The
-    // openai path has no ping lanes — the window pinger tags anthropic
-    // lanes — so every chat completion counts. The guard's Drop is the
-    // decrement, so no early return can leak it; for a streamed
-    // response it rides the body stream.
+    // finishes, and one long turn can outlast a 5-minute tier. Every
+    // chat completion counts while it runs, pings included — a running
+    // request is genuinely holding the machine, whatever tagged it; a
+    // ping's LANE is what never holds the lock, and the ping flag on the
+    // lane note below is what excludes it. The guard's Drop is the
+    // decrement, so no early return — a cold notice, a 502 — can leak
+    // it; for a streamed response it rides the body stream.
     let in_flight = Some(server.begin_in_flight());
 
     // 2.-5. Parse, fidelity-check, route.
     let mut forward = original.clone();
     let mut record = None;
+    // The request's own shape and ask, kept past the record context: the
+    // cold gate keys the lane on the session × tools-hash the request
+    // itself carries, answers in the wire form the request asked for,
+    // and exempts by the post-routing model.
+    let mut gate_shape: Option<Shape> = None;
+    let mut stream_requested = false;
+    let mut gate_model: Option<String> = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
         // 3. Invariant 5, verified per request: Exact is the normal case;
         // Drift forwards the original buffer either way, and lands a
@@ -122,10 +151,16 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 .filter(|m| m.is_system())
                 .count() as u64
         });
+        stream_requested = ir.openai_chat().stream();
+        gate_model = effective_model.clone();
+        gate_shape = Some(shape.clone());
         record = Some(RecordCtx {
             server: server.clone(),
             started,
-            session_id,
+            // Cloned, not moved: the cold gate below still keys the lane
+            // on the session.
+            session_id: session_id.clone(),
+            ping,
             requested_model: model,
             effective_model,
             drift,
@@ -134,7 +169,131 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         });
     }
 
-    // 6. Upstream; 7.-9. in forward_upstream.
+    // 6. The cold-cache notice (see the module docs). Advisory like the
+    // anthropic gate's: once per idle spell, re-armed by activity, and
+    // the resend IS the release — there is no marker on this wire.
+    // Skipped for unparseable bodies, which have neither a shape nor a
+    // lane (the same verdict a keyless miss reaches), and every failure
+    // below is "a lost notice, never a lost request": a store error
+    // reads as absence and the request forwards.
+    let cold_armed = server.config.gates.cold_enabled;
+    let cold_lane_key = gate_shape
+        .as_ref()
+        .and_then(|shape| shape.tools_hash.as_deref())
+        .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
+    let cold_lane = cold_lane_key
+        .as_ref()
+        .and_then(|key| server.store.load_lane(key).ok().flatten());
+    if cold_armed {
+        let gates = &server.config.gates;
+        let now = now_ms();
+        // The openai lane's clock is openrouter's own: sticky sessions
+        // expire after 10 minutes of inactivity — not the anthropic
+        // 5m/1h tier ladder, so the floor is the provider's window and
+        // never the lane's stored tier (a lane shared with anthropic
+        // traffic must not be judged on that wire's clock).
+        if let cold::ColdDecision::Notice {
+            idle_ms, prompt, ..
+        } = cold::decide_cold(
+            cold_lane.as_ref(),
+            // No summarising detection exists on this wire — the openai
+            // IR has no compaction shape, so nothing is exempt.
+            false,
+            gates.cold_min_tokens,
+            Some(lanes::OPENAI_LANE_TTL_MS),
+            now,
+            // No quota outlook: this backend has no meter source, so
+            // the decision is coldness + threshold + spell alone.
+            None,
+        ) {
+            // The per-model writes-free exemption: the re-read this
+            // notice warns about is what cache writes cost — when the
+            // fetched openrouter catalogue says this model's writes are
+            // free, the warning buys nothing. Only a POSITIVE verdict
+            // exempts; an unknown model never does (conservative: the
+            // gate applies). The skip records nothing — it is a debug
+            // line, observable without a row per request.
+            let writes_free = gate_model.as_deref().is_some_and(|model| {
+                server
+                    .catalogs
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cache_writes_free(server.openrouter.id(), model)
+                    == Some(true)
+            });
+            if writes_free {
+                tracing::debug!(
+                    model = gate_model.as_deref().unwrap_or("?"),
+                    "cold gate skipped: the fetched catalogue says this model's cache writes are free"
+                );
+            } else {
+                // The compact model is resolved, not assumed — the same
+                // rule the anthropic gate keeps: the notice names the
+                // model a cheap `/compact` would actually run on, and
+                // stays silent about it when there is none.
+                let compact_on = server
+                    .models
+                    .compaction_target(&compact_spec(gates), prompt)
+                    .ok()
+                    .flatten();
+                let text = cold::ColdBlocking::notice(
+                    idle_ms,
+                    prompt,
+                    compact_on.as_deref(),
+                    None,
+                    now,
+                    &jiff::tz::TimeZone::system(),
+                    gates.notice_style,
+                );
+                let body = cold::ColdBlocking::openai_turn(
+                    &text,
+                    gate_model.as_deref(),
+                    stream_requested,
+                    now,
+                );
+                // The lane remembers it has spoken; `at` does not move —
+                // the compaction the user runs after reading the notice
+                // must still be seen as cold, which is the whole point
+                // of the two clocks.
+                if let Some(key) = &cold_lane_key
+                    && let Err(error) = cold::note_lane_notice(&server.store, key, now)
+                {
+                    tracing::error!(%error, "lane notice mark failed");
+                }
+                record_openai_cold(ColdOpenaiRecord {
+                    server: &server,
+                    started,
+                    session_id: session_id.as_deref(),
+                    tools_hash: gate_shape
+                        .as_ref()
+                        .and_then(|shape| shape.tools_hash.as_deref()),
+                    idle_ms,
+                    prompt,
+                    // The message count of the stopped request: the
+                    // synthetic turn is appended to the client's
+                    // transcript, so the next request in this lane
+                    // should carry both.
+                    req_messages: gate_shape
+                        .as_ref()
+                        .and_then(|shape| shape.req_messages)
+                        .map(|messages| messages as i64),
+                    compact_target: compact_on.as_deref(),
+                });
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    if stream_requested {
+                        HeaderValue::from_static("text/event-stream")
+                    } else {
+                        HeaderValue::from_static("application/json")
+                    },
+                );
+                return build_response(StatusCode::OK, headers, Body::from(body));
+            }
+        }
+    }
+
+    // 7. Upstream; 8.-10. in forward_upstream.
     match send_upstream(
         &server,
         server.openrouter.as_ref(),
@@ -295,6 +454,19 @@ pub(crate) async fn forward_upstream(
 /// is a later phase's work.
 pub(crate) fn strip_provider_prefix(model: &str) -> Option<&str> {
     model.strip_prefix("openrouter/")
+}
+
+/// The compaction retarget's model spec — the mirror of the anthropic
+/// path's (`crate::server::anthropic`): a family name resolved against
+/// what is actually in use (the default, "sonnet"), an explicit model
+/// id, or "off". The notice names a `/compact` target only when one
+/// resolves; an unarmed proxy promising a cheap compaction would be the
+/// feature lying about its own configuration.
+fn compact_spec(gates: &crate::config::GatesConfig) -> String {
+    gates
+        .compact_model
+        .clone()
+        .unwrap_or_else(|| "sonnet".to_owned())
 }
 
 /// The session identity from the configured header names, in priority

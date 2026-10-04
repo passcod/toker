@@ -51,7 +51,7 @@ use anyhow::bail;
 use axum::Router;
 use axum::routing::{get, post};
 
-use crate::catalog::fetched::{self, FetchedCatalogs};
+use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
 use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
@@ -403,6 +403,18 @@ impl Server {
     }
 
     // ── the fetched models catalogues ────────────────────────────────
+
+    /// Install (or replace) one source's fetched catalogue in memory —
+    /// the same write the background refresh makes per cycle, exposed so
+    /// embedders and tests can seed a catalogue without touching the
+    /// disk cache. The source must be one of [`fetched::SOURCES`] to be
+    /// reachable through the provider-mapped lookups.
+    pub fn install_catalog(&self, source: &'static str, catalog: FetchedCatalog) {
+        self.catalogs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set(source, catalog);
+    }
 
     /// The three models-catalogue sources as this server is configured
     /// (see [`crate::catalog::fetched`]): openrouter's public listing,

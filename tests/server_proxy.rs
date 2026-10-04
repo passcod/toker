@@ -102,6 +102,22 @@ const NON_STREAM_BODY: &str = concat!(
     r#""cost":0.000128,"cost_details":{"upstream":0.0001}}}"#,
 );
 
+/// A non-streaming completion carrying a 500k-token prompt — the
+/// cold-gate tests' lane seeder: one recorded response with this shape
+/// lands a lane holding 500,000 tokens, over the 175k cold bar.
+fn big_non_stream_body(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "id": "gen-test-big",
+        "provider": "z-ai",
+        "model": model,
+        "object": "chat.completion",
+        "created": 1760000600,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Done"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 500_000, "completion_tokens": 8, "total_tokens": 500_008},
+    }))
+    .expect("serialise big non-stream body")
+}
+
 /// OpenAI/OpenRouter error shape: `type` plus a numeric code.
 const ERROR_BODY: &str = r#"{"error":{"message":"No auth credentials found.","type":"invalid_request_error","code":401}}"#;
 
@@ -133,6 +149,13 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
             response
         }
+        // The cold-gate tests' seeding model: a 500k-token response,
+        // so the recorded request lands a lane over the cold bar.
+        m if m.starts_with("big/") => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(big_non_stream_body(model)),
+        ),
         "gzip-me" => {
             // "Compressed" bytes that are not really gzip: the point is
             // verbatim passthrough, not decompression.
@@ -312,6 +335,29 @@ async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
     (addr, store)
 }
 
+/// [`spawn_toker`], with one fetched catalogue installed before serving —
+/// the cold-gate tests' fixture. The background refresh task only spawns
+/// in `serve`, which tests never run, so this is the only way a test's
+/// server sees a catalogue.
+async fn spawn_toker_cataloged(
+    config: Config,
+    source: &'static str,
+    catalog: toker::catalog::FetchedCatalog,
+) -> (SocketAddr, Arc<Store>) {
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::new(config, store.clone()).expect("build server");
+    server.install_catalog(source, catalog);
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    (addr, store)
+}
+
 fn client() -> reqwest::Client {
     reqwest::Client::builder().build().expect("client")
 }
@@ -352,6 +398,82 @@ fn chat_body(model: &str, stream: bool) -> Vec<u8> {
         r#"{{"model":"{model}","messages":[{{"role":"user","content":"Hi"}}],"stream":{stream}}}"#
     )
     .into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// The cold gate on the openai path
+// ---------------------------------------------------------------------------
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_millis() as i64
+}
+
+/// A tools-carrying chat body — the cold gate keys lanes on session ×
+/// tools-hash, so without tools there is no lane and no gate. All the
+/// cold tests drive the same session `post_chat` sends.
+fn cold_body(model: &str, stream: bool) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "model": model,
+        "stream": stream,
+        "tools": [{"type": "function", "function": {"name": "run_command"}}],
+        "messages": [{"role": "user", "content": "Hi"}],
+    }))
+    .expect("serialise cold body")
+}
+
+/// The lane key a cold body keys to (`post_chat`'s session × the body's
+/// tools hash).
+fn cold_lane_key(body: &[u8]) -> String {
+    let shape = IrRequest::parse(body).expect("parse").openai_chat().shape();
+    format!(
+        "ses-test-1|{}",
+        shape.tools_hash.expect("the cold body carries tools")
+    )
+}
+
+/// A fetched openrouter catalogue whose entries are raw listing objects
+/// — the pricing fixture the writes-free exemption reads.
+fn openrouter_catalog(entries: Vec<(&str, serde_json::Value)>) -> toker::catalog::FetchedCatalog {
+    toker::catalog::FetchedCatalog {
+        fetched_at_ms: 0,
+        models: entries
+            .into_iter()
+            .map(|(id, raw)| toker::catalog::FetchedModel {
+                id: id.to_owned(),
+                context_window: Some(200_000),
+                raw,
+            })
+            .collect(),
+    }
+}
+
+/// Seed the lane this body keys with a 500k prompt — via a real recorded
+/// openai response, so the lane derivation itself is under test — then
+/// move its clock 11 minutes back: past openrouter's 10-minute sticky
+/// window (the gate must fire), inside the anthropic hour tier (which
+/// must not govern this path).
+async fn seed_cold_lane(addr: SocketAddr, store: &Store, body: &[u8]) {
+    let response = post_chat(addr, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rows = wait_for_rows(store, 1).await;
+    assert_eq!(rows[0].kind, None, "the seeding response is a measurement");
+
+    let mut lane = store
+        .load_lane(&cold_lane_key(body))
+        .expect("load lane")
+        .expect("the recorded response grew the lane");
+    assert_eq!(lane.prompt_tokens, Some(500_000), "the held total");
+    assert_eq!(
+        lane.ttl,
+        Some(600_000),
+        "openrouter's sticky window, not a tier guess"
+    );
+    lane.updated_ms = now_ms() - 11 * 60_000;
+    store.upsert_lane(&lane).expect("poison the lane's clock");
 }
 
 // ---------------------------------------------------------------------------
@@ -926,23 +1048,30 @@ async fn poisoned_meters_state_never_blocks_the_openai_path() {
 }
 
 #[tokio::test]
-async fn the_openai_path_grows_no_lanes_and_no_learned_models() {
-    // Phase 2's lane table and learned model store wire into the
-    // anthropic path only (plan: unit 5's scope — the openai route
-    // table stays phase-1). A successful, fully-recorded openai chat
-    // completion must leave both state tables untouched: no lane row,
-    // no learned entry, whatever the request carries.
+async fn the_openai_path_grows_lanes_on_the_openrouter_clock_not_learned_models() {
+    // The phase-2 exclusion is reversed: a recorded openai response
+    // grows the lane table (session × tools-hash, openrouter's sticky
+    // 10-minute window as the TTL) — but still teaches the learned
+    // model store nothing (that stays anthropic-path middleware, and
+    // the openai wire has no host model map to feed).
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
-    // A session header and a ping header, so the assertion is not passed
-    // merely by the request carrying nothing to key on.
+    // A session header, a ping header, and a tools-carrying body, so
+    // the lane has everything to key on and the ping flag to record.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "z-ai/glm-5.3",
+        "stream": false,
+        "tools": [{"type": "function", "function": {"name": "run_command"}}],
+        "messages": [{"role": "user", "content": "Hi"}],
+    }))
+    .expect("serialise tools body");
     let response = client()
         .post(toker_url(addr, "/v1/chat/completions"))
         .header("x-toker-session", "ses-openai-1")
         .header("x-toker-ping", "1")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(chat_body("z-ai/glm-5.3", false))
+        .body(body.clone())
         .send()
         .await
         .expect("chat request");
@@ -951,11 +1080,18 @@ async fn the_openai_path_grows_no_lanes_and_no_learned_models() {
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, None, "a real measurement, fully recorded");
     assert_eq!(rows[0].session_id.as_deref(), Some("ses-openai-1"));
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert!(
-        store.load_lanes().expect("lanes").is_empty(),
-        "the openai path writes no lanes"
+    let lanes = store.load_lanes().expect("lanes");
+    assert_eq!(lanes.len(), 1, "the openai path writes its lane");
+    let lane = &lanes[0];
+    assert_eq!(lane.session_id.as_deref(), Some("ses-openai-1"));
+    assert!(lane.tools_hash.is_some());
+    assert_eq!(
+        lane.ttl,
+        Some(600_000),
+        "the lane runs on openrouter's sticky window"
     );
+    assert_eq!(lane.ping, Some(true), "the ping header is recorded");
+    assert_eq!(lane.prompt_tokens, Some(64), "input + read + writes held");
     assert!(
         store.load_models().expect("models").is_empty(),
         "the openai path teaches the learned store nothing"
@@ -965,4 +1101,349 @@ async fn the_openai_path_grows_no_lanes_and_no_learned_models() {
         1,
         "the request forwarded exactly once"
     );
+}
+
+#[tokio::test]
+async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
+    let (mock, upstream) = spawn_mock().await;
+    // The fetched catalogue with a PRICED entry: cache writes are
+    // charged (the live gpt-5.6-sol figure), so the exemption does not
+    // apply.
+    let (addr, store) = spawn_toker_cataloged(
+        test_config(upstream, UNSET_KEY_ENV, None),
+        "openrouter",
+        openrouter_catalog(vec![(
+            "big/charged-model",
+            serde_json::json!({
+                "id": "big/charged-model",
+                "pricing": {
+                    "prompt": "0.00000125",
+                    "completion": "0.00001",
+                    "input_cache_read": "0.000000125",
+                    "input_cache_write": "0.0000025"
+                }
+            }),
+        )]),
+    )
+    .await;
+
+    let body = cold_body("big/charged-model", false);
+    seed_cold_lane(addr, &store, &body).await;
+    assert_eq!(mock.captured().len(), 1, "only the seed went upstream");
+
+    // The gated request: 200 with the synthetic JSON turn, never an
+    // error status — and never forwarded.
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/json")),
+        "a non-stream request is answered with the JSON turn"
+    );
+    let bytes = response.bytes().await.expect("notice bytes");
+    let value: Value = serde_json::from_slice(&bytes).expect("the notice is a chat completion");
+    assert_eq!(value["id"], "chatcmpl-toker-cold");
+    assert_eq!(value["model"], "big/charged-model");
+    assert_eq!(value["choices"][0]["message"]["role"], "assistant");
+    let text = value["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("the notice text");
+    assert!(
+        text.contains("prompt cache had expired after 11m idle"),
+        "{text}"
+    );
+    assert!(
+        text.contains("would re-read 500,000 tokens as fresh input"),
+        "{text}"
+    );
+    assert!(text.contains("Fired once for that idle spell.]"), "{text}");
+    // The GFM alert is the default style, like the quota gate's notice.
+    assert!(text.contains("> [!NOTE]"), "{text}");
+    // No model entry exists to resolve a compact target onto, so the
+    // notice stays silent about one.
+    assert!(!text.contains("The proxy would run it on"), "{text}");
+    assert_eq!(
+        value["usage"],
+        serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
+        "nothing reached upstream: the synthetic turn claims no tokens"
+    );
+
+    // Upstream was never hit for the gated request.
+    assert_eq!(mock.captured().len(), 1, "the gate answered, not the API");
+
+    // The cold row: the openai shape, the anthropic cold row's fields.
+    let rows = wait_for_rows(&store, 2).await;
+    let cold = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::Cold))
+        .expect("a cold row is recorded");
+    assert_eq!(cold.frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(cold.provider.as_deref(), Some("openrouter"));
+    assert_eq!(cold.route.as_deref(), Some("openai_chat:openrouter"));
+    assert_eq!(cold.session_id.as_deref(), Some("ses-test-1"));
+    let expected_tools = cold_lane_key(&body)
+        .split_once('|')
+        .expect("the lane key carries both halves")
+        .1
+        .to_owned();
+    assert_eq!(cold.tools_hash.as_deref(), Some(expected_tools.as_str()));
+    assert_eq!(cold.req_messages, Some(1));
+    assert_eq!(cold.cold_on, Some(true));
+    assert_eq!(cold.gate_on, None, "no quota gate exists on this path");
+    assert_eq!(cold.rate_limits, None, "nothing reached upstream");
+    let extra = cold.extra.as_ref().expect("the payload rides `extra`");
+    assert!(
+        (extra["idleMs"].as_i64().expect("idleMs") - 660_000).abs() < 60_000,
+        "{extra}"
+    );
+    assert_eq!(extra["lastPrompt"], serde_json::json!(500_000));
+    assert_eq!(extra["reqMessages"], serde_json::json!(1));
+    assert_eq!(extra["compactTarget"], Value::Null);
+    assert_eq!(extra["quotaExtra"], Value::Null, "no outlook on this path");
+    assert_eq!(extra["util5h"], Value::Null);
+
+    // The lane remembers it has spoken; `at` did not move.
+    let lane = store
+        .load_lane(&cold_lane_key(&body))
+        .expect("load")
+        .expect("the poisoned lane");
+    assert!(
+        lane.noticed_at
+            .is_some_and(|noticed| noticed > lane.updated_ms)
+    );
+    assert_eq!(lane.prompt_tokens, Some(500_000));
+
+    // The resend in the same idle spell forwards: sending the request
+    // again IS the release — there is no marker on this wire.
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        big_non_stream_body("big/charged-model").as_slice(),
+        "the resend is served by the upstream, not the gate"
+    );
+    assert_eq!(mock.captured().len(), 2);
+
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.kind == Some(RowKind::Cold))
+            .count(),
+        1,
+        "once per idle spell: no second notice row"
+    );
+    let measurements = rows.iter().filter(|row| row.kind.is_none()).count();
+    assert_eq!(measurements, 2, "the seed and the resend both recorded");
+}
+
+#[tokio::test]
+async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_no_row() {
+    let (mock, upstream) = spawn_mock().await;
+    // The z-ai shape: the pricing object itemises prompt/completion/
+    // cache-read and OMITS the write price — the documented free signal.
+    let (addr, store) = spawn_toker_cataloged(
+        test_config(upstream, UNSET_KEY_ENV, None),
+        "openrouter",
+        openrouter_catalog(vec![(
+            "big/free-model",
+            serde_json::json!({
+                "id": "big/free-model",
+                "pricing": {
+                    "prompt": "0.00000011",
+                    "completion": "0.00000043",
+                    "input_cache_read": "0.0000000022"
+                }
+            }),
+        )]),
+    )
+    .await;
+
+    // The same cold 500k lane the charged test fires on.
+    let body = cold_body("big/free-model", false);
+    seed_cold_lane(addr, &store, &body).await;
+    let poisoned_at = store
+        .load_lane(&cold_lane_key(&body))
+        .expect("load")
+        .expect("lane")
+        .updated_ms;
+
+    // The request forwards normally: the re-read the notice would warn
+    // about is free, so the interruption buys nothing.
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        big_non_stream_body("big/free-model").as_slice(),
+        "the upstream answered, not the gate"
+    );
+    assert_eq!(mock.captured().len(), 2, "the request really went upstream");
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row.kind, Some(RowKind::Cold | RowKind::ColdQuiet))),
+        "the exemption records no row — the skip is the debug line"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.kind.is_none()).count(),
+        2,
+        "the seed and the exempted request both recorded"
+    );
+    // The lane was not marked noticed (nothing was said), and its clock
+    // moved with the served response.
+    let lane = store
+        .load_lane(&cold_lane_key(&body))
+        .expect("load")
+        .expect("lane");
+    assert_eq!(
+        lane.noticed_at, None,
+        "a skipped notice is not a spoken one"
+    );
+    assert!(
+        lane.updated_ms > poisoned_at,
+        "the served response re-touched the lane"
+    );
+}
+
+#[tokio::test]
+async fn a_model_unknown_to_the_catalogue_fires_conservatively() {
+    let (mock, upstream) = spawn_mock().await;
+    // A catalogue that exists but does not carry the request's model:
+    // unknown is never free (absence ≠ zero, invariant 3), so the gate
+    // applies exactly as it did before the exemption existed.
+    let (addr, store) = spawn_toker_cataloged(
+        test_config(upstream, UNSET_KEY_ENV, None),
+        "openrouter",
+        openrouter_catalog(vec![(
+            "big/some-other-model",
+            serde_json::json!({"id": "big/some-other-model", "pricing": {"prompt": "0.000001"}}),
+        )]),
+    )
+    .await;
+
+    let body = cold_body("big/unknown-model", false);
+    seed_cold_lane(addr, &store, &body).await;
+    assert_eq!(mock.captured().len(), 1);
+
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("notice bytes");
+    let value: Value = serde_json::from_slice(&bytes).expect("the synthetic turn");
+    assert_eq!(
+        value["id"], "chatcmpl-toker-cold",
+        "the gate fired for a model the catalogue does not know"
+    );
+    assert_eq!(mock.captured().len(), 1, "upstream was never hit");
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(rows.iter().any(|row| row.kind == Some(RowKind::Cold)));
+}
+
+#[tokio::test]
+async fn a_warm_openai_lane_forwards_without_a_notice() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_cataloged(
+        test_config(upstream, UNSET_KEY_ENV, None),
+        "openrouter",
+        openrouter_catalog(vec![(
+            "big/charged-model",
+            serde_json::json!({
+                "id": "big/charged-model",
+                "pricing": {"prompt": "0.00000125", "input_cache_write": "0.0000025"}
+            }),
+        )]),
+    )
+    .await;
+
+    let body = cold_body("big/charged-model", false);
+    // Seed WITHOUT moving the clock: the lane is 500k tokens but its
+    // cache is live — idle ~0, well inside openrouter's 10-minute
+    // window — so the notice must not fire (a false alarm costs the
+    // user a turn).
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_rows(&store, 1).await;
+
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        big_non_stream_body("big/charged-model").as_slice(),
+        "a warm lane forwards, charged writes or not"
+    );
+    assert_eq!(mock.captured().len(), 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let rows = store.requests_since(0, 100).expect("rows");
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row.kind, Some(RowKind::Cold | RowKind::ColdQuiet))),
+        "no notice on a lane inside its sticky window"
+    );
+}
+
+#[tokio::test]
+async fn the_openai_notice_renders_as_sse_for_stream_requests() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_cataloged(
+        test_config(upstream, UNSET_KEY_ENV, None),
+        "openrouter",
+        openrouter_catalog(vec![(
+            "big/charged-model",
+            serde_json::json!({
+                "id": "big/charged-model",
+                "pricing": {"prompt": "0.00000125", "input_cache_write": "0.0000025"}
+            }),
+        )]),
+    )
+    .await;
+
+    // Seed on the same lane (session and tools; the stream flag is not
+    // part of the key), then ask to stream.
+    let seed = cold_body("big/charged-model", false);
+    seed_cold_lane(addr, &store, &seed).await;
+    assert_eq!(mock.captured().len(), 1);
+
+    let response = post_chat(addr, &cold_body("big/charged-model", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("text/event-stream")),
+        "a stream request is answered with the SSE turn"
+    );
+    let bytes = response.bytes().await.expect("notice bytes");
+    let text = String::from_utf8_lossy(&bytes);
+    // One content delta then the terminator, the captured-fixture
+    // dialect — parse the chunk, then require [DONE] last.
+    assert!(text.starts_with("data: {"), "{text}");
+    assert!(text.ends_with("data: [DONE]\n"), "{text}");
+    let chunk = text
+        .strip_prefix("data: ")
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("the delta chunk");
+    let chunk: Value = serde_json::from_str(chunk).expect("the chunk parses");
+    assert_eq!(chunk["id"], "chatcmpl-toker-cold");
+    assert_eq!(chunk["object"], "chat.completion.chunk");
+    assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
+    assert!(
+        chunk["choices"][0]["delta"]["content"]
+            .as_str()
+            .expect("the notice text")
+            .contains("prompt cache had expired after 11m idle")
+    );
+    assert_eq!(mock.captured().len(), 1, "upstream was never hit");
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(rows.iter().any(|row| row.kind == Some(RowKind::Cold)));
 }

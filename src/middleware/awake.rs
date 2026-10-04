@@ -516,7 +516,7 @@ mod tests {
         AwakeDecision, AwakeState, AwakeTransition, INHIBIT_WHO, INHIBIT_WHY, InhibitCommand,
         LockSpawner, RETRY_MS, decide_awake, inhibit_command, on_path, platform_command,
     };
-    use crate::middleware::lanes::Ttl;
+    use crate::middleware::lanes::{OPENAI_LANE_TTL_MS, Ttl};
     use crate::store::Lane;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -582,6 +582,22 @@ mod tests {
             false,
         );
         assert!(decide_awake(&[almost], 0, NOW).hold);
+
+        // The openai lane's provider window — openrouter's 10-minute
+        // sticky session — is its own clock: an openai response must not
+        // hold the lock for an hour.
+        let openai = lane(NOW - 1_000, Some(OPENAI_LANE_TTL_MS), false);
+        assert_eq!(OPENAI_LANE_TTL_MS, 600_000);
+        assert_eq!(
+            decide_awake(std::slice::from_ref(&openai), 0, NOW),
+            AwakeDecision {
+                hold: true,
+                until: Some(NOW - 1_000 + OPENAI_LANE_TTL_MS),
+                reason: "1 live lane".to_owned(),
+            }
+        );
+        let expired_openai = lane(NOW - OPENAI_LANE_TTL_MS, Some(OPENAI_LANE_TTL_MS), false);
+        assert!(!decide_awake(&[expired_openai], 0, NOW).hold);
 
         // 1-hour tier, and the unrecorded tier reads as the hour —
         // anything not "5m" is the long one; guessing short would

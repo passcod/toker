@@ -94,10 +94,17 @@ const HOUR_MS: i64 = 60 * MIN_MS;
 /// How long this lane's cache survives without traffic: read from the
 /// tier the lane was last observed writing
 /// rather than pinned, and an unrecorded or unrecognised tier is the LONG
-/// one — see the module docs.
+/// one — see the module docs. The one addition over the predecessor: the
+/// openai lane's own provider window (openrouter's sticky session,
+/// [`crate::middleware::lanes::OPENAI_LANE_TTL_MS`]) is a recognised
+/// duration, so an openai lane expires on its true 10-minute clock —
+/// reading it as the unrecognised LONG one would hold the sleep lock
+/// for an hour per openai request.
 pub fn ttl_of(lane: &Lane) -> i64 {
     if lane.ttl == Some(300_000) {
         5 * MIN_MS
+    } else if lane.ttl == Some(super::lanes::OPENAI_LANE_TTL_MS) {
+        super::lanes::OPENAI_LANE_TTL_MS
     } else {
         HOUR_MS
     }
@@ -1885,6 +1892,73 @@ impl ColdBlocking {
         ]);
         render(style, &lines.join("\n"))
     }
+
+    /// The synthetic assistant turn id on the openai wire, so a reader of
+    /// the client's transcript or the ledger can tell a proxy answer
+    /// from a provider one (the openai-chat spelling of the quota gate's
+    /// [`SYNTHETIC_ID`-shaped marker](crate::middleware::quota::Blocking)).
+    const OPENAI_SYNTHETIC_ID: &str = "chatcmpl-toker-cold";
+
+    /// The synthetic turn's model when the request named none — a
+    /// stand-in the client renders like any other (the id says toker; a
+    /// chat body without a model never reaches the gate, which needs a
+    /// parsed shape to key the lane).
+    const OPENAI_DEFAULT_MODEL: &str = "z-ai/glm-5.3";
+
+    /// The same notice as an OpenAI-chat turn — the openai wire's answer
+    /// to the anthropic [`blocked_turn`](crate::middleware::quota::Blocking::blocked_turn):
+    /// non-stream a chat-completion JSON with one assistant message,
+    /// stream a single content delta then `data: [DONE]`. Usage is zeroed
+    /// (nothing reached upstream, and a synthetic turn that claimed
+    /// tokens would be counted by every view that reads the ledger).
+    ///
+    /// Pure function of its inputs like [`ColdBlocking::notice`]
+    /// (invariant 4): `created` is the caller's clock, an input here for
+    /// the same reason the notice's stamp is — the outer envelope never
+    /// enters replayed history (the client keeps the rendered content,
+    /// not the wire bytes), but the bytes are still a function of the
+    /// arguments alone.
+    pub fn openai_turn(text: &str, model: Option<&str>, stream: bool, now_ms: i64) -> Vec<u8> {
+        let model = model
+            .filter(|model| !model.is_empty())
+            .unwrap_or(Self::OPENAI_DEFAULT_MODEL);
+        let created = (now_ms / 1000).max(0);
+        if !stream {
+            return serde_json::to_vec(&serde_json::json!({
+                "id": Self::OPENAI_SYNTHETIC_ID,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }))
+            .expect("a json! object always serialises");
+        }
+        // One content delta, then the terminator — the minimal stream a
+        // chat client renders (the dialect of the captured fixtures:
+        // `data: {chunk}` blocks, blank-line separated, `[DONE]` last).
+        let chunk = serde_json::to_string(&serde_json::json!({
+            "id": Self::OPENAI_SYNTHETIC_ID,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": null,
+            }],
+        }))
+        .expect("a json! object always serialises");
+        format!("data: {chunk}\n\ndata: [DONE]\n").into_bytes()
+    }
 }
 
 // ── the compaction retarget ──────────────────────────────────────────
@@ -2336,6 +2410,13 @@ mod tests {
     fn the_ttl_tier_sets_the_floor_and_absence_is_the_long_tier() {
         assert_eq!(ttl_of(&lane(NOW, 1, Some(300_000))), 5 * MIN);
         assert_eq!(ttl_of(&lane(NOW, 1, Some(3_600_000))), HOUR);
+        // The openai lane's provider window is a recognised duration —
+        // its own clock, not the unrecognised-value LONG one.
+        assert_eq!(
+            ttl_of(&lane(NOW, 1, Some(600_000))),
+            10 * MIN,
+            "an openai lane expires on openrouter's sticky window"
+        );
         // An unrecorded or unrecognised tier is the LONG one: guessing
         // short would fire on lanes whose cache is still live.
         assert_eq!(ttl_of(&lane(NOW, 1, None)), HOUR);
@@ -3323,6 +3404,70 @@ mod tests {
             )
             .starts_with("> [!NOTE]\n> ")
         );
+    }
+
+    #[test]
+    fn the_openai_turn_wraps_the_notice_in_both_wire_forms() {
+        let content = ColdBlocking::notice(
+            47 * MIN,
+            200_000,
+            None,
+            None,
+            1_769_500_800_000,
+            &utc(),
+            NoticeStyle::Plain,
+        );
+        // Non-stream: one chat completion, one assistant message, zeroed
+        // usage, the toker id.
+        let json = ColdBlocking::openai_turn(&content, Some("z-ai/glm-5.3"), false, NOW);
+        let value: Value =
+            serde_json::from_slice(&json).expect("the non-stream turn is a chat completion");
+        assert_eq!(value["id"], "chatcmpl-toker-cold");
+        assert_eq!(value["object"], "chat.completion");
+        assert_eq!(value["created"], json!(NOW / 1000));
+        assert_eq!(value["model"], "z-ai/glm-5.3");
+        assert_eq!(value["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(value["choices"][0]["message"]["content"], json!(content));
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            value["usage"],
+            json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
+            "nothing reached upstream: a synthetic turn claims no tokens"
+        );
+
+        // Stream: a single content delta, then the terminator — the
+        // captured-fixture dialect.
+        let sse = ColdBlocking::openai_turn(&content, Some("z-ai/glm-5.3"), true, NOW);
+        let text = String::from_utf8(sse).expect("utf-8");
+        assert_eq!(
+            text,
+            format!(
+                "data: {}\n\ndata: [DONE]\n",
+                serde_json::json!({
+                    "id": "chatcmpl-toker-cold",
+                    "object": "chat.completion.chunk",
+                    "created": NOW / 1000,
+                    "model": "z-ai/glm-5.3",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": null,
+                    }],
+                })
+            ),
+            "one content delta then [DONE], byte for byte"
+        );
+
+        // An absent or empty model falls back to the stand-in; the bytes
+        // are a pure function of the inputs.
+        assert_eq!(
+            ColdBlocking::openai_turn("x", None, false, NOW),
+            ColdBlocking::openai_turn("x", Some(""), false, NOW)
+        );
+        let with_default: Value =
+            serde_json::from_slice(&ColdBlocking::openai_turn("x", None, false, NOW))
+                .expect("parses");
+        assert_eq!(with_default["model"], "z-ai/glm-5.3");
     }
 
     #[test]

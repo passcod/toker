@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 
 use crate::ir::Shape;
 use crate::middleware::awake;
+use crate::middleware::lanes;
 use crate::observe::UsageCapture;
 use crate::store::{CostKind, RequestRow, RowKind};
 
@@ -53,6 +54,9 @@ pub(crate) struct RecordCtx {
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
     pub(crate) session_id: Option<String>,
+    /// The request carried the ping header: its lane is recorded but
+    /// excluded from liveness (a ping lane never holds the sleep lock).
+    pub(crate) ping: bool,
     /// The model the frontend asked for, `provider/model` routing included.
     pub(crate) requested_model: Option<String>,
     /// The model that served, after the routing rewrite (phase 1: the
@@ -101,6 +105,40 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             ctx,
             measurement_row(ctx, ts_ms, duration_ms, &route, capture),
         );
+        // The lane table moves alongside the row, on the response
+        // identity — the openai path's own lane note (the phase-2
+        // exclusion reversed): session × tools-hash from the request's
+        // own shape, the held total as the prompt, and the provider's
+        // sticky window as the TTL (openrouter has no cache-write
+        // tiers; [`lanes::OPENAI_LANE_TTL_MS`] is the honest clock).
+        // Accounting must never break a session (invariant 6): a store
+        // error is logged and lost — the measurement row is already in.
+        let buckets = token_buckets(capture);
+        let held = buckets
+            .input
+            .unwrap_or(0)
+            .saturating_add(buckets.cache_read.unwrap_or(0))
+            .saturating_add(buckets.cache_write_total.unwrap_or(0));
+        if let Err(error) = lanes::note_lane_response(
+            &ctx.server.store,
+            lanes::LaneResponse {
+                session_id: ctx.session_id.as_deref(),
+                tools_hash: ctx
+                    .shape
+                    .as_ref()
+                    .and_then(|shape| shape.tools_hash.as_deref()),
+                at_ms: ts_ms,
+                prompt: held,
+                write_5m: 0,
+                write_1h: 0,
+                ping: ctx.ping,
+                ttl_ms: Some(lanes::OPENAI_LANE_TTL_MS),
+                forced: None,
+                compaction: false,
+            },
+        ) {
+            tracing::error!(%error, "lane table update failed");
+        }
     }
 
     tracing::info!(
@@ -112,6 +150,11 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
         drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
+
+    // The lane table just moved, so the sleep lock is re-evaluated —
+    // idempotent: the request's own in-flight hold, if any, is still
+    // standing until its body is dropped (the anthropic path's rule).
+    ctx.server.evaluate_awake();
 }
 
 /// Record a non-2xx usage-path response (plan: Server core): an error row
@@ -151,6 +194,146 @@ pub(crate) fn record_error(
         drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
+}
+
+/// The cold-notice row for the openai path (the `kind: "cold"` row) —
+/// the openai mirror of the anthropic unit's
+/// [`record_anthropic_cold`](super::record_anthropic::record_anthropic_cold).
+///
+/// Same discipline: the record of a notice the user was interrupted
+/// with — the idle spell measured, the prefix that would be re-read,
+/// the message count of the stopped request, the compaction model the
+/// notice named. No `rate_limits` (nothing reached upstream), no usage,
+/// never priced. No quota figures: this path has no meter source, so
+/// no outlook was measured — those `extra` keys ride as null, the same
+/// fields the anthropic cold row carries. And no model columns, like
+/// the anthropic cold row: the row is the gate's own event.
+///
+/// The row's existence is also the exemption's absence: a model whose
+/// cache writes are free never produces this row (the skip is a debug
+/// log, deliberately — a quiet row per request would be noise the
+/// anthropic path's `cold-quiet` discipline reserves for measured
+/// withholdings).
+pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
+    let ColdOpenaiRecord {
+        server,
+        started,
+        session_id,
+        tools_hash,
+        idle_ms,
+        prompt,
+        req_messages,
+        compact_target,
+    } = record;
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(RowKind::Cold),
+        frontend: Some("openai_chat".to_owned()),
+        provider: Some(server.openrouter.id().to_owned()),
+        route: Some(format!("openai_chat:{}", server.openrouter.id())),
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages,
+        req_tools: None,
+        tools_hash: tools_hash.map(str::to_owned),
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        // The openai path has no quota gate to be armed or not — no
+        // meter source exists on it — so the row carries no `gate_on`
+        // claim, like every other openai row. `cold_on` is proven by
+        // construction: this row IS the cold gate firing.
+        gate_on: None,
+        cold_on: Some(true),
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        // The cold-row fields, in the kind-specific payload column — the
+        // same keys the anthropic cold row carries, the quota figures
+        // null (no outlook phase on this path: no quota meters).
+        extra: Some(json!({
+            "idleMs": idle_ms,
+            "lastPrompt": prompt,
+            "reqMessages": req_messages,
+            "compactTarget": compact_target,
+            "quotaExtra": null,
+            "quotaBound": null,
+            "quotaMeter": null,
+            "util5h": null,
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST /v1/chat/completions → COLD {} idle {} · {} tokens",
+        session_id
+            .and_then(|session| session.get(0..8))
+            .unwrap_or("?"),
+        crate::middleware::cold::human_idle(idle_ms),
+        crate::middleware::quota::group(prompt),
+    );
+}
+
+/// The inputs of one openai cold-notice row (see [`record_openai_cold`]).
+pub(crate) struct ColdOpenaiRecord<'a> {
+    /// The server (for the store).
+    pub(crate) server: &'a Server,
+    /// Request start, for `duration_ms`.
+    pub(crate) started: Instant,
+    /// Session identity, read by header name only (invariant 2).
+    pub(crate) session_id: Option<&'a str>,
+    /// The lane's tools-hash — the cold gate is a per-lane decision.
+    pub(crate) tools_hash: Option<&'a str>,
+    /// How long the lane sat idle before this request.
+    pub(crate) idle_ms: i64,
+    /// The prefix the next request would re-read.
+    pub(crate) prompt: u64,
+    /// The message count of the stopped request.
+    pub(crate) req_messages: Option<i64>,
+    /// The model the notice promised a cheap `/compact` on, when one
+    /// resolved.
+    pub(crate) compact_target: Option<&'a str>,
 }
 
 /// The route column, `frontend:backend`.

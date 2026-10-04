@@ -15,7 +15,9 @@
 //! - the lane key ([`lane_key`] — toker keeps the predecessor's
 //!   `?`-collapse out: no
 //!   session or no tools-hash means no lane at all, per this unit's plan);
-//! - the TTL stickiness rule ([`lane_ttl`]);
+//! - the TTL stickiness rule ([`lane_ttl`]) and the openai path's
+//!   explicit TTL override ([`OPENAI_LANE_TTL_MS`],
+//!   [`LaneResponse::ttl_ms`]);
 //! - the response merge ([`note_lane_response`]);
 //! - the restart reseed ([`lanes_from_rows`]);
 //! - the 4000-lane / 30-day prune policy ([`LANE_MAX`],
@@ -33,9 +35,11 @@
 //! periodically, never per request.
 //!
 //! Units: `updated_ms`/`noticed_at` are epoch milliseconds (a
-//! `Date.now()`-style convention). The TTL tier is stored as its duration in milliseconds
-//! (`300_000` = the 5-minute tier, `3_600_000` = the 1-hour tier), the same
-//! shape the store's v1 schema already fixed.
+//! `Date.now()`-style convention). The TTL is stored as its duration in
+//! milliseconds (`300_000` = the 5-minute tier, `3_600_000` = the 1-hour
+//! tier — the anthropic write tiers, the same shape the store's v1
+//! schema fixed — and `600_000` = the openai lane's provider window,
+//! openrouter's sticky session).
 //!
 //! Absence ≠ zero (invariant 3): `prompt_tokens` and `ttl` are `None` until
 //! a lane has been observed carrying them, and `ping` is `Some(true)` only
@@ -60,6 +64,21 @@ pub const LANE_MAX_AGE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// threshold measured in hours does not miss up to this much staleness, and
 /// real I/O never lands on the request path.
 pub const LANE_FLUSH_MS: u64 = 30_000;
+
+/// How long an openai-path lane's cache survives without traffic:
+/// openrouter's sticky window — "sticky sessions expire after 10 minutes
+/// of inactivity" (the prompt-caching doc), so an openai lane's clock
+/// expires at 10 minutes. NOT one of the anthropic 5m/1h write tiers:
+/// the openai wire has no cache-write TTL tiers, and pinning the lane to
+/// the provider's own documented window is the honest semantics — the
+/// anthropic ladder would read an unrecorded tier as the 1-hour one and
+/// hold the sleep lock for an hour per openai request.
+///
+/// The openai record path passes this as [`LaneResponse::ttl_ms`] and
+/// the reseed derives it by frontend (`openai_chat` rows); the cold
+/// gate reads it as its idle floor and [`crate::middleware::cold::ttl_of`]
+/// recognises it so the sleep lock releases on the same clock.
+pub const OPENAI_LANE_TTL_MS: i64 = 600_000;
 
 /// The default header the window pinger tags its requests with (plan:
 /// "Ping tagging — marks ping lanes so they never hold the sleep lock";
@@ -200,6 +219,13 @@ pub struct LaneResponse<'a> {
     /// The request carried the ping header: recorded, but excluded from
     /// liveness (a ping lane never holds the sleep lock).
     pub ping: bool,
+    /// An explicit TTL for this response's cache, in milliseconds,
+    /// overriding the tier ladder — for providers whose cache window is
+    /// a documented duration rather than the anthropic 5m/1h write
+    /// tiers. The openai path passes [`OPENAI_LANE_TTL_MS`]
+    /// (openrouter's sticky window); the anthropic path passes `None`
+    /// and keeps the ladder.
+    pub ttl_ms: Option<i64>,
     /// An upgrade this response made; `None` when it rewrote nothing.
     pub forced: Option<Forced>,
     /// Whether this response served a real compaction (the tool-set test,
@@ -253,12 +279,19 @@ fn merge_lane(prev: Option<&Lane>, key: &str, response: &LaneResponse<'_>) -> La
         tools_hash: response.tools_hash.map(str::to_owned),
         updated_ms: response.at_ms,
         prompt_tokens: Some(response.prompt),
-        ttl: lane_ttl(
-            prev.and_then(|lane| Ttl::from_ms(lane.ttl)),
-            response.write_5m,
-            response.write_1h,
-        )
-        .map(Ttl::as_ms),
+        // The explicit override replaces the derived tier: it is a
+        // statement about THIS provider's cache window (openrouter's
+        // sticky 10 minutes), not a guess about which anthropic tier a
+        // write landed in — the tiers do not exist on that wire. The
+        // anthropic path passes `None` and keeps the stickiness ladder.
+        ttl: response.ttl_ms.or_else(|| {
+            lane_ttl(
+                prev.and_then(|lane| Ttl::from_ms(lane.ttl)),
+                response.write_5m,
+                response.write_1h,
+            )
+            .map(Ttl::as_ms)
+        }),
         // Only `true` is a ping — a lane
         // wrongly marked one is a session the machine may sleep through,
         // so a non-ping response clears the flag rather than sticking.
@@ -306,12 +339,15 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
         if row.kind.is_some() {
             continue;
         }
-        // Lanes are an Anthropic cache concept (plan: wire only the
-        // anthropic path for now): openai-chat rows carry a session id
-        // (opencode sends `x-session-id`) and a tools hash, but their TTL
-        // semantics are undefined — an unrecorded tier reads as the 1-hour
-        // one, which would hold the sleep lock for an hour per request.
-        if row.frontend.as_deref() != Some("anthropic") {
+        // Lanes are per-protocol cache concepts, and each protocol's rows
+        // carry their own TTL semantics: the anthropic rows the 5m/1h
+        // write-tier ladder, the openai rows openrouter's sticky window
+        // ([`OPENAI_LANE_TTL_MS`]) — the wire has no cache-write tiers,
+        // so the provider's documented duration is the honest clock.
+        // Anything else (a frontend this table does not know) seeds
+        // nothing: no TTL semantics can be derived for it.
+        let openai = row.frontend.as_deref() == Some("openai_chat");
+        if !openai && row.frontend.as_deref() != Some("anthropic") {
             continue;
         }
         let Some(key) = lane_key(row.session_id.as_deref(), row.tools_hash.as_deref()) else {
@@ -331,12 +367,20 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
         let lane = Lane {
             updated_ms: row.ts_ms,
             prompt_tokens: Some(prompt_of(row)),
-            ttl: lane_ttl(
-                prev.and_then(|lane| Ttl::from_ms(lane.ttl)),
-                row.cache_write_5m.unwrap_or(0).max(0) as u64,
-                row.cache_write_1h.unwrap_or(0).max(0) as u64,
-            )
-            .map(Ttl::as_ms),
+            ttl: if openai {
+                // By provider: an openai lane's clock is the sticky
+                // window, whatever the row's apportioned write buckets
+                // say (the conservative 1h split is a ledger guess, not
+                // a tier this wire has).
+                Some(OPENAI_LANE_TTL_MS)
+            } else {
+                lane_ttl(
+                    prev.and_then(|lane| Ttl::from_ms(lane.ttl)),
+                    row.cache_write_5m.unwrap_or(0).max(0) as u64,
+                    row.cache_write_1h.unwrap_or(0).max(0) as u64,
+                )
+                .map(Ttl::as_ms)
+            },
             ping: (row.ping == Some(true)).then_some(true),
             session_id: row.session_id.clone(),
             tools_hash: row.tools_hash.clone(),
@@ -453,6 +497,7 @@ mod tests {
             write_5m: 0,
             write_1h: 0,
             ping: false,
+            ttl_ms: None,
             forced: None,
             compaction: false,
         }
@@ -463,8 +508,9 @@ mod tests {
         row.ts_ms = ts_ms;
         row.session_id = session.map(str::to_owned);
         row.tools_hash = tools.map(str::to_owned);
-        // Real measurement rows always carry the frontend; these lanes are
-        // an anthropic concept (see the filter in `lanes_from_rows`).
+        // Real measurement rows always carry the frontend; the lane
+        // derivation reads it for the TTL semantics (see the filter in
+        // `lanes_from_rows`).
         row.frontend = Some("anthropic".to_owned());
         row
     }
@@ -765,18 +811,99 @@ mod tests {
     }
 
     #[test]
-    fn openai_rows_grow_no_lanes_even_with_session_and_tools() {
-        // opencode sends `x-session-id` and the openai shape carries a tools
-        // hash, so its rows have both lane-key halves — but the lane TTL is
-        // an anthropic cache concept; an unrecorded tier would read as the
-        // 1-hour one and hold the sleep lock for an hour per request.
+    fn openai_rows_grow_lanes_on_the_openrouter_ten_minute_clock() {
+        // The phase-2 exclusion is reversed: an openai-chat row carries
+        // both lane-key halves (opencode sends `x-session-id`, the
+        // openai shape hashes its tools), and its lane runs on the
+        // provider's own clock — openrouter's 10-minute sticky window,
+        // never the anthropic tier ladder (an unrecorded tier would
+        // read as the 1-hour one and hold the sleep lock for an hour
+        // per request).
         let mut row = measurement_row(Some("ses-1"), Some("t1"), 1_000);
         row.frontend = Some("openai_chat".to_owned());
+        row.input = Some(50_000);
+        row.cache_read = Some(1_200);
+        // The conservative ledger apportionment charges the whole write
+        // to the 1-hour bucket — the reseed must not mistake that guess
+        // for a tier this wire has.
+        row.cache_write_total = Some(300);
+        row.cache_write_1h = Some(300);
         let lanes = lanes_from_rows(&[row]);
-        assert!(
-            lanes.is_empty(),
-            "reseed must not build lanes from openai-path rows"
+        let lane = &lanes["ses-1|t1"];
+        assert_eq!(lane.prompt_tokens, Some(51_500), "input + read + writes");
+        assert_eq!(
+            lane.ttl,
+            Some(super::OPENAI_LANE_TTL_MS),
+            "the TTL derives from the frontend, not the write buckets"
         );
+        assert_eq!(super::OPENAI_LANE_TTL_MS, 600_000);
+
+        // A frontend the table does not know still seeds nothing: no
+        // TTL semantics can be derived for it.
+        let mut unknown = measurement_row(Some("ses-2"), Some("t2"), 2_000);
+        unknown.frontend = Some("responses".to_owned());
+        assert!(lanes_from_rows(&[unknown]).is_empty());
+    }
+
+    #[test]
+    fn the_reseed_merges_openai_and_anthropic_lanes_by_their_own_clocks() {
+        // The same session's two protocols carry different TTL
+        // semantics side by side: the anthropic row's ladder, the
+        // openai row's sticky window.
+        let mut anthropic = measurement_row(Some("ses-1"), Some("t1"), 1_000);
+        anthropic.input = Some(10);
+        anthropic.cache_write_1h = Some(5_000);
+        let mut openai = measurement_row(Some("ses-2"), Some("t2"), 2_000);
+        openai.frontend = Some("openai_chat".to_owned());
+        openai.input = Some(20);
+
+        let lanes = lanes_from_rows(&[anthropic, openai]);
+        assert_eq!(lanes["ses-1|t1"].ttl, Some(Ttl::Hour.as_ms()));
+        assert_eq!(lanes["ses-2|t2"].ttl, Some(super::OPENAI_LANE_TTL_MS));
+    }
+
+    #[test]
+    fn an_openai_cold_row_still_restores_the_notice_memory() {
+        // The cold-row branch runs ahead of the frontend filter, so an
+        // openai-path notice survives a restart the same way.
+        let mut rows = vec![measurement_row(Some("ses-1"), Some("t1"), 1_000)];
+        rows[0].frontend = Some("openai_chat".to_owned());
+        rows[0].input = Some(500_000);
+        let mut cold = measurement_row(Some("ses-1"), Some("t1"), 6_000);
+        cold.frontend = Some("openai_chat".to_owned());
+        cold.kind = Some(RowKind::Cold);
+        rows.push(cold);
+        let lane = &lanes_from_rows(&rows)["ses-1|t1"];
+        assert_eq!(lane.updated_ms, 1_000, "`at` does not move for a notice");
+        assert_eq!(lane.noticed_at, Some(6_000));
+    }
+
+    #[test]
+    fn an_explicit_ttl_override_replaces_the_ladder() {
+        let store = mem_store();
+        // An anthropic-shaped first response sets the hour tier...
+        let mut hour = response(Some("ses-1"), Some("t1"), 1_000);
+        hour.write_1h = 10_000;
+        note_lane_response(&store, hour)
+            .expect("note")
+            .expect("lane");
+        // ...and an openai response with the explicit override carries
+        // its provider's window instead — the override is a statement
+        // about this response's cache, not a tier guess.
+        let mut openai = response(Some("ses-1"), Some("t1"), 2_000);
+        openai.ttl_ms = Some(super::OPENAI_LANE_TTL_MS);
+        let lane = note_lane_response(&store, openai)
+            .expect("note")
+            .expect("lane");
+        assert_eq!(lane.ttl, Some(super::OPENAI_LANE_TTL_MS));
+        // Without the override the ladder still governs (the anthropic
+        // path): a 1h write on a fresh lane sets the hour tier.
+        let mut anthropic = response(Some("ses-2"), Some("t2"), 3_000);
+        anthropic.write_1h = 10_000;
+        let lane = note_lane_response(&store, anthropic)
+            .expect("note")
+            .expect("lane");
+        assert_eq!(lane.ttl, Some(Ttl::Hour.as_ms()));
     }
 
     #[test]

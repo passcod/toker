@@ -17,8 +17,10 @@
 //!   the mid-conversation system message merged), asserted byte for
 //!   byte, with the downgrade provenance on the row;
 //! - a WARM compaction passes through untouched;
-//! - the openai path never meets the cold machinery: a poisoned lane and
-//!   openai traffic with the same session forwards.
+//! - a model whose listing entry prices its cache writes at nothing is
+//!   exempt from the notice: the request forwards and a `cold-quiet`
+//!   row with `writesFree` records the withholding (the
+//!   withheld-notice-with-reason discipline).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -111,24 +113,11 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
     raw_json(Bytes::from(non_stream_body(&model)))
 }
 
-async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response {
-    let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
-        .await
-        .expect("mock reads body");
-    mock.requests.lock().unwrap().push(body);
-    raw_json(Bytes::from_static(
-        br#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],
-            "usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
-    ))
-}
-
-/// One mock standing for every backend: the anthropic routes, plus the
-/// openai-chat route the openai-isolation test drives.
+/// One mock standing for the anthropic backend.
 async fn spawn_mock() -> (MockState, reqwest::Url) {
     let state = MockState::default();
     let app = Router::new()
         .route("/v1/messages", post(mock_messages))
-        .route("/v1/chat/completions", post(mock_chat))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -215,6 +204,29 @@ fn test_config(upstream: reqwest::Url) -> Config {
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     let server = Server::new(config, store.clone()).expect("build server");
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    (addr, store)
+}
+
+/// [`spawn_toker`], with one fetched catalogue installed before serving —
+/// the writes-free exemption's fixture. The background refresh task
+/// only spawns in `serve`, which tests never run, so this is the only
+/// way a test's server sees a catalogue.
+async fn spawn_toker_cataloged(
+    config: Config,
+    source: &'static str,
+    catalog: toker::catalog::FetchedCatalog,
+) -> (SocketAddr, Arc<Store>) {
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::new(config, store.clone()).expect("build server");
+    server.install_catalog(source, catalog);
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -766,64 +778,89 @@ async fn a_warm_compaction_passes_through_untouched() {
 }
 
 #[tokio::test]
-async fn openai_traffic_never_meets_the_cold_machinery() {
+async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream)).await;
+    let mut config = test_config(upstream);
+    // A model-mapped route: the map (whose rewrite stage runs AFTER the
+    // cold gate) moves claude-opus-5 onto a model whose listing entry
+    // prices its cache writes at nothing — the exemption must see the
+    // identity the upstream will actually bill.
+    config.anthropic_sub.model_map = toker::middleware::model_map::parse_model_map(
+        r#"{"model:claude-opus-5":"free/claude-sonnet"}"#,
+    )
+    .expect("the map parses");
+    // The backend's fetched catalogue: an entry whose pricing object is
+    // itemised with the write price OMITTED — the documented free
+    // signal. The real anthropic presence list carries no pricing at
+    // all (unknown → the gate fires), so this fixture is the
+    // cross-protocol wiring the exemption exists for.
+    let catalog = toker::catalog::FetchedCatalog {
+        fetched_at_ms: 0,
+        models: vec![toker::catalog::FetchedModel {
+            id: "free/claude-sonnet".to_owned(),
+            context_window: None,
+            raw: json!({
+                "id": "free/claude-sonnet",
+                "pricing": {
+                    "prompt": "0.00000011",
+                    "completion": "0.00000043",
+                    "input_cache_read": "0.0000000022"
+                }
+            }),
+        }],
+    };
+    let (addr, store) = spawn_toker_cataloged(config, "anthropic", catalog).await;
 
-    // Poison the lane this openai body would key to, cold in every
-    // dimension the anthropic gate reads: a 500k prefix, four hours
-    // idle. The openai path forwards regardless — the cold gate lives
-    // on the anthropic usage path alone.
-    let body = serde_json::to_vec(&json!({
-        "model": "z-ai/glm-5.3",
-        "stream": false,
-        "tools": [{"type": "function", "function": {"name": "run_command"}}],
-        "messages": [{"role": "user", "content": "Hi"}],
-    }))
-    .expect("serialise openai body");
-    let shape = IrRequest::parse(&body)
-        .expect("parse")
-        .openai_chat()
-        .shape();
-    let tools_hash = shape.tools_hash.expect("the body carries tools");
-    store
-        .upsert_lane(&Lane {
-            key: format!("ccses-42|{tools_hash}"),
-            session_id: Some("ccses-42".to_owned()),
-            tools_hash: Some(tools_hash),
-            updated_ms: now_ms() - 4 * 3_600_000,
-            prompt_tokens: Some(500_000),
-            ttl: None,
-            ping: None,
-            noticed_at: None,
-            forced_from: None,
-            forced_to: None,
-        })
-        .expect("poison lane");
+    // The same cold 200k lane the notice test fires on.
+    let body = tools_body("claude-opus-5");
+    poison_cold_lane(&store, &body, 2 * 3_600_000);
 
-    let response = client()
-        .post(format!("http://{addr}/v1/chat/completions"))
-        .header("x-claude-code-session-id", "ccses-42")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.clone())
-        .send()
-        .await
-        .expect("chat request");
+    let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert!(
-        String::from_utf8_lossy(&bytes).contains("\"choices\""),
-        "the openai upstream answered, not a gate"
+    assert_eq!(
+        bytes.as_ref(),
+        non_stream_body("free/claude-sonnet").as_slice(),
+        "the request forwarded on the MAPPED model — no interruption"
     );
-    assert_eq!(mock.captured().len(), 1);
-    assert_eq!(mock.captured()[0].as_ref(), body.as_slice());
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    let sent: Value = serde_json::from_slice(&captured[0]).expect("the forwarded body");
+    assert_eq!(sent["model"], "free/claude-sonnet");
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let rows = store.requests_since(0, 100).expect("rows");
-    assert!(
-        !rows
-            .iter()
-            .any(|row| matches!(row.kind, Some(RowKind::Cold | RowKind::ColdQuiet))),
-        "the cold gate is anthropic-path machinery only"
+    // The skip is visible: a cold-quiet row with writesFree — silence
+    // distinguishable from breakage — and no notice row.
+    let rows = wait_for_rows(&store, 2).await;
+    let quiet = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::ColdQuiet))
+        .expect("the withheld notice is recorded");
+    assert_eq!(quiet.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(quiet.provider.as_deref(), Some("anthropic_sub"));
+    assert_eq!(quiet.cold_on, Some(true));
+    assert_eq!(quiet.rate_limits, None, "no stale meters on a proxy row");
+    let extra = extra_of(quiet);
+    assert_eq!(extra["writesFree"], json!(true), "{extra}");
+    assert_eq!(extra["lastPrompt"], json!(200_000));
+    assert_eq!(
+        extra["quotaExtra"],
+        Value::Null,
+        "the exemption answered before the outlook was worth measuring"
     );
+    assert!(
+        !rows.iter().any(|row| row.kind == Some(RowKind::Cold)),
+        "no notice fired"
+    );
+
+    // The lane was NOT marked noticed (nothing was said); its clock
+    // moved with the served response.
+    let lane = store
+        .load_lane(&lane_key_of(&body))
+        .expect("load")
+        .expect("lane");
+    assert_eq!(
+        lane.noticed_at, None,
+        "a withheld notice is not a spoken one"
+    );
+    assert_no_more_rows(&store, 2).await;
 }
