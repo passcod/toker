@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use super::labels::Label;
 use super::quota::QuotaAgg;
 use super::rebuilds::RebuildAgg;
+use crate::catalog::fetched::FetchedCatalogs;
 use crate::catalog::windows::{ContextWindow, resolve_context_window};
 use crate::store::{CostKind, DisplayRow, RowKind, is_api_measurement};
 
@@ -97,6 +98,13 @@ pub(crate) struct SessionAgg {
     pub requests: usize,
     /// The latest non-NULL model; `None` when no row reported one.
     pub model: Option<String>,
+    /// The provider of the row that most recently named
+    /// [`SessionAgg::model`] — the per-provider key the
+    /// fetched-catalogue ceiling lookup needs, moved on every
+    /// model-naming row so the model·provider pairing stays true
+    /// (a model-less row cannot move it). `None` when no
+    /// model-naming row carried a provider.
+    pub provider: Option<String>,
     /// The latest row's prompt — `input + cache_read + cache writes`,
     /// the measure the "prompt now" figure and the CONTEXT bars share.
     /// `None` unless every
@@ -129,12 +137,15 @@ pub(crate) struct SessionAgg {
     /// the caller from the allowances table against the current meter
     /// resets, and passed in as a set.
     pub released: bool,
-    /// The context ceiling of the latest model, from the hand-verified
-    /// catalogue ([`resolve_context_window`] of the model, as of the
-    /// latest row) — `Unknown` renders as `?`, never a guess. The
-    /// catalogue carries the claude native-1M/fixed-200k identities and
-    /// the gpt-5.6-sol/luna 872k declarations, so this is a pure lookup
-    /// with no extra read.
+    /// The context ceiling of the latest model, resolved through the
+    /// chain (see [`session_ctx`]): the hand-verified catalogue first
+    /// ([`resolve_context_window`] of the model, as of the latest row
+    /// — it encodes the claude native-1M/fixed-200k identities, the
+    /// beta phases, and the gpt-5.6-sol/luna 872k declarations), then
+    /// the fetched catalogue of the provider that named it (a
+    /// provider listing's `Declared` ceiling — the openrouter `?`
+    /// becomes a real window), then unknown — `?` renders, never a
+    /// guess.
     pub ctx: ContextWindow,
     /// The session's name from Claude Code's own transcript (see
     /// [super::labels]): the working directory and title the tail
@@ -309,6 +320,7 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
         None,
         &HashSet::new(),
         &HashMap::new(),
+        &FetchedCatalogs::default(),
         None,
         window_mins,
         0,
@@ -326,20 +338,24 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// lane walk over the 24 h tail, [`super::rebuilds`]), `released`
 /// the sessions holding a live allowance for the window now running
 /// (read from the allowances table against the quota section's
-/// current resets), and `labels` the
+/// current resets), `labels` the
 /// transcript-derived session labels resolved by the display tick
-/// (one read per session per refresh, [`super::labels::Labels`]) —
-/// all built on their own slower cadences or the tick itself, passed
-/// in to keep this function pure over cheap inputs. Eight positional
-/// parameters is the honest shape of a frame's inputs: the rows plus
-/// the precomputed/resolved sections and the window anchors. Rows may
-/// arrive in any order — "latest" is decided by `ts_ms` throughout.
+/// (one read per session per refresh, [`super::labels::Labels`]), and
+/// `catalogs` the fetched models catalogues the TUI loaded read-only
+/// from the daemon's cache files (the per-provider `Declared` ceilings
+/// — [`crate::catalog::fetched`]) — all built on their own slower
+/// cadences or the tick itself, passed in to keep this function pure
+/// over cheap inputs. Nine positional parameters is the honest shape
+/// of a frame's inputs: the rows plus the precomputed/resolved
+/// sections, the catalogues, and the window anchors. Rows may arrive
+/// in any order — "latest" is decided by `ts_ms` throughout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate(
     rows: &[DisplayRow],
     quota: Option<&QuotaAgg>,
     released: &HashSet<String>,
     labels: &HashMap<String, Label>,
+    catalogs: &FetchedCatalogs,
     rebuilds: Option<RebuildAgg>,
     window_mins: u64,
     now_ms: i64,
@@ -423,6 +439,7 @@ pub(crate) fn aggregate(
                 session: key.clone(),
                 requests: 0,
                 model: None,
+                provider: None,
                 input_now: None,
                 input_peak: None,
                 output_total: None,
@@ -440,10 +457,16 @@ pub(crate) fn aggregate(
         let session = &mut sessions[slot];
         session.requests += 1;
         session.latest_ts_ms = row.ts_ms;
-        if let Some(model) = &row.model
-            && session.model.as_deref() != Some(model.as_str())
-        {
-            session.model = row.model.clone();
+        if let Some(model) = &row.model {
+            if session.model.as_deref() != Some(model.as_str()) {
+                session.model = row.model.clone();
+            }
+            // The provider of the row that named the model — moved on
+            // every model-naming row (the latest namer wins), so the
+            // pairing the fetched-catalogue lookup needs stays true
+            // even when the same model string repeats across
+            // providers.
+            session.provider = row.provider.clone();
         }
         // The prompt needs every operand; a missing one is unknown.
         session.input_now = prompt_of(row);
@@ -495,12 +518,18 @@ pub(crate) fn aggregate(
         }
     }
 
-    // The context ceiling is a pure catalogue lookup off each session's
-    // latest model, resolved as of the latest row's
-    // timestamp, so a phased capability resolves to the phase
-    // that applied, never to today's against historical rows.
+    // The context ceiling is a catalogue lookup off each session's
+    // latest model — the hand-verified catalogue first, then the
+    // fetched catalogue of the provider that named it — resolved as of
+    // the latest row's timestamp, so a phased capability resolves to
+    // the phase that applied, never to today's against historical rows.
     for session in &mut sessions {
-        session.ctx = session_ctx(session.model.as_deref(), session.latest_ts_ms);
+        session.ctx = session_ctx(
+            session.model.as_deref(),
+            session.provider.as_deref(),
+            session.latest_ts_ms,
+            catalogs,
+        );
     }
 
     // Most-recent-first; session name breaks ties for a stable order.
@@ -586,22 +615,32 @@ fn anthropic_shaped(provider: Option<&str>) -> bool {
     provider.is_some_and(|provider| provider.starts_with("anthropic"))
 }
 
-/// The session's context ceiling: the catalogue lookup of its latest
-/// model, resolved as of the latest row's timestamp
-/// (its own served-at). No betas and no learned declaration: the
-/// hand-verified catalogue carries the exact identities that matter
-/// (claude native-1M/fixed-200k, the gpt-5.6-sol/luna 872k
+/// The session's context ceiling: the catalogue chain of its latest
+/// model — the hand-verified catalogue first
+/// ([`resolve_context_window`]), then the fetched catalogue of the
+/// provider that named the model (a provider listing's `Declared`
+/// ceiling, exact id match), resolved as of the latest row's
+/// timestamp (its own served-at). No betas and no learned declaration:
+/// the hand-verified catalogue carries the exact identities that
+/// matter (claude native-1M/fixed-200k, the gpt-5.6-sol/luna 872k
 /// declarations), a beta-selectable phase without captured betas stays
-/// `Unknown` exactly as the catalogue leaves it, and a model outside the
-/// catalogue renders `?` rather than inheriting a family's ceiling.
-fn session_ctx(model: Option<&str>, latest_ts_ms: i64) -> ContextWindow {
+/// `Unknown` exactly as the catalogue leaves it, and a model outside
+/// both catalogues renders `?` rather than inheriting a family's
+/// ceiling.
+fn session_ctx(
+    model: Option<&str>,
+    provider: Option<&str>,
+    latest_ts_ms: i64,
+    catalogs: &FetchedCatalogs,
+) -> ContextWindow {
     let Some(model) = model else {
         return ContextWindow::Unknown;
     };
+    let fetched = provider.and_then(|provider| catalogs.context_window_of(provider, model));
     let at = jiff::Timestamp::from_millisecond(latest_ts_ms)
         .ok()
         .map(|ts| ts.strftime("%Y-%m-%d").to_string());
-    resolve_context_window(model, None, None, at.as_deref())
+    resolve_context_window(model, None, fetched, None, at.as_deref())
 }
 
 /// The minute bucket a timestamp falls into: index `window_mins - 1` is the
@@ -644,6 +683,13 @@ mod tests {
         std::collections::HashMap::new()
     }
 
+    /// The tests' shared "no fetched catalogues" input — the absent
+    /// state the loop passes before its first cache read: hand-verified
+    /// lookups still resolve, fetched ones do not.
+    fn no_catalogs() -> super::FetchedCatalogs {
+        super::FetchedCatalogs::default()
+    }
+
     fn agg(rows: &[DisplayRow], total: i64) -> Snapshot {
         // The tests' display rows carry no meter snapshots (the narrow
         // display shape has none to carry), so the loop's quota
@@ -654,6 +700,7 @@ mod tests {
             None,
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -966,6 +1013,7 @@ mod tests {
             None,
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             0,
             NOW,
@@ -1000,6 +1048,7 @@ mod tests {
             quota_section.as_ref(),
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1025,6 +1074,7 @@ mod tests {
             quota_section.as_ref(),
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1289,6 +1339,7 @@ mod tests {
             quota.as_ref(),
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1308,6 +1359,7 @@ mod tests {
             quota.as_ref(),
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1472,6 +1524,7 @@ mod tests {
             None,
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1482,6 +1535,7 @@ mod tests {
             None,
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1652,6 +1706,7 @@ mod tests {
                 None,
                 &no_sections(),
                 &no_labels(),
+                &no_catalogs(),
                 None,
                 30,
                 now_ms,
@@ -1677,6 +1732,7 @@ mod tests {
                 None,
                 &no_sections(),
                 &no_labels(),
+                &no_catalogs(),
                 None,
                 30,
                 now_ms,
@@ -1694,6 +1750,7 @@ mod tests {
             None,
             &no_sections(),
             &no_labels(),
+            &no_catalogs(),
             None,
             30,
             now_ms,
@@ -1815,6 +1872,225 @@ mod tests {
         assert_eq!(ctx_of("ses-modelless"), ContextWindow::Unknown);
     }
 
+    /// The fetched-catalogue source in the aggregation: a session on an
+    /// uncatalogued model gains a `Declared` ceiling from its
+    /// provider's listing (exact id match); the hand-verified verdict
+    /// survives a listing that claims otherwise; the provider of the
+    /// row that NAMED the model is the pairing that decides — and a
+    /// provider with no catalogue, or no provider at all, stays
+    /// unknown.
+    #[test]
+    fn ctx_ceilings_gain_fetched_windows_per_provider() {
+        use crate::catalog::fetched::{FetchedCatalog, FetchedModel};
+        use crate::catalog::windows::ContextWindow;
+        use serde_json::json;
+
+        let mut catalogs = no_catalogs();
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: NOW,
+                models: vec![
+                    // The openrouter `?` fix: a model the hand-verified
+                    // catalogue does not carry, listed with a real window.
+                    FetchedModel {
+                        id: "z-ai/glm-5.3".to_owned(),
+                        context_window: Some(200_000),
+                        raw: json!({"id": "z-ai/glm-5.3", "context_length": 200_000}),
+                    },
+                    // A claude-named entry claiming a WRONG window: the
+                    // hand-verified catalogue's 1M must survive it.
+                    FetchedModel {
+                        id: "claude-opus-5".to_owned(),
+                        context_window: Some(123_456),
+                        raw: json!({"id": "claude-opus-5"}),
+                    },
+                ],
+            },
+        );
+        catalogs.set(
+            "codex_sub",
+            FetchedCatalog {
+                fetched_at_ms: NOW,
+                models: vec![FetchedModel {
+                    id: "gpt-6-terra".to_owned(),
+                    context_window: Some(400_000),
+                    raw: json!({"slug": "gpt-6-terra", "max_context_window": 400_000}),
+                }],
+            },
+        );
+        // The anthropic presence list: ids, never windows.
+        catalogs.set(
+            "anthropic",
+            FetchedCatalog {
+                fetched_at_ms: NOW,
+                models: vec![FetchedModel {
+                    id: "claude-opus-5".to_owned(),
+                    context_window: None,
+                    raw: json!({"id": "claude-opus-5"}),
+                }],
+            },
+        );
+
+        // Six sessions, one per rule:
+        // - openrouter row on the uncatalogued glm → the listing's ceiling;
+        // - openrouter row on a catalogued claude id → hand-verified wins;
+        // - codex_sub row on an uncatalogued codex slug → its listing;
+        // - the same slug on openrouter (not listed there) → unknown;
+        // - anthropic row on an uncatalogued claude id → the presence
+        //   list has no window → unknown (hand-verified stays
+        //   authoritative);
+        // - an openrouter row whose model survived but whose naming
+        //   row carried no provider → no catalogue consulted.
+        let mut glm = display_bare(mins_ago(6));
+        glm.session_id = Some("ses-glm".into());
+        glm.model = Some("z-ai/glm-5.3".into());
+        glm.provider = Some("openrouter".into());
+        let mut hostile = display_bare(mins_ago(5));
+        hostile.session_id = Some("ses-hostile".into());
+        hostile.model = Some("claude-opus-5".into());
+        hostile.provider = Some("openrouter".into());
+        let mut terra = display_bare(mins_ago(4));
+        terra.session_id = Some("ses-terra".into());
+        terra.model = Some("gpt-6-terra".into());
+        terra.provider = Some("codex_sub".into());
+        let mut terra_openai = display_bare(mins_ago(3));
+        terra_openai.session_id = Some("ses-terra-openai".into());
+        terra_openai.model = Some("gpt-6-terra".into());
+        terra_openai.provider = Some("openrouter".into());
+        let mut uncatalogued_claude = display_bare(mins_ago(2));
+        uncatalogued_claude.session_id = Some("ses-future-claude".into());
+        uncatalogued_claude.model = Some("claude-opus-6".into());
+        uncatalogued_claude.provider = Some("anthropic_sub".into());
+        let mut providerless = display_bare(mins_ago(1));
+        providerless.session_id = Some("ses-providerless".into());
+        providerless.model = Some("z-ai/glm-5.3".into());
+
+        let snap = super::aggregate(
+            &[
+                glm,
+                hostile,
+                terra,
+                terra_openai,
+                uncatalogued_claude,
+                providerless,
+            ],
+            None,
+            &no_sections(),
+            &no_labels(),
+            &catalogs,
+            None,
+            WINDOW,
+            NOW,
+            6,
+        );
+        let ctx_of = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+                .ctx
+        };
+        assert_eq!(
+            ctx_of("ses-glm"),
+            ContextWindow::Declared { tokens: 200_000 },
+            "the openrouter listing turns the `?` into a real ceiling"
+        );
+        assert_eq!(
+            ctx_of("ses-hostile"),
+            ContextWindow::Exact { tokens: 1_000_000 },
+            "a listing claiming a different window for a claude-named model never overrides the hand-verified catalogue"
+        );
+        assert_eq!(
+            ctx_of("ses-terra"),
+            ContextWindow::Declared { tokens: 400_000 },
+            "the codex listing answers for its own backend's rows"
+        );
+        assert_eq!(
+            ctx_of("ses-terra-openai"),
+            ContextWindow::Unknown,
+            "per-provider: an openrouter row does not consult the codex listing"
+        );
+        assert_eq!(
+            ctx_of("ses-future-claude"),
+            ContextWindow::Unknown,
+            "the anthropic presence list has no window to give — the hand-verified catalogue stays authoritative there"
+        );
+        assert_eq!(
+            ctx_of("ses-providerless"),
+            ContextWindow::Unknown,
+            "a model-naming row without a provider consults no fetched catalogue"
+        );
+
+        // The provider tracked is the naming row's, and it moves with
+        // the model: a session that switches models picks up the new
+        // naming row's provider.
+        let mut switched = display_bare(mins_ago(3));
+        switched.session_id = Some("ses-switch".into());
+        switched.model = Some("z-ai/glm-5.3".into());
+        switched.provider = Some("openrouter".into());
+        let mut later = display_bare(mins_ago(2));
+        later.session_id = Some("ses-switch".into());
+        later.model = Some("gpt-6-terra".into());
+        later.provider = Some("codex_sub".into());
+        let snap = super::aggregate(
+            &[switched, later],
+            None,
+            &no_sections(),
+            &no_labels(),
+            &catalogs,
+            None,
+            WINDOW,
+            NOW,
+            2,
+        );
+        assert_eq!(
+            snap.sessions[0].provider.as_deref(),
+            Some("codex_sub"),
+            "the naming row's provider, moved in step with the model"
+        );
+        assert_eq!(
+            snap.sessions[0].ctx,
+            ContextWindow::Declared { tokens: 400_000 },
+            "so the ceiling follows the model that is actually served"
+        );
+
+        // The same model string re-named by a DIFFERENT provider: the
+        // latest namer's provider is the pairing that counts — and a
+        // model-less row after it moves nothing.
+        let mut glm_openai = display_bare(mins_ago(3));
+        glm_openai.session_id = Some("ses-drift".into());
+        glm_openai.model = Some("z-ai/glm-5.3".into());
+        glm_openai.provider = Some("openrouter".into());
+        let mut glm_elsewhere = display_bare(mins_ago(2));
+        glm_elsewhere.session_id = Some("ses-drift".into());
+        glm_elsewhere.model = Some("z-ai/glm-5.3".into());
+        glm_elsewhere.provider = Some("lunaroute".into());
+        let mut modelless = display_bare(mins_ago(1));
+        modelless.session_id = Some("ses-drift".into());
+        let snap = super::aggregate(
+            &[glm_openai, glm_elsewhere, modelless],
+            None,
+            &no_sections(),
+            &no_labels(),
+            &catalogs,
+            None,
+            WINDOW,
+            NOW,
+            3,
+        );
+        assert_eq!(
+            snap.sessions[0].provider.as_deref(),
+            Some("lunaroute"),
+            "the latest row that named the model names its provider"
+        );
+        assert_eq!(
+            snap.sessions[0].ctx,
+            ContextWindow::Unknown,
+            "a provider with no fetched catalogue answers nothing, even though an earlier namer had one"
+        );
+    }
+
     /// The `↑` marks rewrites (bright on the latest row, dim when only
     /// an earlier one) and the `$` marks a released session — both
     /// from inputs the loop owns, passed in as data.
@@ -1838,6 +2114,7 @@ mod tests {
             None,
             &released,
             &no_labels(),
+            &no_catalogs(),
             None,
             WINDOW,
             NOW,
@@ -1886,7 +2163,17 @@ mod tests {
                 prompt: None,
             },
         );
-        let snap = super::aggregate(&rows, None, &no_sections(), &labels, None, WINDOW, NOW, 4);
+        let snap = super::aggregate(
+            &rows,
+            None,
+            &no_sections(),
+            &labels,
+            &no_catalogs(),
+            None,
+            WINDOW,
+            NOW,
+            4,
+        );
         let session = |name: &str| {
             snap.sessions
                 .iter()

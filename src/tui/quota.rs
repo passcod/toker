@@ -1181,6 +1181,7 @@ mod tests {
             quota.as_ref(),
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &crate::catalog::fetched::FetchedCatalogs::default(),
             None,
             30,
             now_ms,

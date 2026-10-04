@@ -1360,6 +1360,7 @@ mod tests {
         as_display_rows, as_meter_rows, display_bare, display_billed, display_kind_row,
         metered_full,
     };
+    use crate::catalog::fetched::FetchedCatalogs;
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1431,6 +1432,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -1513,6 +1515,7 @@ mod tests {
                 quota.as_ref(),
                 &HashSet::new(),
                 &no_labels(),
+                &FetchedCatalogs::default(),
                 None,
                 30,
                 NOW,
@@ -1649,6 +1652,7 @@ mod tests {
             None,
             &released,
             &no_labels(),
+            &FetchedCatalogs::default(),
             Some(rebuilds),
             30,
             NOW,
@@ -1698,7 +1702,17 @@ mod tests {
 
     #[test]
     fn empty_window_renders_absence_not_zero() {
-        let snap = model::aggregate(&[], None, &HashSet::new(), &no_labels(), None, 30, NOW, 523);
+        let snap = model::aggregate(
+            &[],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        );
         let text = rendered(&snap, 100, 30);
         assert!(text.contains("no requests in window"));
         assert!(text.contains("no data in window"));
@@ -1717,7 +1731,17 @@ mod tests {
         // A zero-total ledger and a quiet window are indistinguishable
         // on the dashboard now — the header shows the window only, and
         // neither state invents anything.
-        let snap = model::aggregate(&[], None, &HashSet::new(), &no_labels(), None, 30, NOW, 0);
+        let snap = model::aggregate(
+            &[],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            0,
+        );
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("no requests in window"));
         assert!(!text.contains("ledger"), "no lifetime count:\n{text}");
@@ -1925,6 +1949,7 @@ mod tests {
                 quota.as_ref(),
                 &HashSet::new(),
                 &no_labels(),
+                &FetchedCatalogs::default(),
                 None,
                 30,
                 NOW,
@@ -2076,7 +2101,17 @@ mod tests {
                 prompt: Some("the last prompt".into()),
             },
         );
-        let snap = model::aggregate(&rows, None, &HashSet::new(), &labels, None, 30, NOW, 523);
+        let snap = model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &labels,
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        );
 
         // 120 wide: the SESSION column takes the slack — the names
         // render in full, the labeled ids are gone, and the session
@@ -2182,6 +2217,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -2217,6 +2253,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -2259,6 +2296,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -2365,6 +2403,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -2549,6 +2588,7 @@ mod tests {
             None,
             &HashSet::new(),
             &no_labels(),
+            &FetchedCatalogs::default(),
             None,
             30,
             NOW,
@@ -2697,7 +2737,17 @@ mod tests {
             5,
             0.1,
         ));
-        let snap = model::aggregate(&rows, None, &HashSet::new(), &no_labels(), None, 30, NOW, 5);
+        let snap = model::aggregate(
+            &rows,
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            5,
+        );
         for (width, height) in [
             (1u16, 1u16),
             (2, 2),

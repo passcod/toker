@@ -327,6 +327,16 @@ pub fn model_identity(model: &str) -> Option<String> {
 ///   the request carried none or the row did not capture them. A
 ///   beta-selectable phase without captured betas stays `Unknown` — an
 ///   uncaptured selection is not evidence.
+/// - `fetched`: this model's context window from the row's provider's
+///   **fetched catalogue** ([`crate::catalog::fetched`]) — the models
+///   API listing, when it named one. Consulted SECOND: after the
+///   hand-verified catalogue, before a stored declaration — a fresh
+///   provider listing outranks a stale learned one, and a model the
+///   hand-verified catalogue KNOWS keeps its verdict even when that
+///   verdict is `Unknown` (an uncaptured beta phase is a decision, not
+///   a gap a listing may fill). A fetched window resolves as
+///   [`ContextWindow::Declared`] — a provider listing is a declaration,
+///   not hand-verified source capability.
 /// - `declared`: the provider's stored `{default, max}` declaration for a
 ///   model outside this catalogue (learned-store JSON; validated here).
 ///   A catalogued model ignores it — the hand-verified table wins over a
@@ -339,6 +349,7 @@ pub fn model_identity(model: &str) -> Option<String> {
 pub fn resolve_context_window(
     model: &str,
     betas: Option<&[&str]>,
+    fetched: Option<u64>,
     declared: Option<&Value>,
     at: Option<&str>,
 ) -> ContextWindow {
@@ -346,8 +357,13 @@ pub fn resolve_context_window(
         return ContextWindow::Unknown;
     };
     let Some(entry) = catalog_entry(&id) else {
-        // Outside the catalogue: a validated provider declaration is still
-        // a ceiling; a name prefix alone never supplies one.
+        // Outside the catalogue: the fetched listing first (fresher
+        // than a stored declaration), then a validated provider
+        // declaration — both ceilings; a name prefix alone never
+        // supplies one.
+        if let Some(tokens) = fetched {
+            return ContextWindow::Declared { tokens };
+        }
         return match declared.and_then(DeclaredWindow::from_json) {
             Some(declared) => ContextWindow::Declared {
                 tokens: declared.max_tokens,
@@ -356,6 +372,10 @@ pub fn resolve_context_window(
         };
     };
 
+    // Catalogued: the hand-verified verdict is the whole answer — every
+    // Unknown it can return (a date no phase covers, an uncaptured
+    // beta selection) is a decision about what a listing cannot know,
+    // so `fetched` is deliberately NOT consulted past this point.
     let Some(capability) = capability_at(entry, at) else {
         return ContextWindow::Unknown;
     };
@@ -501,21 +521,21 @@ mod tests {
         ];
         for model in native {
             assert_eq!(
-                resolve_context_window(model, None, None, None),
+                resolve_context_window(model, None, None, None, None),
                 exact(1_000_000),
                 "{model}"
             );
             // Captured empty betas change nothing: the beta header does not
             // select these windows.
             assert_eq!(
-                resolve_context_window(model, Some(NO_BETAS), None, None),
+                resolve_context_window(model, Some(NO_BETAS), None, None, None),
                 exact(1_000_000),
                 "{model} with captured empty betas"
             );
             // An Anthropic-shaped beta never narrows or widens a native 1M
             // model either.
             assert_eq!(
-                resolve_context_window(model, Some(BETA), None, None),
+                resolve_context_window(model, Some(BETA), None, None, None),
                 exact(1_000_000),
                 "{model} with the 1M beta present"
             );
@@ -527,27 +547,27 @@ mod tests {
         let historical = "2026-03-01T12:00:00Z";
         for model in ["claude-sonnet-4-0", "claude-sonnet-4-5"] {
             assert_eq!(
-                resolve_context_window(model, Some(NO_BETAS), None, Some(historical)),
+                resolve_context_window(model, Some(NO_BETAS), None, None, Some(historical)),
                 exact(200_000),
                 "{model} without beta"
             );
             assert_eq!(
-                resolve_context_window(model, Some(BETA), None, Some(historical)),
+                resolve_context_window(model, Some(BETA), None, None, Some(historical)),
                 exact(1_000_000),
                 "{model} with beta"
             );
             assert_eq!(
-                resolve_context_window(model, None, None, Some(historical)),
+                resolve_context_window(model, None, None, None, Some(historical)),
                 ContextWindow::Unknown,
                 "{model} without beta capture"
             );
             assert_eq!(
-                resolve_context_window(model, Some(BETA), None, Some("2026-05-01T00:00:00Z")),
+                resolve_context_window(model, Some(BETA), None, None, Some("2026-05-01T00:00:00Z")),
                 exact(200_000),
                 "{model} after beta retirement"
             );
             assert_eq!(
-                resolve_context_window(model, Some(BETA), None, None),
+                resolve_context_window(model, Some(BETA), None, None, None),
                 exact(200_000),
                 "{model} current capability"
             );
@@ -559,6 +579,7 @@ mod tests {
                 "claude-opus-4-6",
                 Some(NO_BETAS),
                 None,
+                None,
                 Some("2026-02-20T00:00:00Z")
             ),
             exact(200_000),
@@ -568,6 +589,7 @@ mod tests {
             resolve_context_window(
                 "claude-opus-4-6",
                 Some(BETA),
+                None,
                 None,
                 Some("2026-02-20T00:00:00Z")
             ),
@@ -579,13 +601,14 @@ mod tests {
                 "claude-opus-4-6",
                 Some(NO_BETAS),
                 None,
+                None,
                 Some("2026-03-20T00:00:00Z")
             ),
             exact(1_000_000),
             "native 1M treated as legacy"
         );
         assert_eq!(
-            resolve_context_window("claude-opus-4-6", None, None, None),
+            resolve_context_window("claude-opus-4-6", None, None, None, None),
             exact(1_000_000),
             "current capability"
         );
@@ -596,6 +619,7 @@ mod tests {
                 "claude-sonnet-4-6",
                 Some(NO_BETAS),
                 None,
+                None,
                 Some("2026-03-01T00:00:00Z")
             ),
             exact(200_000),
@@ -605,6 +629,7 @@ mod tests {
             resolve_context_window(
                 "claude-sonnet-4-6",
                 Some(BETA),
+                None,
                 None,
                 Some("2026-03-01T00:00:00Z")
             ),
@@ -616,6 +641,7 @@ mod tests {
                 "claude-sonnet-4-6",
                 Some(NO_BETAS),
                 None,
+                None,
                 Some("2026-03-20T00:00:00Z")
             ),
             exact(1_000_000),
@@ -624,7 +650,7 @@ mod tests {
 
         // A widened beta cannot lift a fixed 200k model.
         assert_eq!(
-            resolve_context_window("claude-haiku-4-5", Some(BETA), None, None),
+            resolve_context_window("claude-haiku-4-5", Some(BETA), None, None, None),
             exact(200_000),
             "beta widened ineligible Haiku"
         );
@@ -634,7 +660,7 @@ mod tests {
     fn invalid_or_unmatched_served_dates_stay_unknown_on_phased_models() {
         for at in ["not-a-date", "2026-3-1", "2026-03", "20260301T12:00:00Z"] {
             assert_eq!(
-                resolve_context_window("claude-sonnet-4-0", Some(BETA), None, Some(at)),
+                resolve_context_window("claude-sonnet-4-0", Some(BETA), None, None, Some(at)),
                 ContextWindow::Unknown,
                 "{at}"
             );
@@ -645,13 +671,14 @@ mod tests {
                 "claude-sonnet-4-5",
                 Some(BETA),
                 None,
+                None,
                 Some("2025-09-28T00:00:00Z")
             ),
             ContextWindow::Unknown
         );
         // A non-phased model ignores the served-at date entirely.
         assert_eq!(
-            resolve_context_window("claude-opus-5", None, None, Some("not-a-date")),
+            resolve_context_window("claude-opus-5", None, None, None, Some("not-a-date")),
             exact(1_000_000)
         );
     }
@@ -659,7 +686,7 @@ mod tests {
     #[test]
     fn context_lookup_normalises_snapshots_and_bracket_variants() {
         assert_eq!(
-            resolve_context_window(" Claude-Opus-5[1m] ", None, None, None),
+            resolve_context_window(" Claude-Opus-5[1m] ", None, None, None, None),
             exact(1_000_000)
         );
         assert_eq!(
@@ -667,19 +694,20 @@ mod tests {
                 "claude-sonnet-4-20250514",
                 Some(BETA),
                 None,
+                None,
                 Some("2026-03-01T12:00:00Z")
             ),
             exact(1_000_000),
             "published snapshot alias folds to sonnet-4-0"
         );
         assert_eq!(
-            resolve_context_window("claude-haiku-4-5-20251001", None, None, None),
+            resolve_context_window("claude-haiku-4-5-20251001", None, None, None, None),
             exact(200_000)
         );
         // An unpublished dated identity is not a published snapshot: it must
         // not become a known dateless model.
         assert_eq!(
-            resolve_context_window("claude-opus-5-20990101", None, None, None),
+            resolve_context_window("claude-opus-5-20990101", None, None, None, None),
             ContextWindow::Unknown
         );
     }
@@ -701,7 +729,7 @@ mod tests {
         ];
         for model in snapshots {
             assert_eq!(
-                resolve_context_window(model, None, None, None),
+                resolve_context_window(model, None, None, None, None),
                 exact(200_000),
                 "{model}"
             );
@@ -712,7 +740,7 @@ mod tests {
     fn unknown_claude_identities_stay_unknown_despite_captured_betas() {
         for betas in [None, Some(NO_BETAS), Some(BETA)] {
             assert_eq!(
-                resolve_context_window("claude-opus-6", betas, None, None),
+                resolve_context_window("claude-opus-6", betas, None, None, None),
                 ContextWindow::Unknown
             );
         }
@@ -722,7 +750,7 @@ mod tests {
     fn codex_declarations_report_the_maximum_as_a_declared_ceiling() {
         for model in ["gpt-5.6-sol", "gpt-5.6-luna"] {
             assert_eq!(
-                resolve_context_window(model, None, None, None),
+                resolve_context_window(model, None, None, None, None),
                 declared(872_000),
                 "{model}"
             );
@@ -730,12 +758,12 @@ mod tests {
         // An Anthropic-shaped beta from a compatibility gateway never makes
         // a non-Claude response 1M.
         assert_eq!(
-            resolve_context_window("gpt-5.6-sol", Some(BETA), None, None),
+            resolve_context_window("gpt-5.6-sol", Some(BETA), None, None, None),
             declared(872_000)
         );
         // Nor does it invent a window for an uncatalogued model.
         assert_eq!(
-            resolve_context_window("other-provider-1", Some(BETA), None, None),
+            resolve_context_window("other-provider-1", Some(BETA), None, None, None),
             ContextWindow::Unknown
         );
     }
@@ -744,13 +772,13 @@ mod tests {
     fn stored_declarations_resolve_to_their_model_ceiling() {
         let declaration = json!({"default": 64_000, "max": 256_000});
         assert_eq!(
-            resolve_context_window("generic", None, Some(&declaration), None),
+            resolve_context_window("generic", None, None, Some(&declaration), None),
             declared(256_000),
             "generic stored declaration"
         );
         let claude_declared = json!({"default": 200_000, "max": 1_000_000});
         assert_eq!(
-            resolve_context_window("claude-opus-6", None, Some(&claude_declared), None),
+            resolve_context_window("claude-opus-6", None, None, Some(&claude_declared), None),
             declared(1_000_000),
             "unknown Claude identity with stored generic declaration"
         );
@@ -770,7 +798,7 @@ mod tests {
         ];
         for value in invalid {
             assert_eq!(
-                resolve_context_window("generic", None, Some(&value), None),
+                resolve_context_window("generic", None, None, Some(&value), None),
                 ContextWindow::Unknown,
                 "{value}"
             );
@@ -782,13 +810,68 @@ mod tests {
     fn the_catalogue_wins_over_a_stored_declaration() {
         let stale = json!({"default": 272_000, "max": 872_000});
         assert_eq!(
-            resolve_context_window("claude-opus-5", None, Some(&stale), None),
+            resolve_context_window("claude-opus-5", None, None, Some(&stale), None),
             exact(1_000_000),
             "catalogued model ignores a stale stored declaration"
         );
         assert_eq!(
-            resolve_context_window("gpt-5.6-sol", None, Some(&stale), None),
+            resolve_context_window("gpt-5.6-sol", None, None, Some(&stale), None),
             declared(872_000)
+        );
+    }
+
+    /// The fetched-catalogue source (the models APIs): second to the
+    /// hand-verified catalogue, above a stored declaration, above
+    /// unknown — and the chain's guards hold at every step.
+    #[test]
+    fn fetched_listings_fill_only_the_catalogue_gaps() {
+        // Hand-verified verdicts stand, whatever a listing claims —
+        // including a listing that answers for a claude-named model a
+        // window the catalogue disproves.
+        assert_eq!(
+            resolve_context_window("claude-opus-5", None, Some(123_456), None, None),
+            exact(1_000_000),
+            "the hand-verified catalogue encodes knowledge a listing cannot"
+        );
+        assert_eq!(
+            resolve_context_window("gpt-5.6-sol", None, Some(999_999), None, None),
+            declared(872_000)
+        );
+        // ...including the catalogue's own Unknown verdicts: an
+        // uncaptured beta phase is a decision, not a gap.
+        assert_eq!(
+            resolve_context_window(
+                "claude-sonnet-4-0",
+                None,
+                Some(1_000_000),
+                None,
+                Some("2026-03-01T00:00:00Z")
+            ),
+            ContextWindow::Unknown,
+            "a fetched window must not fill an uncaptured beta phase"
+        );
+        // Outside the catalogue, the fetched ceiling is a declared one:
+        // the openrouter `?` becomes a real ceiling.
+        assert_eq!(
+            resolve_context_window("z-ai/glm-5.3", None, Some(200_000), None, None),
+            declared(200_000)
+        );
+        // It outranks a stored declaration — a fresh provider listing
+        // beats a stale learned one.
+        let stale = json!({"default": 32_000, "max": 64_000});
+        assert_eq!(
+            resolve_context_window("z-ai/glm-5.3", None, Some(200_000), Some(&stale), None),
+            declared(200_000)
+        );
+        // With no fetched ceiling, the declaration still stands…
+        assert_eq!(
+            resolve_context_window("generic", None, None, Some(&stale), None),
+            declared(64_000)
+        );
+        // …and with neither, unknown — never a guess.
+        assert_eq!(
+            resolve_context_window("z-ai/glm-5.3", None, None, None, None),
+            ContextWindow::Unknown
         );
     }
 

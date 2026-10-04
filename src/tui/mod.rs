@@ -40,9 +40,11 @@ mod quota;
 mod rebuilds;
 mod view;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::catalog::fetched::{self, FetchedCatalogs};
 use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
 use crate::store::Store;
 
@@ -126,12 +128,28 @@ pub fn run(
     let mut next_quota = Instant::now();
     let mut quota: Option<quota::QuotaAgg> = None;
     let mut rebuilds: Option<rebuilds::RebuildAgg> = None;
+    // The daemon's models caches, read-only: loaded (or not) on the
+    // quota cadence below, never fetched, never written.
+    let mut model_caches = match fetched::cache_dir() {
+        Ok(dir) => ModelCaches::new(dir),
+        Err(error) => {
+            // No data home: nothing to read — the CTX column falls back
+            // to the hand-verified catalogue alone, absence rather than
+            // zeros.
+            eprintln!("tui: no models caches ({error})");
+            ModelCaches::disabled()
+        }
+    };
     let mut snapshot = model::empty(window_mins);
     loop {
         let now = Instant::now();
         if now >= next_quota {
             quota = quota_snapshot(&store, window_mins)?;
             rebuilds = rebuild_snapshot(&store, window_mins)?;
+            // The cache read rides the quota cadence: three stat calls
+            // are free against a 60 s tick, and the files themselves
+            // only move on the daemon's 24 h cycle.
+            model_caches.refresh();
             next_quota = Instant::now() + QUOTA_REFRESH;
         }
         if now >= next_display {
@@ -142,6 +160,7 @@ pub fn run(
                 quota.as_ref(),
                 &released,
                 rebuilds.as_ref(),
+                model_caches.catalogs(),
                 &mut labels,
             )?;
             next_display = Instant::now() + REFRESH;
@@ -189,9 +208,9 @@ pub fn run(
 }
 
 /// Reload the display window's rows and total, then aggregate with the
-/// CACHED quota and rebuild sections plus the live-allowance set. The
-/// read is the store's narrow display projection
-/// ([`Store::display_rows_since`]): the fifteen columns the
+/// CACHED quota and rebuild sections, the live-allowance set, and the
+/// loaded models catalogues. The read is the store's narrow display
+/// projection ([`Store::display_rows_since`]): the fifteen columns the
 /// aggregation consumes, no JSON parse per row — the full-row read
 /// this path used to pay cast 59 columns and parsed six JSON values
 /// per row, every 2 s (invariant 7). Errors propagate — with WAL and
@@ -202,13 +221,17 @@ pub fn run(
 /// ([`labels::Labels`], the labels' economics: a 2-second refresh
 /// re-reads each tail so a title that regenerates mid-session stays
 /// current) — never per render, which is why the label state is loop
-/// state passed in rather than a fresh read per frame.
+/// state passed in rather than a fresh read per frame. `catalogs` is
+/// the loop's loaded mirror of the daemon's models caches (see
+/// [`ModelCaches`]) — the fetched `Declared` ceilings the CTX column
+/// resolves through, read-only from disk.
 fn refresh_display(
     store: &Store,
     window_mins: u64,
     quota: Option<&quota::QuotaAgg>,
     released: &std::collections::HashSet<String>,
     rebuilds: Option<&rebuilds::RebuildAgg>,
+    catalogs: &FetchedCatalogs,
     labels: &mut labels::Labels,
 ) -> anyhow::Result<model::Snapshot> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
@@ -231,11 +254,88 @@ fn refresh_display(
         quota,
         released,
         &resolved,
+        catalogs,
         rebuilds.cloned(),
         window_mins,
         now_ms,
         total,
     ))
+}
+
+/// The TUI's read-only mirror of the daemon's models caches — the
+/// ownership decision, made concrete: the daemon
+/// ([`crate::server::Server::spawn_catalog_refresh`]) is the ONLY
+/// writer (atomic rewrites on its 24 h cycle); this side loads whatever
+/// exists and never fetches, never writes. Each source's cache file is
+/// re-read only when its mtime moved since the last load — the daemon's
+/// atomic replace always moves it, and an untouched file is free. A
+/// file that vanishes or stops parsing leaves whatever was last loaded
+/// (a stale ceiling beats none); a source never seen simply stays
+/// absent — absence, never zeros (invariant 3).
+struct ModelCaches {
+    /// [`fetched::cache_dir`], or `None` when no data home resolves —
+    /// every refresh is then a no-op.
+    dir: Option<PathBuf>,
+    /// Per source: the mtime the loaded catalogue was read at.
+    mtimes: HashMap<String, Option<std::time::SystemTime>>,
+    /// The loaded catalogues — what [`refresh_display`] consults.
+    catalogs: FetchedCatalogs,
+    /// How many cache files were (re)loaded — the tests' proof the
+    /// mtime gate holds.
+    loads: usize,
+}
+
+impl ModelCaches {
+    fn new(dir: PathBuf) -> ModelCaches {
+        ModelCaches {
+            dir: Some(dir),
+            mtimes: HashMap::new(),
+            catalogs: FetchedCatalogs::default(),
+            loads: 0,
+        }
+    }
+
+    /// The no-data-home shape: nothing to read, ever.
+    fn disabled() -> ModelCaches {
+        ModelCaches {
+            dir: None,
+            mtimes: HashMap::new(),
+            catalogs: FetchedCatalogs::default(),
+            loads: 0,
+        }
+    }
+
+    /// Reload any source whose cache file moved since the last load.
+    fn refresh(&mut self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        for source in fetched::SOURCES {
+            let path = fetched::cache_path(dir, source);
+            let mtime = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok();
+            if mtime == self.mtimes.get(*source).copied().flatten() {
+                continue; // unchanged (or still absent) since the last load
+            }
+            self.mtimes.insert((*source).to_owned(), mtime);
+            let Some((fetched_at, response)) = fetched::load_cache(dir, source) else {
+                continue; // absent or unreadable: keep whatever was loaded
+            };
+            let Some(parse) = fetched::parse_for(source) else {
+                continue;
+            };
+            if let Ok(catalog) = parse(&response, fetched_at) {
+                self.catalogs.set(source, catalog);
+                self.loads += 1;
+            }
+        }
+    }
+
+    /// The loaded catalogues, as the aggregation consumes them.
+    fn catalogs(&self) -> &FetchedCatalogs {
+        &self.catalogs
+    }
 }
 
 /// The CACHE REBUILDS section, on the quota cadence (the heavy read's
@@ -715,6 +815,183 @@ mod tests {
     /// ledger's size by construction (checked, not assumed).
     const EVERYTHING: u64 = 1_000_000;
 
+    /// One cache file in the shape the daemon writes: the wrapper
+    /// (`fetched_at_ms` + the provider's raw response), pretty JSON
+    /// with a trailing newline — written here directly because the
+    /// shape is the reader's contract, pinned from the reading side.
+    fn write_cache(
+        dir: &std::path::Path,
+        provider: &str,
+        fetched_at_ms: i64,
+        response: &serde_json::Value,
+    ) {
+        let value = serde_json::json!({
+            "fetched_at_ms": fetched_at_ms,
+            "response": response,
+        });
+        let mut text = serde_json::to_string_pretty(&value).expect("serialise");
+        text.push('\n');
+        std::fs::write(crate::catalog::fetched::cache_path(dir, provider), text)
+            .expect("write cache");
+    }
+
+    /// The openrouter listing shape, two models — the second variant
+    /// swaps the window so a reload is visible.
+    fn openrouter_response(window: u64) -> serde_json::Value {
+        serde_json::json!({
+            "data": [
+                {"id": "z-ai/glm-5.3", "context_length": window, "pricing": {"prompt": "0"}},
+                {"id": "openai/gpt-6-luna", "context_length": 250_000}
+            ]
+        })
+    }
+
+    /// The mtime gate: a cache file is read when it first appears and
+    /// again only when its mtime moves — an unchanged file (or an
+    /// absent one) costs nothing, and the loaded catalogue survives a
+    /// rewrite whose mtime claims nothing changed.
+    #[test]
+    fn model_caches_reload_only_when_the_mtime_moves() {
+        let dir = crate::setup::test_dir("model-caches");
+        let mut caches = super::ModelCaches::new(dir.clone());
+        // The stamp the rewritten caches carry: any constant later than
+        // the first write's.
+        const REWRITTEN_AT: i64 = 1_800_000_000_000;
+
+        // Nothing on disk yet: three absent sources, nothing loaded.
+        caches.refresh();
+        assert_eq!(caches.loads, 0, "no cache files exist yet");
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            None,
+            "an absent source has no ceilings"
+        );
+
+        // The daemon's first write: one load, and the ceilings answer.
+        write_cache(
+            &dir,
+            "openrouter",
+            1_700_000_000_000,
+            &openrouter_response(200_000),
+        );
+        caches.refresh();
+        assert_eq!(caches.loads, 1);
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            Some(200_000)
+        );
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "openai/gpt-6-luna"),
+            Some(250_000)
+        );
+
+        // An unchanged mtime is not re-read — even when the CONTENT
+        // moved underneath (the gate is the daemon's own atomic
+        // replace moving the mtime, and the pinned clock proves the
+        // gate is the mtime, not the bytes).
+        let recorded = *caches.mtimes.get("openrouter").expect("mtime recorded");
+        std::fs::write(
+            crate::catalog::fetched::cache_path(&dir, "openrouter"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "fetched_at_ms": REWRITTEN_AT,
+                "response": openrouter_response(999_999),
+            }))
+            .expect("serialise"),
+        )
+        .expect("rewrite the cache");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(crate::catalog::fetched::cache_path(&dir, "openrouter"))
+            .expect("open for set_times");
+        file.set_times(std::fs::FileTimes::new().set_modified(recorded.expect("a time")))
+            .expect("pin the mtime back");
+        drop(file);
+        caches.refresh();
+        assert_eq!(
+            caches.loads, 1,
+            "an unchanged mtime is not re-read, whatever the bytes say"
+        );
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            Some(200_000),
+            "the last good parse stands"
+        );
+
+        // The daemon's atomic replace: a moved mtime reloads, and the
+        // new listing answers.
+        std::fs::write(
+            crate::catalog::fetched::cache_path(&dir, "openrouter"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "fetched_at_ms": REWRITTEN_AT,
+                "response": openrouter_response(400_000),
+            }))
+            .expect("serialise"),
+        )
+        .expect("rewrite the cache");
+        caches.refresh();
+        assert_eq!(caches.loads, 2, "a moved mtime reloads");
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            Some(400_000),
+            "the fresh listing answers"
+        );
+
+        // A source that appears later is picked up independently; the
+        // anthropic presence list parses ids and answers no windows.
+        write_cache(
+            &dir,
+            "anthropic",
+            REWRITTEN_AT,
+            &serde_json::json!({
+                "data": [{"type": "model", "id": "claude-opus-5", "display_name": "Claude Opus 5"}]
+            }),
+        );
+        caches.refresh();
+        assert_eq!(caches.loads, 3);
+        for provider in ["anthropic_sub", "anthropic_api"] {
+            assert_eq!(
+                caches
+                    .catalogs()
+                    .context_window_of(provider, "claude-opus-5"),
+                None,
+                "the presence list answers ids, never windows"
+            );
+        }
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            Some(400_000),
+            "the other sources are untouched"
+        );
+    }
+
+    /// No data home at all: the disabled mirror reads nothing and the
+    /// aggregation runs on the hand-verified catalogue alone.
+    #[test]
+    fn model_caches_without_a_data_home_stay_empty() {
+        let mut caches = super::ModelCaches::disabled();
+        caches.refresh();
+        assert_eq!(caches.loads, 0);
+        assert_eq!(caches.dir, None);
+        assert_eq!(
+            caches
+                .catalogs()
+                .context_window_of("openrouter", "z-ai/glm-5.3"),
+            None
+        );
+    }
+
     #[test]
     #[ignore = "reads the live production ledger (the toker service's own \
                 DB, read the same way the TUI reads it, including the \
@@ -733,11 +1010,19 @@ mod tests {
             .expect("read the display window");
         let earliest = display.iter().map(|row| row.ts_ms).min().unwrap_or(now_ms);
         let window_mins = ((now_ms - earliest) / 60_000).max(1) as u64;
+        // The caches the way the loop reads them: the daemon's cache
+        // files, read-only (nothing is fetched — the probe reads what
+        // the TUI would actually consult).
+        let mut caches = super::ModelCaches::new(
+            crate::catalog::fetched::cache_dir().expect("resolve the data home"),
+        );
+        caches.refresh();
         let snap = crate::tui::model::aggregate(
             &display,
             None,
             &HashSet::new(),
             &HashMap::new(),
+            caches.catalogs(),
             None,
             window_mins,
             now_ms,

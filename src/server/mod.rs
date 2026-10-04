@@ -51,6 +51,7 @@ use anyhow::bail;
 use axum::Router;
 use axum::routing::{get, post};
 
+use crate::catalog::fetched::{self, FetchedCatalogs};
 use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
@@ -76,6 +77,15 @@ pub struct Server {
     /// family election) with its in-memory recently-served map, seeded
     /// from the ledger tail at startup.
     pub(crate) models: Arc<ModelStore>,
+    /// The fetched models catalogues (one per source: openrouter's
+    /// public listing, anthropic's presence list, the codex backend's
+    /// own models endpoint — see [`crate::catalog::fetched`]),
+    /// refreshed by the background task
+    /// [`Server::spawn_catalog_refresh`] spawns at startup and every
+    /// [`fetched::CACHE_TTL_MS`]. Held so the record paths and a
+    /// future `/_toker` endpoint can read them without touching disk;
+    /// the TUI reads the same data from the cache files, read-only.
+    pub(crate) catalogs: Arc<std::sync::RwLock<FetchedCatalogs>>,
     /// The shared upstream HTTP client. Connect timeout only — no read
     /// timeout, so streams live as long as their connections do (see the
     /// module docs).
@@ -209,6 +219,7 @@ impl Server {
             codex_sub,
             codex_turn,
             models,
+            catalogs: Arc::new(std::sync::RwLock::new(FetchedCatalogs::default())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
             started: Instant::now(),
@@ -335,6 +346,7 @@ impl Server {
         tracing::info!("toker listening on http://{address}");
         self.spawn_lane_prune();
         self.spawn_awake_timer();
+        self.spawn_catalog_refresh();
         // A restart inside a live session takes the lock straight back.
         self.evaluate_awake();
         axum::serve(listener, self.router()).await?;
@@ -389,6 +401,112 @@ impl Server {
             }
         });
     }
+
+    // ── the fetched models catalogues ────────────────────────────────
+
+    /// The three models-catalogue sources as this server is configured
+    /// (see [`crate::catalog::fetched`]): openrouter's public listing,
+    /// anthropic's presence list, and the codex backend's own models
+    /// endpoint. Built per refresh cycle so the codex credentials and
+    /// client version are read fresh, never cached here.
+    fn catalog_sources(&self) -> Vec<fetched::CatalogSource> {
+        vec![
+            fetched::CatalogSource {
+                provider: "openrouter",
+                // The upstream base already includes `/v1`, so the
+                // frontend's own models path is the endpoint (and the
+                // public listing needs no credential).
+                url: self.openrouter.endpoint("/v1/models"),
+                bearer: None,
+            },
+            fetched::CatalogSource {
+                provider: "anthropic",
+                // Deliberately uncredentialed (see the fetched module's
+                // docs): the 401 falls back to the hand-verified
+                // windows, which cover claude.
+                url: self.anthropic_sub.endpoint("/v1/models"),
+                bearer: None,
+            },
+            fetched::CatalogSource {
+                provider: "codex_sub",
+                // The codex CLI's own request shape: the version the
+                // handshake speaks rides as the client_version query.
+                // The stored login as-is, no refresh attempt — a stale
+                // token simply fails into the fallback.
+                url: self.codex_sub.endpoint(&format!(
+                    "/models?client_version={}",
+                    self.codex_turn.client_version()
+                )),
+                bearer: self
+                    .codex_turn
+                    .auth()
+                    .and_then(|auth| auth.access_token().map(str::to_owned)),
+            },
+        ]
+    }
+
+    /// Refresh all three fetched catalogues into
+    /// [`Server::catalogs`], one write-lock swap per cycle. Each
+    /// source goes through [`fetched::refresh`] (cache → fetch →
+    /// stale fallback, internally); a source that still errors keeps
+    /// its previous entry (an empty swap would throw away good data
+    /// over bookkeeping). Failures log at debug and retry next cycle.
+    async fn refresh_catalogs(&self) {
+        let Ok(dir) = fetched::cache_dir() else {
+            tracing::debug!("no data home; models catalogues disabled");
+            return;
+        };
+        let previous = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut next = FetchedCatalogs::default();
+        for source in self.catalog_sources() {
+            match fetched::refresh(&source, &dir, &self.http, record::now_ms()).await {
+                Ok(catalog) => {
+                    tracing::debug!(
+                        provider = source.provider,
+                        "models catalogue refreshed: {} models",
+                        catalog.models.len()
+                    );
+                    next.set(source.provider, catalog);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        provider = source.provider,
+                        %error,
+                        "models catalogue refresh failed; keeping the previous entry"
+                    );
+                    if let Some(previous) = previous.get(source.provider) {
+                        next.set(source.provider, previous.clone());
+                    }
+                }
+            }
+        }
+        *self
+            .catalogs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+
+    /// The models-catalogue refresh: all three sources at startup, then
+    /// every [`fetched::CACHE_TTL_MS`] — the timers' pattern (the
+    /// interval's first tick fires immediately). Nothing here can
+    /// delay or fail serving: the task runs beside the listener, each
+    /// fetch is bounded by [`fetched::FETCH_TIMEOUT`], and every
+    /// failure is the refresh chain's own fallback plus a debug log.
+    fn spawn_catalog_refresh(&self) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let tick = Duration::from_millis(fetched::CACHE_TTL_MS as u64);
+            let mut timer = tokio::time::interval(tick);
+            loop {
+                timer.tick().await;
+                server.refresh_catalogs().await;
+            }
+        });
+    }
 }
 
 /// One in-flight request's hold on the sleep lock: increments on entry,
@@ -405,5 +523,85 @@ pub(crate) struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.server.end_in_flight();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+    use crate::config::Config;
+    use crate::store::Store;
+    use std::sync::Arc;
+
+    /// A server over a scratch config whose providers point at
+    /// unreachable localhost ports (nothing contacts them at
+    /// construction; the codex version probe is disabled too, and the
+    /// background catalog task only spawns in `serve`, which tests
+    /// never run). The scratch `auth_path` keeps the codex version at
+    /// the built-in floor and the bearer absent — hermetic, never the
+    /// real `~/.codex`.
+    fn server(dir: &std::path::Path) -> Server {
+        std::fs::write(
+            dir.join("toker.toml"),
+            format!(
+                r#"
+awake = false
+db_path = ":memory:"
+
+[providers.openrouter]
+upstream = "http://localhost:9/v1"
+
+[providers.anthropic_sub]
+upstream = "http://localhost:10"
+
+[providers.codex_sub]
+upstream = "http://localhost:11/backend-api/codex"
+auth_path = {auth_path:?}
+version_probe = false
+"#,
+                auth_path = dir.join("auth.json"),
+            ),
+        )
+        .expect("write config");
+        let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
+        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
+        Server::new(config, store).expect("server builds")
+    }
+
+    /// The three sources the background task refreshes: the openrouter
+    /// models path off the `/v1` base (public, unauthenticated),
+    /// anthropic's presence list (deliberately uncredentialed), and
+    /// the codex backend's own endpoint with the client_version query
+    /// and the stored bearer — none in the scratch setup.
+    #[test]
+    fn catalog_sources_point_at_the_configured_models_endpoints() {
+        let dir = crate::setup::test_dir("catalog-sources");
+        let sources = server(&dir).catalog_sources();
+        assert_eq!(sources.len(), 3);
+
+        assert_eq!(sources[0].provider, "openrouter");
+        assert_eq!(sources[0].url.as_str(), "http://localhost:9/v1/models");
+        assert_eq!(sources[0].bearer, None, "the openrouter listing is public");
+
+        assert_eq!(sources[1].provider, "anthropic");
+        assert_eq!(sources[1].url.as_str(), "http://localhost:10/v1/models");
+        assert_eq!(
+            sources[1].bearer, None,
+            "anthropic is called WITHOUT credentials — the 401 falls back to the hand-verified windows"
+        );
+
+        assert_eq!(sources[2].provider, "codex_sub");
+        assert_eq!(
+            sources[2].url.as_str(),
+            format!(
+                "http://localhost:11/backend-api/codex/models?client_version={}",
+                crate::providers::codex::DEFAULT_CLIENT_VERSION
+            ),
+            "the codex CLI's own request shape: the version the handshake speaks rides as the query"
+        );
+        assert_eq!(
+            sources[2].bearer, None,
+            "no login in the scratch dir → no bearer (the request goes up cleanly and fails into the fallback)"
+        );
     }
 }

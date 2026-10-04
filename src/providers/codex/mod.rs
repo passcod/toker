@@ -218,6 +218,34 @@ impl CodexSub {
         Ok(Some(refreshed))
     }
 
+    /// The codex client version toker currently identifies as: the one
+    /// resolved at construction (config pin → the installed CLI's
+    /// `version.json` → the built-in floor), upgraded in place when the
+    /// background latest-release probe found something newer — max
+    /// wins, so a stale local record never downgrades a probe result.
+    /// The `version` handshake header and the models endpoint's
+    /// `client_version` query must speak the same version, so both
+    /// read it from here.
+    pub fn client_version(&self) -> String {
+        let mut client_version = self
+            .client_version
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // The background probe's landing: max wins, so the ecosystem's
+        // latest release upgrades a stale local record, and nothing
+        // ever downgrades.
+        if let Some(latest) = LATEST_PROBE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && semver_newer(latest, &client_version)
+        {
+            client_version.clone_from(latest);
+        }
+        client_version
+    }
+
     /// The full codex request-header set for one turn — the codex
     /// client's header block ([`Provider::inject_auth`]'s auth headers
     /// plus the dialect's identity headers), built for the routing unit
@@ -245,22 +273,7 @@ impl CodexSub {
         let mut headers = HeaderMap::new();
         auth_headers(auth, &mut headers);
         insert(&mut headers, "originator", &self.originator);
-        let mut client_version = self
-            .client_version
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        // The background probe's landing: max wins, so the ecosystem's
-        // latest release upgrades a stale local record, and nothing
-        // ever downgrades.
-        if let Some(latest) = LATEST_PROBE
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            && semver_newer(latest, &client_version)
-        {
-            client_version.clone_from(latest);
-        }
+        let client_version = self.client_version();
         insert(&mut headers, "version", &client_version);
         insert(&mut headers, "session-id", prompt_cache_key);
         insert(&mut headers, "thread-id", thread_id);
