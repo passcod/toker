@@ -33,6 +33,12 @@
 //! order; for real turns the categories arrive in exactly that order
 //! anyway, and the SSE path emits true arrival order for whatever
 //! interleaving the upstream sends.
+//!
+//! Upcoming unit: this direction splits the same way the request
+//! direction now does — a codex frontend adapter (responses →
+//! canonical IR) composed with an anthropic backend adapter
+//! (canonical → anthropic SSE / complete message). Until that unit
+//! lands, this module is the response direction whole.
 
 use serde_json::{Map, Value, json};
 

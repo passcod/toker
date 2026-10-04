@@ -266,8 +266,10 @@ fn the_release_marker_rides_through_and_system_roles_translate() {
     wire_constants_pinned(&value);
     // The marker is middleware's to strip, not translation's — it
     // rides in the user text verbatim. The trailing mid-conversation
-    // system-role message becomes a system-role input message (the
-    // Responses wire accepts one).
+    // system-role message merges into the PRECEDING user turn as a
+    // `[PROMPT_INJECTION]`-prefixed text part (ctp's transform for
+    // the same problem; the codex backend refuses system-role input
+    // items — verified live: "System messages are not allowed").
     assert_eq!(
         value["input"],
         json!([
@@ -275,10 +277,10 @@ fn the_release_marker_rides_through_and_system_roles_translate() {
              "content": [{"type": "input_text", "text": "Earlier work."}]},
             {"type": "message", "role": "assistant",
              "content": [{"type": "output_text", "text": "Ok."}]},
-            {"type": "message", "role": "user",
-             "content": [{"type": "input_text", "text": "$#$BURN$#$ keep going"}]},
-            {"type": "message", "role": "system",
-             "content": [{"type": "input_text", "text": "reminder"}]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "$#$BURN$#$ keep going"},
+                {"type": "input_text", "text": "[PROMPT_INJECTION] reminder"},
+            ]},
         ])
     );
     assert_eq!(value["instructions"], json!("You are a careful assistant."));
@@ -368,7 +370,9 @@ fn tool_use_tool_result_pairs_translate_to_calls_and_outputs() {
              "output": "[{\"type\":\"text\",\"text\":\"src holds\"},{\"type\":\"text\",\"text\":\"two modules.\"}]"},
         ])
     );
-    assert_eq!(value["max_output_tokens"], json!(2048));
+    // Sampling never crosses (the live-verified drop): the fixture
+    // carries max_tokens 2048, the translated request carries nothing.
+    assert!(value.get("max_output_tokens").is_none());
 }
 
 #[test]
@@ -397,5 +401,7 @@ fn images_translate_and_thinking_drops() {
     assert!(!bytes.contains("The image shows a chart."));
     assert!(!bytes.contains("EncryptedBlob123"));
     assert!(!bytes.contains("EqQBCkgIBRABGAIiQK3"));
-    assert_eq!(value["max_output_tokens"], json!(512));
+    // Sampling never crosses (the live-verified drop): the fixture
+    // carries max_tokens 512, the translated request carries nothing.
+    assert!(value.get("max_output_tokens").is_none());
 }

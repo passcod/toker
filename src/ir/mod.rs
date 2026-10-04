@@ -24,7 +24,10 @@
 //!   today), which touch one key position and never remove or reorder fields
 //!   they do not understand. Translation adapters (phase 2+) project this
 //!   Value into a protocol-typed model when crossing protocols; same-
-//!   protocol routes never project at all.
+//!   protocol routes never project at all. The cross-protocol model is
+//!   [`canonical`] — the canonical IR frontend adapters parse into and
+//!   backend adapters render out of, engaged only on cross-protocol
+//!   routes.
 //!
 //! Invariant 4 (serialisation purity): [`Request::serialise`] is a pure
 //! function of the parsed value. No serialisation decision depends on
@@ -43,11 +46,16 @@
 //! prefix-stability test over deterministic seeded conversations.
 
 pub mod anthropic;
+pub mod canonical;
 pub mod fidelity;
 pub mod openai_chat;
 
 pub use anthropic::{
     AnthropicBody, AnthropicBodyMut, AnthropicShape, SENTINEL, System, SystemBlockDigest,
+};
+pub use canonical::{
+    CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest,
+    Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
 pub use fidelity::{Fidelity, compare};
 pub use openai_chat::{

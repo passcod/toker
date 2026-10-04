@@ -1,47 +1,61 @@
-//! Cross-protocol translation: the Anthropic Messages frontend onto the
-//! codex backend's OpenAI-Responses wire, and its responses back.
+//! Cross-protocol translation, layered: **frontend adapters** parse
+//! a frontend wire body into the canonical IR
+//! ([`crate::ir::canonical`]); **backend adapters** render the
+//! canonical onto a backend's wire. A pair is the composition of
+//! the two — adding a frontend or a backend is one adapter, not a
+//! new pair. Same-protocol routes never come through here at all:
+//! they keep the [`Value`-wrapped protocol IR](crate::ir) and its
+//! byte-exact passthrough; translation is the cross-protocol
+//! machinery only.
 //!
-//! Two directions, one submodule each, one rule over both: **pure**. A
-//! translation is a function of its explicit inputs only — no clock, no
-//! counters, no state beyond the event under translation. That is
-//! invariant 4 applied cross-protocol, and it buys invariant 5 for free
-//! (docs/plans/toker-toolsuite.md:96): a translated request reproduces
-//! byte-identically wherever the conversation did not change, so the
-//! upstream's cacheable prefix stays stable even though it never
-//! existed in the frontend's wire format. The model slug and the
-//! prompt cache key are CALLER-derived and passed in as explicit
-//! parameters for exactly that reason — translation never reaches for
-//! anything the request did not carry.
+//! One rule over both directions: **pure**. A translation is a
+//! function of its explicit inputs only — no clock, no counters, no
+//! state beyond the event under translation. That is invariant 4
+//! applied cross-protocol, and it buys invariant 5 for free
+//! (docs/plans/toker-toolsuite.md:96): a translated request
+//! reproduces byte-identically wherever the conversation did not
+//! change, so the upstream's cacheable prefix stays stable even
+//! though it never existed in the frontend's wire format. The model
+//! slug and the prompt cache key are CALLER-derived and passed in as
+//! explicit parameters for exactly that reason — translation never
+//! reaches for anything the request did not carry.
 //!
-//! - [`to_codex`](to_codex::to_codex): one Anthropic Messages
-//!   body → one
-//!   [`ResponsesRequest`](crate::providers::codex::ResponsesRequest)
-//!   (unit A's wire types).
-//! - [`to_anthropic`]: a responses-dialect turn → Anthropic SSE —
-//!   [`AnthropicStream`] fed
-//!   [`ResponseEvent`](crate::providers::codex::ResponseEvent)s — or
-//!   the complete non-streaming message JSON,
-//!   [`message_from_capture`] over unit A's
-//!   [`TurnCapture`](crate::providers::codex::TurnCapture).
+//! ## The request direction (composed today: anthropic → codex)
 //!
-//! ## The request table (Anthropic Messages → Responses)
+//! - [`from_anthropic`]: the frontend adapter — one Anthropic
+//!   Messages body → one [`CanonicalRequest`]. Wire-shape problems
+//!   are ITS domain ([`TranslateError::Malformed`] for shape
+//!   violations, [`TranslateError::UnsupportedBlock`] for a block
+//!   with no faithful parse) — and nothing backend-shaped happens
+//!   there: system-role messages stay messages, thinking blocks stay
+//!   blocks, sampling rides as specs.
+//! - [`codex_backend::codex_from_canonical`]: the backend adapter —
+//!   one [`CanonicalRequest`] → one
+//!   [`ResponsesRequest`](crate::providers::codex::ResponsesRequest).
+//!   What this backend refuses is its declared property
+//!   ([`Capabilities`](crate::ir::canonical::Capabilities)); its
+//!   live-verified cost table lives in its module docs.
+//! - [`to_codex`]: the composition of the two — the public entry
+//!   the server calls (unit C).
+//!
+//! ## The request table (Anthropic Messages → Responses, as composed)
 //!
 //! | Anthropic | Responses |
 //! |---|---|
-//! | `system` (string or block array) | `instructions` — the text pieces (each block's `text`, each bare string element, `""` when a block carries none) joined on blank lines |
+//! | `system` (string or block array) | `instructions` — the text pieces (each block's `text`, each bare string element, `""` when a block carries none) joined on blank lines, then any LEADING system-role message texts appended the same way |
 //! | user `text` (string content or text blocks) | `message{role:"user", content:[{type:"input_text", text}]}` |
 //! | user `image` (base64 source) | `message` content part `{type:"input_image", image_url:"data:<media_type>;base64,<data>"}` |
 //! | user `image` (url source) | `input_image` with the url verbatim |
 //! | user `tool_result` | `function_call_output{call_id: tool_use_id, output}` |
 //! | assistant `text` | `message{role:"assistant", content:[{type:"output_text", text}]}` |
 //! | assistant `tool_use` | `function_call{name, arguments: <input serialised as a JSON string>, call_id: id}` |
-//! | assistant `thinking` / `redacted_thinking` | **DROPPED** — see below |
-//! | `role:"system"` messages (claude Code's mid-conversation reminders) | `message{role:"system", content:[input_text]}` (the Responses wire accepts system-role input messages) |
+//! | assistant `thinking` / `redacted_thinking` | **DROPPED** — this backend's declared cost (see below) |
+//! | `role:"system"` messages (claude Code's mid-conversation reminders) | merged into the PRECEDING user turn as `[PROMPT_INJECTION]`-prefixed text parts (this backend refuses system-role input items — live-verified); with no preceding user item, the text joins `instructions` instead |
 //! | tools `{name, description, input_schema}` | `{type:"function", name, description, strict:false, parameters: input_schema}` (`description` `""` when absent) |
-//! | `max_tokens` | `max_output_tokens` (omitted when the request omits it) |
-//! | `temperature` / `top_p` | same names, the number verbatim |
+//! | `max_tokens` / `temperature` / `top_p` | **DROPPED** — this backend's declared cost: it refuses sampling outright (live-verified: "Unsupported parameter: temperature") |
 //! | `tool_choice` absent / `{type:"auto"}` | `tool_choice:"auto"` (the wire constant) |
 //! | `tool_choice {type:"any"}` | `tool_choice:"required"` (the Responses equivalent) |
+//! | `tool_choice {type:"tool"}` or an unknown type | reported — no faithful string form on this wire |
 //! | `tool_result.content` string | `function_call_output.output` text |
 //! | `tool_result.content` block array | `function_call_output.output` as the JSON of the array (the only lossless string form; the wire's own content-item array output does not fit unit A's typed view, whose `output` is a string) |
 //!
@@ -59,43 +73,58 @@
 //! violations (a message without a role, a `tool_use` without an id)
 //! fail with [`TranslateError::Malformed`].
 //!
-//! ### Dropped, loudly — the known translation costs
+//! ### Dropped, loudly — per-BACKEND costs, not toker policy
 //!
-//! These are deliberate omissions, each with its reason; none is a
-//! silent bug:
+//! What a backend refuses is its declared property
+//! ([`Capabilities`]), enforced in its adapter and documented there
+//! (the codex backend's cost table lives in [`codex_backend`]). The
+//! canonical IR carries the intent — thinking blocks, sampling
+//! specs, system-role messages — so a backend that supports a thing
+//! loses nothing. The cross-cutting facts, either way:
 //!
 //! - **`thinking` and `redacted_thinking` blocks are DROPPED on
-//!   replay.** Claude's reasoning cannot cross providers: the
-//!   Responses reasoning items carry OpenAI's own encrypted reasoning
-//!   (`include: ["reasoning.encrypted_content"]`, unit A's constant),
-//!   and claude's thinking signatures verify against Anthropic's keys,
-//!   so neither direction's reasoning is legible to the other.
-//!   Replaying claude thinking as plain text would leak chain-of-thought
-//!   the source protocol deliberately redacts. The drop is coherent
-//!   both ways: the request direction drops thinking blocks, and the
-//!   response direction synthesises **unsigned** thinking blocks from
-//!   the codex summaries — display-only, never replayed (and
-//!   anthropic-side replay of thinking needs a signature this
-//!   translation never mints).
-//! - **`stop_sequences`** — the Responses protocol has no stop
-//!   sequences; there is nothing to map onto.
-//! - **`top_k`**, **`metadata`** (incl. `user_id`), **`thinking`**
-//!   config (the codex backend reasons with its own effort; unit C may
-//!   set `reasoning.effort` on the built request) — no Responses
-//!   equivalent.
+//!   replay** by the codex backend. Claude's reasoning cannot cross
+//!   providers: the Responses reasoning items carry OpenAI's own
+//!   encrypted reasoning (`include: ["reasoning.encrypted_content"]`,
+//!   unit A's constant), and claude's thinking signatures verify
+//!   against Anthropic's keys, so neither direction's reasoning is
+//!   legible to the other. Replaying claude thinking as plain text
+//!   would leak chain-of-thought the source protocol deliberately
+//!   redacts. The drop is coherent both ways: the request direction
+//!   drops thinking blocks, and the response direction synthesises
+//!   **unsigned** thinking blocks from the codex summaries —
+//!   display-only, never replayed (and anthropic-side replay of
+//!   thinking needs a signature this translation never mints).
+//! - **`stop_sequences`** — no Responses equivalent, so the codex
+//!   backend drops it; the canonical carries it with the sampling
+//!   specs for a backend that takes it. **`top_k`** and
+//!   **`metadata`** (incl. `user_id`) have no canonical form (and no
+//!   backend has asked for one — the pair module dropped them too).
+//!   The thinking **request** crosses as the codex reasoning effort
+//!   (see [`codex_backend`]).
 //! - **`tool_result.is_error` / `cache_control`** and other block
 //!   metadata — metadata, not content; the output text carries what
 //!   the model needs.
 //! - Unmapped **top-level fields** are dropped: cross-protocol
 //!   translation maps the table above, not the raw-preservation rule
-//!   ([crate::ir] keeps unknown fields for same-protocol routes; a
+//!   ([`crate::ir`] keeps unknown fields for same-protocol routes; a
 //!   foreign protocol has nowhere to put them).
 //! - The release marker `$#$BURN$#$` rides through untouched —
 //!   stripping is middleware's job
 //!   ([`crate::ir::AnthropicBodyMut::strip_release`]), which runs
 //!   before translation in the pipeline.
 //!
-//! ## The response table (Responses → Anthropic SSE)
+//! ## The response direction (Responses → Anthropic SSE)
+//!
+//! [`to_anthropic`] is this direction today: a responses-dialect
+//! turn → Anthropic SSE — [`AnthropicStream`] fed
+//! [`ResponseEvent`](crate::providers::codex::ResponseEvent)s — or
+//! the complete non-streaming message JSON,
+//! [`message_from_capture`] over unit A's
+//! [`TurnCapture`](crate::providers::codex::TurnCapture). It splits
+//! the same way in its upcoming unit — codex→canonical (a codex
+//! frontend adapter) + canonical→anthropic (an anthropic backend
+//! adapter).
 //!
 //! | Responses event | Anthropic events |
 //! |---|---|
@@ -149,9 +178,13 @@
 //! `"upstream error"` (the anthropic shape requires a message — the
 //! placeholder says nothing the upstream did not).
 
+pub mod codex_backend;
+pub mod from_anthropic;
 pub mod to_anthropic;
 pub mod to_codex;
 
+pub use codex_backend::codex_from_canonical;
+pub use from_anthropic::from_anthropic;
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::to_codex;
 

@@ -593,7 +593,10 @@ async fn an_http_error_maps_through_the_error_table() {
 
 #[tokio::test]
 async fn an_in_band_failure_maps_and_records_status_200() {
-    let (upstream, mock) = spawn_mock().await;
+    // The mock stays bound for the test's lifetime (the upstream must
+    // outlive the turn); its captured requests are not read here —
+    // the row assertions are the point.
+    let (upstream, _mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(
         "fail",
         upstream,

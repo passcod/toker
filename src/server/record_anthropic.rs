@@ -1134,29 +1134,6 @@ pub(crate) fn error_pair(body: &[u8]) -> (Option<String>, Option<String>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::record::i64_of;
-    use super::{cost_kind_of, ladder_json};
-    use crate::store::CostKind;
-
-    #[test]
-    fn cost_kinds_follow_the_backend_semantics() {
-        assert_eq!(cost_kind_of("anthropic_sub"), CostKind::PlanEquivalent);
-        assert_eq!(cost_kind_of("anthropic_api"), CostKind::Estimated);
-    }
-
-    #[test]
-    fn ladders_store_as_json_arrays_and_empty_ones_stay_absent() {
-        assert_eq!(
-            ladder_json(&["abc".to_owned(), "def".to_owned()]),
-            Some(r#"["abc","def"]"#.to_owned())
-        );
-        assert_eq!(ladder_json(&[]), None, "no rungs = nothing localised");
-        assert_eq!(i64_of(u64::MAX), i64::MAX, "saturated, never wrapped");
-    }
-}
-
 // ── the codex translation branch's rows ──────────────────────────────────
 
 /// Record a completed codex turn (kind `None` = a real API measurement).
@@ -1393,4 +1370,27 @@ pub(crate) fn record_codex_error(
         ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::record::i64_of;
+    use super::{cost_kind_of, ladder_json};
+    use crate::store::CostKind;
+
+    #[test]
+    fn cost_kinds_follow_the_backend_semantics() {
+        assert_eq!(cost_kind_of("anthropic_sub"), CostKind::PlanEquivalent);
+        assert_eq!(cost_kind_of("anthropic_api"), CostKind::Estimated);
+    }
+
+    #[test]
+    fn ladders_store_as_json_arrays_and_empty_ones_stay_absent() {
+        assert_eq!(
+            ladder_json(&["abc".to_owned(), "def".to_owned()]),
+            Some(r#"["abc","def"]"#.to_owned())
+        );
+        assert_eq!(ladder_json(&[]), None, "no rungs = nothing localised");
+        assert_eq!(i64_of(u64::MAX), i64::MAX, "saturated, never wrapped");
+    }
 }
