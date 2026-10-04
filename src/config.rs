@@ -289,9 +289,16 @@ pub struct CodexSubConfig {
     /// backend gates models by this (an old version is refused with
     /// "requires a newer version of Codex"), so toker must speak a
     /// version the ecosystem recognizes — `None` (the default) resolves
-    /// to the installed CLI's own `version.json` `latest_version`,
-    /// falling back to the built-in floor.
+    /// to the installed CLI's own `version.json` `latest_version`, then
+    /// the built-in floor, and is upgraded in the background by the
+    /// GitHub latest-release probe. A pinned value wins absolutely.
     pub client_version: Option<String>,
+    /// Fetch the ecosystem's latest codex release at startup (the same
+    /// GitHub request the codex CLI's updater makes; 5 s budget,
+    /// non-fatal, never delays serving) and upgrade the version
+    /// handshake to it. Default on; a pinned `client_version` disables
+    /// it regardless.
+    pub version_probe: bool,
 }
 
 /// Resolve one provider's `[providers.<id>.model_map]` TOML table into the
@@ -488,6 +495,12 @@ impl Config {
                 .codex_sub
                 .as_ref()
                 .and_then(|p| p.client_version.clone()),
+            version_probe: file
+                .providers
+                .codex_sub
+                .as_ref()
+                .and_then(|p| p.version_probe)
+                .unwrap_or(true),
         };
 
         let mut config = Config {
@@ -693,6 +706,8 @@ struct FileCodexSub {
     /// The codex client version to identify as (see
     /// [`CodexSubConfig::client_version`]).
     client_version: Option<String>,
+    /// See [`CodexSubConfig::version_probe`].
+    version_probe: Option<bool>,
 }
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else

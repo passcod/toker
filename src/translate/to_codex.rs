@@ -12,10 +12,25 @@
 //! conversation turn byte-identical over its earlier input items
 //! (invariant 5 — the prefix-stability property test pins it).
 //!
-//! Field placement: the routing fields, the wire constants, and the
-//! field order are unit A's ([`ResponsesRequest::new`]); the sampling
-//! translations (`max_output_tokens`, `temperature`, `top_p`, in that
-//! order) ride in `extra`, emitted after the pinned fields.
+//! # Translation costs are per-pair, and this module is the pair
+//!
+//! Everything this module drops or reshapes is a fact about the
+//! **codex backend** — verified against it, not assumed — and lives
+//! here precisely so it can never leak into another pair's adapter:
+//!
+//! | Cost | Why | What the upstream *does* support |
+//! | --- | --- | --- |
+//! | thinking-block replay | forced: cross-provider reasoning is opaque — claude's blocks carry no `encrypted_content`, so they cannot ride the codex wire | reasoning itself: summaries and reasoning items, its own `encrypted_content` |
+//! | sampling (`temperature`, `top_p`, `max_tokens`) | refused: verified live ("Unsupported parameter: temperature"); the codex client sends none | its own defaults, echoed in every response |
+//! | system-role input items | refused: verified live ("System messages are not allowed") | system content via `instructions` (leading) and ctp's preceding-user merge (mid-conversation) |
+//! | `stop_sequences`, `top_k`, `metadata` | no Responses equivalent exists | — |
+//!
+//! A future pair whose upstream supports these (an
+//! anthropic→openai_chat adapter, where `temperature`/`top_p` map
+//! natively) keeps them in ITS adapter; the drops above are this
+//! pair's costs, not toker policy. Conversely, what the upstream
+//! supports is always kept: the thinking **request** maps to the
+//! reasoning effort ([`thinking_of`]), tools map, images map.
 
 use serde_json::{Map, Value, json};
 
@@ -54,6 +69,12 @@ pub fn to_codex(
     request.tools = tools_of(body)?;
     request.tool_choice = tool_choice_of(body)?.to_owned();
     sampling_of(body, &mut request.extra)?;
+    // claude's extended-thinking request maps to the codex reasoning
+    // effort — the upstream SUPPORTS reasoning, so the intent crosses
+    // (a drop here would be the annoying kind: losing something the
+    // upstream takes). Only the REPLAY of thinking blocks is forced
+    // out by the protocol (see the module docs).
+    request.reasoning.effort = thinking_of(body)?;
     Ok(request)
 }
 
@@ -461,6 +482,43 @@ fn tool_choice_of(body: &Value) -> Result<&'static str, TranslateError> {
 /// verbatim. All three ride in `extra`, after the pinned fields.
 /// `stop_sequences` and `top_k` are dropped (no Responses equivalent —
 /// the parent module's docs).
+/// claude's `thinking` request → the codex reasoning effort, the
+/// upstream's own knob for the same intent. Budget tiers follow
+/// claude's own ladder (1024 floor, 10 k standard, 32 k extended):
+/// below 16 k → `low`, below 32 k → `medium`, otherwise `high` — a
+/// deliberate, documented policy translation, not a silent default.
+/// Absent or disabled thinking stays `None`: the model's own default
+/// effort then governs (the codex catalog's `default_reasoning_level`),
+/// which is exactly what "the client did not ask" means. Malformed
+/// budgets are reported, never coerced.
+fn thinking_of(body: &Value) -> Result<Option<String>, TranslateError> {
+    let Some(thinking) = body.get("thinking").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let object = thinking
+        .as_object()
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "thinking is not an object".to_owned(),
+        })?;
+    if object.get("type").and_then(Value::as_str) != Some("enabled") {
+        return Ok(None);
+    }
+    let budget = object
+        .get("budget_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "thinking.budget_tokens is missing or not a non-negative integer".to_owned(),
+        })?;
+    Ok(Some(
+        match budget {
+            0..=16_383 => "low",
+            16_384..=32_767 => "medium",
+            _ => "high",
+        }
+        .to_owned(),
+    ))
+}
+
 /// Sampling parameters (`max_tokens`, `temperature`, `top_p`) are a
 /// **translation cost, dropped loudly**: the codex backend rejects them
 /// outright (verified live: `"Unsupported parameter: temperature"`),
@@ -1055,6 +1113,72 @@ mod tests {
             ),
             Err(TranslateError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn thinking_requests_map_to_reasoning_effort_tiers() {
+        // The upstream SUPPORTS reasoning — the intent crosses (only
+        // thinking-block REPLAY is protocol-forced out). Tiers follow
+        // claude's own budget ladder.
+        for (budget, effort) in [
+            (1024, "low"),
+            (10_000, "low"),
+            (16_383, "low"),
+            (16_384, "medium"),
+            (24_000, "medium"),
+            (32_767, "medium"),
+            (32_768, "high"),
+            (64_000, "high"),
+        ] {
+            let body = json!({
+                "model": "m",
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+                "messages": [{"role": "user", "content": "Hi"}],
+            });
+            let request = to_codex(&body, MODEL, KEY).expect("translates");
+            assert_eq!(
+                request.reasoning.effort.as_deref(),
+                Some(effort),
+                "budget {budget}"
+            );
+        }
+        // Absent and disabled both mean "the client did not ask": the
+        // model's own default effort governs — never guessed here.
+        for body in [
+            json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]}),
+            json!({"model": "m", "thinking": {"type": "disabled"},
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+            json!({"model": "m", "thinking": null,
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+        ] {
+            let request = to_codex(&body, MODEL, KEY).expect("translates");
+            assert_eq!(request.reasoning.effort, None);
+        }
+        // Malformed budgets are reported, never coerced.
+        for body in [
+            json!({"model": "m", "thinking": {"type": "enabled"},
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+            json!({"model": "m", "thinking": {"type": "enabled", "budget_tokens": "4096"},
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+        ] {
+            assert!(matches!(
+                to_codex(&body, MODEL, KEY),
+                Err(TranslateError::Malformed { .. })
+            ));
+        }
+        // Purity: same budget, same effort bytes, every time.
+        let body = json!({
+            "model": "m",
+            "thinking": {"type": "enabled", "budget_tokens": 20_000},
+            "messages": [{"role": "user", "content": "Hi"}],
+        });
+        let first = serde_json::to_string(&to_codex(&body, MODEL, KEY).expect("translates"))
+            .expect("serialise");
+        for _ in 0..2 {
+            let again = serde_json::to_string(&to_codex(&body, MODEL, KEY).expect("translates"))
+                .expect("serialise");
+            assert_eq!(first, again);
+        }
     }
 
     #[test]

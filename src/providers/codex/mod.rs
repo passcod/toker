@@ -123,8 +123,12 @@ pub struct CodexSub {
     /// `claude-opus-5`, the codex backend receives `gpt-5.6-sol`.
     model_map: Option<crate::middleware::model_map::ModelMap>,
     /// The codex client version to identify as (see
-    /// [`DEFAULT_CLIENT_VERSION`]) — resolved once at construction.
-    client_version: String,
+    /// [`DEFAULT_CLIENT_VERSION`]) — resolved at construction from the
+    /// local sources (config override → the installed CLI's own
+    /// `version.json` → the built-in floor), then **upgraded in place**
+    /// by the background probe when the ecosystem's latest release is
+    /// newer. An [`RwLock`] because [`CodexSub::turn_headers`] is sync.
+    client_version: std::sync::RwLock<String>,
 }
 
 impl CodexSub {
@@ -140,16 +144,19 @@ impl CodexSub {
         refresh_url: Url,
         model_map: Option<crate::middleware::model_map::ModelMap>,
         client_version: Option<String>,
+        version_probe: bool,
     ) -> anyhow::Result<CodexSub> {
         let auth = CodexAuth::load(&auth_path)
             .with_context(|| format!("loading {}", auth_path.display()))?;
         // The version handshake reads the CLI's own records beside the
         // shared login — resolve it before the path moves into the
-        // provider.
+        // provider. A pin wins absolutely: the probe never runs past
+        // an operator-chosen version.
+        let pinned = client_version.is_some();
         let client_version = client_version
             .or_else(|| installed_cli_version(&auth_path))
             .unwrap_or_else(|| DEFAULT_CLIENT_VERSION.to_owned());
-        Ok(CodexSub {
+        let provider = CodexSub {
             upstream,
             originator,
             auth_path,
@@ -157,8 +164,14 @@ impl CodexSub {
             auth: Mutex::new(auth),
             refresh_lock: tokio::sync::Mutex::new(()),
             model_map,
-            client_version,
-        })
+            client_version: std::sync::RwLock::new(client_version),
+        };
+        // A pinned version wins absolutely (the operator chose it);
+        // the probe only complements a resolved one.
+        if version_probe && !pinned {
+            provider.spawn_latest_version_probe();
+        }
+        Ok(provider)
     }
 
     /// The loaded login, cloned out of the cache — the snapshot
@@ -232,14 +245,30 @@ impl CodexSub {
         let mut headers = HeaderMap::new();
         auth_headers(auth, &mut headers);
         insert(&mut headers, "originator", &self.originator);
-        insert(&mut headers, "version", &self.client_version);
+        let mut client_version = self
+            .client_version
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // The background probe's landing: max wins, so the ecosystem's
+        // latest release upgrades a stale local record, and nothing
+        // ever downgrades.
+        if let Some(latest) = LATEST_PROBE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && semver_newer(latest, &client_version)
+        {
+            client_version.clone_from(latest);
+        }
+        insert(&mut headers, "version", &client_version);
         insert(&mut headers, "session-id", prompt_cache_key);
         insert(&mut headers, "thread-id", thread_id);
         insert(&mut headers, "x-client-request-id", request_id);
         insert(
             &mut headers,
             "user-agent",
-            &user_agent(&self.originator, &self.client_version),
+            &user_agent(&self.originator, &client_version),
         );
         insert(&mut headers, "accept", "text/event-stream");
         insert(&mut headers, "content-type", "application/json");
@@ -289,6 +318,101 @@ fn user_agent(originator: &str, client_version: &str) -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
+}
+
+/// Where the codex CLI's own updater looks for the latest release
+/// (doctor/updates.rs in its source) — the authoritative,
+/// never-stale source, independent of whether a codex CLI is installed
+/// at all.
+const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+
+impl CodexSub {
+    /// Upgrade the client version from the ecosystem's latest release,
+    /// in the background: resolve locally first (the caller serves
+    /// immediately), then let the probe land whenever it lands — a slow
+    /// or unreachable GitHub never delays or fails a turn, and a probe
+    /// that finds nothing newer (or errors) is a no-op. Only spawned
+    /// when a tokio runtime is running (the daemon, tokio tests);
+    /// constructed outside one, the local resolution stands.
+    fn spawn_latest_version_probe(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let current = self
+            .client_version
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let originator = self.originator.clone();
+        handle.spawn(async move {
+            match latest_github_release(&originator, &current).await {
+                Ok(latest) if semver_newer(&latest, &current) => {
+                    tracing::info!(
+                        "codex client version: {current} → {latest}                          (the ecosystem's latest release; picked up on the next turn)"
+                    );
+                    LATEST_PROBE
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .replace(latest);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, "codex latest-release probe failed (keeping the local version)");
+                }
+            }
+        });
+    }
+}
+
+/// The probe's landing slot: the spawned task cannot reach the provider
+/// (it moved into the server), so the upgrade travels through here and
+/// [`CodexSub::turn_headers`] consults it after its own resolution —
+/// max wins, so a stale local `version.json` never downgrades a probe
+/// result. (One provider per process: the daemon builds exactly one.)
+static LATEST_PROBE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Fetch the ecosystem's latest codex release tag from GitHub, the same
+/// request the codex CLI's updater makes (5 s budget, one request; the
+/// GitHub API requires a User-Agent). The tag arrives as `rust-vX.Y.Z`.
+async fn latest_github_release(originator: &str, current: &str) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct ReleaseInfo {
+        tag_name: String,
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let info: ReleaseInfo = client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .header("user-agent", format!("{originator}/{current} (toker)"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let version = info
+        .tag_name
+        .strip_prefix("rust-v")
+        .ok_or_else(|| anyhow::anyhow!("unexpected release tag {:?}", info.tag_name))?;
+    Ok(version.to_owned())
+}
+
+/// Semver-ish "is `a` strictly newer than `b`": compare x.y.z tuples;
+/// anything unparseable is never newer (a malformed tag never downgrades
+/// or loops an upgrade).
+fn semver_newer(a: &str, b: &str) -> bool {
+    match (semver_triple(a), semver_triple(b)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+fn semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    (parts.next().is_none()).then_some((major, minor, patch))
 }
 
 /// The installed codex CLI's own notion of the current version, from
@@ -384,6 +508,7 @@ mod tests {
                 .expect("refresh url"),
             None,
             None,
+            false,
         )
         .expect("provider builds")
     }
@@ -409,6 +534,7 @@ mod tests {
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
             None,
+            false,
         )
         .expect("provider builds");
         assert_eq!(
@@ -568,6 +694,7 @@ mod tests {
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
             None,
+            false,
         )
         .expect("provider builds");
         let headers = provider.turn_headers(None, "k", "t", "r");
@@ -628,6 +755,7 @@ mod tests {
             url,
             None,
             None,
+            false,
         )
         .expect("provider builds");
         let stale_now = now + 400_000; // past the fixture's exp

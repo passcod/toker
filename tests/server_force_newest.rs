@@ -194,6 +194,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         codex_sub: CodexSubConfig {
             model_map: None,
             client_version: None,
+            version_probe: false,
             upstream: "http://127.0.0.1:9/backend-api/codex"
                 .parse()
                 .expect("codex upstream url"),

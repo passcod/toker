@@ -261,6 +261,7 @@ fn test_config(
         },
         codex_sub: CodexSubConfig {
             client_version: Some("0.154.0".to_owned()),
+            version_probe: false,
             model_map: family_map.then(|| {
                 model_map::parse_model_map(r#"{"family:opus":"gpt-5.6-sol"}"#)
                     .expect("valid map")
