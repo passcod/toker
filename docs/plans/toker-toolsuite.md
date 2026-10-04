@@ -1,7 +1,7 @@
 # toker — unified local proxy toolsuite
 
 Date: 2026-10-03
-Status: phases 1-2 shipped; codex_sub backend + anthropic→codex translation shipped and live (claude → toker → codex sub); the Responses FRONTEND endpoint (/v1/responses for driving toker from the codex CLI) is phase 3's remaining half. Dogfooding live: opencode → openrouter and claude → codex_sub, both through one toker.
+Status: phases 1-2 shipped; codex_sub backend + translation shipped and live through the canonical IR (claude → toker → codex sub); the Responses FRONTEND endpoint (/v1/responses for driving toker from the codex CLI) is phase 3's remaining half. Dogfooding live: opencode → openrouter and claude → codex_sub, both through one toker.
 
 ## Purpose
 
@@ -181,7 +181,7 @@ Each phase usable standalone; dogfood-first ordering:
 
 1. **Opencode + openrouter, today.** OpenAI-chat frontend + openrouter backend, IR core with the serialisation-purity and fidelity-monitor machinery, full recording (billed cost + serving provider verbatim), lanes, minimal TUI (sessions, context, spend). Same-protocol from day one, so this phase is the live test of IR re-serialisation against OpenRouter's real cache behaviour. Exit: ledger proxy retired.
 2. **Anthropic.** Frontend endpoint + api/sub backends, full middleware (meters → quota gate, release marker, cold gate, compaction retarget, force-newest), `toker import`, sleep lock, quota panels. Exit: ctp retired at work.
-3. **Codex.** Responses frontend endpoint + codex sub backend (auth reuse, usage-limit shape verified; possibly promoted to a meter source), cross-protocol translation as needed.
+3. **Codex.** Responses frontend endpoint + codex sub backend (auth reuse, usage-limit shape verified; possibly promoted to a meter source), cross-protocol translation as needed — now canonical-IR shaped: the canonical IR (`src/ir/canonical.rs` — request model, turn events, backend `Capabilities`) sits between frontend adapters (`anthropic_frontend.rs`: wire→canonical both directions) and backend adapters (`codex_backend.rs`: canonical→wire both directions). Adding a frontend or a backend is ONE adapter; "what a backend supports" is a backend property (`Capabilities`), never a pair property. Same-protocol routes keep the byte-passthrough machinery; canonical engages only when crossing. The composition seams (`to_codex`, `AnthropicStream`) are stable and byte-pinned by the corpus.
 4. **OpenAI api + lunaroute** backends (adapter exists; these are auth + costing semantics).
 5. **Grown TUI + `report` + `setup` wizard + wake/hold/ping units + attribution plugin fallback.**
 
