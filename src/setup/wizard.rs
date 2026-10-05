@@ -3335,27 +3335,50 @@ default_backend_anthropic = "codex_sub"
         ]
     }
 
+    /// Snapshot a unit file's text. A snapshot ignores trailing
+    /// whitespace, so the one newline every unit file ends with is
+    /// asserted here.
+    fn unit_snapshot(name: &str, unit: &str) {
+        assert!(
+            unit.ends_with('\n') && !unit.ends_with("\n\n"),
+            "{name} ends with exactly one newline: {unit:?}"
+        );
+        insta::assert_snapshot!(name, unit);
+    }
+
+    /// Snapshot a wizard run's whole output. The scratch root and the
+    /// mock upstream's port differ per run, so they are filtered to
+    /// stand-ins.
+    fn transcript_snapshot(name: &str, rig: &Rig, port: u16, out: &str) {
+        let root = regex_escape(&rig.root.display().to_string());
+        let port = format!(r"\b{port}\b");
+        insta::with_settings!({filters => vec![
+            (root.as_str(), "[ROOT]"),
+            (port.as_str(), "[PORT]"),
+        ]}, {
+            insta::assert_snapshot!(name, out);
+        });
+    }
+
+    fn regex_escape(text: &str) -> String {
+        text.chars()
+            .flat_map(|ch| {
+                let escape = r"\.+*?()|[]{}^$#&-~".contains(ch);
+                escape
+                    .then_some('\\')
+                    .into_iter()
+                    .chain(std::iter::once(ch))
+            })
+            .collect()
+    }
+
     // ── the tests ──────────────────────────────────────────────────
 
     #[test]
     fn the_unit_templates_are_pinned() {
         // The socket: the hand-installed unit as a function of the
         // configured port (nothing machine-specific survives).
-        assert_eq!(
-            socket_unit(18_123),
-            r#"[Unit]
-Description=toker proxy socket (local proxy + measurement for AI coding traffic)
-
-[Socket]
-# One long-lived server process is handed the listening socket, rather than one
-# process per connection: toker holds per-lane state across requests.
-ListenStream=127.0.0.1:18123
-Accept=no
-
-[Install]
-WantedBy=sockets.target
-"#
-        );
+        unit_snapshot("socket_unit", &socket_unit(18_123));
         assert!(
             socket_unit(20_000).contains("ListenStream=127.0.0.1:20000"),
             "the port substitutes"
@@ -3406,35 +3429,34 @@ WantedBy=sockets.target
         // toker only on the configured port, in any of its shapes; a
         // claude still on the bare listener is told its prefix is
         // missing.
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&claude, &base("http://127.0.0.1:18123/f/claude"), 18_123),
-            "claude (/home/u/.claude/settings.json): points at toker (port 18123)"
+            @"claude (/home/u/.claude/settings.json): points at toker (port 18123)"
         );
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&claude, &base("http://127.0.0.1:18123"), 18_123),
-            "claude (/home/u/.claude/settings.json): points at toker (port 18123) \
-             without its /f/claude prefix — re-pointing adds it"
+            @"claude (/home/u/.claude/settings.json): points at toker (port 18123) without its /f/claude prefix — re-pointing adds it"
         );
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&opencode, &base("http://127.0.0.1:20000/v1"), 20_000),
-            "opencode (/home/u/.config/opencode/opencode.json): points at toker (port 20000)"
+            @"opencode (/home/u/.config/opencode/opencode.json): points at toker (port 20000)"
         );
 
         // The predecessor's listener is named as such, not as toker.
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&claude, &base("http://127.0.0.1:18082"), 18_123),
-            "claude (/home/u/.claude/settings.json): points at claude-token-proxy (port 18082)"
+            @"claude (/home/u/.claude/settings.json): points at claude-token-proxy (port 18082)"
         );
 
         // Any other loopback port — a stale toker port included — is
         // just the URL; so is anything not loopback.
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&claude, &base("http://127.0.0.1:18123"), 20_000),
-            "claude (/home/u/.claude/settings.json): points at http://127.0.0.1:18123"
+            @"claude (/home/u/.claude/settings.json): points at http://127.0.0.1:18123"
         );
-        assert_eq!(
+        insta::assert_snapshot!(
             frontend_state(&claude, &base("https://api.anthropic.com"), 18_123),
-            "claude (/home/u/.claude/settings.json): points at https://api.anthropic.com"
+            @"claude (/home/u/.claude/settings.json): points at https://api.anthropic.com"
         );
     }
 
@@ -3446,45 +3468,11 @@ WantedBy=sockets.target
         // The wake SYSTEM unit: one OnCalendar= per slot, WakeSystem,
         // no catch-up, to the second, timers.target.
         let wake = wake_system_unit(&slots);
-        assert_eq!(
-            wake,
-            r#"[Unit]
-Description=toker wake timer (wakes the machine at the chosen slots)
-
-[Timer]
-# The only root-level piece toker installs: WakeSystem=true needs
-# CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
-# the system manager and `toker setup` enables it through sudo. Wakes
-# from suspend only — a machine that is powered off stays off.
-WakeSystem=true
-OnCalendar=Mon..Fri 09:00
-OnCalendar=Mon..Fri 23:55
-# A missed wake is not worth honouring late: the ping would refuse its
-# slot anyway, and a wake at an arbitrary hour is what this avoids. To
-# the second, because the default accuracy lets systemd fire up to a
-# minute late, which eats into the hold's margin before the ping.
-Persistent=false
-AccuracySec=1s
-
-[Install]
-WantedBy=timers.target
-"#
-        );
+        unit_snapshot("wake_system_unit", &wake);
 
         // The wake service: the timer's unit by the shared name, and
         // nothing in it — the timer's WakeSystem is the whole job.
-        assert_eq!(
-            wake_system_service(),
-            r#"[Unit]
-Description=toker wake service (the wake timer's unit; does nothing itself)
-
-[Service]
-# The wake is the whole job and the timer's WakeSystem does it; holding
-# the machine up afterwards is the toker-hold user unit's.
-Type=oneshot
-ExecStart=/bin/true
-"#
-        );
+        unit_snapshot("wake_system_service", &wake_system_service());
         assert_eq!(
             WAKE_SERVICE_UNIT.strip_suffix(".service"),
             WAKE_TIMER_UNIT.strip_suffix(".timer"),
@@ -3494,44 +3482,8 @@ ExecStart=/bin/true
         // The hold pair: the slots verbatim, Persistent=false, and the
         // verb with the pinned 15 m span.
         let (hold_timer, hold_service) = hold_user_units(&slots, exe);
-        assert_eq!(
-            hold_timer,
-            r#"[Unit]
-Description=toker hold timer (holds the idle-sleep lock 15m after each wake slot)
-
-[Timer]
-# At the wake slots themselves: a timer that elapses while the machine
-# is suspended fires on resume, and the hold then keeps the machine up
-# for its span so the ping (11 m after the slot) can fire.
-OnCalendar=Mon..Fri 09:00
-OnCalendar=Mon..Fri 23:55
-
-# A hold re-run hours after a missed slot would hold the machine up for
-# nothing — the ping it protects never fires that late either.
-Persistent=false
-# To the second, beside the wake: systemd's default accuracy of a
-# minute could start the hold after the machine has dozed off again.
-AccuracySec=1s
-
-[Install]
-WantedBy=timers.target
-"#
-        );
-        assert_eq!(
-            hold_service,
-            r#"[Unit]
-Description=toker hold service (holds the idle-sleep lock for its span)
-
-[Service]
-Type=oneshot
-# The verb takes the lock independently of the daemon's own — both
-# hold, both release on their own. The start timeout is off: a hold is
-# exactly as long as its --for, and must not be killed at the 90 s
-# default.
-TimeoutStartSec=0
-ExecStart="/opt/toker/toker" hold --for=15m
-"#
-        );
+        unit_snapshot("hold_timer", &hold_timer);
+        unit_snapshot("hold_service", &hold_service);
 
         // The ping pairs: ONE per slot, the timer at slot+11 m — the
         // 23:55 slot wraps to 00:06, which a daily OnCalendar reads as
@@ -3541,46 +3493,8 @@ ExecStart="/opt/toker/toker" hold --for=15m
         assert_eq!(pings.len(), 2, "one timer+service pair per slot");
         assert_eq!(pings[0].timer_name, "toker-ping-0900.timer");
         assert_eq!(pings[0].service_name, "toker-ping-0900.service");
-        assert_eq!(
-            pings[0].timer,
-            r#"[Unit]
-Description=toker ping timer (opens the 09:00 quota window, 11 m after the slot)
-
-[Timer]
-# 11 m after the slot: the machine has woken and settled, and
-# the hold still has 4 m left to run. Persistent=false deliberately —
-# a ping re-run hours late would open a mostly-spent window, and the
-# verb's lateness guard refuses those anyway.
-OnCalendar=Mon..Fri 09:11
-Persistent=false
-# The window anchors on the 10-minute grid, so the fire time is the
-# boundary: systemd's default accuracy of a minute could push a ping
-# across a grid line and move the boundary with it.
-AccuracySec=10s
-
-[Install]
-WantedBy=timers.target
-"#
-        );
-        assert_eq!(
-            pings[0].service,
-            r#"[Unit]
-Description=toker ping service (opens the 09:00 quota window)
-
-[Service]
-Type=oneshot
-# claude -p as a CLIENT of toker: the request lands on the ledger with
-# ping: true — on-ledger, and never holding the sleep lock. User
-# services start with a minimal environment, so the common user-local
-# bin dirs ride along on PATH (TOKER_PING_CLAUDE names one that is
-# not). The verb kills claude at 120 s itself; the start timeout is only
-# a backstop above that and the readback, so a hung verb cannot
-# suppress the next slot's ping.
-Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-TimeoutStartSec=3m
-ExecStart="/opt/toker/toker" ping-window --slot=09:00
-"#
-        );
+        unit_snapshot("ping_timer_0900", &pings[0].timer);
+        unit_snapshot("ping_service_0900", &pings[0].service);
         // The wrapped slot: 23:55 + 11 m = 00:06, still paired with
         // --slot=23:55.
         assert_eq!(pings[1].timer_name, "toker-ping-2355.timer");
@@ -3726,6 +3640,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         // The output: the state summary said fresh/unknown, and every
         // step of the plan reported.
         let out = rig.out();
+        transcript_snapshot("fresh_machine_transcript", &rig, port, &out);
         assert!(out.contains("none (fresh setup)"), "the config line: {out}");
         // The env-var choice says plainly where the variable must live.
         assert!(
@@ -3739,12 +3654,6 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             out.contains("codex login : ") && out.contains("not found"),
             "{out}"
         );
-        assert!(out.contains("[1/6] choose backends"), "{out}");
-        assert!(out.contains("[2/6] write toker.toml"), "{out}");
-        assert!(out.contains("[3/6] install + start the units"), "{out}");
-        assert!(out.contains("[4/6] verify the service answers"), "{out}");
-        assert!(out.contains("[5/6] wire the frontends"), "{out}");
-        assert!(out.contains("[6/6] done"), "{out}");
         // The timers question was asked (the last question of the
         // run), defaulting to no with none installed, and the no
         // installed nothing: no slots asked, no enable attempted,
@@ -4783,6 +4692,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         // The transcript: the sudo warning appears before the call,
         // and the summary reports all three timers.
         let out = rig.out();
+        transcript_snapshot("timers_slots_transcript", &rig, port, &out);
         assert!(
             out.contains("sudo will be asked"),
             "the sudo prompt is in the transcript: {out}"
@@ -4796,7 +4706,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "{out}"
         );
         assert!(
-            out.contains("timers    : slots 09:00, 12:30 — hold+ping user timers installed and enabled; wake system timer enabled"),
+            out.contains("timers    : slots 09:00, 12:30"),
             "the summary's timers line: {out}"
         );
     }
@@ -4849,6 +4759,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         );
         assert!(!report.wake_enabled);
         let out = rig.out();
+        transcript_snapshot("failed_sudo_transcript", &rig, port, &out);
         assert!(
             out.contains("linking the wake service failed: sudo: command not found"),
             "{out}"
@@ -4858,10 +4769,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             1,
             "the timer is not enabled once its service failed to link"
         );
-        assert!(
-            out.contains("the wake timer is NOT enabled — the machine will not wake for its slots"),
-            "{out}"
-        );
+        assert!(out.contains("wake timer is NOT enabled"), "{out}");
         // The manual commands: the copy into /etc, then the enable by
         // name — and they ride the summary too.
         let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
@@ -4984,10 +4892,9 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "the manual commands: {:?}",
             report.timers_manual
         );
+        transcript_snapshot("failed_user_timers_transcript", &rig, port, &rig.out());
         assert!(
-            rig.out().contains(
-                "the user timers did not all come up — the wake timer is still attempted"
-            ),
+            rig.out().contains("wake timer is still attempted"),
             "{}",
             rig.out()
         );
@@ -5180,10 +5087,8 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(rig.paths().units_dir.join(WAKE_TIMER_UNIT).exists());
         assert_eq!(report.wake_manual.len(), 2, "{:?}", report.wake_manual);
         let out = rig.out();
-        assert!(
-            out.contains("the wake timer is still enabled — it will keep waking the machine"),
-            "{out}"
-        );
+        transcript_snapshot("refused_wake_disable_transcript", &rig, port, &out);
+        assert!(out.contains("wake timer is still enabled"), "{out}");
         assert!(out.contains("NOT fully removed"), "{out}");
     }
 
@@ -5248,9 +5153,9 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(!rig.paths().units_dir.join("toker-ping-0730.timer").exists());
         assert!(rig.paths().units_dir.join("toker-ping-1220.timer").exists());
         assert!(report.timers_ok && report.wake_enabled);
+        transcript_snapshot("changed_slots_transcript", &rig, port, &rig.out());
         assert!(
-            rig.out()
-                .contains("wake system timer enabled; removed toker-ping-0730.timer"),
+            rig.out().contains("removed toker-ping-0730.timer"),
             "{}",
             rig.out()
         );

@@ -1,0 +1,15 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker hold service (holds the idle-sleep lock for its span)
+
+[Service]
+Type=oneshot
+# The verb takes the lock independently of the daemon's own — both
+# hold, both release on their own. The start timeout is off: a hold is
+# exactly as long as its --for, and must not be killed at the 90 s
+# default.
+TimeoutStartSec=0
+ExecStart="/opt/toker/toker" hold --for=15m

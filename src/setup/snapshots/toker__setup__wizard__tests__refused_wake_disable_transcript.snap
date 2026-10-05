@@ -1,0 +1,64 @@
+---
+source: src/setup/wizard.rs
+expression: out
+---
+toker setup — the state of this machine
+  config      : none (fresh setup)
+  systemd     : toker.socket is not active
+  frontends:
+    claude ([ROOT]/.claude/settings.json): points at https://api.anthropic.com
+    workhorse : no [ROOT]/.workhorse/repos directory — not offered
+    opencode ([ROOT]/.config/opencode/opencode.json): points at https://openrouter.ai/api/v1
+    shell rc ([ROOT]/.bashrc): no ANTHROPIC_BASE_URL set
+  codex login : [ROOT]/.codex/auth.json — not found
+  predecessor history : none
+
+[1/6] choose backends
+  note: toker runs as a socket-activated systemd user service, so it sees only the user manager's environment, not your shell's. Put OPENROUTER_API_KEY in ~/.config/environment.d/*.conf (read at login), or run `systemctl --user set-environment OPENROUTER_API_KEY=…`; then restart toker.service for a running service to pick it up
+
+[2/6] write toker.toml
+wrote [ROOT]/.config/toker/toker.toml
+  port [PORT], awake on, backends anthropic_sub, openrouter
+  anthropic → anthropic_sub; openai_chat → openrouter
+  openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the frontend's own key
+
+[3/6] install + start the units
+installed toker.socket ([ROOT]/.config/systemd/user/toker.socket)
+installed toker.service ([ROOT]/.config/systemd/user/toker.service)
+systemctl --user daemon-reload — ok
+systemctl --user enable --now toker.socket — ok
+
+[4/6] verify the service answers
+the /f/claude prefix → 200 (toker's own status)
+POST /f/claude/v1/messages → 401 (the upstream's verdict)
+POST /v1/messages → 401 (the upstream's verdict)
+POST /v1/chat/completions → 401 (the upstream's verdict)
+
+[5/6] wire the frontends
+claude ([ROOT]/.claude/settings.json): env.ANTHROPIC_BASE_URL = http://127.0.0.1:[PORT]/f/claude
+opencode ([ROOT]/.config/opencode/opencode.json): provider.openrouter.options.baseURL = http://127.0.0.1:[PORT]/v1
+shell rc ([ROOT]/.bashrc): export ANTHROPIC_BASE_URL="http://127.0.0.1:[PORT]"
+opencode plugin: installed to [ROOT]/.config/opencode/plugins/toker-cost
+
+optional toggles
+  awake (idle-sleep lock while sessions are live): on
+removing the wake/hold/ping timers an earlier run installed
+disabling the wake system timer — sudo will be asked
+disabling the wake system timer failed: sudo: a password is required
+the wake timer is still enabled — it will keep waking the machine;
+finish by hand:
+  sudo systemctl disable --now toker-wake.timer toker-wake.service
+  sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
+  predecessor history: none to import
+
+[6/6] done
+  config    : wrote [ROOT]/.config/toker/toker.toml
+  units     : [ROOT]/.config/systemd/user: toker.socket, toker.service installed; daemon-reload + enable --now ok
+  verified  : answered (200/401/401/401)
+  frontends : 3 patched, 0 left as is
+    patched: claude ([ROOT]/.claude/settings.json)
+    patched: opencode ([ROOT]/.config/opencode/opencode.json)
+    patched: shell rc ([ROOT]/.bashrc)
+  ledger    : not imported
+  timers    : none — NOT fully removed — finish by hand: sudo systemctl disable --now toker-wake.timer toker-wake.service && sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
+re-run `toker setup` any time to change anything.

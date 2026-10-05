@@ -1,0 +1,15 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker proxy socket (local proxy + measurement for AI coding traffic)
+
+[Socket]
+# One long-lived server process is handed the listening socket, rather than one
+# process per connection: toker holds per-lane state across requests.
+ListenStream=127.0.0.1:18123
+Accept=no
+
+[Install]
+WantedBy=sockets.target

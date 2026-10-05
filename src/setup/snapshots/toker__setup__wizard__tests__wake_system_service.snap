@@ -1,0 +1,12 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker wake service (the wake timer's unit; does nothing itself)
+
+[Service]
+# The wake is the whole job and the timer's WakeSystem does it; holding
+# the machine up afterwards is the toker-hold user unit's.
+Type=oneshot
+ExecStart=/bin/true

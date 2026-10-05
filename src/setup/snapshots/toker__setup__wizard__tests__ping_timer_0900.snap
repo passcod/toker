@@ -1,0 +1,21 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker ping timer (opens the 09:00 quota window, 11 m after the slot)
+
+[Timer]
+# 11 m after the slot: the machine has woken and settled, and
+# the hold still has 4 m left to run. Persistent=false deliberately —
+# a ping re-run hours late would open a mostly-spent window, and the
+# verb's lateness guard refuses those anyway.
+OnCalendar=Mon..Fri 09:11
+Persistent=false
+# The window anchors on the 10-minute grid, so the fire time is the
+# boundary: systemd's default accuracy of a minute could push a ping
+# across a grid line and move the boundary with it.
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

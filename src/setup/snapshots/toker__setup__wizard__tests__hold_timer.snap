@@ -1,0 +1,23 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker hold timer (holds the idle-sleep lock 15m after each wake slot)
+
+[Timer]
+# At the wake slots themselves: a timer that elapses while the machine
+# is suspended fires on resume, and the hold then keeps the machine up
+# for its span so the ping (11 m after the slot) can fire.
+OnCalendar=Mon..Fri 09:00
+OnCalendar=Mon..Fri 23:55
+
+# A hold re-run hours after a missed slot would hold the machine up for
+# nothing — the ping it protects never fires that late either.
+Persistent=false
+# To the second, beside the wake: systemd's default accuracy of a
+# minute could start the hold after the machine has dozed off again.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

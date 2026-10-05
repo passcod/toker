@@ -1,0 +1,24 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker wake timer (wakes the machine at the chosen slots)
+
+[Timer]
+# The only root-level piece toker installs: WakeSystem=true needs
+# CAP_WAKE_ALARM, which the user manager lacks, so this unit belongs to
+# the system manager and `toker setup` enables it through sudo. Wakes
+# from suspend only — a machine that is powered off stays off.
+WakeSystem=true
+OnCalendar=Mon..Fri 09:00
+OnCalendar=Mon..Fri 23:55
+# A missed wake is not worth honouring late: the ping would refuse its
+# slot anyway, and a wake at an arbitrary hour is what this avoids. To
+# the second, because the default accuracy lets systemd fire up to a
+# minute late, which eats into the hold's margin before the ping.
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
