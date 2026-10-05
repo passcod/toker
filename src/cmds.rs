@@ -47,6 +47,7 @@ pub async fn serve() -> anyhow::Result<()> {
 /// scripted in [`crate::setup::wizard`]'s tests; everything here is
 /// wiring. The wizard prints its own state summary and report.
 pub fn setup() -> anyhow::Result<()> {
+    use crate::secrets::OsKeyring;
     use crate::setup::wizard::{InquirePrompt, Paths, ProcessRunner, VERIFY_TIMEOUT, Wizard};
 
     use anyhow::Context as _;
@@ -59,7 +60,17 @@ pub fn setup() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("building the setup wizard's runtime")?
-        .block_on(Wizard::new(&mut prompt, &runner, &paths, &mut out, VERIFY_TIMEOUT).run())?;
+        .block_on(
+            Wizard::new(
+                &mut prompt,
+                &runner,
+                &OsKeyring,
+                &paths,
+                &mut out,
+                VERIFY_TIMEOUT,
+            )
+            .run(),
+        )?;
     Ok(())
 }
 
@@ -131,10 +142,21 @@ pub fn status() -> anyhow::Result<()> {
 
 /// One api-key backend's key sources for `status`: which are set,
 /// never a value (invariant 2).
+///
+/// The env verdict is this shell's environment, which the service does
+/// not share (it sees the systemd user manager's), so the line says so.
+/// The keyring is reported as configured, never read here: only the
+/// service reads it.
 fn key_sources_line(env: &str, sources: crate::config::KeySources) -> String {
     format!(
-        "env {env} ({}), literal ({})",
+        "env {env} ({} in this shell; the service reads the systemd user environment), \
+         keyring ({}), literal ({}); with none, the frontend's own key passes through",
         if sources.env_set { "set" } else { "unset" },
+        if sources.keyring_configured {
+            "configured"
+        } else {
+            "unused"
+        },
         if sources.literal_set { "set" } else { "unset" },
     )
 }

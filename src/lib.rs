@@ -25,6 +25,7 @@ pub mod middleware;
 pub mod observe;
 pub mod proto;
 pub mod providers;
+pub mod secrets;
 pub mod server;
 pub mod setup;
 pub mod store;

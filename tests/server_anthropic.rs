@@ -507,6 +507,7 @@ fn test_config(
         openrouter: Some(OpenRouterConfig {
             upstream: unused_openrouter,
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         default_backend_anthropic: Some(default_backend.to_owned()),
@@ -518,6 +519,7 @@ fn test_config(
             model_map: None,
             upstream: anthropic_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key,
         }),
         // The codex backend's config: never routed to in these suites

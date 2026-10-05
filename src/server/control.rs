@@ -73,6 +73,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
                 "api_key_env": api.api_key_env,
                 // Key *sources* only — never values (invariant 2).
                 "api_key_env_set": sources.env_set,
+                "api_key_keyring_configured": sources.keyring_configured,
                 "api_key_literal_set": sources.literal_set,
             }),
         );
@@ -91,6 +92,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
                 "upstream": openrouter.upstream.as_str(),
                 "api_key_env": openrouter.api_key_env,
                 "api_key_env_set": sources.env_set,
+                "api_key_keyring_configured": sources.keyring_configured,
                 "api_key_literal_set": sources.literal_set,
             }),
         );

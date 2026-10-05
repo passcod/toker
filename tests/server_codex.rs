@@ -286,6 +286,7 @@ fn test_config(
         openrouter: Some(OpenRouterConfig {
             upstream: "http://127.0.0.1:9/v1".parse().expect("url"),
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         default_backend_anthropic: Some("codex_sub".to_owned()),
@@ -297,6 +298,7 @@ fn test_config(
             model_map: None,
             upstream: unused,
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         codex_sub: Some(CodexSubConfig {

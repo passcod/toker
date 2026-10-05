@@ -9,8 +9,10 @@
 //! expose a [`Config`] the server and CLI can use.
 //!
 //! Invariant 2 (credentials): the resolved config holds the key sources
-//! (env var name, optional literal), and `toker status` reports only which
-//! sources are set — never the key values.
+//! (env var name, whether the key is in the keyring, optional literal),
+//! and `toker status` reports only which sources are set — never the key
+//! values. The keyring itself is read only by the service
+//! ([`crate::secrets::read_key`]), never at load.
 
 use std::env;
 use std::fs;
@@ -223,23 +225,35 @@ pub struct OpenRouterConfig {
     pub upstream: reqwest::Url,
     /// The env var the API key is read from.
     pub api_key_env: String,
-    /// An optional literal key, used only when the env var is unset.
+    /// The key is in the OS keyring (`api_key_keyring = true`), under
+    /// [`crate::secrets::KEYRING_SERVICE`] / `openrouter`.
+    pub api_key_keyring: bool,
+    /// An optional literal key, used only when neither the env var nor
+    /// the keyring yields one.
     pub api_key: Option<String>,
 }
 
 impl OpenRouterConfig {
-    /// The API key to use: the env var when set, else the configured
-    /// literal. `None` when neither is set — requests then go upstream
-    /// unauthenticated and openrouter's 401 body passes through, which
-    /// verifies the wiring (ledger-proxy lesson).
-    pub fn api_key(&self) -> Option<String> {
-        resolve_api_key(&self.api_key_env, &self.api_key)
+    /// The API key to use: the env var when set, else the keyring entry
+    /// when the config says there is one (`keyring` reads it — the
+    /// service passes [`crate::secrets::read_key`]), else the configured
+    /// literal. `None` when none yields a key — requests then go upstream
+    /// with only the frontend's own credential, or unauthenticated, and
+    /// openrouter's 401 body passes through, which verifies the wiring
+    /// (ledger-proxy lesson).
+    pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        resolve_api_key(
+            &self.api_key_env,
+            self.api_key_keyring,
+            keyring,
+            &self.api_key,
+        )
     }
 
     /// Which key sources are set, for status reporting (invariant 2: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, &self.api_key)
+        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
     }
 }
 
@@ -268,21 +282,31 @@ pub struct AnthropicApiConfig {
     pub model_map: Option<ModelMap>,
     /// The env var the API key is read from.
     pub api_key_env: String,
-    /// An optional literal key, used only when the env var is unset.
+    /// The key is in the OS keyring, under `anthropic_api` (see
+    /// [`OpenRouterConfig::api_key_keyring`]).
+    pub api_key_keyring: bool,
+    /// An optional literal key, used only when neither the env var nor
+    /// the keyring yields one.
     pub api_key: Option<String>,
 }
 
 impl AnthropicApiConfig {
-    /// The API key to use: the env var when set, else the configured
-    /// literal. `None` when neither is set — requests then go upstream
-    /// unauthenticated and anthropic's 401 body passes through.
-    pub fn api_key(&self) -> Option<String> {
-        resolve_api_key(&self.api_key_env, &self.api_key)
+    /// The API key to use, resolved like [`OpenRouterConfig::api_key`].
+    /// `None` when no source yields one — requests then go upstream with
+    /// only the frontend's own credential, or unauthenticated, and
+    /// anthropic's 401 body passes through.
+    pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        resolve_api_key(
+            &self.api_key_env,
+            self.api_key_keyring,
+            keyring,
+            &self.api_key,
+        )
     }
 
     /// Which key sources are set, for status reporting (invariant 2).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, &self.api_key)
+        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
     }
 }
 
@@ -332,6 +356,7 @@ impl Default for OpenRouterConfig {
         OpenRouterConfig {
             upstream: default_url(DEFAULT_OPENROUTER_UPSTREAM),
             api_key_env: DEFAULT_OPENROUTER_API_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }
     }
@@ -352,6 +377,7 @@ impl Default for AnthropicApiConfig {
             upstream: default_url(DEFAULT_ANTHROPIC_UPSTREAM),
             model_map: None,
             api_key_env: DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }
     }
@@ -429,29 +455,44 @@ fn toml_type_of(value: &toml::Value) -> &'static str {
     }
 }
 
-/// Resolve an API key: the named env var when set, else the literal (the
-/// shared KeySources resolution every api-key provider uses).
-fn resolve_api_key(api_key_env: &str, literal: &Option<String>) -> Option<String> {
+/// Resolve an API key: the named env var when set, else the keyring
+/// entry when configured and readable, else the literal (the shared
+/// KeySources resolution every api-key provider uses). The keyring is
+/// consulted only when configured, so a config without it never touches
+/// the secret service.
+fn resolve_api_key(
+    api_key_env: &str,
+    keyring_configured: bool,
+    keyring: impl FnOnce() -> Option<String>,
+    literal: &Option<String>,
+) -> Option<String> {
     if let Some(key) = env::var_os(api_key_env).filter(|key| !key.is_empty()) {
         return key.into_string().ok();
+    }
+    if keyring_configured && let Some(key) = keyring().filter(|key| !key.is_empty()) {
+        return Some(key);
     }
     literal.clone()
 }
 
 /// Which key sources are set — the whole of what status may report about
-/// credentials (invariant 2).
-fn key_sources_of(api_key_env: &str, literal: &Option<String>) -> KeySources {
+/// credentials (invariant 2). The keyring is reported as configured, not
+/// read: only the service reads it.
+fn key_sources_of(api_key_env: &str, keyring: bool, literal: &Option<String>) -> KeySources {
     KeySources {
         env_set: env::var_os(api_key_env).is_some_and(|key| !key.is_empty()),
+        keyring_configured: keyring,
         literal_set: literal.is_some(),
     }
 }
 
 /// Whether each key source is configured — the whole of what status may
-/// report about credentials.
+/// report about credentials. `env_set` is this process's environment,
+/// which for `toker status` is the shell's, not the service's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySources {
     pub env_set: bool,
+    pub keyring_configured: bool,
     pub literal_set: bool,
 }
 
@@ -550,6 +591,7 @@ impl Config {
                 openrouter: self.openrouter.as_ref().map(|openrouter| FileOpenRouter {
                     upstream: Some(openrouter.upstream.to_string()),
                     api_key_env: Some(openrouter.api_key_env.clone()),
+                    api_key_keyring: openrouter.api_key_keyring.then_some(true),
                     api_key: openrouter.api_key.clone(),
                 }),
                 anthropic_sub: self.anthropic_sub.as_ref().map(|sub| FileAnthropicSub {
@@ -559,6 +601,7 @@ impl Config {
                 anthropic_api: self.anthropic_api.as_ref().map(|api| FileAnthropicApi {
                     upstream: Some(api.upstream.to_string()),
                     api_key_env: Some(api.api_key_env.clone()),
+                    api_key_keyring: api.api_key_keyring.then_some(true),
                     api_key: api.api_key.clone(),
                     model_map: api.model_map.as_ref().map(model_map_table),
                 }),
@@ -607,6 +650,7 @@ impl Config {
                     api_key_env: block
                         .api_key_env
                         .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned()),
+                    api_key_keyring: block.api_key_keyring.unwrap_or(false),
                     api_key: block.api_key,
                 })
             })
@@ -643,6 +687,7 @@ impl Config {
                     api_key_env: block
                         .api_key_env
                         .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned()),
+                    api_key_keyring: block.api_key_keyring.unwrap_or(false),
                     api_key: block.api_key,
                 })
             })
@@ -975,6 +1020,9 @@ pub(crate) struct FileOpenRouter {
     upstream: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_env: Option<String>,
+    /// The key is in the OS keyring; written only when true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_keyring: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
 }
@@ -999,6 +1047,9 @@ pub(crate) struct FileAnthropicApi {
     upstream: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key_env: Option<String>,
+    /// The key is in the OS keyring; written only when true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_keyring: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
     /// Written last (see [`FileAnthropicSub::model_map`]).
@@ -1457,7 +1508,7 @@ api_key = "ak-literal-test"
                 .anthropic_api
                 .as_ref()
                 .expect("enabled")
-                .api_key()
+                .api_key(|| None)
                 .as_deref(),
             Some("ak-from-env")
         );
@@ -1469,6 +1520,7 @@ api_key = "ak-literal-test"
                 .key_sources(),
             KeySources {
                 env_set: true,
+                keyring_configured: false,
                 literal_set: true
             }
         );
@@ -2089,47 +2141,81 @@ quota_enabled = false
     }
 
     #[test]
-    fn api_key_env_wins_over_literal_then_none() {
+    fn api_key_env_wins_over_the_keyring_over_the_literal_then_none() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let config = OpenRouterConfig {
+        let mut config = OpenRouterConfig {
             upstream: super::parse_upstream(DEFAULT_OPENROUTER_UPSTREAM).unwrap(),
             api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),
+            api_key_keyring: true,
             api_key: Some("literal-key".to_owned()),
         };
+        let keyring = || Some("from-keyring".to_owned());
+        let no_entry = || None;
+        let untouched = || -> Option<String> { panic!("the keyring must not be read") };
+
         set_env("TOKER_TEST_KEY_PRECEDENCE", Some("from-env"));
-        assert_eq!(config.api_key().as_deref(), Some("from-env"));
+        assert_eq!(config.api_key(untouched).as_deref(), Some("from-env"));
         assert_eq!(
             config.key_sources(),
             KeySources {
                 env_set: true,
+                keyring_configured: true,
                 literal_set: true
             }
         );
 
         set_env("TOKER_TEST_KEY_PRECEDENCE", None);
-        assert_eq!(config.api_key().as_deref(), Some("literal-key"));
+        assert_eq!(config.api_key(keyring).as_deref(), Some("from-keyring"));
+        // A keyring read that yields nothing falls to the literal.
+        assert_eq!(config.api_key(no_entry).as_deref(), Some("literal-key"));
+
+        // Not configured: never read, whatever it holds.
+        config.api_key_keyring = false;
+        assert_eq!(config.api_key(untouched).as_deref(), Some("literal-key"));
         assert_eq!(
             config.key_sources(),
             KeySources {
                 env_set: false,
+                keyring_configured: false,
                 literal_set: true
             }
         );
 
-        let no_literal = OpenRouterConfig {
-            upstream: super::parse_upstream(DEFAULT_OPENROUTER_UPSTREAM).unwrap(),
-            api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),
-            api_key: None,
-        };
-        assert_eq!(no_literal.api_key(), None, "neither source set");
+        config.api_key = None;
+        assert_eq!(config.api_key(untouched), None, "no source set");
         assert_eq!(
-            no_literal.key_sources(),
+            config.key_sources(),
             KeySources {
                 env_set: false,
+                keyring_configured: false,
                 literal_set: false
             }
         );
+    }
+
+    #[test]
+    fn the_keyring_flag_reads_and_round_trips() {
+        let dir = test_dir("keyring-flag");
+        fs::write(
+            dir.join("toker.toml"),
+            "[providers.openrouter]\napi_key_keyring = true\n\
+             [providers.anthropic_api]\n",
+        )
+        .expect("write config");
+        let config = load_from(&dir);
+        assert!(config.openrouter.as_ref().expect("enabled").api_key_keyring);
+        assert!(
+            !config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .api_key_keyring
+        );
+        // Written only when on: the file keeps saying exactly what it
+        // said.
+        let text = toml::to_string(&config.to_file()).expect("serialise");
+        assert_eq!(text.matches("api_key_keyring").count(), 1, "{text}");
     }
 }

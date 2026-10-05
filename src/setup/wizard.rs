@@ -33,10 +33,11 @@
 //! ([`patchers`]). A fully-wired machine re-run detects everything,
 //! changes nothing, and says so.
 //!
-//! Credentials (invariant 2): a pasted key goes only into the 0600
-//! `toker.toml` — never into a prompt message, never into the wizard's
-//! output, never into a unit file. Tests pin the rule with a scripted
-//! key and an output scan.
+//! Credentials (invariant 2): a pasted key goes only into the OS keyring
+//! ([`SecretStore`] — tests inject a map) or, when there is none, the
+//! 0600 `toker.toml` — never into a prompt message, never into the
+//! wizard's output, never into a unit file. Tests pin the rule with a
+//! scripted key and an output scan.
 //!
 //! The wake/hold/ping timers (plan: "Sleep lock, wake, ping") are a
 //! real offer in the toggles step: a yes/no defaulting to what is
@@ -66,6 +67,7 @@ use crate::config::{
     DEFAULT_PORT,
 };
 use crate::import::{self, ImportOpts};
+use crate::secrets::SecretStore;
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::config_writer::write_config;
 use crate::setup::patchers::{self, Frontend};
@@ -815,13 +817,25 @@ struct FrontendDetected {
 
 // ── the wizard's config choices ────────────────────────────────────────
 
-/// How one api-key backend authenticates. An env name is the default
-/// offer — the key never touches a file; a literal is the explicit
-/// alternative, stored in the 0600 `toker.toml`.
+/// How one api-key backend authenticates (plan: Credentials).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyChoice {
-    Env(String),
+    /// Store nothing: the frontend sends its own key, which toker passes
+    /// through (pass-through-when-present).
+    Frontend,
+    /// A key given to toker, before it is placed: the keyring when there
+    /// is one, else the 0600 `toker.toml` ([`Wizard::place_keys`]).
+    Store(String),
+    /// "Give it to toker" with an empty answer over a key toker already
+    /// stores: keep it where it is.
+    KeepStored,
+    /// Placed in the keyring.
+    Keyring,
+    /// Placed in the 0600 `toker.toml`: no secret service was available.
     Literal(String),
+    /// An env var, which must be in the systemd user manager's
+    /// environment (the service never sees the shell's).
+    Env(String),
 }
 
 /// The backends/defaults/toggles the wizard asked about (the plan's
@@ -935,6 +949,8 @@ pub struct RunReport {
 pub struct Wizard<'a> {
     prompt: &'a mut dyn Prompt,
     runner: &'a dyn SystemRunner,
+    /// Where a key given to toker is kept ([`Wizard::place_keys`]).
+    secrets: &'a dyn SecretStore,
     paths: &'a Paths,
     out: &'a mut dyn Write,
     verify_timeout: Duration,
@@ -944,6 +960,7 @@ impl<'a> Wizard<'a> {
     pub fn new(
         prompt: &'a mut dyn Prompt,
         runner: &'a dyn SystemRunner,
+        secrets: &'a dyn SecretStore,
         paths: &'a Paths,
         out: &'a mut dyn Write,
         verify_timeout: Duration,
@@ -951,6 +968,7 @@ impl<'a> Wizard<'a> {
         Wizard {
             prompt,
             runner,
+            secrets,
             paths,
             out,
             verify_timeout,
@@ -1292,11 +1310,17 @@ impl<'a> Wizard<'a> {
 
         let anthropic_api_key = if ticked("anthropic_api") {
             let api = existing.and_then(|config| config.anthropic_api.as_ref());
-            let default_env = api
-                .map(|api| api.api_key_env.clone())
-                .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned());
-            let existing_literal = api.and_then(|api| api.api_key.clone());
-            Some(self.ask_api_key("anthropic_api", default_env, existing_literal)?)
+            Some(self.ask_api_key(
+                "anthropic_api",
+                DEFAULT_ANTHROPIC_API_KEY_ENV,
+                api.map(|api| {
+                    (
+                        api.api_key_env.as_str(),
+                        api.api_key_keyring,
+                        api.api_key.is_some(),
+                    )
+                }),
+            )?)
         } else {
             None
         };
@@ -1316,11 +1340,17 @@ impl<'a> Wizard<'a> {
         }
         let openrouter_key = if ticked("openrouter") {
             let openrouter = existing.and_then(|config| config.openrouter.as_ref());
-            let default_env = openrouter
-                .map(|openrouter| openrouter.api_key_env.clone())
-                .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned());
-            let existing_literal = openrouter.and_then(|openrouter| openrouter.api_key.clone());
-            Some(self.ask_api_key("openrouter", default_env, existing_literal)?)
+            Some(self.ask_api_key(
+                "openrouter",
+                DEFAULT_OPENROUTER_API_KEY_ENV,
+                openrouter.map(|openrouter| {
+                    (
+                        openrouter.api_key_env.as_str(),
+                        openrouter.api_key_keyring,
+                        openrouter.api_key.is_some(),
+                    )
+                }),
+            )?)
         } else {
             None
         };
@@ -1423,59 +1453,129 @@ impl<'a> Wizard<'a> {
         bail!("no backend was picked")
     }
 
-    /// One api-key backend's source (plan: Credentials): an env var
-    /// name — the default, the key never touching a file — or a
-    /// literal into the 0600 `toker.toml`, the explicit alternative.
-    /// The key itself is only ever the ANSWER (masked in the real UI);
-    /// it appears in no message and no output.
+    /// One api-key backend's source (plan: Credentials), in this order:
+    /// the frontend brings its own (toker stores nothing), give it to
+    /// toker (the OS keyring, else the 0600 `toker.toml`), or an env var
+    /// in the systemd user environment. The existing config's choice is
+    /// preselected. The key itself is only ever the ANSWER (masked in the
+    /// real UI); it appears in no message and no output.
     fn ask_api_key(
         &mut self,
         provider: &str,
-        default_env: String,
-        existing_literal: Option<String>,
+        default_env: &str,
+        existing: Option<(&str, bool, bool)>,
     ) -> Result<KeyChoice> {
         let options = [
-            "from an env var (recommended — the key never touches a file)",
-            "a literal key in toker.toml (mode 0600)",
+            "the frontend brings its own — toker stores nothing and passes the frontend's key through",
+            "give it to toker — kept in the OS keyring (toker.toml at mode 0600 when there is none)",
+            "an env var — set in the systemd user environment, not your shell's",
         ];
-        if self.prompt.select(
+        // The existing choice, as far as the config can tell: a stored
+        // key is option 1, a renamed env var option 2. The default env
+        // name with nothing stored reads as the frontend bringing its
+        // own, which is what it does at runtime when the var is unset.
+        let stored = existing.is_some_and(|(_, keyring, literal)| keyring || literal);
+        let preselect = match existing {
+            Some(_) if stored => 1,
+            Some((env, _, _)) if env != default_env => 2,
+            _ => 0,
+        };
+        match self.prompt.select(
             &format!("How should toker authenticate to {provider}?"),
             &options,
-            Some(0),
-        )? == 0
-        {
-            let answer = self.prompt.text(
-                &format!("Env var holding the {provider} API key"),
-                Some(&default_env),
-                false,
-            )?;
-            Ok(KeyChoice::Env(if answer.is_empty() {
-                default_env
-            } else {
-                answer
-            }))
-        } else {
-            let hint = if existing_literal.is_some() {
-                " (empty keeps the existing one)"
-            } else {
-                ""
-            };
-            for _ in 0..3 {
-                let key = self.prompt.text(
-                    &format!("The {provider} API key, stored in toker.toml at mode 0600{hint}"),
-                    None,
-                    true,
-                )?;
-                if key.is_empty() {
-                    if let Some(key) = &existing_literal {
-                        return Ok(KeyChoice::Literal(key.clone()));
-                    }
-                    continue;
-                }
-                return Ok(KeyChoice::Literal(key));
+            Some(preselect),
+        )? {
+            0 => {
+                self.say(&format!(
+                    "  {provider}: toker stores no key; the frontend's own is passed through \
+                     (a request without one goes upstream unauthenticated)"
+                ))?;
+                Ok(KeyChoice::Frontend)
             }
-            bail!("no {provider} key was given")
+            1 => {
+                let hint = if stored {
+                    " (empty keeps the stored one)"
+                } else {
+                    ""
+                };
+                for _ in 0..3 {
+                    let key = self.prompt.text(
+                        &format!("The {provider} API key, for the OS keyring{hint}"),
+                        None,
+                        true,
+                    )?;
+                    if !key.is_empty() {
+                        return Ok(KeyChoice::Store(key));
+                    }
+                    if stored {
+                        return Ok(KeyChoice::KeepStored);
+                    }
+                }
+                bail!("no {provider} key was given")
+            }
+            _ => {
+                let current = existing.map_or(default_env, |(env, _, _)| env);
+                let answer = self.prompt.text(
+                    &format!("Env var holding the {provider} API key"),
+                    Some(current),
+                    false,
+                )?;
+                let name = if answer.is_empty() {
+                    current.to_owned()
+                } else {
+                    answer
+                };
+                // The plain statement of where the variable must live:
+                // a variable exported in a shell rc is invisible to the
+                // service, and the symptom (401s) does not say why.
+                self.say(&format!(
+                    "  note: toker runs as a socket-activated systemd user service, so it sees \
+                     only the user manager's environment, not your shell's. Put {name} in \
+                     ~/.config/environment.d/*.conf (read at login), or run \
+                     `systemctl --user set-environment {name}=…`; then restart toker.service \
+                     for a running service to pick it up"
+                ))?;
+                Ok(KeyChoice::Env(name))
+            }
         }
+    }
+
+    /// Place every key given to toker: the OS keyring when it takes the
+    /// write, else the 0600 `toker.toml` with a line saying so. Runs
+    /// before the config write, so the config records where each key
+    /// actually went.
+    fn place_keys(&mut self, choices: &mut Choices) -> Result<()> {
+        for (provider, slot) in [
+            ("anthropic_api", &mut choices.anthropic_api_key),
+            ("openrouter", &mut choices.openrouter_key),
+        ] {
+            let Some(KeyChoice::Store(key)) = slot.as_ref() else {
+                continue;
+            };
+            let key = key.clone();
+            *slot = Some(match self.secrets.set(provider, &key) {
+                Ok(()) => {
+                    writeln!(
+                        self.out,
+                        "  {provider} key: stored in the OS keyring ({}/{provider})",
+                        crate::secrets::KEYRING_SERVICE
+                    )
+                    .context("writing the wizard's output")?;
+                    KeyChoice::Keyring
+                }
+                Err(error) => {
+                    // The error names the entry, never the key.
+                    writeln!(
+                        self.out,
+                        "  {provider} key: no OS keyring ({error:#}) — stored in toker.toml \
+                         at mode 0600 instead"
+                    )
+                    .context("writing the wizard's output")?;
+                    KeyChoice::Literal(key)
+                }
+            });
+        }
+        Ok(())
     }
 
     /// The listener port (plan: "a new port, not 18082"): a text
@@ -1522,10 +1622,12 @@ impl<'a> Wizard<'a> {
             report.config_kept = true;
             return Ok(config);
         };
+        let mut choices = choices.clone();
+        self.place_keys(&mut choices)?;
         let db_explicit = detected.db_explicit;
         let mut written: Option<Config> = None;
         write_config(&self.paths.config_toml, |config| {
-            apply_choices(config, choices, self.paths, db_explicit)?;
+            apply_choices(config, &choices, self.paths, db_explicit)?;
             written = Some(config.clone());
             Ok(())
         })?;
@@ -1548,15 +1650,19 @@ impl<'a> Wizard<'a> {
                 .as_deref()
                 .unwrap_or("none")
         ))?;
+        if let Some(api) = &config.anthropic_api {
+            self.say(&key_line(
+                "anthropic_api",
+                api.key_sources(),
+                &api.api_key_env,
+            ))?;
+        }
         if let Some(openrouter) = &config.openrouter {
             self.say(&key_line(
                 "openrouter",
+                openrouter.key_sources(),
                 &openrouter.api_key_env,
-                &openrouter.api_key,
             ))?;
-        }
-        if let Some(api) = &config.anthropic_api {
-            self.say(&key_line("anthropic_api", &api.api_key_env, &api.api_key))?;
         }
         report.config_written = true;
         Ok(config)
@@ -2455,26 +2561,58 @@ fn apply_choices(
     config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
     config.default_backend_openai_chat = ticked("openrouter").then(|| "openrouter".to_owned());
     if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
-        match key {
-            KeyChoice::Env(name) => {
-                api.api_key_env = name.clone();
-                api.api_key = None;
-            }
-            KeyChoice::Literal(key) => api.api_key = Some(key.clone()),
-        }
+        apply_key(
+            key,
+            &mut api.api_key_env,
+            &mut api.api_key_keyring,
+            &mut api.api_key,
+        )?;
     }
     if let (Some(openrouter), Some(key)) = (config.openrouter.as_mut(), &choices.openrouter_key) {
-        match key {
-            KeyChoice::Env(name) => {
-                openrouter.api_key_env = name.clone();
-                openrouter.api_key = None;
-            }
-            KeyChoice::Literal(key) => openrouter.api_key = Some(key.clone()),
-        }
+        apply_key(
+            key,
+            &mut openrouter.api_key_env,
+            &mut openrouter.api_key_keyring,
+            &mut openrouter.api_key,
+        )?;
     }
     config.awake = choices.awake;
     if !db_explicit {
         config.db_path = paths.db_path();
+    }
+    Ok(())
+}
+
+/// One key choice onto a provider block's key sources. A chosen source
+/// REPLACES the others, so the file says exactly what was just answered
+/// (the env var name is left as it is unless the choice names one: an
+/// unset variable is no source).
+fn apply_key(
+    key: &KeyChoice,
+    env: &mut String,
+    keyring: &mut bool,
+    literal: &mut Option<String>,
+) -> Result<()> {
+    match key {
+        KeyChoice::Frontend => {
+            *keyring = false;
+            *literal = None;
+        }
+        KeyChoice::Env(name) => {
+            *env = name.clone();
+            *keyring = false;
+            *literal = None;
+        }
+        KeyChoice::Keyring => {
+            *keyring = true;
+            *literal = None;
+        }
+        KeyChoice::Literal(key) => {
+            *keyring = false;
+            *literal = Some(key.clone());
+        }
+        KeyChoice::KeepStored => {}
+        KeyChoice::Store(_) => bail!("a key given to toker was never placed"),
     }
     Ok(())
 }
@@ -2540,13 +2678,15 @@ fn toml_has_db_path(text: &str) -> bool {
 
 /// A provider's key line for the config summary — sources only, never
 /// values (invariant 2).
-fn key_line(provider: &str, env: &str, literal: &Option<String>) -> String {
-    match literal {
-        Some(_) => format!(
-            "  {provider} key: env {env} when set, else the literal in toker.toml (mode 0600)"
-        ),
-        None => format!("  {provider} key: env {env}"),
-    }
+fn key_line(provider: &str, sources: crate::config::KeySources, env: &str) -> String {
+    let stored = if sources.keyring_configured {
+        ", else the OS keyring"
+    } else if sources.literal_set {
+        ", else the literal in toker.toml (mode 0600)"
+    } else {
+        ", else the frontend's own key"
+    };
+    format!("  {provider} key: env {env} (systemd user environment) when set{stored}")
 }
 
 /// The enabled backends for the summary lines, or "none".
@@ -2583,6 +2723,7 @@ fn stderr_of(outcome: &Result<Output>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::MemoryStore;
     use crate::setup::test_dir;
     use crate::store::Store;
     use axum::http::StatusCode;
@@ -2859,6 +3000,9 @@ mod tests {
         root: PathBuf,
         prompt: ScriptedPrompt,
         runner: FakeRunner,
+        /// Never the real keyring: a working map unless a test swaps
+        /// in [`MemoryStore::unavailable`].
+        secrets: MemoryStore,
         out: Vec<u8>,
     }
 
@@ -2873,6 +3017,7 @@ mod tests {
                 root,
                 prompt: ScriptedPrompt::new(answers),
                 runner: FakeRunner::new(units_dir, systemctl),
+                secrets: MemoryStore::new(),
                 out: Vec::new(),
             }
         }
@@ -2891,6 +3036,7 @@ mod tests {
             Wizard::new(
                 &mut self.prompt,
                 &self.runner,
+                &self.secrets,
                 &paths,
                 &mut self.out,
                 timeout,
@@ -3054,7 +3200,7 @@ default_backend_anthropic = "codex_sub"
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
             multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-            select(0),               // key source: env
+            select(2),               // key source: env var
             text(""),                // env name: keep the default
             confirm(true),           // awake
             text(&port.to_string()), // the listener port
@@ -3440,6 +3586,13 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         // step of the plan reported.
         let out = rig.out();
         assert!(out.contains("none (fresh setup)"), "the config line: {out}");
+        // The env-var choice says plainly where the variable must live.
+        assert!(
+            out.contains("socket-activated systemd user service")
+                && out.contains("environment.d")
+                && out.contains("systemctl --user set-environment OPENROUTER_API_KEY="),
+            "the systemd environment note: {out}"
+        );
         assert!(out.contains("unknown"), "the failed socket query: {out}");
         assert!(
             out.contains("codex login : ") && out.contains("not found"),
@@ -3608,7 +3761,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // never reaches a frontend question.
             vec![
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(0),
+                select(2),      // openrouter key: an env var
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
@@ -3750,7 +3903,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // slots.
             vec![
                 multi(&[0, 3]),          // backends: anthropic_sub + openrouter
-                select(0),               // key source: env
+                select(2),               // key source: env var
                 text(""),                // env name: keep the default
                 confirm(true),           // awake
                 text(&port.to_string()), // the listener port
@@ -3821,7 +3974,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // detected), no slots, plus the import yes.
             vec![
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(0),
+                select(2),      // openrouter key: an env var
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
@@ -3886,6 +4039,9 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             },
             vec![inactive(), ok_empty(), ok_empty()],
         );
+        // No secret service on this machine: the key falls back to the
+        // 0600 toml.
+        rig.secrets = MemoryStore::unavailable();
 
         rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
@@ -3931,8 +4087,85 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             .mode();
         assert_eq!(mode & 0o777, 0o600);
 
-        // And the summary named only the SOURCE, never the value.
+        // And the summary named only the SOURCE, never the value, and
+        // said why the key is not in the keyring.
         assert!(out.contains("the literal in toker.toml"), "{out}");
+        assert!(out.contains("no OS keyring"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_key_given_to_toker_goes_to_the_keyring_and_the_other_choices_store_nothing() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        const KEY: &str = "sk-ant-this-must-never-appear-in-output";
+        let mut rig = Rig::new(
+            "keyring",
+            vec![
+                multi(&[1, 3]), // anthropic_api + openrouter
+                select(1),      // anthropic_api: give it to toker
+                text(KEY),      // the key, masked in the real UI
+                select(0),      // openrouter: the frontend brings its own
+                confirm(true),  // awake
+                text(&port.to_string()),
+                confirm(false), // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        // The key is in the (fake) keyring and nowhere else.
+        assert_eq!(rig.secrets.peek("anthropic_api").as_deref(), Some(KEY));
+        assert_eq!(rig.secrets.peek("openrouter"), None);
+        let toml = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
+        assert!(!toml.contains(KEY), "{toml}");
+        assert!(!toml.contains("api_key ="), "no literal: {toml}");
+        let config = Config::load_from(&rig.toml_path()).expect("loads");
+        let api = config.anthropic_api.as_ref().expect("enabled");
+        assert!(api.api_key_keyring);
+        let openrouter = config.openrouter.as_ref().expect("enabled");
+        assert!(!openrouter.api_key_keyring && openrouter.api_key.is_none());
+        let out = rig.out();
+        assert!(!out.contains(KEY), "{out}");
+        assert!(out.contains("stored in the OS keyring"), "{out}");
+        assert!(
+            out.contains("the frontend's own is passed through"),
+            "{out}"
+        );
+        // The auth question offered the three choices in the agreed
+        // order, the frontend's own first.
+        let auth = &rig.prompt.asked()[1];
+        assert!(auth.options[0].starts_with("the frontend brings its own"));
+        assert!(auth.options[1].starts_with("give it to toker"));
+        assert!(auth.options[2].starts_with("an env var"));
+
+        // A re-run over the stored key, answered with Enter: it stays
+        // where it is, and the stored choice is preselected.
+        let mut rerun = Rig::at(
+            rig.root.clone(),
+            vec![
+                select(1),        // reconfigure
+                multi_defaults(), // the same backends
+                select(1),        // anthropic_api: still toker's
+                text(""),         // empty keeps the stored key
+                select(0),        // openrouter: the frontend's own
+                confirm(true),
+                text(&port.to_string()),
+                confirm(false),
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        rerun
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("the rerun completes");
+        assert_eq!(rerun.prompt.asked()[2].default.as_deref(), Some("1"));
+        let config = Config::load_from(&rerun.toml_path()).expect("loads");
+        assert!(
+            config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .api_key_keyring
+        );
     }
 
     #[tokio::test]
@@ -3997,7 +4230,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "state-dir-fail",
             vec![
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(0),
+                select(2),      // openrouter key: an env var
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
@@ -4056,7 +4289,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "units-fail",
             vec![
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(0),
+                select(2),      // openrouter key: an env var
                 text(""),
                 confirm(true),
                 text(&port.to_string()),

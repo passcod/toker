@@ -72,6 +72,7 @@ use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenRouter, Provider};
+use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::Store;
 
 use record::now_ms;
@@ -176,6 +177,19 @@ impl Server {
         store: Arc<Store>,
         spawner: Box<dyn LockSpawner>,
     ) -> anyhow::Result<Server> {
+        Self::with_seams(config, store, spawner, Arc::new(OsKeyring))
+    }
+
+    /// [`Server::with_awake_spawner`], with the keyring injected too: the
+    /// stored API keys are read from it here, once, in the service — the
+    /// only process that ever reads the keyring. Tests pass a
+    /// [`crate::secrets::MemoryStore`] and never touch the real one.
+    pub fn with_seams(
+        config: Config,
+        store: Arc<Store>,
+        spawner: Box<dyn LockSpawner>,
+        secrets: Arc<dyn SecretStore>,
+    ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
         // tests, any embedder) must not reach routing with a default that
         // names a disabled backend — `default_anthropic` relies on it.
@@ -184,7 +198,9 @@ impl Server {
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
                 openrouter.upstream.clone(),
-                openrouter.api_key(),
+                openrouter.api_key(|| {
+                    secrets::read_key(secrets.clone(), "openrouter", KEYRING_READ_TIMEOUT)
+                }),
             )) as Arc<dyn Provider>
         });
         let anthropic_sub = config.anthropic_sub.as_ref().map(|sub| {
@@ -196,7 +212,9 @@ impl Server {
         let anthropic_api = config.anthropic_api.as_ref().map(|api| {
             Arc::new(AnthropicApi::new(
                 api.upstream.clone(),
-                api.api_key(),
+                api.api_key(|| {
+                    secrets::read_key(secrets.clone(), "anthropic_api", KEYRING_READ_TIMEOUT)
+                }),
                 api.model_map.clone(),
             )) as Arc<dyn Provider>
         });

@@ -318,6 +318,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         openrouter: Some(OpenRouterConfig {
             upstream,
             api_key_env: api_key_env.to_owned(),
+            api_key_keyring: false,
             api_key,
         }),
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
@@ -329,6 +330,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             model_map: None,
             upstream: anthropic_upstream,
             api_key_env: api_key_env.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         // The codex backend's config: never routed to in these suites
@@ -1753,4 +1755,76 @@ async fn no_anthropic_backend_answers_every_anthropic_path_not_configured() {
         assert_eq!(body["error"]["type"], "not_found_error");
     }
     assert!(mock.captured().is_empty(), "nothing reached any upstream");
+}
+
+#[tokio::test]
+async fn a_keyring_key_is_read_by_the_service_and_injected() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, UNSET_KEY_ENV, None);
+    config.openrouter.as_mut().expect("enabled").api_key_keyring = true;
+    // Never the real keyring: a map holding the key.
+    let secrets = Arc::new(toker::secrets::MemoryStore::new());
+    toker::secrets::SecretStore::set(secrets.as_ref(), "openrouter", "sk-from-keyring")
+        .expect("seed the fake keyring");
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::with_seams(
+        config,
+        store,
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        secrets,
+    )
+    .expect("build server");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    let app = server.router();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+
+    let body = chat_body("z-ai/glm-5.3", false);
+    assert_eq!(post_chat(addr, &body).await.status(), StatusCode::OK);
+    assert_eq!(
+        mock.captured()[0]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-from-keyring"),
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_keyring_reads_as_no_key() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, UNSET_KEY_ENV, None);
+    config.openrouter.as_mut().expect("enabled").api_key_keyring = true;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    // The service still starts: a keyring failure costs the key, never
+    // the listener.
+    let server = Server::with_seams(
+        config,
+        store,
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        Arc::new(toker::secrets::MemoryStore::unavailable()),
+    )
+    .expect("build server");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    let app = server.router();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+
+    let body = chat_body("z-ai/glm-5.3", false);
+    assert_eq!(post_chat(addr, &body).await.status(), StatusCode::OK);
+    assert!(
+        mock.captured()[0]
+            .headers
+            .get(header::AUTHORIZATION)
+            .is_none(),
+        "no key, nothing injected"
+    );
 }

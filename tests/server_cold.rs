@@ -162,6 +162,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
             // Only the openai-isolation test routes here.
             upstream: openrouter_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
@@ -173,6 +174,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
             model_map: None,
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
+            api_key_keyring: false,
             api_key: None,
         }),
         // The codex backend's config: never routed to in these suites
