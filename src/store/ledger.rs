@@ -519,12 +519,12 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 }
 
 /// The narrow projection of a `requests` row for the display tick (the
-/// sessions/spend/rate/context/tokens refresh): the fifteen columns the
+/// sessions/spend/rate/context/tokens refresh): the eighteen columns the
 /// dashboard's aggregation consumes, nothing else. Like [`MeterRow`], it
 /// exists so that read CANNOT regress into materialising full rows —
 /// the full-row reader casts 59 columns and parses six JSON values per
 /// row, while the display read parses none (no JSON column is among
-/// the fifteen) — so adding a field to this type must be justified
+/// the eighteen) — so adding a field to this type must be justified
 /// against the per-refresh cost of fetching it across up to the
 /// display window's 10 000-row cap, on the TUI's 2-second cadence: a
 /// field added here is a per-tick cost decision, made in the open.
@@ -538,7 +538,7 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 /// `reasoning` and `cache_write_total` are other consumers' columns.
 ///
 /// The phase-5 growth (display parity with the reference dashboard) adds
-/// five columns, each a
+/// six columns, each a
 /// scalar fetched for exactly one panel read:
 ///
 /// - `req_messages`, `compact_generations` — the sessions table's
@@ -555,6 +555,14 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 ///   so a prompt without its write share understates the context.
 ///   `cache_write_total` alone would not do — the tokens panel
 ///   renders the TTL tiers separately.
+/// - `tools_hash` — the lane key's second half (`session_id` +
+///   `tools_hash`), so each session's row reads its MAIN lane: the one
+///   whose latest row holds the largest prompt. Without it the latest
+///   row of any lane stood in for the session, and a subagent or a
+///   utility call landing last moved ctx, model, prompt and idle to a
+///   lane that is not the conversation — on the real log 95 of 129
+///   multi-request sessions held more than one lane. A TEXT column,
+///   but a short digest read as one string per row.
 ///
 /// Absence stays absence (invariant 3): every field except `ts_ms`
 /// round-trips NULL as `None`, never as zero or `""`. That includes
@@ -569,6 +577,9 @@ pub struct DisplayRow {
     pub kind: Option<RowKind>,
     /// Frontend-provided session identity, when known.
     pub session_id: Option<String>,
+    /// The request's tool-set digest — with the session, the lane key.
+    /// `None` rows share one lane, as the rebuild walk's do.
+    pub tools_hash: Option<String>,
     /// Model as reported back by the provider.
     pub model: Option<String>,
     /// Backend provider id.
@@ -630,7 +641,7 @@ pub(super) fn display_rows_since(
     rows_of(
         conn,
         "SELECT * FROM (
-            SELECT id, ts_ms, kind, session_id, model, provider,
+            SELECT id, ts_ms, kind, session_id, tools_hash, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
@@ -659,6 +670,7 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
             RowKind::parse,
         )?,
         session_id: row.get("session_id")?,
+        tools_hash: row.get("tools_hash")?,
         model: row.get("model")?,
         provider: row.get("provider")?,
         input: row.get("input")?,

@@ -82,27 +82,35 @@ pub(crate) struct Snapshot {
 /// `ts_ms`, not input order — the ledger is insert-only and rows arrive
 /// slightly out of order.
 ///
-/// One deliberate deviation from the predecessor dashboard, scoped and
-/// priced: it picks
-/// each session's MAIN lane (the largest by prompt size) and reads
-/// `ctx`/`msgs`/`cmpct`/prompt off its latest row;
-/// this aggregation is session-scoped, reading the latest row of the
-/// session. Lane-picking needs `tools_hash` plus the write share on the
-/// narrow read — a text column on the 2-second tick — and a subagent's
-/// turn landing after the main lane's would move every "latest" to it,
-/// where the lane-picked reading would stay on the main conversation.
-/// On the single-lane
-/// sessions that dominate real traffic the two read identically; on
-/// multi-lane ones the lane-picked behaviour lands with `toker report`,
-/// whose
-/// full-row reads can afford the lane walk.
+/// The conversation-shaped fields — model, ctx, prompt now and peak,
+/// msgs, compactions, the bright `↑`, and the idle clock — read the
+/// session's MAIN lane, as the predecessor's `mainLane` chose it: a
+/// lane is `session_id` + `tools_hash` (one session interleaves the
+/// main agent, its subagents, and small utility calls, each with its
+/// own tool set and its own cache), and the main lane is the one whose
+/// latest row holds the largest prompt, ties going to the more recent
+/// lane. By size, not request count: a utility lane can match the main
+/// agent's request count while holding a twentieth of its context.
+/// Requests, output, and the dim `↑` stay session-wide.
+///
+/// Reading the session's latest row instead, of whatever lane, was the
+/// earlier shape here, on the assumption that single-lane sessions
+/// dominate. They do not: on the real log 95 of 129 multi-request
+/// sessions held more than one lane, and at 12% of instants the latest
+/// row's model differed from the main lane's — a haiku title call or a
+/// subagent turn landing last swapped the row's model, ctx and prompt
+/// to a lane that is not the conversation, and reset its idle clock.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SessionAgg {
     /// The session id, or [`NO_SESSION`] for the NULL-session group.
     pub session: String,
-    /// Measurement rows in this session.
+    /// Measurement rows in this session, every lane.
     pub requests: usize,
-    /// The latest non-NULL model; `None` when no row reported one.
+    /// Measurement rows in the main lane — the CONTEXT panel's floor
+    /// counts the conversation's turns, not a subagent's.
+    pub lane_requests: usize,
+    /// The main lane's latest non-NULL model; `None` when no row of
+    /// that lane reported one.
     pub model: Option<String>,
     /// The provider of the row that most recently named
     /// [`SessionAgg::model`] — the per-provider key the
@@ -111,31 +119,33 @@ pub(crate) struct SessionAgg {
     /// (a model-less row cannot move it). `None` when no
     /// model-naming row carried a provider.
     pub provider: Option<String>,
-    /// The latest row's prompt — `input + cache_read + cache writes`,
+    /// The main lane's latest prompt — `input + cache_read + cache writes`,
     /// the measure the "prompt now" figure and the CONTEXT bars share.
     /// `None` unless every
     /// operand is known: anthropic's `input_tokens` excludes cache
     /// writes, so a row without its write share does not understate
     /// the context — it refuses to guess it (see [`prompt_of`]).
     pub input_now: Option<i64>,
-    /// The high-water mark of [`SessionAgg::input_now`] over the rows
-    /// where the whole prompt is known; `None` when none are.
+    /// The high-water mark of [`SessionAgg::input_now`] over the main
+    /// lane's rows where the whole prompt is known; `None` when none
+    /// are.
     pub input_peak: Option<i64>,
-    /// Sum of reported output tokens; `None` when no row reported output.
+    /// Sum of reported output tokens over every lane; `None` when no row
+    /// reported output.
     pub output_total: Option<i64>,
-    /// The latest row's message count — the `msgs` column
-    /// (the latest row's `reqMessages`); `None` when no row carried
-    /// one (`?`, never zero).
+    /// The main lane's latest message count — the `msgs` column; `None`
+    /// when that row carried none (`?`, never zero).
     pub req_messages: Option<i64>,
-    /// The latest row's compaction generation — the `cmpct` column.
+    /// The main lane's latest compaction generation — the `cmpct` column.
     /// The lane's LATEST marker is read, not a count over
     /// the window, and zero/absent renders as `-`; `None` and zero
     /// stay distinct here and render the same.
     pub compact_generations: Option<i64>,
-    /// The latest row was served on a rewritten (newer) model — the
-    /// bright `↑`.
+    /// The main lane's latest row was served on a rewritten (newer)
+    /// model — the bright `↑`.
     pub forced_latest: bool,
-    /// Some row in the window was — the dim `↑` when not the latest.
+    /// Some row in the window was, in any lane — the dim `↑` when not
+    /// the latest.
     pub forced_any: bool,
     /// The session holds a live allowance for the quota window now
     /// running — the `$` marker: released past the
@@ -143,9 +153,9 @@ pub(crate) struct SessionAgg {
     /// the caller from the allowances table against the current meter
     /// resets, and passed in as a set.
     pub released: bool,
-    /// The context ceiling of the latest model, resolved through the
+    /// The context ceiling of the main lane's model, resolved through the
     /// chain (see [`session_ctx`]): the hand-verified catalogue first
-    /// ([`resolve_context_window`] of the model, as of the latest row
+    /// ([`resolve_context_window`] of the model, as of that lane's latest row
     /// — it encodes the claude native-1M/fixed-200k identities, the
     /// beta phases, and the gpt-5.6-sol/luna 872k declarations), then
     /// the fetched catalogue of the provider that named it (a
@@ -159,7 +169,9 @@ pub(crate) struct SessionAgg {
     /// (invariant 1). `None` when no transcript carries one — the view
     /// falls back to the session id, never an empty cell.
     pub label: Option<Label>,
-    /// Newest row timestamp (epoch ms).
+    /// The main lane's newest row timestamp (epoch ms) — the idle clock
+    /// and the table's order. A subagent's turn does not touch the
+    /// cache worth keeping warm, so it does not reset idle either.
     pub latest_ts_ms: i64,
 }
 
@@ -392,6 +404,8 @@ pub(crate) fn aggregate(
 
     let mut sessions: Vec<SessionAgg> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    // Per session (parallel to `sessions`), its lanes by tool-set digest.
+    let mut lanes: Vec<HashMap<Option<String>, LaneAgg>> = Vec::new();
     let mut spend = SpendAgg {
         billed_total: None,
         billed_requests: 0,
@@ -450,8 +464,9 @@ pub(crate) fn aggregate(
             tokens.cold += 1;
         }
 
-        // Sessions: group by id (NULL under the dash), accumulate per row
-        // in ts order so the last write is the latest row's value.
+        // Sessions: group by id (NULL under the dash). Requests, output
+        // and the dim `↑` are session-wide; everything the main lane
+        // decides accumulates per lane and is picked after the pass.
         let key = row
             .session_id
             .clone()
@@ -460,6 +475,7 @@ pub(crate) fn aggregate(
             sessions.push(SessionAgg {
                 session: key.clone(),
                 requests: 0,
+                lane_requests: 0,
                 model: None,
                 provider: None,
                 input_now: None,
@@ -474,38 +490,19 @@ pub(crate) fn aggregate(
                 label: labels.get(&key).cloned(),
                 latest_ts_ms: row.ts_ms,
             });
+            lanes.push(HashMap::new());
             sessions.len() - 1
         });
         let session = &mut sessions[slot];
         session.requests += 1;
-        session.latest_ts_ms = row.ts_ms;
-        if let Some(model) = &row.model {
-            if session.model.as_deref() != Some(model.as_str()) {
-                session.model = row.model.clone();
-            }
-            // The provider of the row that named the model — moved on
-            // every model-naming row (the latest namer wins), so the
-            // pairing the fetched-catalogue lookup needs stays true
-            // even when the same model string repeats across
-            // providers.
-            session.provider = row.provider.clone();
-        }
-        // The prompt needs every operand; a missing one is unknown.
-        session.input_now = prompt_of(row);
-        if let Some(now) = session.input_now
-            && session.input_peak.is_none_or(|peak| now > peak)
-        {
-            session.input_peak = Some(now);
-        }
         if let Some(output) = row.output {
             session.output_total = Some(session.output_total.unwrap_or(0) + output);
         }
-        // The latest row decides `msgs`, `cmpct`, and the bright `↑`;
-        // any row's rewrite lights the dim one.
-        session.req_messages = row.req_messages;
-        session.compact_generations = row.compact_generations;
-        session.forced_latest = row.forced_to.is_some();
         session.forced_any |= row.forced_to.is_some();
+        lanes[slot]
+            .entry(row.tools_hash.clone())
+            .or_default()
+            .add(row);
 
         // Cost: billed sums, everything else stays explicit (above).
         match (row.cost_usd, row.cost_kind) {
@@ -540,12 +537,30 @@ pub(crate) fn aggregate(
         }
     }
 
-    // The context ceiling is a catalogue lookup off each session's
-    // latest model — the hand-verified catalogue first, then the
-    // fetched catalogue of the provider that named it — resolved as of
-    // the latest row's timestamp, so a phased capability resolves to
-    // the phase that applied, never to today's against historical rows.
-    for session in &mut sessions {
+    // Each session reads its main lane, then the context ceiling is a
+    // catalogue lookup off that lane's model — the hand-verified
+    // catalogue first, then the fetched catalogue of the provider that
+    // named it — resolved as of the lane's latest row, so a phased
+    // capability resolves to the phase that applied, never to today's
+    // against historical rows.
+    for (session, lanes) in sessions.iter_mut().zip(lanes) {
+        if let Some((_, main)) = lanes.into_iter().max_by(|(a_key, a), (b_key, b)| {
+            a.held
+                .cmp(&b.held)
+                .then_with(|| a.latest_ts_ms.cmp(&b.latest_ts_ms))
+                // Last resort, so the pick never rests on hash order.
+                .then_with(|| b_key.cmp(a_key))
+        }) {
+            session.lane_requests = main.requests;
+            session.model = main.model;
+            session.provider = main.provider;
+            session.input_now = main.input_now;
+            session.input_peak = main.input_peak;
+            session.req_messages = main.req_messages;
+            session.compact_generations = main.compact_generations;
+            session.forced_latest = main.forced_latest;
+            session.latest_ts_ms = main.latest_ts_ms;
+        }
         session.ctx = session_ctx(
             session.model.as_deref(),
             session.provider.as_deref(),
@@ -596,6 +611,71 @@ pub(crate) fn aggregate(
         // lookback's 20k-row read and its aggregation are far too heavy
         // for the display tick (the spin this split fixed).
         quota: quota.cloned(),
+    }
+}
+
+/// One lane's running state over the ts-ordered pass: what the session
+/// row reads if this lane turns out to be the main one.
+#[derive(Debug, Default)]
+struct LaneAgg {
+    /// Measurement rows in the lane.
+    requests: usize,
+    /// The latest row's prompt with unknown operands as zero — the
+    /// main-lane selector only, never displayed. The predecessor's
+    /// `held` summed what it had the same way: a missing write share
+    /// should not take a 400k conversation out of the running against
+    /// a utility lane.
+    held: i64,
+    /// The latest row's timestamp.
+    latest_ts_ms: i64,
+    /// The latest non-NULL model and the provider of the row naming it.
+    model: Option<String>,
+    provider: Option<String>,
+    /// The latest row's whole prompt ([`prompt_of`]) and the lane's
+    /// high-water mark of it.
+    input_now: Option<i64>,
+    input_peak: Option<i64>,
+    /// The latest row's message count and compaction generation.
+    req_messages: Option<i64>,
+    compact_generations: Option<i64>,
+    /// The latest row was served on a rewritten model.
+    forced_latest: bool,
+}
+
+impl LaneAgg {
+    /// Fold the next row in ts order: the last write is the latest
+    /// row's value.
+    fn add(&mut self, row: &DisplayRow) {
+        self.requests += 1;
+        self.latest_ts_ms = row.ts_ms;
+        self.held = [
+            row.input,
+            row.cache_read,
+            row.cache_write_5m,
+            row.cache_write_1h,
+        ]
+        .into_iter()
+        .map(|value| value.unwrap_or(0))
+        .sum();
+        if row.model.is_some() {
+            self.model = row.model.clone();
+            // The provider of the row that named the model — moved on
+            // every model-naming row (the latest namer wins), so the
+            // pairing the fetched-catalogue lookup needs stays true
+            // even when the same model string repeats across
+            // providers.
+            self.provider = row.provider.clone();
+        }
+        // The prompt needs every operand; a missing one is unknown.
+        self.input_now = prompt_of(row);
+        if let Some(now) = self.input_now
+            && self.input_peak.is_none_or(|peak| now > peak)
+        {
+            self.input_peak = Some(now);
+        }
+        self.req_messages = row.req_messages;
+        self.compact_generations = row.compact_generations;
+        self.forced_latest = row.forced_to.is_some();
     }
 }
 
@@ -2178,6 +2258,121 @@ mod tests {
         );
         assert!(session("ses-free").released);
         assert!(!session("ses-live").released);
+    }
+
+    /// A session row reads its main lane — the lane (`tools_hash`)
+    /// whose latest row holds the largest prompt — not the latest row
+    /// of any lane: a subagent on haiku writing last must not move the
+    /// model, ctx, prompt, msgs, compactions, bright `↑`, or idle clock
+    /// off the conversation. Requests, output, and the dim `↑` stay
+    /// session-wide.
+    #[test]
+    fn session_rows_follow_the_main_lane_not_the_latest_row() {
+        use crate::catalog::windows::ContextWindow;
+        let lane_row = |at: i64, tools: &str, model: &str, read: i64, msgs: i64| {
+            let mut row = display_bare(mins_ago(at));
+            row.session_id = Some("ses-multi".into());
+            row.tools_hash = Some(tools.into());
+            row.model = Some(model.into());
+            row.provider = Some("anthropic".into());
+            row.input = Some(10);
+            row.cache_read = Some(read);
+            row.cache_write_5m = Some(0);
+            row.cache_write_1h = Some(1_000);
+            row.output = Some(100);
+            row.req_messages = Some(msgs);
+            row.compact_generations = Some(if tools == "main" { 2 } else { 0 });
+            row
+        };
+        let mut rows = vec![
+            lane_row(10, "main", "claude-opus-5", 150_000, 40),
+            lane_row(8, "main", "claude-opus-5", 170_000, 42),
+            lane_row(6, "main", "claude-opus-5", 160_000, 44),
+            lane_row(5, "sub", "claude-haiku-4-5", 20_000, 3),
+            lane_row(1, "sub", "claude-haiku-4-5", 22_000, 5),
+        ];
+        // An earlier main-lane rewrite and the subagent's latest one:
+        // the dim mark is lit, the bright one follows the main lane.
+        rows[0].forced_to = Some("claude-opus-5".into());
+        rows[4].forced_to = Some("claude-haiku-4-5".into());
+        // Reversed input: the pick is by timestamp and size, not order.
+        rows.reverse();
+
+        let snap = agg(&rows, 5);
+        assert_eq!(snap.sessions.len(), 1);
+        let session = &snap.sessions[0];
+        assert_eq!(session.requests, 5, "requests stay session-wide");
+        assert_eq!(session.lane_requests, 3);
+        assert_eq!(session.output_total, Some(500), "output stays session-wide");
+        assert_eq!(session.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(session.ctx, ContextWindow::Exact { tokens: 1_000_000 });
+        assert_eq!(session.input_now, Some(161_010));
+        assert_eq!(session.input_peak, Some(171_010), "peak over the main lane");
+        assert_eq!(session.req_messages, Some(44));
+        assert_eq!(session.compact_generations, Some(2));
+        assert!(
+            !session.forced_latest,
+            "the subagent's rewrite lit the bright mark"
+        );
+        assert!(session.forced_any);
+        assert_eq!(
+            session.latest_ts_ms,
+            mins_ago(6),
+            "the subagent's turn reset the idle clock"
+        );
+    }
+
+    /// The main lane is picked by size, not request count, and a size
+    /// tie goes to the more recent lane whatever order the rows came
+    /// in. A busy utility lane must never stand in for the conversation
+    /// (the predecessor's CONTEXT panel once swapped between two lanes
+    /// tied at four requests each as its window slid).
+    #[test]
+    fn the_main_lane_is_the_largest_and_ties_go_to_the_more_recent() {
+        let lane_row = |at: i64, tools: Option<&str>, read: i64| {
+            let mut row = display_bare(mins_ago(at));
+            row.session_id = Some("ses-lanes".into());
+            row.tools_hash = tools.map(str::to_owned);
+            row.provider = Some("anthropic".into());
+            row.input = Some(1);
+            row.cache_read = Some(read);
+            row.cache_write_1h = Some(0);
+            row
+        };
+        // Four utility calls against two conversation turns; the
+        // NULL-hash rows share one lane of their own.
+        let mut rows = vec![
+            lane_row(9, Some("big"), 150_000),
+            lane_row(4, Some("big"), 159_532),
+        ];
+        for at in [8, 6, 3, 2] {
+            rows.push(lane_row(at, Some("util"), 7_537));
+        }
+        rows.push(lane_row(1, None, 7_000));
+        for order in [false, true] {
+            if order {
+                rows.reverse();
+            }
+            let session = &agg(&rows, 7).sessions[0];
+            assert_eq!(session.input_now, Some(159_533));
+            assert_eq!(session.lane_requests, 2);
+        }
+
+        // Equal holds: the lane that spoke last wins, in either order.
+        let mut tied = vec![
+            lane_row(5, Some("older"), 50_000),
+            lane_row(3, Some("newer"), 50_000),
+            lane_row(4, Some("newer"), 1),
+        ];
+        tied.sort_by_key(|row| row.ts_ms);
+        for order in [false, true] {
+            if order {
+                tied.reverse();
+            }
+            let session = &agg(&tied, 3).sessions[0];
+            assert_eq!(session.latest_ts_ms, mins_ago(3));
+            assert_eq!(session.lane_requests, 2);
+        }
     }
 
     /// Session labels arrive as data, keyed by session id exactly like

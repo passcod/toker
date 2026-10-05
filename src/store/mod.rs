@@ -944,6 +944,7 @@ mod tests {
                 ts_ms: row.ts_ms,
                 kind: None, // full_row is a measurement
                 session_id: Some("ses-abc".to_string()),
+                tools_hash: Some("sha256:tool5".to_string()),
                 model: Some("z-ai/glm-5.3".to_string()),
                 provider: Some("openrouter".to_string()),
                 input: Some(12_345),
@@ -959,7 +960,7 @@ mod tests {
                 compact_generations: Some(1),
                 forced_to: Some("z-ai/glm-5.3".to_string()),
             },
-            "the sixteen display columns round-trip; the rest never cross"
+            "the eighteen display columns round-trip; the rest never cross"
         );
 
         // A bare row's absence stays absence on every one of the ten.
@@ -971,6 +972,7 @@ mod tests {
                 ts_ms: 9_999,
                 kind: None,
                 session_id: None,
+                tools_hash: None,
                 model: None,
                 provider: None,
                 input: None,

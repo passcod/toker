@@ -210,7 +210,7 @@ pub fn run(
 /// Reload the display window's rows and total, then aggregate with the
 /// CACHED quota and rebuild sections, the live-allowance set, and the
 /// loaded models catalogues. The read is the store's narrow display
-/// projection ([`Store::display_rows_since`]): the fifteen columns the
+/// projection ([`Store::display_rows_since`]): the eighteen columns the
 /// aggregation consumes, no JSON parse per row — the full-row read
 /// this path used to pay cast 59 columns and parsed six JSON values
 /// per row, every 2 s (invariant 7). Errors propagate — with WAL and
@@ -659,6 +659,7 @@ pub(crate) mod testrows {
             ts_ms,
             kind: None,
             session_id: None,
+            tools_hash: None,
             model: None,
             provider: None,
             input: None,
@@ -712,7 +713,7 @@ pub(crate) mod testrows {
     /// Project full ledger rows onto the display window's narrow
     /// shape, keeping EVERY row (no filter — the display read has
     /// none). The parity bridge: the old display path materialised
-    /// full rows and read these fifteen fields off them, so aggregating
+    /// full rows and read these eighteen fields off them, so aggregating
     /// this projection of a full-row read must equal aggregating the
     /// narrow read.
     pub(crate) fn as_display_rows(rows: &[RequestRow]) -> Vec<DisplayRow> {
@@ -721,6 +722,7 @@ pub(crate) mod testrows {
                 ts_ms: row.ts_ms,
                 kind: row.kind,
                 session_id: row.session_id.clone(),
+                tools_hash: row.tools_hash.clone(),
                 model: row.model.clone(),
                 provider: row.provider.clone(),
                 input: row.input,

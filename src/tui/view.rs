@@ -77,9 +77,9 @@ const FRESH_SECS: i64 = 30;
 /// freshness turns red and counts in minutes.
 const STALE_SECS: i64 = 300;
 
-/// The context panel lists sessions with at least this many requests —
-/// occupancy is a claim about a conversation, and two rows say nothing
-/// yet (a "fewer than three" check).
+/// The context panel lists sessions whose main lane holds at least this
+/// many requests — occupancy is a claim about a conversation, and two
+/// rows say nothing yet (a "fewer than three" check).
 const CONTEXT_MIN_REQUESTS: usize = 3;
 
 /// The least width a session NAME renders in (`labelW >= 12`):
@@ -312,7 +312,7 @@ fn rebuilds_height(snap: &Snapshot) -> u16 {
 fn context_rows(snap: &Snapshot) -> usize {
     snap.sessions
         .iter()
-        .filter(|session| session.requests >= CONTEXT_MIN_REQUESTS)
+        .filter(|session| session.lane_requests >= CONTEXT_MIN_REQUESTS)
         .count()
 }
 
@@ -699,7 +699,7 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let mut lines = Vec::new();
     let mut listed = 0;
     for session in &snap.sessions {
-        if session.requests < CONTEXT_MIN_REQUESTS {
+        if session.lane_requests < CONTEXT_MIN_REQUESTS {
             continue;
         }
         listed += 1;
