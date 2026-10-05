@@ -23,7 +23,9 @@
 //! - an error-path request (no upstream at all) still cycles the
 //!   in-flight count cleanly — the guard's Drop is the decrement, so
 //!   two consecutive failures produce two full hold/release cycles
-//!   (a leaked count would hold the lock forever and skip the second).
+//!   (a leaked count would hold the lock forever and skip the second);
+//! - a stalled upstream on a live connection releases the lock once the
+//!   upstream idle timeout fires, without the client hanging up.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -139,7 +141,31 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .expect("mock reads body");
-    mock.requests.lock().unwrap().push(body);
+    mock.requests.lock().unwrap().push(body.clone());
+    let model = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|json| json.get("model").and_then(Value::as_str).map(str::to_owned));
+    if model.as_deref() == Some("stall") {
+        // The turn opens, then the upstream goes silent on a live
+        // connection: never another byte, never an end.
+        let turn = sse_turn();
+        let first_event = turn
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .expect("the turn has events")
+            + 2;
+        let opening = Bytes::copy_from_slice(&turn[..first_event]);
+        let body = Body::from_stream(futures::StreamExt::chain(
+            futures::stream::iter([Ok::<_, std::io::Error>(opening)]),
+            futures::stream::pending(),
+        ));
+        let mut response = Response::new(body);
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        return response;
+    }
     raw_response(StatusCode::OK, "text/event-stream", Bytes::from(sse_turn()))
 }
 
@@ -243,11 +269,25 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
 /// toker over the injected fake spawner — never the real one; see the
 /// module docs.
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>, AwakeProbe) {
+    spawn_toker_idle(config, None).await
+}
+
+/// [`spawn_toker`], with the upstream idle timeout shortened so a stall
+/// test need not wait the real five minutes.
+async fn spawn_toker_idle(
+    config: Config,
+    idle: Option<std::time::Duration>,
+) -> (SocketAddr, Arc<Store>, AwakeProbe) {
     let probe = AwakeProbe::default();
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server =
+    let mut server =
         Server::with_awake_spawner(config, store.clone(), Box::new(ProbeSpawner(probe.clone())))
             .expect("build server");
+    if let Some(idle) = idle {
+        server
+            .set_upstream_idle_timeout(idle)
+            .expect("rebuild the upstream client");
+    }
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -658,4 +698,32 @@ async fn error_paths_never_leak_the_in_flight_count() {
     );
     assert_eq!(probe.spawns(), 2);
     assert_eq!(probe.kills(), 2);
+}
+
+#[tokio::test]
+async fn a_stalled_upstream_releases_the_lock_after_the_idle_timeout() {
+    let (_mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, true);
+    let (addr, store, probe) =
+        spawn_toker_idle(config, Some(std::time::Duration::from_millis(300))).await;
+
+    // The client stays connected throughout: with no idle timeout, the
+    // stalled upstream kept the request in flight, and the lock held,
+    // for as long as the connection lived.
+    let response = post_messages(addr, &bare_body("stall"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = wait_for_awake_rows(&store, 2).await;
+    assert_eq!(
+        rows,
+        vec![
+            (true, true, None, "1 in flight".to_owned()),
+            (false, false, None, "no live lanes".to_owned()),
+        ],
+        "the stall holds, then the idle timeout releases"
+    );
+    assert_eq!(probe.spawns(), 1);
+    assert_eq!(probe.kills(), 1);
+    // Released by the timeout, not by the client going away.
+    drop(response);
 }

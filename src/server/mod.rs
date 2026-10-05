@@ -27,13 +27,17 @@
 //!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
 //!   everything but its control path.
 //!
-//! Timeouts: none. Axum applies no default request or idle timeout, so
-//! streams run as long as both ends keep the connection open — the plan's
-//! `requestTimeout = 0`. The upstream client ([`Server::new`]) sets a
-//! connect timeout only: no read timeout, on any path, because a read
-//! timeout would kill live SSE streams; axum tears the connection down
-//! itself when either end hangs up (the body stream's Drop aborts the
-//! upstream, [proxy] implements it).
+//! Timeouts: axum applies no default request or idle timeout on the
+//! client side, so streams run as long as both ends keep the connection
+//! open — the plan's `requestTimeout = 0`; axum tears the connection down
+//! itself when the client hangs up (the body stream's Drop aborts the
+//! upstream, [proxy] implements it). The upstream client
+//! ([`Server::new`]) sets a connect timeout and an idle timeout
+//! ([`UPSTREAM_IDLE_TIMEOUT`]): time *between* reads, never a total, so a
+//! long healthy stream is left alone while a stalled one fails. It covers
+//! the wait for the response headers too. Its expiry is an upstream
+//! failure like any other: before a body, a 502; mid-body, the client's
+//! response is aborted rather than ended (no row either way).
 //!
 //! [`RecordCtx`]-based recording notes the clock is used **only** for row
 //! fields (ts, duration) — never for bytes (invariant 4); serialisation
@@ -71,6 +75,29 @@ use record::now_ms;
 /// back over.
 const SEED_ROWS: u64 = 20_000;
 
+/// How long the upstream may go silent — no response headers, no body
+/// bytes — before toker gives up on it. Time between reads, never a
+/// total: a whole-response deadline would kill long healthy SSE streams,
+/// which is why there was once no read timeout at all. But with none, a
+/// stalled upstream on a live connection keeps its [`InFlightGuard`]
+/// forever, and with it the idle-sleep lock. 300 s is the predecessor's
+/// read timeout: the API sends pings through a long turn, so five minutes
+/// of silence is a dead stream, not a slow one.
+pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The upstream client: a connect timeout and the between-reads idle
+/// timeout, never an overall one (see [`UPSTREAM_IDLE_TIMEOUT`]).
+fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        // reqwest's read timeout resets after every successful read, and
+        // also bounds the wait for the response headers: exactly the
+        // between-chunks idle timeout, on every path that uses this
+        // client, with no per-path wrapper to forget.
+        .read_timeout(idle)
+        .build()
+}
+
 /// The running proxy: config, ledger, upstream client, backend providers,
 /// and the learned model store, cloned cheaply into every request handler.
 #[derive(Clone)]
@@ -90,9 +117,9 @@ pub struct Server {
     /// future `/_toker` endpoint can read them without touching disk;
     /// the TUI reads the same data from the cache files, read-only.
     pub(crate) catalogs: Arc<std::sync::RwLock<FetchedCatalogs>>,
-    /// The shared upstream HTTP client. Connect timeout only — no read
-    /// timeout, so streams live as long as their connections do (see the
-    /// module docs).
+    /// The shared upstream HTTP client. Connect and between-reads idle
+    /// timeouts only — no overall deadline, so a stream lives as long as
+    /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
     /// Phase 1's one openai-chat backend; a trait object because routing
     /// selects by `provider/model` prefix and later phases add providers
@@ -156,11 +183,7 @@ impl Server {
                 config.default_backend_anthropic
             );
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            // Deliberately no read/overall timeout: streams must not be
-            // killed by the clock (see the module docs).
-            .build()?;
+        let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
         let openrouter = Arc::new(OpenRouter::new(
             config.openrouter.upstream.clone(),
             config.openrouter.api_key(),
@@ -228,6 +251,14 @@ impl Server {
             awake,
             started: Instant::now(),
         })
+    }
+
+    /// Replace the upstream idle timeout ([`UPSTREAM_IDLE_TIMEOUT`] by
+    /// default). For tests, which cannot wait five minutes to see a
+    /// stalled upstream abort.
+    pub fn set_upstream_idle_timeout(&mut self, idle: Duration) -> anyhow::Result<()> {
+        self.http = upstream_client(idle)?;
+        Ok(())
     }
 
     /// Resolve an anthropic backend by provider name — routing and the

@@ -277,6 +277,37 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             metered(&mut response, "0.4127");
             response
         }
+        "stall-headers" => {
+            // The upstream accepts the request and then says nothing at
+            // all — not even the response headers.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            raw_response(StatusCode::OK, "application/json", Bytes::new())
+        }
+        "slow" if stream => {
+            // A healthy stream that takes longer in total than the idle
+            // timeout the slow test sets, but never pauses that long
+            // between chunks: the timeout must leave it alone.
+            let fixture = fixture("03_1h_write_crlf.sse");
+            let pieces: Vec<Bytes> = fixture
+                .chunks(fixture.len().div_ceil(8))
+                .map(Bytes::copy_from_slice)
+                .collect();
+            let body = Body::from_stream(futures::stream::unfold(
+                pieces.into_iter(),
+                |mut pieces| async move {
+                    let piece = pieces.next()?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Some((Ok::<_, std::io::Error>(piece), pieces))
+                },
+            ));
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            metered(&mut response, "0.4127");
+            response
+        }
         // A 5-minute-tier-only write (fixture 04): the lane-stickiness
         // probe — a warm follow-up whose writes landed on the short tier
         // must not shorten what the lane already holds.
@@ -499,8 +530,22 @@ fn test_config(
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
+    spawn_toker_idle(config, None).await
+}
+
+/// [`spawn_toker`], with the upstream idle timeout shortened so a stall
+/// test need not wait the real five minutes.
+async fn spawn_toker_idle(
+    config: Config,
+    idle: Option<std::time::Duration>,
+) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let mut server = Server::new(config, store.clone()).expect("build server");
+    if let Some(idle) = idle {
+        server
+            .set_upstream_idle_timeout(idle)
+            .expect("rebuild the upstream client");
+    }
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1467,6 +1512,95 @@ async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
     }
 
     assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn a_stalled_upstream_stream_aborts_after_the_idle_timeout() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_idle(
+        test_config(upstream, None, "anthropic_sub"),
+        Some(std::time::Duration::from_millis(300)),
+    )
+    .await;
+
+    // The first event arrives, then the upstream goes silent on a live
+    // connection — the stall that once held the sleep lock forever.
+    let mut response = post_messages(addr, "/v1/messages", &[], &messages_body("hang", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let chunk = response
+        .chunk()
+        .await
+        .expect("first chunk")
+        .expect("non-empty");
+    assert!(!chunk.is_empty());
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(10), read_to_end(response))
+        .await
+        .expect("the idle timeout ends the stall");
+    assert!(rest.is_err(), "a stall is an abort, not a clean end");
+
+    // The upstream request is released too, and nothing is recorded.
+    for _ in 0..100 {
+        if mock.upstream_dropped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        mock.upstream_dropped.load(Ordering::SeqCst),
+        "the stalled upstream request was dropped"
+    );
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn an_upstream_silent_before_its_headers_answers_502_after_the_idle_timeout() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_idle(
+        test_config(upstream, None, "anthropic_sub"),
+        Some(std::time::Duration::from_millis(300)),
+    )
+    .await;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        post_messages(
+            addr,
+            "/v1/messages",
+            &[],
+            &messages_body("stall-headers", true),
+        ),
+    )
+    .await
+    .expect("the idle timeout covers the wait for headers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn the_idle_timeout_leaves_a_slow_but_live_stream_alone() {
+    let (_mock, upstream) = spawn_mock().await;
+    // Eight chunks 100 ms apart: longer in total than the 300 ms idle
+    // timeout, never that long between reads.
+    let (addr, store) = spawn_toker_idle(
+        test_config(upstream, None, "anthropic_sub"),
+        Some(std::time::Duration::from_millis(300)),
+    )
+    .await;
+
+    let response = post_messages(addr, "/v1/messages", &[], &messages_body("slow", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_to_end(response)
+        .await
+        .expect("a live stream completes");
+    assert_eq!(
+        body,
+        fixture("03_1h_write_crlf.sse").to_vec(),
+        "every byte arrives"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1, "a completed slow stream still records");
 }
 
 /// Whether raw request bytes still contain the release marker.
