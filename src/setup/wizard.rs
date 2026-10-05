@@ -62,7 +62,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::config::{
-    Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENROUTER_API_KEY_ENV, DEFAULT_PORT,
+    ANTHROPIC_BACKENDS, Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENROUTER_API_KEY_ENV,
+    DEFAULT_PORT,
 };
 use crate::import::{self, ImportOpts};
 use crate::setup::atomic::atomic_write_bytes;
@@ -172,6 +173,15 @@ pub trait Prompt {
     /// preselected answer.
     fn select(&mut self, message: &str, options: &[&str], default: Option<usize>) -> Result<usize>;
 
+    /// Pick any of `options`; `defaults` are the indices offered
+    /// ticked. Returns the ticked indices, ascending.
+    fn multi_select(
+        &mut self,
+        message: &str,
+        options: &[&str],
+        defaults: &[usize],
+    ) -> Result<Vec<usize>>;
+
     /// A yes/no, with `default` as the suggested answer.
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool>;
 
@@ -197,6 +207,20 @@ impl Prompt for InquirePrompt {
             .iter()
             .position(|option| *option == answer)
             .expect("inquire returns one of the offered options"))
+    }
+
+    fn multi_select(
+        &mut self,
+        message: &str,
+        options: &[&str],
+        defaults: &[usize],
+    ) -> Result<Vec<usize>> {
+        let answer = inquire::MultiSelect::new(message, options.to_vec())
+            .with_default(defaults)
+            .raw_prompt()?;
+        let mut ticked: Vec<usize> = answer.iter().map(|option| option.index).collect();
+        ticked.sort_unstable();
+        Ok(ticked)
     }
 
     fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
@@ -805,12 +829,39 @@ enum KeyChoice {
 #[derive(Debug, Clone)]
 struct Choices {
     port: u16,
-    anthropic_backend: String,
+    /// The ticked backends, in [`BACKENDS`] order: exactly the set the
+    /// written config enables.
+    backends: Vec<&'static str>,
+    /// The anthropic protocol's default, among the ticked; `None` when
+    /// no anthropic backend is ticked.
+    anthropic_default: Option<&'static str>,
+    /// Asked only when anthropic_api is ticked.
     anthropic_api_key: Option<KeyChoice>,
-    openrouter: bool,
+    /// Asked only when openrouter is ticked.
     openrouter_key: Option<KeyChoice>,
     awake: bool,
 }
+
+/// Every backend the wizard offers, in the multi-select's order, with
+/// the line that says what it is.
+const BACKENDS: &[(&str, &str)] = &[
+    (
+        "anthropic_sub",
+        "anthropic_sub — the Claude subscription (claude's own login, nothing to store)",
+    ),
+    (
+        "anthropic_api",
+        "anthropic_api — the Anthropic API, by API key",
+    ),
+    (
+        "codex_sub",
+        "codex_sub — the ChatGPT subscription, through the codex CLI's login",
+    ),
+    (
+        "openrouter",
+        "openrouter — the openai-chat protocol (opencode), by API key",
+    ),
+];
 
 // ── the report ─────────────────────────────────────────────────────────
 
@@ -1076,9 +1127,10 @@ impl<'a> Wizard<'a> {
         self.say("toker setup — the state of this machine")?;
         let config_line = match (&detected.config, &detected.config_error) {
             (Some(config), _) => format!(
-                "{} — port {}, anthropic → {}, openai_chat → {}, awake {}, db {}",
+                "{} — port {}, backends {}, anthropic → {}, openai_chat → {}, awake {}, db {}",
                 self.paths.config_toml.display(),
                 config.port,
+                backends_list(config),
                 config
                     .default_backend_anthropic
                     .as_deref()
@@ -1115,9 +1167,9 @@ impl<'a> Wizard<'a> {
             "  codex login : {} — {}",
             self.paths.codex_auth.display(),
             if detected.codex_auth {
-                "found (codex_sub is offered)"
+                "found (codex_sub is pre-ticked)"
             } else {
-                "not found (codex_sub is not offered)"
+                "not found"
             },
         ))?;
         match detected.ctp_usage {
@@ -1209,12 +1261,14 @@ impl<'a> Wizard<'a> {
     // ── step 1: choose backends ───────────────────────────────────
 
     /// [`Step::ChooseBackends`] — the plan's "backends → defaults →
-    /// toggles" questions: the anthropic protocol's backend, openrouter
-    /// for openai-chat (and how each key is sourced), the awake
-    /// toggle, and the port. An existing config is offered
-    /// keep-vs-reconfigure first; `Ok(None)` means "keep" — the caller
-    /// writes nothing. Every existing value preselects its own answer,
-    /// so a re-run can be walked through with Enter.
+    /// toggles" questions: which backends toker serves (one
+    /// multi-select, pre-ticked from what the machine has), the auth of
+    /// each ticked key backend, the default per protocol among the
+    /// ticked ones (asked only when there is a choice), the awake toggle,
+    /// and the port. An existing config is offered keep-vs-reconfigure
+    /// first; `Ok(None)` means "keep" — the caller writes nothing. Every
+    /// existing value preselects its own answer, so a re-run can be
+    /// walked through with Enter.
     fn choose_backends(&mut self, detected: &Detected) -> Result<Option<Choices>> {
         self.step(Step::ChooseBackends)?;
         let existing = detected.config.as_ref();
@@ -1233,64 +1287,69 @@ impl<'a> Wizard<'a> {
             }
         }
 
-        // The anthropic protocol's backend. anthropic_sub is the
-        // default: claude brings its own credentials and there is
-        // nothing to store. codex_sub is offered only when the CLI's
-        // shared login exists (its auth is that login).
-        let mut options = vec!["anthropic_sub", "anthropic_api"];
-        if detected.codex_auth {
-            options.push("codex_sub");
-        }
-        let current = existing
-            .and_then(|config| config.default_backend_anthropic.as_deref())
-            .unwrap_or("anthropic_sub");
-        let default = options.iter().position(|option| *option == current);
-        let picked = options[self.prompt.select(
-            "Default backend for the anthropic protocol (claude and friends)? \
-             (anthropic_sub reuses claude's own OAuth — nothing to store; \
-             codex_sub reuses the codex CLI's login)",
-            &options,
-            default,
-        )?]
-        .to_owned();
-        let anthropic_api_key = if picked == "anthropic_api" {
-            let default_env = existing
-                .and_then(|config| config.anthropic_api.as_ref())
+        let backends = self.ask_backends(detected)?;
+        let ticked = |name: &str| backends.contains(&name);
+
+        let anthropic_api_key = if ticked("anthropic_api") {
+            let api = existing.and_then(|config| config.anthropic_api.as_ref());
+            let default_env = api
                 .map(|api| api.api_key_env.clone())
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned());
-            let existing_literal = existing
-                .and_then(|config| config.anthropic_api.as_ref())
-                .and_then(|api| api.api_key.clone());
+            let existing_literal = api.and_then(|api| api.api_key.clone());
             Some(self.ask_api_key("anthropic_api", default_env, existing_literal)?)
         } else {
             None
         };
-        if picked == "codex_sub" {
+        if ticked("codex_sub") {
+            if !detected.codex_auth {
+                self.say(&format!(
+                    "  note: there is no codex login at {} yet — `codex login` creates it, \
+                     and codex_sub answers 401s until then",
+                    self.paths.codex_auth.display()
+                ))?;
+            }
             self.say(
                 "  note: the model routing that makes the translated route useful \
                  ([providers.codex_sub.model_map] in toker.toml) is a deliberate \
-                 operator edit — none was written",
+                 operator edit — the wizard writes none",
             )?;
         }
-
-        // The openai-chat protocol's backend: openrouter is the only
-        // one, so this is a yes/no, declined by leaving whatever the
-        // config already says.
-        let openrouter = self.prompt.confirm(
-            "Use openrouter as the openai-chat backend (opencode)?",
-            true,
-        )?;
-        let openrouter_key = if openrouter {
-            let default_env = existing
-                .and_then(|config| config.openrouter.as_ref())
+        let openrouter_key = if ticked("openrouter") {
+            let openrouter = existing.and_then(|config| config.openrouter.as_ref());
+            let default_env = openrouter
                 .map(|openrouter| openrouter.api_key_env.clone())
                 .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned());
-            let existing_literal = existing
-                .and_then(|config| config.openrouter.as_ref())
-                .and_then(|openrouter| openrouter.api_key.clone());
+            let existing_literal = openrouter.and_then(|openrouter| openrouter.api_key.clone());
             Some(self.ask_api_key("openrouter", default_env, existing_literal)?)
         } else {
             None
+        };
+
+        // The anthropic protocol's default, among the ticked anthropic
+        // backends. The openai protocol has one backend, so it never
+        // asks.
+        let candidates: Vec<&'static str> = ANTHROPIC_BACKENDS
+            .iter()
+            .copied()
+            .filter(|name| ticked(name))
+            .collect();
+        let anthropic_default = match candidates.as_slice() {
+            [] => None,
+            [only] => Some(*only),
+            several => {
+                let current = existing
+                    .and_then(|config| config.default_backend_anthropic.as_deref())
+                    .unwrap_or(ANTHROPIC_BACKENDS[0]);
+                let default = several.iter().position(|name| *name == current);
+                Some(
+                    several[self.prompt.select(
+                        "Default backend for the anthropic protocol (claude and friends)? \
+                     (bare model names go here; a provider/ prefix picks another per request)",
+                        several,
+                        default.or(Some(0)),
+                    )?],
+                )
+            }
         };
 
         let awake_default = existing.map(|config| config.awake).unwrap_or(true);
@@ -1303,12 +1362,65 @@ impl<'a> Wizard<'a> {
 
         Ok(Some(Choices {
             port,
-            anthropic_backend: picked,
+            backends,
+            anthropic_default,
             anthropic_api_key,
-            openrouter,
             openrouter_key,
             awake,
         }))
+    }
+
+    /// The backend multi-select. Pre-ticked from the existing config's
+    /// enabled set when there is one, else from what the machine has: a
+    /// claude settings file or the Workhorse repos ticks anthropic_sub,
+    /// the codex CLI's login ticks codex_sub, an opencode config ticks
+    /// openrouter. An empty answer is asked again: a toker with no
+    /// backend answers every request with a not-configured error.
+    fn ask_backends(&mut self, detected: &Detected) -> Result<Vec<&'static str>> {
+        let ticked_before: Vec<&str> = match &detected.config {
+            Some(config) => config.enabled_backends(),
+            None => {
+                let has = |pick: fn(&Frontend) -> bool| {
+                    detected.frontends.iter().any(|fd| pick(&fd.frontend))
+                };
+                let mut found = Vec::new();
+                if has(|frontend| {
+                    matches!(
+                        frontend,
+                        Frontend::Claude { .. } | Frontend::ClaudeWorkhorse { .. }
+                    )
+                }) {
+                    found.push("anthropic_sub");
+                }
+                if detected.codex_auth {
+                    found.push("codex_sub");
+                }
+                if has(|frontend| matches!(frontend, Frontend::Opencode { .. })) {
+                    found.push("openrouter");
+                }
+                found
+            }
+        };
+        let defaults: Vec<usize> = BACKENDS
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| ticked_before.contains(name))
+            .map(|(index, _)| index)
+            .collect();
+        let labels: Vec<&str> = BACKENDS.iter().map(|(_, label)| *label).collect();
+        for _ in 0..3 {
+            let picked = self.prompt.multi_select(
+                "Which backends should toker serve? (space toggles, enter accepts)",
+                &labels,
+                &defaults,
+            )?;
+            if picked.is_empty() {
+                self.say("  pick at least one backend — try again")?;
+                continue;
+            }
+            return Ok(picked.into_iter().map(|index| BACKENDS[index].0).collect());
+        }
+        bail!("no backend was picked")
     }
 
     /// One api-key backend's source (plan: Credentials): an env var
@@ -1420,9 +1532,10 @@ impl<'a> Wizard<'a> {
         let config = written.expect("the write ran");
         self.say(&format!("wrote {}", self.paths.config_toml.display()))?;
         self.say(&format!(
-            "  port {}, awake {}",
+            "  port {}, awake {}, backends {}",
             config.port,
-            on_off(config.awake)
+            on_off(config.awake),
+            backends_list(&config),
         ))?;
         self.say(&format!(
             "  anthropic → {}; openai_chat → {}",
@@ -2324,25 +2437,24 @@ fn apply_choices(
     db_explicit: bool,
 ) -> Result<()> {
     config.port = choices.port;
-    // A chosen backend gets its block (its presence is what enables it);
-    // an existing block keeps its hand edits.
-    match choices.anthropic_backend.as_str() {
-        "anthropic_sub" => {
-            config.anthropic_sub.get_or_insert_with(Default::default);
+    // The ticked set is exactly the enabled set: a ticked backend gets
+    // its block (an existing block keeps its hand edits), an unticked one
+    // loses it, because a block's presence is what enables a backend.
+    let ticked = |name: &str| choices.backends.contains(&name);
+    fn keep_or_create<T: Default>(slot: &mut Option<T>, on: bool) {
+        if on {
+            slot.get_or_insert_with(T::default);
+        } else {
+            *slot = None;
         }
-        "anthropic_api" => {
-            config.anthropic_api.get_or_insert_with(Default::default);
-        }
-        "codex_sub" => {
-            config.codex_sub.get_or_insert_with(Default::default);
-        }
-        other => bail!("no anthropic backend named {other:?}"),
     }
-    config.default_backend_anthropic = Some(choices.anthropic_backend.clone());
-    if let Some(api) = config.anthropic_api.as_mut()
-        && choices.anthropic_backend == "anthropic_api"
-        && let Some(key) = &choices.anthropic_api_key
-    {
+    keep_or_create(&mut config.anthropic_sub, ticked("anthropic_sub"));
+    keep_or_create(&mut config.anthropic_api, ticked("anthropic_api"));
+    keep_or_create(&mut config.codex_sub, ticked("codex_sub"));
+    keep_or_create(&mut config.openrouter, ticked("openrouter"));
+    config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
+    config.default_backend_openai_chat = ticked("openrouter").then(|| "openrouter".to_owned());
+    if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
         match key {
             KeyChoice::Env(name) => {
                 api.api_key_env = name.clone();
@@ -2351,18 +2463,14 @@ fn apply_choices(
             KeyChoice::Literal(key) => api.api_key = Some(key.clone()),
         }
     }
-    if choices.openrouter {
-        let openrouter = config.openrouter.get_or_insert_with(Default::default);
-        if let Some(key) = &choices.openrouter_key {
-            match key {
-                KeyChoice::Env(name) => {
-                    openrouter.api_key_env = name.clone();
-                    openrouter.api_key = None;
-                }
-                KeyChoice::Literal(key) => openrouter.api_key = Some(key.clone()),
+    if let (Some(openrouter), Some(key)) = (config.openrouter.as_mut(), &choices.openrouter_key) {
+        match key {
+            KeyChoice::Env(name) => {
+                openrouter.api_key_env = name.clone();
+                openrouter.api_key = None;
             }
+            KeyChoice::Literal(key) => openrouter.api_key = Some(key.clone()),
         }
-        config.default_backend_openai_chat = Some("openrouter".to_owned());
     }
     config.awake = choices.awake;
     if !db_explicit {
@@ -2441,6 +2549,16 @@ fn key_line(provider: &str, env: &str, literal: &Option<String>) -> String {
     }
 }
 
+/// The enabled backends for the summary lines, or "none".
+fn backends_list(config: &Config) -> String {
+    let enabled = config.enabled_backends();
+    if enabled.is_empty() {
+        "none".to_owned()
+    } else {
+        enabled.join(", ")
+    }
+}
+
 /// "on"/"off" for the summary lines.
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
@@ -2480,12 +2598,23 @@ mod tests {
     #[derive(Debug, Clone)]
     enum Answer {
         Select(usize),
+        /// The ticked indices; `None` accepts the offered defaults.
+        MultiSelect(Option<Vec<usize>>),
         Confirm(bool),
         Text(String),
     }
 
     fn select(index: usize) -> Answer {
         Answer::Select(index)
+    }
+
+    fn multi(ticked: &[usize]) -> Answer {
+        Answer::MultiSelect(Some(ticked.to_vec()))
+    }
+
+    /// Accept the multi-select's pre-ticked defaults (the Enter key).
+    fn multi_defaults() -> Answer {
+        Answer::MultiSelect(None)
     }
 
     fn confirm(yes: bool) -> Answer {
@@ -2566,6 +2695,25 @@ mod tests {
             ) {
                 Answer::Select(index) => Ok(index),
                 other => panic!("select {message:?} was scripted {other:?}"),
+            }
+        }
+
+        fn multi_select(
+            &mut self,
+            message: &str,
+            options: &[&str],
+            defaults: &[usize],
+        ) -> Result<Vec<usize>> {
+            match self.next(
+                "multi_select",
+                message,
+                options,
+                false,
+                Some(format!("{defaults:?}")),
+            ) {
+                Answer::MultiSelect(Some(ticked)) => Ok(ticked),
+                Answer::MultiSelect(None) => Ok(defaults.to_vec()),
+                other => panic!("multi_select {message:?} was scripted {other:?}"),
             }
         }
 
@@ -2897,15 +3045,15 @@ default_backend_anthropic = "codex_sub"
 
     // ── the scripted answers ──────────────────────────────────────
 
-    /// A full fresh-machine run: anthropic_sub, openrouter via env,
+    /// A full fresh-machine run: anthropic_sub and openrouter ticked
+    /// (whatever detection pre-ticked), openrouter's key via env,
     /// awake on, the given port, yes to every detected frontend
     /// (claude, [workhorse,] opencode, shell rc — the caller splices
     /// the workhorse confirm in where detection found it), and no to
     /// the wake/hold/ping timers (the default with none installed).
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
-            select(0),               // anthropic backend: anthropic_sub
-            confirm(true),           // openrouter on
+            multi(&[0, 3]),          // backends: anthropic_sub + openrouter
             select(0),               // key source: env
             text(""),                // env name: keep the default
             confirm(true),           // awake
@@ -3293,7 +3441,10 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         let out = rig.out();
         assert!(out.contains("none (fresh setup)"), "the config line: {out}");
         assert!(out.contains("unknown"), "the failed socket query: {out}");
-        assert!(out.contains("codex_sub is not offered"), "{out}");
+        assert!(
+            out.contains("codex login : ") && out.contains("not found"),
+            "{out}"
+        );
         assert!(out.contains("[1/6] choose backends"), "{out}");
         assert!(out.contains("[2/6] write toker.toml"), "{out}");
         assert!(out.contains("[3/6] install + start the units"), "{out}");
@@ -3330,11 +3481,28 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         );
         assert_ne!(unwired_opencode, opencode_wired(port));
 
-        // codex_sub was not offered (no login file): the backend
-        // question carried exactly the two other options.
-        assert_eq!(
-            rig.prompt.asked()[0].options,
-            ["anthropic_sub", "anthropic_api"],
+        // One multi-select offered every backend, pre-ticked from
+        // detection: claude's settings tick anthropic_sub, opencode's
+        // config ticks openrouter, and with no codex login codex_sub is
+        // offered unticked. One anthropic backend ticked: no default
+        // question.
+        let first = &rig.prompt.asked()[0];
+        assert_eq!(first.kind, "multi_select");
+        assert_eq!(first.options.len(), 4);
+        for (option, name) in first
+            .options
+            .iter()
+            .zip(BACKENDS.iter().map(|(name, _)| name))
+        {
+            assert!(option.starts_with(name), "{option} offers {name}");
+        }
+        assert_eq!(first.default.as_deref(), Some("[0, 3]"));
+        assert!(
+            !rig.prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("Default backend")),
+            "one candidate per protocol, no default asked"
         );
     }
 
@@ -3439,8 +3607,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // The fresh script up to the port answer — the wizard
             // never reaches a frontend question.
             vec![
-                select(0),
-                confirm(true),
+                multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(0),
                 text(""),
                 confirm(true),
@@ -3484,7 +3651,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(rig.toml_path().exists());
         assert_eq!(rig.runner.installed().len(), 2);
         // And nothing was asked past the port.
-        assert_eq!(rig.prompt.asked().len(), 6);
+        assert_eq!(rig.prompt.asked().len(), 5);
     }
 
     #[tokio::test]
@@ -3494,8 +3661,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "reconfigure",
             vec![
                 select(1),               // reconfigure
-                select(2),               // codex_sub — offered, the login exists
-                confirm(false),          // openrouter declined
+                multi_defaults(),        // backends: the config's own (codex_sub)
                 confirm(true),           // awake
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
@@ -3525,11 +3691,15 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(text.contains("\"family:opus\" = \"gpt-5.6-sol\""));
         assert!(text.contains("\"family:haiku\" = \"gpt-5.6-luna\""));
 
-        // codex_sub WAS offered (the login exists) — and the note
-        // about the deliberate model-map edit was printed.
-        assert_eq!(
-            rig.prompt.asked()[1].options,
-            ["anthropic_sub", "anthropic_api", "codex_sub"],
+        // The existing config's enabled set was pre-ticked (codex_sub
+        // alone, though claude's settings exist: the config wins over
+        // detection) — and the note about the deliberate model-map edit
+        // was printed.
+        assert_eq!(rig.prompt.asked()[1].kind, "multi_select");
+        assert_eq!(rig.prompt.asked()[1].default.as_deref(), Some("[2]"));
+        assert!(
+            !text.contains("[providers.openrouter]"),
+            "not ticked, not enabled"
         );
         assert!(
             rig.out().contains("providers.codex_sub.model_map"),
@@ -3579,8 +3749,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // no opencode, no shell rc, so no plugin offer), then no
             // slots.
             vec![
-                select(0),               // anthropic backend: anthropic_sub
-                confirm(true),           // openrouter on
+                multi(&[0, 3]),          // backends: anthropic_sub + openrouter
                 select(0),               // key source: env
                 text(""),                // env name: keep the default
                 confirm(true),           // awake
@@ -3651,8 +3820,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // The fresh script without frontend confirms (nothing
             // detected), no slots, plus the import yes.
             vec![
-                select(0),
-                confirm(true),
+                multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(0),
                 text(""),
                 confirm(true),
@@ -3710,9 +3878,9 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             // questions end at the port, then the slots text.
             {
                 let mut answers = answers_fresh(port);
-                answers[2] = select(1); // key source: literal in toker.toml
-                answers[3] = text(KEY); // the key itself, masked in the real UI
-                answers.truncate(6); // nothing past the port is asked
+                answers[1] = select(1); // key source: literal in toker.toml
+                answers[2] = text(KEY); // the key itself, masked in the real UI
+                answers.truncate(5); // nothing past the port is asked
                 answers.push(confirm(false)); // wake/hold/ping timers: no
                 answers
             },
@@ -3768,13 +3936,67 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
     }
 
     #[tokio::test]
+    async fn the_ticked_set_is_the_enabled_set_and_a_default_is_asked_among_several() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "multi-select",
+            vec![
+                select(1),               // reconfigure
+                multi(&[]),              // nothing ticked: asked again
+                multi(&[0, 2]),          // anthropic_sub + codex_sub
+                select(1),               // the anthropic default: codex_sub
+                confirm(true),           // awake
+                text(&port.to_string()), // the port
+                confirm(false),          // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
+        std::fs::write(
+            rig.toml_path(),
+            "[providers.anthropic_sub]\n[providers.openrouter]\napi_key_env = \"MY_KEY\"\n",
+        )
+        .expect("seed the existing toml");
+
+        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        let asked = rig.prompt.asked();
+        // The existing config's enabled set was pre-ticked.
+        assert_eq!(asked[1].default.as_deref(), Some("[0, 3]"));
+        assert!(rig.out().contains("pick at least one backend"));
+        // The default question offered exactly the ticked anthropic
+        // backends, the existing default preselected.
+        assert_eq!(asked[3].kind, "select");
+        assert_eq!(asked[3].options, ["anthropic_sub", "codex_sub"]);
+        assert_eq!(asked[3].default.as_deref(), Some("0"));
+        // No openrouter key was asked: it is no longer ticked.
+        assert!(
+            !asked
+                .iter()
+                .any(|asked| asked.message.contains("openrouter"))
+        );
+
+        let config = Config::load_from(&rig.toml_path()).expect("the written config loads");
+        assert_eq!(
+            config.enabled_backends(),
+            vec!["anthropic_sub", "codex_sub"]
+        );
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
+        assert_eq!(config.default_backend_openai_chat, None);
+        // codex_sub ticked without a login: said so.
+        assert!(rig.out().contains("no codex login"), "{}", rig.out());
+    }
+
+    #[tokio::test]
     async fn a_state_dir_that_cannot_be_created_is_reported_with_manual_commands() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "state-dir-fail",
             vec![
-                select(0),
-                confirm(true),
+                multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(0),
                 text(""),
                 confirm(true),
@@ -3833,8 +4055,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         let mut rig = Rig::new(
             "units-fail",
             vec![
-                select(0),
-                confirm(true),
+                multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(0),
                 text(""),
                 confirm(true),
@@ -3919,7 +4140,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "plugin-declined",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the opt-out
+                answers[8] = confirm(false); // the opt-out
                 answers
             },
             vec![inactive(), ok_empty(), ok_empty()],
@@ -3958,7 +4179,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "plugin-guarded",
             {
                 let mut answers = answers_fresh(port);
-                answers[9] = confirm(false); // the reinstall refusal
+                answers[8] = confirm(false); // the reinstall refusal
                 answers
             },
             vec![inactive(), ok_empty(), ok_empty()],
@@ -4002,7 +4223,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00, 12:30")]);
+                answers.splice(9..10, [confirm(true), text("09:00, 12:30")]);
                 answers
             },
             vec![
@@ -4125,7 +4346,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-sudo-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -4211,7 +4432,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-enable-refused",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -4262,7 +4483,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-user-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
+                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -4334,7 +4555,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-default-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("")]);
+                answers.splice(9..10, [confirm(true), text("")]);
                 answers
             },
             vec![
@@ -4510,7 +4731,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-retire-stale",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(10..11, [confirm(true), text("07:20, 12:20")]);
+                answers.splice(9..10, [confirm(true), text("07:20, 12:20")]);
                 answers
             },
             vec![
