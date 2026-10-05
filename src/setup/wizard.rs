@@ -567,11 +567,20 @@ enum UrlRead {
     Base(String),
 }
 
-/// The toker port a base URL points at, when it points at toker's
-/// listener shape at all. Both of the wizard's own URL shapes count
-/// (the patchers' hand-done precedent): the bare listener claude
-/// takes and the `/v1` form opencode takes.
-fn toker_port_of(url: &str) -> Option<u16> {
+/// The predecessor proxy's (claude-token-proxy's) listener port. A
+/// frontend still wired to it reads as loopback in the same shape as
+/// toker's, so without naming it the state summary called ctp's
+/// listener toker's — toker's own port is the configured one
+/// ([`DEFAULT_PORT`] unless changed), never this.
+const CTP_PORT: u16 = 18_082;
+
+/// The loopback port a base URL points at, when it is in one of the
+/// wizard's own URL shapes at all (the patchers' hand-done precedent):
+/// the bare listener claude takes and the `/v1` form opencode takes.
+/// The port alone does not say whose listener it is; compare it with
+/// the configured port before calling it toker's. The one place a
+/// frontend base URL's shape is parsed, so a new shape is taught here.
+fn loopback_port_of(url: &str) -> Option<u16> {
     let rest = url.strip_prefix("http://127.0.0.1:")?;
     let rest = rest.strip_suffix("/v1").unwrap_or(rest);
     rest.parse().ok()
@@ -998,12 +1007,20 @@ impl<'a> Wizard<'a> {
     /// including the not-offered reasons (a frontend that is not
     /// detected is reported as such, not silently skipped).
     fn frontend_lines(&mut self, detected: &Detected) -> Result<()> {
+        let toker_port = detected
+            .config
+            .as_ref()
+            .map(|config| config.port)
+            .unwrap_or(DEFAULT_PORT);
         let claude = detected
             .frontends
             .iter()
             .find(|fd| matches!(fd.frontend, Frontend::Claude { .. }));
         match claude {
-            Some(fd) => self.say(&format!("    {}", frontend_state(&fd.frontend, &fd.url)))?,
+            Some(fd) => self.say(&format!(
+                "    {}",
+                frontend_state(&fd.frontend, &fd.url, toker_port)
+            ))?,
             None => self.say(&format!(
                 "    claude    : no {} — not offered",
                 self.paths.claude_settings.display()
@@ -1014,7 +1031,10 @@ impl<'a> Wizard<'a> {
             .iter()
             .find(|fd| matches!(fd.frontend, Frontend::ClaudeWorkhorse { .. }));
         match workhorse {
-            Some(fd) => self.say(&format!("    {}", frontend_state(&fd.frontend, &fd.url)))?,
+            Some(fd) => self.say(&format!(
+                "    {}",
+                frontend_state(&fd.frontend, &fd.url, toker_port)
+            ))?,
             None => self.say(&format!(
                 "    workhorse : no {} directory — not offered",
                 self.paths.workhorse_repos.display()
@@ -1025,7 +1045,10 @@ impl<'a> Wizard<'a> {
             .iter()
             .find(|fd| matches!(fd.frontend, Frontend::Opencode { .. }));
         match opencode {
-            Some(fd) => self.say(&format!("    {}", frontend_state(&fd.frontend, &fd.url)))?,
+            Some(fd) => self.say(&format!(
+                "    {}",
+                frontend_state(&fd.frontend, &fd.url, toker_port)
+            ))?,
             None => self.say(&format!(
                 "    opencode  : no {} — not offered",
                 self.paths.opencode_config.display()
@@ -1036,7 +1059,10 @@ impl<'a> Wizard<'a> {
             .iter()
             .find(|fd| matches!(fd.frontend, Frontend::ShellRc { .. }));
         match shell {
-            Some(fd) => self.say(&format!("    {}", frontend_state(&fd.frontend, &fd.url)))?,
+            Some(fd) => self.say(&format!(
+                "    {}",
+                frontend_state(&fd.frontend, &fd.url, toker_port)
+            ))?,
             None => {
                 let candidates: Vec<String> = self
                     .paths
@@ -1445,8 +1471,7 @@ impl<'a> Wizard<'a> {
             let frontend = &detected.frontend;
             let url = frontend.base_url(port);
             let name = frontend.describe();
-            let wired =
-                matches!(&detected.url, UrlRead::Base(found) if toker_port_of(found) == Some(port));
+            let wired = matches!(&detected.url, UrlRead::Base(found) if loopback_port_of(found) == Some(port));
             let question = if wired {
                 format!("{name} already points at toker — leave it as is?")
             } else {
@@ -1960,7 +1985,12 @@ fn apply_choices(
 
 /// One frontend's state-summary line: what its file says about its
 /// base URL, or why there is nothing to read yet.
-fn frontend_state(frontend: &Frontend, url: &UrlRead) -> String {
+///
+/// `toker_port` is the port toker is configured on before this run's
+/// answers (the existing config's, else [`DEFAULT_PORT`]): a loopback
+/// URL is toker only on that port. On [`CTP_PORT`] it is the
+/// predecessor; on any other it is shown as the URL it is.
+fn frontend_state(frontend: &Frontend, url: &UrlRead, toker_port: u16) -> String {
     let what = match frontend {
         Frontend::Opencode { .. } => "baseURL",
         _ => "ANTHROPIC_BASE_URL",
@@ -1975,9 +2005,15 @@ fn frontend_state(frontend: &Frontend, url: &UrlRead) -> String {
             frontend.describe()
         ),
         UrlRead::NoBase => format!("{}: no {what} set", frontend.describe()),
-        UrlRead::Base(url) => match toker_port_of(url) {
-            Some(port) => format!("{}: points at toker (port {port})", frontend.describe()),
-            None => format!("{}: points at {url}", frontend.describe()),
+        UrlRead::Base(url) => match loopback_port_of(url) {
+            Some(port) if port == toker_port => {
+                format!("{}: points at toker (port {port})", frontend.describe())
+            }
+            Some(CTP_PORT) => format!(
+                "{}: points at claude-token-proxy (port {CTP_PORT})",
+                frontend.describe()
+            ),
+            _ => format!("{}: points at {url}", frontend.describe()),
         },
     }
 }
@@ -2527,6 +2563,44 @@ WantedBy=sockets.target
         assert!(
             !service.contains("18082") && !service.contains("18123"),
             "no hardcoded port in the service unit"
+        );
+    }
+
+    #[test]
+    fn the_state_summary_names_whose_listener_a_frontend_points_at() {
+        let claude = Frontend::Claude {
+            settings: PathBuf::from("/home/u/.claude/settings.json"),
+        };
+        let opencode = Frontend::Opencode {
+            config: PathBuf::from("/home/u/.config/opencode/opencode.json"),
+        };
+        let base = |url: &str| UrlRead::Base(url.to_owned());
+
+        // toker only on the configured port, in either of its shapes.
+        assert_eq!(
+            frontend_state(&claude, &base("http://127.0.0.1:18123"), 18_123),
+            "claude (/home/u/.claude/settings.json): points at toker (port 18123)"
+        );
+        assert_eq!(
+            frontend_state(&opencode, &base("http://127.0.0.1:20000/v1"), 20_000),
+            "opencode (/home/u/.config/opencode/opencode.json): points at toker (port 20000)"
+        );
+
+        // The predecessor's listener is named as such, not as toker.
+        assert_eq!(
+            frontend_state(&claude, &base("http://127.0.0.1:18082"), 18_123),
+            "claude (/home/u/.claude/settings.json): points at claude-token-proxy (port 18082)"
+        );
+
+        // Any other loopback port — a stale toker port included — is
+        // just the URL; so is anything not loopback.
+        assert_eq!(
+            frontend_state(&claude, &base("http://127.0.0.1:18123"), 20_000),
+            "claude (/home/u/.claude/settings.json): points at http://127.0.0.1:18123"
+        );
+        assert_eq!(
+            frontend_state(&claude, &base("https://api.anthropic.com"), 18_123),
+            "claude (/home/u/.claude/settings.json): points at https://api.anthropic.com"
         );
     }
 
