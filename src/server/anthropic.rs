@@ -622,7 +622,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     // send — what the compaction will actually run on.
                     let compact_on = server
                         .models
-                        .compaction_target(&compact_spec(gates), prompt, backend.model_map())
+                        .compaction_target(
+                            &compact_spec(gates),
+                            prompt,
+                            backend.model_map(),
+                            &|model: &str| declared_window(&server, backend.as_ref(), model),
+                        )
                         .ok()
                         .flatten()
                         .and_then(|target| {
@@ -733,7 +738,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .unwrap_or_default() as u64;
             let target = server
                 .models
-                .compaction_target(&compact_spec(gates), prompt, backend.model_map())
+                .compaction_target(
+                    &compact_spec(gates),
+                    prompt,
+                    backend.model_map(),
+                    &|model: &str| declared_window(&server, backend.as_ref(), model),
+                )
                 .ok()
                 .flatten();
             if let Some(outcome) =
@@ -830,6 +840,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 body_bytes: forward.len() as u64,
                 min_idle_ms: cold_idle_ms(&server.config.gates),
                 now_ms: now_ms(),
+                declared: &|model: &str| declared_window(&server, backend.as_ref(), model),
             },
             &server.models,
         );
@@ -1027,6 +1038,21 @@ fn writes_free_of(server: &Server, backend: &dyn Provider, model: Option<&str>) 
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     catalogs.cache_writes_free(backend.id(), effective) == Some(true)
+}
+
+/// The backend's declared context window for `model`, from its fetched
+/// models listing: authoritative over the learned ceiling in the rewrites'
+/// fit check ([`crate::middleware::models::fits_context`]). Looked up as
+/// the identity the backend's model map will send, since the listing is
+/// keyed by what the provider serves. `None` when there is no listing or
+/// it names no window, which leaves the learned ceiling to decide.
+fn declared_window(server: &Server, backend: &dyn Provider, model: &str) -> Option<u64> {
+    let effective = model_map::preview_mapped_model(backend.model_map(), model)?;
+    let catalogs = server
+        .catalogs
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    catalogs.context_window_of(backend.id(), effective)
 }
 
 /// The compaction retarget's model spec:

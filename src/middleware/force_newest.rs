@@ -65,7 +65,7 @@ use crate::catalog::windows::model_identity;
 use crate::middleware::cold::lane_is_cold;
 use crate::middleware::lanes::Forced;
 use crate::middleware::models::{
-    ModelStore, family_of, fits_context, newer_than, newest_in_family,
+    DeclaredWindows, ModelStore, family_of, fits_context, newer_than, newest_in_family,
 };
 use crate::store::{Lane, ModelEntry};
 
@@ -137,13 +137,18 @@ pub fn idle_for_ttl(last_seen: Option<i64>, covered_since: Option<i64>, now_ms: 
 ///
 /// Strictly newer, always ([`newer_than`]); the family's learned-newest
 /// ([`newest_in_family`]); and proven at `prompt` ([`fits_context`]).
-pub fn force_target_of(entries: &[ModelEntry], model: &str, prompt: u64) -> Option<String> {
+pub fn force_target_of(
+    entries: &[ModelEntry],
+    model: &str,
+    prompt: u64,
+    declared: DeclaredWindows,
+) -> Option<String> {
     let family = family_of(model)?;
     let best = newest_in_family(entries, &family.name)?;
     if !newer_than(&best, model) {
         return None;
     }
-    if !fits_context(entries, &best, prompt) {
+    if !fits_context(entries, &best, prompt, declared) {
         return None;
     }
     Some(best)
@@ -166,7 +171,7 @@ pub fn sticky_target(lane: &Lane, model: &str) -> Option<String> {
 /// (the block inputs): the asked model, the lane record,
 /// the request shape, and the idle floor the cold gate shares. `now_ms`
 /// is the only clock (invariant 4).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ForceContext<'a> {
     /// The model the request asks for, as it stands after routing
     /// (the client's own named model). `None` when
@@ -203,6 +208,24 @@ pub struct ForceContext<'a> {
     pub min_idle_ms: Option<i64>,
     /// Now, epoch milliseconds.
     pub now_ms: i64,
+    /// The provider's declared context windows, authoritative over the
+    /// learned ceiling ([`fits_context`]).
+    pub declared: DeclaredWindows<'a>,
+}
+
+impl std::fmt::Debug for ForceContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForceContext")
+            .field("model", &self.model)
+            .field("served_as", &self.served_as)
+            .field("lane", &self.lane)
+            .field("req_messages", &self.req_messages)
+            .field("compaction", &self.compaction)
+            .field("body_bytes", &self.body_bytes)
+            .field("min_idle_ms", &self.min_idle_ms)
+            .field("now_ms", &self.now_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The whole answer for one request: leave it on the model it asked for,
@@ -281,7 +304,10 @@ pub fn decide(request: &ForceContext<'_>, models: &ModelStore) -> ForceDecision 
                 Some(lane) => lane.prompt_tokens.unwrap_or(0).max(0) as u64,
                 None => prompt_bound(request.body_bytes),
             };
-            target = models.force_target(asked, prompt).ok().flatten();
+            target = models
+                .force_target(asked, prompt, request.declared)
+                .ok()
+                .flatten();
         }
     }
 
@@ -377,7 +403,13 @@ mod tests {
             body_bytes: 1_000,
             min_idle_ms: None,
             now_ms,
+            declared: &no_window,
         }
+    }
+
+    /// No provider declaration: the learned ceiling decides.
+    fn no_window(_: &str) -> Option<u64> {
+        None
     }
 
     const NOW: i64 = 1_800_000_000_000; // a fixed, arbitrary now
@@ -395,7 +427,7 @@ mod tests {
             entry("claude-opus-4-8", &D, Some(1_000_000_000)),
         ];
         assert_eq!(
-            force_target_of(&entries, "claude-opus-4-8", 5_000),
+            force_target_of(&entries, "claude-opus-4-8", 5_000, &no_window),
             Some("claude-opus-5".to_owned())
         );
     }
@@ -413,13 +445,25 @@ mod tests {
             entry("claude-sonnet-5", &D, Some(1_000_000_000)),
         ];
         // An asked model newer than the elected newest is left alone.
-        assert_eq!(force_target_of(&entries, "claude-opus-6", 5_000), None);
+        assert_eq!(
+            force_target_of(&entries, "claude-opus-6", 5_000, &no_window),
+            None
+        );
         // So is a request already on the newest.
-        assert_eq!(force_target_of(&entries, "claude-opus-5", 5_000), None);
+        assert_eq!(
+            force_target_of(&entries, "claude-opus-5", 5_000, &no_window),
+            None
+        );
         // Families never borrow from each other, and a family nothing
         // served has no target.
-        assert_eq!(force_target_of(&entries, "claude-sonnet-5", 5_000), None);
-        assert_eq!(force_target_of(&entries, "claude-mythos-5", 5_000), None);
+        assert_eq!(
+            force_target_of(&entries, "claude-sonnet-5", 5_000, &no_window),
+            None
+        );
+        assert_eq!(
+            force_target_of(&entries, "claude-mythos-5", 5_000, &no_window),
+            None
+        );
         // The election's bar still governs which family member counts as
         // newest: a one-day newcomer stays a trial, so the move lands on
         // the proven opus-5, never the barred opus-5-5.
@@ -428,23 +472,62 @@ mod tests {
             entry("claude-opus-5-5", &D[..1], Some(1_000_000_000)),
         ];
         assert_eq!(
-            force_target_of(&young, "claude-opus-4-8", 5_000),
+            force_target_of(&young, "claude-opus-4-8", 5_000, &no_window),
             Some("claude-opus-5".to_owned()),
             "the one-day 5-5 is barred; 5 holds the family"
         );
         // An identity with no family (an unpublished snapshot, a blank)
         // is never rewritten.
         assert_eq!(
-            force_target_of(&entries, "claude-opus-4-9-20261225", 5_000),
+            force_target_of(&entries, "claude-opus-4-9-20261225", 5_000, &no_window),
             None
         );
-        assert_eq!(force_target_of(&entries, "", 5_000), None);
+        assert_eq!(force_target_of(&entries, "", 5_000, &no_window), None);
+    }
+
+    #[test]
+    fn a_declared_window_decides_the_fit_over_the_learned_ceiling() {
+        // The provider's listing is authoritative when it names a window:
+        // learning undershoots (248k learned against 1M listed, measured
+        // 2026-10-06), and a declaration is what the API will accept.
+        let small = [
+            entry("claude-opus-5", &D, Some(50_000)),
+            entry("claude-opus-4-8", &D, Some(500_000)),
+        ];
+        let million = |model: &str| (model == "claude-opus-5").then_some(1_000_000);
+        assert_eq!(
+            force_target_of(&small, "claude-opus-4-8", 400_000, &million),
+            Some("claude-opus-5".to_owned()),
+            "a declared 1M fits a 400k conversation the learning never saw"
+        );
+        // And it binds the other way: over the declaration declines,
+        // however large a prompt was learned.
+        let roomy = [
+            entry("claude-opus-5", &D, Some(900_000)),
+            entry("claude-opus-4-8", &D, Some(500_000)),
+        ];
+        let small_window = |model: &str| (model == "claude-opus-5").then_some(200_000);
+        assert_eq!(
+            force_target_of(&roomy, "claude-opus-4-8", 400_000, &small_window),
+            None
+        );
+        // A listing that is silent about the target leaves it to learning,
+        // and absence still reads as zero there.
+        let unproven = [
+            entry("claude-opus-5", &D, None),
+            entry("claude-opus-4-8", &D, Some(500_000)),
+        ];
+        let elsewhere = |model: &str| (model == "claude-opus-4-8").then_some(1_000_000);
+        assert_eq!(
+            force_target_of(&unproven, "claude-opus-4-8", 1, &elsewhere),
+            None
+        );
     }
 
     #[test]
     fn a_model_must_be_observed_holding_a_conversation_this_size() {
-        // Learned, not listed: the log records every prompt size against
-        // every model, so an unproven model declines — which costs an
+        // With no declaration the fit is learned: the log records every
+        // prompt size against every model, so an unproven model declines — which costs an
         // upgrade, where the alternative costs a failed request at the
         // worst possible moment.
         let small = [
@@ -452,12 +535,12 @@ mod tests {
             entry("claude-opus-4-8", &D, Some(500_000)),
         ];
         assert_eq!(
-            force_target_of(&small, "claude-opus-4-8", 20_000),
+            force_target_of(&small, "claude-opus-4-8", 20_000, &no_window),
             Some("claude-opus-5".to_owned()),
             "a prompt well inside what the target has served"
         );
         assert_eq!(
-            force_target_of(&small, "claude-opus-4-8", 400_000),
+            force_target_of(&small, "claude-opus-4-8", 400_000, &no_window),
             None,
             "a 400k conversation was sent to a model never seen serving more than 50k"
         );
@@ -466,7 +549,10 @@ mod tests {
             entry("claude-opus-5", &D, None),
             entry("claude-opus-4-8", &D, Some(500_000)),
         ];
-        assert_eq!(force_target_of(&unproven, "claude-opus-4-8", 1), None);
+        assert_eq!(
+            force_target_of(&unproven, "claude-opus-4-8", 1, &no_window),
+            None
+        );
     }
 
     // ── sticky ───────────────────────────────────────────────────────

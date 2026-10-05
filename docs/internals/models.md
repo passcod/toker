@@ -89,21 +89,32 @@ has nothing to lose either way. The record is rebuilt from the rows'
 `forced_from`/`forced_to` on restart (`lanes_from_rows`), or the first request
 after one would be the rebuild all over again.
 
-## Two context facts, never conflated
+## Two context facts, and which one decides a fit
 
+- A declared context window is a provider fact. For the rewrites' fit check
+  (`fits_context`, used by force-newest, the compaction retarget and the cold
+  notice's named target) it is the routed backend's fetched models listing,
+  looked up by the identity the backend's model map will send. When the listing
+  names a window it decides, both ways: a prompt over it declines whatever was
+  learned, and a prompt within it fits whatever was not.
 - `max_prompt` is the largest prompt toker (or ctp, via import) has actually
-  watched that model serve. `fits_context` consults only this value. It is the
-  conservative guard for force-newest, the compaction retarget, and promotion,
-  and an unproven model declines, which costs an upgrade where the alternative
-  costs a failed request at the worst possible moment.
-- A declared context window is a provider fact, resolved by
-  `catalog::windows::resolve_context_window` in this order: the hand-verified
-  catalogue (which encodes beta phases a listing cannot), then the provider's
-  fetched listing, then a stored declaration, then unknown. A model the
-  hand-verified catalogue knows resolves to its verdict even when that verdict
-  is unknown: an uncaptured beta phase is a decision, not a gap a listing may
-  fill. A declared ceiling is never evidence that this route has served a prompt
-  of that size, and nothing raises `max_prompt` from one.
+  watched that model serve. It decides a fit only when the listing names no
+  window, and there an unproven model declines, which costs an upgrade where
+  the alternative costs a failed request at the worst possible moment.
+
+The order was the other way round until 2026-10-06, with `max_prompt` the only
+guard. Learning undershoots by construction, since it is the largest prompt
+anyone happened to send: `claude-sonnet-5` was learned at 248k against a listed
+1,000,000, and a 485k cold compaction stayed on Opus because of it.
+
+For display and for `watch-context-window`, a window is resolved by
+`catalog::windows::resolve_context_window` in this order: the hand-verified
+catalogue (which encodes beta phases a listing cannot), then the provider's
+fetched listing, then a stored declaration, then unknown. A model the
+hand-verified catalogue knows resolves to its verdict even when that verdict is
+unknown: an uncaptured beta phase is a decision, not a gap a listing may fill.
+A declared ceiling is never evidence that this route has served a prompt of
+that size, and nothing raises `max_prompt` from one.
 
 `toker watch-context-window` (`watch.rs`) is the one place a declared or exact
 window is turned into a claim, and it claims only what a served response proves:

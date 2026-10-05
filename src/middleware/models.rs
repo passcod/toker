@@ -223,16 +223,37 @@ pub fn newest_in_family_accepting(
     best
 }
 
-/// Has a model been observed holding a conversation at least `prompt`
-/// tokens? (a learned context check:
-/// an unproven model declines, which costs an upgrade where the
-/// alternative costs a failed request at the worst possible moment.)
+/// A provider's declared context window, looked up by the identity the
+/// caller will ask about. The caller owns the lookup: the server answers
+/// from the routed backend's fetched models listing, by the identity the
+/// backend's model map will actually send. `None` when the listing names
+/// no window for it.
+pub type DeclaredWindows<'a> = &'a dyn Fn(&str) -> Option<u64>;
+
+/// Does a `prompt`-token conversation fit `model`?
+///
+/// The provider's declared window decides when it names one, either way:
+/// it is what the API will accept, and learning undershot it badly (on
+/// 2026-10-06 `claude-sonnet-5` was learned at 248k against a listed
+/// 1,000,000, and a 485k cold compaction stayed on Opus for it). Only
+/// without a declaration does the learned `max_prompt` decide: has the
+/// model been observed holding a conversation at least `prompt` tokens?
+/// An unproven model declines then, which costs an upgrade where the
+/// alternative costs a failed request at the worst possible moment.
 /// Absence reads as zero, never a free pass.
 ///
 /// Shared by the two rewrites that need it: the compaction retarget
 /// ([`compaction_target_of`]) and the force-newest move
 /// ([`crate::middleware::force_newest`]) — one shared check, both callers.
-pub(crate) fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> bool {
+pub(crate) fn fits_context(
+    entries: &[ModelEntry],
+    model: &str,
+    prompt: u64,
+    declared: DeclaredWindows,
+) -> bool {
+    if let Some(window) = declared(model) {
+        return prompt <= window;
+    }
     entries
         .iter()
         .find(|entry| entry.model_id == model)
@@ -255,6 +276,7 @@ pub fn compaction_target_of(
     spec: &str,
     prompt: u64,
     map: Option<&crate::middleware::model_map::ModelMap>,
+    declared: DeclaredWindows,
 ) -> Option<String> {
     if spec.is_empty() || spec == "off" {
         return None;
@@ -274,7 +296,7 @@ pub fn compaction_target_of(
             }),
         )
     }?;
-    if !fits_context(entries, &target, prompt) {
+    if !fits_context(entries, &target, prompt, declared) {
         return None;
     }
     Some(target)
@@ -715,9 +737,10 @@ impl ModelStore {
         spec: &str,
         prompt: u64,
         map: Option<&crate::middleware::model_map::ModelMap>,
+        declared: DeclaredWindows,
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
-        Ok(compaction_target_of(&entries, spec, prompt, map))
+        Ok(compaction_target_of(&entries, spec, prompt, map, declared))
     }
 
     /// The strictly-newer learned member of `model`'s family that a
@@ -726,10 +749,15 @@ impl ModelStore {
     /// [`crate::middleware::force_newest::force_target_of`], where the
     /// sequencing that calls it is ported). A store error propagates; the
     /// caller loses the upgrade, never the request (invariant 6).
-    pub fn force_target(&self, model: &str, prompt: u64) -> crate::store::Result<Option<String>> {
+    pub fn force_target(
+        &self,
+        model: &str,
+        prompt: u64,
+        declared: DeclaredWindows,
+    ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
         Ok(crate::middleware::force_newest::force_target_of(
-            &entries, model, prompt,
+            &entries, model, prompt, declared,
         ))
     }
 
@@ -821,6 +849,11 @@ mod tests {
     use jiff::tz::TimeZone;
     use serde_json::json;
     use std::sync::Arc;
+
+    /// No provider declaration: the learned ceiling decides.
+    fn no_window(_: &str) -> Option<u64> {
+        None
+    }
 
     fn mem_store() -> Arc<Store> {
         Arc::new(Store::open(":memory:").expect("open in-memory store"))
@@ -1380,8 +1413,13 @@ mod tests {
         // them too.
         let mut after = entries.clone();
         after[3].max_prompt = plan.max_prompt;
-        assert!(!fits_context(&entries, "claude-opus-5-5", 300_000));
-        assert!(fits_context(&after, "claude-opus-5-5", 300_000));
+        assert!(!fits_context(
+            &entries,
+            "claude-opus-5-5",
+            300_000,
+            &no_window
+        ));
+        assert!(fits_context(&after, "claude-opus-5-5", 300_000, &no_window));
 
         // An explicit ceiling overrides the family's best...
         let plan =
@@ -1567,31 +1605,62 @@ mod tests {
         // size guard passes on the model that has actually held the
         // prompt.
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 400_000, None),
+            compaction_target_of(&entries, "sonnet", 400_000, None, &no_window),
             Some("claude-sonnet-5".to_owned())
         );
         // The same spec at a prompt only the 1M window has held: still
         // sonnet-5. At a prompt nothing has held: decline.
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 900_000, None),
+            compaction_target_of(&entries, "sonnet", 900_000, None, &no_window),
             Some("claude-sonnet-5".to_owned())
         );
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 1_200_000, None),
+            compaction_target_of(&entries, "sonnet", 1_200_000, None, &no_window),
             None
+        );
+        // The listed window outranks the learned ceiling: the case that
+        // kept a 485k cold compaction on Opus on 2026-10-06, sonnet-5
+        // learned at 248k and listed at 1M. The lookup is by the identity
+        // that will be sent, so it sees the model map's target.
+        let learned_short = vec![entry("claude-sonnet-5", &days, Some(248_414))];
+        assert_eq!(
+            compaction_target_of(&learned_short, "sonnet", 485_552, None, &no_window),
+            None
+        );
+        let listed = |model: &str| (model == "claude-sonnet-5").then_some(1_000_000);
+        assert_eq!(
+            compaction_target_of(&learned_short, "sonnet", 485_552, None, &listed),
+            Some("claude-sonnet-5".to_owned())
+        );
+        assert_eq!(
+            compaction_target_of(&learned_short, "sonnet", 1_200_000, None, &listed),
+            None,
+            "over the listed window declines"
         );
         // An explicit id is a pin, not an election.
         assert_eq!(
-            compaction_target_of(&entries, "claude-sonnet-4-6", 150_000, None),
+            compaction_target_of(&entries, "claude-sonnet-4-6", 150_000, None, &no_window),
             Some("claude-sonnet-4-6".to_owned())
         );
         // "off" and "" are nothing (a falsy spec).
-        assert_eq!(compaction_target_of(&entries, "off", 1, None), None);
-        assert_eq!(compaction_target_of(&entries, "", 1, None), None);
+        assert_eq!(
+            compaction_target_of(&entries, "off", 1, None, &no_window),
+            None
+        );
+        assert_eq!(
+            compaction_target_of(&entries, "", 1, None, &no_window),
+            None
+        );
         // A family nothing served has no target, and an unknown name has
         // no family.
-        assert_eq!(compaction_target_of(&entries, "haiku", 1, None), None);
-        assert_eq!(compaction_target_of(&entries, "gpt-5.6-sol", 1, None), None);
+        assert_eq!(
+            compaction_target_of(&entries, "haiku", 1, None, &no_window),
+            None
+        );
+        assert_eq!(
+            compaction_target_of(&entries, "gpt-5.6-sol", 1, None, &no_window),
+            None
+        );
 
         // The price filter (the `accept` hook): a family whose elected
         // newest cannot be priced is no use to a rewrite that judges
@@ -1602,7 +1671,7 @@ mod tests {
             entry("claude-sonnet-5", &days, Some(1_000_000)),
         ];
         assert_eq!(
-            compaction_target_of(&mixed, "gpt-5.6-sol", 1, None),
+            compaction_target_of(&mixed, "gpt-5.6-sol", 1, None, &no_window),
             None,
             "the election refuses a candidate it cannot price"
         );
@@ -1612,7 +1681,7 @@ mod tests {
             crate::middleware::model_map::parse_model_map(r#"{"family:sonnet": "z-ai/glm-5.3"}"#)
                 .expect("map parses");
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 400_000, unpriced.as_ref()),
+            compaction_target_of(&entries, "sonnet", 400_000, unpriced.as_ref(), &no_window),
             None,
             "the alias is not price evidence"
         );
@@ -1625,13 +1694,13 @@ mod tests {
             .expect("upsert");
         assert_eq!(
             models
-                .compaction_target("sonnet", 400_000, None)
+                .compaction_target("sonnet", 400_000, None, &no_window)
                 .expect("resolve"),
             Some("claude-sonnet-5".to_owned())
         );
         assert_eq!(
             models
-                .compaction_target("off", 400_000, None)
+                .compaction_target("off", 400_000, None, &no_window)
                 .expect("resolve"),
             None
         );

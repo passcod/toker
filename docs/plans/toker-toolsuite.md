@@ -56,7 +56,7 @@ Route-scoped toggles (route = frontend × backend), enabled per route in config:
 | Lane tracking + sleep lock | always on | Lane = session × tools-hash; the ctp lane rule carries over |
 | Cold gate | any backend | Needs only idle time + prompt size per lane, which the IR always has |
 | Compaction retarget | any backend | Where the frontend protocol exposes compaction detection |
-| Force-newest model rewrite | any backend | Per-provider family map + empirical maxPrompt safety; never downgrade, never lose a cache, sticky once moved |
+| Force-newest model rewrite | any backend | Per-provider family map + context fit (listed window, else empirical maxPrompt); never downgrade, never lose a cache, sticky once moved |
 | Model routing map | route-level | Deliberate, once-per-change byte edits |
 | Quota gate + release marker | requires a meter source | Anthropic sub is the only meter source today. The meter interface is open so codex sub's usage limits can become one if their shape supports it. Marker *stripping* stays unconditional (frozen API) |
 | Ping tagging | toggle | Marks ping lanes so they never hold the sleep lock |
@@ -137,7 +137,7 @@ SQLite, `$XDG_DATA_HOME/toker/toker.db`, WAL mode. Engine choice: plain **rusqli
 
 ## Model catalogues
 
-- **Learned-newest store**: per exact model identity, days served + max prompt observed; a model becomes its family's rewrite target after enough distinct days; never beyond observed maxPrompt. *(ctp, per-provider in toker)*
+- **Learned-newest store**: per exact model identity, days served + max prompt observed; a model becomes its family's rewrite target after enough distinct days; never beyond the provider's listed window, or observed maxPrompt where none is listed. *(ctp, per-provider in toker)*
 - **Context-window ceilings**: hand-verified catalogue per provider (exact normalised identities; Anthropic native-1M/fixed-200k, Codex declarations like `gpt-5.6-sol`/`gpt-5.6-luna` at 872k, openrouter/lunaroute from their catalogues). Exact-identity matching throughout; unknown stays `?` rather than confidently wrong. *(ctp)*
 - **Pricing**: hand-verified per-provider table with a freshness date; unknown model → `costUsd: null` + one-time warning, never guessed. *(ctp)*
 
