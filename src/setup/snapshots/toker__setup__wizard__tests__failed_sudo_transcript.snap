@@ -9,6 +9,7 @@ toker setup — the state of this machine
     claude ([ROOT]/.claude/settings.json): points at https://api.anthropic.com
     workhorse : no [ROOT]/.workhorse/repos directory — not offered
     opencode ([ROOT]/.config/opencode/opencode.json): points at https://openrouter.ai/api/v1
+    codex     : no [ROOT]/.codex/config.toml or [ROOT]/.codex/auth.json — not offered
     shell rc ([ROOT]/.bashrc): no ANTHROPIC_BASE_URL set
   codex login : [ROOT]/.codex/auth.json — not found
   predecessor history : none

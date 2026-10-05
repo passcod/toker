@@ -1457,6 +1457,21 @@ impl<'a> Wizard<'a> {
                 self.paths.opencode_config.display()
             ))?,
         }
+        let codex = detected
+            .frontends
+            .iter()
+            .find(|fd| matches!(fd.frontend, Frontend::Codex { .. }));
+        match codex {
+            Some(fd) => self.say(&format!(
+                "    {}",
+                frontend_state(&fd.frontend, &fd.url, toker_port)
+            ))?,
+            None => self.say(&format!(
+                "    codex     : no {} or {} — not offered",
+                self.paths.codex_config.display(),
+                self.paths.codex_auth.display()
+            ))?,
+        }
         let shell = detected
             .frontends
             .iter()
