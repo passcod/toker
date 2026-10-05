@@ -50,7 +50,6 @@
 //! A client hangup aborts the upstream and records no row, exactly like
 //! the openai path; a hung-up stream is half a measurement, not a row.
 
-use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,7 +82,7 @@ use super::codex;
 use super::proxy::{
     MAX_ERROR_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_BUFFER, UpstreamBody, buffer_up_to,
     buffered_body, build_response, is_compressed, is_event_stream, plain_status, response_headers,
-    send_upstream, session_id,
+    send_upstream, session_id, truncated_body,
 };
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
@@ -1164,7 +1163,9 @@ async fn forward_response(
     // Non-2xx on a usage path: error row (status, error pair, retry-after
     // — never priced), body forwarded unchanged.
     if !status.is_success() {
-        let buffered = buffer_up_to(upstream, MAX_ERROR_BODY).await;
+        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            return truncated_body();
+        };
         let (error_type, error_message) = error_pair(&buffered.bytes);
         let retry_after = retry_after_ms(&upstream_headers);
         record_anthropic_error(
@@ -1188,7 +1189,9 @@ async fn forward_response(
     }
 
     // Non-SSE: buffer, observe, forward the original bytes unchanged.
-    let buffered = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await;
+    let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        return truncated_body();
+    };
     if buffered.rest.is_some() {
         tracing::warn!("non-streaming response exceeded the buffer cap; passed through unledgered");
         let body = buffered_body(buffered);
@@ -1261,7 +1264,10 @@ impl AnthropicObservedStream {
 }
 
 impl Stream for AnthropicObservedStream {
-    type Item = Result<Bytes, Infallible>;
+    /// The upstream's own error type, yielded so hyper aborts the
+    /// client's response (see the openai `ObservedStream`): a clean end
+    /// let a reset mid-turn reach claude as a complete, truncated turn.
+    type Item = reqwest::Result<Bytes>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -1275,8 +1281,8 @@ impl Stream for AnthropicObservedStream {
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(Some(Err(error))) => {
-                // Upstream transport died mid-stream: the response is
-                // truncated wherever the client lost it. No completion, no
+                // Upstream transport died mid-stream (a reset, the idle
+                // timeout): the response is truncated. No completion, no
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
@@ -1284,7 +1290,9 @@ impl Stream for AnthropicObservedStream {
                 // event fires on failure too): the in-flight hold goes
                 // with it.
                 drop(this.in_flight.take());
-                std::task::Poll::Ready(None)
+                // Yielded, so the client sees a transport error and
+                // retries, never a clean end.
+                std::task::Poll::Ready(Some(Err(error)))
             }
             std::task::Poll::Ready(None) => {
                 // Natural completion: flush the splitter's tail, finish the

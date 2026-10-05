@@ -41,7 +41,6 @@
 //!     the lane-table note (the openai lane's clock is openrouter's
 //!     10-minute sticky window, [`lanes::OPENAI_LANE_TTL_MS`]).
 
-use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::time::Instant;
@@ -423,7 +422,9 @@ pub(crate) async fn forward_upstream(
     // Non-2xx on a usage path: error row (status, type, retry-after —
     // never priced), body forwarded unchanged.
     if !status.is_success() {
-        let buffered = buffer_up_to(upstream, MAX_ERROR_BODY).await;
+        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            return truncated_body();
+        };
         let error_type = parse_error_type(&buffered.bytes);
         let retry_after = retry_after_ms(&upstream_headers);
         record_error(&ctx, status.as_u16(), error_type, retry_after);
@@ -440,7 +441,9 @@ pub(crate) async fn forward_upstream(
     }
 
     // Non-SSE: buffer, observe, forward the original bytes unchanged.
-    let buffered = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await;
+    let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        return truncated_body();
+    };
     if buffered.rest.is_some() {
         tracing::warn!("non-streaming response exceeded the buffer cap; passed through unledgered");
         let body = buffered_body(buffered);
@@ -590,27 +593,41 @@ pub(crate) struct Buffered {
     pub(crate) rest: Option<reqwest::Response>,
 }
 
-/// Buffer a response body up to `cap` bytes.
-pub(crate) async fn buffer_up_to(mut response: reqwest::Response, cap: usize) -> Buffered {
+/// Buffer a response body up to `cap` bytes. An upstream failure
+/// mid-transfer (a reset, the idle timeout) is an error, not a short
+/// buffer: these bytes were once forwarded as a whole body under the
+/// upstream's status, so a truncated turn reached the client as a
+/// complete one, and a client that accepts it never retries.
+pub(crate) async fn buffer_up_to(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Buffered, reqwest::Error> {
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if bytes.len() + chunk.len() > cap {
-                    return Buffered {
+                    return Ok(Buffered {
                         bytes,
                         rest: Some(response),
-                    };
+                    });
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(None) => return Buffered { bytes, rest: None },
+            Ok(None) => return Ok(Buffered { bytes, rest: None }),
             Err(error) => {
                 tracing::warn!(%error, "upstream response body failed mid-transfer");
-                return Buffered { bytes, rest: None };
+                return Err(error);
             }
         }
     }
+}
+
+/// The answer when [`buffer_up_to`] failed: the body never arrived
+/// whole, so nothing of it is forwarded and no row is written — the
+/// buffered mirror of an aborted stream.
+pub(crate) fn truncated_body() -> Response {
+    plain_status(StatusCode::BAD_GATEWAY, "upstream response failed\n")
 }
 
 /// The response body for a buffered-then-maybe-overflowed response: the
@@ -678,7 +695,12 @@ impl ObservedStream {
 }
 
 impl Stream for ObservedStream {
-    type Item = Result<Bytes, Infallible>;
+    /// The upstream's own error type: an upstream failure is yielded, not
+    /// swallowed, so hyper aborts the client's response instead of
+    /// terminating it cleanly. A cleanly ended stream once let a
+    /// connection reset mid-turn reach the client as a complete
+    /// (truncated) turn, which it accepted rather than retried.
+    type Item = reqwest::Result<Bytes>;
 
     fn poll_next(
         self: Pin<&mut Self>,
@@ -692,8 +714,8 @@ impl Stream for ObservedStream {
                 std::task::Poll::Ready(Some(Ok(chunk)))
             }
             std::task::Poll::Ready(Some(Err(error))) => {
-                // Upstream transport died mid-stream: the response is
-                // truncated wherever the client lost it. No completion, no
+                // Upstream transport died mid-stream (a reset, the idle
+                // timeout): the response is truncated. No completion, no
                 // row — drop the context so a later poll cannot record one.
                 tracing::warn!(%error, "upstream response stream failed");
                 this.ctx.take();
@@ -701,7 +723,9 @@ impl Stream for ObservedStream {
                 // event fires on failure too): the in-flight hold goes
                 // with it.
                 drop(this.in_flight.take());
-                std::task::Poll::Ready(None)
+                // Yielded, so the client sees a transport error (the
+                // predecessor destroyed the response), never a clean end.
+                std::task::Poll::Ready(Some(Err(error)))
             }
             std::task::Poll::Ready(None) => {
                 // Natural completion: flush the splitter's tail, finish the

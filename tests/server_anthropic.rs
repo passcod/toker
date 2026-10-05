@@ -237,15 +237,42 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             // and the abort must propagate (the Drop flag proves it).
             let body = Body::from_stream(Hanging {
                 mock: mock.clone(),
-                first: Some(Bytes::from_static(
-                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2}}}\n\n",
-                )),
+                first: Some(Bytes::from_static(MESSAGE_START)),
             });
             let mut response = Response::new(body);
             *response.status_mut() = StatusCode::OK;
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
+            );
+            metered(&mut response, "0.4127");
+            response
+        }
+        "drop-mid" if stream => {
+            // First event, then the connection dies: a reset mid-turn.
+            let body = Body::from_stream(fail_after(MESSAGE_START, "connection reset mid-turn"));
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            metered(&mut response, "0.4127");
+            response
+        }
+        "drop-mid" | "drop-mid-401" => {
+            // Half a JSON body, then the connection dies: what arrived
+            // must not be forwarded as if it were the whole body.
+            let body = Body::from_stream(fail_after(
+                br#"{"type":"message","usage":{"#,
+                "connection reset mid-body",
+            ));
+            let mut response = Response::new(body);
+            if model == "drop-mid-401" {
+                *response.status_mut() = StatusCode::UNAUTHORIZED;
+            }
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
             );
             metered(&mut response, "0.4127");
             response
@@ -285,6 +312,30 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         }
     }
 }
+
+/// A body that delivers `first`, then fails. The pause between them lets
+/// the mock's hyper flush the headers and the first bytes; an error in
+/// the same poll would abort the response before anything went out,
+/// which is a different failure (no response at all).
+fn fail_after(
+    first: &'static [u8],
+    error: &'static str,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    futures::stream::unfold(0, move |step| async move {
+        match step {
+            0 => Some((Ok(Bytes::from_static(first)), 1)),
+            1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Some((Err(std::io::Error::other(error)), 2))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The opening event of a turn, alone: what a stream that fails or
+/// stalls mid-turn has already delivered.
+const MESSAGE_START: &[u8] = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2}}}\n\n";
 
 async fn mock_count_tokens(State(mock): State<MockState>, request: Request) -> Response {
     let (_path, _headers, _json, _stream) = read_and_capture(&mock, request).await;
@@ -1366,6 +1417,56 @@ async fn client_hangup_aborts_the_upstream_and_records_no_row() {
     // A hung-up stream records no row (plan: Server core).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+/// Read a response body to its end: `Err` when the transfer was
+/// aborted rather than terminated.
+async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[tokio::test]
+async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_no_row() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let response = post_messages(addr, "/v1/messages", &[], &messages_body("drop-mid", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The stream once ended cleanly here, so claude saw a properly
+    // terminated (truncated) turn and accepted it instead of retrying.
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), read_to_end(response))
+        .await
+        .expect("the client response ends promptly");
+    assert!(
+        read.is_err(),
+        "the client sees a transport error, not a clean end: {read:?}"
+    );
+
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // A 2xx body and an error body alike: half of either was once
+    // forwarded under the upstream's status as if it were whole.
+    for model in ["drop-mid", "drop-mid-401"] {
+        let response = post_messages(addr, "/v1/messages", &[], &messages_body(model, false)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{model}");
+        let body = response.bytes().await.expect("the 502 itself is whole");
+        assert!(
+            !body.starts_with(b"{"),
+            "{model}: none of the truncated body is forwarded"
+        );
+    }
+
+    assert_no_rows(&store).await;
 }
 
 /// Whether raw request bytes still contain the release marker.

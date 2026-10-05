@@ -36,7 +36,7 @@ use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
 use crate::server::InFlightGuard;
-use crate::server::proxy::{MAX_ERROR_BODY, buffer_up_to, plain_status};
+use crate::server::proxy::{MAX_ERROR_BODY, buffer_up_to, plain_status, truncated_body};
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_codex_measurement};
@@ -182,7 +182,9 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         // A provider error, translated: the client sees an anthropic
         // error naming the mapped type; the row records the real
         // upstream status with the same mapping.
-        let buffered = buffer_up_to(upstream, MAX_ERROR_BODY).await;
+        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            return truncated_body();
+        };
         let error = parse_upstream_error(&buffered.bytes);
         let kind = translate::anthropic_error_type(&error);
         let message = error
@@ -293,7 +295,11 @@ async fn aggregated_turn(
 /// event, the in-flight guard riding the stream (dropped when the client
 /// goes away or the turn completes, whichever comes first). The row
 /// lands when the turn completes — a hung-up stream records nothing,
-/// like every other path.
+/// like every other path. An upstream that fails mid-turn (a reset, the
+/// idle timeout, or a close before the turn's terminator) aborts the
+/// client's response after the events already translated: the
+/// translation must not end cleanly on a turn the upstream never
+/// finished, or the client takes the truncated turn as complete.
 #[allow(clippy::too_many_arguments)]
 async fn streamed_turn(
     _server: Server,
@@ -311,6 +317,7 @@ async fn streamed_turn(
         capture: TurnCapture::new(),
         pending: VecDeque::new(),
         done: false,
+        failure: None,
         record,
         meters,
         in_flight,
@@ -319,10 +326,12 @@ async fn streamed_turn(
     let stream = futures::stream::unfold(state, |mut state| async move {
         loop {
             if let Some(bytes) = state.pending.pop_front() {
-                return Some((Ok::<Bytes, std::convert::Infallible>(bytes), state));
+                return Some((Ok(bytes), state));
             }
             if state.done {
-                return None;
+                // A failure is yielded once, after the events that did
+                // arrive, so hyper aborts the response; then the end.
+                return state.failure.take().map(|error| (Err(error), state));
             }
             match state.upstream.chunk().await {
                 Ok(Some(chunk)) => {
@@ -337,11 +346,22 @@ async fn streamed_turn(
                     if let Some(event) = state.sse.finish() {
                         state.observe(&event);
                     }
-                    state.finish();
+                    if state.capture.turn_ended() || state.capture.error().is_some() {
+                        state.finish();
+                    } else {
+                        // Closed before the terminator: the codex client
+                        // treats this as an error, and so does the
+                        // aggregated shape (502) — never a clean end.
+                        tracing::warn!("codex stream closed before response.completed");
+                        state.fail(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "codex stream closed before response.completed",
+                        ));
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "codex stream failed mid-turn");
-                    state.done = true;
+                    state.fail(std::io::Error::other(error));
                 }
             }
         }
@@ -365,12 +385,14 @@ struct StreamState {
     capture: TurnCapture,
     pending: VecDeque<Bytes>,
     done: bool,
+    /// The upstream failure still to be yielded to the client, once the
+    /// pending events are out.
+    failure: Option<std::io::Error>,
     record: Option<AnthropicRecordCtx>,
     meters: Option<Value>,
-    /// Held, never read: the guard's Drop (when the client goes away or
-    /// the turn completes) is the point — the in-flight count must live
-    /// exactly as long as the stream does.
-    #[allow(dead_code)]
+    /// The guard's Drop (when the client goes away, the turn completes,
+    /// or the upstream fails) is the point — the in-flight count must
+    /// live exactly as long as the exchange does.
     in_flight: Option<InFlightGuard>,
 }
 
@@ -384,7 +406,16 @@ impl StreamState {
         self.capture.observe(event);
     }
 
-    /// The turn ended (or the stream died): write the row, close out.
+    /// The upstream failed mid-turn: no row (no usage arrived), the
+    /// in-flight hold released now, and the error queued for the client.
+    fn fail(&mut self, error: std::io::Error) {
+        self.done = true;
+        self.record = None;
+        self.failure = Some(error);
+        drop(self.in_flight.take());
+    }
+
+    /// The turn ended: write the row, close out.
     fn finish(&mut self) {
         self.done = true;
         let Some(ctx) = self.record.as_ref() else {
@@ -402,8 +433,8 @@ impl StreamState {
         } else if self.capture.turn_ended() {
             record_codex_measurement(ctx, &self.capture, self.meters.clone(), 200);
         }
-        // A stream that died without a terminator records nothing: no
-        // usage arrived, and a hung-up client produces no row.
+        // A stream that died without a terminator never reaches here
+        // ([`StreamState::fail`]), and a hung-up client produces no row.
     }
 }
 

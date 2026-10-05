@@ -186,6 +186,26 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
             );
             response
         }
+        "drop-mid" => {
+            // First bytes, then the connection dies: a reset mid-body,
+            // on the stream and the buffered shape alike.
+            let first: &'static [u8] = if stream {
+                b"data: {\"id\":\"gen-drop\",\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+            } else {
+                br#"{"id":"gen-drop","choices":["#
+            };
+            let body = Body::from_stream(fail_after(first));
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }),
+            );
+            response
+        }
         _ if stream => raw_response(
             StatusCode::OK,
             "text/event-stream",
@@ -197,6 +217,22 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
             Bytes::from_static(NON_STREAM_BODY.as_bytes()),
         ),
     }
+}
+
+/// A body that delivers `first`, then fails. The pause between them lets
+/// the mock's hyper flush the headers and the first bytes; an error in
+/// the same poll would abort the response before anything went out.
+fn fail_after(first: &'static [u8]) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    futures::stream::unfold(0, move |step| async move {
+        match step {
+            0 => Some((Ok(Bytes::from_static(first)), 1)),
+            1 => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Some((Err(std::io::Error::other("connection reset")), 2))
+            }
+            _ => None,
+        }
+    })
 }
 
 /// An SSE body that yields one chunk then never completes, marking its
@@ -950,6 +986,52 @@ async fn client_hangup_aborts_the_upstream_and_records_no_row() {
 
     // A hung-up stream records no row (plan: Server core).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+/// Read a response body to its end: `Err` when the transfer was
+/// aborted rather than terminated.
+async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[tokio::test]
+async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_no_row() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    let response = post_chat(addr, &chat_body("drop-mid", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), read_to_end(response))
+        .await
+        .expect("the client response ends promptly");
+    assert!(
+        read.is_err(),
+        "the client sees a transport error, not a clean end: {read:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    let response = post_chat(addr, &chat_body("drop-mid", false)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.bytes().await.expect("the 502 itself is whole");
+    assert!(
+        !body.starts_with(b"{"),
+        "none of the truncated body is forwarded"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(store.count_requests().expect("count"), 0);
 }
 

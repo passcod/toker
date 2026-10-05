@@ -125,6 +125,17 @@ fn expected_meters() -> Value {
     })
 }
 
+/// The first events of the tool-call fixture — whole events, everything
+/// before the first completed item — with no terminator.
+fn turn_opening() -> Bytes {
+    let turn = fixture("01_tool_call_turn.sse");
+    let cut = turn
+        .windows(b"event: response.output_item.done".len())
+        .position(|window| window == b"event: response.output_item.done")
+        .expect("the fixture completes an item");
+    turn.slice(..cut)
+}
+
 async fn mock_responses(State(mock): State<MockState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
@@ -155,6 +166,35 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
                 br#"{"error":{"type":"authentication_error","message":"bad token"}}"#,
             ),
         ),
+        // The turn's opening events, then the connection dies (a reset
+        // mid-turn) or closes cleanly before `response.completed`.
+        "drop-mid" | "eof-mid" => {
+            let opening = turn_opening();
+            let reset = model == "drop-mid";
+            let body = Body::from_stream(futures::stream::unfold(0, move |step| {
+                let opening = opening.clone();
+                async move {
+                    match step {
+                        0 => Some((Ok(opening), 1)),
+                        // The pause lets the mock flush the headers and
+                        // the opening, and toker its translation of it;
+                        // an end in the same poll would abort before
+                        // anything went out — a different failure.
+                        1 => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            reset.then(|| (Err(std::io::Error::other("connection reset")), 2))
+                        }
+                        _ => None,
+                    }
+                }
+            }));
+            let mut response = Response::new(body);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        }
         "failed" => raw_response(
             StatusCode::OK,
             "text/event-stream",
@@ -711,4 +751,50 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(store.requests_since(0, 100).expect("rows").is_empty());
+}
+
+/// Read a response body to its end: `Err` when the transfer was
+/// aborted rather than terminated.
+async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[tokio::test]
+async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_no_row() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "drop-mid",
+        upstream,
+        login_dir("drop-mid").join("auth.json"),
+        false,
+    ))
+    .await;
+
+    // A reset mid-turn, and a clean close before the terminator: the
+    // translation once ended cleanly on both, handing claude a turn the
+    // upstream never finished.
+    for model in ["drop-mid", "eof-mid"] {
+        let response = client()
+            .post(format!("http://{addr}/v1/messages"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(messages_body(model, true))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let read = tokio::time::timeout(std::time::Duration::from_secs(10), read_to_end(response))
+            .await
+            .expect("the client response ends promptly");
+        assert!(
+            read.is_err(),
+            "{model}: the client sees a transport error, not a clean end: {read:?}"
+        );
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(store.count_requests().expect("count"), 0, "no row");
 }
