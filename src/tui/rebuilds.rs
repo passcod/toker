@@ -784,9 +784,9 @@ mod tests {
         // No ladders fetched: the detail claims the chars and the
         // block, and no position.
         super::localise(&mut walked.events, &HashMap::new(), &Fmt::fixed());
-        assert_eq!(
-            walked.events[0].detail.as_deref(),
-            Some("43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars)")
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars)"
         );
 
         // With the ladders: block 1, in the last 8 bytes — the README's
@@ -815,9 +815,9 @@ mod tests {
         .into_iter()
         .collect();
         super::localise(&mut walked.events, &ladders, &Fmt::fixed());
-        assert_eq!(
-            walked.events[0].detail.as_deref(),
-            Some("43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars), in the last 8 bytes")
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars), in the last 8 bytes"
         );
 
         // A stored capture-time localisation wins over the re-derived
@@ -833,9 +833,9 @@ mod tests {
             },
         );
         super::localise(&mut walked.events, &stored, &Fmt::fixed());
-        assert_eq!(
-            walked.events[0].detail.as_deref(),
-            Some("43,696 → 43,801 chars; block 1, in the last 8 bytes")
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"43,696 → 43,801 chars; block 1, in the last 8 bytes"
         );
     }
 
@@ -879,9 +879,9 @@ mod tests {
 
         let mut walked = walk(&[prev, changed], 30 * MIN);
         super::localise(&mut walked.events, &ladders, &Fmt::fixed());
-        assert_eq!(
-            walked.events[0].detail.as_deref(),
-            Some("20,000 → 20,000 chars; between bytes 8192 and 16384")
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"20,000 → 20,000 chars; between bytes 8192 and 16384"
         );
     }
 
@@ -930,11 +930,9 @@ mod tests {
 
         let mut walked = walk(&[prev, changed], 30 * MIN);
         super::localise(&mut walked.events, &ladders, &Fmt::fixed());
-        assert_eq!(
-            walked.events[0].detail.as_deref(),
-            Some(
-                "130,000 → 130,000 chars; block 0 (130,000 → 130,000 chars), beyond the last 1024 bytes"
-            )
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"130,000 → 130,000 chars; block 0 (130,000 → 130,000 chars), beyond the last 1024 bytes"
         );
     }
 

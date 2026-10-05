@@ -2484,9 +2484,17 @@ mod tests {
         text
     }
 
+    /// Snapshot a whole rendered frame, each row's trailing blank cells
+    /// trimmed so the snapshot reads as the screen does.
+    fn frame_snapshot(name: &str, text: &str) {
+        let rows: Vec<&str> = text.lines().map(str::trim_end).collect();
+        insta::assert_snapshot!(name, rows.join("\n"));
+    }
+
     #[test]
     fn renders_all_panels_at_a_comfortable_size() {
         let text = rendered(&snapshot(), 100, 30);
+        frame_snapshot("frame_100x30", &text);
         for expected in [
             "last 30m",
             "12:34:56",
@@ -2934,6 +2942,7 @@ mod tests {
         // holds every meter line at full width — bar, resets clock,
         // status, verdict.
         let text = rendered(&snap, 200, 30);
+        frame_snapshot("quota_frame_200x30", &text);
         assert!(text.contains("RATE & QUOTA"));
         // The 5-hour meter: measured burn that resets first, gated by
         // overageInUse, so the countdown is to exhaustion — but the
@@ -3151,23 +3160,13 @@ mod tests {
         // went. Now the bar gives up cells first: the resets clause
         // stays and the bar takes the 12 cells left.
         let text = meter_text(&snap, "5-hour", 60);
-        assert_eq!(
-            text,
-            format!(
-                "  5-hour   {}  32% resets 15:53 · gated · on track",
-                "█".repeat(4) + &"░".repeat(8)
-            )
-        );
+        assert!(text.contains("resets"), "{text:?}");
+        insta::assert_snapshot!(text, @"  5-hour   ████░░░░░░░░  32% resets 15:53 · gated · on track");
         // The status still goes before the clock: with it, the bar
         // would fall under its floor.
         let text = meter_text(&snap, "overage", 60);
-        assert_eq!(
-            text,
-            format!(
-                "  overage  {}  64% resets 10 Feb · estimating",
-                "█".repeat(11) + &"░".repeat(6)
-            )
-        );
+        assert!(text.contains("resets"), "{text:?}");
+        insta::assert_snapshot!(text, @"  overage  ███████████░░░░░░  64% resets 10 Feb · estimating");
         // Under the floor the clock goes and the bar grows back.
         let text = meter_text(&snap, "5-hour", 50);
         assert!(!text.contains("resets"), "{text:?}");
@@ -3227,8 +3226,7 @@ mod tests {
             }
             text
         };
-        assert_eq!(
-            line(
+        insta::assert_snapshot!(line(
                 Spent::Measured {
                     points: 0.03,
                     floor: false
@@ -3237,22 +3235,17 @@ mod tests {
                     points: 0.004,
                     floor: false
                 }
-            ),
-            "  spent    today +3%  ·  30m <1%"
-        );
-        assert_eq!(
-            line(
+            ), @"  spent    today +3%  ·  30m <1%");
+        insta::assert_snapshot!(line(
                 Spent::Measured {
                     points: 0.06,
                     floor: true
                 },
                 Spent::Idle
-            ),
-            "  spent    today ≥6%  ·  30m idle"
-        );
-        assert_eq!(
+            ), @"  spent    today ≥6%  ·  30m idle");
+        insta::assert_snapshot!(
             line(Spent::NoData, Spent::NoData),
-            "  spent    today no data  ·  30m no data"
+            @"  spent    today no data  ·  30m no data"
         );
     }
 
@@ -3274,6 +3267,7 @@ mod tests {
         let snap = full_snapshot();
         // 120 wide: every column survives; 40 tall: every panel fits.
         let text = rendered(&snap, 120, 40);
+        frame_snapshot("full_frame_120x40", &text);
         for expected in [
             "ctx", "msgs", "↺", "1M",   // ses-hot's native ceiling, bright green
             "200k", // ses-crowded's fixed window
@@ -3693,6 +3687,7 @@ mod tests {
             ..plain()
         };
         let on = text_of(&buffer_with(&snap, 100, 30, &ui));
+        frame_snapshot("legend_100x30", &on);
         for expected in [
             "LEGEND",
             "served on a newer model",
@@ -3728,7 +3723,7 @@ mod tests {
             "2 of 9 requests rewrote ≥50,000 tokens",
             "system prompt changed",
             "new prefix / first turn",
-            "· ses-hot — system prompt changed (43,696 → 43,801 chars; block 1, in the last 8 bytes)",
+            "· ses-hot — system prompt changed",
         ] {
             assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
         }
@@ -3817,6 +3812,7 @@ mod tests {
         // 100×30: boxed still, but the two lists cannot both be whole.
         // They split the room, and each cut list says what it hid.
         let text = rendered(&snap, 100, 30);
+        frame_snapshot("full_frame_100x30", &text);
         assert!(text.contains("┌SESSIONS"), "{text}");
         assert!(text.contains("… 2 more sessions"), "{text}");
         assert!(text.contains("… 2 more"), "{text}");
