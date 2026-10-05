@@ -452,7 +452,19 @@ WantedBy=sockets.target
 /// hardcoded path, and `ReadWritePaths` the configured state dir
 /// rather than `%h` (the state dir follows `$XDG_DATA_HOME`, which
 /// `%h` cannot express).
-pub fn service_unit(exe: &Path, state_dir: &Path) -> String {
+///
+/// `extra_writable` are directories outside the state dir the service
+/// must write: the codex login's, when codex_sub is enabled, because a
+/// refresh persists the new tokens by renaming over `auth.json` there.
+/// Under `ProtectHome=read-only` that rename failed, so every refresh
+/// was lost and the next start refreshed again from the stale token.
+/// Each is `-`-prefixed: a missing one is skipped, where a missing state
+/// dir must fail the start (it is where the ledger lives).
+pub fn service_unit(exe: &Path, state_dir: &Path, extra_writable: &[PathBuf]) -> String {
+    let extra: String = extra_writable
+        .iter()
+        .map(|dir| format!("ReadWritePaths=-{}\n", dir.display()))
+        .collect();
     format!(
         r#"[Unit]
 Description=toker proxy service (socket-activated)
@@ -472,14 +484,14 @@ SyslogIdentifier=toker
 
 # Hardening, following the established hand-installed unit pattern.
 # MemoryDenyWriteExecute is safe for a Rust binary. The state dir is
-# the only writable path; credentials pass through in transit and are
-# never written to disk by the proxy itself.
+# writable, plus any login directory a backend refreshes in place
+# (codex); credentials otherwise pass through in transit.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths={state_dir}
-ProtectKernelTunables=true
+{extra}ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -493,6 +505,18 @@ MemoryDenyWriteExecute=true
         exe = exe.display(),
         state_dir = state_dir.display(),
     )
+}
+
+/// The directories outside the state dir that `config`'s backends write
+/// (see [`service_unit`]).
+pub fn extra_writable(config: &Config) -> Vec<PathBuf> {
+    config
+        .codex_sub
+        .as_ref()
+        .and_then(|codex| codex.auth_path.parent())
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect()
 }
 
 /// `toker-wake.timer` — the SYSTEM unit (plan: "Sleep lock, wake,
@@ -1085,7 +1109,7 @@ impl<'a> Wizard<'a> {
             ))?;
         }
 
-        if self.units_step(current.port, &mut report)? {
+        if self.units_step(&current, &mut report)? {
             self.verify_step(&current, &detected, &mut report).await?;
             self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
@@ -1741,12 +1765,16 @@ impl<'a> Wizard<'a> {
     /// non-fatal and reported with the manual commands — but the
     /// return value is the spine: `false` means the run stops here
     /// (no verify, no frontends, no import).
-    fn units_step(&mut self, port: u16, report: &mut RunReport) -> Result<bool> {
+    fn units_step(&mut self, current: &Config, report: &mut RunReport) -> Result<bool> {
         self.step(Step::InstallUnits)?;
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
+        let port = current.port;
         let units = [
             (SOCKET_UNIT, socket_unit(port)),
-            (SERVICE_UNIT, service_unit(&exe, &self.paths.state_dir)),
+            (
+                SERVICE_UNIT,
+                service_unit(&exe, &self.paths.state_dir, &extra_writable(current)),
+            ),
         ];
 
         let mut ok = true;
@@ -3375,6 +3403,38 @@ default_backend_anthropic = "codex_sub"
     // ── the tests ──────────────────────────────────────────────────
 
     #[test]
+    fn codex_s_login_dir_is_writable_only_when_codex_is_enabled() {
+        // A refresh renames over auth.json in its own directory; under
+        // ProtectHome=read-only that failed and every refresh was lost.
+        let dir = crate::setup::test_dir("codex-writable");
+        let with = dir.join("with.toml");
+        std::fs::write(
+            &with,
+            "[providers.codex_sub]\nauth_path = \"/home/u/.codex/auth.json\"\n",
+        )
+        .expect("write config");
+        let config = Config::load_from(&with).expect("loads");
+        assert_eq!(
+            extra_writable(&config),
+            vec![PathBuf::from("/home/u/.codex")]
+        );
+        let unit = service_unit(
+            Path::new("/opt/toker/toker"),
+            Path::new("/srv/state/toker"),
+            &extra_writable(&config),
+        );
+        assert!(unit.contains("ReadWritePaths=/srv/state/toker\n"));
+        // Optional: a missing login dir must not fail the start the way a
+        // missing state dir does.
+        assert!(unit.contains("ReadWritePaths=-/home/u/.codex\n"));
+
+        let without = dir.join("without.toml");
+        std::fs::write(&without, "[providers.anthropic_sub]\n").expect("write config");
+        let config = Config::load_from(&without).expect("loads");
+        assert!(extra_writable(&config).is_empty());
+    }
+
+    #[test]
     fn the_unit_templates_are_pinned() {
         // The socket: the hand-installed unit as a function of the
         // configured port (nothing machine-specific survives).
@@ -3386,7 +3446,11 @@ default_backend_anthropic = "codex_sub"
 
         // The service: the binary path and state dir substitute, and
         // every hardening line from the hand-installed unit survives.
-        let service = service_unit(Path::new("/opt/toker/toker"), Path::new("/srv/state/toker"));
+        let service = service_unit(
+            Path::new("/opt/toker/toker"),
+            Path::new("/srv/state/toker"),
+            &[],
+        );
         assert!(service.contains("ExecStart=\"/opt/toker/toker\" serve"));
         for line in [
             "Requires=toker.socket",
@@ -3574,7 +3638,7 @@ default_backend_anthropic = "codex_sub"
                 (SOCKET_UNIT.to_owned(), socket_unit(port)),
                 (
                     SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().state_dir)
+                    service_unit(&exe, &rig.paths().state_dir, &[])
                 ),
             ],
             "the units generated are functions of current_exe and the state dir"
@@ -4634,7 +4698,7 @@ default_backend_anthropic = "codex_sub"
                 (SOCKET_UNIT.to_owned(), socket_unit(port)),
                 (
                     SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().state_dir)
+                    service_unit(&exe, &rig.paths().state_dir, &[])
                 ),
                 (HOLD_TIMER_UNIT.to_owned(), hold_timer),
                 (HOLD_SERVICE_UNIT.to_owned(), hold_service),

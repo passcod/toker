@@ -54,9 +54,11 @@ The codex login is shared with the codex CLI, which refreshes the same file on
 its own schedule. `providers/codex/auth.rs` re-reads it right before every
 refresh and adopts the CLI's tokens if they moved; the race that remains is
 documented there. That refresh is the one write toker makes outside its state
-dir. As the unit template in `setup/wizard.rs` stands (`ProtectHome=read-only`,
-`ReadWritePaths` the state dir alone), the service cannot write that file, so
-check that before relying on a refresh from the service rather than the CLI.
+dir, and it renames over `auth.json`, so it needs the whole directory. The unit
+runs under `ProtectHome=read-only`, so setup adds that directory as an optional
+`ReadWritePaths=-` entry when codex_sub is enabled (`extra_writable` in
+`setup/wizard.rs`). Before that, every refresh from the service failed to
+persist. A unit written by an older setup still lacks it: re-run `toker setup`.
 
 ## The `/f/<frontend>` prefix
 

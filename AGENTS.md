@@ -19,7 +19,8 @@ and meter snapshots are tables there, not files. Config is
 `toker setup` and read by the service. Anything new the service writes goes in
 the state dir, and tests get a temp directory, never the real ledger. The one
 write outside it is the codex login refresh, which rewrites the codex CLI's own
-`~/.codex/auth.json` (see [routing.md](docs/internals/routing.md)).
+`~/.codex/auth.json`; setup makes that directory writable in the unit only when
+codex_sub is enabled (see [routing.md](docs/internals/routing.md)).
 
 ## Invariants
 
