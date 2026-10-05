@@ -518,8 +518,16 @@ fn rebuild_snapshot(
     ids.sort_unstable();
     ids.dedup();
     let localisation = store.localisation_rows(&ids)?;
-    let by_id: std::collections::HashMap<_, _> =
+    let mut by_id: std::collections::HashMap<_, _> =
         localisation.into_iter().map(|row| (row.id, row)).collect();
+    // A predecessor that dropped its ladders: its prompt's rungs, by hash.
+    // A failed lookup localises less, never fails the panel.
+    rebuilds::fill_baselines(&walk.events, &mut by_id, |session, tools, hash, at| {
+        store
+            .lane_system_ladders(session, tools, hash, at)
+            .ok()
+            .flatten()
+    });
     rebuilds::localise(&mut walk.events, &by_id, fmt);
     Ok(Some(rebuilds::aggregate(walk)))
 }
@@ -1375,7 +1383,16 @@ mod tests {
             localisation.len(),
             ids.len(),
         );
-        let by_id: HashMap<_, _> = localisation.into_iter().map(|row| (row.id, row)).collect();
+        let mut by_id: HashMap<_, _> = localisation.into_iter().map(|row| (row.id, row)).collect();
+        crate::tui::rebuilds::fill_baselines(
+            &walk.events,
+            &mut by_id,
+            |session, tools, hash, at| {
+                store
+                    .lane_system_ladders(session, tools, hash, at)
+                    .expect("read a baseline's rungs")
+            },
+        );
         crate::tui::rebuilds::localise(&mut walk.events, &by_id, &crate::tui::locale::Fmt::fixed());
         let rebuilds = crate::tui::rebuilds::aggregate(walk);
         eprintln!(
@@ -1389,12 +1406,25 @@ mod tests {
         for (cause, count) in &rebuilds.causes {
             eprintln!("  {:<24} {}", cause.label(), count);
         }
-        for event in rebuilds
+        let system: Vec<_> = rebuilds
             .events
             .iter()
             .filter(|event| event.cause == crate::tui::rebuilds::Cause::SystemPrompt)
-            .take(3)
-        {
+            .collect();
+        let unknown = system
+            .iter()
+            .filter(|event| {
+                event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.ends_with("where unknown"))
+            })
+            .count();
+        eprintln!(
+            "system prompt changes: {} ({unknown} with no position)",
+            system.len()
+        );
+        for event in system.iter().take(3) {
             eprintln!(
                 "  · {} — system prompt changed ({})",
                 event.session,

@@ -57,9 +57,13 @@
 //! tail (8-byte steps over the last 256, 64-byte steps to 1 024 — the
 //! geometry [`crate::ir::anthropic`] cuts the stored rungs to). The
 //! capture-time `system_change.where` is preferred when the row
-//! carries it — toker itself never writes that
-//! column, but the imported history does. A localisation never
-//! names a position the rungs do not bound: no rungs, no claim.
+//! carries it: toker writes it on every changed row since capture began
+//! localising, and the imported history carries ctp's. Older toker rows
+//! lack it but kept ladders on every row, so the walk re-derives theirs;
+//! a predecessor that dropped its ladders has them found by its hash
+//! ([`fill_baselines`]). A localisation never names a position the rungs
+//! do not bound: no rungs, no claim, and the line says the position is
+//! unknown.
 //!
 //! Absence ≠ zero (invariant 3) throughout: a NULL `cache_write_total`
 //! is an unmeasurable rewrite (counted, never zero-filled), and the
@@ -69,8 +73,8 @@
 use std::collections::HashMap;
 
 use super::locale::Fmt;
-use crate::ir::anthropic::{LADDER_STEP, tail_offsets};
-use crate::store::{LocalisationRow, RebuildRow};
+use crate::ir::anthropic::{LADDER_STEP, prefix_rungs, tail_offsets};
+use crate::store::{LocalisationRow, RebuildRow, StoredLadders};
 use serde_json::Value;
 
 /// Tokens of cache-write in one request before it counts as a rebuild
@@ -176,6 +180,16 @@ pub(crate) struct SystemChange {
     pub prev_blocks: Option<Value>,
     /// `system_blocks` of the changed row.
     pub blocks: Option<Value>,
+    /// The lane's session, `None` for the session-less group (which has
+    /// no lane to look a baseline up in).
+    pub session_id: Option<String>,
+    /// The lane's tools hash.
+    pub tools_hash: Option<String>,
+    /// `system_hash` of the predecessor: the key its rungs are found by
+    /// when the predecessor itself dropped them.
+    pub prev_hash: Option<String>,
+    /// `ts_ms` of the predecessor.
+    pub prev_ts_ms: i64,
 }
 
 /// The lane walk's raw output: the window's denominators plus the
@@ -355,6 +369,10 @@ fn classify_one(
             chars: row.system_chars,
             prev_blocks: prev.system_blocks.clone(),
             blocks: row.system_blocks.clone(),
+            session_id: row.session_id.clone(),
+            tools_hash: row.tools_hash.clone(),
+            prev_hash: prev.system_hash.clone(),
+            prev_ts_ms: prev.ts_ms,
         };
         return event(Cause::SystemPrompt, None, Some(system));
     }
@@ -363,12 +381,62 @@ fn classify_one(
     event(Cause::MidHistory, None, None)
 }
 
+/// Find the predecessor's rungs where the walk's by-id fetch came back
+/// without them, for the events that must re-derive a position.
+///
+/// Since capture began localising, a row whose system prompt matched its
+/// lane predecessor drops its ladders, so a changed row's predecessor
+/// usually has none; the rungs of its prompt sit on the row that
+/// introduced that prompt to the lane. `lookup` finds them by the
+/// predecessor's hash ([`crate::store::Store::lane_system_ladders`]). An
+/// event whose row carries the capture-time `system_change` needs no
+/// rungs and is not looked up; nor is one with no lane to look in.
+pub(crate) fn fill_baselines(
+    events: &[RebuildEvent],
+    by_id: &mut HashMap<i64, LocalisationRow>,
+    mut lookup: impl FnMut(&str, &str, &str, (i64, i64)) -> Option<StoredLadders>,
+) {
+    for system in events.iter().filter_map(|event| event.system.as_ref()) {
+        let stored = by_id
+            .get(&system.row_id)
+            .is_some_and(|row| row.system_change.is_some());
+        let has_rungs = by_id
+            .get(&system.prev_id)
+            .is_some_and(|row| row.system_ladder.is_some() || row.system_tail.is_some());
+        if stored || has_rungs {
+            continue;
+        }
+        let (Some(session), Some(tools), Some(hash)) = (
+            system.session_id.as_deref(),
+            system.tools_hash.as_deref(),
+            system.prev_hash.as_deref(),
+        ) else {
+            continue;
+        };
+        if let Some((ladder, tail)) =
+            lookup(session, tools, hash, (system.prev_ts_ms, system.prev_id))
+        {
+            let entry = by_id.entry(system.prev_id).or_insert(LocalisationRow {
+                id: system.prev_id,
+                system_ladder: None,
+                system_tail: None,
+                system_change: None,
+            });
+            entry.system_ladder = ladder;
+            entry.system_tail = tail;
+        }
+    }
+}
+
 /// Fill every system-prompt event's detail (the `chars … where`
 /// line): `43,696 → 43,801 chars; block 2, in the last
 /// 8 bytes`. The position clause prefers the capture-time
-/// `system_change.where` the row may carry (written by the predecessor;
-/// toker never writes it itself) and
-/// otherwise re-derives it from the ladders ([`where_changed`]).
+/// `system_change.where` the row carries (toker's own rows since capture
+/// began localising, and imported ctp rows) and otherwise re-derives it
+/// from the ladders ([`where_changed`]): older toker rows kept ladders on
+/// every row. Where neither bounds anything, the line says the position is
+/// unknown rather than leaving it out, which would read as a change with
+/// nowhere to be.
 pub(crate) fn localise(
     events: &mut [RebuildEvent],
     by_id: &HashMap<i64, LocalisationRow>,
@@ -393,19 +461,31 @@ pub(crate) fn localise(
         );
         event.detail = Some(match where_changed {
             Some(where_changed) => format!("{chars}; {where_changed}"),
-            None => chars,
+            None => format!("{chars}; where unknown"),
         });
     }
 }
 
-/// One row's ladder rungs, if it carried any.
-fn ladder_of(loc: Option<&LocalisationRow>) -> Option<&[String]> {
+/// One row's ladder rungs, if it carried any cut to today's geometry
+/// for its length.
+///
+/// ctp's first ladders stepped every 2 KiB (its rows from 2026-09-03 02:06Z
+/// to 07:50Z), and the imported rows still carry them: read at 8 KiB, a 37,185-char
+/// prompt's 18 rungs named a change "after byte 147456". A rung count that
+/// disagrees with the length bounds nothing, so it reads as no rungs; an
+/// unknown length cannot be checked and reads the same.
+fn ladder_of(loc: Option<&LocalisationRow>, chars: Option<i64>) -> Option<&[String]> {
+    let length = usize::try_from(chars?).ok()?;
     loc.and_then(|row| row.system_ladder.as_deref())
+        .filter(|rungs| rungs.len() == prefix_rungs(length))
 }
 
-/// One row's tail rungs, if it carried any.
-fn tail_of(loc: Option<&LocalisationRow>) -> Option<&[String]> {
+/// One row's tail rungs, if it carried any cut to today's geometry for its
+/// length (ctp's first tail reached 4 KiB in 64-byte steps).
+fn tail_of(loc: Option<&LocalisationRow>, chars: Option<i64>) -> Option<&[String]> {
+    let length = usize::try_from(chars?).ok()?;
     loc.and_then(|row| row.system_tail.as_deref())
+        .filter(|rungs| rungs.len() == tail_offsets(length).len())
 }
 
 /// Where the system prompt changed, from the block map and the rungs:
@@ -455,19 +535,19 @@ fn where_changed(
     // a stale 2048, which would mislabel a live rung window 4×.)
     let prev_loc = by_id.get(&system.prev_id);
     let row_loc = by_id.get(&system.row_id);
-    let ladder = ladder_of;
-    let tail = tail_of;
-    let ladder_window = ladder(prev_loc)
-        .zip(ladder(row_loc))
-        .and_then(|(prev, row)| {
-            prev.iter().zip(row).position(|(a, b)| a != b).map(|pi| {
-                format!(
-                    "between bytes {} and {}",
-                    pi * LADDER_STEP,
-                    (pi + 1) * LADDER_STEP
-                )
-            })
-        });
+    let prev_ladder = ladder_of(prev_loc, system.prev_chars);
+    let row_ladder = ladder_of(row_loc, system.chars);
+    let prev_tail = tail_of(prev_loc, system.prev_chars);
+    let row_tail = tail_of(row_loc, system.chars);
+    let ladder_window = prev_ladder.zip(row_ladder).and_then(|(prev, row)| {
+        prev.iter().zip(row).position(|(a, b)| a != b).map(|pi| {
+            format!(
+                "between bytes {} and {}",
+                pi * LADDER_STEP,
+                (pi + 1) * LADDER_STEP
+            )
+        })
+    });
     match ladder_window {
         Some(window) => parts.push(window),
         None => {
@@ -479,35 +559,37 @@ fn where_changed(
             // Without both rows' lengths the offsets cannot be named,
             // so no claim is made rather than a wrong one.
             let lengths = system.prev_chars.zip(system.chars);
-            let tail_bound = tail(prev_loc).zip(tail(row_loc)).zip(lengths).map(
-                |((prev, row), (prev_chars, chars))| {
-                    let offsets = tail_offsets(prev_chars.min(chars).max(0) as usize);
-                    match prev.iter().zip(row).position(|(a, b)| a != b) {
-                        Some(ti) => {
-                            let to = offsets.get(ti).copied().unwrap_or(0);
-                            let from = if ti == 0 {
-                                0
-                            } else {
-                                offsets.get(ti - 1).copied().unwrap_or(0)
-                            };
-                            if from == 0 {
-                                format!("in the last {to} bytes")
-                            } else {
-                                format!("{from}-{to} bytes from the end")
+            let tail_bound =
+                prev_tail
+                    .zip(row_tail)
+                    .zip(lengths)
+                    .map(|((prev, row), (prev_chars, chars))| {
+                        let offsets = tail_offsets(prev_chars.min(chars).max(0) as usize);
+                        match prev.iter().zip(row).position(|(a, b)| a != b) {
+                            Some(ti) => {
+                                let to = offsets.get(ti).copied().unwrap_or(0);
+                                let from = if ti == 0 {
+                                    0
+                                } else {
+                                    offsets.get(ti - 1).copied().unwrap_or(0)
+                                };
+                                if from == 0 {
+                                    format!("in the last {to} bytes")
+                                } else {
+                                    format!("{from}-{to} bytes from the end")
+                                }
                             }
+                            // Every shared suffix matching puts the change
+                            // beyond the tail's reach — the honest bound.
+                            None => format!(
+                                "beyond the last {} bytes",
+                                offsets.last().copied().unwrap_or(0)
+                            ),
                         }
-                        // Every shared suffix matching puts the change
-                        // beyond the tail's reach — the honest bound.
-                        None => format!(
-                            "beyond the last {} bytes",
-                            offsets.last().copied().unwrap_or(0)
-                        ),
-                    }
-                },
-            );
+                    });
             if let Some(bound) = tail_bound {
                 parts.push(bound);
-            } else if let (Some(prev), Some(row)) = (ladder(prev_loc), ladder(row_loc)) {
+            } else if let (Some(prev), Some(row)) = (prev_ladder, row_ladder) {
                 // Ladders on both rows but no tails: the change is
                 // after the last complete step either of them measured
                 // (the fallback bound, at the geometry
@@ -791,14 +873,19 @@ mod tests {
 
         // With the ladders: block 1, in the last 8 bytes — the README's
         // localised shape. The predecessor's tail matches every rung
-        // but the first, so the change lands in the last 8 bytes.
+        // but the first, so the change lands in the last 8 bytes. Five
+        // prefix rungs and a 44-rung tail: the geometry of a 43k prompt.
+        let ladder: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+        let tail: Vec<String> = (0..44).map(|i| format!("t{i}")).collect();
+        let mut changed_tail = tail.clone();
+        changed_tail[0] = "t0*".into();
         let ladders: HashMap<_, _> = [
             (
                 11,
                 LocalisationRow {
                     id: 11,
-                    system_ladder: Some(vec!["r1".into(), "r2".into()]),
-                    system_tail: Some(vec!["t8".into(), "t16".into(), "t24".into()]),
+                    system_ladder: Some(ladder.clone()),
+                    system_tail: Some(tail),
                     system_change: None,
                 },
             ),
@@ -806,8 +893,8 @@ mod tests {
                 12,
                 LocalisationRow {
                     id: 12,
-                    system_ladder: Some(vec!["r1".into(), "r2".into()]),
-                    system_tail: Some(vec!["t8*".into(), "t16".into(), "t24".into()]),
+                    system_ladder: Some(ladder),
+                    system_tail: Some(changed_tail),
                     system_change: None,
                 },
             ),
@@ -839,6 +926,126 @@ mod tests {
         );
     }
 
+    /// A lane whose second row changed the system prompt, as two
+    /// rebuild rows (ids 41, 42), for the fallback tests.
+    fn changed_lane() -> Vec<RebuildRow> {
+        let mut prev = rebuild_bare(NOW - 10 * MIN);
+        prev.id = 41;
+        prev.session_id = Some("ses-a".into());
+        prev.tools_hash = Some("tools-1".into());
+        prev.req_messages = Some(40);
+        prev.system_hash = Some("sys-1".into());
+        prev.system_chars = Some(20_000);
+        prev.cache_write_total = Some(0);
+        let mut changed = prev.clone();
+        changed.id = 42;
+        changed.ts_ms = NOW - 5 * MIN;
+        changed.system_hash = Some("sys-2".into());
+        changed.cache_write_total = Some(REBUILD_MIN);
+        vec![prev, changed]
+    }
+
+    fn rungs_row(id: i64, ladder: &[&str], change: Option<serde_json::Value>) -> LocalisationRow {
+        LocalisationRow {
+            id,
+            system_ladder: Some(ladder.iter().map(|rung| (*rung).to_owned()).collect()),
+            system_tail: None,
+            system_change: change,
+        }
+    }
+
+    #[test]
+    fn a_predecessor_that_dropped_its_ladders_is_found_by_its_hash() {
+        // Since capture began localising, the predecessor of a changed row
+        // usually carries no ladders: the row that introduced its prompt
+        // does. Without the lookup the position is unknown, and says so.
+        let mut walked = walk(&changed_lane(), 30 * MIN);
+        let mut by_id: HashMap<_, _> = [(42, rungs_row(42, &["a", "b*"], None))]
+            .into_iter()
+            .collect();
+        super::localise(&mut walked.events, &by_id, &Fmt::fixed());
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"20,000 → 20,000 chars; where unknown"
+        );
+
+        let mut asked = Vec::new();
+        super::fill_baselines(&walked.events, &mut by_id, |session, tools, hash, at| {
+            asked.push((session.to_owned(), tools.to_owned(), hash.to_owned(), at));
+            Some((Some(vec!["a".into(), "b".into()]), None))
+        });
+        assert_eq!(
+            asked,
+            vec![(
+                "ses-a".to_owned(),
+                "tools-1".to_owned(),
+                "sys-1".to_owned(),
+                (NOW - 10 * MIN, 41)
+            )],
+            "the predecessor's own prompt, at or before the predecessor"
+        );
+        super::localise(&mut walked.events, &by_id, &Fmt::fixed());
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"20,000 → 20,000 chars; between bytes 8192 and 16384"
+        );
+    }
+
+    #[test]
+    fn a_stored_change_or_a_predecessor_with_rungs_needs_no_lookup() {
+        let walked = walk(&changed_lane(), 30 * MIN);
+        let never =
+            |_: &str, _: &str, _: &str, _: (i64, i64)| -> Option<crate::store::StoredLadders> {
+                panic!("no lookup was needed")
+            };
+
+        // Capture localised it: the stored value is the answer.
+        let mut stored: HashMap<_, _> = [(
+            42,
+            rungs_row(
+                42,
+                &["a", "b*"],
+                Some(json!({"delta": 0, "where": "between bytes 8192 and 16384"})),
+            ),
+        )]
+        .into_iter()
+        .collect();
+        super::fill_baselines(&walked.events, &mut stored, never);
+
+        // An older toker row: ladders on every row, the predecessor's too.
+        let mut older: HashMap<_, _> = [
+            (41, rungs_row(41, &["a", "b"], None)),
+            (42, rungs_row(42, &["a", "b*"], None)),
+        ]
+        .into_iter()
+        .collect();
+        super::fill_baselines(&walked.events, &mut older, never);
+        let mut walked = walked;
+        super::localise(&mut walked.events, &older, &Fmt::fixed());
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"20,000 → 20,000 chars; between bytes 8192 and 16384"
+        );
+    }
+
+    #[test]
+    fn a_session_less_change_is_never_looked_up() {
+        let mut rows = changed_lane();
+        for row in &mut rows {
+            row.session_id = None;
+        }
+        let mut walked = walk(&rows, 30 * MIN);
+        let mut by_id = HashMap::new();
+        super::fill_baselines(&walked.events, &mut by_id, |_, _, _, _| {
+            panic!("no session, no lane")
+        });
+        super::localise(&mut walked.events, &by_id, &Fmt::fixed());
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"20,000 → 20,000 chars; where unknown"
+        );
+    }
+
     #[test]
     fn the_ladder_window_bounds_a_change_to_one_step() {
         let mut prev = rebuild_bare(NOW - 10 * MIN);
@@ -859,7 +1066,7 @@ mod tests {
                 21,
                 LocalisationRow {
                     id: 21,
-                    system_ladder: Some(vec!["a".into(), "b".into(), "c".into()]),
+                    system_ladder: Some(vec!["a".into(), "b".into()]),
                     system_tail: None,
                     system_change: None,
                 },
@@ -868,7 +1075,7 @@ mod tests {
                 22,
                 LocalisationRow {
                     id: 22,
-                    system_ladder: Some(vec!["a".into(), "b*".into(), "c".into()]),
+                    system_ladder: Some(vec!["a".into(), "b*".into()]),
                     system_tail: None,
                     system_change: None,
                 },
@@ -882,6 +1089,46 @@ mod tests {
         insta::assert_snapshot!(
             walked.events[0].detail.as_deref().expect("a detail"),
             @"20,000 → 20,000 chars; between bytes 8192 and 16384"
+        );
+    }
+
+    #[test]
+    fn rungs_cut_to_ctps_first_geometry_bound_nothing() {
+        // A 37,185-char prompt from ctp's 2 KiB era carries 18 prefix
+        // rungs and no tail; read at 8 KiB they named a change "after byte
+        // 147456", far past the prompt's end.
+        let mut rows = changed_lane();
+        for row in &mut rows {
+            row.system_chars = Some(37_185);
+        }
+        let old_cut: Vec<String> = (0..18).map(|i| format!("r{i}")).collect();
+        let by_id: HashMap<_, _> = [
+            (
+                41,
+                LocalisationRow {
+                    id: 41,
+                    system_ladder: Some(old_cut.clone()),
+                    system_tail: None,
+                    system_change: None,
+                },
+            ),
+            (
+                42,
+                LocalisationRow {
+                    id: 42,
+                    system_ladder: Some(old_cut),
+                    system_tail: None,
+                    system_change: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut walked = walk(&rows, 30 * MIN);
+        super::localise(&mut walked.events, &by_id, &Fmt::fixed());
+        insta::assert_snapshot!(
+            walked.events[0].detail.as_deref().expect("a detail"),
+            @"37,185 → 37,185 chars; where unknown"
         );
     }
 
@@ -905,12 +1152,13 @@ mod tests {
         // A full-length tail (44 rungs for 130 000 units) where every
         // rung matches: the change is beyond the tail's 1024-byte reach.
         let rungs: Vec<String> = (0..44).map(|i| format!("t{i}")).collect();
+        let ladder: Vec<String> = (0..15).map(|i| format!("l{i}")).collect();
         let ladders: HashMap<_, _> = [
             (
                 31,
                 LocalisationRow {
                     id: 31,
-                    system_ladder: Some(vec!["l1".into()]),
+                    system_ladder: Some(ladder.clone()),
                     system_tail: Some(rungs.clone()),
                     system_change: None,
                 },
@@ -919,7 +1167,7 @@ mod tests {
                 32,
                 LocalisationRow {
                     id: 32,
-                    system_ladder: Some(vec!["l1".into()]),
+                    system_ladder: Some(ladder.clone()),
                     system_tail: Some(rungs.clone()),
                     system_change: None,
                 },
