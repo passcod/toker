@@ -160,7 +160,7 @@ pub fn run(
     let mut next_tick = Instant::now();
     let mut quota: Option<quota::QuotaAgg> = None;
     let mut rebuilds: Option<rebuilds::RebuildAgg> = None;
-    let mut released = std::collections::HashSet::new();
+    let mut released = model::Released::new();
     let mut window: Option<DisplayWindow> = None;
     // The daemon's models caches, read-only: loaded (or not) on the
     // quota cadence below, never fetched, never written.
@@ -443,7 +443,7 @@ impl DisplayWindow {
         &mut self,
         window_mins: u64,
         quota: Option<&quota::QuotaAgg>,
-        released: &std::collections::HashSet<String>,
+        released: &model::Released,
         rebuilds: Option<&rebuilds::RebuildAgg>,
         catalogs: &FetchedCatalogs,
     ) -> model::Snapshot {
@@ -598,12 +598,12 @@ fn rebuild_snapshot(
 fn released_sessions(
     store: &Store,
     quota: Option<&quota::QuotaAgg>,
-) -> anyhow::Result<std::collections::HashSet<String>> {
+) -> anyhow::Result<model::Released> {
     let Some(quota) = quota else {
-        return Ok(std::collections::HashSet::new());
+        return Ok(model::Released::new());
     };
     if !quota.gate_on {
-        return Ok(std::collections::HashSet::new());
+        return Ok(model::Released::new());
     }
     // The resets the newest reading reports, per meter key — the
     // windows a release can be live for.
@@ -615,7 +615,7 @@ fn released_sessions(
             resets.push((meter.key, reset));
         }
     }
-    let mut released = std::collections::HashSet::new();
+    let mut released = model::Released::new();
     if resets.is_empty() {
         return Ok(released);
     }
@@ -624,7 +624,14 @@ fn released_sessions(
             .iter()
             .any(|(meter, reset)| allowance.meter == *meter && allowance.reset_value == *reset)
         {
-            released.insert(allowance.session_id);
+            // A session holding both kinds (one per meter) shows the
+            // wider one: overage is what it may spend somewhere.
+            let held = released
+                .entry(allowance.session_id)
+                .or_insert(allowance.release);
+            if allowance.release == crate::ir::Release::Overage {
+                *held = crate::ir::Release::Overage;
+            }
         }
     }
     Ok(released)
@@ -1042,7 +1049,8 @@ mod tests {
     //! reads exactly the way the TUI's own ticks do and writes
     //! nothing).
 
-    use std::collections::{HashMap, HashSet};
+    use crate::tui::model::Released;
+    use std::collections::HashMap;
 
     use crate::store::{Store, is_api_measurement};
 
@@ -1094,7 +1102,7 @@ mod tests {
         let refresh = |labels: &mut super::labels::Labels| {
             super::read_window(&store, 30, labels)
                 .expect("read")
-                .snapshot(30, None, &HashSet::new(), None, &catalogs)
+                .snapshot(30, None, &Released::new(), None, &catalogs)
         };
 
         let empty = refresh(&mut labels);
@@ -1376,7 +1384,7 @@ mod tests {
         let snap = crate::tui::model::aggregate(
             &display,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &HashMap::new(),
             caches.catalogs(),
             None,

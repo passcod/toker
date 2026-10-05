@@ -10,7 +10,7 @@
 //! touches one key position.
 //!
 //! The shape extraction ([`AnthropicBody::shape`]) and the release-marker
-//! semantics ([`SENTINEL`], [`AnthropicBody::carries_release`],
+//! semantics ([`SENTINEL`], [`AnthropicBody::release_marker`],
 //! [`AnthropicBodyMut::strip_release`]) are ports of the measured
 //! production behaviours of the predecessor proxy, ctp — the Node proxy this
 //! toolsuite replaces. They are ported, not improved: the behaviours were
@@ -44,6 +44,31 @@ use super::{Request, short_hash};
 /// changed stripping rule is a changed cached prefix, and a changed
 /// prefix is a full rebuild on every live conversation.
 pub const SENTINEL: &str = "$#$BURN$#$";
+
+/// The plan-only release marker: past the quota gate, but only while the
+/// plan still has room, never into overage. Frozen under the same rule
+/// as [`SENTINEL`], and stripped by the same function.
+pub const PLAN_SENTINEL: &str = "$#$OVER$#$";
+
+/// Which release a fresh marker asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Release {
+    /// [`SENTINEL`]: continue on overage until the window resets.
+    Overage,
+    /// [`PLAN_SENTINEL`]: use what is left of the plan quota, and stop
+    /// again before overage.
+    Plan,
+}
+
+impl Release {
+    /// The marker text this release is typed as.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Release::Overage => SENTINEL,
+            Release::Plan => PLAN_SENTINEL,
+        }
+    }
+}
 
 // Fixed strings Claude Code itself emits around a
 // compaction. Only whether they matched is recorded, never the surrounding
@@ -220,7 +245,7 @@ impl<'a> AnthropicBody<'a> {
         }
     }
 
-    /// Does this request carry a fresh release marker?
+    /// Which fresh release marker this request carries, if any.
     ///
     /// Anchored to the request, not to the string: the marker must OPEN
     /// the last user message's first text block. That fires on exactly
@@ -228,13 +253,16 @@ impl<'a> AnthropicBody<'a> {
     /// after it, whose last user message holds `tool_result` blocks. A
     /// marker is only ever last once, which is why no occurrence counting
     /// is needed.
-    pub fn carries_release(&self) -> bool {
-        self.messages()
+    pub fn release_marker(&self) -> Option<Release> {
+        let text = self
+            .messages()
             .iter()
             .rev()
             .find(|message| message.role() == Some("user"))
-            .and_then(|message| message.first_text())
-            .is_some_and(|text| text.starts_with(SENTINEL))
+            .and_then(|message| message.first_text())?;
+        [Release::Overage, Release::Plan]
+            .into_iter()
+            .find(|release| text.starts_with(release.marker()))
     }
 }
 
@@ -269,8 +297,9 @@ impl AnthropicBodyMut<'_> {
         parts.push(serde_json::json!({"role": role, "content": content}));
     }
 
-    /// Remove the release marker from position 0 of user text blocks, so
-    /// the model never sees it.
+    /// Remove the release markers from position 0 of user text blocks, so
+    /// the model never sees them: [`SENTINEL`] first, then
+    /// [`PLAN_SENTINEL`], each under the whole rule below on its own.
     /// The rule is a frozen public API: it stays byte-stable forever.
     ///
     /// **Byte equivalence with a raw splice.** The predecessor
@@ -303,6 +332,13 @@ impl AnthropicBodyMut<'_> {
     /// implementation: anything else would rewrite pasted code —
     /// `if (!burn) x()` would have become `if () x()`.
     pub fn strip_release(&mut self) {
+        for release in [Release::Overage, Release::Plan] {
+            self.strip_marker(release.marker());
+        }
+    }
+
+    /// [`Self::strip_release`] for one marker.
+    fn strip_marker(&mut self, marker: &str) {
         // Phase 1 — the parsed decision, as mutation targets (message
         // index, block index; a string-content message has no block
         // index, mirroring the synthesised `{type: "text"}` block).
@@ -314,7 +350,7 @@ impl AnthropicBodyMut<'_> {
                 }
                 match message.get("content") {
                     Some(Value::String(text)) => {
-                        if strippable(text) {
+                        if strippable(text, marker) {
                             targets.push((message_index, None));
                         }
                     }
@@ -326,7 +362,7 @@ impl AnthropicBodyMut<'_> {
                             if block
                                 .get("text")
                                 .and_then(Value::as_str)
-                                .is_some_and(strippable)
+                                .is_some_and(|text| strippable(text, marker))
                             {
                                 targets.push((message_index, Some(block_index)));
                             }
@@ -348,7 +384,7 @@ impl AnthropicBodyMut<'_> {
         // non-canonical body surfaces as fidelity drift rather than
         // passing silently, per invariant 5's per-request compare).
         let bytes = self.request.serialise();
-        let needle = format!("\"{SENTINEL}");
+        let needle = format!("\"{marker}");
         let hits = bytes
             .windows(needle.len())
             .filter(|window| *window == needle.as_bytes())
@@ -377,7 +413,7 @@ impl AnthropicBodyMut<'_> {
             match block_index {
                 None => {
                     if let Some(Value::String(text)) = message.get_mut("content") {
-                        *text = text[SENTINEL.len()..].to_owned();
+                        *text = text[marker.len()..].to_owned();
                     }
                 }
                 Some(block_index) => {
@@ -387,7 +423,7 @@ impl AnthropicBodyMut<'_> {
                         .and_then(|blocks| blocks.get_mut(block_index))
                         .and_then(|block| block.get_mut("text"))
                     {
-                        *text = text[SENTINEL.len()..].to_owned();
+                        *text = text[marker.len()..].to_owned();
                     }
                 }
             }
@@ -807,13 +843,13 @@ fn utf16_bytes(units: &[u16]) -> Vec<u8> {
     String::from_utf16_lossy(units).into_bytes()
 }
 
-/// Whether a text block starting with the marker can lose it
+/// Whether a text block starting with `marker` can lose it
 /// (the would-empty-it test): the remainder must survive `trim`
 /// non-empty, because the API rejects empty AND whitespace-only text
 /// blocks. JS `trim` removes Unicode White_Space plus U+FEFF;
 /// `char::is_whitespace` covers every member but U+FEFF.
-fn strippable(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix(SENTINEL) else {
+fn strippable(text: &str, marker: &str) -> bool {
+    let Some(rest) = text.strip_prefix(marker) else {
         return false;
     };
     !rest
@@ -824,7 +860,7 @@ fn strippable(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::short_hash;
-    use super::{SENTINEL, System};
+    use super::{PLAN_SENTINEL, Release, SENTINEL, System};
     use crate::ir::Request;
 
     fn parse(body: &[u8]) -> Request {
@@ -859,14 +895,54 @@ mod tests {
     // ── release marker: detection ─────────────────────────────────────
 
     #[test]
-    fn the_marker_literal_is_unchanged() {
+    fn the_marker_literals_are_unchanged() {
         assert_eq!(SENTINEL, "$#$BURN$#$");
+        assert_eq!(PLAN_SENTINEL, "$#$OVER$#$");
+    }
+
+    /// The plan marker fires under the same anchoring as the overage one,
+    /// and says which it is.
+    #[test]
+    fn the_plan_marker_fires_as_a_plan_release() {
+        let body = body_of(vec![user_text(&format!("{PLAN_SENTINEL} use the rest"))]);
+        assert_eq!(
+            parse(&body).anthropic().release_marker(),
+            Some(Release::Plan)
+        );
+        let body = body_of(vec![user_text(&format!("later {PLAN_SENTINEL}"))]);
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
+    }
+
+    /// The plan marker strips exactly like the overage one: a byte splice
+    /// at position zero, and only there.
+    #[test]
+    fn the_plan_marker_strips_like_the_overage_marker() {
+        let original = body_of(vec![
+            user_text(&format!("{PLAN_SENTINEL} keep going")),
+            assistant_text("ok"),
+            user_text(&format!("quoting {PLAN_SENTINEL} mid-line")),
+        ]);
+        let mut request = parse(&original);
+        request.anthropic_mut().strip_release();
+        let out = request.serialise();
+        let needle = format!("\"{PLAN_SENTINEL}");
+        let at = original
+            .windows(needle.len())
+            .position(|window| window == needle.as_bytes())
+            .expect("the marker is in the body");
+        let mut spliced = original[..at + 1].to_vec();
+        spliced.extend_from_slice(&original[at + 1 + PLAN_SENTINEL.len()..]);
+        assert_eq!(out, spliced);
+        assert_eq!(request.anthropic().release_marker(), None);
     }
 
     #[test]
     fn fires_when_the_marker_opens_the_last_user_message() {
         let body = body_of(vec![user_text(&format!("{SENTINEL} keep going"))]);
-        assert!(parse(&body).anthropic().carries_release());
+        assert_eq!(
+            parse(&body).anthropic().release_marker(),
+            Some(Release::Overage)
+        );
     }
 
     // This is the code-fragment case: an earlier design matched anywhere
@@ -874,9 +950,9 @@ mod tests {
     #[test]
     fn does_not_fire_mid_message() {
         let body = body_of(vec![user_text("var burn = true;\nif (!burn) x();")]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
         let body = body_of(vec![user_text(&format!("please run {SENTINEL} later"))]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
     }
 
     // Claude Code appends a trailing mid-conversation system message after
@@ -888,7 +964,10 @@ mod tests {
             user_text(&format!("{SENTINEL} go on")),
             system_message("reminder"),
         ]);
-        assert!(parse(&body).anthropic().carries_release());
+        assert_eq!(
+            parse(&body).anthropic().release_marker(),
+            Some(Release::Overage)
+        );
     }
 
     #[test]
@@ -898,7 +977,7 @@ mod tests {
             assistant_text("ok"),
             user_text("and now something else"),
         ]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
     }
 
     // A tool-loop follow-up ends in tool_result blocks, not typed text.
@@ -913,13 +992,16 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "hi"},
             ]}),
         ]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
     }
 
     #[test]
     fn string_content_is_handled_not_just_block_arrays() {
         let body = body_of(vec![user_string(&format!("{SENTINEL} go"))]);
-        assert!(parse(&body).anthropic().carries_release());
+        assert_eq!(
+            parse(&body).anthropic().release_marker(),
+            Some(Release::Overage)
+        );
     }
 
     // The first-text read stops at the first text-typed block: a marker in
@@ -930,24 +1012,30 @@ mod tests {
             {"type": "text", "text": "no marker here"},
             {"type": "text", "text": SENTINEL},
         ]})]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
         // …and a text-typed block without string text ends the search
         // the same way a first-match find does.
         let body = body_of(vec![serde_json::json!({"role": "user", "content": [
             {"type": "text", "text": 5},
             {"type": "text", "text": SENTINEL},
         ]})]);
-        assert!(!parse(&body).anthropic().carries_release());
+        assert_eq!(parse(&body).anthropic().release_marker(), None);
     }
 
     #[test]
     fn absent_or_malformed_shapes_read_false_never_panic() {
-        assert!(!parse(b"{}").anthropic().carries_release());
-        assert!(!parse(br#"{"messages":5}"#).anthropic().carries_release());
-        assert!(!parse(br#"{"messages":{}}"#).anthropic().carries_release());
-        assert!(!parse(b"[]").anthropic().carries_release());
-        assert!(!parse(b"5").anthropic().carries_release());
-        assert!(!parse(br#""body""#).anthropic().carries_release());
+        assert_eq!(parse(b"{}").anthropic().release_marker(), None);
+        assert_eq!(
+            parse(br#"{"messages":5}"#).anthropic().release_marker(),
+            None
+        );
+        assert_eq!(
+            parse(br#"{"messages":{}}"#).anthropic().release_marker(),
+            None
+        );
+        assert_eq!(parse(b"[]").anthropic().release_marker(), None);
+        assert_eq!(parse(b"5").anthropic().release_marker(), None);
+        assert_eq!(parse(br#""body""#).anthropic().release_marker(), None);
     }
 
     // ── release marker: stripping ─────────────────────────────────────

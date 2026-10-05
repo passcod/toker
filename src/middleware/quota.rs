@@ -11,7 +11,8 @@
 //!   [`exhausted_meters`], [`grant_for`], [`decide`]);
 //! - `carriesRelease` / `stripSentinel` (the frozen marker rule) — the IR
 //!   already ports those ([`crate::ir::anthropic`]: [`SENTINEL`],
-//!   `carries_release`, `strip_release`);
+//!   `release_marker`, `strip_release`), plus toker's own plan-only
+//!   marker ([`crate::ir::PLAN_SENTINEL`], [`plan_room`]);
 //! - the block notice and the synthetic turn it is answered with
 //!   ([`Blocking`]);
 //! - the request-pipeline sequencing (release check on the original body
@@ -40,6 +41,7 @@
 use serde_json::Value;
 
 use super::notice::{NoticeLevel, NoticeStyle, TOKER_LINK, render};
+use crate::ir::Release;
 use crate::store::Allowance;
 
 /// A meter is exhausted when its utilisation reaches this fraction of the
@@ -283,6 +285,21 @@ pub enum GateDecision {
     },
 }
 
+/// Whether `meter`'s plan quota still has room: its utilisation reads
+/// under 1.0 and spend has not shifted to overage. A plan release
+/// ([`Release::Plan`]) un-gates an exhausted meter only while this holds,
+/// so the session stops again at the point the next request would be
+/// billed as overage. An unreadable utilisation has no room: a plan
+/// release is a promise not to reach overage, and a window it cannot see
+/// is one it cannot keep that promise in.
+pub fn plan_room(meters: Meters<'_>, meter: Meter) -> bool {
+    let util = match meter {
+        Meter::FiveHour => meters.util5h(),
+        Meter::SevenDay => meters.util7d(),
+    };
+    !meters.overage_in_use() && util.is_some_and(|util| util < 1.0)
+}
+
 /// See [`GateDecision`].
 pub fn decide(meters: Option<Meters<'_>>, allowances: &[Allowance], now_ms: i64) -> GateDecision {
     let Some(meters) = meters else {
@@ -294,10 +311,16 @@ pub fn decide(meters: Option<Meters<'_>>, allowances: &[Allowance], now_ms: i64)
             Meter::SevenDay => meters.reset7d(),
         };
         // Released for this window: a stored reset that is present and
-        // equals the meter's currently reported one.
+        // equals the meter's currently reported one, and, for a plan
+        // release, a plan that still has room.
         let released = current.is_some_and(|reset| {
             allowances.iter().any(|allowance| {
-                allowance.meter == meter.as_str() && allowance.reset_value == reset
+                allowance.meter == meter.as_str()
+                    && allowance.reset_value == reset
+                    && match allowance.release {
+                        Release::Overage => true,
+                        Release::Plan => plan_room(meters, meter),
+                    }
             })
         });
         if !released {
@@ -359,20 +382,26 @@ impl Blocking {
     /// entirely when unknown or zero rather than printed as a zero (a
     /// notice reading "0 tokens" would be read as a measurement). A reset
     /// the reading did not carry is "an unknown time" — the same verdict
-    /// as a null `resetsAt`.
+    /// as a null `resetsAt`. `plan_left` ([`plan_room`] for the blocked
+    /// meter) adds the plan-only marker to the resume line.
     pub fn notice(
         meter: Meter,
         resets_at: Option<i64>,
+        plan_left: bool,
         context_tokens: Option<u64>,
         tz: &jiff::tz::TimeZone,
         style: NoticeStyle,
     ) -> String {
-        let spent = match resets_at
+        let when = resets_at
             .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
-            .map(|timestamp| timestamp.to_zoned(tz.clone()).strftime("%H:%M").to_string())
-        {
-            Some(when) => format!("is spent until {when}"),
-            None => "is spent, and its reset time is unknown".to_owned(),
+            .map(|timestamp| timestamp.to_zoned(tz.clone()).strftime("%H:%M").to_string());
+        // With plan left the quota is at the gate, not past it: "spent"
+        // would contradict the resume line offering the rest of it.
+        let spent = match (when, plan_left) {
+            (Some(when), false) => format!("is spent until {when}"),
+            (None, false) => "is spent, and its reset time is unknown".to_owned(),
+            (Some(when), true) => format!("is almost spent, and resets at {when}"),
+            (None, true) => "is almost spent, and its reset time is unknown".to_owned(),
         };
         // Comma-grouped, never locale-moving — these figures
         // land in notices the tests assert on.
@@ -382,9 +411,16 @@ impl Blocking {
             }
             _ => String::new(),
         };
+        // The over marker is offered only where it would get somewhere:
+        // with the plan spent or overage drawn, it would stop at once.
+        let resume = if plan_left {
+            "Reply with the over marker to use the rest without overage, \
+             or the release marker to continue on overage until then."
+        } else {
+            "Reply with the release marker to continue on overage until then."
+        };
         let content = format!(
-            "Stopped by {TOKER_LINK}: the {} quota {spent}.{size}\n\
-             Reply with the release marker to continue on overage until then.",
+            "Stopped by {TOKER_LINK}: the {} quota {spent}.{size}\n{resume}",
             meter.notice_name(),
         );
         // A Caution: the session is stopped until the operator acts.
@@ -533,8 +569,9 @@ pub(crate) fn group(n: u64) -> String {
 mod tests {
     use super::{
         Allowance, Blocking, GateDecision, Meter, Meters, Rendering, THRESHOLD, decide,
-        exhausted_meters, expired, grant_for,
+        exhausted_meters, expired, grant_for, plan_room,
     };
+    use crate::ir::Release;
     use crate::middleware::notice::{BLOCK_FOOTER, BLOCK_HEADER, NoticeStyle};
     use serde_json::json;
 
@@ -562,7 +599,75 @@ mod tests {
             session_id: "ses-test".to_owned(),
             meter: meter.to_owned(),
             reset_value: reset,
+            release: Release::Overage,
         }
+    }
+
+    fn plan_allowance(meter: &str, reset: i64) -> Allowance {
+        Allowance {
+            release: Release::Plan,
+            ..allowance(meter, reset)
+        }
+    }
+
+    /// A plan release forwards past the threshold while the plan has
+    /// room, and blocks again once it is spent or overage is drawn; an
+    /// overage release forwards through all of it.
+    #[test]
+    fn a_plan_release_stops_before_overage() {
+        let reading = |util: f64, overage: bool| json!({"util5h": util, "reset5h": 2_000_000_600, "overageInUse": overage});
+        let plan = [plan_allowance("5h", 2_000_000_600)];
+        let overage = [allowance("5h", 2_000_000_600)];
+        let block = GateDecision::Block {
+            meter: Meter::FiveHour,
+            resets_at: Some(2_000_000_600),
+        };
+
+        let room = reading(0.99, false);
+        assert_eq!(decide(meters(&room), &plan, NOW_MS), GateDecision::Forward);
+        assert!(plan_room(Meters::over(&room), Meter::FiveHour));
+
+        for spent in [
+            reading(1.0, false),
+            reading(0.99, true),
+            reading(0.40, true),
+        ] {
+            assert_eq!(decide(meters(&spent), &plan, NOW_MS), block, "{spent}");
+            assert!(!plan_room(Meters::over(&spent), Meter::FiveHour));
+            assert_eq!(
+                decide(meters(&spent), &overage, NOW_MS),
+                GateDecision::Forward,
+                "the burn marker spends overage: {spent}"
+            );
+        }
+
+        // A plan allowance for a rolled window is inert like any other.
+        let rolled = json!({"util5h": 0.995, "reset5h": 2_000_018_600, "overageInUse": false});
+        assert_eq!(
+            decide(meters(&rolled), &plan, NOW_MS),
+            GateDecision::Block {
+                meter: Meter::FiveHour,
+                resets_at: Some(2_000_018_600),
+            }
+        );
+
+        // The 7-day meter: plan room is its own utilisation.
+        let weekly = json!({
+            "util5h": 0.20, "reset5h": 2_000_000_600,
+            "util7d": 0.99, "reset7d": 2_000_600_000,
+            "overageInUse": false,
+        });
+        assert_eq!(
+            decide(
+                meters(&weekly),
+                &[plan_allowance("7d", 2_000_600_000)],
+                NOW_MS
+            ),
+            GateDecision::Forward
+        );
+        // An unreadable utilisation is no room.
+        let blind = json!({"reset5h": 2_000_000_600, "overageInUse": false});
+        assert!(!plan_room(Meters::over(&blind), Meter::FiveHour));
     }
 
     // ── the threshold edge ─────────────────────────────────────────────
@@ -904,6 +1009,7 @@ mod tests {
             Blocking::notice(
                 Meter::FiveHour,
                 Some(1_769_500_800),
+                false,
                 None,
                 &tz,
                 NoticeStyle::Plain
@@ -914,6 +1020,7 @@ mod tests {
         let with_context = Blocking::notice(
             Meter::SevenDay,
             Some(1_769_500_800),
+            false,
             Some(123_456),
             &tz,
             NoticeStyle::Plain,
@@ -925,6 +1032,7 @@ mod tests {
             Blocking::notice(
                 Meter::FiveHour,
                 Some(1_769_500_800),
+                false,
                 Some(0),
                 &tz,
                 NoticeStyle::Plain
@@ -932,16 +1040,34 @@ mod tests {
             Blocking::notice(
                 Meter::FiveHour,
                 Some(1_769_500_800),
+                false,
                 None,
                 &tz,
                 NoticeStyle::Plain
             ),
             "a zero context is not a measurement: the known check is finite and > 0"
         );
+        // At the gate with plan left: the over marker is offered, and
+        // the quota is "almost spent", not spent.
+        insta::assert_snapshot!(
+            "plain_five_hour_plan_left",
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                true,
+                None,
+                &tz,
+                NoticeStyle::Plain
+            )
+        );
+        insta::assert_snapshot!(
+            "plain_reset_unknown_plan_left",
+            Blocking::notice(Meter::FiveHour, None, true, None, &tz, NoticeStyle::Plain)
+        );
         // No reset carried: name the ignorance, in the frozen wording.
         insta::assert_snapshot!(
             "plain_reset_unknown",
-            Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain)
+            Blocking::notice(Meter::FiveHour, None, false, None, &tz, NoticeStyle::Plain)
         );
     }
 
@@ -957,6 +1083,7 @@ mod tests {
             Blocking::notice(
                 Meter::FiveHour,
                 Some(1_769_500_800),
+                false,
                 Some(9_872_344),
                 &tz,
                 NoticeStyle::default(),
@@ -974,6 +1101,7 @@ mod tests {
         let in_auckland = Blocking::notice(
             Meter::FiveHour,
             Some(1_769_500_800),
+            false,
             None,
             &auckland,
             NoticeStyle::default(),
@@ -992,8 +1120,16 @@ mod tests {
         // are pinned above); gfm is the generic default (the block is
         // claude's rendering).
         let tz = utc();
-        let notice =
-            |style| Blocking::notice(Meter::FiveHour, Some(1_769_500_800), None, &tz, style);
+        let notice = |style| {
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                false,
+                None,
+                &tz,
+                style,
+            )
+        };
         let plain = notice(NoticeStyle::Plain);
         let content = plain
             .strip_prefix('[')
@@ -1036,8 +1172,11 @@ mod tests {
                         NoticeStyle::Toker,
                         NoticeStyle::Block,
                     ] {
-                        let notice = Blocking::notice(meter, resets_at, context, &tz, style);
-                        assert!(!notice.contains('\u{2014}'), "{notice}");
+                        for plan_left in [false, true] {
+                            let notice =
+                                Blocking::notice(meter, resets_at, plan_left, context, &tz, style);
+                            assert!(!notice.contains('\u{2014}'), "{notice}");
+                        }
                     }
                 }
             }
@@ -1121,6 +1260,7 @@ mod tests {
         let rendered = Blocking::notice(
             Meter::FiveHour,
             Some(1_769_500_800),
+            false,
             None,
             &tz,
             NoticeStyle::Block,

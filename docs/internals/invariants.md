@@ -119,11 +119,12 @@ reasons.
    transformed it (see [routing.md](routing.md)), so every edit below is a
    deliberate, once-per-change byte event:
 
-   - `AnthropicBodyMut::strip_release` removes the release marker
-     (`$#$BURN$#$`), a string toker itself defined. It runs on every
-     `/v1/messages` request, for every backend and whatever the gate's toggle:
-     the marker rule is a frozen public API, and a toggled strip would change
-     the cached prefix of every conversation carrying one.
+   - `AnthropicBodyMut::strip_release` removes the release markers
+     (`$#$BURN$#$`, and the plan-only `$#$OVER$#$`), strings toker itself
+     defined. It runs on every `/v1/messages` request, for every backend and
+     whatever the gate's toggle: the marker rule is a frozen public API, and a
+     toggled strip would change the cached prefix of every conversation
+     carrying one.
    - The `provider/model` prefix strip (`anthropic_sub/`, `anthropic_api/`,
      `anthropic/`, `openrouter/`) is the client choosing a backend in the model
      string; `set_model` writes the rest back.

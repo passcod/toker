@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use toker::ir::{AnthropicShape, Request, SENTINEL, SystemBlockDigest};
+use toker::ir::{AnthropicShape, Release, Request, SENTINEL, SystemBlockDigest};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/anthropic")
@@ -298,7 +298,7 @@ fn release_marker_fixture_carries_and_shapes() {
     // The marker opens the last user message, with Claude Code's trailing
     // mid-conversation system message after it.
     let request = parse_fixture("08_release_marker.json");
-    assert!(request.anthropic().carries_release());
+    assert_eq!(request.anthropic().release_marker(), Some(Release::Overage));
     assert_eq!(
         request.anthropic().shape(),
         expected_shape(
@@ -351,7 +351,11 @@ fn strip_is_byte_equal_to_the_hand_done_splice() {
         "bytes after the marker differ"
     );
     assert_eq!(out.len(), original.len() - SENTINEL.len());
-    assert!(!request.anthropic().carries_release(), "gone once stripped");
+    assert_eq!(
+        request.anthropic().release_marker(),
+        None,
+        "gone once stripped"
+    );
 
     // Idempotent: a second pass finds nothing to do.
     let once = request.serialise();
@@ -366,7 +370,7 @@ fn marker_negatives_never_fire_or_strip() {
     // outside the first message: the pinned shape is all-absent, the strip is
     // a byte-for-byte no-op, and the marker never reads as carried.
     let request = parse_fixture("09_marker_negatives.json");
-    assert!(!request.anthropic().carries_release());
+    assert_eq!(request.anthropic().release_marker(), None);
     assert_eq!(
         request.anthropic().shape(),
         expected_shape(

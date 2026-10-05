@@ -66,6 +66,21 @@ If you change what the outlook does with a weight, check it against a re-read
 whose meter movement you can see in the ledger: a figure that only agrees with
 the fit agrees with itself.
 
+## Two releases: overage, or the rest of the plan
+
+The gate stops at 99%, so the last percent of a window is left unspent unless
+the session releases past it. `$#$BURN$#$` releases into overage for the rest
+of the window. `$#$OVER$#$` releases only while the plan has room: the blocked
+meter reads under 1.0 and `overageInUse` is false (`quota::plan_room`). Once
+either fails, the gate stops the session again, and only the burn marker goes
+further. The request that crosses 100% may still be billed partly as overage:
+the meters only say so in its response, after it was sent.
+
+Both kinds are allowance rows, told apart by the `release` column. A second
+release for the same window only widens it: burn over over makes it overage,
+over over burn leaves it overage. The TUI marks a session `$` for overage and
+`%` for the plan only.
+
 ## Allowances outlive their window only as dead rows
 
 A release grants an allowance per exhausted meter, keyed by that meter's

@@ -52,6 +52,7 @@ use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
 use super::quota::{MeterPanel, Spent};
 use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
+use crate::ir::Release;
 use crate::middleware::cold::Verdict;
 
 /// The most lines SPEND claims in the bottom strip: the total line, the
@@ -357,12 +358,16 @@ fn strip_colour(frame: &mut Frame) {
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 17] = [
+const LEGEND: [(&str, &str); 18] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
     ),
     ("$", "released past the armed quota gate for this window"),
+    (
+        "%",
+        "released to the end of the plan, stopping before overage",
+    ),
     ("↺", "compactions so far; - for none"),
     ("-", "not reported, which is not zero"),
     ("?", "unknown: model, context ceiling, or token count"),
@@ -1162,7 +1167,7 @@ fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
     }
 }
 
-/// The MODEL cell with its `↑`/`$` markers, coloured per marker. The
+/// The MODEL cell with its `↑`/`$`/`%` markers, coloured per marker. The
 /// `claude-` prefix goes: every anthropic model carries it, so it
 /// distinguishes nothing and costs seven cells a row.
 fn model_cell(session: &SessionAgg) -> Line<'static> {
@@ -1177,8 +1182,10 @@ fn model_cell(session: &SessionAgg) -> Line<'static> {
         };
         line.push(Span::styled(" ↑", style));
     }
-    if session.released {
-        line.push(Span::styled(" $", Style::new().fg(Color::Yellow)));
+    match session.released {
+        Some(Release::Overage) => line.push(Span::styled(" $", Style::new().fg(Color::Yellow))),
+        Some(Release::Plan) => line.push(Span::styled(" %", Style::new().fg(Color::Yellow))),
+        None => {}
     }
     Line::from(line)
 }
@@ -2292,7 +2299,10 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::style::{Color, Modifier, Style};
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
+
+    use super::super::model::Released;
+    use crate::ir::Release;
 
     use super::super::labels::Label;
     use super::super::locale::Fmt;
@@ -2371,7 +2381,7 @@ mod tests {
         model::aggregate(
             &rows,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -2454,7 +2464,7 @@ mod tests {
             model::aggregate(
                 &as_display_rows(&rows),
                 quota.as_ref(),
-                &HashSet::new(),
+                &Released::new(),
                 &no_labels(),
                 &FetchedCatalogs::default(),
                 None,
@@ -2508,7 +2518,7 @@ mod tests {
     fn full_snapshot_parts() -> (
         Vec<crate::store::DisplayRow>,
         crate::tui::rebuilds::RebuildAgg,
-        HashSet<String>,
+        Released,
     ) {
         let mut rows = Vec::new();
         // ses-hot: three turns, cache metrics on every one — the last
@@ -2613,8 +2623,8 @@ mod tests {
             }],
         };
 
-        let mut released = HashSet::new();
-        released.insert("ses-free".to_owned());
+        let mut released = Released::new();
+        released.insert("ses-free".to_owned(), Release::Overage);
         (rows, rebuilds, released)
     }
 
@@ -2769,7 +2779,7 @@ mod tests {
         let snap = model::aggregate(
             &[],
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -2798,7 +2808,7 @@ mod tests {
         let snap = model::aggregate(
             &[],
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -2876,7 +2886,7 @@ mod tests {
         let snap = model::aggregate(
             &[],
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -3212,7 +3222,7 @@ mod tests {
         let snap = model::aggregate(
             &[unpriced],
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -3351,7 +3361,7 @@ mod tests {
             model::aggregate(
                 &as_display_rows(&rows),
                 quota.as_ref(),
-                &HashSet::new(),
+                &Released::new(),
                 &no_labels(),
                 &FetchedCatalogs::default(),
                 None,
@@ -3428,6 +3438,31 @@ mod tests {
     }
 
     // ── the phase-5 panels ───────────────────────────────────────────
+
+    /// The model cell names which release a session holds: `$` for
+    /// overage, `%` for the plan only, nothing without one.
+    #[test]
+    fn the_model_cell_marks_the_release_kind() {
+        let snap = full_snapshot();
+        let mut session = snap
+            .sessions
+            .iter()
+            .find(|session| session.session == "ses-free")
+            .expect("ses-free")
+            .clone();
+        let text = |session: &super::SessionAgg| -> String {
+            super::model_cell(session)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert!(text(&session).ends_with(" $"), "{}", text(&session));
+        session.released = Some(Release::Plan);
+        assert!(text(&session).ends_with(" %"), "{}", text(&session));
+        session.released = None;
+        assert!(!text(&session).contains('$') && !text(&session).contains('%'));
+    }
 
     #[test]
     fn sessions_table_renders_ctx_msgs_cmpct_and_the_markers() {
@@ -3514,7 +3549,7 @@ mod tests {
         let snap = model::aggregate(
             &rows,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &labels,
             &FetchedCatalogs::default(),
             None,
@@ -3685,7 +3720,7 @@ mod tests {
         let snap = model::aggregate(
             &rows,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -3721,7 +3756,7 @@ mod tests {
         let snap = model::aggregate(
             &rows,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,
@@ -4180,7 +4215,7 @@ mod tests {
         let snap = model::aggregate(
             &rows,
             None,
-            &HashSet::new(),
+            &Released::new(),
             &no_labels(),
             &FetchedCatalogs::default(),
             None,

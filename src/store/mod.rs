@@ -508,6 +508,7 @@ mod tests {
         Allowance, CostKind, DisplayRow, Error, Lane, MetersSnapshot, ModelEntry, PingAction,
         PingRecord, RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
     };
+    use crate::ir::Release;
     use rusqlite::Connection;
     use serde_json::json;
     use std::path::PathBuf;
@@ -1891,6 +1892,7 @@ mod tests {
             session_id: "ses-1".to_string(),
             meter: "5h".to_string(),
             reset_value: 1_769_100_000_000,
+            release: Release::Overage,
         };
         store.record_allowance(&five_h).expect("record");
         store.record_allowance(&five_h).expect("record again");
@@ -1898,12 +1900,38 @@ mod tests {
             session_id: "ses-1".to_string(),
             meter: "7d".to_string(),
             reset_value: 1_769_700_000_000,
+            release: Release::Plan,
         };
         store.record_allowance(&seven_d).expect("record");
         assert_eq!(
             store.load_allowances().expect("allowances"),
-            vec![five_h, seven_d],
+            vec![five_h.clone(), seven_d.clone()],
             "same allowance twice is one row"
+        );
+
+        // A second release for the same window only widens it: plan over
+        // overage stays overage, overage over plan becomes overage.
+        store
+            .record_allowance(&Allowance {
+                release: Release::Plan,
+                ..five_h.clone()
+            })
+            .expect("narrower");
+        store
+            .record_allowance(&Allowance {
+                release: Release::Overage,
+                ..seven_d.clone()
+            })
+            .expect("wider");
+        assert_eq!(
+            store.load_allowances().expect("allowances"),
+            vec![
+                five_h,
+                Allowance {
+                    release: Release::Overage,
+                    ..seven_d
+                }
+            ],
         );
 
         // Pings: insert-only, windowed like the ledger.
@@ -2117,6 +2145,7 @@ mod tests {
             session_id: session.to_owned(),
             meter: meter.to_owned(),
             reset_value,
+            release: Release::Overage,
         };
         // A window that ended an hour ago: dead.
         store

@@ -70,7 +70,7 @@ use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
 use crate::middleware::quota::{
-    Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for,
+    Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for, plan_room,
 };
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
@@ -293,7 +293,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // allowance.
             if gate_armed
                 && let Some(session) = session_id.as_deref()
-                && ir.anthropic().carries_release()
+                && let Some(release) = ir.anthropic().release_marker()
             {
                 let meters = meters_snapshot.as_ref().map(Meters::over);
                 let now = now_ms();
@@ -307,6 +307,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                             session_id: session.to_owned(),
                             meter: meter.as_str().to_owned(),
                             reset_value: reset,
+                            release,
                         })
                     {
                         tracing::error!(%error, "allowance record failed");
@@ -328,6 +329,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     &server,
                     session,
                     backend.id(),
+                    release,
                     &merged,
                     meters_snapshot.as_ref(),
                     frontend.as_deref(),
@@ -433,9 +435,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     .ok()
                     .and_then(|lanes| lanes::session_prompt(&lanes, session))
             });
+            // The over marker is offered only while the blocked meter's
+            // plan has room for it.
+            let plan_left = meters_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| plan_room(Meters::over(snapshot), meter));
             let text = Blocking::notice(
                 meter,
                 resets_at,
+                plan_left,
                 context_tokens,
                 &jiff::tz::TimeZone::system(),
                 server.config.notices.style_for(frontend.as_deref()),

@@ -1,0 +1,6 @@
+---
+source: src/middleware/quota.rs
+expression: "Blocking::notice(Meter::FiveHour, Some(1_769_500_800), true, None, &tz,\nNoticeStyle::Plain)"
+---
+[Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is almost spent, and resets at 08:00.
+Reply with the over marker to use the rest without overage, or the release marker to continue on overage until then.]

@@ -29,7 +29,7 @@ staleness back as the API's, which is how a 77-second observed lag first read as
 | Kind | What it records |
 | --- | --- |
 | `blocked` | The quota gate stopped a request. `rate_limits` is toker's last-seen meter copy, not a response header: nothing reached upstream. `extra` holds `meter`, `resets_at`, and `context_tokens`. |
-| `released` | The release marker granted an allowance. Its `rate_limits` is a last-seen copy too. |
+| `released` | A release marker granted an allowance. Its `rate_limits` is a last-seen copy too. `extra.release` says which marker: `overage` or `plan`; rows from before the plan marker lack it, and were all overage. |
 | `cold` | The cold notice fired. No `rate_limits`. |
 | `cold-quiet` | A cold notice was withheld. `extra` carries `quotaExtra` (the re-read's estimated share of a 5-hour window), `quotaBound` (true where that weight was borrowed, so an upper bound), and `util5h` (the utilisation the decision rested on, from the burn, not the last-seen copy). The request itself went through, so an ordinary row follows. |
 | `awake` | The sleep lock changed hands. No `rate_limits`, and no frontend, provider or route: the lock is not a route. |

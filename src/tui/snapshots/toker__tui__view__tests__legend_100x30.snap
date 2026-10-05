@@ -6,10 +6,10 @@ last 30m · 4 sessions · 1 idle · 12 requests                             last
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                ctx model         reqs prompt now    peak msgs ↺   out idle│
 │ses-free                                1M sonnet-5 $       3      2,500   2,500    - -    60   1m│
-│ses-hot                                 1M opus-5 ↑         3    470,893 472,000   77 1 2,304   1m│
-│… 2 more ┌LEGEND───────────────────────────────────────────────────────────────────────┐          │
-└─────────│ ↑           served on a newer model: bright on the latest turn, dim earlier │──────────┘
-┌CONTEXT──│ $           released past the armed quota gate for this window              │──────────┐
+│ses-hot  ┌LEGEND───────────────────────────────────────────────────────────────────────┐2,304   1m│
+│… 2 more │ ↑           served on a newer model: bright on the latest turn, dim earlier │          │
+└─────────│ $           released past the armed quota gate for this window              │──────────┘
+┌CONTEXT──│ %           released to the end of the plan, stopping before overage        │──────────┐
 │ses-free │ ↺           compactions so far; - for none                                  │          │
 │ses-hot  │ -           not reported, which is not zero                                 │          │
 │… 2 more │ ?           unknown: model, context ceiling, or token count                 │          │

@@ -18,7 +18,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use toker::ir::Request;
+use toker::ir::{Release, Request};
 use toker::middleware::awake::decide_awake;
 use toker::middleware::cold::{self, ColdDecision};
 use toker::middleware::lanes::Ttl;
@@ -47,6 +47,8 @@ fn allowances_of(value: Option<&Value>) -> Vec<Allowance> {
                 session_id: "fixture".to_owned(),
                 meter: meter.to_owned(),
                 reset_value: reset,
+                // ctp had only the one marker.
+                release: Release::Overage,
             });
         }
     }

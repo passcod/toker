@@ -35,7 +35,7 @@ use toker::catalog::{CostBuckets, price};
 use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
-use toker::ir::{Request as IrRequest, SENTINEL};
+use toker::ir::{PLAN_SENTINEL, Release, Request as IrRequest, SENTINEL};
 use toker::middleware::notice::NoticeStyle;
 use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering, decide};
 use toker::server::Server;
@@ -1711,7 +1711,14 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     // GatesConfig::default() above → the notice renders in the default
     // style, the generic GFM alert; the expected turn is built the same
     // way, wrapper and all.
-    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
+    let notice = Blocking::notice(
+        Meter::FiveHour,
+        Some(reset5h),
+        false,
+        None,
+        &tz,
+        NoticeStyle::Gfm,
+    );
     let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
     assert_eq!(
         bytes.as_ref(),
@@ -1823,6 +1830,7 @@ async fn a_block_states_the_size_of_the_session_s_largest_lane() {
     let notice = Blocking::notice(
         Meter::FiveHour,
         Some(reset5h),
+        false,
         Some(412_345),
         &tz,
         NoticeStyle::Gfm,
@@ -1911,7 +1919,7 @@ async fn the_notice_style_follows_the_frontend_prefix() {
             post_messages(addr, path, &[], &messages_body_no_stream("claude-opus-5")).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let bytes = response.bytes().await.expect("blocked bytes");
-        let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, style);
+        let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), false, None, &tz, style);
         let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
         assert_eq!(
             bytes.as_ref(),
@@ -2064,6 +2072,7 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
             session_id: "ccses-42".to_owned(),
             meter: "5h".to_owned(),
             reset_value: reset5h,
+            release: Release::Overage,
         }]
     );
 
@@ -2080,6 +2089,104 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
     );
 }
 
+/// The over marker through the real router: offered while the plan has
+/// room, it forwards past the gate until the plan is spent, then the gate
+/// stops the session again and offers only the burn marker, which widens
+/// the same allowance to overage.
+#[tokio::test]
+async fn the_over_marker_spends_the_plan_and_stops_before_overage() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, snapshot) = poison_meters(&store, 0.99, 3600);
+    let reading = |util: f64| {
+        let mut reading = snapshot.clone();
+        reading["util5h"] = json!(util);
+        store
+            .save_meters(
+                "anthropic_sub",
+                &MetersSnapshot {
+                    updated_ms: jiff::Timestamp::now().as_millisecond(),
+                    snapshot: reading,
+                },
+            )
+            .expect("meters");
+    };
+    let typed = |text: &str| {
+        serde_json::to_vec(&json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": text}],
+        }))
+        .expect("body")
+    };
+    let plain = typed("carry on");
+
+    // At the gate with room: blocked, and the notice offers both markers.
+    let blocked = post_messages(addr, "/v1/messages", &[], &plain).await;
+    let text = blocked.text().await.expect("notice");
+    assert!(text.contains("almost spent"), "{text}");
+    assert!(text.contains("over marker"), "{text}");
+    assert!(mock.captured().is_empty());
+
+    // The over marker forwards, stripped, and grants a plan allowance.
+    let released = typed(&format!("{PLAN_SENTINEL} use the rest"));
+    let response = post_messages(addr, "/v1/messages", &[], &released).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await;
+    assert_eq!(mock.captured().len(), 1);
+    assert!(
+        !mock.captured()[0]
+            .body
+            .windows(PLAN_SENTINEL.len())
+            .any(|window| window == PLAN_SENTINEL.as_bytes()),
+        "the over marker never reaches the model"
+    );
+    let allowance = Allowance {
+        session_id: "ccses-42".to_owned(),
+        meter: "5h".to_owned(),
+        reset_value: reset5h,
+        release: Release::Plan,
+    };
+    assert_eq!(
+        store.load_allowances().expect("allowances"),
+        vec![allowance.clone()]
+    );
+    let rows = wait_for_rows(&store, 3).await;
+    let row = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::Released))
+        .expect("a released row");
+    assert_eq!(
+        row.extra.as_ref().and_then(|extra| extra.get("release")),
+        Some(&json!("plan"))
+    );
+
+    // Still room: plain turns forward.
+    let response = post_messages(addr, "/v1/messages", &[], &plain).await;
+    let _ = response.bytes().await;
+    assert_eq!(mock.captured().len(), 2);
+
+    // The plan is spent: stopped again, offered only the burn marker.
+    reading(1.0);
+    let blocked = post_messages(addr, "/v1/messages", &[], &plain).await;
+    let text = blocked.text().await.expect("notice");
+    assert!(text.contains("is spent until"), "{text}");
+    assert!(!text.contains("over marker"), "{text}");
+    assert_eq!(mock.captured().len(), 2, "nothing reached upstream");
+
+    // The burn marker widens the same allowance to overage.
+    let burn = typed(&format!("{SENTINEL} go on"));
+    let response = post_messages(addr, "/v1/messages", &[], &burn).await;
+    let _ = response.bytes().await;
+    assert_eq!(mock.captured().len(), 3);
+    assert_eq!(
+        store.load_allowances().expect("allowances"),
+        vec![Allowance {
+            release: Release::Overage,
+            ..allowance
+        }]
+    );
+}
+
 #[tokio::test]
 async fn the_gate_reads_only_the_session_s_own_allowances_and_survives_the_prune() {
     // The gate loads one session's rows by key rather than the whole
@@ -2093,6 +2200,7 @@ async fn the_gate_reads_only_the_session_s_own_allowances_and_survives_the_prune
         session_id: session.to_owned(),
         meter: "5h".to_owned(),
         reset_value,
+        release: Release::Overage,
     };
     // This session's release for a window that has already rolled, and
     // a neighbour's release for the current one.
@@ -2314,7 +2422,14 @@ async fn an_unparseable_body_on_the_gated_path_still_gates() {
     assert_eq!(content_type(&response), "text/event-stream");
     let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
-    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
+    let notice = Blocking::notice(
+        Meter::FiveHour,
+        Some(reset5h),
+        false,
+        None,
+        &tz,
+        NoticeStyle::Gfm,
+    );
     let expected = Blocking::blocked_turn(&notice, None, Rendering::Sse);
     assert_eq!(
         bytes.as_ref(),

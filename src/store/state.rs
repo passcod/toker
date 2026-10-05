@@ -9,6 +9,7 @@
 //! window's reset passes, the 30-day lane prune) are the caller's too — the
 //! store has no clock beyond `ts_ms` values handed to it.
 
+use crate::ir::Release;
 use serde_json::Value;
 
 use super::{Error, Result, row_of, rows_of};
@@ -66,6 +67,16 @@ pub struct Allowance {
     pub session_id: String,
     pub meter: String,
     pub reset_value: i64,
+    /// What the release covers: overage, or only the plan's own room.
+    pub release: Release,
+}
+
+/// The `release` column's spelling.
+fn release_name(release: Release) -> &'static str {
+    match release {
+        Release::Overage => "overage",
+        Release::Plan => "plan",
+    }
 }
 
 /// One ping run (plan: ping windows). Every field but `ts_ms` is
@@ -286,15 +297,22 @@ pub(super) fn prune_lanes(
 }
 
 /// Idempotent: recording the same (session, meter, reset) allowance twice is
-/// one row.
+/// one row. A second release for the same window only ever widens it: an
+/// overage grant over a plan one makes it overage, and a plan grant over
+/// an overage one leaves it overage, because the burn marker already said
+/// overage was fine for this window.
 pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO allowances (session_id, meter, reset_value)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO allowances (session_id, meter, reset_value, release)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (session_id, meter, reset_value) DO UPDATE SET
+           release = CASE WHEN excluded.release = 'overage' THEN 'overage'
+                          ELSE allowances.release END",
         (
             &allowance.session_id,
             &allowance.meter,
             allowance.reset_value,
+            release_name(allowance.release),
         ),
     )?;
     Ok(())
@@ -303,7 +321,7 @@ pub(super) fn record_allowance(conn: &Connection, allowance: &Allowance) -> Resu
 pub(super) fn load_allowances(conn: &Connection) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value FROM allowances
+        "SELECT session_id, meter, reset_value, release FROM allowances
          ORDER BY session_id, meter, reset_value",
         [],
         read_allowance,
@@ -320,7 +338,7 @@ pub(super) fn load_session_allowances(
 ) -> Result<Vec<Allowance>> {
     rows_of(
         conn,
-        "SELECT session_id, meter, reset_value FROM allowances
+        "SELECT session_id, meter, reset_value, release FROM allowances
          WHERE session_id = ?1
          ORDER BY meter, reset_value",
         [session_id],
@@ -350,10 +368,18 @@ pub(super) fn prune_allowances(conn: &Connection, now_ms: i64) -> Result<u64> {
 }
 
 fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
+    let release: String = row.get("release")?;
     Ok(Allowance {
         session_id: row.get("session_id")?,
         meter: row.get("meter")?,
         reset_value: row.get("reset_value")?,
+        // A spelling this binary does not know reads as the narrower
+        // release: a plan allowance can never spend overage.
+        release: if release == "overage" {
+            Release::Overage
+        } else {
+            Release::Plan
+        },
     })
 }
 

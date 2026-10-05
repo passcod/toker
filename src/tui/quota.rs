@@ -1263,7 +1263,7 @@ mod tests {
         let snap = crate::tui::model::aggregate(
             &window_rows,
             quota.as_ref(),
-            &std::collections::HashSet::new(),
+            &crate::tui::model::Released::new(),
             &std::collections::HashMap::new(),
             &crate::catalog::fetched::FetchedCatalogs::default(),
             None,

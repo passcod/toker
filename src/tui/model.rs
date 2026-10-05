@@ -20,14 +20,19 @@
 //! deliberate zero is the count of requests without cost data: a count
 //! over known rows is a real number.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::labels::Label;
 use super::quota::QuotaAgg;
 use super::rebuilds::RebuildAgg;
 use crate::catalog::fetched::FetchedCatalogs;
 use crate::catalog::windows::{ContextWindow, resolve_context_window};
+use crate::ir::Release;
 use crate::store::{CostKind, DisplayRow, RowKind, is_api_measurement};
+
+/// The sessions holding a live allowance for the running window, and
+/// which release each holds (see [`SessionAgg::released`]).
+pub(crate) type Released = HashMap<String, Release>;
 
 /// The label for rows grouped without a session id (NULL `session_id`).
 pub(crate) const NO_SESSION: &str = "-";
@@ -148,11 +153,12 @@ pub(crate) struct SessionAgg {
     /// the latest.
     pub forced_any: bool,
     /// The session holds a live allowance for the quota window now
-    /// running — the `$` marker: released past the
-    /// armed gate, spending overage where the others stop. Decided by
-    /// the caller from the allowances table against the current meter
-    /// resets, and passed in as a set.
-    pub released: bool,
+    /// running, and which: the `$` marker for an overage release (past
+    /// the armed gate, spending overage where the others stop), the `%`
+    /// for a plan release (past the gate until the plan is spent, never
+    /// into overage). Decided by the caller from the allowances table
+    /// against the current meter resets, and passed in as a map.
+    pub released: Option<Release>,
     /// The context ceiling of the main lane's model, resolved through the
     /// chain (see [`session_ctx`]): the hand-verified catalogue first
     /// ([`resolve_context_window`] of the model, as of that lane's latest row
@@ -352,7 +358,7 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
     aggregate(
         &[],
         None,
-        &HashSet::new(),
+        &Released::new(),
         &HashMap::new(),
         &FetchedCatalogs::default(),
         None,
@@ -387,7 +393,7 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 pub(crate) fn aggregate(
     rows: &[DisplayRow],
     quota: Option<&QuotaAgg>,
-    released: &HashSet<String>,
+    released: &Released,
     labels: &HashMap<String, Label>,
     catalogs: &FetchedCatalogs,
     rebuilds: Option<RebuildAgg>,
@@ -485,7 +491,7 @@ pub(crate) fn aggregate(
                 compact_generations: None,
                 forced_latest: false,
                 forced_any: false,
-                released: released.contains(&key),
+                released: released.get(&key).copied(),
                 ctx: ContextWindow::Unknown,
                 label: labels.get(&key).cloned(),
                 latest_ts_ms: row.ts_ms,
@@ -778,8 +784,8 @@ mod tests {
     /// section, no rebuild section, no released sessions — absence, not
     /// zeros, exactly what the loop passes before the quota cadence's
     /// first pass.
-    fn no_sections() -> std::collections::HashSet<String> {
-        std::collections::HashSet::new()
+    fn no_sections() -> super::Released {
+        super::Released::new()
     }
 
     /// The tests' shared "no transcript labels" input — the absent
@@ -2230,8 +2236,8 @@ mod tests {
         let mut released_row = display_bare(mins_ago(3));
         released_row.session_id = Some("ses-free".into());
 
-        let mut released = std::collections::HashSet::new();
-        released.insert("ses-free".to_owned());
+        let mut released = super::Released::new();
+        released.insert("ses-free".to_owned(), crate::ir::Release::Overage);
         let snap = super::aggregate(
             &[latest, earlier_only, after, released_row],
             None,
@@ -2254,8 +2260,11 @@ mod tests {
             !session("ses-dim").forced_latest && session("ses-dim").forced_any,
             "an earlier rewrite, not the latest turn"
         );
-        assert!(session("ses-free").released);
-        assert!(!session("ses-live").released);
+        assert_eq!(
+            session("ses-free").released,
+            Some(crate::ir::Release::Overage)
+        );
+        assert_eq!(session("ses-live").released, None);
     }
 
     /// A session row reads its main lane — the lane (`tools_hash`)

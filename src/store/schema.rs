@@ -210,6 +210,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX requests_lane_idx ON requests (session_id, tools_hash, ts_ms);
     "#,
+    // v6 — which release an allowance is: `overage` (the burn marker,
+    // every allowance before this column existed) or `plan` (the over
+    // marker: past the gate only while the plan has room). The default
+    // is what every existing row was granted as.
+    r#"
+    ALTER TABLE allowances ADD COLUMN release TEXT NOT NULL DEFAULT 'overage';
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.

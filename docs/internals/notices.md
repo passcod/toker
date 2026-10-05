@@ -30,8 +30,10 @@ incident behind that.
 
 No em dashes in notice text: a terminal font renders one two cells wide, and the
 line reads as misaligned. Colons and commas do the same job. The quota notice
-does not embed the release marker either: it would then sit in history as
-assistant text.
+does not embed the release markers either: they would then sit in history as
+assistant text. It names the over marker only while the blocked meter's plan
+has room (`quota::plan_room`): with the plan spent or overage drawn, that marker
+would be stopped again at once.
 
 ## One style per frontend
 

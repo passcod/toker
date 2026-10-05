@@ -46,7 +46,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::catalog::{CostBuckets, normalise_model_id, price};
-use crate::ir::AnthropicShape;
+use crate::ir::{AnthropicShape, Release};
 use crate::middleware::cold::Outlook;
 use crate::middleware::lanes;
 use crate::middleware::quota::{Grant, Meter, group};
@@ -703,6 +703,7 @@ pub(crate) fn record_anthropic_released(
     server: &Server,
     session_id: &str,
     backend_id: &str,
+    release: Release,
     grant: &Grant,
     stale_meters: Option<&Value>,
     frontend: Option<&str>,
@@ -772,10 +773,16 @@ pub(crate) fn record_anthropic_released(
         error_type: None,
         retry_after_ms: None,
         // The fiveHour/sevenDay row fields, in the kind-specific
-        // payload column (the schema has no dedicated columns).
+        // payload column (the schema has no dedicated columns), and which
+        // marker granted it. Rows from before the plan marker carry no
+        // `release`: they were all overage.
         extra: Some(json!({
             "fiveHour": grant.five_hour,
             "sevenDay": grant.seven_day,
+            "release": match release {
+                Release::Overage => "overage",
+                Release::Plan => "plan",
+            },
         })),
         betas: None,
         geo: None,
@@ -786,7 +793,7 @@ pub(crate) fn record_anthropic_released(
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
-        "POST /v1/messages → released {} five_hour={:?} seven_day={:?}",
+        "POST /v1/messages → released {} ({release:?}) five_hour={:?} seven_day={:?}",
         session_id,
         grant.five_hour,
         grant.seven_day,
