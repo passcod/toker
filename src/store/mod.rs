@@ -404,6 +404,12 @@ impl Store {
         state::load_session_allowances(&*self.conn()?, session_id)
     }
 
+    /// Delete every allowance one session holds: the TUI's Close control
+    /// (see `state::delete_session_allowances`). Returns how many went.
+    pub fn delete_session_allowances(&self, session_id: &str) -> Result<u64> {
+        state::delete_session_allowances(&*self.conn()?, session_id)
+    }
+
     /// Delete the allowances whose window has ended (see
     /// `state::prune_allowances`). Returns how many went.
     pub fn prune_allowances(&self, now_ms: i64) -> Result<u64> {
@@ -794,6 +800,7 @@ mod tests {
             RowKind::Awake,
             RowKind::Error,
             RowKind::FidelityDrift,
+            RowKind::Revoked,
         ];
         for kind in kinds {
             assert!(!is_api_measurement(Some(kind)));

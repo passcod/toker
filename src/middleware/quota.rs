@@ -254,6 +254,23 @@ pub fn grant_for(meters: Option<Meters<'_>>, now_ms: i64) -> Grant {
     }
 }
 
+/// The grant a TUI release makes, ahead of time: the 5-hour window's
+/// current reset whenever that window has not ended, exhausted or not, so
+/// a session can be opened before it is stopped; the 7-day window's only
+/// when it is exhausted, as with [`grant_for`], so a release for the
+/// afternoon cannot quietly become one for the week. A window whose
+/// reading has ended names no reset worth granting for: the next one's
+/// is not known until a response reports it.
+pub fn grant_ahead(meters: Option<Meters<'_>>, now_ms: i64) -> Grant {
+    let five_hour = meters
+        .and_then(|meters| meters.reset5h())
+        .filter(|&reset| !expired(Some(reset), now_ms));
+    Grant {
+        five_hour,
+        seven_day: grant_for(meters, now_ms).seven_day,
+    }
+}
+
 /// Block or forward.
 ///
 /// `allowances` are the session's stored [`Allowance`] rows — the caller
@@ -568,8 +585,8 @@ pub(crate) fn group(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Allowance, Blocking, GateDecision, Meter, Meters, Rendering, THRESHOLD, decide,
-        exhausted_meters, expired, grant_for, plan_room,
+        Allowance, Blocking, GateDecision, Grant, Meter, Meters, Rendering, THRESHOLD, decide,
+        exhausted_meters, expired, grant_ahead, grant_for, plan_room,
     };
     use crate::ir::Release;
     use crate::middleware::notice::{BLOCK_FOOTER, BLOCK_HEADER, NoticeStyle};
@@ -608,6 +625,41 @@ mod tests {
             release: Release::Plan,
             ..allowance(meter, reset)
         }
+    }
+
+    /// Ahead of time: the 5-hour window though it is healthy, the 7-day
+    /// one only when exhausted, and nothing for a window that has ended
+    /// or a reading that names no reset.
+    #[test]
+    fn a_grant_ahead_opens_the_five_hour_window_early_but_not_the_week() {
+        let healthy = json!({
+            "util5h": 0.30, "reset5h": 2_000_000_600,
+            "util7d": 0.40, "reset7d": 2_000_600_000,
+        });
+        assert_eq!(
+            grant_ahead(meters(&healthy), NOW_MS),
+            Grant {
+                five_hour: Some(2_000_000_600),
+                seven_day: None
+            }
+        );
+        let weekly = json!({
+            "util5h": 0.30, "reset5h": 2_000_000_600,
+            "util7d": 0.995, "reset7d": 2_000_600_000,
+        });
+        assert_eq!(
+            grant_ahead(meters(&weekly), NOW_MS).seven_day,
+            Some(2_000_600_000)
+        );
+        let ended = json!({"util5h": 0.30, "reset5h": 1_999_999_000});
+        assert_eq!(grant_ahead(meters(&ended), NOW_MS).five_hour, None);
+        assert_eq!(
+            grant_ahead(None, NOW_MS),
+            Grant {
+                five_hour: None,
+                seven_day: None
+            }
+        );
     }
 
     /// A plan release forwards past the threshold while the plan has

@@ -33,6 +33,8 @@ pub enum RowKind {
     Error,
     /// Re-serialisation drifted from the request bytes (invariant 5); `drift_digest` set.
     FidelityDrift,
+    /// A session's allowances were deleted from the TUI: its gate applies again.
+    Revoked,
 }
 
 impl RowKind {
@@ -46,6 +48,7 @@ impl RowKind {
             Self::Awake => "awake",
             Self::Error => "error",
             Self::FidelityDrift => "fidelity-drift",
+            Self::Revoked => "revoked",
         }
     }
 
@@ -59,6 +62,7 @@ impl RowKind {
             "awake" => Some(Self::Awake),
             "error" => Some(Self::Error),
             "fidelity-drift" => Some(Self::FidelityDrift),
+            "revoked" => Some(Self::Revoked),
             _ => None,
         }
     }

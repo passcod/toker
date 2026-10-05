@@ -708,86 +708,15 @@ pub(crate) fn record_anthropic_released(
     stale_meters: Option<&Value>,
     frontend: Option<&str>,
 ) {
-    let row = RequestRow {
-        id: None,
-        ts_ms: now_ms(),
-        duration_ms: None,
-        kind: Some(RowKind::Released),
-        frontend: Some("anthropic".to_owned()),
-        provider: Some(backend_id.to_owned()),
-        route: Some(format!("anthropic:{backend_id}")),
-        session_id: Some(session_id.to_owned()),
-        ping: None,
-        model: None,
-        raw_model: None,
-        requested_model: None,
-        effective_model: None,
-        input: None,
-        cache_read: None,
-        cache_write_total: None,
-        cache_write_5m: None,
-        cache_write_1h: None,
-        output: None,
-        reasoning: None,
-        iterations: None,
-        web_searches: None,
-        code_execs: None,
-        ttl_split_known: None,
-        usage_presence: None,
-        usage_raw: None,
-        cost_usd: None,
-        cost_kind: None,
-        // Row parity: the stale snapshot the grant rested on. A blocked
-        // request can never refresh meters, so this is often the same
-        // spent reading the NEXT blocked row will carry — that is the
-        // point of recording it (measure the
-        // reset lag from response rows only, never these).
-        rate_limits: stale_meters.cloned(),
-        req_bytes: None,
-        req_messages: None,
-        req_tools: None,
-        tools_hash: None,
-        system_chars: None,
-        system_hash: None,
-        system_blocks: None,
-        system_messages: None,
-        compact_generations: None,
-        summarising: None,
-        system_change: None,
-        system_ladder: None,
-        system_tail: None,
-        // The release marker fires regardless of whether the gate is
-        // armed (stripping is unconditional) — the row must not claim the
-        // gate was on when it wasn't.
-        gate_on: Some(server.config.gates.quota_enabled),
-        cold_on: Some(server.config.gates.cold_enabled),
-        forced_from: None,
-        forced_to: None,
-        downgraded_from: None,
-        downgraded_to: None,
-        cache_stripped: None,
-        system_merged: None,
-        model_mappings: None,
-        drift_digest: None,
-        status: None,
-        error_type: None,
-        retry_after_ms: None,
-        // The fiveHour/sevenDay row fields, in the kind-specific
-        // payload column (the schema has no dedicated columns), and which
-        // marker granted it. Rows from before the plan marker carry no
-        // `release`: they were all overage.
-        extra: Some(json!({
-            "fiveHour": grant.five_hour,
-            "sevenDay": grant.seven_day,
-            "release": match release {
-                Release::Overage => "overage",
-                Release::Plan => "plan",
-            },
-        })),
-        betas: None,
-        geo: None,
-        fast: None,
-    };
+    let row = crate::release::released_row(
+        session_id,
+        backend_id,
+        release,
+        grant,
+        stale_meters,
+        &server.config.gates,
+        now_ms(),
+    );
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");

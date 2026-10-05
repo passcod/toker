@@ -367,6 +367,15 @@ pub(super) fn prune_allowances(conn: &Connection, now_ms: i64) -> Result<u64> {
     Ok(gone as u64)
 }
 
+/// Delete every allowance `session_id` holds, live or not: closing a
+/// session's gate. The ledger records the change as its own row; this
+/// table is state, not history, so a delete here loses nothing the
+/// ledger needs. Returns how many rows went.
+pub(super) fn delete_session_allowances(conn: &Connection, session_id: &str) -> Result<u64> {
+    let gone = conn.execute("DELETE FROM allowances WHERE session_id = ?1", [session_id])?;
+    Ok(gone as u64)
+}
+
 fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
     let release: String = row.get("release")?;
     Ok(Allowance {

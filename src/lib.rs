@@ -5,9 +5,10 @@
 //! ([providers]), with [ir] as the canonical request model they share,
 //! [store] as the SQLite ledger, [server] as the listener, [tui] as the
 //! dashboard, [setup] as the wizard's library half (the tested
-//! modules the interactive `toker setup` composes), and [timers] as
-//! the wake/hold/ping subsystem (the hidden verbs the
-//! wizard-installed systemd units invoke). The binary
+//! modules the interactive `toker setup` composes), [timers] as the
+//! wake/hold/ping subsystem (the hidden verbs the wizard-installed
+//! systemd units invoke), and [release] as the quota gate's grant and
+//! revoke writes, shared by the markers and the TUI. The binary
 //! (src/main.rs) is the CLI surface over these modules.
 //!
 //! The lib/bin split exists so each unit can land its full public API before
@@ -26,6 +27,7 @@ pub mod middleware;
 pub mod observe;
 pub mod proto;
 pub mod providers;
+pub mod release;
 pub mod secrets;
 pub mod server;
 pub mod setup;

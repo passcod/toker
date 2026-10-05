@@ -70,7 +70,7 @@ use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
 use crate::middleware::quota::{
-    Blocking, GateDecision, Grant, Meter, Meters, Rendering, decide, grant_for, plan_room,
+    Blocking, GateDecision, Meters, Rendering, decide, grant_for, plan_room,
 };
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
@@ -298,33 +298,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 let meters = meters_snapshot.as_ref().map(Meters::over);
                 let now = now_ms();
                 let fresh = grant_for(meters, now);
-                for (meter, reset) in [
-                    (Meter::FiveHour, fresh.five_hour),
-                    (Meter::SevenDay, fresh.seven_day),
-                ] {
-                    if let Some(reset) = reset
-                        && let Err(error) = server.store.record_allowance(&Allowance {
-                            session_id: session.to_owned(),
-                            meter: meter.as_str().to_owned(),
-                            reset_value: reset,
-                            release,
-                        })
-                    {
-                        tracing::error!(%error, "allowance record failed");
-                    }
+                if let Err(error) =
+                    crate::release::record_grant(&server.store, session, release, &fresh)
+                {
+                    tracing::error!(%error, "allowance record failed");
                 }
-                // The grant merges, never replaces: a fresh
-                // null for a meter defers to the allowance already held,
-                // so a release while only the 5-hour window is spent must
-                // not wipe an existing 7-day allowance.
-                let merged = Grant {
-                    five_hour: fresh
-                        .five_hour
-                        .or_else(|| prior_live(&server, session, "5h", now)),
-                    seven_day: fresh
-                        .seven_day
-                        .or_else(|| prior_live(&server, session, "7d", now)),
-                };
+                let merged = crate::release::merged(&server.store, session, &fresh, now);
                 record_anthropic_released(
                     &server,
                     session,
@@ -1012,24 +991,6 @@ fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allo
             tracing::error!(%error, "allowances load failed");
             Vec::new()
         })
-}
-
-/// The live prior allowance a session holds for one meter (the merge
-/// rule: `fresh ?? prior`). The predecessor stored one value per
-/// meter per session; the store's reset-value keying can hold several
-/// across rolled windows, and the one still in force is the live
-/// (future-reset) row with the greatest reset — a rolled window's rows
-/// are inert by the value match and never answer here for long.
-fn prior_live(server: &Server, session: &str, meter: &str, now_ms: i64) -> Option<i64> {
-    server
-        .store
-        .load_session_allowances(session)
-        .ok()?
-        .into_iter()
-        .filter(|allowance| allowance.meter == meter)
-        .map(|allowance| allowance.reset_value)
-        .filter(|reset| reset.saturating_mul(1000) > now_ms)
-        .max()
 }
 
 /// The cold gate's idle floor override, in ms
