@@ -11,7 +11,7 @@
 //! ```text
 //! last 30m · 2 sessions · 17 requests       last req 12s ago · 12:34:56
 //! ┌ SESSIONS ────────────────────────────────────────────────────────┐
-//! │ table, sheds rightmost columns when the terminal narrows          │
+//! │ table sized to its data; sheds columns before the label narrows  │
 //! └────────────────────────────────────────────────────────────────────┘
 //! ┌ SPEND ─────────────┐ ┌ RATE & QUOTA ──────────────────────────────┐
 //! │ billed             │ │ requests ▁▂··▃█ 0.6/min  1 error           │
@@ -85,10 +85,22 @@ const STALE_SECS: i64 = 300;
 /// rows say nothing yet (a "fewer than three" check).
 const CONTEXT_MIN_REQUESTS: usize = 3;
 
-/// The least width a session NAME renders in (`labelW >= 12`):
-/// whatever is left over after the table goes to
-/// the label, and less than this is noise — the id renders instead.
+/// The least width a session NAME renders in (`labelW >= 12`): below
+/// this the label column shows the short id instead — too narrow a name
+/// is noise.
 const LABEL_MIN_W: u16 = 12;
+
+/// The label column's floor before a numeric column sheds: the table
+/// gives the label its leftover width, and sheds a column only when the
+/// leftover would drop under this (or under the widest label, when every
+/// label is shorter). A title is the session's name; twenty cells of it
+/// are worth more than a peak or an output total.
+const LABEL_SHED_W: u16 = 20;
+
+/// The width an unlabelled session's id renders at: eight characters
+/// tell sessions apart at a glance (the reference's `sid.slice(0, 8)`),
+/// and the full UUID is a column of noise.
+const SHORT_ID: usize = 8;
 
 /// The CONTEXT panel's name field: wide enough for the id forms and
 /// short labels, a hard CAP for long titles — the bar is the panel's
@@ -150,21 +162,75 @@ const TOKENS_SHARE_MIN_W: usize =
 /// the number survives the shed and only the shape goes.
 const TOKENS_RATE_BAR_MIN_W: usize = TOKENS_LABEL_W + TOKENS_AMOUNT_W + 2 + TOKENS_BAR_MIN_W;
 
-/// The sessions table's columns, left to right, with their base widths.
-/// When the terminal is too narrow the *rightmost* columns shed first
-/// (see [`session_plan`]) — columns never wrap and never squeeze.
-const SESSION_COLUMNS: [(&str, u16); 10] = [
-    ("SESSION", 18),
-    ("CTX", 5),
-    ("MODEL", 22),
-    ("REQS", 5),
-    ("IN NOW", 10),
-    ("PEAK", 10),
-    ("MSGS", 5),
-    ("CMPCT", 6),
-    ("OUT", 8),
-    ("LAST", 8),
-];
+/// The sessions table's numeric and model columns, after the label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Ctx,
+    Model,
+    Reqs,
+    PromptNow,
+    Peak,
+    Msgs,
+    Compactions,
+    Out,
+    Idle,
+}
+
+impl Col {
+    /// Left to right, after the label.
+    const ALL: [Col; 9] = [
+        Col::Ctx,
+        Col::Model,
+        Col::Reqs,
+        Col::PromptNow,
+        Col::Peak,
+        Col::Msgs,
+        Col::Compactions,
+        Col::Out,
+        Col::Idle,
+    ];
+
+    /// The order columns go in when the label would fall under
+    /// [`LABEL_SHED_W`]: the session-wide total first, then the history
+    /// figures, the idle age — what says a session is alive — last
+    /// among the numbers, and the model and its ceiling after them.
+    const SHED: [Col; 9] = [
+        Col::Out,
+        Col::Peak,
+        Col::Compactions,
+        Col::Msgs,
+        Col::PromptNow,
+        Col::Reqs,
+        Col::Idle,
+        Col::Model,
+        Col::Ctx,
+    ];
+
+    /// Lowercase like the reference's dim header row; compactions take a
+    /// glyph, single-width (U+21BA, not an emoji, whose width terminals
+    /// disagree on and which would shift every cell after it).
+    fn header(self) -> &'static str {
+        match self {
+            Col::Ctx => "ctx",
+            Col::Model => "model",
+            Col::Reqs => "reqs",
+            Col::PromptNow => "prompt now",
+            Col::Peak => "peak",
+            Col::Msgs => "msgs",
+            Col::Compactions => "↺",
+            Col::Out => "out",
+            Col::Idle => "idle",
+        }
+    }
+
+    /// Numbers right-align, so magnitudes line up; the model reads left.
+    fn alignment(self) -> Alignment {
+        match self {
+            Col::Model => Alignment::Left,
+            _ => Alignment::Right,
+        }
+    }
+}
 
 /// Sparkline blocks, low → high (▁▂▃▄▅▆▇█ style; a space is a flat minute).
 const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
@@ -464,10 +530,12 @@ fn freshness(snap: &Snapshot) -> (String, Style) {
     }
 }
 
-/// The sessions table (the reference's SESSIONS block). Column shedding
-/// is a
-/// width-fallback chain: keep the leftmost columns that fit, give the
-/// leftover width to SESSION.
+/// The sessions table (the reference's SESSIONS block): the label,
+/// then columns sized to their data — each the wider of its header and
+/// its widest formatted value, measured in cells, so a locale's
+/// separators or a long model id size the column rather than clip in
+/// it. The label takes what is left; when that falls under
+/// [`LABEL_SHED_W`] columns shed in [`Col::SHED`] order.
 fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     let block = Block::bordered().title_top("SESSIONS");
     if area.height == 0 {
@@ -484,112 +552,120 @@ fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     }
 
     let inner = block.inner(area);
-    let (headers, widths) = session_plan(inner.width);
-    // The SESSION column's width is the label's budget — the leftover
-    // width the table plan hands that column.
-    let session_w = match widths.first() {
-        Some(ratatui::layout::Constraint::Length(width)) => *width,
-        _ => 0,
-    };
-    let header = Row::new(headers.iter().map(|h| (*h).to_string())).style(Style::new().bold());
-    let rows = snap
+    let cells: Vec<[Line<'static>; 9]> = snap
         .sessions
         .iter()
-        .map(|s| Row::new(session_cells(s, snap.now_ms, headers.len(), session_w, fmt)));
-    frame.render_widget(Table::new(rows, widths).header(header).block(block), area);
+        .map(|session| session_cells(session, snap.now_ms, fmt))
+        .collect();
+    let mut widths = [0u16; 9];
+    for (i, col) in Col::ALL.iter().enumerate() {
+        let widest = cells.iter().map(|row| row[i].width()).max().unwrap_or(0);
+        widths[i] = widest.max(col.header().width()) as u16;
+    }
+    // The label's own need, capped at the shedding floor: a table of
+    // short ids sheds nothing to make room for names it does not have.
+    let label_need = snap
+        .sessions
+        .iter()
+        .map(|session| session_name_width(session) as u16)
+        .max()
+        .unwrap_or(0)
+        .max("session".width() as u16)
+        .min(LABEL_SHED_W);
+    let (kept, label_w) = session_plan(&widths, label_need, inner.width);
+
+    let dim = Style::new().dim();
+    let mut header = vec![Cell::new(Line::styled("session", dim))];
+    header.extend(kept.iter().map(|&i| {
+        let col = Col::ALL[i];
+        Cell::new(Line::styled(col.header(), dim).alignment(col.alignment()))
+    }));
+    let rows = snap.sessions.iter().zip(cells).map(|(session, row)| {
+        let mut out = vec![session_cell(session, label_w)];
+        let mut row = row.map(Some);
+        out.extend(kept.iter().map(|&i| {
+            let line = row[i].take().unwrap_or_default();
+            Cell::new(line.alignment(Col::ALL[i].alignment()))
+        }));
+        Row::new(out)
+    });
+    let constraints = std::iter::once(label_w)
+        .chain(kept.iter().map(|&i| widths[i]))
+        .map(Constraint::Length);
+    frame.render_widget(
+        Table::new(rows, constraints)
+            .header(Row::new(header))
+            .block(block),
+        area,
+    );
 }
 
-/// The width-fallback chain: the largest prefix of [`SESSION_COLUMNS`]
-/// (plus inter-column spacing) that fits `available` cells, with every
-/// leftover cell handed to the SESSION column. Always returns at least
-/// one column, pinned to the available width when even that cannot fit.
-fn session_plan(available: u16) -> (Vec<&'static str>, Vec<Constraint>) {
-    let width_of = |count: usize| -> u16 {
-        SESSION_COLUMNS[..count]
-            .iter()
-            .map(|(_, w)| *w)
-            .sum::<u16>()
-            .saturating_add(count.saturating_sub(1) as u16)
+/// The columns that survive at `available` cells (indices into
+/// [`Col::ALL`], in display order) and the label's width. The label gets
+/// every cell the kept columns and their one-cell gaps leave; while that
+/// is under `label_need`, the next column in [`Col::SHED`] order goes.
+/// With every column shed the label takes the whole width.
+fn session_plan(widths: &[u16; 9], label_need: u16, available: u16) -> (Vec<usize>, u16) {
+    let mut kept: Vec<usize> = (0..Col::ALL.len()).collect();
+    let leftover = |kept: &[usize]| {
+        let used: u16 = kept.iter().map(|&i| widths[i] + 1).sum();
+        available.saturating_sub(used)
     };
-    let mut count = SESSION_COLUMNS.len();
-    while count > 1 && width_of(count) > available {
-        count -= 1;
+    for shed in Col::SHED {
+        if leftover(&kept) >= label_need {
+            break;
+        }
+        let index = Col::ALL
+            .iter()
+            .position(|col| *col == shed)
+            .expect("every shed column is a column");
+        kept.retain(|&i| i != index);
     }
-    let mut widths: Vec<u16> = SESSION_COLUMNS[..count].iter().map(|(_, w)| *w).collect();
-    let needed = width_of(count);
-    if needed <= available {
-        widths[0] += available - needed; // SESSION absorbs the slack
-    } else {
-        widths[0] = available.max(1); // degenerate width: one clipped column
-    }
-    (
-        SESSION_COLUMNS[..count].iter().map(|(h, _)| *h).collect(),
-        widths.into_iter().map(Constraint::Length).collect(),
-    )
+    let label_w = leftover(&kept);
+    (kept, label_w)
 }
 
-/// One table row for a session; cells are produced only for the surviving
-/// columns so shedding never leaves stray data.
+/// One session's cells for every column in [`Col::ALL`] order; the plan
+/// picks which render.
 ///
 /// The `↑` is bright while the conversation is being served upgraded
 /// and dim once it has been at some point in the window but the latest
-/// turn was not; the `$` marks a session released
-/// past the armed quota gate for the window now running. Idle ages dim
-/// past [`IDLE_SECS`], like the reference's idle column. `session_w` is
-/// the
-/// SESSION column's width — the label's budget (see [`session_cell`]).
-fn session_cells(
-    session: &SessionAgg,
-    now_ms: i64,
-    count: usize,
-    session_w: u16,
-    fmt: &Fmt,
-) -> Vec<Cell<'static>> {
-    let mut cells: Vec<Cell<'static>> = Vec::with_capacity(count);
-    let mut push_if = |n: usize, cell: Cell<'static>| {
-        if n < count {
-            cells.push(cell);
-        }
-    };
-    push_if(0, session_cell(session, session_w));
-    push_if(1, ctx_cell(session.ctx));
-    push_if(2, model_cell(session));
-    push_if(3, Cell::new(session.requests.to_string()));
-    push_if(4, Cell::new(unknown_or_grouped(fmt, session.input_now)));
-    push_if(5, Cell::new(unknown_or_grouped(fmt, session.input_peak)));
-    push_if(
-        6,
-        Cell::new(
+/// turn was not; the `$` marks a session released past the armed quota
+/// gate for the window now running. Idle ages dim past [`IDLE_SECS`],
+/// like the reference's idle column. Counts (requests, messages,
+/// compactions) print bare — a separator in a three-digit count is
+/// clutter — while token figures group.
+fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>; 9] {
+    let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
+    let last = rel_age(now_ms - session.latest_ts_ms);
+    Col::ALL.map(|col| match col {
+        Col::Ctx => ctx_cell(session.ctx),
+        Col::Model => model_cell(session),
+        Col::Reqs => Line::raw(session.requests.to_string()),
+        Col::PromptNow => Line::raw(unknown_or_grouped(fmt, session.input_now)),
+        Col::Peak => Line::raw(unknown_or_grouped(fmt, session.input_peak)),
+        Col::Msgs => Line::raw(
             session
                 .req_messages
                 .map(|messages| messages.to_string())
                 .unwrap_or_else(|| "-".into()),
         ),
-    );
-    push_if(
-        7,
-        Cell::new(
-            // The latest generation,
-            // and zero/absent renders as a dash (`String(gens || "-")`).
-            session
-                .compact_generations
-                .filter(|generations| *generations > 0)
-                .map(|generations| generations.to_string())
-                .unwrap_or_else(|| "-".into()),
-        ),
-    );
-    push_if(8, Cell::new(unknown_or_grouped(fmt, session.output_total)));
-    let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
-    let last = rel_age(now_ms - session.latest_ts_ms);
-    push_if(
-        9,
-        if idle {
-            Cell::new(last).dim()
-        } else {
-            Cell::new(last)
+        // The latest generation, and zero/absent is a dim dash
+        // (`String(gens || "-")`): no compaction is the usual state, and
+        // a column of zeros would shout it.
+        Col::Compactions => match session.compact_generations.filter(|g| *g > 0) {
+            Some(generations) => Line::raw(generations.to_string()),
+            None => Line::styled("-", Style::new().dim()),
         },
-    );
-    cells
+        Col::Out => Line::raw(unknown_or_grouped(fmt, session.output_total)),
+        Col::Idle => {
+            if idle {
+                Line::styled(last.clone(), Style::new().dim())
+            } else {
+                Line::raw(last.clone())
+            }
+        }
+    })
 }
 
 /// The session's NAME spans, shared by every panel that names a
@@ -620,38 +696,83 @@ fn session_name_spans(session: &SessionAgg) -> Option<Vec<Span<'static>>> {
     Some(spans)
 }
 
-/// The SESSION cell: the shared name where the column is wide enough
-/// for one ([`LABEL_MIN_W`], on the "too narrow a name is noise"
-/// rule), else the session id. The cell clips at the column's width,
-/// which grows with the terminal exactly like the reference's leftover
-/// label column.
+/// A session's id as the panels show it when it has no name: the first
+/// [`SHORT_ID`] characters.
+fn short_id(session: &str) -> String {
+    session.chars().take(SHORT_ID).collect()
+}
+
+/// The name a session renders under in every panel: its label's spans,
+/// or the short id — the same string everywhere, so rows correlate.
+fn session_name_or_id(session: &SessionAgg) -> Vec<Span<'static>> {
+    session_name_spans(session).unwrap_or_else(|| vec![Span::raw(short_id(&session.session))])
+}
+
+/// The cells [`session_name_or_id`] takes, unclipped.
+fn session_name_width(session: &SessionAgg) -> usize {
+    session_name_or_id(session).iter().map(Span::width).sum()
+}
+
+/// `spans` cut to `width` cells with an ellipsis when anything had to
+/// go, each surviving span keeping its style — the directory stays
+/// cyan up to the cut.
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(Span::width).sum();
+    if total <= width {
+        return spans;
+    }
+    let mut room = width.saturating_sub(1); // the ellipsis
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    let mut style = Style::new();
+    for span in spans {
+        if room == 0 {
+            break;
+        }
+        let text = clip(&span.content, room);
+        room -= text.width();
+        style = span.style;
+        out.push(Span::styled(text, span.style));
+    }
+    if width > 0 {
+        out.push(Span::styled("…", style));
+    }
+    out
+}
+
+/// The label cell: the shared name clipped to the column (with an
+/// ellipsis) where the column fits a name ([`LABEL_MIN_W`], on the "too
+/// narrow a name is noise" rule), else the short id.
 fn session_cell(session: &SessionAgg, width: u16) -> Cell<'static> {
     if width >= LABEL_MIN_W
         && let Some(spans) = session_name_spans(session)
     {
-        return Cell::new(Line::from(spans));
+        return Cell::new(Line::from(clip_spans(spans, width as usize)));
     }
-    Cell::new(session.session.clone())
+    Cell::new(short_id(&session.session))
 }
 
 /// The CTX cell: `1M`/`200k`/`872k` for a known ceiling, a dim `?` for
 /// none — green and bright for a native exact 1M, yellow otherwise
 /// (the reference's context colouring).
-fn ctx_cell(ctx: ContextWindow) -> Cell<'static> {
+fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
     match ctx {
-        ContextWindow::Unknown => Cell::new("?").dim(),
-        ContextWindow::Exact { tokens } if tokens >= 1_000_000 => {
-            Cell::new(short_tokens(tokens)).fg(Color::Green).bold()
-        }
+        ContextWindow::Unknown => Line::styled("?", Style::new().dim()),
+        ContextWindow::Exact { tokens } if tokens >= 1_000_000 => Line::styled(
+            short_tokens(tokens),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
         ContextWindow::Exact { tokens } | ContextWindow::Declared { tokens } => {
-            Cell::new(short_tokens(tokens)).fg(Color::Yellow)
+            Line::styled(short_tokens(tokens), Style::new().fg(Color::Yellow))
         }
     }
 }
 
-/// The MODEL cell with its `↑`/`$` markers, coloured per marker.
-fn model_cell(session: &SessionAgg) -> Cell<'static> {
-    let model = session.model.clone().unwrap_or_else(|| "?".into());
+/// The MODEL cell with its `↑`/`$` markers, coloured per marker. The
+/// `claude-` prefix goes: every anthropic model carries it, so it
+/// distinguishes nothing and costs seven cells a row.
+fn model_cell(session: &SessionAgg) -> Line<'static> {
+    let model = session.model.as_deref().unwrap_or("?");
+    let model = model.strip_prefix("claude-").unwrap_or(model).to_owned();
     let mut line = vec![Span::raw(model)];
     if session.forced_any {
         let style = if session.forced_latest {
@@ -664,7 +785,7 @@ fn model_cell(session: &SessionAgg) -> Cell<'static> {
     if session.released {
         line.push(Span::styled(" $", Style::new().fg(Color::Yellow)));
     }
-    Cell::new(Line::from(line))
+    Line::from(line)
 }
 
 /// Unknown token counts render as `?`, never as a fake zero; known ones
@@ -813,8 +934,7 @@ fn context_name_spans(session: &SessionAgg) -> Vec<Span<'static>> {
     // the same column in both panels — correlation is alignment, not
     // just a shared string.
     let mut spans = Vec::with_capacity(4);
-    let shown =
-        session_name_spans(session).unwrap_or_else(|| vec![Span::raw(session.session.clone())]);
+    let shown = session_name_or_id(session);
     let name_w: usize = shown.iter().map(|span| span.width()).sum();
     if name_w <= CONTEXT_NAME_W {
         spans.extend(shown);
@@ -1146,11 +1266,8 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             .sessions
             .iter()
             .find(|session| session.session == event.session)
-            .map(|session| {
-                session_name_spans(session)
-                    .unwrap_or_else(|| vec![Span::raw(session.session.clone())])
-            })
-            .unwrap_or_else(|| vec![Span::raw(event.session.clone())]);
+            .map(session_name_or_id)
+            .unwrap_or_else(|| vec![Span::raw(short_id(&event.session))]);
         let name_text = name
             .iter()
             .map(|span| span.content.clone())
@@ -1649,6 +1766,7 @@ mod tests {
     use super::super::labels::Label;
     use super::super::locale::Fmt;
     use super::BLOCKS;
+    use unicode_width::UnicodeWidthStr;
 
     const NOW: i64 = 1_769_000_000_000;
     const MIN: i64 = 60_000;
@@ -2238,27 +2356,26 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_sheds_rightmost_columns() {
+    fn narrow_terminal_sheds_columns_before_the_label() {
         let snap = snapshot();
-        // 100 wide: the full column set, model included.
+        // 100 wide: every column, and the label column the rest.
         let wide = rendered(&snap, 100, 36);
-        assert!(wide.contains("z-ai/glm-5.3"));
-        assert!(wide.contains("MODEL"));
-        assert!(wide.contains("PEAK"));
+        for name in ["model", "peak", "out", "idle", "z-ai/glm-5.3"] {
+            assert!(wide.contains(name), "{name:?} in:\n{wide}");
+        }
 
-        // 40 wide (sessions block ≈ 38 inner cells): the chain sheds
-        // down to SESSION + CTX — the id and its ceiling survive, the
-        // model and token columns do not (clipped, not wrapped).
+        // 40 wide (38 inner cells): the label keeps its floor, so the
+        // output total, the history figures, and the prompt go — and
+        // the idle age outlives them.
         let narrow = rendered(&snap, 40, 36);
+        let header = narrow
+            .lines()
+            .find(|line| line.contains("session"))
+            .expect("the header row");
         assert!(narrow.contains("ses-abc"), "session ids always survive");
-        assert!(!narrow.contains("z-ai/glm-5.3"), "model column is shed");
-        assert!(!narrow.contains("PEAK"), "rightmost columns are shed");
-
-        // 80 wide: an intermediate level — model kept, LAST shed.
-        let mid = rendered(&snap, 80, 36);
-        assert!(mid.contains("z-ai/glm-5.3"));
-        assert!(mid.contains("MODEL"));
-        assert!(!mid.contains("LAST"));
+        assert!(!header.contains("out"), "{narrow}");
+        assert!(!header.contains("peak"), "{narrow}");
+        assert!(header.contains("idle"), "{narrow}");
 
         // 20 rows tall: the height budget sheds the sessions LIST
         // before anything else — the panel keeps its scaffold (title
@@ -2283,52 +2400,121 @@ mod tests {
     }
 
     #[test]
-    fn column_chain_sheds_in_order() {
-        let plan = |width: u16| super::session_plan(width).0.to_vec();
-        // Full set: 97 + 9 spacing = 106 cells needed.
+    fn columns_shed_in_priority_order_to_keep_the_label() {
+        use super::Col;
+        // Every column four cells wide: nine columns and their gaps take
+        // 45 cells.
+        let widths = [4u16; 9];
+        let plan = |available: u16| {
+            let (kept, label_w) = super::session_plan(&widths, 20, available);
+            let cols: Vec<Col> = kept.into_iter().map(|i| Col::ALL[i]).collect();
+            (cols, label_w)
+        };
+        // Room for all and a 20-cell label: nothing sheds, and the label
+        // takes every leftover cell.
+        assert_eq!(plan(65), (Col::ALL.to_vec(), 20));
+        assert_eq!(plan(80).1, 35);
+        // One cell short: the session-wide output total goes first.
+        let (cols, label_w) = plan(64);
+        assert!(!cols.contains(&Col::Out));
+        assert_eq!(cols.len(), 8);
+        assert_eq!(label_w, 24);
+        // Then peak, compactions, messages — display order kept for the
+        // survivors.
+        let (cols, _) = plan(45);
         assert_eq!(
-            plan(106),
-            [
-                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT", "LAST"
-            ]
+            cols,
+            [Col::Ctx, Col::Model, Col::Reqs, Col::PromptNow, Col::Idle]
         );
+        // Idle outlives the prompt and the request count.
+        let (cols, _) = plan(30);
+        assert_eq!(cols, [Col::Ctx, Col::Model]);
+        let (cols, _) = plan(35);
+        assert_eq!(cols, [Col::Ctx, Col::Model, Col::Idle]);
+        // Degenerate: every column gone, the label takes the width.
+        assert_eq!(plan(10), (vec![], 10));
+        // A label that needs less than the floor sheds less.
+        let (kept, label_w) = super::session_plan(&widths, 8, 54);
+        assert_eq!((kept.len(), label_w), (9, 9));
+    }
+
+    #[test]
+    fn the_sessions_table_sizes_columns_to_their_data() {
+        let snap = full_snapshot();
+        let text = rendered(&snap, 160, 40);
+        let header = text
+            .lines()
+            .find(|line| line.contains("prompt now"))
+            .expect("the header row");
+        // Lowercase headers; compactions under the glyph; MSGS keeps
+        // its word.
+        for name in [
+            "session", "ctx", "model", "reqs", "peak", "msgs", "↺", "out", "idle",
+        ] {
+            assert!(header.contains(name), "{name:?} in {header:?}");
+        }
+        // The `claude-` prefix goes; the markers stay.
+        assert!(text.contains("opus-5 ↑"), "{text}");
+        assert!(!text.contains("claude-opus-5"), "{text}");
+        assert!(text.contains("sonnet-5 $"), "{text}");
+        // An unlabelled session shows eight characters of its id.
+        assert!(text.contains("ses-crow "), "{text}");
+        assert!(!text.contains("ses-crowded"), "{text}");
+        // Numbers right-align: the prompt figures end under the header's
+        // right edge.
+        let column_end = |line: &str, needle: &str| {
+            let at = line.find(needle).expect("present");
+            line[..at + needle.len()].width()
+        };
+        let row = text
+            .lines()
+            .find(|line| line.contains("470,893"))
+            .expect("ses-hot's row");
         assert_eq!(
-            plan(120),
-            [
-                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT", "LAST"
-            ]
+            column_end(row, "470,893"),
+            column_end(header, "prompt now"),
+            "{header}\n{row}"
         );
-        // Each step down sheds exactly the rightmost surviving column.
-        assert_eq!(
-            plan(105),
-            [
-                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT", "OUT"
-            ]
-        );
-        assert_eq!(
-            plan(96),
-            [
-                "SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS", "CMPCT"
-            ]
-        );
-        assert_eq!(
-            plan(87),
-            ["SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK", "MSGS"]
-        );
-        assert_eq!(
-            plan(80),
-            ["SESSION", "CTX", "MODEL", "REQS", "IN NOW", "PEAK"]
-        );
-        assert_eq!(plan(70), ["SESSION", "CTX", "MODEL", "REQS", "IN NOW"]);
-        assert_eq!(plan(59), ["SESSION", "CTX", "MODEL", "REQS"]);
-        assert_eq!(plan(48), ["SESSION", "CTX", "MODEL"]);
-        assert_eq!(plan(24), ["SESSION", "CTX"]);
-        assert_eq!(plan(18), ["SESSION"]);
-        // Degenerate: never empty, pinned to whatever exists.
-        assert_eq!(plan(5), ["SESSION"]);
-        // Leftover width lands on SESSION: at 110 cells, 106 are needed.
-        let (_, widths) = super::session_plan(110);
-        assert_eq!(widths[0], ratatui::layout::Constraint::Length(18 + 4));
+        // Columns are sized to their data, not to fixed widths: the
+        // reqs column is its header's four cells, so the requests count
+        // ends where "reqs" does.
+        assert_eq!(column_end(row, " 3 "), column_end(header, "reqs") + 1);
+    }
+
+    #[test]
+    fn compactions_render_a_dim_dash_when_none() {
+        let snap = full_snapshot();
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("terminal");
+        terminal
+            .draw(|frame| super::render(frame, &snap, "12:34:56", &utc(), &plain()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width;
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let header_y = rows
+            .iter()
+            .position(|row| row.contains("prompt now"))
+            .expect("the header");
+        let col_x = rows[header_y]
+            .chars()
+            .position(|ch| ch == '↺')
+            .expect("the glyph") as u16;
+        // ses-crowded never compacted: a dim dash under the glyph.
+        let crowded_y = rows
+            .iter()
+            .position(|row| row.contains("ses-crow "))
+            .expect("ses-crowded's row") as u16;
+        let cell = &buffer[(col_x, crowded_y)];
+        assert_eq!(cell.symbol(), "-");
+        assert!(cell.modifier.contains(Modifier::DIM));
+        // ses-hot compacted once: a plain 1.
+        let hot_y = rows
+            .iter()
+            .position(|row| row.contains("470,893"))
+            .expect("ses-hot's row") as u16;
+        assert_eq!(buffer[(col_x, hot_y)].symbol(), "1");
     }
 
     // ── the rate & quota panel ────────────────────────────────────────
@@ -2667,7 +2853,7 @@ mod tests {
         // 120 wide: every column survives; 40 tall: every panel fits.
         let text = rendered(&snap, 120, 40);
         for expected in [
-            "CTX", "MSGS", "CMPCT", "1M",   // ses-hot's native ceiling, bright green
+            "ctx", "msgs", "↺", "1M",   // ses-hot's native ceiling, bright green
             "200k", // ses-crowded's fixed window
             "?",    // gpt-5.6-terra: outside the catalogue
             "77",   // ses-hot's latest message count
@@ -2785,11 +2971,11 @@ mod tests {
         );
 
         // 13 wide: the sessions panel keeps 11 inner cells, under the
-        // 12 a name needs — the ids everywhere, the labels never, and
-        // nothing panics.
+        // 12 a name needs — the short ids everywhere, the labels never,
+        // and nothing panics.
         let narrow = rendered(&snap, 13, 40);
         assert!(
-            narrow.contains("ses-named"),
+            narrow.contains("ses-name"),
             "too narrow → the id:\n{narrow}"
         );
         assert!(
@@ -2864,8 +3050,8 @@ mod tests {
             !text.contains("ses-hot"),
             "the labeled session never renders its id:\n{text}"
         );
-        // The unlabeled one: its id, also twice.
-        assert_eq!(text.matches("ses-crowded").count(), 2);
+        // The unlabeled one: its short id, also twice.
+        assert_eq!(text.matches("ses-crow ").count(), 2, "{text}");
     }
 
     #[test]
@@ -2938,7 +3124,7 @@ mod tests {
         // …and no share on that line: the `?` is the whole claim.
         let line = text
             .lines()
-            .find(|line| line.contains("ses-blank"))
+            .find(|line| line.contains("ses-blan "))
             .expect("the context line");
         assert!(
             !line.contains('%'),
