@@ -110,7 +110,7 @@ impl std::str::FromStr for CostKind {
 
 /// Invariant 3: proxy-written rows are never API measurements. A row is an
 /// API measurement iff its kind is `None` — that is the whole rule, kept in
-/// one place so every consumer (TUI, report, export) classifies identically.
+/// one place so every consumer (TUI, export) classifies identically.
 pub fn is_api_measurement(kind: Option<RowKind>) -> bool {
     kind.is_none()
 }
@@ -670,11 +670,6 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 /// - `compact_generations` — the compaction test, a fact not an
 ///   inference (a compaction continues a session, so its first message
 ///   carries the continuation preamble).
-/// - `summarising` — carried but deliberately NOT consulted by the
-///   cause rules: the same prompt shape serves Claude Code's routine
-///   background summaries, so treating it as a compaction would fire
-///   constantly. It rides the row for the
-///   report path, which prices compaction passes.
 /// - `cache_write_total` — the rewritten-token measure against the
 ///   panel's `REBUILD_MIN` cutoff (tui::rebuilds). The predecessor's
 ///   walk summed the
@@ -714,9 +709,6 @@ pub struct RebuildRow {
     pub req_messages: Option<i64>,
     /// Compaction generation count for the lane.
     pub compact_generations: Option<i64>,
-    /// Request was a summarisation pass (compaction), 0/1 — carried,
-    /// never a cause (see the struct docs).
-    pub summarising: Option<bool>,
     /// Cache-read token bucket (the rebuild's prompt shape).
     pub cache_read: Option<i64>,
     /// Total cache-write tokens — the rewritten-token measure.
@@ -745,7 +737,7 @@ pub(super) fn rebuild_rows_since(
         conn,
         "SELECT * FROM (
             SELECT id, ts_ms, session_id, tools_hash, system_hash, system_chars,
-                   system_blocks, req_messages, compact_generations, summarising,
+                   system_blocks, req_messages, compact_generations,
                    cache_read, cache_write_total, input, model
             FROM requests
             WHERE ts_ms >= ?1 AND kind IS NULL
@@ -771,7 +763,6 @@ fn read_rebuild_row(row: &rusqlite::Row<'_>) -> Result<RebuildRow> {
         system_blocks: super::opt_json_from_text(row.get("system_blocks")?)?,
         req_messages: row.get("req_messages")?,
         compact_generations: row.get("compact_generations")?,
-        summarising: row.get("summarising")?,
         cache_read: row.get("cache_read")?,
         cache_write_total: row.get("cache_write_total")?,
         input: row.get("input")?,

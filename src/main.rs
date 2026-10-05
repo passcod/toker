@@ -57,8 +57,6 @@ enum Command {
         #[arg(long = "db", value_name = "PATH")]
         db: Option<PathBuf>,
     },
-    /// Print ledger-derived reports (plan: `toker report`).
-    Report,
     /// Run the interactive setup wizard (plan: Setup wizard).
     Setup,
     /// Show configuration and backend status (plan: Credentials).
@@ -127,7 +125,6 @@ fn main() -> anyhow::Result<()> {
             max_prompt,
         } => cmds::promote(model, days, max_prompt),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
-        Command::Report => not_implemented("report"),
         Command::Setup => cmds::setup(),
         Command::Status => cmds::status(),
         Command::Import {

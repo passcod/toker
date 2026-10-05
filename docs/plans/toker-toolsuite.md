@@ -19,6 +19,7 @@ Core value: both the context+cache management features grown used to at work, an
 - **Multi-user or team features.** Out of scope forever, not deferred. Single local user, loopback only.
 - **macOS in v1.** The launchd/caffeinate paths from ctp can come later; v1 is Linux-only.
 - **Legacy ctp tooling.** API price comparisons, subscription limit modelling, and the plan/overage constants in `pricing.mjs` die with ctp.
+- **ctp's `summarise.mjs` reports.** There is no `toker report`: the TUI is the view onto the ledger, and the quota fit is kept only because the cold gate's outlook prices with it (fitted per run, never pinned), not as a diagnostics surface.
 
 ## Architecture
 
@@ -97,7 +98,7 @@ Carried over from ctp where marked, new where noted:
    - **Enforced by**: round-trip byte-equality corpus tests (`serialize(parse(body)) == body` against captured real traffic, seeded from ctp fixtures); prefix-stability property tests per frontend×backend pair (mutate only the conversation tail, assert the upstream body is unchanged up to the mutation point); the CACHE REBUILDS analytics as the end-to-end production signal (systematic serialisation rebuilds would localise to nowhere).
    - **Honest caveat**: the *first* request of an existing conversation through a translated route rebuilds the upstream cache once — the upstream's prefix genuinely changes. Bounded, deliberate, visible in the ledger. *(new, replaces ctp's byte-splice precaution)*
 6. **Accounting must never break a session; only a gate may stop one.** Observational parsing runs around an already-forwarded byte stream; a parse failure loses a measurement, never a request. *(ctp; free in Rust via Result, but the design stance carries)*
-7. **Reads pull only what their consumer reads.** Every per-tick read path fetches the narrowest row shape its aggregation needs — `MeterRow` (4 columns, one JSON parse) for the quota tick, the display row for the sessions/spend tick — never a full 59-column `RequestRow` materialization; SQL filters what Rust would only discard (`rate_limits IS NOT NULL OR gate_on IS NOT NULL`). Adding a field to a narrow row is a per-tick cost decision made in the open, in that row type's docs. The full `RequestRow` is for the ledger's writers and full-row readers (export, report), not for refresh paths. A path that over-reads is the 80%-CPU bug waiting to come back.
+7. **Reads pull only what their consumer reads.** Every per-tick read path fetches the narrowest row shape its aggregation needs — `MeterRow` (4 columns, one JSON parse) for the quota tick, the display row for the sessions/spend tick — never a full 59-column `RequestRow` materialization; SQL filters what Rust would only discard (`rate_limits IS NOT NULL OR gate_on IS NOT NULL`). Adding a field to a narrow row is a per-tick cost decision made in the open, in that row type's docs. The full `RequestRow` is for the ledger's writers and full-row readers (export), not for refresh paths. A path that over-reads is the 80%-CPU bug waiting to come back.
 
 ## Server core
 
@@ -151,11 +152,8 @@ ratatui + crossterm, long-running (~2 s refresh from SQLite), replacing `watch �
 
 - Panels: **sessions** (context ceiling, model, requests, prompt now/peak, messages, compactions, `↑` newer-model marker, `$` released marker), **context** bars (occupancy vs known ceilings, red past 80 %, nothing claimed for `?`), **tokens** (input buckets, hit rate over the reusable prefix), **cache rebuilds** (≥50 k rewrites, cause-classified by walking lanes over every row read — ctp's phantom-rebuild lesson), **rate & quota** (sparkline, meter bars + reset times + forecasts, `spent` span totals, `binding` claim).
 - New: **spend** panel — billed vs estimated, per-provider breakdown à la the ledger sidebar; per-backend panels render only when that backend has traffic.
+- Locale-correct clocks (ctp's `LC_ALL`→`LC_TIME`→`LANG` lesson).
 - Session labels from transcripts (`~/.claude`, `$CLAUDE_CONFIG_DIR`, configured extra roots for harnesses like Workhorse), read-only at view time.
-
-## `toker report`
-
-Inherits the `summarise.mjs` views that still matter: rebuilds (with cause localisation ladders), quota fit (NNLS weights refit from the ledger, collinearity/lockstep demotion, model rows with any `kind` excluded), compactions, cold, models. Locale-correct clocks (ctp's `LC_ALL`→`LC_TIME`→`LANG` lesson).
 
 ## Setup wizard
 
@@ -184,7 +182,7 @@ Each phase usable standalone; dogfood-first ordering:
 2. **Anthropic.** Frontend endpoint + api/sub backends, full middleware (meters → quota gate, release marker, cold gate, compaction retarget, force-newest), `toker import`, sleep lock, quota panels. Exit: ctp retired at work.
 3. **Codex.** Responses frontend endpoint + codex sub backend (auth reuse, usage-limit shape verified; possibly promoted to a meter source), cross-protocol translation as needed — now canonical-IR shaped: the canonical IR (`src/ir/canonical.rs` — request model, turn events, backend `Capabilities`) sits between frontend adapters (`anthropic_frontend.rs`: wire→canonical both directions) and backend adapters (`codex_backend.rs`: canonical→wire both directions). Adding a frontend or a backend is ONE adapter; "what a backend supports" is a backend property (`Capabilities`), never a pair property. Same-protocol routes keep the byte-passthrough machinery; canonical engages only when crossing. The composition seams (`to_codex`, `AnthropicStream`) are stable and byte-pinned by the corpus.
 4. **OpenAI api + lunaroute** backends (adapter exists; these are auth + costing semantics).
-5. **Grown TUI + `report` + `setup` wizard + wake/hold/ping units + attribution plugin fallback.**
+5. **Grown TUI + `setup` wizard + wake/hold/ping units + attribution plugin fallback.**
 
 ## Stretch goals
 

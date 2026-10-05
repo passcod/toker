@@ -47,9 +47,9 @@
 //! reference table has neither), and a NULL `tools_hash` keys its own
 //! lane rather than aborting classification (the reference's shared
 //! `?` lane).
-//! `summarising` is carried on the row but never consulted — the same
-//! prompt shape serves routine background summaries, so treating it
-//! as a compaction would fire constantly.
+//! `summarising` is not read at all — the same prompt shape serves
+//! routine background summaries, so treating it as a compaction would
+//! fire constantly.
 //!
 //! The localisation ([`localise`]) ports the reference's split: which
 //! block changed (per-block digests), then

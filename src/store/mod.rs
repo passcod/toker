@@ -988,7 +988,6 @@ mod tests {
         );
         assert_eq!(row.req_messages, Some(42));
         assert_eq!(row.compact_generations, Some(1));
-        assert_eq!(row.summarising, Some(false));
         assert_eq!(row.cache_read, Some(66_944));
         assert_eq!(row.cache_write_total, Some(60_000));
         assert_eq!(row.input, Some(673));

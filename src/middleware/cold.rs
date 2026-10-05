@@ -18,11 +18,11 @@
 //!   cache_control strip, system merge, the all-or-nothing rule);
 //! - `isCompaction` — already ported ([`crate::ir::AnthropicShape::is_compaction`]);
 //! - the burn ladder ([`burn_rate`] / [`project_to`]) — the two pieces
-//!   the outlook calls (the span/total verdicts are the TUI/report
-//!   unit's, not ported here);
+//!   the outlook calls (the span/total verdicts are the TUI's, not
+//!   ported here);
 //! - the weight fit ([`fit_quota_model`] / [`quota_for`]) — what the
-//!   outlook prices the re-read with (the diagnostics surface —
-//!   groups, spreads, worst window — stays the report unit's);
+//!   outlook prices the re-read with (the predecessor's diagnostics
+//!   surface — groups, spreads, worst window — is not ported);
 //! - the pipeline sequencing (quota gate first; the cold notice exempting
 //!   summarising requests; the retarget's lane-cold licence) —
 //!   see [`crate::server::anthropic`].
@@ -268,7 +268,7 @@ pub fn note_lane_notice(store: &Store, key: &str, now_ms: i64) -> crate::store::
 
 /// One meter's fields on a row's `rate_limits`, and the window's length
 /// where known. The 5h/7d windows have lengths; the
-/// overage window's is not known and is the report unit's concern.
+/// overage window's is not known, and the outlook does not need it.
 pub struct MeterSpec {
     pub util_key: &'static str,
     pub reset_key: &'static str,
@@ -944,8 +944,8 @@ pub fn outlook_target(gate_on: bool) -> f64 {
 /// consumption tracks fresh prompt tokens (uncached input + cache writes)
 /// and output tokens, weighted per model. These weights are MEASUREMENTS
 /// re-derived from the ledger (ported
-/// for what the outlook calls; the diagnostics surface is the report
-/// unit's).
+/// for what the outlook calls; the predecessor's diagnostics surface
+/// is not ported).
 ///
 /// A window contributes nothing if utilisation barely moved across it.
 const MIN_WINDOW_UTIL: f64 = 0.05;
@@ -986,8 +986,7 @@ pub struct GroupWeight {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuotaFit {
     pub ok: bool,
-    /// Why the fit declined, when it did (for the log line; the report
-    /// unit will render it).
+    /// Why the fit declined, when it did (for the log line).
     pub reason: Option<&'static str>,
     weights: BTreeMap<String, GroupWeight>,
     folded: BTreeSet<String>,
@@ -1077,7 +1076,7 @@ fn build_windows(rows: &[RequestRow]) -> Vec<Window> {
     }
     let mut out = Vec::new();
     for (reset, mut all) in by_reset {
-        let _ = reset; // the window's identity; the report's to render
+        let _ = reset; // the window's identity; only the grouping needs it
         all.sort_by_key(|(row, _)| row.ts_ms);
         let du = all.last().expect("non-empty").1 - all[0].1;
         let body = &all[1..];
