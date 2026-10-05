@@ -1226,15 +1226,12 @@ fn context_name_spans(session: &SessionAgg) -> Vec<Span<'static>> {
     let last = shown.len().saturating_sub(1);
     for (index, span) in shown.into_iter().enumerate() {
         if index == last {
+            // Cut in cells: the byte-indexed cut this replaces stopped
+            // a character short (and short again per multi-byte one),
+            // so a clipped name's bar started a column left of the
+            // others'.
             let room = keep.saturating_sub(used);
-            let text = span.content.clone();
-            let cut = text
-                .char_indices()
-                .take_while(|(byte, _)| *byte <= room.saturating_sub(1).min(text.len()))
-                .last()
-                .map(|(byte, _)| byte)
-                .unwrap_or(0);
-            let text = format!("{}…", &text[..cut]);
+            let text = format!("{}…", clip(&span.content, room));
             clipped.push(Span::styled(text, span.style));
         } else {
             used += span.width();
@@ -1759,8 +1756,8 @@ fn render_rate(
 /// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` and
 /// `N drift` in red only when there are any — a zero would be a line of
 /// noise on every quiet frame. The sparkline spans the WHOLE window at
-/// any width: the minute buckets fold into fewer, wider ones (the
-/// reference's `min(40, max(10, W − 40))`), where the old line cut to
+/// any width: the minute buckets fold into fewer, wider ones (at most
+/// the reference's `min(40, max(10, W − 40))`), where the old line cut to
 /// the newest minutes and silently dropped the rest. An empty bucket is
 /// a dim `·`, so a quiet stretch reads as quiet rather than as a gap,
 /// and a bucket holding an error is red.
@@ -1809,16 +1806,20 @@ fn requests_line(snap: &Snapshot, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The window's minute buckets folded into `count` wider ones, oldest
-/// first: minute `i` of `n` lands in bucket `i × count / n`, the
-/// reference's time-to-bucket mapping at minute resolution.
+/// The window's minute buckets folded into at most `count` wider ones,
+/// oldest first, every bucket the same whole number of minutes: a
+/// bucket two minutes wide beside one a minute wide would stand twice
+/// as tall for the same rate. Where the minutes do not divide evenly
+/// the OLDEST bucket is the short one — the newest is the one watched.
 fn fold_buckets(
     minutes: &[super::model::MinuteBucket],
     count: usize,
 ) -> Vec<super::model::MinuteBucket> {
+    let per = minutes.len().div_ceil(count.max(1)).max(1);
+    let count = minutes.len().div_ceil(per);
     let mut folded = vec![super::model::MinuteBucket::default(); count];
     for (i, minute) in minutes.iter().enumerate() {
-        let bucket = &mut folded[i * count / minutes.len()];
+        let bucket = &mut folded[count - 1 - (minutes.len() - 1 - i) / per];
         bucket.requests += minute.requests;
         bucket.errors += minute.errors;
     }
@@ -2561,6 +2562,29 @@ mod tests {
         // ramp, folded.
         assert!(dots.starts_with("·······"), "{text:?}");
         assert!(!dots.ends_with('·'), "{text:?}");
+    }
+
+    #[test]
+    fn folded_buckets_span_equal_minutes_with_the_short_one_oldest() {
+        let minutes: Vec<model::MinuteBucket> = (1..=7)
+            .map(|requests| model::MinuteBucket {
+                requests,
+                errors: usize::from(requests == 2),
+            })
+            .collect();
+        let counts = |count: usize| -> Vec<usize> {
+            super::fold_buckets(&minutes, count)
+                .iter()
+                .map(|bucket| bucket.requests)
+                .collect()
+        };
+        assert_eq!(counts(7), [1, 2, 3, 4, 5, 6, 7]);
+        // Seven minutes into at most three: three minutes each, the
+        // oldest bucket holding the one left over.
+        assert_eq!(counts(3), [1, 2 + 3 + 4, 5 + 6 + 7]);
+        // At most five: two-minute buckets only fit four.
+        assert_eq!(counts(5), [1, 2 + 3, 4 + 5, 6 + 7]);
+        assert_eq!(super::fold_buckets(&minutes, 3)[1].errors, 1);
     }
 
     #[test]
@@ -3450,6 +3474,33 @@ mod tests {
         );
         // The unlabeled one: its short id, also twice.
         assert_eq!(text.matches("ses-crow ").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_clipped_context_name_keeps_the_bars_aligned() {
+        // A title past the name field's cap clips with an ellipsis; its
+        // bar must start in the same column as an unclipped name's.
+        let mut labels = HashMap::new();
+        labels.insert(
+            "ses-hot".to_owned(),
+            Label {
+                cwd: Some("/home/u/code/claude-token-proxy".into()),
+                title: Some("Toker Rust rewrite parity and UI".into()),
+                prompt: None,
+            },
+        );
+        let snap = full_snapshot_with_labels(&labels);
+        let text = rendered(&snap, 120, 44);
+        let bar_column = |needle: &str| {
+            let line = text
+                .lines()
+                .find(|line| line.contains(needle) && line.contains('░'))
+                .unwrap_or_else(|| panic!("{needle:?} in:\n{text}"));
+            let at = line.find(['█', '░']).expect("a bar");
+            line[..at].width()
+        };
+        assert!(text.contains("claude-token-proxy · To…  "), "{text}");
+        assert_eq!(bar_column("claude-token-proxy"), bar_column("ses-crow"));
     }
 
     #[test]
