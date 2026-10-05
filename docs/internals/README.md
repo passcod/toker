@@ -3,9 +3,8 @@
 What was learned building this, by topic. AGENTS.md holds the rules; these hold
 the reasons, and most of the reasons are a bug that was paid for. Many were paid
 for in claude-token-proxy (ctp), the Node proxy toker replaces; where a lesson
-came from there, the topic says so, and where toker does not yet honour it, the
-topic says that too and points at the open items in [the cutover
-plan](../plans/cutover.md).
+came from there, the topic says so, and where toker does not honour one, the
+topic says that too.
 
 | Topic | |
 | --- | --- |
