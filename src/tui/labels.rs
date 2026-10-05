@@ -5,8 +5,8 @@
 //! a session is but not which one it is. Claude Code already keeps a
 //! transcript per session under its config directory, named by the same
 //! id the proxy logs from the session header, and appends the working
-//! directory, a generated title, the deliberate agent name, and the last
-//! prompt as it goes. The dashboard reads that to put a name on a row;
+//! directory, a generated title, the deliberate agent name, a custom
+//! title, and the last prompt as it goes. The dashboard reads that to put a name on a row;
 //! this module only ever reads, and nothing it returns is written
 //! anywhere — the predecessor's transcript reader, ported whole:
 //!
@@ -19,10 +19,11 @@
 //! - [`find_transcript`]: the `projects/<dir>/<session-id>.jsonl`
 //!   layout, with the id refused outright unless it is nothing but
 //!   `[0-9a-zA-Z-]` (it is interpolated into a path).
-//! - [`session_label`]: the tail-only read. A transcript is mostly tool
+//! - [`session_label`]: the bounded read. A transcript is mostly tool
 //!   results and a single one can run to hundreds of KiB, so only the
-//!   last [`TAIL_BYTES`] are ever read, and only the few small records
-//!   wanted are parsed out of them, newest first.
+//!   last [`TAIL_BYTES`] are read, plus the first [`HEAD_BYTES`] when
+//!   the tail holds no custom title, and only the few small records
+//!   wanted are parsed out of them.
 //! - [`Labels`]: the per-refresh cache — one read per session per
 //!   display read, never per render or per tick (the reference
 //!   re-resolved on every 2-second render; here a read follows each
@@ -45,12 +46,23 @@ use std::path::{Path, PathBuf};
 /// KiB.
 pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
 
+/// How much of a transcript's START is read for a custom title the
+/// tail does not hold (the reference's `HEAD_BYTES`). Workhorse writes
+/// its custom title once, near the top, so on a long session it falls
+/// out of the tail. The opening prompt and first turn run to tens of
+/// KiB; a custom title written further in than this is lost once the
+/// session outgrows the tail, and the row falls back to the agent name
+/// or the generated title.
+pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
+
 /// The name, working directory, and last prompt a transcript's tail
 /// carries, or [`None`] via the `Option` that holds it when it carries
-/// none of them (the tail-read's output). The
-/// title is the deliberate agent name when the tail carries one, else
-/// the generated ai-title — the agent name wins wherever in the tail it
-/// sits (`clean(name) ?? clean(title)`).
+/// none of them (the tail-read's output). The title ranks a custom
+/// title first — set on purpose, by `/rename` or by a harness such as
+/// Workhorse, whose sessions then skip generating one — then the
+/// deliberate agent name, then the generated ai-title, each winning
+/// wherever in the tail it sits (`clean(custom) ?? clean(name) ??
+/// clean(title)`).
 ///
 /// Nothing here is ever written anywhere: labels exist at view time
 /// only (invariant 1), which is also why this type has no serialisation
@@ -59,7 +71,8 @@ pub(crate) const TAIL_BYTES: u64 = 1024 * 1024;
 pub(crate) struct Label {
     /// The newest `cwd` the tail carries.
     pub cwd: Option<String>,
-    /// The newest agent name, else the newest generated title.
+    /// The newest custom title, else the newest agent name, else the
+    /// newest generated title.
     pub title: Option<String>,
     /// The newest last-prompt record's text.
     pub prompt: Option<String>,
@@ -156,9 +169,11 @@ fn find_transcript(sid: &str, roots: &[PathBuf]) -> Option<PathBuf> {
 /// reference's session-label rule. Only the last
 /// `tail_bytes` are read; a read that starts mid-line drops up to the
 /// first newline first, because half a record can match the cwd pattern
-/// on the wrong string. Never panics: every failure — no transcript, an
-/// unreadable one, a torn tail — is `None`, a row without a name, not
-/// an error.
+/// on the wrong string. When the tail does not reach the start, the
+/// first [`HEAD_BYTES`] it does not cover are read too, cut at their
+/// last whole line, for a custom title written early. Never panics:
+/// every failure — no transcript, an unreadable one, a torn tail — is
+/// `None`, a row without a name, not an error.
 pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Option<Label> {
     let path = find_transcript(sid, roots)?;
     let file = std::fs::File::open(&path).ok()?;
@@ -177,7 +192,22 @@ pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Op
     {
         text.drain(..=first_nl);
     }
-    label_from_tail(&text)
+    // Only a head the tail does not already cover, cut at its last
+    // whole line: a torn record there is no record.
+    let mut head = String::new();
+    if start > 0 {
+        let mut bytes = vec![0u8; start.min(HEAD_BYTES) as usize];
+        if handle.seek(SeekFrom::Start(0)).is_ok()
+            && let Ok(()) = handle.read_exact(&mut bytes)
+        {
+            let whole = bytes
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |nl| nl + 1);
+            head = String::from_utf8_lossy(&bytes[..whole]).into_owned();
+        }
+    }
+    label_from_tail(&text, &head)
 }
 
 /// The label opencode's own session store carries: its SQLite db has
@@ -221,8 +251,9 @@ pub(crate) fn opencode_db_default() -> Option<PathBuf> {
     Some(data_home.join("opencode").join("opencode.db"))
 }
 
-/// The label a transcript tail carries. Only the few small records
-/// wanted are parsed —
+/// The label a transcript tail carries; `head`, the start of the same
+/// transcript, is looked in for a custom title only when the tail has
+/// none. Only the few small records wanted are parsed —
 /// the rest of the tail is mostly tool results, and parsing a megabyte
 /// of them for every session every two seconds would be the whole cost
 /// of the view — and the scan runs newest-first so the LATEST of each
@@ -231,11 +262,12 @@ pub(crate) fn opencode_db_default() -> Option<PathBuf> {
 /// `"type":"ai-title"` as escaped text) never matches the marker, and a
 /// line that carries the marker but fails to parse — a torn record —
 /// stands in for nothing; the scan keeps going.
-fn label_from_tail(text: &str) -> Option<Label> {
+fn label_from_tail(text: &str, head: &str) -> Option<Label> {
     // The raw field values, newest-first; `None` keeps the scan going,
     // exactly the reference's keep-until-set rule (a record whose field
     // is missing or JSON null
     // never wins, and a non-string value wins only to clean to `None`).
+    let mut custom: Option<serde_json::Value> = None;
     let mut name: Option<serde_json::Value> = None;
     let mut title: Option<serde_json::Value> = None;
     let mut prompt: Option<serde_json::Value> = None;
@@ -243,6 +275,11 @@ fn label_from_tail(text: &str) -> Option<Label> {
     for line in text.split('\n').rev() {
         if line.is_empty() {
             continue;
+        }
+        if custom.is_none()
+            && let Some(found) = record_field(line, "\"type\":\"custom-title\"", "customTitle")
+        {
+            custom = Some(found);
         }
         if name.is_none()
             && let Some(found) = record_field(line, "\"type\":\"agent-name\"", "agentName")
@@ -264,13 +301,26 @@ fn label_from_tail(text: &str) -> Option<Label> {
         {
             cwd = Some(found);
         }
-        if name.is_some() && title.is_some() && prompt.is_some() && cwd.is_some() {
+        // Only a custom title can end the scan: a newer agent name or
+        // generated title does not mean there is no older custom title
+        // further back.
+        if custom.is_some() && prompt.is_some() && cwd.is_some() {
             break;
+        }
+    }
+    if custom.is_none() {
+        // The head reads forward, so its latest custom title wins too.
+        for line in head.split('\n') {
+            if let Some(found) = record_field(line, "\"type\":\"custom-title\"", "customTitle") {
+                custom = Some(found);
+            }
         }
     }
     let label = Label {
         cwd: clean(cwd),
-        title: clean_value(name.as_ref()).or_else(|| clean_value(title.as_ref())),
+        title: clean_value(custom.as_ref())
+            .or_else(|| clean_value(name.as_ref()))
+            .or_else(|| clean_value(title.as_ref())),
         prompt: clean_value(prompt.as_ref()),
     };
     (label.cwd.is_some() || label.title.is_some() || label.prompt.is_some()).then_some(label)
@@ -450,7 +500,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Labels, TAIL_BYTES, find_transcript, label_from_tail, roots_from, session_label, short_dir,
+        HEAD_BYTES, Labels, TAIL_BYTES, find_transcript, label_from_tail, roots_from,
+        session_label, short_dir,
     };
     use serde_json::json;
 
@@ -497,7 +548,7 @@ mod tests {
             .to_string(),
         ]
         .join("\n");
-        let label = label_from_tail(&tail).expect("a label");
+        let label = label_from_tail(&tail, "").expect("a label");
         assert_eq!(
             label.title.as_deref(),
             Some("New title"),
@@ -523,9 +574,76 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(
-            label_from_tail(&tail).expect("a label").title.as_deref(),
+            label_from_tail(&tail, "")
+                .expect("a label")
+                .title
+                .as_deref(),
             Some("named"),
             "generated title beat the agent name"
+        );
+    }
+
+    #[test]
+    fn a_custom_title_beats_a_newer_name_and_generated_title() {
+        // The custom title is the OLDEST record: a newer agent name or
+        // generated title must neither outrank it nor end the scan
+        // before reaching it.
+        let tail = [
+            json!({"type": "custom-title", "customTitle": "  the  card's title "}).to_string(),
+            json!({"type": "user", "cwd": "/home/u/code/repo"}).to_string(),
+            json!({"type": "agent-name", "agentName": "named"}).to_string(),
+            json!({"type": "ai-title", "aiTitle": "gen"}).to_string(),
+            json!({"type": "last-prompt", "lastPrompt": "go"}).to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            label_from_tail(&tail, "")
+                .expect("a label")
+                .title
+                .as_deref(),
+            Some("the card's title")
+        );
+    }
+
+    #[test]
+    fn the_head_is_read_for_a_custom_title_only_when_the_tail_has_none() {
+        let head = [
+            json!({"type": "custom-title", "customTitle": "first"}).to_string(),
+            json!({"type": "custom-title", "customTitle": "renamed"}).to_string(),
+            json!({"type": "agent-name", "agentName": "head name"}).to_string(),
+        ]
+        .join("\n");
+        let tail = json!({"type": "ai-title", "aiTitle": "gen"}).to_string();
+        assert_eq!(
+            label_from_tail(&tail, &head)
+                .expect("a label")
+                .title
+                .as_deref(),
+            Some("renamed"),
+            "the head's latest custom title outranks the tail's generated one"
+        );
+        let tail_custom = [
+            json!({"type": "custom-title", "customTitle": "tail custom"}).to_string(),
+            tail.clone(),
+        ]
+        .join("\n");
+        assert_eq!(
+            label_from_tail(&tail_custom, &head)
+                .expect("a label")
+                .title
+                .as_deref(),
+            Some("tail custom"),
+            "the tail's custom title is newer than any in the head"
+        );
+        // The head carries custom titles only: its agent name is not
+        // a label.
+        let head_name = json!({"type": "agent-name", "agentName": "head name"}).to_string();
+        assert_eq!(
+            label_from_tail(&tail, &head_name)
+                .expect("a label")
+                .title
+                .as_deref(),
+            Some("gen")
         );
     }
 
@@ -534,20 +652,20 @@ mod tests {
         // Bad input never throws: a tail without a usable record is
         // no label at all, never an empty one.
         assert_eq!(
-            label_from_tail(&json!({"type": "assistant"}).to_string()),
+            label_from_tail(&json!({"type": "assistant"}).to_string(), ""),
             None,
             "empty tail produced a label"
         );
-        assert_eq!(label_from_tail(""), None, "empty text produced a label");
+        assert_eq!(label_from_tail("", ""), None, "empty text produced a label");
         assert_eq!(
-            label_from_tail(r#"{"type":"ai-title","aiTi"#),
+            label_from_tail(r#"{"type":"ai-title","aiTi"#, ""),
             None,
             "torn line produced a label"
         );
         // A cwd whose value is complete on a torn line still reads —
         // the cwd pattern matches the raw line, not the parsed record.
         assert_eq!(
-            label_from_tail(r#"{"type":"user","cwd":"/home/u/code/repo","mess"#)
+            label_from_tail(r#"{"type":"user","cwd":"/home/u/code/repo","mess"#, "")
                 .expect("the torn line's complete cwd reads")
                 .cwd
                 .as_deref(),
@@ -893,6 +1011,58 @@ mod tests {
         let label = session_label(sid, std::slice::from_ref(&root), TAIL_BYTES).expect("a label");
         assert_eq!(label.title.as_deref(), Some("canary"));
         assert_eq!(label.cwd.as_deref(), Some("/home/u/code/toker"));
+    }
+
+    #[test]
+    fn a_custom_title_near_the_start_survives_a_long_transcript() {
+        // Workhorse's shape: the custom title written once, near the
+        // top, then more than the tail budget of turns. The tail holds
+        // only a generated title; the head read finds the custom one.
+        // A second transcript puts its custom title past HEAD_BYTES
+        // (but still before the tail): lost, as the reference loses
+        // it, and the generated title stands.
+        let root = scratch("head-window");
+        let padding = json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "p".repeat(200)}]}
+        })
+        .to_string();
+        let tail = [
+            json!({"type": "user", "cwd": "/home/u/code/toker"}).to_string(),
+            json!({"type": "ai-title", "aiTitle": "generated"}).to_string(),
+        ]
+        .join("\n");
+        let small = tail.len() as u64 + 40;
+        let write = |sid: &str, lead: usize| {
+            let path = super::projects_of(&root, "-home-u-code-toker", sid);
+            let mut text = String::new();
+            while text.len() < lead {
+                text.push_str(&padding);
+                text.push('\n');
+            }
+            text.push_str(
+                &json!({"type": "custom-title", "customTitle": "C1 the card"}).to_string(),
+            );
+            text.push('\n');
+            while text.len() < HEAD_BYTES as usize + 64 * 1024 {
+                text.push_str(&padding);
+                text.push('\n');
+            }
+            text.push_str(&tail);
+            text.push('\n');
+            std::fs::write(&path, &text).expect("write the transcript");
+        };
+
+        let near = "018f2b7c-9999-4a55-9a99-000000000009";
+        write(near, 4 * 1024);
+        let label = session_label(near, std::slice::from_ref(&root), small).expect("a label");
+        assert_eq!(label.title.as_deref(), Some("C1 the card"));
+        assert_eq!(label.cwd.as_deref(), Some("/home/u/code/toker"));
+
+        let far = "018f2b7c-aaaa-4a55-9aaa-00000000000a";
+        write(far, HEAD_BYTES as usize + 8 * 1024);
+        let label = session_label(far, std::slice::from_ref(&root), small).expect("a label");
+        assert_eq!(label.title.as_deref(), Some("generated"));
     }
 
     // ── the cache ───────────────────────────────────────────────────
