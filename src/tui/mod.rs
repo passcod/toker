@@ -36,6 +36,7 @@
 //! explicit "no … data" / `?` strings, never as zero.
 
 mod labels;
+mod locale;
 mod model;
 mod quota;
 mod rebuilds;
@@ -131,6 +132,11 @@ pub fn run(
     // The system zone, read once: every local clock the panels render
     // (the quota resets and runout labels) anchors here.
     let tz = jiff::tz::TimeZone::system();
+    // The display locale, resolved once (see [locale]): clocks and
+    // grouped counts follow it; nothing model-visible does.
+    let ui = view::Ui {
+        fmt: locale::Fmt::from_env(),
+    };
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
@@ -163,7 +169,7 @@ pub fn run(
             let due = cadence.due(Instant::now(), store.data_version()?);
             if due.heavy {
                 quota = quota_snapshot(&store, window_mins)?;
-                rebuilds = rebuild_snapshot(&store, window_mins)?;
+                rebuilds = rebuild_snapshot(&store, window_mins, &ui.fmt)?;
                 // The cache read rides the quota cadence: three stat
                 // calls are free against it, and the files themselves
                 // only move on the daemon's 24 h cycle.
@@ -190,7 +196,7 @@ pub fn run(
             }
             next_tick = Instant::now() + TICK;
         }
-        terminal.draw(|frame| view::render(frame, &snapshot, &clock(), &tz))?;
+        terminal.draw(|frame| view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui))?;
 
         // Block until the next tick or an input event. The deadline was
         // set after the tick's work, so it is in the future unless the
@@ -488,6 +494,7 @@ impl ModelCaches {
 fn rebuild_snapshot(
     store: &Store,
     window_mins: u64,
+    fmt: &locale::Fmt,
 ) -> anyhow::Result<Option<rebuilds::RebuildAgg>> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let since = window_start(now_ms, window_mins);
@@ -508,7 +515,7 @@ fn rebuild_snapshot(
     let localisation = store.localisation_rows(&ids)?;
     let by_id: std::collections::HashMap<_, _> =
         localisation.into_iter().map(|row| (row.id, row)).collect();
-    rebuilds::localise(&mut walk.events, &by_id);
+    rebuilds::localise(&mut walk.events, &by_id, fmt);
     Ok(Some(rebuilds::aggregate(walk)))
 }
 
@@ -606,11 +613,11 @@ fn local_day_start_ms(now_ms: i64) -> i64 {
         .unwrap_or(now_ms)
 }
 
-/// The local-clock string for the header (HH:MM:SS, the system zone). Kept
-/// out of [view] so rendering stays a pure function of its inputs and the
-/// tests stay deterministic.
-fn clock() -> String {
-    jiff::Zoned::now().strftime("%H:%M:%S").to_string()
+/// The local-clock string for the header (to the second, the system zone,
+/// in the display locale). Kept out of [view] so rendering stays a pure
+/// function of its inputs and the tests stay deterministic.
+fn clock(fmt: &locale::Fmt) -> String {
+    fmt.clock_sec(&jiff::Zoned::now())
 }
 
 /// Restores the terminal (raw mode off, alternate screen left) on drop —
@@ -1364,7 +1371,7 @@ mod tests {
             ids.len(),
         );
         let by_id: HashMap<_, _> = localisation.into_iter().map(|row| (row.id, row)).collect();
-        crate::tui::rebuilds::localise(&mut walk.events, &by_id);
+        crate::tui::rebuilds::localise(&mut walk.events, &by_id, &crate::tui::locale::Fmt::fixed());
         let rebuilds = crate::tui::rebuilds::aggregate(walk);
         eprintln!(
             "rebuilds: {} of {} measured requests rewrote ≥{} tokens ({} unknown)",

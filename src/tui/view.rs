@@ -41,12 +41,15 @@ use ratatui::{
     widgets::{Block, Cell, Paragraph, Row, Table},
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use super::labels::short_dir;
+use super::locale::Fmt;
 use super::model::{HitRate, NO_SESSION, SessionAgg, Snapshot};
 use super::quota::{MeterPanel, Spent};
 use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
-use crate::middleware::cold::{Verdict, alongside, reset_label};
+use crate::middleware::cold::Verdict;
 
 /// Bottom panel row height while SPEND renders beside RATE: tall
 /// enough for the total line, the never-dropped "no cost data" line,
@@ -166,6 +169,12 @@ const SESSION_COLUMNS: [(&str, u16); 10] = [
 /// Sparkline blocks, low → high (▁▂▃▄▅▆▇█ style; a space is a flat minute).
 const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
+/// What the loop holds for the view beyond the snapshot: the display
+/// formatter, resolved once at startup.
+pub(crate) struct Ui {
+    pub fmt: Fmt,
+}
+
 /// The whole frame. `clock` is the preformatted HH:MM:SS string and
 /// `tz` the zone the quota labels render in, both passed in so tests
 /// stay deterministic.
@@ -180,23 +189,24 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// slack, and a short terminal sheds panel rows from the top of the
 /// middle (sessions first) rather than ever letting the quota block
 /// scroll off the bottom, "the part worth watching".
-pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone) {
+pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone, ui: &Ui) {
+    let fmt = &ui.fmt;
     let [header, sessions, context, tokens, rebuilds, bottom] = panel_areas(snap, frame.area());
 
     render_header(frame, header, snap, clock);
-    render_sessions(frame, sessions, snap);
-    render_context(frame, context, snap);
-    render_tokens(frame, tokens, snap);
-    render_rebuilds(frame, rebuilds, snap);
+    render_sessions(frame, sessions, snap, fmt);
+    render_context(frame, context, snap, fmt);
+    render_tokens(frame, tokens, snap, fmt);
+    render_rebuilds(frame, rebuilds, snap, fmt);
     if snap.spend.carries_cost() {
         // Even halves: the meters' reset clocks need the width as much
         // as the breakdown lines do.
         let [spend, rate] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(bottom);
         render_spend(frame, spend, snap);
-        render_rate(frame, rate, snap, tz);
+        render_rate(frame, rate, snap, tz, fmt);
     } else {
-        render_rate(frame, bottom, snap, tz);
+        render_rate(frame, bottom, snap, tz, fmt);
     }
 }
 
@@ -458,7 +468,7 @@ fn freshness(snap: &Snapshot) -> (String, Style) {
 /// is a
 /// width-fallback chain: keep the leftmost columns that fit, give the
 /// leftover width to SESSION.
-fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     let block = Block::bordered().title_top("SESSIONS");
     if area.height == 0 {
         return;
@@ -485,7 +495,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let rows = snap
         .sessions
         .iter()
-        .map(|s| Row::new(session_cells(s, snap.now_ms, headers.len(), session_w)));
+        .map(|s| Row::new(session_cells(s, snap.now_ms, headers.len(), session_w, fmt)));
     frame.render_widget(Table::new(rows, widths).header(header).block(block), area);
 }
 
@@ -533,6 +543,7 @@ fn session_cells(
     now_ms: i64,
     count: usize,
     session_w: u16,
+    fmt: &Fmt,
 ) -> Vec<Cell<'static>> {
     let mut cells: Vec<Cell<'static>> = Vec::with_capacity(count);
     let mut push_if = |n: usize, cell: Cell<'static>| {
@@ -544,8 +555,8 @@ fn session_cells(
     push_if(1, ctx_cell(session.ctx));
     push_if(2, model_cell(session));
     push_if(3, Cell::new(session.requests.to_string()));
-    push_if(4, Cell::new(unknown_or_grouped(session.input_now)));
-    push_if(5, Cell::new(unknown_or_grouped(session.input_peak)));
+    push_if(4, Cell::new(unknown_or_grouped(fmt, session.input_now)));
+    push_if(5, Cell::new(unknown_or_grouped(fmt, session.input_peak)));
     push_if(
         6,
         Cell::new(
@@ -567,7 +578,7 @@ fn session_cells(
                 .unwrap_or_else(|| "-".into()),
         ),
     );
-    push_if(8, Cell::new(unknown_or_grouped(session.output_total)));
+    push_if(8, Cell::new(unknown_or_grouped(fmt, session.output_total)));
     let idle = now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
     let last = rel_age(now_ms - session.latest_ts_ms);
     push_if(
@@ -658,10 +669,8 @@ fn model_cell(session: &SessionAgg) -> Cell<'static> {
 
 /// Unknown token counts render as `?`, never as a fake zero; known ones
 /// comma-grouped.
-fn unknown_or_grouped(value: Option<i64>) -> String {
-    value
-        .map(|n| super::rebuilds::grouped(Some(n)))
-        .unwrap_or_else(|| "?".into())
+fn unknown_or_grouped(fmt: &Fmt, value: Option<i64>) -> String {
+    value.map(|n| fmt.count(n)).unwrap_or_else(|| "?".into())
 }
 
 /// Rough relative age for the LAST column.
@@ -685,7 +694,7 @@ fn rel_age(delta_ms: i64) -> String {
 /// and an idle session is dimmed, because a session that is not about
 /// to do anything is not about to compact either. Past 80% a live
 /// session's bar turns red with the marker that says why.
-fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     let block = Block::bordered().title_top("CONTEXT");
     if area.height == 0 {
         return;
@@ -743,7 +752,7 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             // Known prompt, unknown ceiling: the number is real, the
             // share is not claimable.
             let mut spans = name_spans;
-            spans.push(Span::raw(format!("{:>13} / ", grouped(Some(prompt)))));
+            spans.push(Span::raw(format!("{:>13} / ", fmt.count(prompt))));
             spans.push(Span::styled("?".to_owned(), Style::new().dim()));
             if let Some(note) = idle_note {
                 spans.extend(note.spans);
@@ -771,7 +780,7 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot) {
         spans.push(Span::styled(bar(frac, bar_width), bar_style));
         spans.push(Span::raw(format!(
             " {:>13} / {:<4} {:>3}%",
-            grouped(Some(prompt)),
+            fmt.count(prompt),
             ctx_label,
             (frac * 100.0).round() as i64
         )));
@@ -862,7 +871,7 @@ fn ctx_span(label: &str, ctx: ContextWindow) -> Span<'static> {
 /// plus rewrites, never all input (fresh input was never going to be a
 /// hit). Absence renders as absence throughout: `?` rates, `≥` floors,
 /// "N req unknown" counts — never confident zeros.
-fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     let block = Block::bordered().title_top("TOKENS");
     if area.height == 0 {
         return;
@@ -891,7 +900,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             format!(
                 "{}{}",
                 if bucket.unavailable > 0 { "≥" } else { "" },
-                grouped(Some(bucket.value))
+                fmt.count(bucket.value)
             )
         )
     };
@@ -988,7 +997,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
                 Span::raw(label("missed")),
                 Span::raw(format!(
                     "{:>TOKENS_AMOUNT_W$}",
-                    format!("≥{}", grouped(Some(tokens.written())))
+                    format!("≥{}", fmt.count(tokens.written()))
                 )),
                 Span::raw("  "),
                 Span::styled("known cache writes only".to_owned(), Style::new().dim()),
@@ -1042,15 +1051,12 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             };
             lines.push(Line::from(vec![
                 Span::raw(label("missed")),
-                Span::raw(format!(
-                    "{:>TOKENS_AMOUNT_W$}",
-                    grouped(Some(tokens.written()))
-                )),
+                Span::raw(format!("{:>TOKENS_AMOUNT_W$}", fmt.count(tokens.written()))),
                 Span::raw("  "),
                 Span::styled(
                     format!(
                         "rewritten · {}/req · {} of {} req reused nothing",
-                        grouped(Some(per_req)),
+                        fmt.count(per_req),
                         tokens.cold,
                         tokens.requests
                     ),
@@ -1070,7 +1076,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 /// localised system-prompt changes. The panel never vanishes: no
 /// rebuilds is a verdict ("none — every prefix held"), not an absence
 /// of data, and unknown rewrites are counted, never guessed.
-fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
     let block = Block::bordered().title_top("CACHE REBUILDS");
     if area.height == 0 {
         return;
@@ -1090,7 +1096,7 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     }
 
     let mut lines = Vec::new();
-    let threshold = grouped(Some(REBUILD_MIN));
+    let threshold = fmt.count(REBUILD_MIN);
     // The denominator is the walk's own window count (`measured` +
     // `unmeasured`), not the display aggregation's: the rebuild read
     // is capped separately, and a fraction must be honest about its
@@ -1160,13 +1166,13 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 }
 
 /// Short tokens: round thousands and millions
-/// abbreviate; anything else renders comma-grouped.
+/// abbreviate; anything else is under a thousand, so ungrouped.
 fn short_tokens(tokens: u64) -> String {
     // Human-rounded, deliberately not exact: the CONTEXT panel carries
     // the precise figure (occupancy bar + exact counts), so the table's
     // cell answers "which league is this window in". ≥1M rounds to the
     // nearest 0.1M (1,048,576 → `1M`, 1,050,000 → `1.1M`); ≥1k to the
-    // nearest 1k (262,144 → `262k`); below that, grouped as-is.
+    // nearest 1k (262,144 → `262k`); below that, as-is.
     if tokens >= 1_000_000 {
         let tenths = ((tokens as f64 / 100_000.0).round()) as u64;
         let whole = tenths / 10;
@@ -1179,14 +1185,8 @@ fn short_tokens(tokens: u64) -> String {
     } else if tokens >= 1_000 {
         format!("{}k", ((tokens as f64 / 1_000.0).round()) as u64)
     } else {
-        grouped(Some(tokens as i64))
+        tokens.to_string()
     }
-}
-
-/// Comma-grouped counts (shared with the
-/// rebuild panel's detail lines).
-fn grouped(value: Option<i64>) -> String {
-    super::rebuilds::grouped(value)
 }
 
 /// The TOKENS panel's bucket bars (`▬`
@@ -1245,7 +1245,7 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
 /// snapshot carries a quota section, the plan's own meters with their
 /// reset clocks and forecasts, the `spent` line, and the `binding`
 /// claim (the reference's RATE & QUOTA block).
-fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
+fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone, fmt: &Fmt) {
     let block = Block::bordered().title_top("RATE & QUOTA");
     let inner = block.inner(area);
     let mut lines = vec![Line::from(format!("{:.1}/min", snap.rate.per_minute))];
@@ -1291,6 +1291,7 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
                 inner.width,
                 snap.now_ms,
                 tz,
+                fmt,
             ));
         }
         if let (Some(today), Some(window)) = (quota.spent_today, quota.spent_window) {
@@ -1315,6 +1316,7 @@ fn meter_line(
     width: u16,
     now_ms: i64,
     tz: &TimeZone,
+    fmt: &Fmt,
 ) -> Line<'static> {
     let width = width as usize;
 
@@ -1329,7 +1331,7 @@ fn meter_line(
                 .reset_s
                 .map(|reset| reset as f64 * 1000.0)
                 .unwrap_or(at_ms);
-            let label = alongside(at_ms, other, now_ms, tz);
+            let label = fmt.alongside(at_ms, other, now_ms, tz);
             if meter.target < 1.0 {
                 (format!("stops ~{label}"), Style::new().fg(Color::Yellow))
             } else {
@@ -1355,7 +1357,7 @@ fn meter_line(
         _ => Some(match meter.reset_s {
             Some(reset) => format!(
                 "resets {} · ",
-                reset_label(reset as f64 * 1000.0, now_ms, tz)
+                fmt.reset_label(reset as f64 * 1000.0, now_ms, tz)
             ),
             None => "resets ? · ".to_owned(),
         }),
@@ -1373,7 +1375,9 @@ fn meter_line(
     // Where the reference cuts the bar string mid-glyph at
     // this point, the bar here shrinks instead — every surviving piece
     // keeps its styling and a partial bar still reads as a bar.
-    let len = |s: &str| s.chars().count();
+    // Cells, not chars: a locale's clock may carry a narrow no-break
+    // space or wide digits, and the line is budgeted in columns.
+    let len = |s: &str| s.width();
     let with = |status: Option<&str>, resets: Option<&str>| {
         let mut right = String::new();
         if let Some(status) = status {
@@ -1459,10 +1463,7 @@ fn meter_line(
         // the reference's spread clamps the left side of the line, at
         // the price of the cut portion's styling.
         let keep = width.saturating_sub(len(&right) + 1);
-        let mut spans = vec![
-            Span::raw(left.chars().take(keep).collect::<String>()),
-            Span::raw(" "),
-        ];
+        let mut spans = vec![Span::raw(clip(&left, keep)), Span::raw(" ")];
         spans.extend(right_spans());
         Line::from(spans)
     }
@@ -1534,6 +1535,22 @@ fn binding_line(claim: &str, overage_in_use: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// `text` cut to at most `width` cells, whole characters only — a wide
+/// character that would straddle the edge goes rather than half-renders.
+fn clip(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out
+}
+
 /// The meter bar: fill to `round(frac × w)`, pad with `░`.
 fn bar(frac: f64, w: u16) -> String {
     let w = w as usize;
@@ -1592,6 +1609,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::super::labels::Label;
+    use super::super::locale::Fmt;
 
     const NOW: i64 = 1_769_000_000_000;
     const MIN: i64 = 60_000;
@@ -1605,6 +1623,12 @@ mod tests {
     /// state, never a fabricated one.
     fn no_labels() -> HashMap<String, Label> {
         HashMap::new()
+    }
+
+    /// The pinned formats: the expected strings below hold on any host,
+    /// whatever its locale.
+    fn plain() -> super::Ui {
+        super::Ui { fmt: Fmt::fixed() }
     }
 
     /// A fixed zone keeps the pinned clock strings independent of the
@@ -1905,7 +1929,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         let tz = utc();
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56", &tz))
+            .draw(|frame| super::render(frame, snap, "12:34:56", &tz, &plain()))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -1994,7 +2018,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
         let tz = utc();
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56", &tz))
+            .draw(|frame| super::render(frame, snap, "12:34:56", &tz, &plain()))
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let cells: Vec<&str> = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
@@ -2366,7 +2390,7 @@ mod tests {
             .iter()
             .find(|meter| meter.label == label)
             .expect("the fixture has this meter");
-        super::meter_line(meter, quota.gate_assumed, width, NOW, &utc())
+        super::meter_line(meter, quota.gate_assumed, width, NOW, &utc(), &Fmt::fixed())
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2811,6 +2835,51 @@ mod tests {
     }
 
     #[test]
+    fn counts_and_clocks_render_in_the_display_locale() {
+        // The view takes its formatter from the loop: here fr's grouping
+        // (U+202F, one cell, not ASCII) and en-IN's lakh grouping reach
+        // every grouped figure, and the meter clocks follow the time
+        // locale. Nothing reads the host's locale.
+        let locale = |tag: &str| icu_locale_core::Locale::try_from_str(tag).expect("a tag");
+        let draw = |snap: &model::Snapshot, ui: &super::Ui| {
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+            terminal
+                .draw(|frame| super::render(frame, snap, "12:34:56", &utc(), ui))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            text
+        };
+        let fr = super::Ui {
+            fmt: Fmt::new(None, Some(&locale("fr-FR"))),
+        };
+        let text = draw(&full_snapshot(), &fr);
+        assert!(text.contains("470\u{202f}893 / 1M"), "{text}");
+        assert!(text.contains("≥50\u{202f}000 tokens"), "{text}");
+
+        let lakh = super::Ui {
+            fmt: Fmt::new(None, Some(&locale("en-IN"))),
+        };
+        let text = draw(&full_snapshot(), &lakh);
+        assert!(text.contains("4,70,893 / 1M"), "{text}");
+
+        // A 12-hour time locale reaches the meter clocks; the pinned
+        // fixture strings elsewhere are the 24-hour fallback.
+        let us = super::Ui {
+            fmt: Fmt::new(Some(&locale("en-US")), None),
+        };
+        let text = draw(&quota_snapshot(), &us);
+        assert!(text.contains("resets 3:53"), "{text}");
+        assert!(text.contains("PM · gated · on track"), "{text}");
+    }
+
+    #[test]
     fn rebuilds_panel_renders_counts_causes_and_localisations() {
         let snap = full_snapshot();
         let text = rendered(&snap, 120, 40);
@@ -2955,7 +3024,7 @@ mod tests {
         ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
             terminal
-                .draw(|frame| super::render(frame, &snap, "12:34:56", &utc()))
+                .draw(|frame| super::render(frame, &snap, "12:34:56", &utc(), &plain()))
                 .expect("draw");
         }
     }

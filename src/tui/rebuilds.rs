@@ -68,6 +68,7 @@
 
 use std::collections::HashMap;
 
+use super::locale::Fmt;
 use crate::ir::anthropic::{LADDER_STEP, tail_offsets};
 use crate::store::{LocalisationRow, RebuildRow};
 use serde_json::Value;
@@ -368,7 +369,11 @@ fn classify_one(
 /// `system_change.where` the row may carry (written by the predecessor;
 /// toker never writes it itself) and
 /// otherwise re-derives it from the ladders ([`where_changed`]).
-pub(crate) fn localise(events: &mut [RebuildEvent], by_id: &HashMap<i64, LocalisationRow>) {
+pub(crate) fn localise(
+    events: &mut [RebuildEvent],
+    by_id: &HashMap<i64, LocalisationRow>,
+    fmt: &Fmt,
+) {
     for event in events {
         let Some(system) = &event.system else {
             continue;
@@ -380,11 +385,11 @@ pub(crate) fn localise(events: &mut [RebuildEvent], by_id: &HashMap<i64, Localis
             .and_then(Value::as_str);
         let where_changed = stored
             .map(str::to_owned)
-            .or_else(|| where_changed(system, by_id));
+            .or_else(|| where_changed(system, by_id, fmt));
         let chars = format!(
             "{} → {} chars",
-            grouped(system.prev_chars),
-            grouped(system.chars)
+            fmt.grouped(system.prev_chars),
+            fmt.grouped(system.chars)
         );
         event.detail = Some(match where_changed {
             Some(where_changed) => format!("{chars}; {where_changed}"),
@@ -407,7 +412,11 @@ fn tail_of(loc: Option<&LocalisationRow>) -> Option<&[String]> {
 /// which block, then the
 /// ladder window, then the tail bound. `None` when the rungs bound
 /// nothing — never a guessed position.
-fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -> Option<String> {
+fn where_changed(
+    system: &SystemChange,
+    by_id: &HashMap<i64, LocalisationRow>,
+    fmt: &Fmt,
+) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
     // Which block: naming the block is not enough
@@ -429,8 +438,8 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
                 if prev.get("hash") != row.get("hash") {
                     parts.push(format!(
                         "block {i} ({} → {} chars)",
-                        chars_of(prev),
-                        chars_of(row)
+                        chars_of(prev, fmt),
+                        chars_of(row, fmt)
                     ));
                 }
             }
@@ -516,8 +525,8 @@ fn where_changed(system: &SystemChange, by_id: &HashMap<i64, LocalisationRow>) -
 
 /// A block map entry's `chars`, rendered as a missing count renders
 /// (`-`), never as a zero.
-fn chars_of(block: &Value) -> String {
-    grouped(block.get("chars").and_then(Value::as_i64))
+fn chars_of(block: &Value, fmt: &Fmt) -> String {
+    fmt.grouped(block.get("chars").and_then(Value::as_i64))
 }
 
 /// The panel's aggregate over a localised walk: the summary counts, the
@@ -561,34 +570,11 @@ pub(crate) fn aggregate(walk: Walk) -> RebuildAgg {
     }
 }
 
-/// Comma-grouped token counts: `12,213,961`,
-/// and `-` for an unknown, never a zero (the detail lines only ever
-/// render a known count or an explicit gap).
-pub(crate) fn grouped(value: Option<i64>) -> String {
-    match value {
-        None => "-".to_owned(),
-        Some(value) => {
-            let digits = value.unsigned_abs().to_string();
-            let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-            for (i, digit) in digits.bytes().enumerate() {
-                if i > 0 && (digits.len() - i) % 3 == 0 {
-                    grouped.push(',');
-                }
-                grouped.push(digit as char);
-            }
-            if value < 0 {
-                format!("-{grouped}")
-            } else {
-                grouped
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Cause, REBUILD_MIN, RebuildRow};
     use crate::store::LocalisationRow;
+    use crate::tui::locale::Fmt;
     use crate::tui::testrows::rebuild_bare;
     use serde_json::json;
     use std::collections::HashMap;
@@ -797,7 +783,7 @@ mod tests {
 
         // No ladders fetched: the detail claims the chars and the
         // block, and no position.
-        super::localise(&mut walked.events, &HashMap::new());
+        super::localise(&mut walked.events, &HashMap::new(), &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some("43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars)")
@@ -828,7 +814,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        super::localise(&mut walked.events, &ladders);
+        super::localise(&mut walked.events, &ladders, &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some("43,696 → 43,801 chars; block 1 (42,696 → 42,801 chars), in the last 8 bytes")
@@ -846,7 +832,7 @@ mod tests {
                 system_change: Some(json!({"delta": 105, "where": "block 1, in the last 8 bytes"})),
             },
         );
-        super::localise(&mut walked.events, &stored);
+        super::localise(&mut walked.events, &stored, &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some("43,696 → 43,801 chars; block 1, in the last 8 bytes")
@@ -892,7 +878,7 @@ mod tests {
         .collect();
 
         let mut walked = walk(&[prev, changed], 30 * MIN);
-        super::localise(&mut walked.events, &ladders);
+        super::localise(&mut walked.events, &ladders, &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some("20,000 → 20,000 chars; between bytes 8192 and 16384")
@@ -943,7 +929,7 @@ mod tests {
         .collect();
 
         let mut walked = walk(&[prev, changed], 30 * MIN);
-        super::localise(&mut walked.events, &ladders);
+        super::localise(&mut walked.events, &ladders, &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some(
@@ -1098,7 +1084,7 @@ mod tests {
         changed.system_blocks = Some(json!([{"hash": "b1", "chars": 9_500}]));
 
         let mut walked = walk(&[prev, changed], 30 * MIN);
-        super::localise(&mut walked.events, &HashMap::new());
+        super::localise(&mut walked.events, &HashMap::new(), &Fmt::fixed());
         assert_eq!(
             walked.events[0].detail.as_deref(),
             Some("9,000 → 9,500 chars; block count 2 → 1"),

@@ -1694,7 +1694,7 @@ pub fn human_idle(ms: i64) -> String {
 /// (a future 06:43 read at 20:45 can only be tomorrow), a weekday within
 /// 6 d, day + month beyond. The forms are pinned, not locale-derived
 /// (invariant 4): `%H:%M`, `%a %H:%M`, day-then-month.
-fn at_scale(at_ms: f64, tz: &TimeZone, scale: usize) -> String {
+pub(crate) fn at_scale(at_ms: f64, tz: &TimeZone, scale: usize) -> String {
     let Some(zoned) = zoned_of(at_ms, tz) else {
         return "?".to_owned();
     };
@@ -1705,7 +1705,7 @@ fn at_scale(at_ms: f64, tz: &TimeZone, scale: usize) -> String {
     }
 }
 
-fn scale_of(at_ms: f64, now_ms: i64) -> usize {
+pub(crate) fn scale_of(at_ms: f64, now_ms: i64) -> usize {
     let delta = at_ms - now_ms as f64;
     if delta < 20.0 * 3600e3 {
         0
@@ -1723,11 +1723,16 @@ fn scale_of(at_ms: f64, now_ms: i64) -> usize {
 /// shares this for its meter lines — one labelling rule, everywhere two
 /// instants sit side by side.
 pub(crate) fn alongside(at_ms: f64, other_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
+    at_scale(at_ms, tz, alongside_scale(at_ms, other_ms, now_ms))
+}
+
+/// [`alongside`]'s resolution, apart from its pinned forms: the TUI
+/// renders the same rule in the user's locale.
+pub(crate) fn alongside_scale(at_ms: f64, other_ms: f64, now_ms: i64) -> usize {
     // The scale is max(own, min(other, 1)); the
     // final 0 is defensive (scales are non-negative here), so it has no
     // Rust equivalent to carry.
-    let scale = scale_of(at_ms, now_ms).max(scale_of(other_ms, now_ms).min(1));
-    at_scale(at_ms, tz, scale)
+    scale_of(at_ms, now_ms).max(scale_of(other_ms, now_ms).min(1))
 }
 
 /// A future instant at the coarsest resolution that still identifies it
@@ -1738,7 +1743,7 @@ pub fn reset_label(at_ms: f64, now_ms: i64, tz: &TimeZone) -> String {
     at_scale(at_ms, tz, scale_of(at_ms, now_ms))
 }
 
-fn zoned_of(at_ms: f64, tz: &TimeZone) -> Option<jiff::Zoned> {
+pub(crate) fn zoned_of(at_ms: f64, tz: &TimeZone) -> Option<jiff::Zoned> {
     // jiff's Timestamp range is ±9999 years; clamp rather than guess.
     let ms = at_ms.clamp(-253_402_300_799_000.0, 253_402_300_799_000.0) as i64;
     Some(
