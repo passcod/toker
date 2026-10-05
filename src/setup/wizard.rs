@@ -56,7 +56,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -268,6 +268,12 @@ pub trait SystemRunner {
     /// disable are the only calls the wizard makes here.
     fn systemctl_system(&self, args: &[&str]) -> Result<Output>;
 
+    /// Ask the installed binary to replace the running service through
+    /// its draining control endpoint. A setup re-run may have changed the
+    /// config or unit while the old process still holds both in memory;
+    /// `enable --now` does nothing to an already-active socket.
+    fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus>;
+
     /// Install a unit file into the user units dir, returning the path
     /// written. Declarative: the same contents install cleanly over an
     /// earlier install of the same unit.
@@ -309,6 +315,15 @@ impl SystemRunner for ProcessRunner {
             .args(args)
             .output()
             .with_context(|| format!("running sudo systemctl {}", args.join(" ")))
+    }
+
+    fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
+        // Keep stdio attached: `toker restart` may wait for a quiet moment,
+        // and its progress (including the Ctrl-C promise) must stay visible.
+        std::process::Command::new(exe)
+            .arg("restart")
+            .status()
+            .with_context(|| format!("running {} restart", exe.display()))
     }
 
     fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
@@ -1162,7 +1177,12 @@ impl<'a> Wizard<'a> {
             ))?;
         }
 
-        if self.units_step(&current, &mut report)? {
+        let refresh_running = detected.socket_active == Some(true)
+            && detected
+                .config
+                .as_ref()
+                .is_some_and(|old| old.port == current.port);
+        if self.units_step(&current, refresh_running, &mut report)? {
             self.verify_step(&current, &detected, &mut report).await?;
             self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
@@ -1817,11 +1837,18 @@ impl<'a> Wizard<'a> {
     /// [`Step::InstallUnits`] — create the state dir, generate the
     /// units (functions of the configured port, this binary, and the
     /// state dir), install them, `daemon-reload`, `enable --now
-    /// toker.socket`. Every failure is
+    /// toker.socket`, then gracefully replace a process already serving
+    /// the same listener so it reads the installed unit and current config.
+    /// Every failure is
     /// non-fatal and reported with the manual commands — but the
     /// return value is the spine: `false` means the run stops here
     /// (no verify, no frontends, no import).
-    fn units_step(&mut self, current: &Config, report: &mut RunReport) -> Result<bool> {
+    fn units_step(
+        &mut self,
+        current: &Config,
+        refresh_running: bool,
+        report: &mut RunReport,
+    ) -> Result<bool> {
         self.step(Step::InstallUnits)?;
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
         let port = current.port;
@@ -1900,6 +1927,23 @@ impl<'a> Wizard<'a> {
                         stderr_of(&other)
                     ))?;
                 }
+            }
+        }
+
+        if ok && refresh_running {
+            self.say(
+                "an existing toker listener is active — refreshing it without cutting responses",
+            )?;
+            match self.runner.graceful_restart(&exe) {
+                Ok(status) if status.success() => self.say("toker restart — ok")?,
+                Ok(status) => bail!(
+                    "the running service could not be refreshed (toker restart exited {status}); \
+                     the wizard stopped before verification and no frontend config was changed"
+                ),
+                Err(error) => bail!(
+                    "the running service could not be refreshed: {error:#}; the wizard stopped \
+                     before verification and no frontend config was changed"
+                ),
             }
         }
 
@@ -3214,6 +3258,7 @@ mod tests {
         system_calls: Arc<Mutex<Vec<Vec<String>>>>,
         installed: Arc<Mutex<Vec<(String, String)>>>,
         removed: Arc<Mutex<Vec<String>>>,
+        restarts: Arc<Mutex<Vec<PathBuf>>>,
     }
 
     impl FakeRunner {
@@ -3226,6 +3271,7 @@ mod tests {
                 system_calls: Arc::new(Mutex::new(Vec::new())),
                 installed: Arc::new(Mutex::new(Vec::new())),
                 removed: Arc::new(Mutex::new(Vec::new())),
+                restarts: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -3243,6 +3289,10 @@ mod tests {
 
         fn installed(&self) -> Vec<(String, String)> {
             self.installed.lock().unwrap().clone()
+        }
+
+        fn restarts(&self) -> Vec<PathBuf> {
+            self.restarts.lock().unwrap().clone()
         }
     }
 
@@ -3269,6 +3319,11 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| panic!("no scripted sudo systemctl outcome for {args:?}"))
+        }
+
+        fn graceful_restart(&self, exe: &Path) -> Result<ExitStatus> {
+            self.restarts.lock().unwrap().push(exe.to_owned());
+            Ok(ok_empty()?.status)
         }
 
         fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf> {
@@ -3878,6 +3933,10 @@ default_backend_anthropic = "codex_sub"
         assert!(!report.config_kept);
         assert!(report.units_ok);
         assert!(
+            rig.runner.restarts().is_empty(),
+            "a fresh listener is current"
+        );
+        assert!(
             rig.paths().state_dir.is_dir(),
             "the state dir exists before the service could need it"
         );
@@ -4044,6 +4103,11 @@ default_backend_anthropic = "codex_sub"
         assert_eq!(report.left_unchanged.len(), 3);
         assert!(report.verified.is_some());
         assert!(report.units_ok);
+        assert_eq!(
+            rerun.runner.restarts(),
+            vec![std::env::current_exe().expect("this test binary's path")],
+            "an active listener is gracefully refreshed before verification"
+        );
         // The transcript pin: run two's first question was the
         // keep-vs-reconfigure select, the frontend questions were
         // confirms, and the last question was the timers confirm (no —
@@ -4060,6 +4124,10 @@ default_backend_anthropic = "codex_sub"
         assert!(out.contains("points at toker"), "{out}");
         assert!(out.contains("already wired, nothing to do"), "{out}");
         assert!(out.contains("kept"), "{out}");
+        assert!(
+            out.contains("refreshing it without cutting responses"),
+            "{out}"
+        );
         assert!(
             out.contains("0 patched, 3 left as is"),
             "the finish summary reports the no-op: {out}"

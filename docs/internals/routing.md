@@ -222,3 +222,12 @@ A `toker serve` run by hand has no systemd behind it: the drain still works, but
 nothing starts the next instance, and the CLI says so when its wait runs out. A
 toker from before this endpoint answers status without an `instance`, and the
 CLI refuses rather than falling back to a signal.
+
+Setup uses this same drain-and-restart path when its initial state check found
+an active socket on the configured port. Reinstalling and reloading a unit does
+not change an already-running process: without the restart it would verify the
+old in-memory config (and possibly the old binary inode), even though setup's
+state summary had read the current `toker.toml`. A fresh or port-changing setup
+does not take this path; socket activation starts the installed service, while
+a live socket whose port changed still needs the explicit socket restart setup
+reports.
