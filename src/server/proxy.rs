@@ -58,6 +58,7 @@ use futures::stream::{Stream, StreamExt};
 
 use crate::ir::{Fidelity, Request as IrRequest, Shape, compare};
 use crate::middleware::cold;
+use crate::middleware::force_newest;
 use crate::middleware::lanes;
 use crate::observe::{SseSplitter, UsageObserver};
 use crate::providers::Provider;
@@ -216,6 +217,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // No quota outlook: this backend has no meter source, so
             // the decision is coldness + threshold + spell alone.
             None,
+            Some(force_newest::prompt_bound(original.len() as u64)),
         ) {
             // The per-model writes-free exemption: the re-read this
             // notice warns about is what cache writes cost — when the

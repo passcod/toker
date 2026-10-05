@@ -279,8 +279,9 @@ async fn assert_no_more_rows(store: &Store, count: usize) {
 }
 
 /// The tools body the anthropic tests use (streaming, so the gates answer
-/// with the SSE turn): without tools there is no lane, just a session —
-/// the lane rule: a session is not a cache entry.
+/// with the SSE turn), sized like the resume of the 200k conversation
+/// [`poison_cold_lane`] seeds: the gate only stops a request whose own
+/// upper bound (bytes / 2) could be that re-read.
 fn tools_body(model: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "model": model,
@@ -289,7 +290,11 @@ fn tools_body(model: &str) -> Vec<u8> {
             {"name": "Read", "input_schema": {"type": "object"}},
             {"name": "Bash", "input_schema": {"type": "object"}},
         ],
-        "messages": [{"role": "user", "content": "Hi"}],
+        "messages": [
+            {"role": "user", "content": "x".repeat(400_000)},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "Hi"},
+        ],
     }))
     .expect("serialise tools body")
 }
@@ -546,7 +551,7 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
         extra
     );
     assert_eq!(extra["lastPrompt"], json!(200_000));
-    assert_eq!(extra["reqMessages"], json!(1));
+    assert_eq!(extra["reqMessages"], json!(3));
     assert_eq!(extra["compactTarget"], Value::Null);
     assert_eq!(
         extra["quotaExtra"],

@@ -510,6 +510,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             min_idle_ms,
             now,
             None,
+            Some(force_newest::prompt_bound(original.len() as u64)),
         );
         // The writes-free exemption (the README's "if cache writes are
         // free at the backend, this doesn't apply"): a notice exists to
@@ -556,6 +557,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 min_idle_ms,
                 now,
                 outlook.as_ref(),
+                Some(force_newest::prompt_bound(original.len() as u64)),
             )
         } else {
             fired

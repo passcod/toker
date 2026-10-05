@@ -110,6 +110,7 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
                     None,
                     now_ms,
                     None,
+                    None,
                 );
                 match expected.get("action").and_then(Value::as_str) {
                     Some("forward") => assert_eq!(

@@ -219,8 +219,19 @@ pub fn decide_cold(
     min_idle_ms: Option<i64>,
     now_ms: i64,
     outlook: Option<&Outlook>,
+    request_bound: Option<u64>,
 ) -> ColdDecision {
     if summarising {
+        return ColdDecision::Forward;
+    }
+    // The lane says what was cached; only the request says what this send
+    // would re-read. Subagents share their parent's session id, so a fresh
+    // subagent with a sibling's toolset lands in that sibling's lane: on
+    // 2026-10-05 one was stopped on its first request over a 484k re-read
+    // its predecessor had left four hours earlier. A request whose upper
+    // bound is under the threshold cannot be that re-read, whatever the
+    // lane held. An unknown bound decides nothing.
+    if request_bound.is_some_and(|bound| bound < min_tokens) {
         return ColdDecision::Forward;
     }
     let Some(lane) = lane else {
@@ -2613,12 +2624,20 @@ mod tests {
         // `lane_is_cold` for the cache question instead.
         let cold = lane(NOW - 2 * HOUR, 200_000, None);
         assert_eq!(
-            decide_cold(Some(&cold), true, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(Some(&cold), true, DEFAULT_MIN_TOKENS, None, NOW, None, None),
             ColdDecision::Forward
         );
         // Without the flag, the same lane notices.
         assert!(matches!(
-            decide_cold(Some(&cold), false, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(
+                Some(&cold),
+                false,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Notice { .. }
         ));
     }
@@ -2631,7 +2650,15 @@ mod tests {
             ..lane(NOW - 2 * HOUR, 200_000, None)
         };
         assert_eq!(
-            decide_cold(Some(&noticed), false, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(
+                Some(&noticed),
+                false,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Forward
         );
         // A notice recorded BEFORE the lane was last active belongs to an
@@ -2641,7 +2668,15 @@ mod tests {
             ..lane(NOW - 2 * HOUR, 200_000, None)
         };
         assert!(matches!(
-            decide_cold(Some(&re_armed), false, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(
+                Some(&re_armed),
+                false,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Notice { .. }
         ));
         // No notice recorded: fires, carrying no outlook.
@@ -2652,6 +2687,7 @@ mod tests {
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
+                None,
                 None
             ),
             ColdDecision::Notice {
@@ -2675,7 +2711,15 @@ mod tests {
             .expect("lane");
         assert_eq!(marked.noticed_at, Some(NOW));
         assert_eq!(
-            decide_cold(Some(&marked), false, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(
+                Some(&marked),
+                false,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Forward
         );
         // note_lane_notice on an unknown key is a no-op, not an invention.
@@ -2729,7 +2773,15 @@ mod tests {
         // Without the outlook the notice fires; with it, quiet.
         let cold = lane(NOW - 2 * HOUR, 200_000, None);
         assert!(matches!(
-            decide_cold(Some(&cold), false, DEFAULT_MIN_TOKENS, None, NOW, None),
+            decide_cold(
+                Some(&cold),
+                false,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Notice { .. }
         ));
         assert_eq!(
@@ -2739,7 +2791,8 @@ mod tests {
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
-                Some(&outlook)
+                Some(&outlook),
+                None
             ),
             ColdDecision::Quiet {
                 idle_ms: 2 * HOUR,
@@ -2771,7 +2824,8 @@ mod tests {
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
-                Some(&off_track)
+                Some(&off_track),
+                None
             ),
             ColdDecision::Notice {
                 idle_ms: 2 * HOUR,
@@ -2789,7 +2843,8 @@ mod tests {
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
-                Some(&unknown)
+                Some(&unknown),
+                None
             ),
             ColdDecision::Notice { .. }
         ));

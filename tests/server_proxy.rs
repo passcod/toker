@@ -451,15 +451,20 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// A tools-carrying chat body — the cold gate keys lanes on session ×
-/// tools-hash, so without tools there is no lane and no gate. All the
-/// cold tests drive the same session `post_chat` sends.
+/// A tools-carrying chat body, sized like the resume of the 500k
+/// conversation [`seed_cold_lane`] seeds: the gate only stops a request
+/// whose own upper bound (bytes / 2) could be that re-read. All the cold
+/// tests drive the same session `post_chat` sends.
 fn cold_body(model: &str, stream: bool) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "model": model,
         "stream": stream,
         "tools": [{"type": "function", "function": {"name": "run_command"}}],
-        "messages": [{"role": "user", "content": "Hi"}],
+        "messages": [
+            {"role": "user", "content": "x".repeat(1_000_000)},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "Hi"},
+        ],
     }))
     .expect("serialise cold body")
 }
@@ -1339,7 +1344,7 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
         .1
         .to_owned();
     assert_eq!(cold.tools_hash.as_deref(), Some(expected_tools.as_str()));
-    assert_eq!(cold.req_messages, Some(1));
+    assert_eq!(cold.req_messages, Some(3));
     assert_eq!(cold.cold_on, Some(true));
     assert_eq!(cold.gate_on, None, "no quota gate exists on this path");
     assert_eq!(cold.rate_limits, None, "nothing reached upstream");
@@ -1349,7 +1354,7 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
         "{extra}"
     );
     assert_eq!(extra["lastPrompt"], serde_json::json!(500_000));
-    assert_eq!(extra["reqMessages"], serde_json::json!(1));
+    assert_eq!(extra["reqMessages"], serde_json::json!(3));
     assert_eq!(extra["compactTarget"], Value::Null);
     assert_eq!(extra["quotaExtra"], Value::Null, "no outlook on this path");
     assert_eq!(extra["util5h"], Value::Null);
