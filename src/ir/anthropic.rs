@@ -208,7 +208,7 @@ impl<'a> AnthropicBody<'a> {
         }
 
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-        let (compact_generations, summarising) = compaction_of(messages.parts);
+        let (compact_generations, summarising, compact_marker) = compaction_of(messages.parts);
         let system_messages = {
             let count = messages
                 .iter()
@@ -240,6 +240,7 @@ impl<'a> AnthropicBody<'a> {
             system_messages,
             compact_generations,
             summarising,
+            compact_marker,
             system_ladder: prefix_ladder(&system_units),
             system_tail: suffix_ladder(&system_units),
         }
@@ -649,13 +650,16 @@ pub struct AnthropicShape {
     /// system-reminder blocks, so requiring offset zero missed every real
     /// case. `None` when zero.
     pub compact_generations: Option<u64>,
-    /// Whether the LAST message begins a line with a summarisation
-    /// instruction. NOT a compaction flag: Claude Code
+    /// Whether the last non-system message begins a line with a
+    /// summarisation instruction. NOT a compaction flag: Claude Code
     /// issues the same summarisation prompt for session titles and
     /// resume metadata, on a small model with no tools, several times a
     /// minute. Which kind it is takes the tool set too — ask
     /// [`AnthropicShape::is_compaction`], never this field alone.
     pub summarising: bool,
+    /// Where a summarisation wording sits near the end, matched or not
+    /// ([`CompactMarker`]). Diagnostic only: nothing acts on it.
+    pub compact_marker: Option<CompactMarker>,
     /// Cumulative system-text digests every 8 KiB (`LADDER_STEP`):
     /// the first rung that differs between two requests bounds the
     /// change to one 8 KiB window. Complete steps only, so the final
@@ -722,12 +726,18 @@ fn system_pieces(value: &Value) -> Vec<&str> {
 /// any conversation that *discusses* compaction contains the marker text
 /// and reports itself as compacted. Claude Code puts the continuation
 /// preamble in the first message and the summarisation instruction in the
-/// last, so both are matched at those positions only — and the
+/// last turn, so both are matched at those positions only — and the
 /// summarisation wordings are additionally line-anchored within it, so
 /// quoted prose and file listings do not count.
-fn compaction_of(messages: &[Value]) -> (Option<u64>, bool) {
+///
+/// "The last turn" is the last message that is not a mid-conversation
+/// `system` message. Claude Code sends hook output and attachments that
+/// way, and one trailing the prompt hid every compaction from the cutover
+/// to 2026-10-06: the detector read the system message, found nothing, and
+/// the retarget never ran.
+fn compaction_of(messages: &[Value]) -> (Option<u64>, bool, Option<CompactMarker>) {
     let Some(first) = messages.first() else {
-        return (None, false);
+        return (None, false, None);
     };
     // A first message that quotes the preamble (its own summary)
     // over-counts — a limitation carried over from the predecessor. The
@@ -736,15 +746,87 @@ fn compaction_of(messages: &[Value]) -> (Option<u64>, bool) {
     let generations = count_of(&Message { value: first }.text(), COMPACT_RESUMED);
     let compact_generations = (generations > 0).then_some(generations);
 
-    let last = Message {
-        value: &messages[messages.len() - 1],
-    };
-    let last_text = last.text();
-    let summarising = !last.has_tool_result()
-        && COMPACT_PERFORMING
+    let summarising = messages
+        .iter()
+        .rposition(|value| Message { value }.role() != Some("system"))
+        .is_some_and(|at| {
+            let last = Message {
+                value: &messages[at],
+            };
+            !last.has_tool_result() && begins_line_any(&last.text(), COMPACT_PERFORMING)
+        });
+    (compact_generations, summarising, compact_marker(messages))
+}
+
+/// How many messages from the end [`compact_marker`] looks at: enough to
+/// see past a few trailing system messages, few enough that an ordinary
+/// turn quoting the wording further back stays out of it.
+const MARKER_SCAN: usize = 4;
+
+/// Where a summarisation wording sits near the end of the conversation,
+/// matched or not, so the next change to Claude Code's layout leaves
+/// evidence in the ledger instead of silence. Positions and booleans
+/// only, never text (invariant 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactMarker {
+    /// Messages between the carrier and the end: 0 when it is the last.
+    pub from_end: u64,
+    /// The carrying message's role.
+    pub role: Option<String>,
+    /// The roles of the messages after it, in order.
+    pub trailing: Vec<String>,
+    /// Whether a wording began a line (the detector's anchor).
+    pub line_start: bool,
+    /// Whether the carrying message holds a tool result (the detector's
+    /// refusal).
+    pub tool_result: bool,
+}
+
+impl CompactMarker {
+    /// The row's `extra.compactMarker` object.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "fromEnd": self.from_end,
+            "role": self.role,
+            "trailing": self.trailing,
+            "lineStart": self.line_start,
+            "toolResult": self.tool_result,
+        })
+    }
+}
+
+/// The last of the final [`MARKER_SCAN`] messages carrying a
+/// summarisation wording anywhere in its text.
+fn compact_marker(messages: &[Value]) -> Option<CompactMarker> {
+    let start = messages.len().saturating_sub(MARKER_SCAN);
+    let (at, value) = messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .rev()
+        .find(|(_, value)| {
+            let text = Message { value }.text();
+            COMPACT_PERFORMING
+                .iter()
+                .any(|marker| text.contains(marker))
+        })?;
+    let message = Message { value };
+    let text = message.text();
+    Some(CompactMarker {
+        from_end: (messages.len() - 1 - at) as u64,
+        role: message.role().map(str::to_owned),
+        trailing: messages[at + 1..]
             .iter()
-            .any(|marker| begins_line(&last_text, marker));
-    (compact_generations, summarising)
+            .map(|value| Message { value }.role().unwrap_or("?").to_owned())
+            .collect(),
+        line_start: begins_line_any(&text, COMPACT_PERFORMING),
+        tool_result: message.has_tool_result(),
+    })
+}
+
+/// Whether any of `markers` begins a line of `haystack`.
+fn begins_line_any(haystack: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| begins_line(haystack, marker))
 }
 
 /// Non-overlapping occurrence count.
@@ -860,7 +942,7 @@ fn strippable(text: &str, marker: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::short_hash;
-    use super::{PLAN_SENTINEL, Release, SENTINEL, System};
+    use super::{MARKER_SCAN, PLAN_SENTINEL, Release, SENTINEL, System};
     use crate::ir::Request;
 
     fn parse(body: &[u8]) -> Request {
@@ -1278,6 +1360,84 @@ mod tests {
             ]}),
         ]);
         assert!(!parse(&body).anthropic().shape().summarising);
+    }
+
+    fn system_text(text: &str) -> serde_json::Value {
+        serde_json::json!({"role": "system", "content": [{"type": "text", "text": text}]})
+    }
+
+    // Claude Code sends hook output and attachments as mid-conversation
+    // system messages, and one trailing the prompt hid every compaction
+    // from the cutover to 2026-10-06.
+    #[test]
+    fn trailing_system_messages_do_not_hide_the_prompt() {
+        let prompt = format!("{PREAMBLE}\n\n{PERFORMING} the conversation so far.");
+        for trailing in 1..=3 {
+            let mut messages = vec![
+                user_text("Earlier."),
+                assistant_text("Done."),
+                user_text(&prompt),
+            ];
+            messages.extend((0..trailing).map(|_| system_text("hook output")));
+            let shape = parse(&body_of(messages)).anthropic().shape();
+            assert!(shape.summarising, "{trailing} trailing system message(s)");
+            let marker = shape.compact_marker.expect("marker recorded");
+            assert_eq!(marker.from_end, trailing);
+            assert_eq!(marker.role.as_deref(), Some("user"));
+            assert_eq!(marker.trailing, vec!["system"; trailing as usize]);
+            assert!(marker.line_start);
+            assert!(!marker.tool_result);
+        }
+
+        // Skipping system messages does not skip the tool-result refusal.
+        let quoted = body_of(vec![
+            user_text("Earlier."),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                {"type": "text", "text": PREAMBLE},
+            ]}),
+            system_text("hook output"),
+        ]);
+        let shape = parse(&quoted).anthropic().shape();
+        assert!(!shape.summarising);
+        // ...but where the wording sat is still recorded.
+        let marker = shape.compact_marker.expect("marker recorded");
+        assert!(marker.tool_result);
+        assert_eq!(marker.from_end, 1);
+
+        // A system message carrying the wording is not the prompt.
+        let in_system = body_of(vec![user_text("Earlier."), system_text(PREAMBLE)]);
+        assert!(!parse(&in_system).anthropic().shape().summarising);
+    }
+
+    #[test]
+    fn the_marker_diagnostic_stays_quiet_on_an_ordinary_turn() {
+        let ordinary = body_of(vec![
+            user_text("Start."),
+            assistant_text("Earlier talk."),
+            user_text("Carry on."),
+            system_text("hook output"),
+        ]);
+        assert_eq!(parse(&ordinary).anthropic().shape().compact_marker, None);
+
+        // A quote further back than the scan is out of it.
+        let mut far = vec![user_text(&format!("Quoting: {PERFORMING}"))];
+        far.extend((0..MARKER_SCAN).map(|_| user_text("later")));
+        assert_eq!(
+            parse(&body_of(far)).anthropic().shape().compact_marker,
+            None
+        );
+
+        // A mid-line quote inside the scan is recorded, and says so.
+        let mid = body_of(vec![user_text(&format!(
+            "I read that '{PERFORMING}' is it."
+        ))]);
+        let marker = parse(&mid)
+            .anthropic()
+            .shape()
+            .compact_marker
+            .expect("recorded");
+        assert!(!marker.line_start);
     }
 
     #[test]

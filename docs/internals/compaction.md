@@ -105,3 +105,25 @@ a limitation carried over from ctp.
 Each guard has its own negative test (in `ir/anthropic.rs`), because either
 alone leaves a hole: the line anchor misses a tool-result turn that quotes the
 prompt faithfully, and the tool-result test misses a plain message that does.
+
+### The last message is not the last turn
+
+From the cutover until 2026-10-06 no row carried `summarising`, so every
+compaction ran on the model it asked for with its breakpoints intact. One was a
+485k-token Opus compaction a minute after a cold notice recommended the cheap
+one. Claude Code still sent both markers at a line start in a plain user
+message, but sessions with hooks carry mid-conversation `system` messages (hook
+output, attachments), and one trailing the prompt was what the detector read.
+
+So the markers are matched in the last message that is not a `system` message.
+A system message is never the prompt itself: one carrying the wording does not
+count, and skipping past them does not skip the tool-result refusal.
+
+The miss was silent for the same reason the partial wordings were: a fixed
+string matched at a fixed position reads as "no compactions" when the position
+moves. Rows now carry `extra.compactMarker` whenever a wording appears anywhere
+in the last four messages, whether or not it matched, recording how far from the
+end it sat, the roles of the carrier and of the messages after it, and whether
+it began a line or shared its message with a tool result. Positions and booleans
+only, never text. A compaction the detector misses again leaves that object on
+a row with `summarising` false; the count of such rows is the check.

@@ -51,8 +51,8 @@ pub mod fidelity;
 pub mod openai_chat;
 
 pub use anthropic::{
-    AnthropicBody, AnthropicBodyMut, AnthropicShape, PLAN_SENTINEL, Release, SENTINEL, System,
-    SystemBlockDigest,
+    AnthropicBody, AnthropicBodyMut, AnthropicShape, CompactMarker, PLAN_SENTINEL, Release,
+    SENTINEL, System, SystemBlockDigest,
 };
 pub use canonical::{
     CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest,

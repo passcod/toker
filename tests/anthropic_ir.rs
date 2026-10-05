@@ -12,7 +12,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use toker::ir::{AnthropicShape, Release, Request, SENTINEL, SystemBlockDigest};
+use toker::ir::{AnthropicShape, CompactMarker, Release, Request, SENTINEL, SystemBlockDigest};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/anthropic")
@@ -80,8 +80,24 @@ fn expected_shape(
         system_messages,
         compact_generations,
         summarising,
+        compact_marker: None,
         system_ladder,
         system_tail,
+    }
+}
+
+/// A shape with the compaction-marker diagnostic set: the wording sat in
+/// the last message, a user turn with nothing after it.
+fn with_last_marker(shape: AnthropicShape, line_start: bool) -> AnthropicShape {
+    AnthropicShape {
+        compact_marker: Some(CompactMarker {
+            from_end: 0,
+            role: Some("user".to_owned()),
+            trailing: Vec::new(),
+            line_start,
+            tool_result: false,
+        }),
+        ..shape
     }
 }
 
@@ -246,19 +262,22 @@ fn performing_compaction_is_summarising_with_tools() {
     let shape = shape_of("06_compaction_performing.json");
     assert_eq!(
         shape,
-        expected_shape(
-            366,
-            Some(3),
-            1,
-            "c9f8123bd272",
-            0,
-            "e3b0c44298fc",
-            Vec::new(),
-            None,
-            None,
+        with_last_marker(
+            expected_shape(
+                366,
+                Some(3),
+                1,
+                "c9f8123bd272",
+                0,
+                "e3b0c44298fc",
+                Vec::new(),
+                None,
+                None,
+                true,
+                Vec::new(),
+                Vec::new(),
+            ),
             true,
-            Vec::new(),
-            Vec::new(),
         )
     );
     assert!(
@@ -275,19 +294,22 @@ fn routine_summariser_is_summarising_but_not_a_compaction() {
     let shape = shape_of("07_summariser_no_tools.json");
     assert_eq!(
         shape,
-        expected_shape(
-            170,
-            Some(1),
-            0,
-            "e3b0c44298fc",
-            0,
-            "e3b0c44298fc",
-            Vec::new(),
-            None,
-            None,
+        with_last_marker(
+            expected_shape(
+                170,
+                Some(1),
+                0,
+                "e3b0c44298fc",
+                0,
+                "e3b0c44298fc",
+                Vec::new(),
+                None,
+                None,
+                true,
+                Vec::new(),
+                Vec::new(),
+            ),
             true,
-            Vec::new(),
-            Vec::new(),
         )
     );
     assert!(!shape.is_compaction());
@@ -373,19 +395,22 @@ fn marker_negatives_never_fire_or_strip() {
     assert_eq!(request.anthropic().release_marker(), None);
     assert_eq!(
         request.anthropic().shape(),
-        expected_shape(
-            473,
-            Some(3),
-            0,
-            "e3b0c44298fc",
-            0,
-            "e3b0c44298fc",
-            Vec::new(),
-            None,
-            None,
+        with_last_marker(
+            expected_shape(
+                473,
+                Some(3),
+                0,
+                "e3b0c44298fc",
+                0,
+                "e3b0c44298fc",
+                Vec::new(),
+                None,
+                None,
+                false,
+                Vec::new(),
+                Vec::new(),
+            ),
             false,
-            Vec::new(),
-            Vec::new(),
         )
     );
     let mut request = request;

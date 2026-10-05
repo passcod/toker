@@ -515,7 +515,11 @@ fn measurement_row(
         status: None,
         error_type: None,
         retry_after_ms: None,
-        extra: None,
+        // Where a summarisation wording sat, when one was near the end:
+        // the evidence the detector's position rules are checked against.
+        extra: shape
+            .and_then(|s| s.compact_marker.as_ref())
+            .map(|marker| json!({ "compactMarker": marker.to_json() })),
         betas: ctx.betas.as_ref().map(|betas| betas.to_string()),
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),

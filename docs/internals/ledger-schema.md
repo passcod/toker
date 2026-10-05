@@ -64,6 +64,14 @@ regression.
 - `ping` marks a request the window pinger sent.
 - `extra.frontend` is the `/f/<frontend>` name the request came through; absent
   on unprefixed requests and on every row before prefixes existed.
+- `extra.compactMarker` says where a compaction wording sat when one appeared in
+  the last four messages, matched or not: `fromEnd`, `role`, `trailing` (the
+  roles after it), `lineStart`, `toolResult`. Absent before 2026-10-06.
+- `summarising` on toker's own rows was never set from the cutover until
+  2026-10-06 (a trailing system message hid the prompt; see
+  [compaction.md](compaction.md)), so a compaction count by that flag over that
+  range is zero, not a measurement. Count by `compact_generations` on the rows
+  after instead.
 - `cost_usd` comes with `cost_kind` (`billed`, `estimated`, `plan_equivalent`),
   and the kinds are never summed together blindly.
 - `rate_limits` is a meter snapshot in ctp's camelCase shape (`util5h`,
