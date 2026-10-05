@@ -37,3 +37,7 @@ Compaction management is also important. If cache is hot, a compaction is basica
 New models come out regularly, but harnesses don't always follow suit. Toker learns which model families you use, and transparently upgrades requests to newer versions of your models once you'vetried out the latest versions for a little while, and you can also promote a model version manually.
 
 When using opencode, a custom sidebar and footer plugin augments the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and shows the provider breakdown when using a router.
+
+## Tests
+
+Pinned output (gate notices, unit files, wizard and ping transcripts, TUI frames) is tested with [insta](https://insta.rs) snapshots. After a deliberate wording or layout change, run `cargo insta review` (or `INSTA_UPDATE=always cargo test`, then read the diff) and commit the updated `.snap` files. `CI=true cargo test` fails on any snapshot that is missing or not yet accepted.
