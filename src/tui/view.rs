@@ -2,7 +2,8 @@
 //!
 //! ratatui over crossterm, alternate screen handled by the parent module's
 //! init/restore. [`render`] is a pure function of the snapshot, the
-//! clock string, and the timezone — no I/O, no time reads — so the
+//! clock string, the timezone, and the [`Ui`] state — no I/O, no time
+//! reads, no environment — so the
 //! TestBackend tests below assert real buffer contents at several
 //! terminal sizes without ever touching a real terminal.
 //!
@@ -24,7 +25,9 @@
 //! ```
 //! (the bottom strip holds SPEND and RATE & QUOTA side by side, and the
 //! quota lines render only when the snapshot carries a quota section —
-//! absence renders nothing, never zeros).
+//! absence renders nothing, never zeros). The panels are boxed while the
+//! page has room and ruled (`SESSIONS ────`, a row cheaper each) when it
+//! does not; [`plan_layout`] says what goes in which order.
 //!
 //! Invariant 3 in rendering: every unknown renders as an explicit string —
 //! `?` for unknown models and token counts, "no billed cost data",
@@ -51,11 +54,10 @@ use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
 use crate::middleware::cold::Verdict;
 
-/// Bottom panel row height while SPEND renders beside RATE: tall
-/// enough for the total line, the never-dropped "no cost data" line,
-/// and a few breakdown lines. The quota section grows it (see
-/// [`bottom_height`]); without SPEND the strip is RATE's own height.
-const BOTTOM_HEIGHT: u16 = 9;
+/// The most lines SPEND claims in the bottom strip: the total line, the
+/// never-dropped "no cost data" line, and a few breakdown lines. The
+/// quota section can grow the strip past it (see [`bottom_height`]).
+const SPEND_LINES: u16 = 7;
 
 /// The meter bar's width (22 cells), the widest
 /// it ever renders — it shrinks as the panel narrows rather than
@@ -257,33 +259,30 @@ pub(crate) fn no_color(value: Option<std::ffi::OsString>) -> bool {
 /// stay deterministic.
 ///
 /// The panels stack in the reference dashboard's order — SESSIONS /
-/// CONTEXT /
-/// TOKENS / CACHE REBUILDS, then the bottom strip holding RATE & QUOTA,
-/// with the toker-only SPEND beside it when the window carries a cost
+/// CONTEXT / TOKENS / CACHE REBUILDS, then the bottom strip holding
+/// RATE & QUOTA, with the toker-only SPEND beside it when the window
+/// carries a cost
 /// ([`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost))
-/// — into a height budget
-/// computed from the snapshot ([`panel_areas`]): lists grow into
-/// slack, and a short terminal sheds panel rows from the top of the
-/// middle (sessions first) rather than ever letting the quota block
-/// scroll off the bottom, "the part worth watching".
+/// — into the height plan [`plan_layout`] computes from the snapshot.
 pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone, ui: &Ui) {
     let fmt = &ui.fmt;
-    let [header, sessions, context, tokens, rebuilds, bottom] = panel_areas(snap, frame.area());
+    let layout = plan_layout(snap, frame.area());
+    let chrome = layout.chrome;
 
-    render_header(frame, header, snap, clock);
-    render_sessions(frame, sessions, snap, fmt);
-    render_context(frame, context, snap, fmt);
-    render_tokens(frame, tokens, snap, fmt);
-    render_rebuilds(frame, rebuilds, snap, fmt);
+    render_header(frame, layout.header, snap, clock);
+    render_sessions(frame, layout.sessions, chrome, snap, fmt);
+    render_context(frame, layout.context, chrome, snap, fmt);
+    render_tokens(frame, layout.tokens, chrome, snap, fmt);
+    render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
     if snap.spend.carries_cost() {
         // Even halves: the meters' reset clocks need the width as much
         // as the breakdown lines do.
         let [spend, rate] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(bottom);
-        render_spend(frame, spend, snap);
-        render_rate(frame, rate, snap, tz, fmt);
+            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(layout.bottom);
+        render_spend(frame, spend, chrome, snap);
+        render_rate(frame, rate, chrome, snap, tz, fmt);
     } else {
-        render_rate(frame, bottom, snap, tz, fmt);
+        render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
     }
     if ui.legend {
         render_legend(frame);
@@ -369,120 +368,274 @@ fn render_legend(frame: &mut Frame) {
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-/// The frame's panel areas, from the snapshot's content and the frame's
-/// height: the header and the bottom strip are pinned, the four middle
-/// panels get their natural heights plus any slack (the sessions list
-/// grows into it, as the reference's two lists did), and a deficit
-/// sheds rows top-first among the middle panels — down to each panel's
-/// scaffold (borders and a title row) before the scaffolds give way,
-/// so the quota block never scrolls.
-fn panel_areas(snap: &Snapshot, frame: Rect) -> [Rect; 6] {
-    let bottom = bottom_height(snap);
-    let room = frame.height.saturating_sub(1 + bottom);
-    let [sessions, context, tokens, rebuilds] = middle_heights(snap, room);
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(sessions),
-        Constraint::Length(context),
-        Constraint::Length(tokens),
-        Constraint::Length(rebuilds),
-        Constraint::Length(bottom),
-    ])
-    .areas(frame)
+/// How the panels are framed. Boxed panels cost two rows each (the
+/// borders); a short terminal drops them for a `TITLE ───` rule that
+/// costs one, because a border is the cheapest thing on the page to
+/// lose — data goes only after every border has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chrome {
+    Boxed,
+    Ruled,
 }
 
-/// The four middle panels' heights within `room` rows. Natural heights
-/// come from the snapshot; a deficit sheds from the top (sessions
-/// first, then context, tokens, rebuilds — the middle cut keeps
-/// the tail), each panel keeping its scaffold while it can; slack goes
-/// to the sessions list. The result always sums to exactly `room`, so
-/// the layout never wraps and never leaves a gap.
-fn middle_heights(snap: &Snapshot, room: u16) -> [u16; 4] {
-    let natural = [
-        sessions_height(snap),
-        context_height(snap),
-        tokens_height(snap),
-        rebuilds_height(snap),
+impl Chrome {
+    /// The rows a panel's frame takes.
+    fn cost(self) -> u16 {
+        match self {
+            Chrome::Boxed => 2,
+            Chrome::Ruled => 1,
+        }
+    }
+}
+
+/// Draw a panel's frame — a bordered box, or the title rule — and
+/// return the area its content goes in. The ruled form insets the
+/// content by a column a side like the box does, so every width-driven
+/// choice (column shedding, bar budgets) is the same in both.
+fn panel(frame: &mut Frame, area: Rect, title: &str, chrome: Chrome) -> Rect {
+    match chrome {
+        Chrome::Boxed => {
+            let block = Block::bordered().title_top(title.to_owned());
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            inner
+        }
+        Chrome::Ruled => {
+            if area.height == 0 {
+                return area;
+            }
+            // The rule stops a cell short of the edge, so side-by-side
+            // panels' titles never run into each other's rules.
+            let rule = area.width.saturating_sub(title.width() as u16 + 2).into();
+            frame.render_widget(
+                Line::from(vec![
+                    Span::styled(title.to_owned(), Style::new().bold()),
+                    Span::raw(" "),
+                    Span::styled("─".repeat(rule), Style::new().dim()),
+                ]),
+                Rect { height: 1, ..area },
+            );
+            Rect {
+                x: area.x + 1.min(area.width),
+                y: area.y + 1,
+                width: area.width.saturating_sub(2),
+                height: area.height - 1,
+            }
+        }
+    }
+}
+
+/// Where everything goes: the panel areas and the framing they share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutPlan {
+    chrome: Chrome,
+    header: Rect,
+    sessions: Rect,
+    context: Rect,
+    tokens: Rect,
+    rebuilds: Rect,
+    bottom: Rect,
+}
+
+/// The height plan, the reference's: the fixed sections are laid out
+/// first — the header, TOKENS, CACHE REBUILDS, and the bottom strip —
+/// and the two lists share what they leave ([`share_rows`]), each
+/// floored at one row and cut with a "… N more" line. When that does
+/// not fit, the borders go ([`Chrome::Ruled`]); then TOKENS sheds rows
+/// down to its hit-rate pair, and CACHE REBUILDS down to its summary.
+/// Only a terminal too short even for that cuts whole rows from the top
+/// of the middle, never the quota block — "the part worth watching".
+///
+/// The plan is top-aligned: on a tall terminal the spare rows sit below
+/// the content rather than padding an empty SESSIONS box.
+fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
+    let sessions_head = u16::from(!snap.sessions.is_empty()); // the table's header row
+    let sessions_need = snap.sessions.len().max(1) as u16;
+    let context_need = context_rows(snap).max(1) as u16;
+    let tokens_full = tokens_lines(snap) as u16;
+    let tokens_min = tokens_min_lines(snap) as u16;
+    let rebuilds_full = rebuilds_lines(snap) as u16;
+
+    // Natural heights first, boxed then ruled; then the fixed sections
+    // shrink, TOKENS before CACHE REBUILDS (the panel to watch).
+    let mut attempts = vec![
+        (Chrome::Boxed, tokens_full, rebuilds_full),
+        (Chrome::Ruled, tokens_full, rebuilds_full),
     ];
-    // Borders plus a title row: the least a panel can be and still
-    // say what it is.
-    let scaffold = [3u16, 2, 2, 2];
-    let mut out = natural;
-    let mut over = out.iter().sum::<u16>().saturating_sub(room);
-    for (height, floor) in out.iter_mut().zip(scaffold) {
-        let cut = (*height).saturating_sub(floor).min(over);
-        *height -= cut;
+    attempts.extend(
+        (tokens_min..tokens_full)
+            .rev()
+            .map(|t| (Chrome::Ruled, t, rebuilds_full)),
+    );
+    attempts.extend(
+        (1..rebuilds_full)
+            .rev()
+            .map(|r| (Chrome::Ruled, tokens_min, r)),
+    );
+    for (chrome, tokens, rebuilds) in attempts {
+        let cost = chrome.cost();
+        let fixed = 1 + bottom_height(snap, chrome) + tokens + rebuilds + sessions_head + 4 * cost;
+        let Some(avail) = area.height.checked_sub(fixed).filter(|avail| *avail >= 2) else {
+            continue;
+        };
+        let (rows_s, rows_c) = share_rows(sessions_need, context_need, avail);
+        return stack(
+            area,
+            chrome,
+            1,
+            bottom_height(snap, chrome),
+            [
+                sessions_head + rows_s + cost,
+                rows_c + cost,
+                tokens + cost,
+                rebuilds + cost,
+            ],
+        );
+    }
+
+    // Too short for every panel's floor: the middle is cut from the
+    // top — the session rows, then whole panels down the page, the
+    // SESSIONS scaffold last (the reference's guard kept the table's
+    // title and column header with the page header) — the quota block
+    // is kept whole as long as it fits, and the header goes before it
+    // does.
+    let chrome = Chrome::Ruled;
+    let bottom = bottom_height(snap, chrome).min(area.height);
+    let header = 1.min(area.height - bottom);
+    let mut middle = [
+        sessions_head + 1 + 1,
+        1 + 1,
+        tokens_min + 1,
+        1 + 1, // the rebuild summary under its rule
+    ];
+    let room = area.height - bottom - header;
+    let mut over = middle.iter().sum::<u16>().saturating_sub(room);
+    for (panel, floor) in [(0, 1 + sessions_head), (1, 0), (2, 0), (3, 0), (0, 0)] {
+        let cut = middle[panel].saturating_sub(floor).min(over);
+        middle[panel] -= cut;
         over -= cut;
-        if over == 0 {
-            break;
-        }
     }
-    // Still short: the scaffolds give way bottom-first — the rebuild
-    // and tokens panels fold before the context list, and the sessions
-    // panel's title last, matching the guard that keeps the header
-    // plus the SESSIONS scaffold over the middle.
-    for (height, floor) in out.iter_mut().zip(scaffold).rev() {
-        let cut = (*height).min(floor).min(over);
-        *height -= cut;
-        over -= cut;
-        if over == 0 {
-            break;
-        }
+    // TOKENS never clips its hit-rate pair: a cut that would leave it
+    // part of its floor takes it whole, and the rows go to CACHE
+    // REBUILDS below it, which renders a cause row in each.
+    if (1..tokens_min + 1).contains(&middle[2]) {
+        middle[3] += std::mem::take(&mut middle[2]);
     }
-    debug_assert_eq!(over, 0, "the floors sum to more than any real room");
-    // Slack: the sessions list takes what is left, like the
-    // reference's lists sharing the page.
-    let used: u16 = out.iter().sum();
-    out[0] += room.saturating_sub(used);
-    out
+    stack(area, chrome, header, bottom, middle)
 }
 
-/// The sessions panel's natural height: borders, the table header, one
-/// row per session — or its explicit empty-state line.
-fn sessions_height(snap: &Snapshot) -> u16 {
-    2 + 1 + snap.sessions.len().max(1) as u16
-}
-
-/// The CONTEXT panel's natural height.
-fn context_height(snap: &Snapshot) -> u16 {
-    2 + context_rows(snap).max(1) as u16
-}
-
-/// The TOKENS panel's natural height: the four input buckets, output,
-/// the reasoning row when a provider reported thinking tokens (it is
-/// rendered only then), and the hit-rate lines the data supports
-/// (no hit-rate line at all when nothing was reused).
-fn tokens_height(snap: &Snapshot) -> u16 {
-    if snap.window_empty {
-        return 2 + 1;
+/// The panels stacked top-down from `area`'s top: the header at
+/// `header` rows, the four middle panels at `middle`, the bottom strip
+/// at `bottom`. Rows past the last are left blank.
+fn stack(area: Rect, chrome: Chrome, header: u16, bottom: u16, middle: [u16; 4]) -> LayoutPlan {
+    let mut y = area.y;
+    let mut take = |height: u16| {
+        let height = height.min(area.bottom().saturating_sub(y));
+        let rect = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height,
+        };
+        y += height;
+        rect
+    };
+    let header = take(header);
+    let [sessions, context, tokens, rebuilds] = middle.map(&mut take);
+    let bottom = take(bottom);
+    LayoutPlan {
+        chrome,
+        header,
+        sessions,
+        context,
+        tokens,
+        rebuilds,
+        bottom,
     }
-    let mut lines = 4 + 1; // input buckets + output
-    if snap.tokens.reasoning.value > 0
-        || (snap.tokens.reasoning.unavailable > 0
-            && snap.tokens.reasoning.unavailable < snap.tokens.requests)
-    {
-        lines += 1;
-    }
-    if !matches!(
-        snap.tokens.hit_rate(),
-        super::model::HitRate::NothingReusable
-    ) {
-        lines += 2; // hit rate + missed
-    }
-    2 + lines
 }
 
-/// The CACHE REBUILDS panel's natural height.
-fn rebuilds_height(snap: &Snapshot) -> u16 {
-    2 + rebuilds_lines(snap).max(1) as u16
+/// The reference's list sharing: each list gets what it needs when both
+/// fit; otherwise half each, and the room one does not need goes to the
+/// other. `avail` is at least two, so each list keeps a row.
+fn share_rows(need_s: u16, need_c: u16, avail: u16) -> (u16, u16) {
+    if need_s + need_c <= avail {
+        return (need_s, need_c);
+    }
+    let mut rows_s = need_s.min(avail.div_ceil(2));
+    let rows_c = need_c.min(avail - rows_s);
+    rows_s = need_s.min(avail - rows_c);
+    (rows_s, rows_c)
 }
 
-/// The middle panels' line counts (heights minus borders).
+/// A list's items cut to `room` rows: all of them when they fit; the
+/// top one alone at one row (a row is better spent on an entry than
+/// on a count of none shown); otherwise the top `room − 1` and the
+/// `more` line counting the rest.
+fn fit_list(
+    mut items: Vec<Line<'static>>,
+    room: usize,
+    more: impl Fn(usize) -> String,
+) -> Vec<Line<'static>> {
+    if items.len() <= room {
+        return items;
+    }
+    if room <= 1 {
+        items.truncate(room);
+        return items;
+    }
+    let hidden = items.len() - (room - 1);
+    items.truncate(room - 1);
+    items.push(Line::styled(more(hidden), Style::new().dim()));
+    items
+}
+
+/// The CONTEXT list's entries: sessions whose main lane has enough
+/// history for an occupancy claim (the same floor the panel applies).
 fn context_rows(snap: &Snapshot) -> usize {
+    if snap.window_empty {
+        return 0;
+    }
     snap.sessions
         .iter()
         .filter(|session| session.lane_requests >= CONTEXT_MIN_REQUESTS)
         .count()
+}
+
+/// The TOKENS panel's natural line count: the four input buckets,
+/// output, the reasoning row when a provider reported thinking tokens
+/// (it is rendered only then), and the hit-rate pair the data supports
+/// (no hit-rate line at all when nothing was reused).
+fn tokens_lines(snap: &Snapshot) -> usize {
+    if snap.window_empty {
+        return 1;
+    }
+    let mut lines = 4 + 1; // input buckets + output
+    if shows_reasoning(&snap.tokens) {
+        lines += 1;
+    }
+    if has_hit_rate(&snap.tokens) {
+        lines += 2; // hit rate + missed
+    }
+    lines
+}
+
+/// The fewest lines TOKENS sheds to: the hit-rate pair, which never
+/// clips — it is the panel's answer — or one line when there is none.
+fn tokens_min_lines(snap: &Snapshot) -> usize {
+    if !snap.window_empty && has_hit_rate(&snap.tokens) {
+        2
+    } else {
+        1
+    }
+}
+
+fn shows_reasoning(tokens: &super::model::TokensAgg) -> bool {
+    tokens.reasoning.value > 0
+        || (tokens.reasoning.unavailable > 0 && tokens.reasoning.unavailable < tokens.requests)
+}
+
+fn has_hit_rate(tokens: &super::model::TokensAgg) -> bool {
+    !matches!(tokens.hit_rate(), HitRate::NothingReusable)
 }
 
 /// The rebuild panel's content lines: the summary, the cause table (or
@@ -504,15 +657,13 @@ fn rebuilds_lines(snap: &Snapshot) -> usize {
     lines
 }
 
-/// The bottom row's height: RATE & QUOTA's own lines, floored at
-/// [`BOTTOM_HEIGHT`] while SPEND renders beside it (its breakdown has
-/// no line budget of its own) — the reference
-/// dashboard drops middle rows
-/// rather than let the quota block scroll off the bottom
-/// ("the part worth watching"); here the middle
-/// panels shed their rows first ([`middle_heights`]) and the bottom
-/// strip is pinned at whatever it needs.
-fn bottom_height(snap: &Snapshot) -> u16 {
+/// The bottom strip's height: the taller of RATE & QUOTA's lines and,
+/// while SPEND renders beside it, SPEND's — its breakdown capped at
+/// [`SPEND_LINES`], since it has no line budget of its own — plus the
+/// frame. Sized to the content rather than floored: a padded strip is
+/// rows a short terminal's lists never get. Pinned: the middle sheds
+/// before the strip does ([`plan_layout`]).
+fn bottom_height(snap: &Snapshot, chrome: Chrome) -> u16 {
     let mut lines = 1; // the requests line
     if let Some(quota) = &snap.quota {
         lines += quota.meters.len();
@@ -523,12 +674,14 @@ fn bottom_height(snap: &Snapshot) -> u16 {
             lines += 1;
         }
     }
-    let rate = (lines + 2) as u16; // + 2 border rows
-    if snap.spend.carries_cost() {
-        BOTTOM_HEIGHT.max(rate)
+    let lines = lines as u16;
+    let lines = if snap.spend.carries_cost() {
+        let spend = 2 + snap.spend.breakdown.len() + usize::from(snap.spend.other_cost_kinds > 0);
+        lines.max((spend as u16).min(SPEND_LINES))
     } else {
-        rate
-    }
+        lines
+    };
+    lines + chrome.cost()
 }
 
 /// Header line: the window summary on the left, the freshness and the
@@ -629,22 +782,21 @@ fn freshness(snap: &Snapshot) -> (String, Style) {
 /// separators or a long model id size the column rather than clip in
 /// it. The label takes what is left; when that falls under
 /// [`LABEL_SHED_W`] columns shed in [`Col::SHED`] order.
-fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
-    let block = Block::bordered().title_top("SESSIONS");
+fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
     if area.height == 0 {
         return;
     }
+    let inner = panel(frame, area, "SESSIONS", chrome);
     if snap.sessions.is_empty() {
         let message = if snap.window_empty {
             "no requests in window"
         } else {
             "no sessions in window"
         };
-        frame.render_widget(Paragraph::new(message).dim().block(block), area);
+        frame.render_widget(Paragraph::new(message).dim(), inner);
         return;
     }
 
-    let inner = block.inner(area);
     let cells: Vec<[Line<'static>; 9]> = snap
         .sessions
         .iter()
@@ -673,24 +825,51 @@ fn render_sessions(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
         let col = Col::ALL[i];
         Cell::new(Line::styled(col.header(), dim).alignment(col.alignment()))
     }));
-    let rows = snap.sessions.iter().zip(cells).map(|(session, row)| {
-        let mut out = vec![session_cell(session, label_w)];
-        let mut row = row.map(Some);
-        out.extend(kept.iter().map(|&i| {
-            let line = row[i].take().unwrap_or_default();
-            Cell::new(line.alignment(Col::ALL[i].alignment()))
-        }));
-        Row::new(out)
-    });
+    // The rows the panel has room for, under the header row; a cut list
+    // ends in a count of what it left out.
+    let room = inner.height.saturating_sub(1) as usize;
+    let total = snap.sessions.len();
+    let (shown, hidden) = if total <= room || room <= 1 {
+        (total.min(room), 0)
+    } else {
+        (room - 1, total - (room - 1))
+    };
+    let rows = snap
+        .sessions
+        .iter()
+        .zip(cells)
+        .take(shown)
+        .map(|(session, row)| {
+            let mut out = vec![session_cell(session, label_w)];
+            let mut row = row.map(Some);
+            out.extend(kept.iter().map(|&i| {
+                let line = row[i].take().unwrap_or_default();
+                Cell::new(line.alignment(Col::ALL[i].alignment()))
+            }));
+            Row::new(out)
+        });
     let constraints = std::iter::once(label_w)
         .chain(kept.iter().map(|&i| widths[i]))
         .map(Constraint::Length);
+    let table = Rect {
+        height: inner.height.min(1 + shown as u16),
+        ..inner
+    };
     frame.render_widget(
-        Table::new(rows, constraints)
-            .header(Row::new(header))
-            .block(block),
-        area,
+        Table::new(rows, constraints).header(Row::new(header)),
+        table,
     );
+    if hidden > 0 {
+        let s = if hidden == 1 { "" } else { "s" };
+        frame.render_widget(
+            Line::styled(format!("… {hidden} more session{s}"), Style::new().dim()),
+            Rect {
+                y: table.bottom(),
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 /// The columns that survive at `available` cells (indices into
@@ -908,16 +1087,16 @@ fn rel_age(delta_ms: i64) -> String {
 /// and an idle session is dimmed, because a session that is not about
 /// to do anything is not about to compact either. Past 80% a live
 /// session's bar turns red with the marker that says why.
-fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
-    let block = Block::bordered().title_top("CONTEXT");
+fn render_context(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
     if area.height == 0 {
         return;
     }
+    let inner = panel(frame, area, "CONTEXT", chrome);
     if snap.window_empty {
-        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        frame.render_widget(Paragraph::new("no data in window").dim(), inner);
         return;
     }
-    let width = block.inner(area).width as usize;
+    let width = inner.width as usize;
 
     let mut lines = Vec::new();
     let mut listed = 0;
@@ -1014,7 +1193,10 @@ fn render_context(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             Style::new().dim(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let lines = fit_list(lines, inner.height as usize, |hidden| {
+        format!("… {hidden} more")
+    });
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The CONTEXT panel's name line: the same name the sessions table
@@ -1084,19 +1266,19 @@ fn ctx_span(label: &str, ctx: ContextWindow) -> Span<'static> {
 /// plus rewrites, never all input (fresh input was never going to be a
 /// hit). Absence renders as absence throughout: `?` rates, `≥` floors,
 /// "N req unknown" counts — never confident zeros.
-fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
-    let block = Block::bordered().title_top("TOKENS");
+fn render_tokens(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
     if area.height == 0 {
         return;
     }
+    let inner = panel(frame, area, "TOKENS", chrome);
     if snap.window_empty {
-        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        frame.render_widget(Paragraph::new("no data in window").dim(), inner);
         return;
     }
-    let width = block.inner(area).width as usize;
+    let width = inner.width as usize;
     let tokens = &snap.tokens;
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<(TokensRow, Line<'static>)> = Vec::new();
     // Shares render per bucket from the KNOWN sums: a bucket with
     // unknown rows is a FLOOR (the `≥` marker) and keeps its share —
     // missing data on one row never blanks the others. The share's
@@ -1117,12 +1299,7 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             )
         )
     };
-    for (name, bucket) in [
-        ("fresh input", &tokens.fresh_input),
-        ("cache read", &tokens.cache_read),
-        ("cache write 1h", &tokens.write_1h),
-        ("cache write 5m", &tokens.write_5m),
-    ] {
+    let bucket_row = |name: &str, bucket: &super::model::BucketAgg| {
         let note = (bucket.unavailable > 0).then(|| format!("{} req unknown", bucket.unavailable));
         let mut row = vec![Span::raw(label(name)), Span::raw(amount(bucket))];
         if show_shares {
@@ -1143,7 +1320,15 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             row.push(Span::raw("  "));
             row.push(Span::styled(note, Style::new().dim()));
         }
-        lines.push(Line::from(row));
+        Line::from(row)
+    };
+    for (kind, name, bucket) in [
+        (TokensRow::Fresh, "fresh input", &tokens.fresh_input),
+        (TokensRow::Read, "cache read", &tokens.cache_read),
+        (TokensRow::Write1h, "cache write 1h", &tokens.write_1h),
+        (TokensRow::Write5m, "cache write 5m", &tokens.write_5m),
+    ] {
+        lines.push((kind, bucket_row(name, bucket)));
     }
 
     // Output: no shared denominator with the input buckets, so no bar
@@ -1160,12 +1345,15 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             }
         )
     };
-    lines.push(Line::from(vec![
-        Span::raw(label("output")),
-        Span::raw(amount(&tokens.output)),
-        Span::raw("  "),
-        Span::styled(output_note, Style::new().dim()),
-    ]));
+    lines.push((
+        TokensRow::Output,
+        Line::from(vec![
+            Span::raw(label("output")),
+            Span::raw(amount(&tokens.output)),
+            Span::raw("  "),
+            Span::styled(output_note, Style::new().dim()),
+        ]),
+    ));
 
     // Reasoning: rendered only when a provider reported thinking
     // tokens — an output-side bucket, so the note
@@ -1186,35 +1374,44 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
         } else {
             "0/req".to_owned()
         };
-        lines.push(Line::from(vec![
-            Span::raw(label("reasoning")),
-            Span::raw(amount(&tokens.reasoning)),
-            Span::raw("  "),
-            Span::styled(reasoning_note, Style::new().dim()),
-        ]));
+        lines.push((
+            TokensRow::Reasoning,
+            Line::from(vec![
+                Span::raw(label("reasoning")),
+                Span::raw(amount(&tokens.reasoning)),
+                Span::raw("  "),
+                Span::styled(reasoning_note, Style::new().dim()),
+            ]),
+        ));
     }
 
     // Hit rate over the reusable prefix, and the missed line beside it.
     match tokens.hit_rate() {
         HitRate::Unknown => {
-            lines.push(Line::from(vec![
-                Span::raw(label("hit rate")),
-                Span::raw(format!("{:>TOKENS_AMOUNT_W$}", "?")),
-                Span::raw("  "),
-                Span::styled(
-                    format!("cache metrics unavailable for {} req", tokens.cache_unknown),
-                    Style::new().dim(),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw(label("missed")),
-                Span::raw(format!(
-                    "{:>TOKENS_AMOUNT_W$}",
-                    format!("≥{}", fmt.count(tokens.written()))
-                )),
-                Span::raw("  "),
-                Span::styled("known cache writes only".to_owned(), Style::new().dim()),
-            ]));
+            lines.push((
+                TokensRow::HitRate,
+                Line::from(vec![
+                    Span::raw(label("hit rate")),
+                    Span::raw(format!("{:>TOKENS_AMOUNT_W$}", "?")),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("cache metrics unavailable for {} req", tokens.cache_unknown),
+                        Style::new().dim(),
+                    ),
+                ]),
+            ));
+            lines.push((
+                TokensRow::HitRate,
+                Line::from(vec![
+                    Span::raw(label("missed")),
+                    Span::raw(format!(
+                        "{:>TOKENS_AMOUNT_W$}",
+                        format!("≥{}", fmt.count(tokens.written()))
+                    )),
+                    Span::raw("  "),
+                    Span::styled("known cache writes only".to_owned(), Style::new().dim()),
+                ]),
+            ));
         }
         HitRate::Rate(hit) => {
             let style = if hit > 0.95 {
@@ -1256,32 +1453,92 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
                     Style::new().dim(),
                 ));
             }
-            lines.push(Line::from(row));
+            lines.push((TokensRow::HitRate, Line::from(row)));
             let per_req = if tokens.requests > 0 {
                 (tokens.written() as f64 / tokens.requests as f64).round() as i64
             } else {
                 0
             };
-            lines.push(Line::from(vec![
-                Span::raw(label("missed")),
-                Span::raw(format!("{:>TOKENS_AMOUNT_W$}", fmt.count(tokens.written()))),
-                Span::raw("  "),
-                Span::styled(
-                    format!(
-                        "rewritten · {}/req · {} of {} req reused nothing",
-                        fmt.count(per_req),
-                        tokens.cold,
-                        tokens.requests
+            lines.push((
+                TokensRow::HitRate,
+                Line::from(vec![
+                    Span::raw(label("missed")),
+                    Span::raw(format!("{:>TOKENS_AMOUNT_W$}", fmt.count(tokens.written()))),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!(
+                            "rewritten · {}/req · {} of {} req reused nothing",
+                            fmt.count(per_req),
+                            tokens.cold,
+                            tokens.requests
+                        ),
+                        Style::new().dim(),
                     ),
-                    Style::new().dim(),
-                ),
-            ]));
+                ]),
+            ));
         }
         // Nothing was read or rewritten: no rate is claimable either
         // way, and no line renders at all.
         HitRate::NothingReusable => {}
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+
+    // A short panel sheds rows, never the hit-rate pair: first the two
+    // write buckets fold into one row (their sum loses only the TTL
+    // split), then rows go in [`TokensRow::SHED`] order.
+    let room = inner.height as usize;
+    if lines.len() > room {
+        let at = lines
+            .iter()
+            .position(|(kind, _)| *kind == TokensRow::Write1h)
+            .expect("the write rows render with the buckets");
+        let writes = super::model::BucketAgg {
+            value: tokens.write_1h.value + tokens.write_5m.value,
+            // A row missing its write share is missing both TTLs, so
+            // the larger count is the requests unknown — a sum would
+            // count each of them twice.
+            unavailable: tokens.write_1h.unavailable.max(tokens.write_5m.unavailable),
+        };
+        lines.splice(
+            at..at + 2,
+            [(TokensRow::Write, bucket_row("cache write", &writes))],
+        );
+    }
+    for shed in TokensRow::SHED {
+        if lines.len() <= room {
+            break;
+        }
+        lines.retain(|(kind, _)| *kind != shed);
+    }
+    let lines: Vec<Line> = lines.into_iter().map(|(_, line)| line).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A TOKENS row's kind, for shedding on a short panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokensRow {
+    Fresh,
+    Read,
+    Write1h,
+    Write5m,
+    /// The two write buckets folded into one row.
+    Write,
+    Output,
+    Reasoning,
+    /// The hit rate and the missed line: the panel's answer, never shed.
+    HitRate,
+}
+
+impl TokensRow {
+    /// The order rows go when the panel is short: the folded writes,
+    /// then the output side, then the input buckets the hit rate is
+    /// computed from.
+    const SHED: [TokensRow; 5] = [
+        TokensRow::Write,
+        TokensRow::Reasoning,
+        TokensRow::Output,
+        TokensRow::Read,
+        TokensRow::Fresh,
+    ];
 }
 
 /// CACHE REBUILDS: the panel to watch (the reference's rebuild
@@ -1289,22 +1546,19 @@ fn render_tokens(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
 /// localised system-prompt changes. The panel never vanishes: no
 /// rebuilds is a verdict ("none — every prefix held"), not an absence
 /// of data, and unknown rewrites are counted, never guessed.
-fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
-    let block = Block::bordered().title_top("CACHE REBUILDS");
+fn render_rebuilds(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
     if area.height == 0 {
         return;
     }
+    let inner = panel(frame, area, "CACHE REBUILDS", chrome);
     let Some(rebuilds) = snap.rebuilds.as_ref() else {
         // The loop computes the section before the first draw; this is
         // the pre-refresh placeholder's shape, and it says so.
-        frame.render_widget(
-            Paragraph::new("no rebuild data yet").dim().block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new("no rebuild data yet").dim(), inner);
         return;
     };
     if snap.window_empty {
-        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
+        frame.render_widget(Paragraph::new("no data in window").dim(), inner);
         return;
     }
 
@@ -1338,7 +1592,14 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             Style::new().dim(),
         )));
     }
-    for (cause, count) in &rebuilds.causes {
+    // A short panel sheds the detail lines first, then the cause rows
+    // from the bottom; the summary is the panel's answer and stays.
+    let room = (inner.height as usize).max(1);
+    for (cause, count) in rebuilds
+        .causes
+        .iter()
+        .take(room.saturating_sub(lines.len()))
+    {
         lines.push(Line::from(vec![
             Span::raw(format!("{:<24}{:>4}  ", cause.label(), count)),
             Span::styled("▬".repeat((*count).min(30)), Style::new().dim()),
@@ -1350,7 +1611,7 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
         .events
         .iter()
         .filter(|event| event.cause == super::rebuilds::Cause::SystemPrompt)
-        .take(REBUILD_DETAIL_LINES)
+        .take(REBUILD_DETAIL_LINES.min(room.saturating_sub(lines.len())))
     {
         // The session's NAME, shared with the other panels (label or
         // id) — correlation everywhere a session is named, the same
@@ -1372,7 +1633,7 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, snap: &Snapshot, fmt: &Fmt) {
             Style::new().dim(),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Short tokens: round thousands and millions
@@ -1414,8 +1675,11 @@ fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
 /// never reported is visible, not folded into the total). Rendered only
 /// when [`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost),
 /// so never over an empty window.
-fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
-    let block = Block::bordered().title_top("SPEND");
+fn render_spend(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot) {
+    if area.height == 0 {
+        return;
+    }
+    let inner = panel(frame, area, "SPEND", chrome);
     let spend = &snap.spend;
     let mut lines = Vec::with_capacity(3 + spend.breakdown.len());
     match spend.billed_total {
@@ -1447,16 +1711,25 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             reqs(spend.other_cost_kinds)
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// RATE & QUOTA: the requests line (see [`requests_line`]) — and, when the
 /// snapshot carries a quota section, the plan's own meters with their
 /// reset clocks and forecasts, the `spent` line, and the `binding`
 /// claim (the reference's RATE & QUOTA block).
-fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone, fmt: &Fmt) {
-    let block = Block::bordered().title_top("RATE & QUOTA");
-    let inner = block.inner(area);
+fn render_rate(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    tz: &TimeZone,
+    fmt: &Fmt,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let inner = panel(frame, area, "RATE & QUOTA", chrome);
     let mut lines = vec![requests_line(snap, inner.width as usize)];
 
     // The quota lines: absent when the section is absent — an openai
@@ -1480,7 +1753,7 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone, fm
             lines.push(binding_line(binding, quota.overage_in_use));
         }
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` and
@@ -2488,23 +2761,23 @@ mod tests {
         assert!(!header.contains("peak"), "{narrow}");
         assert!(header.contains("idle"), "{narrow}");
 
-        // 20 rows tall: the height budget sheds the sessions LIST
-        // before anything else — the panel keeps its scaffold (title
-        // and header), the rows go, and nothing wraps or panics.
+        // 20 rows tall: the borders go before the list does — the
+        // sessions keep a row under a rule.
         let short = rendered(&snap, 40, 20);
-        assert!(short.contains("SESSIONS"), "the scaffold survives");
-        assert!(!short.contains("ses-abc"), "the list rows are shed");
+        assert!(short.contains("SESSIONS ─"), "{short}");
+        assert!(!short.contains('┌'), "{short}");
+        assert!(short.contains("z-ai/glm-5.3"), "a session row:\n{short}");
     }
 
     #[test]
     fn tiny_terminal_does_not_panic_and_keeps_the_session_column() {
         let snap = snapshot();
-        // Height 12 leaves the middle panels two rows between the
-        // header and the fixed bottom row; the sessions scaffold keeps
-        // them (the guard keeps its top — the SESSIONS scaffold and
-        // the quota block — over everything else). Width 16 is barely
-        // enough for the panel titles. The point: no panic, and the
-        // two panels that matter survive.
+        // Height 12 is under every panel's floor: the middle is cut
+        // from the top, the SESSIONS scaffold kept last (the guard keeps
+        // its top — the SESSIONS rule and column header — and the quota
+        // block over everything else). Width 16 is barely enough for
+        // the panel titles. The point: no panic, and the two panels
+        // that matter survive.
         let text = rendered(&snap, 16, 12);
         assert!(text.contains("SESSIONS"));
         assert!(text.contains("RATE"));
@@ -2738,7 +3011,7 @@ mod tests {
         let top = text.lines().nth(strip_top(&text)).expect("the top row");
         assert!(top.starts_with("┌RATE & QUOTA"), "{top}");
         assert!(top.ends_with('┐'), "{top}");
-        assert_eq!(text.lines().count() - strip_top(&text), 8, "{text}");
+        assert_eq!(strip_height(&text), 8, "{text}");
 
         // With no quota section either, the strip is the requests line
         // and its borders.
@@ -2760,14 +3033,27 @@ mod tests {
         assert_eq!(snap.spend.no_cost_data, 1);
         let text = rendered(&snap, 100, 30);
         assert!(!text.contains("SPEND"), "{text}");
-        assert_eq!(text.lines().count() - strip_top(&text), 3, "{text}");
+        assert_eq!(strip_height(&text), 3, "{text}");
+    }
+
+    /// The bottom strip's rows: its top border to the last bottom
+    /// border (the plan is top-aligned, so blank rows may follow).
+    fn strip_height(text: &str) -> usize {
+        let last = text
+            .lines()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|line| line.starts_with('└'))
+            .expect("the strip closes");
+        last + 1 - strip_top(text)
     }
 
     #[test]
     fn a_billed_window_splits_the_strip_evenly() {
         // The shared fixture carries one billed request: SPEND renders
-        // on the left half and RATE & QUOTA on the right, at the
-        // nine-row floor SPEND's breakdown needs.
+        // on the left half and RATE & QUOTA on the right, at SPEND's
+        // three lines (total, no cost data, one breakdown) — the strip
+        // sized to its content, not padded.
         let snap = snapshot();
         assert!(snap.spend.carries_cost());
         let text = rendered(&snap, 100, 30);
@@ -2787,7 +3073,7 @@ mod tests {
                 .starts_with("┌RATE & QUOTA"),
             "{text}"
         );
-        assert_eq!(text.lines().count() - strip_top(&text), 9, "{text}");
+        assert_eq!(strip_height(&text), 5, "{text}");
     }
 
     /// One meter line's text at `width`, from the quota fixture's
@@ -2949,8 +3235,9 @@ mod tests {
     #[test]
     fn a_tiny_terminal_renders_the_quota_lines_without_panicking() {
         let snap = quota_snapshot();
-        // The quota section grows the bottom row to ten; a 12-row
-        // terminal still renders the panel titles and clips cleanly.
+        // The quota section grows the strip to seven ruled rows; a
+        // 12-row terminal still renders the panel titles and clips
+        // cleanly.
         let text = rendered(&snap, 40, 12);
         assert!(text.contains("RATE"));
         assert!(text.contains("SESSIONS"));
@@ -3443,36 +3730,152 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_height_budget_grows_the_sessions_list_and_sheds_from_the_top() {
-        let snap = full_snapshot();
-        // Comfortable: everything at natural height and the slack goes
-        // to the sessions list (its rows render).
-        let text = rendered(&snap, 120, 44);
-        assert!(
-            text.contains("ses-hot"),
-            "sessions rows at natural height:\n{text}"
-        );
-        assert!(text.contains("CACHE REBUILDS"), "{text}");
+    /// The rendered rows, trailing blanks trimmed off each.
+    fn rows_of(text: &str) -> Vec<&str> {
+        text.lines().map(str::trim_end).collect()
+    }
 
-        // Short: the middle sheds from the top — the sessions LIST
-        // rows go first (the scaffold keeps its title), and the quota
-        // block at the bottom never scrolls off.
-        let text = rendered(&snap, 120, 24);
-        assert!(text.contains("SESSIONS"), "the sessions scaffold:\n{text}");
+    #[test]
+    fn a_tall_terminal_leaves_its_spare_rows_below_the_content() {
+        let snap = full_snapshot();
+        let text = rendered(&snap, 160, 60);
+        let rows = rows_of(&text);
+        // Boxed, every list whole, no "… more".
+        assert!(text.contains("┌SESSIONS"), "{text}");
+        assert!(!text.contains("more"), "{text}");
+        // The SESSIONS box is exactly its header and four rows: the
+        // slack is not padding in it.
+        let top = rows
+            .iter()
+            .position(|row| row.starts_with("┌SESSIONS"))
+            .expect("the box");
+        assert!(rows[top + 6].starts_with('└'), "{text}");
+        // The strip closes the content, and blank rows follow it.
+        let last = rows
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .expect("content");
+        assert!(rows[last].starts_with('└'), "{text}");
+        assert!(rows[last - 2].starts_with("┌RATE & QUOTA"), "{text}");
+        assert!(last < 40, "the spare rows sit below: {text}");
+    }
+
+    #[test]
+    fn the_lists_share_what_the_fixed_sections_leave() {
+        let snap = full_snapshot();
+        // 100×30: boxed still, but the two lists cannot both be whole.
+        // They split the room, and each cut list says what it hid.
+        let text = rendered(&snap, 100, 30);
+        assert!(text.contains("┌SESSIONS"), "{text}");
+        assert!(text.contains("… 2 more sessions"), "{text}");
+        assert!(text.contains("… 2 more"), "{text}");
+        // The fixed sections are whole.
+        for expected in ["cache write 5m", "hit rate", "missed", "· ses-hot — system"] {
+            assert!(text.contains(expected), "{expected:?} in:\n{text}");
+        }
+        assert_eq!(text.lines().count(), 30);
         assert!(
-            !text.contains("claude-opus-5"),
-            "the list rows are shed (the id also rides the rebuild detail line, the model cell does not):\n{text}"
-        );
-        assert!(
-            text.contains("RATE & QUOTA"),
-            "the quota block stays:\n{text}"
-        );
-        assert!(
-            text.contains("CACHE REBUILDS"),
-            "the panel to watch stays:\n{text}"
+            rows_of(&text)[29].starts_with('└'),
+            "fills the page: {text}"
         );
     }
+
+    #[test]
+    fn borders_go_before_data() {
+        let snap = full_snapshot();
+        // 80×24: boxed, the lists would fall under a row each; ruled,
+        // they keep rows. No border anywhere, a rule per panel.
+        let text = rendered(&snap, 80, 24);
+        assert!(!text.contains('┌'), "{text}");
+        for title in [
+            "SESSIONS ─",
+            "CONTEXT ─",
+            "TOKENS ─",
+            "CACHE REBUILDS ─",
+            "RATE & QUOTA ─",
+        ] {
+            assert!(text.contains(title), "{title:?} in:\n{text}");
+        }
+        assert!(text.contains("ses-free"), "a session row:\n{text}");
+        assert!(text.contains("… 2 more sessions"), "{text}");
+        assert!(text.contains("2,500 / 1M"), "a context row:\n{text}");
+        assert!(text.contains("… 3 more"), "{text}");
+        assert!(text.contains("hit rate"), "{text}");
+        assert!(text.contains("missed"), "{text}");
+        assert!(text.contains("requests "), "{text}");
+    }
+
+    #[test]
+    fn tokens_never_clips_its_hit_rate_pair() {
+        // Every height from roomy down to degenerate: whenever TOKENS
+        // renders more than its rule, both lines of its answer render;
+        // the write rows fold into one before anything goes.
+        let snap = full_snapshot();
+        let mut folded = false;
+        for height in 4..=44u16 {
+            let text = rendered(&snap, 100, height);
+            let rows = rows_of(&text);
+            let Some(at) = rows.iter().position(|row| row.contains("TOKENS")) else {
+                continue;
+            };
+            let body: Vec<&str> = rows[at + 1..]
+                .iter()
+                .take_while(|row| !row.contains("CACHE REBUILDS") && !row.starts_with('└'))
+                .copied()
+                .collect();
+            if body.is_empty() {
+                continue;
+            }
+            assert!(
+                body.iter().any(|row| row.contains("hit rate"))
+                    && body.iter().any(|row| row.contains("missed")),
+                "at {height}:\n{text}"
+            );
+            if body.iter().any(|row| row.contains("cache write   ")) {
+                folded = true;
+                assert!(!text.contains("cache write 1h"), "at {height}:\n{text}");
+                assert!(
+                    text.contains("97,000"),
+                    "the folded sum at {height}:\n{text}"
+                );
+            }
+        }
+        assert!(folded, "some height shows the folded write row");
+    }
+
+    #[test]
+    fn list_sharing_follows_the_reference() {
+        // Both fit: each its need.
+        assert_eq!(super::share_rows(2, 3, 10), (2, 3));
+        // Neither fits: half each, the odd row to the sessions.
+        assert_eq!(super::share_rows(10, 10, 7), (4, 3));
+        // One needs less than half: the other takes the rest.
+        assert_eq!(super::share_rows(10, 1, 7), (6, 1));
+        assert_eq!(super::share_rows(1, 10, 7), (1, 6));
+        // The floor: a row each.
+        assert_eq!(super::share_rows(5, 5, 2), (1, 1));
+
+        let items = |n: usize| -> Vec<ratatui::text::Line<'static>> {
+            (0..n)
+                .map(|i| ratatui::text::Line::raw(format!("item {i}")))
+                .collect()
+        };
+        let text = |lines: Vec<ratatui::text::Line<'static>>| -> Vec<String> {
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let more = |k: usize| format!("… {k} more");
+        assert_eq!(
+            text(super::fit_list(items(2), 3, more)),
+            ["item 0", "item 1"]
+        );
+        assert_eq!(
+            text(super::fit_list(items(5), 3, more)),
+            ["item 0", "item 1", "… 3 more"]
+        );
+        // One row: the top entry, not a count of none shown.
+        assert_eq!(text(super::fit_list(items(5), 1, more)), ["item 0"]);
+    }
+
     #[test]
     fn degenerate_terminal_sizes_render_without_panicking() {
         // The height budget's floor: a frame too short for the header
