@@ -152,6 +152,10 @@ pub(crate) enum Spent {
     /// the span reaches back further than the readings do, so the
     /// figure is a lower bound and renders `≥+N%`.
     Measured { points: f64, floor: bool },
+    /// Readings inside the span, the meter did not move, and every one
+    /// of them says overage was not in use: provably nothing spent,
+    /// which a still meter alone cannot say (it moves in 1% steps).
+    Zero,
 }
 
 /// Aggregate the quota section over the meter lookback (the display
@@ -248,10 +252,15 @@ pub(crate) fn aggregate(
     // week ago — and is the overage meter's line, rendered only where
     // that meter rendered.
     let (spent_today, spent_window) = if meters.iter().any(|m| m.key == "overage") {
-        (
-            Some(meter_used(rows, &METER_OVERAGE, today_start_ms, now_ms)),
-            Some(meter_used(rows, &METER_OVERAGE, window_since_ms, now_ms)),
-        )
+        let spent = |since_ms| {
+            settle_zero(
+                meter_used(rows, &METER_OVERAGE, since_ms, now_ms),
+                rows,
+                since_ms,
+                now_ms,
+            )
+        };
+        (Some(spent(today_start_ms)), Some(spent(window_since_ms)))
     } else {
         (None, None)
     };
@@ -392,6 +401,30 @@ fn periods(readings: &[MeterSample], spec: &MeterSpec) -> Vec<Period> {
         });
     }
     out
+}
+
+/// An overage span that measured nothing becomes [`Spent::Zero`] when
+/// every overage reading inside it explicitly says `overageInUse:
+/// false`: the overage meter only counts while overage is drawn, so
+/// those requests spent none of it. A reading without the flag (ctp's
+/// imported rows, older toker rows) proves nothing, and the span stays
+/// the `<1%` ceiling.
+fn settle_zero(spent: Spent, rows: &[MeterRow], since_ms: i64, now_ms: i64) -> Spent {
+    let Spent::Measured { points, .. } = spent else {
+        return spent;
+    };
+    if points > EPS {
+        return spent;
+    }
+    let mut in_span = rows
+        .iter()
+        .filter(|row| row.kind.is_none() && row.ts_ms >= since_ms && row.ts_ms <= now_ms)
+        .filter_map(|row| row.rate_limits.as_ref())
+        .filter(|limits| limits.get(METER_OVERAGE.util_key).is_some())
+        .peekable();
+    let untouched = in_span.peek().is_some()
+        && in_span.all(|limits| limits.get("overageInUse") == Some(&Value::Bool(false)));
+    if untouched { Spent::Zero } else { spent }
 }
 
 /// How much of `meter` was spent between `since_ms` and `now_ms`
@@ -743,6 +776,57 @@ mod tests {
     }
 
     // ── the span totals ────────────────────────────────────────────
+
+    /// A still overage meter is a measured zero only when every
+    /// reading in the span says overage was not in use; one reading in
+    /// use, or one without the flag, keeps the `<1%` ceiling.
+    #[test]
+    fn a_still_meter_with_overage_unused_is_zero() {
+        let reading = |util: f64, in_use: Option<bool>| {
+            let mut limits = overage(util, NOW);
+            if let Some(in_use) = in_use {
+                limits["overageInUse"] = json!(in_use);
+            }
+            limits
+        };
+        let span = |rows: &[MeterRow]| {
+            super::settle_zero(
+                meter_used(rows, &METER_OVERAGE, NOW - HOUR, NOW),
+                rows,
+                NOW - HOUR,
+                NOW,
+            )
+        };
+
+        let unused = vec![
+            metered(NOW - 2 * HOUR, reading(0.0, Some(false))),
+            metered(NOW - 30 * MIN, reading(0.0, Some(false))),
+            metered(NOW - MIN, reading(0.0, Some(false))),
+        ];
+        assert_eq!(span(&unused), Spent::Zero);
+
+        let mut drawn = unused.clone();
+        drawn[1] = metered(NOW - 30 * MIN, reading(0.0, Some(true)));
+        assert_spent(span(&drawn), 0.0, false);
+
+        let mut unflagged = unused.clone();
+        unflagged[2] = metered(NOW - MIN, reading(0.0, None));
+        assert_spent(span(&unflagged), 0.0, false);
+
+        // A reading before the span does not count either way, and a
+        // meter that moved is a measurement whatever the flag says.
+        let mut before = unused.clone();
+        before[0] = metered(NOW - 2 * HOUR, reading(0.0, Some(true)));
+        assert_eq!(span(&before), Spent::Zero);
+        let moved = vec![
+            metered(NOW - 2 * HOUR, reading(0.10, Some(false))),
+            metered(NOW - MIN, reading(0.12, Some(false))),
+        ];
+        assert_spent(span(&moved), 0.02, false);
+
+        // No reading in the span stays idle.
+        assert_eq!(span(&unused[..1]), Spent::Idle);
+    }
 
     #[test]
     fn spent_no_data_idle_and_the_quantised_floor() {

@@ -14,7 +14,7 @@ last 30m · 4 sessions · 1 idle · 12 requests                             last
 │ses-hot  │ -           not reported, which is not zero                                 │          │
 │… 2 more │ ?           unknown: model, context ceiling, or token count                 │          │
 └─────────│ ≥           a floor: some rows unknown, or the span predates the data       │──────────┘
-┌TOKENS───│ <1%         spent less than the meter's 1% step shows                       │──────────┐
+┌TOKENS───│ <1%         spent less than the meter's 1% step shows; 0% is none at all    │──────────┐
 │fresh inp│ ·           no requests in that slice of the window; red holds an error     │          │
 │cache rea│ on track    the meter resets before it runs out                             │          │
 │cache wri│ estimating  too little data to separate burn from noise                     │          │

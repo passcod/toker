@@ -370,7 +370,10 @@ const LEGEND: [(&str, &str); 17] = [
         "≥",
         "a floor: some rows unknown, or the span predates the data",
     ),
-    ("<1%", "spent less than the meter's 1% step shows"),
+    (
+        "<1%",
+        "spent less than the meter's 1% step shows; 0% is none at all",
+    ),
     (
         "·",
         "no requests in that slice of the window; red holds an error",
@@ -2141,14 +2144,16 @@ fn meter_line(
 /// say, because a meter sitting at 64% got there at some point in the
 /// past, not necessarily this span. "Today" is the user's local day.
 fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
-    // The five display states (the `spent` display table): a total,
-    // a quantisation ceiling, a floor, idle, and no data — a busy span
-    // that did not move the 1%-quantised figure must not print as a
-    // measured "+0%".
+    // The six display states (the `spent` display table): a total,
+    // a quantisation ceiling, a floor, a proven zero, idle, and no
+    // data. A busy span that did not move the 1%-quantised figure must
+    // not print as a measured "+0%": it is `<1%`, unless every reading
+    // says overage was not in use, which makes it a real `0%`.
     let show = |spent: Spent| -> (String, bool) {
         match spent {
             Spent::NoData => ("no data".to_owned(), true),
             Spent::Idle => ("idle".to_owned(), true),
+            Spent::Zero => ("0%".to_owned(), true),
             Spent::Measured { points, floor } => {
                 let pct = (points * 100.0).round();
                 if pct < 1.0 {
@@ -3398,6 +3403,16 @@ mod tests {
         insta::assert_snapshot!(
             line(Spent::NoData, Spent::NoData),
             @"  spent    today no data  ·  30m no data"
+        );
+        insta::assert_snapshot!(
+            line(
+                Spent::Zero,
+                Spent::Measured {
+                    points: 0.0,
+                    floor: false
+                }
+            ),
+            @"  spent    today 0%  ·  30m <1%"
         );
     }
 
