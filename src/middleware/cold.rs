@@ -1038,10 +1038,10 @@ pub struct QuotaFit {
 impl QuotaFit {
     /// What `fresh` prompt tokens on `model` would cost a window, with the
     /// provenance of the figure:
-    /// `(fresh / 1e6) × weight.fresh`, and `bound` true where the group
+    /// `(fresh / 1e6) × weight`, and `bound` true where the group
     /// borrowed its weight from the host it was folded into — an upper
     /// bound rather than a measurement, which a caller that prints it must
-    /// say ("at most"). A group with no weight (unattributed, or a model
+    /// say ("up to"). A group with no weight (unattributed, or a model
     /// the fit never saw) answers `None`, never zero.
     ///
     /// A fresh weight the data cannot separate from zero (its spread
@@ -1051,13 +1051,20 @@ impl QuotaFit {
     /// while live re-reads of 260k and 434k cache-written tokens each moved
     /// the 5-hour meter about two points — five to eight times the point
     /// figure, which priced each as a fraction of a point.
+    ///
+    /// A separated weight is priced at the TOP of its spread, not the
+    /// point fit: over the 7-day window opus-5-5 fitted 0.029 (0.014-0.055)
+    /// and still priced those re-reads at a third of what the meter moved.
+    /// The outlook decides whether to stay quiet, so an underestimate costs
+    /// a missed warning and an overestimate costs one extra notice; the
+    /// cautious end is the right one to be wrong at.
     pub fn quota_for(&self, model: &str, fresh: u64) -> Option<(f64, bool)> {
         let weight = self.weights.get(&price_key(model))?;
         if !weight.fresh_spread.separated() {
             return None;
         }
         Some((
-            fresh as f64 / 1e6 * weight.fresh,
+            fresh as f64 / 1e6 * weight.fresh_spread.max.max(weight.fresh),
             self.folded.contains(&price_key(model)),
         ))
     }
@@ -1865,12 +1872,10 @@ fn outlook_line(outlook: Option<&Outlook>, now_ms: i64, tz: &TimeZone) -> Option
     // percentage as a share of the week.
     let share = o.extra.filter(|extra| extra.is_finite()).map(|extra| {
         format!(
-            "this re-read is {}about {:.1}% of a {}window",
-            if o.bound == Some(true) {
-                "at most "
-            } else {
-                ""
-            },
+            // "up to": the weight is the top of its spread (see
+            // `QuotaFit::quota_for`), and a borrowed one is an upper bound
+            // besides.
+            "this re-read is up to about {:.1}% of a {}window",
             extra * 100.0,
             if o.meter == Some(Meter::SevenDay) {
                 "5-hour "
@@ -1989,6 +1994,7 @@ impl ColdBlocking {
             },
         )];
         if let Some(quota) = quota {
+            lines.push(String::new());
             lines.push(quota);
         }
         lines.extend([
@@ -3404,6 +3410,33 @@ mod tests {
     }
 
     #[test]
+    fn a_separated_weight_prices_at_the_top_of_its_spread() {
+        // The cautious end: the live 7-day opus-5-5 fit (0.029, spread
+        // 0.014-0.055) priced re-reads at a third of what the meter moved.
+        let key = super::price_key("claude-opus-5");
+        let fit = super::QuotaFit {
+            ok: true,
+            reason: None,
+            weights: std::collections::BTreeMap::from([(
+                key.clone(),
+                super::GroupWeight {
+                    fresh: 0.029,
+                    output: 0.6,
+                    fresh_spread: super::Spread {
+                        min: 0.014,
+                        max: 0.055,
+                    },
+                    output_spread: super::Spread { min: 0.5, max: 0.7 },
+                },
+            )]),
+            folded: std::collections::BTreeSet::new(),
+        };
+        let (extra, bound) = fit.quota_for("claude-opus-5", 1_000_000).expect("weighted");
+        assert!((extra - 0.055).abs() < 1e-12, "{extra}");
+        assert!(!bound);
+    }
+
+    #[test]
     fn lockstep_groups_fold_and_borrow_the_host_weight() {
         // Two model groups whose volumes move in exact proportion: their
         // weights cannot be separated, exactly one survives the fit, and
@@ -3744,14 +3777,14 @@ mod tests {
         assert!(
             notice.contains(
                 "The 5-hour window was already heading for its wall at 08:45, \
-                 1h 15m before it resets at 10:00; this re-read is about 6.2% \
+                 1h 15m before it resets at 10:00; this re-read is up to about 6.2% \
                  of a window and brings that forward by 15m."
             ),
             "{notice}"
         );
 
         // An already-spent weekly meter, with a borrowed (bound) share:
-        // "at most", and the share stays of a 5-HOUR window even though the
+        // "up to" like any share, and the share stays of a 5-HOUR window even though the
         // sentence is about the week.
         let spent_week = Outlook {
             known: true,
@@ -3775,8 +3808,8 @@ mod tests {
         );
         assert!(
             notice.contains(
-                "The 7-day window was already spent, and this re-read is at \
-                 most about 6.2% of a 5-hour window."
+                "The 7-day window was already spent, and this re-read is up \
+                 to about 6.2% of a 5-hour window."
             ),
             "{notice}"
         );
