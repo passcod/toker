@@ -27,7 +27,9 @@
 //!   (`Name: 1`). The request is on-ledger like any other: the row
 //!   carries `ping: true`, the lane is tagged, and ping lanes never
 //!   hold the sleep lock ([`crate::middleware::lanes`]). Buys phase,
-//!   not capacity.
+//!   not capacity. A window already open (any sub measurement reporting
+//!   a 5-hour reset ahead of now) is a skip, as in the predecessor's
+//!   `decidePing`.
 //!
 //! The 11-minute delay (not at the slot): the machine needs a moment
 //! after waking for the network to settle, and the hold (15 m) covers
@@ -354,7 +356,8 @@ impl CommandRunner for ProcessCommandRunner {
 
 /// `toker ping-window --slot=hh:mm`: resolve the slot, refuse if more
 /// than [`LATENESS_LIMIT_MINUTES`] past its fire time (non-zero exit,
-/// the reason said), then send one tiny request as a client — `claude
+/// the reason said), skip if the ledger shows a window already open
+/// (recorded, clean exit), then send one tiny request as a client — `claude
 /// -p` with `ANTHROPIC_BASE_URL` at toker's port and
 /// `ANTHROPIC_CUSTOM_HEADERS` carrying `ping_header: 1` — and read the
 /// ledger back: did a `ping: true` row land on the anthropic sub, and
@@ -394,6 +397,85 @@ pub fn ping_window(
         say(out, &reason)?;
         bail!("{reason}");
     }
+
+    // A ping into a window that is already running is a no-op costing
+    // a few tokens, but it is not nothing, and it is recorded as if it
+    // had opened one. So skip while any measurement says a window runs
+    // past now. The decision is lopsided the other way, though: a skip
+    // that was wrong forfeits the boundary, so anything the ledger
+    // cannot answer resolves to "ping" and records itself as assumed.
+    let store = Store::open(config.db_path);
+    // A reading logged more than one window ago cannot name a reset
+    // still ahead (a window ends at most 5 h after any request in it);
+    // the extra step is slack for the two clocks disagreeing.
+    let lookback = now_ms - WINDOW_MS - ANCHOR_STEP_MS;
+    let open_until = match &store {
+        Ok(store) => store
+            .furthest_reset5h(SUB_PROVIDER, lookback, false)
+            .map_err(anyhow::Error::from),
+        Err(error) => Err(anyhow::anyhow!("opening it: {error}")),
+    };
+    let assumed = match open_until {
+        Ok(Some(reset_s)) if reset_s.saturating_mul(1000) > now_ms => {
+            let reset_ms = reset_s.saturating_mul(1000);
+            say(
+                out,
+                &format!(
+                    "slot {slot_hhmm}: no ping — a window is already open until {}",
+                    hhmm_of(reset_ms, tz)
+                ),
+            )?;
+            if let Ok(store) = &store
+                && let Err(error) = store.record_ping(&PingRecord {
+                    id: None,
+                    ts_ms: now_ms,
+                    exit_code: None,
+                    duration_ms: None,
+                    boundary_ms: None,
+                    slot: Some(slot_hhmm.clone()),
+                    action: Some(PingAction::Skip),
+                    observed_ms: Some(reset_ms),
+                    verified: None,
+                    assumed: None,
+                })
+            {
+                say(
+                    out,
+                    &format!("slot {slot_hhmm}: recording the skip failed: {error}"),
+                )?;
+            }
+            return Ok(());
+        }
+        Ok(Some(reset_s)) => {
+            say(
+                out,
+                &format!(
+                    "slot {slot_hhmm}: the last window ended at {}",
+                    hhmm_of(reset_s.saturating_mul(1000), tz)
+                ),
+            )?;
+            false
+        }
+        Ok(None) => {
+            say(
+                out,
+                &format!(
+                    "slot {slot_hhmm}: no window reading in the ledger, assuming none is open"
+                ),
+            )?;
+            true
+        }
+        Err(error) => {
+            say(
+                out,
+                &format!(
+                    "slot {slot_hhmm}: the ledger could not be read ({error:#}), \
+                     assuming no window is open"
+                ),
+            )?;
+            true
+        }
+    };
 
     // Predicted from when the ping fires, which is when the request
     // that anchors the window goes out — not from the slot.
@@ -452,8 +534,8 @@ pub fn ping_window(
     // briefly rather than declare failure on a race. A store that
     // cannot be read at all is a real error. Only the sub's rows count:
     // a ping the router sent anywhere else opened no window.
-    let store = Store::open(config.db_path)
-        .with_context(|| format!("opening the ledger at {}", config.db_path.display()))?;
+    let store =
+        store.with_context(|| format!("opening the ledger at {}", config.db_path.display()))?;
     let mut landed = false;
     for attempt in 0..READBACK_ATTEMPTS {
         if attempt > 0 {
@@ -494,7 +576,7 @@ pub fn ping_window(
         }),
         observed_ms: observed,
         verified,
-        assumed: None,
+        assumed: Some(assumed),
     }) {
         say(
             out,
@@ -918,11 +1000,14 @@ mod tests {
     type ClientCall = (String, Vec<String>, Vec<(String, String)>);
 
     /// The scripted client: records every invocation's shape, answers
-    /// with a fixed exit code. No claude is ever run.
+    /// with a fixed exit code, and lands the rows its request would have
+    /// produced — while it runs, as the daemon would, so the pre-ping
+    /// skip decision never sees them. No claude is ever run.
     struct ScriptedClient {
         calls: Mutex<Vec<ClientCall>>,
         exit_code: i32,
         fail: bool,
+        lands: Option<(std::path::PathBuf, Vec<RequestRow>)>,
     }
 
     impl ScriptedClient {
@@ -931,7 +1016,22 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 exit_code,
                 fail: false,
+                lands: None,
             }
+        }
+
+        /// A client whose request lands `rows` on the ledger at `db`.
+        fn landing(exit_code: i32, db: &std::path::Path, rows: Vec<RequestRow>) -> ScriptedClient {
+            ScriptedClient {
+                lands: Some((db.to_owned(), rows)),
+                ..ScriptedClient::new(exit_code)
+            }
+        }
+
+        /// A client whose request lands one sub ping row at `ts_ms`
+        /// reporting `reset_ms`.
+        fn landing_ping(db: &std::path::Path, ts_ms: i64, reset_ms: i64) -> ScriptedClient {
+            ScriptedClient::landing(0, db, vec![ping_row(ts_ms, reset_ms)])
         }
 
         fn calls(&self) -> Vec<ClientCall> {
@@ -955,6 +1055,11 @@ mod tests {
             ));
             if self.fail {
                 anyhow::bail!("claude: command not found");
+            }
+            if let Some((db, rows)) = &self.lands {
+                for row in rows {
+                    seed(db, row);
+                }
             }
             use std::os::unix::process::ExitStatusExt;
             // A wait status, not a code: the code rides the high byte.
@@ -1032,15 +1137,27 @@ mod tests {
         }
     }
 
-    /// A scratch ledger with one `ping: true` row at `ts_ms`, served by
-    /// the anthropic sub and reporting a 5-hour reset at `reset_ms`.
-    fn seeded_ping_row(db: &std::path::Path, ts_ms: i64, reset_ms: i64) {
+    /// A `ping: true` row at `ts_ms`, served by the anthropic sub and
+    /// reporting a 5-hour reset at `reset_ms`.
+    fn ping_row(ts_ms: i64, reset_ms: i64) -> RequestRow {
+        let mut row = sub_row(ts_ms, reset_ms);
+        row.ping = Some(true);
+        row
+    }
+
+    /// An ordinary session's sub row at `ts_ms` reporting a 5-hour reset
+    /// at `reset_ms`.
+    fn sub_row(ts_ms: i64, reset_ms: i64) -> RequestRow {
         let mut row = bare_row();
         row.ts_ms = ts_ms;
-        row.ping = Some(true);
         row.provider = Some("anthropic_sub".to_owned());
         row.rate_limits = Some(serde_json::json!({"util5h": 0.0, "reset5h": reset_ms / 1000}));
-        seed(db, &row);
+        row
+    }
+
+    /// A scratch ledger with one sub ping row (see [`ping_row`]).
+    fn seeded_ping_row(db: &std::path::Path, ts_ms: i64, reset_ms: i64) {
+        seed(db, &ping_row(ts_ms, reset_ms));
     }
 
     fn seed(db: &std::path::Path, row: &RequestRow) {
@@ -1075,9 +1192,7 @@ mod tests {
         let now = utc_ms(9, 12); // One minute past the 09:11 fire time.
         // The row lands a moment after the run starts, reporting the
         // reset the rule predicts from 09:12: floor to 09:10, plus 5 h.
-        seeded_ping_row(&db, now + 1_000, utc_ms(14, 10));
-
-        let client = ScriptedClient::new(0);
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 10));
         let mut out = Vec::new();
         let mut sleep = no_sleep();
         super::ping_window(
@@ -1155,7 +1270,7 @@ mod tests {
         let db = dir.join("toker.db");
         let now = utc_ms(9, 12);
         // The API anchored somewhere else: the rule has moved.
-        seeded_ping_row(&db, now + 1_000, utc_ms(14, 0));
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 0));
 
         let mut out = Vec::new();
         let mut sleep = no_sleep();
@@ -1165,7 +1280,7 @@ mod tests {
             "09:00",
             now,
             &utc(),
-            &ScriptedClient::new(0),
+            &client,
             &mut sleep,
         )
         .expect("the window did open, just not where predicted");
@@ -1189,25 +1304,16 @@ mod tests {
         let dir = test_dir("ping-readback-scope");
         let db = dir.join("toker.db");
         let now = utc_ms(9, 12);
-        // The previous window's reading, logged before this run: it must
-        // not pass for the ping's own boundary.
-        seeded_ping_row(&db, now - 60_000, utc_ms(14, 10));
-        // A ping row routed to the plain API: it opened no window.
-        let mut api = bare_row();
-        api.ts_ms = now + 1_000;
-        api.ping = Some(true);
+        // What the request produced, none of which is the sub opening
+        // the window for this ping: a ping row routed to the plain API
+        // (it opened no window), a sub row that is not a measurement (a
+        // gate's copy of the meters), and an untagged session's row.
+        let mut api = ping_row(now + 1_000, utc_ms(14, 10));
         api.provider = Some("anthropic_api".to_owned());
-        api.rate_limits = Some(serde_json::json!({"reset5h": utc_ms(14, 10) / 1000}));
-        seed(&db, &api);
-        // A sub row that is not a measurement (a gate's copy of the
-        // meters) and an untagged session's row.
-        let mut blocked = bare_row();
-        blocked.ts_ms = now + 1_000;
-        blocked.ping = Some(true);
-        blocked.provider = Some("anthropic_sub".to_owned());
+        let mut blocked = ping_row(now + 1_000, utc_ms(14, 10));
         blocked.kind = Some(crate::store::RowKind::Blocked);
-        blocked.rate_limits = Some(serde_json::json!({"reset5h": utc_ms(14, 10) / 1000}));
-        seed(&db, &blocked);
+        let session = sub_row(now + 1_000, utc_ms(14, 10));
+        let client = ScriptedClient::landing(0, &db, vec![api, blocked, session]);
 
         let mut out = Vec::new();
         let mut sleep = no_sleep();
@@ -1217,7 +1323,7 @@ mod tests {
             "09:00",
             now,
             &utc(),
-            &ScriptedClient::new(0),
+            &client,
             &mut sleep,
         )
         .expect_err("nothing the ping produced on the sub landed");
@@ -1235,11 +1341,12 @@ mod tests {
         let dir = test_dir("ping-no-reset");
         let db = dir.join("toker.db");
         let now = utc_ms(9, 12);
-        let mut row = bare_row();
-        row.ts_ms = now + 1_000;
-        row.ping = Some(true);
-        row.provider = Some("anthropic_sub".to_owned());
-        seed(&db, &row);
+        // The morning's ping, whose window has ended: its reading is
+        // already in the ledger, and must not pass for this ping's.
+        seeded_ping_row(&db, utc_ms(4, 22), utc_ms(9, 10));
+        let mut row = ping_row(now + 1_000, 0);
+        row.rate_limits = None;
+        let client = ScriptedClient::landing(0, &db, vec![row]);
 
         let mut out = Vec::new();
         let mut sleep = no_sleep();
@@ -1249,11 +1356,15 @@ mod tests {
             "09:00",
             now,
             &utc(),
-            &ScriptedClient::new(0),
+            &client,
             &mut sleep,
         )
         .expect("the row landed");
         let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("slot 09:00: the last window ended at 09:10"),
+            "{out}"
+        );
         assert!(out.contains("boundary unverified, expected 14:10"), "{out}");
         let pings = Store::open(&db)
             .expect("open")
@@ -1308,7 +1419,10 @@ mod tests {
         // Exactly at the fire time, and exactly at the 10-minute guard:
         // admitted (the guard is strictly MORE than).
         for now in [slot_fire, slot_fire + LATENESS_LIMIT_MINUTES * 60_000] {
-            seeded_ping_row(&db, now + 1_000, window_boundary_ms(now));
+            // A fresh ledger each time, or the first run's window would
+            // make the second a skip.
+            let db = dir.join(format!("toker-{now}.db"));
+            let client = ScriptedClient::landing_ping(&db, now + 1_000, window_boundary_ms(now));
             let mut out = Vec::new();
             let mut sleep = no_sleep();
             super::ping_window(
@@ -1317,10 +1431,11 @@ mod tests {
                 "09:00",
                 now,
                 &utc(),
-                &ScriptedClient::new(0),
+                &client,
                 &mut sleep,
             )
             .expect("within the guard runs");
+            assert_eq!(client.calls().len(), 1, "the client ran");
         }
         // One tick past: refused.
         let mut out = Vec::new();
@@ -1466,6 +1581,132 @@ mod tests {
             out.contains("the ledger confirms the window is open until 14:10"),
             "{out}"
         );
+    }
+
+    // ── the skip ───────────────────────────────────────────────────
+
+    #[test]
+    fn an_open_window_skips_the_ping_and_records_the_skip() {
+        let dir = test_dir("ping-skip");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        // A session opened a window at 08:03, ending 13:00 — and a
+        // later row from the same window reports it too, out of order
+        // with an earlier, nearer reading. The furthest counts.
+        seed(&db, &sub_row(utc_ms(8, 3), utc_ms(13, 0)));
+        seed(&db, &sub_row(utc_ms(8, 50), utc_ms(12, 0)));
+
+        let client = ScriptedClient::new(0);
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &client,
+            &mut sleep,
+        )
+        .expect("a skip is a clean exit");
+
+        assert!(client.calls().is_empty(), "nothing was sent");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("slot 09:00: no ping — a window is already open until 13:00"),
+            "{out}"
+        );
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings.len(), 1);
+        assert_eq!(pings[0].action, Some(PingAction::Skip));
+        assert_eq!(pings[0].observed_ms, Some(utc_ms(13, 0)));
+        assert_eq!(pings[0].slot.as_deref(), Some("09:00"));
+        assert_eq!(pings[0].exit_code, None);
+        assert_eq!(pings[0].boundary_ms, None, "nothing was predicted");
+    }
+
+    #[test]
+    fn readings_that_are_not_the_subs_measurements_never_cause_a_skip() {
+        let dir = test_dir("ping-skip-scope");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        // Every one of these names a reset ahead of now, and none of
+        // them is the sub's API telling us a window is open: another
+        // backend's row, the gate's stale copy, and a non-numeric
+        // reset. The stay-quiet half of the decision.
+        let mut api = sub_row(utc_ms(8, 3), utc_ms(13, 0));
+        api.provider = Some("anthropic_api".to_owned());
+        seed(&db, &api);
+        let mut blocked = sub_row(utc_ms(8, 3), utc_ms(13, 0));
+        blocked.kind = Some(crate::store::RowKind::Blocked);
+        seed(&db, &blocked);
+        let mut garbled = sub_row(utc_ms(8, 3), 0);
+        garbled.rate_limits = Some(serde_json::json!({"reset5h": "1790000000"}));
+        seed(&db, &garbled);
+
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 10));
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &client,
+            &mut sleep,
+        )
+        .expect("the ping goes out");
+        assert_eq!(client.calls().len(), 1, "the ping was sent");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("no window reading in the ledger, assuming none is open"),
+            "{out}"
+        );
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings[0].action, Some(PingAction::Ping));
+        assert_eq!(
+            pings[0].assumed,
+            Some(true),
+            "the decision says it was assumed"
+        );
+    }
+
+    #[test]
+    fn an_ended_window_pings_and_is_not_assumed() {
+        let dir = test_dir("ping-ended");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        seed(&db, &sub_row(utc_ms(4, 5), utc_ms(9, 0)));
+
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 10));
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &client,
+            &mut sleep,
+        )
+        .expect("the ping goes out");
+        assert_eq!(client.calls().len(), 1);
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.contains("the last window ended at 09:00"), "{out}");
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings[0].assumed, Some(false));
+        assert_eq!(pings[0].verified, Some(true));
     }
 
     #[test]
