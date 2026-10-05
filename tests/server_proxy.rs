@@ -1307,10 +1307,13 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
         "{text}"
     );
     assert!(
-        text.contains("re-reads 500,000 tokens as fresh input"),
+        text.contains("re-reads 500,000 tokens into the prompt cache"),
         "{text}"
     );
-    assert!(text.contains("Shown once per idle spell."), "{text}");
+    assert!(
+        text.contains("- Reply: carry on and pay the re-read."),
+        "{text}"
+    );
     // The GFM alert is the unprefixed default, at the cold notice's
     // warning level.
     assert!(text.contains("> [!WARNING]"), "{text}");

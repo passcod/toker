@@ -24,6 +24,11 @@
 
 use serde::Deserializer;
 
+/// toker's name as it first appears in a notice: a link to the project,
+/// so a reader who has never heard of the proxy can find out what stopped
+/// them.
+pub const TOKER_LINK: &str = "[toker](https://github.com/passcod/toker)";
+
 /// The block style's header: `★ Toker ` then dashes to 50 columns (42 of
 /// them), wrapped in backticks. Claude Code renders its own explanatory
 /// insight lines as inline code — the backticks are what make this one

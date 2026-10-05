@@ -61,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use super::notice::{NoticeLevel, NoticeStyle, render};
+use super::notice::{NoticeLevel, NoticeStyle, TOKER_LINK, render};
 use super::quota::{Meter, THRESHOLD, group};
 use crate::catalog::pricing::{normalise_model_id, price};
 use crate::catalog::windows::model_identity;
@@ -1775,6 +1775,12 @@ pub fn outlook_over(
 
 // ── the notice ──────────────────────────────────────────────────────
 
+/// `2` for 2.0, `1.25` for 1.25: a multiplier as a person writes it.
+fn trim_float(value: f64) -> String {
+    let text = format!("{value:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// "47m", "2h 6m", "3h" — the shape a human uses for "how long was I away".
 pub fn human_idle(ms: i64) -> String {
     let minutes = ((ms as f64) / 60_000.0).round() as i64;
@@ -1958,17 +1964,17 @@ impl ColdBlocking {
         tz: &TimeZone,
         style: NoticeStyle,
     ) -> String {
-        Self::notice_for(true, idle_ms, prompt, target, outlook, at_ms, tz, style)
+        Self::notice_for(None, idle_ms, prompt, target, outlook, at_ms, tz, style)
     }
 
-    /// [`ColdBlocking::notice`], saying what the re-read is metered by
-    /// only where that is true: `metered` is whether the backend's quota
-    /// is a rate-limit window. Elsewhere (openrouter, the plain API) the
-    /// re-read is billed, not metered, and the notice says only what it
-    /// re-reads.
+    /// [`ColdBlocking::notice`], with the cost of the re-read stated where
+    /// it is known: `write_multiplier` is what a cache write costs against
+    /// plain input on this lane's tier (2 for the 1-hour tier, 1.25 for
+    /// the 5-minute one), and an unknown one is left out rather than
+    /// guessed.
     #[allow(clippy::too_many_arguments)]
     pub fn notice_for(
-        metered: bool,
+        write_multiplier: Option<f64>,
         idle_ms: i64,
         prompt: u64,
         target: Option<&str>,
@@ -1982,34 +1988,30 @@ impl ColdBlocking {
         let cheap = target
             .map(|target| format!(" The proxy would run it on {target}."))
             .unwrap_or_default();
-        let mut lines: Vec<String> = vec![format!(
-            "Paused by toker at {stamp}: the prompt cache expired after {} idle, \
-             so the next request re-reads {} tokens as fresh input{}.",
-            human_idle(idle_ms),
-            group(prompt),
-            if metered {
-                ", which the rate-limit window meters"
-            } else {
-                ""
-            },
-        )];
+        let cost = write_multiplier
+            .filter(|multiplier| multiplier.is_finite() && *multiplier > 0.0)
+            .map(|multiplier| format!(" (\u{d7}{} usage)", trim_float(multiplier)))
+            .unwrap_or_default();
+        // What the reader can learn by doing (that the message is still
+        // there, that this shows once per idle spell) is left out: said
+        // here it only made the notice harder to parse.
+        let mut lines: Vec<String> = vec![
+            format!(
+                "Paused by {TOKER_LINK} at {stamp}: the prompt cache expired after {} \
+                 idle, so the next message re-reads {} tokens into the prompt \
+                 cache{cost}. You can:",
+                human_idle(idle_ms),
+                group(prompt),
+            ),
+            format!("- `/compact`: pay the re-read once for a small prefix.{cheap}"),
+            "- Start a new session: pay nothing, keep none of this context.".to_owned(),
+            "- Reply: carry on and pay the re-read.".to_owned(),
+        ];
         if let Some(quota) = quota {
+            // Markdown would fold an unseparated line into the last item.
             lines.push(String::new());
             lines.push(quota);
         }
-        lines.extend([
-            // The client writes the message to its transcript before the
-            // request leaves, and this notice is appended after it as an
-            // ordinary assistant turn, so both are still there.
-            String::new(),
-            "Your message is still above. Options:".to_owned(),
-            format!("- `/compact`: pay the re-read once for a small prefix.{cheap}"),
-            "- A new session: pay nothing, keep none of this context.".to_owned(),
-            "- Reply: carry on and pay the re-read.".to_owned(),
-            // Markdown would fold an unseparated line into the last item.
-            String::new(),
-            "Shown once per idle spell.".to_owned(),
-        ]);
         // A Warning: advice the operator may act on or ignore.
         render(style, NoticeLevel::Warning, &lines.join("\n"))
     }
@@ -3577,18 +3579,40 @@ mod tests {
         );
         assert_eq!(
             content,
-            "[Paused by toker at 08:00: the prompt cache expired after 2h 6m idle, so the \
-             next request re-reads 200,621 tokens as fresh input, which the rate-limit \
-             window meters.\n\
-             \n\
-             Your message is still above. Options:\n\
+            "[Paused by [toker](https://github.com/passcod/toker) at 08:00: the prompt \
+             cache expired after 2h 6m idle, so the next message re-reads 200,621 tokens \
+             into the prompt cache. You can:\n\
              - `/compact`: pay the re-read once for a small prefix. The proxy would run \
              it on claude-sonnet-5.\n\
-             - A new session: pay nothing, keep none of this context.\n\
-             - Reply: carry on and pay the re-read.\n\
-             \n\
-             Shown once per idle spell.]"
+             - Start a new session: pay nothing, keep none of this context.\n\
+             - Reply: carry on and pay the re-read.]"
         );
+        // A known tier states the write's cost; an unknown one says nothing.
+        let hour = ColdBlocking::notice_for(
+            Some(2.0),
+            2 * HOUR,
+            200_621,
+            None,
+            None,
+            1_769_500_800_000,
+            &utc(),
+            NoticeStyle::Plain,
+        );
+        assert!(
+            hour.contains("200,621 tokens into the prompt cache (\u{d7}2 usage). You can:"),
+            "{hour}"
+        );
+        let five = ColdBlocking::notice_for(
+            Some(1.25),
+            2 * HOUR,
+            200_621,
+            None,
+            None,
+            1_769_500_800_000,
+            &utc(),
+            NoticeStyle::Plain,
+        );
+        assert!(five.contains("(\u{d7}1.25 usage)"), "{five}");
         // Purity (invariant 4): the same inputs render the same bytes,
         // every call, in every style.
         for _ in 0..3 {

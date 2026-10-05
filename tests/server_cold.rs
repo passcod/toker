@@ -518,10 +518,13 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
         "{text}"
     );
     assert!(
-        text.contains("re-reads 200,000 tokens as fresh input"),
+        text.contains("re-reads 200,000 tokens into the prompt cache"),
         "{text}"
     );
-    assert!(text.contains("Shown once per idle spell."), "{text}");
+    assert!(
+        text.contains("- Reply: carry on and pay the re-read."),
+        "{text}"
+    );
     // No model entry exists to resolve a compact target onto, so the
     // notice stays silent about one — an unarmed proxy promising a cheap
     // compaction would be the feature lying about its configuration.

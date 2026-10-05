@@ -643,9 +643,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                                 .map(str::to_owned)
                         });
                     let text = cold::ColdBlocking::notice_for(
-                        // The plain API bills the re-read; only a
-                        // rate-limit window meters it.
-                        backend.is_meter_source(),
+                        // The re-read is written back at the lane's own
+                        // tier; a lane with no recorded tier says nothing
+                        // rather than guess one.
+                        cold_lane
+                            .as_ref()
+                            .and_then(|lane| lanes::Ttl::from_ms(lane.ttl))
+                            .map(lanes::Ttl::write_multiplier),
                         idle_ms,
                         prompt,
                         compact_on.as_deref(),

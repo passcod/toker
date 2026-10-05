@@ -259,7 +259,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 // it against a rate-limit window, so the notice does not
                 // say it does.
                 let text = cold::ColdBlocking::notice_for(
-                    openrouter.is_meter_source(),
+                    // Openrouter's write multiple is per model in its
+                    // catalogue; not read here, so left unsaid.
+                    None,
                     idle_ms,
                     prompt,
                     None,

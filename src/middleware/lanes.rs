@@ -119,6 +119,16 @@ impl Ttl {
         }
     }
 
+    /// What a cache write on this tier costs against plain input: the
+    /// published 1.25x for 5 minutes and 2x for the hour, the same on
+    /// every model that prices caching.
+    pub fn write_multiplier(self) -> f64 {
+        match self {
+            Ttl::FiveMinutes => 1.25,
+            Ttl::Hour => 2.0,
+        }
+    }
+
     /// The longest a cache on this tier survives untouched, in milliseconds.
     pub fn duration_ms(self) -> i64 {
         self.as_ms()

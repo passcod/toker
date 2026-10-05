@@ -39,7 +39,7 @@
 
 use serde_json::Value;
 
-use super::notice::{NoticeLevel, NoticeStyle, render};
+use super::notice::{NoticeLevel, NoticeStyle, TOKER_LINK, render};
 use crate::store::Allowance;
 
 /// A meter is exhausted when its utilisation reaches this fraction of the
@@ -383,7 +383,7 @@ impl Blocking {
             _ => String::new(),
         };
         let content = format!(
-            "Stopped by toker: the {} quota {spent}.{size}\n\
+            "Stopped by {TOKER_LINK}: the {} quota {spent}.{size}\n\
              Reply with the release marker to continue on overage until then.",
             meter.notice_name(),
         );
@@ -907,7 +907,7 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            "[Stopped by toker: the 5-hour quota is spent until 08:00.\nReply with the release marker to continue on overage until then.]"
+            "[Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00.\nReply with the release marker to continue on overage until then.]"
         );
         // The context size rides in the same sentence, comma-grouped,
         // and is dropped entirely when unknown (never printed as zero).
@@ -919,7 +919,7 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            "[Stopped by toker: the 7-day quota is spent until 08:00. \
+            "[Stopped by [toker](https://github.com/passcod/toker): the 7-day quota is spent until 08:00. \
              This session's context is 123,456 tokens.\nReply with the release marker to continue on overage until then.]"
         );
         // A zero context is not a measurement: dropped like an absent one.
@@ -943,7 +943,7 @@ mod tests {
         // No reset carried: name the ignorance, in the frozen wording.
         assert_eq!(
             Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain),
-            "[Stopped by toker: the 5-hour quota is spent, and its reset time is unknown.\n\
+            "[Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent, and its reset time is unknown.\n\
              Reply with the release marker to continue on overage until then.]"
         );
     }
@@ -957,7 +957,7 @@ mod tests {
         // bytes now.
         let tz = utc();
         let expected = "> [!CAUTION]\n\
-                        > Stopped by toker: the 5-hour quota is spent until 08:00. \
+                        > Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00. \
                         This session's context is 9,872,344 tokens.\n\
                         > Reply with the release marker to continue on overage until then.";
         for _ in 0..3 {
@@ -984,7 +984,7 @@ mod tests {
                 &auckland,
                 NoticeStyle::default()
             ),
-            "> [!CAUTION]\n> Stopped by toker: the 5-hour quota is spent until 21:00.\n\
+            "> [!CAUTION]\n> Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 21:00.\n\
              > Reply with the release marker to continue on overage until then.",
             "2026-01-27 08:00 UTC is 21:00 NZDT the same day"
         );
@@ -996,7 +996,7 @@ mod tests {
         // wrapping differs. Plain is the pre-wrapper form, byte for byte;
         // gfm is the generic default (the block is claude's rendering).
         let tz = utc();
-        let content = "Stopped by toker: the 5-hour quota is spent until 08:00.\n\
+        let content = "Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00.\n\
                        Reply with the release marker to continue on overage until then.";
         assert_eq!(
             Blocking::notice(
