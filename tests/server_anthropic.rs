@@ -382,7 +382,24 @@ async fn mock_count_tokens(State(mock): State<MockState>, request: Request) -> R
 /// Every batch-management path (create, list, retrieve, results, cancel)
 /// answers with a batch object that carries no usage.
 async fn mock_batches(State(mock): State<MockState>, request: Request) -> Response {
-    let (_path, _headers, _json, _stream) = read_and_capture(&mock, request).await;
+    let (_path, _headers, json, _stream) = read_and_capture(&mock, request).await;
+    // A batch carrying the marker header model is rejected, so a test can
+    // see the error row a batch writes (a successful one writes none).
+    let rejected = json
+        .get("requests")
+        .and_then(Value::as_array)
+        .is_some_and(|requests| {
+            requests.iter().any(|request| {
+                request.pointer("/params/model").and_then(Value::as_str) == Some("err-401")
+            })
+        });
+    if rejected {
+        return raw_response(
+            StatusCode::UNAUTHORIZED,
+            "application/json",
+            Bytes::from_static(ERROR_BODY.as_bytes()),
+        );
+    }
     let mut response = raw_response(
         StatusCode::OK,
         "application/json",
@@ -1804,6 +1821,49 @@ async fn a_block_states_the_size_of_the_session_s_largest_lane() {
             .and_then(|extra| extra.get("context_tokens")),
         Some(&json!(412_345)),
         "the row carries the figure the notice stated"
+    );
+}
+
+#[tokio::test]
+async fn a_mapped_batch_records_which_requests_the_map_moved() {
+    // A batch has no single top-level model, so its provenance is the
+    // per-request list of the entries the map matched. A batch writes a
+    // row only when it fails, and that row is where the list must land.
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-test".to_owned()), "anthropic_api");
+    config.anthropic_api.model_map = toker::middleware::model_map::parse_model_map(
+        r#"{"family:haiku": "err-401", "model:claude-opus-4-5": "claude-opus-5"}"#,
+    )
+    .expect("the test map parses");
+    let (addr, store) = spawn_toker(config).await;
+
+    let body = json!({"requests": [
+        {"custom_id": "a", "params": {"model": "claude-haiku-4-5", "max_tokens": 1, "messages": []}},
+        {"custom_id": "b", "params": {"model": "claude-sonnet-5", "max_tokens": 1, "messages": []}},
+        {"custom_id": "c", "params": {"model": "claude-opus-4-5", "max_tokens": 1, "messages": []}},
+    ]});
+    let body = serde_json::to_vec(&body).expect("batch body");
+    let response = post_messages(addr, "/v1/messages/batches", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let sent: Value =
+        serde_json::from_slice(&mock.captured()[0].body).expect("the forwarded batch is JSON");
+    assert_eq!(sent.pointer("/requests/0/params/model"), Some(&json!("err-401")));
+    assert_eq!(
+        sent.pointer("/requests/1/params/model"),
+        Some(&json!("claude-sonnet-5")),
+        "an unmatched request keeps its model"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(
+        rows[0].model_mappings,
+        Some(json!([
+            {"requestIndex": 0, "requestedModel": "claude-haiku-4-5", "effectiveModel": "err-401"},
+            {"requestIndex": 2, "requestedModel": "claude-opus-4-5", "effectiveModel": "claude-opus-5"},
+        ])),
+        "only the matched entries, each with its index"
     );
 }
 

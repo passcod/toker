@@ -557,7 +557,10 @@ fn error_row(
         downgraded_to: None,
         cache_stripped: None,
         system_merged: None,
-        model_mappings: None,
+        // There is no response model on a rejected request, so the
+        // client → effective chain is what explains where it went; for a
+        // batch, that chain is the per-request list.
+        model_mappings: ctx.model_mappings.clone(),
         drift_digest: None,
         status: Some(status as i64),
         error_type,

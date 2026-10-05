@@ -847,24 +847,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 // effective one becomes the mapped target.
                 if let Some(ctx) = record.as_mut() {
                     ctx.effective_model = Some(effective.clone());
-                    if rewrite.models.len() > 1 {
-                        // Batch provenance rides the row's model_mappings
-                        // (the per-request list); the top-level position
-                        // is the requested/effective pair above.
-                        ctx.model_mappings = Some(
-                            rewrite
-                                .models
-                                .iter()
-                                .map(|position| {
-                                    serde_json::json!({
-                                        "requestIndex": position.request_index,
-                                        "requestedModel": position.pre_map_model,
-                                        "effectiveModel": position.effective_model,
-                                    })
-                                })
-                                .collect(),
-                        );
-                    }
                 }
                 served_model = Some(effective);
                 tracing::info!(
@@ -872,6 +854,29 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     rewrite.pre_map_model.as_deref().unwrap_or("?"),
                     served_model.as_deref().unwrap_or("?")
                 );
+            } else {
+                // A batch has no single top-level model, so the map
+                // reports no effective one: its provenance is the
+                // per-request list of the entries the map matched (the
+                // predecessor's `modelMappings`). Without it a mapped
+                // batch's row could not say where its requests went.
+                let mappings: Vec<serde_json::Value> = rewrite
+                    .models
+                    .iter()
+                    .filter(|position| position.matched)
+                    .map(|position| {
+                        serde_json::json!({
+                            "requestIndex": position.request_index,
+                            "requestedModel": position.pre_map_model,
+                            "effectiveModel": position.effective_model,
+                        })
+                    })
+                    .collect();
+                if !mappings.is_empty()
+                    && let Some(ctx) = record.as_mut()
+                {
+                    ctx.model_mappings = Some(serde_json::Value::Array(mappings));
+                }
             }
         }
     }
