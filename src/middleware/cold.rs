@@ -21,8 +21,9 @@
 //!   the outlook calls (the span/total verdicts are the TUI's, not
 //!   ported here);
 //! - the weight fit ([`fit_quota_model`] / [`quota_for`]) — what the
-//!   outlook prices the re-read with (the predecessor's diagnostics
-//!   surface — groups, spreads, worst window — is not ported);
+//!   outlook prices the re-read with, each weight with its leave-one-out
+//!   spread (the rest of the predecessor's diagnostics surface — worst
+//!   window, unattributed bound — is not ported);
 //! - the pipeline sequencing (quota gate first; the cold notice exempting
 //!   summarising requests; the retarget's lane-cold licence) —
 //!   see [`crate::server::anthropic`].
@@ -971,11 +972,41 @@ const MAX_COLLINEARITY_R2: f64 = 0.98;
 const MAX_CONTRIBUTION_SWING: f64 = 0.5;
 
 /// One model group's fitted weight: window fraction per million fresh /
-/// output tokens.
+/// output tokens, each with its spread — the least and greatest value the
+/// weight took across the leave-one-window-out refits (the predecessor's
+/// `freshSpread` / `outputSpread`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroupWeight {
     pub fresh: f64,
     pub output: f64,
+    pub fresh_spread: Spread,
+    pub output_spread: Spread,
+}
+
+/// The range one weight took across the leave-one-out refits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spread {
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Where a refit's weight counts as zero. The solver stops once no step
+/// moves a weight by 1e-14, so a weight it is driving to zero from above
+/// can stop a few ulps short of it (1.9e-15 in the test that pins this)
+/// rather than clamping to exactly 0.0 (the live ledger's case). A
+/// billionth of a window per million tokens is no weight at any scale
+/// this meters.
+const SEPARATION_FLOOR: f64 = 1e-9;
+
+impl Spread {
+    /// Whether the data separates this weight from zero. The solver is
+    /// non-negative, so a refit that reaches zero is a refit in which the
+    /// weight could be dropped and the windows still explained: the point
+    /// weight is then whatever the other columns left over, not a
+    /// measurement. A weight whose spread reaches zero is no weight.
+    pub fn separated(&self) -> bool {
+        self.min.is_finite() && self.max.is_finite() && self.min > SEPARATION_FLOOR
+    }
 }
 
 /// The fitted quota model, or the reason there is none. `ok: false` means
@@ -1000,12 +1031,32 @@ impl QuotaFit {
     /// bound rather than a measurement, which a caller that prints it must
     /// say ("at most"). A group with no weight (unattributed, or a model
     /// the fit never saw) answers `None`, never zero.
+    ///
+    /// A fresh weight the data cannot separate from zero (its spread
+    /// reaches zero) also answers `None`, so the outlook is blind and the
+    /// notice fires. Measured over the whole live log: opus-5-5's fresh
+    /// weight fitted at ~0.009 a million with a spread of 0.000-0.018,
+    /// while live re-reads of 260k and 434k cache-written tokens each moved
+    /// the 5-hour meter about two points — five to eight times the point
+    /// figure, which priced each as a fraction of a point.
     pub fn quota_for(&self, model: &str, fresh: u64) -> Option<(f64, bool)> {
         let weight = self.weights.get(&price_key(model))?;
+        if !weight.fresh_spread.separated() {
+            return None;
+        }
         Some((
             fresh as f64 / 1e6 * weight.fresh,
             self.folded.contains(&price_key(model)),
         ))
+    }
+
+    /// Every weighted group, keyed by price signature, with whether its
+    /// weight was borrowed from the host it was folded into — the fit's
+    /// own evidence, for a reader that wants to disbelieve it.
+    pub fn groups(&self) -> impl Iterator<Item = (&str, &GroupWeight, bool)> {
+        self.weights
+            .iter()
+            .map(|(key, weight)| (key.as_str(), weight, self.folded.contains(key)))
     }
 }
 
@@ -1361,6 +1412,9 @@ struct Solve {
     /// Columns in order: (group key, 0 = fresh | 1 = output).
     columns: Vec<(String, usize)>,
     swing: BTreeMap<String, f64>,
+    /// Per column, the range its weight took across the leave-one-out
+    /// refits (indexed like `columns`).
+    spread: Vec<Spread>,
 }
 
 fn solve(
@@ -1421,6 +1475,13 @@ fn solve(
     for key in fitted {
         contributions.insert(key.clone(), Vec::new());
     }
+    let mut spread = vec![
+        Spread {
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        };
+        columns.len()
+    ];
     for leave_out in 0..windows.len() {
         let a_reduced: Vec<Vec<f64>> = a
             .iter()
@@ -1435,6 +1496,10 @@ fn solve(
             .map(|(_, v)| *v)
             .collect();
         let x_loo = nnls(&a_reduced, &y_reduced);
+        for (column, range) in spread.iter_mut().enumerate() {
+            range.min = range.min.min(x_loo[column]);
+            range.max = range.max.max(x_loo[column]);
+        }
         for key in fitted {
             contributions
                 .get_mut(key)
@@ -1457,7 +1522,12 @@ fn solve(
             },
         );
     }
-    Solve { x, columns, swing }
+    Solve {
+        x,
+        columns,
+        swing,
+        spread,
+    }
 }
 
 /// Fit the model: weights when
@@ -1584,21 +1654,20 @@ pub fn fit_quota_model(rows: &[RequestRow]) -> QuotaFit {
     // none.
     let mut weights: BTreeMap<String, GroupWeight> = BTreeMap::new();
     for key in &fitted {
-        let fresh = sol.x[sol
-            .columns
-            .iter()
-            .position(|(k, f)| k == key && *f == 0)
-            .expect("the column set covers every fitted key")];
-        let output = sol.x[sol
-            .columns
-            .iter()
-            .position(|(k, f)| k == key && *f == 1)
-            .expect("the column set covers every fitted key")];
+        let column = |field: usize| {
+            sol.columns
+                .iter()
+                .position(|(k, f)| k == key && *f == field)
+                .expect("the column set covers every fitted key")
+        };
+        let (fresh, output) = (sol.x[column(0)], sol.x[column(1)]);
         weights.insert(
             key.clone(),
             GroupWeight {
                 fresh: if fresh.is_finite() { fresh } else { 0.0 },
                 output: if output.is_finite() { output } else { 0.0 },
+                fresh_spread: sol.spread[column(0)],
+                output_spread: sol.spread[column(1)],
             },
         );
     }
@@ -3164,6 +3233,77 @@ mod tests {
         assert!(
             !fit_quota_model(&three_windows).ok,
             "three windows cannot separate a weight"
+        );
+    }
+
+    #[test]
+    fn every_weight_carries_its_leave_one_out_spread() {
+        // Four identical windows: every refit lands on the same weight, so
+        // the spread collapses onto the point and is clear of zero.
+        let fit = fit_quota_model(&fit_rows(NOW));
+        assert!(fit.ok, "{:?}", fit.reason);
+        let (_, weight, folded) = fit.groups().next().expect("one group");
+        assert!(!folded);
+        assert!((weight.fresh - 0.30).abs() < 1e-9, "{weight:?}");
+        assert!((weight.fresh_spread.min - 0.30).abs() < 1e-9, "{weight:?}");
+        assert!((weight.fresh_spread.max - 0.30).abs() < 1e-9, "{weight:?}");
+        assert!(weight.fresh_spread.separated());
+    }
+
+    #[test]
+    fn a_fresh_weight_the_data_cannot_separate_from_zero_is_no_weight() {
+        // Output explains every window exactly; fresh volume varies
+        // independently, and one window advanced a little more than its
+        // output says, with the most fresh traffic. The full fit hands
+        // fresh a small weight to cover that one window — and the refit
+        // without it drives fresh to zero. The point weight is the one
+        // window's residue, not a measurement.
+        let mut rows = Vec::new();
+        let window_span = 5 * HOUR;
+        for (window, (fresh, output, extra)) in [
+            (400_000i64, 40_000i64, 0.0f64),
+            (100_000, 60_000, 0.0),
+            (250_000, 50_000, 0.0),
+            (50_000, 70_000, 0.0),
+            (600_000, 45_000, 0.02),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let window = window as i64;
+            let reset_ms = NOW - 90 * MIN - 300 * MIN * window;
+            let reset_s = reset_ms / 1000;
+            let du = 0.30 * (output * 20) as f64 / 1e6 + extra;
+            for step in 0..=20i64 {
+                let at = reset_ms - window_span + 10 * MIN + step * MIN;
+                let mut row = served_row(
+                    at,
+                    "claude-opus-5",
+                    fresh,
+                    Some(0.10 + du * step as f64 / 20.0),
+                    Some(reset_s),
+                );
+                row.output = Some(output);
+                rows.push(row);
+            }
+        }
+        let fit = fit_quota_model(&rows);
+        assert!(fit.ok, "{:?}", fit.reason);
+        let (_, weight, _) = fit.groups().next().expect("one group");
+        assert!(
+            weight.fresh > 0.0,
+            "the full fit gives fresh a weight: {weight:?}"
+        );
+        assert!(weight.fresh_spread.min < 1e-12, "{weight:?}");
+        assert!(!weight.fresh_spread.separated());
+        assert_eq!(
+            fit.quota_for("claude-opus-5", 260_000),
+            None,
+            "an unseparated weight is unknown, so the outlook is blind and the notice fires"
+        );
+        assert_eq!(
+            outlook_of(&rows, Some("claude-opus-5"), 260_000, true, NOW),
+            None
         );
     }
 
