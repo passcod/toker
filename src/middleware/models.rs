@@ -247,8 +247,15 @@ pub(crate) fn fits_context(entries: &[ModelEntry], model: &str, prompt: u64) -> 
 /// everything else, so the target follows what is actually in use rather
 /// than being pinned to a literal that goes stale the day a newer Sonnet
 /// ships. The price filter is the `accept` hook: a candidate the table
-/// cannot price is no use to a rewrite that decides "cheaper" from it.
-pub fn compaction_target_of(entries: &[ModelEntry], spec: &str, prompt: u64) -> Option<String> {
+/// cannot price is no use to a rewrite that decides "cheaper" from it —
+/// priced as the identity `map` (the routed backend's model map) will
+/// actually send, since a routing alias is not price evidence.
+pub fn compaction_target_of(
+    entries: &[ModelEntry],
+    spec: &str,
+    prompt: u64,
+    map: Option<&crate::middleware::model_map::ModelMap>,
+) -> Option<String> {
     if spec.is_empty() || spec == "off" {
         return None;
     }
@@ -260,7 +267,11 @@ pub fn compaction_target_of(entries: &[ModelEntry], spec: &str, prompt: u64) -> 
         newest_in_family_accepting(
             entries,
             &f.name,
-            Some(&|model: &str| crate::catalog::pricing::price(model, false, None).is_some()),
+            Some(&|model: &str| {
+                crate::middleware::model_map::preview_mapped_model(map, model)
+                    .and_then(|sent| crate::catalog::pricing::price(sent, false, None))
+                    .is_some()
+            }),
         )
     }?;
     if !fits_context(entries, &target, prompt) {
@@ -703,9 +714,10 @@ impl ModelStore {
         &self,
         spec: &str,
         prompt: u64,
+        map: Option<&crate::middleware::model_map::ModelMap>,
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
-        Ok(compaction_target_of(&entries, spec, prompt))
+        Ok(compaction_target_of(&entries, spec, prompt, map))
     }
 
     /// The strictly-newer learned member of `model`'s family that a
@@ -1555,28 +1567,31 @@ mod tests {
         // size guard passes on the model that has actually held the
         // prompt.
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 400_000),
+            compaction_target_of(&entries, "sonnet", 400_000, None),
             Some("claude-sonnet-5".to_owned())
         );
         // The same spec at a prompt only the 1M window has held: still
         // sonnet-5. At a prompt nothing has held: decline.
         assert_eq!(
-            compaction_target_of(&entries, "sonnet", 900_000),
+            compaction_target_of(&entries, "sonnet", 900_000, None),
             Some("claude-sonnet-5".to_owned())
         );
-        assert_eq!(compaction_target_of(&entries, "sonnet", 1_200_000), None);
+        assert_eq!(
+            compaction_target_of(&entries, "sonnet", 1_200_000, None),
+            None
+        );
         // An explicit id is a pin, not an election.
         assert_eq!(
-            compaction_target_of(&entries, "claude-sonnet-4-6", 150_000),
+            compaction_target_of(&entries, "claude-sonnet-4-6", 150_000, None),
             Some("claude-sonnet-4-6".to_owned())
         );
         // "off" and "" are nothing (a falsy spec).
-        assert_eq!(compaction_target_of(&entries, "off", 1), None);
-        assert_eq!(compaction_target_of(&entries, "", 1), None);
+        assert_eq!(compaction_target_of(&entries, "off", 1, None), None);
+        assert_eq!(compaction_target_of(&entries, "", 1, None), None);
         // A family nothing served has no target, and an unknown name has
         // no family.
-        assert_eq!(compaction_target_of(&entries, "haiku", 1), None);
-        assert_eq!(compaction_target_of(&entries, "gpt-5.6-sol", 1), None);
+        assert_eq!(compaction_target_of(&entries, "haiku", 1, None), None);
+        assert_eq!(compaction_target_of(&entries, "gpt-5.6-sol", 1, None), None);
 
         // The price filter (the `accept` hook): a family whose elected
         // newest cannot be priced is no use to a rewrite that judges
@@ -1587,9 +1602,19 @@ mod tests {
             entry("claude-sonnet-5", &days, Some(1_000_000)),
         ];
         assert_eq!(
-            compaction_target_of(&mixed, "gpt-5.6-sol", 1),
+            compaction_target_of(&mixed, "gpt-5.6-sol", 1, None),
             None,
             "the election refuses a candidate it cannot price"
+        );
+        // Priced as what the backend's model map will send: a Sonnet the
+        // host routes to an unpriced model is no candidate either.
+        let unpriced =
+            crate::middleware::model_map::parse_model_map(r#"{"family:sonnet": "z-ai/glm-5.3"}"#)
+                .expect("map parses");
+        assert_eq!(
+            compaction_target_of(&entries, "sonnet", 400_000, unpriced.as_ref()),
+            None,
+            "the alias is not price evidence"
         );
 
         // Over the store: the same resolution, loading the entries.
@@ -1600,12 +1625,14 @@ mod tests {
             .expect("upsert");
         assert_eq!(
             models
-                .compaction_target("sonnet", 400_000)
+                .compaction_target("sonnet", 400_000, None)
                 .expect("resolve"),
             Some("claude-sonnet-5".to_owned())
         );
         assert_eq!(
-            models.compaction_target("off", 400_000).expect("resolve"),
+            models
+                .compaction_target("off", 400_000, None)
+                .expect("resolve"),
             None
         );
     }

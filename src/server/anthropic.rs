@@ -513,13 +513,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         } else {
             match &fired {
                 cold::ColdDecision::Notice { prompt, .. } if gates.cold_outlook => {
-                    cold::outlook_over(
-                        &server.store,
-                        client_model.as_deref(),
-                        *prompt,
-                        gate_armed,
-                        now,
-                    )
+                    // Priced as what the backend's model map will send
+                    // (the predecessor's `previewMappedModel`): the fit's
+                    // weights are keyed on served identities, and the
+                    // client's alias is not one. Measured on the routed
+                    // backend's own meters only.
+                    let sent = served_model.as_deref().and_then(|model| {
+                        model_map::preview_mapped_model(backend.model_map(), model)
+                    });
+                    cold::outlook_over(&server.store, backend.id(), sent, *prompt, gate_armed, now)
                 }
                 _ => None,
             }
@@ -607,11 +609,18 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     // the notice names the model a
                     // cheap `/compact` would actually run on, and stays
                     // silent about it when there is none.
+                    //
+                    // Named as the identity the backend's model map will
+                    // send — what the compaction will actually run on.
                     let compact_on = server
                         .models
-                        .compaction_target(&compact_spec(gates), prompt)
+                        .compaction_target(&compact_spec(gates), prompt, backend.model_map())
                         .ok()
-                        .flatten();
+                        .flatten()
+                        .and_then(|target| {
+                            model_map::preview_mapped_model(backend.model_map(), &target)
+                                .map(str::to_owned)
+                        });
                     let text = cold::ColdBlocking::notice(
                         idle_ms,
                         prompt,
@@ -708,10 +717,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .unwrap_or_default() as u64;
             let target = server
                 .models
-                .compaction_target(&compact_spec(gates), prompt)
+                .compaction_target(&compact_spec(gates), prompt, backend.model_map())
                 .ok()
                 .flatten();
-            if let Some(outcome) = cold::retarget_compaction(ir, target.as_deref(), true) {
+            if let Some(outcome) =
+                cold::retarget_compaction(ir, target.as_deref(), true, backend.model_map())
+            {
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.

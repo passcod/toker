@@ -328,7 +328,9 @@ fn bare_row(ts_ms: i64) -> RequestRow {
         duration_ms: None,
         kind: None,
         frontend: None,
-        provider: None,
+        // The seeded measurements are the subscription's: the outlook
+        // reads only the routed backend's own rows.
+        provider: Some("anthropic_sub".to_owned()),
         route: None,
         session_id: None,
         ping: None,

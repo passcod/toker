@@ -66,6 +66,7 @@ use super::quota::{Meter, THRESHOLD, group};
 use crate::catalog::pricing::{normalise_model_id, price};
 use crate::catalog::windows::model_identity;
 use crate::ir::Request;
+use crate::middleware::model_map::{ModelMap, preview_mapped_model};
 use crate::store::{Lane, RequestRow, Store};
 
 /// Below this the rebuild is too cheap for the interruption to be worth it.
@@ -1074,9 +1075,11 @@ fn is_response_row(row: &RequestRow) -> bool {
 
 /// Models sharing a price row plausibly share a quota weight; pooling by
 /// price signature rather than name needs no maintenance when a model is
-/// added. Routing aliases are not price
-/// evidence — toker's price lookup IS the identity the host will be billed
-/// (there is no host model map yet; when one lands it goes here).
+/// added. Routing aliases are not price evidence: the fit keys rows on the
+/// model the RESPONSE named, which is the identity the host served after
+/// any model map, and a caller asking [`QuotaFit::quota_for`] about a
+/// request must ask about the model the map will send, never the alias
+/// the client named.
 fn price_key(model: &str) -> String {
     match price(model, false, None) {
         Some(priced) => format!(
@@ -1723,19 +1726,32 @@ pub fn outlook_of(
     ))
 }
 
-/// [`outlook_of`] over the store's recent rows: the
-/// newest [`OUTLOOK_ROWS`] rows within [`OUTLOOK_LOOKBACK_MS`]. A store
-/// error is "blind" — the notice fires, the safe direction.
+/// [`outlook_of`] over the store's recent rows from `provider` — the
+/// backend the request is routed to — the newest [`OUTLOOK_ROWS`] rows
+/// within [`OUTLOOK_LOOKBACK_MS`]. A store error is "blind" — the notice
+/// fires, the safe direction.
+///
+/// Only the routed backend's rows: a window is one backend's meter, and
+/// reading every row once let a request bound for a backend with no
+/// 5-hour meter at all (the plain API, codex's differently-shaped limits)
+/// be quietened by the subscription's burn and weights. A backend that is
+/// not a 5-hour meter source has no such rows, so it has no burn and no
+/// fit — blind, and the notice fires. `model` must be the identity the
+/// backend's model map will send (see [`price_key`]).
 pub fn outlook_over(
     store: &Store,
+    provider: &str,
     model: Option<&str>,
     fresh: u64,
     gate_on: bool,
     now_ms: i64,
 ) -> Option<Outlook> {
-    let rows = store
+    let rows: Vec<RequestRow> = store
         .requests_since(now_ms - OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS)
-        .ok()?;
+        .ok()?
+        .into_iter()
+        .filter(|row| row.provider.as_deref() == Some(provider))
+        .collect();
     outlook_of(&rows, model, fresh, gate_on, now_ms)
 }
 
@@ -2063,16 +2079,22 @@ pub struct RetargetOutcome {
 
 /// `target` if it is strictly cheaper to prompt than `from`, else `None`
 /// (judged on the published input rate
-/// rather than a hand-kept ordering, so a new model needs no edit here.
-/// The predecessor let a host route supply the identities that will really
-/// be billed; toker has no host model map yet, so the price lookup IS the
-/// identity the upstream bills). Never sideways, never upward: that would
-/// buy nothing and cost the quality difference.
-fn cheaper_of(from: Option<&str>, target: Option<&str>) -> Option<String> {
+/// rather than a hand-kept ordering, so a new model needs no edit here).
+/// Both sides are priced as the identity the backend's model map will
+/// actually send (the predecessor's `priceAs`): routing policy is not
+/// price evidence, and an alias that maps onto something dearer must not
+/// be called cheaper because of its own name. An identity that cannot be
+/// priced cannot be judged. Never sideways, never upward: that would buy
+/// nothing and cost the quality difference.
+fn cheaper_of(from: Option<&str>, target: Option<&str>, map: Option<&ModelMap>) -> Option<String> {
     let target = target?;
     let from = from?;
-    let target_input = price(target, false, None)?.rates.input;
-    let from_input = price(from, false, None)?.rates.input;
+    let target_input = price(preview_mapped_model(map, target)?, false, None)?
+        .rates
+        .input;
+    let from_input = price(preview_mapped_model(map, from)?, false, None)?
+        .rates
+        .input;
     (target_input < from_input).then(|| target.to_owned())
 }
 
@@ -2128,6 +2150,9 @@ fn js_trim(text: &str) -> &str {
 /// the client's transcript is untouched — so every usual reason for
 /// leaving bytes alone is absent here, and only here.
 ///
+/// `map` is the routed backend's model map: "cheaper" is judged on what
+/// the map will send, not on the names in the body.
+///
 /// Three things happen together, or none do:
 ///
 /// - the model changes to `target`, where one is offered and is cheaper;
@@ -2157,6 +2182,7 @@ pub fn retarget_compaction(
     ir: &mut Request,
     target: Option<&str>,
     cold: bool,
+    map: Option<&ModelMap>,
 ) -> Option<RetargetOutcome> {
     let original = ir.value();
     if !original.is_object() {
@@ -2171,7 +2197,7 @@ pub fn retarget_compaction(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let to = cheaper_of(from.as_deref(), target);
+    let to = cheaper_of(from.as_deref(), target, map);
     // No cheaper model to move to and no assertion that the cache is gone
     // leaves nothing that justifies touching the body.
     if to.is_none() && !cold {
@@ -2257,9 +2283,9 @@ pub fn retarget_compaction(
 mod tests {
     use super::{
         Burn, ColdBlocking, ColdDecision, DEFAULT_MIN_TOKENS, METER_5H, Outlook, RetargetOutcome,
-        Verdict, burn_rate, burn_rate_samples, coldness, decide_cold, fit_quota_model, human_idle,
-        lane_is_cold, outlook_of, outlook_target, project_to, quota_outlook, retarget_compaction,
-        ttl_of,
+        Verdict, burn_rate, burn_rate_samples, cheaper_of, coldness, decide_cold, fit_quota_model,
+        human_idle, lane_is_cold, outlook_of, outlook_over, outlook_target, project_to,
+        quota_outlook, retarget_compaction, ttl_of,
     };
     use crate::ir::Request;
     use crate::middleware::notice::NoticeStyle;
@@ -3762,9 +3788,85 @@ mod tests {
     }
 
     #[test]
+    fn cheaper_is_judged_on_what_the_model_map_will_send() {
+        // The host map sends every Sonnet as Opus 5: the alias in the body
+        // is cheaper by its own name, but what the upstream bills is not,
+        // so the model stays — the cold licence still strips.
+        let dearer =
+            crate::middleware::model_map::parse_model_map(r#"{"family:sonnet": "claude-opus-5"}"#)
+                .expect("map parses");
+        let mut request = Request::parse(&compaction_body()).expect("parse");
+        let outcome =
+            retarget_compaction(&mut request, Some("claude-sonnet-5"), true, dearer.as_ref())
+                .expect("the cold licence alone still rewrites");
+        assert_eq!(outcome.to.as_deref(), Some("claude-opus-5"), "no move");
+        assert_eq!(outcome.from, outcome.to);
+        assert!(outcome.stripped > 0);
+
+        // A target the map sends somewhere unpriced cannot be judged, so
+        // it is not called cheaper either.
+        let unpriced =
+            crate::middleware::model_map::parse_model_map(r#"{"family:sonnet": "z-ai/glm-5.3"}"#)
+                .expect("map parses");
+        assert_eq!(
+            cheaper_of(
+                Some("claude-opus-5"),
+                Some("claude-sonnet-5"),
+                unpriced.as_ref()
+            ),
+            None
+        );
+        // Without a map the names are the billed identities.
+        assert_eq!(
+            cheaper_of(Some("claude-opus-5"), Some("claude-sonnet-5"), None).as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn the_outlook_reads_only_the_routed_backend_s_rows() {
+        // The subscription's ledger can price a re-read; a request routed
+        // to the plain API must not be quietened by it — the API has no
+        // 5-hour meter, so its outlook is blind and the notice fires.
+        let store = crate::store::Store::open(":memory:").expect("store");
+        let rows: Vec<RequestRow> = fit_rows(NOW)
+            .into_iter()
+            .map(|mut row| {
+                row.provider = Some("anthropic_sub".to_owned());
+                row
+            })
+            .collect();
+        store.record_requests(&rows).expect("seed");
+        assert!(
+            outlook_over(
+                &store,
+                "anthropic_sub",
+                Some("claude-opus-5"),
+                200_000,
+                true,
+                NOW
+            )
+            .is_some_and(|outlook| outlook.known && outlook.on_track),
+            "the subscription's own rows price its re-read"
+        );
+        assert_eq!(
+            outlook_over(
+                &store,
+                "anthropic_api",
+                Some("claude-opus-5"),
+                200_000,
+                true,
+                NOW
+            ),
+            None,
+            "another backend's meters are not this one's"
+        );
+    }
+
+    #[test]
     fn the_retarget_rewrites_strips_and_merges_with_pinned_bytes() {
         let mut request = Request::parse(&compaction_body()).expect("parse");
-        let outcome = retarget_compaction(&mut request, Some("claude-sonnet-5"), true)
+        let outcome = retarget_compaction(&mut request, Some("claude-sonnet-5"), true, None)
             .expect("a cheaper target on a cold lane rewrites");
         assert_eq!(
             outcome,
@@ -3809,7 +3911,7 @@ mod tests {
         // these bytes must be reproducible).
         for _ in 0..3 {
             let mut again = Request::parse(&compaction_body()).expect("parse");
-            retarget_compaction(&mut again, Some("claude-sonnet-5"), true).expect("rewrites");
+            retarget_compaction(&mut again, Some("claude-sonnet-5"), true, None).expect("rewrites");
             assert_eq!(again.serialise(), request.serialise());
         }
     }
@@ -3819,7 +3921,7 @@ mod tests {
         let declines = |body: &[u8], target: Option<&str>, cold: bool| {
             let mut request = Request::parse(body).expect("test bodies parse");
             let before = request.serialise();
-            let outcome = retarget_compaction(&mut request, target, cold);
+            let outcome = retarget_compaction(&mut request, target, cold, None);
             assert!(outcome.is_none(), "{:?}", body);
             assert_eq!(request.serialise(), before, "all-or-nothing: untouched");
         };
@@ -3916,7 +4018,7 @@ mod tests {
                     {"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#,
         )
         .expect("parse");
-        let outcome = retarget_compaction(&mut request, Some("claude-sonnet-5"), false)
+        let outcome = retarget_compaction(&mut request, Some("claude-sonnet-5"), false, None)
             .expect("the model change is the licence");
         assert_eq!(
             outcome,
@@ -3940,7 +4042,8 @@ mod tests {
                 "messages":[{"role":"user","content":[]}]}"#,
         )
         .expect("parse");
-        let outcome = retarget_compaction(&mut request, None, true).expect("cold licence alone");
+        let outcome =
+            retarget_compaction(&mut request, None, true, None).expect("cold licence alone");
         assert_eq!(outcome.from, None);
         assert_eq!(outcome.to, None);
         assert_eq!(outcome.merged, 0);
@@ -3965,8 +4068,8 @@ mod tests {
                 "messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}"#,
         )
         .expect("parse");
-        let outcome =
-            retarget_compaction(&mut request, Some("claude-opus-5"), true).expect("cold licence");
+        let outcome = retarget_compaction(&mut request, Some("claude-opus-5"), true, None)
+            .expect("cold licence");
         assert_eq!(outcome.from.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(
             outcome.to, outcome.from,
@@ -4010,7 +4113,7 @@ mod tests {
         }))
         .expect("serialise");
         let mut request = Request::parse(&body).expect("parse");
-        retarget_compaction(&mut request, Some("claude-sonnet-5"), true).expect("rewrites");
+        retarget_compaction(&mut request, Some("claude-sonnet-5"), true, None).expect("rewrites");
         let retargeted = request.serialise();
 
         // Every key before `model`, and the model region itself, is the
@@ -4026,7 +4129,7 @@ mod tests {
         // The transform is deterministic: a fresh parse of the same body
         // produces the identical bytes (invariant 4).
         let mut again = Request::parse(&body).expect("parse");
-        retarget_compaction(&mut again, Some("claude-sonnet-5"), true).expect("rewrites");
+        retarget_compaction(&mut again, Some("claude-sonnet-5"), true, None).expect("rewrites");
         assert_eq!(again.serialise(), retargeted);
     }
 }

@@ -172,7 +172,7 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
                 }))
                 .expect("serialise the fixture body");
                 let mut request = Request::parse(&body).expect("the fixture body parses");
-                let outcome = cold::retarget_compaction(&mut request, None, cold);
+                let outcome = cold::retarget_compaction(&mut request, None, cold, None);
                 match expected.get("action").and_then(Value::as_str) {
                     Some("forward") => assert!(
                         outcome.is_none(),

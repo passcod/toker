@@ -233,7 +233,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 // stays silent about it when there is none.
                 let compact_on = server
                     .models
-                    .compaction_target(&compact_spec(gates), prompt)
+                    .compaction_target(&compact_spec(gates), prompt, None)
                     .ok()
                     .flatten();
                 let text = cold::ColdBlocking::notice(
