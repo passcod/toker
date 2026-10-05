@@ -39,8 +39,9 @@
 //! key and an output scan.
 //!
 //! The wake/hold/ping timers (plan: "Sleep lock, wake, ping") are a
-//! real offer in the toggles step: a free-form `hh:mm` slot list
-//! (strictly validated; the default, empty, skips silently), the hold
+//! real offer in the toggles step: a yes/no defaulting to what is
+//! installed, then a free-form `hh:mm` slot list (strictly validated;
+//! the default is the installed slots, else [`DEFAULT_SLOTS`]), the hold
 //! and per-slot ping USER units through the ordinary user-manager
 //! path, and the wake SYSTEM timer with the do-nothing service it
 //! starts — the only root-level pieces — staged into the units dir and
@@ -48,7 +49,9 @@
 //! [`SystemRunner::systemctl_system`], which production runs as
 //! `sudo systemctl` (it says so first: sudo will be asked). Every
 //! timers failure is non-fatal with manual commands printed — a
-//! machine that never sleeps-or-wakes still pings fine while up.
+//! machine that never sleeps-or-wakes still pings fine while up. A no
+//! removes whatever an earlier run installed, and a changed slot list
+//! retires the ping timers of the slots it dropped.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -95,6 +98,65 @@ pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
 
 /// The hold USER service's name.
 pub const HOLD_SERVICE_UNIT: &str = "toker-hold.service";
+
+/// The slots offered when no earlier run left any: the predecessor's
+/// schedule. A slot is the wake and hold, and its ping fires
+/// [`PING_DELAY_MINUTES`] later: 07:20's ping at 07:31 anchors its
+/// window on floor(07:31, 10 min) = 07:30, ending 12:30, and 12:20's
+/// at 12:31 anchors 12:30–17:30 (README: a window open for the
+/// morning, re-opened after lunch).
+pub const DEFAULT_SLOTS: &str = "07:20, 12:20";
+
+/// The wake/hold/ping units an earlier run left in the units dir — the
+/// wake pair is staged there too, so its presence stands for the
+/// system install.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InstalledTimers {
+    hold: bool,
+    /// The slots of the per-slot ping timers, `hh:mm`, sorted.
+    ping_slots: Vec<String>,
+    wake_timer: bool,
+    wake_service: bool,
+}
+
+impl InstalledTimers {
+    /// Read the units dir. Unreadable is none installed: the dir is
+    /// created by the first install, so a fresh machine has none.
+    fn read(units_dir: &Path) -> InstalledTimers {
+        let mut found = InstalledTimers::default();
+        let Ok(entries) = std::fs::read_dir(units_dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            match name {
+                HOLD_TIMER_UNIT => found.hold = true,
+                WAKE_TIMER_UNIT => found.wake_timer = true,
+                WAKE_SERVICE_UNIT => found.wake_service = true,
+                _ => {
+                    // toker-ping-HHMM.timer, the stem's colon munged
+                    // away (see ping_unit_stem).
+                    let slot = name
+                        .strip_prefix("toker-ping-")
+                        .and_then(|rest| rest.strip_suffix(".timer"))
+                        .filter(|hhmm| hhmm.len() == 4 && hhmm.is_char_boundary(2))
+                        .map(|hhmm| format!("{}:{}", &hhmm[..2], &hhmm[2..]))
+                        .filter(|slot| timers::parse_slot(slot).is_some());
+                    if let Some(slot) = slot {
+                        found.ping_slots.push(slot);
+                    }
+                }
+            }
+        }
+        found.ping_slots.sort();
+        found
+    }
+
+    fn any(&self) -> bool {
+        self.hold || self.wake_timer || self.wake_service || !self.ping_slots.is_empty()
+    }
+}
 
 /// How long [`Step::VerifyService`] waits for the listener to answer
 /// both usage paths: a cold socket-activated start (SQLite open,
@@ -167,14 +229,18 @@ pub trait SystemRunner {
 
     /// Run `systemctl <args>` against the SYSTEM manager, as root —
     /// production goes through `sudo systemctl` (say so before
-    /// calling: sudo will ask). The wake timer's enable is the only
-    /// call the wizard makes here.
+    /// calling: sudo will ask). The wake pair's link, enable and
+    /// disable are the only calls the wizard makes here.
     fn systemctl_system(&self, args: &[&str]) -> Result<Output>;
 
     /// Install a unit file into the user units dir, returning the path
     /// written. Declarative: the same contents install cleanly over an
     /// earlier install of the same unit.
     fn install_unit(&self, name: &str, contents: &str) -> Result<PathBuf>;
+
+    /// Remove a unit file from the user units dir. A file already gone
+    /// is success: the goal is its absence.
+    fn remove_unit(&self, name: &str) -> Result<()>;
 }
 
 /// The real runner: `systemctl --user` via std::process, unit files
@@ -202,7 +268,7 @@ impl SystemRunner for ProcessRunner {
 
     fn systemctl_system(&self, args: &[&str]) -> Result<Output> {
         // sudo, so the wizard says so before every call: the wake
-        // timer's enable is the only root-level action toker takes.
+        // pair is the only root-level thing toker touches.
         std::process::Command::new("sudo")
             .arg("systemctl")
             .args(args)
@@ -221,6 +287,16 @@ impl SystemRunner for ProcessRunner {
             Ok(())
         })?;
         Ok(path)
+    }
+
+    fn remove_unit(&self, name: &str) -> Result<()> {
+        let path = self.units_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -779,10 +855,14 @@ pub struct RunReport {
     /// The plugin was offered and declined.
     pub plugin_declined: bool,
     /// The wake/hold/ping slots chosen this run (plan: "Sleep lock,
-    /// wake, ping"); empty means none were chosen, in which case no
-    /// timer unit was touched and existing timers (if any) were left
-    /// exactly as they were.
+    /// wake, ping"); empty means the timers were declined, in which
+    /// case nothing was installed and any an earlier run left were
+    /// removed ([`RunReport::timers_removed`]).
     pub timer_slots: Vec<String>,
+    /// The timer units disabled and removed this run: all of them when
+    /// the timers were declined, else the ping pairs of slots no longer
+    /// chosen.
+    pub timers_removed: Vec<String>,
     /// The timer units installed this run: the hold pair, the per-slot
     /// ping pairs, and the staged wake system timer.
     pub timers_installed: Vec<String>,
@@ -1631,9 +1711,10 @@ impl<'a> Wizard<'a> {
 
     /// The plan's optional toggles, after the frontends: the awake
     /// report (asked at the backends step — it is config), the
-    /// wake/hold/ping slot question (empty = skip silently; slots
-    /// install the hold and ping user timers and attempt the wake
-    /// system timer through sudo), and the history import offer (when
+    /// wake/hold/ping timers (a yes/no, then the slots: they install
+    /// the hold and ping user timers and attempt the wake system timer
+    /// through sudo; a no removes any an earlier run installed), and
+    /// the history import offer (when
     /// the source exists: the existing `toker import` logic,
     /// in-process, into the ledger the config names).
     fn toggles_step(
@@ -1648,13 +1729,21 @@ impl<'a> Wizard<'a> {
             "  awake (idle-sleep lock while sessions are live): {}",
             on_off(current.awake)
         ))?;
-        let slots = self.ask_slots()?;
-        if !slots.is_empty() {
-            self.timers_step(&slots, report)?;
+        // Asked as a yes/no first, defaulting to what is installed: the
+        // slots used to be one free-text question whose "clear for none"
+        // could not work, because the prompt hands back its default for
+        // an empty answer — declining installed the default timers.
+        let installed = InstalledTimers::read(&self.paths.units_dir);
+        let wanted = self.prompt.confirm(
+            "Wake the machine on weekdays to open quota windows on a schedule (wake/hold/ping timers)?",
+            installed.any(),
+        )?;
+        if wanted {
+            let slots = self.ask_slots(&installed)?;
+            self.timers_step(&slots, &installed, report)?;
+        } else if installed.any() {
+            self.remove_timers_step(&installed, report)?;
         }
-        // Empty slots skip silently: nothing printed, nothing
-        // installed — and any timers a previous run left standing stay
-        // exactly as they are.
         if !detected.ctp_usage {
             self.say("  predecessor history: none to import")?;
             return Ok(());
@@ -1695,28 +1784,35 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    /// The wake/hold/ping slot question: a free-form `hh:mm` list,
-    /// strictly validated (a bad token is named and re-asked); the
-    /// default — empty — is no slots, skipped silently.
-    fn ask_slots(&mut self) -> Result<Vec<String>> {
-        // The advertised defaults (README: a window open for the
-        // morning, re-opened after lunch), the predecessor's schedule:
-        // a slot is the wake and hold, and its ping fires 11 minutes
-        // later. 07:20's ping at 07:31 anchors the window on
-        // floor(07:31, 10 min) = 07:30, ending 12:30; 12:20's at 12:31
-        // anchors 12:30–17:30. Clearing the answer entirely is the
-        // explicit opt-out.
+    /// The wake/hold/ping slot question, once the timers are wanted: a
+    /// free-form `hh:mm` list, strictly validated (a bad token is named
+    /// and re-asked). The default is the slots an earlier run installed,
+    /// else [`DEFAULT_SLOTS`]; an empty answer takes it.
+    fn ask_slots(&mut self, installed: &InstalledTimers) -> Result<Vec<String>> {
+        let default = if installed.ping_slots.is_empty() {
+            DEFAULT_SLOTS.to_owned()
+        } else {
+            installed.ping_slots.join(", ")
+        };
         for _ in 0..3 {
             let answer = self.prompt.text(
-                "Weekday (Mon..Fri) wake/hold/ping slots (hh:mm, comma- or space-separated; clear for none)",
-                Some("07:20, 12:20"),
+                &format!(
+                    "Weekday (Mon..Fri) wake/hold/ping slots (hh:mm, comma- or space-separated; \
+                     each pings {PING_DELAY_MINUTES} minutes later)"
+                ),
+                Some(&default),
                 false,
             )?;
-            if answer.trim().is_empty() {
-                return Ok(Vec::new());
-            }
-            match timers::parse_slot_list(&answer) {
-                Ok(slots) => return Ok(slots),
+            // The seam's contract: the wizard resolves an empty answer
+            // to the default itself, so the real UI and the fake agree.
+            let answer = if answer.trim().is_empty() {
+                default.as_str()
+            } else {
+                answer.as_str()
+            };
+            match timers::parse_slot_list(answer) {
+                Ok(slots) if !slots.is_empty() => return Ok(slots),
+                Ok(_) => self.say("  no slots given — try again")?,
                 Err(bad) => self.say(&format!("  {bad:?} is not a hh:mm slot — try again"))?,
             }
         }
@@ -1727,9 +1823,16 @@ impl<'a> Wizard<'a> {
     /// wake, ping"). The hold and per-slot ping units go through the
     /// ordinary user-manager path (`install_unit`, `daemon-reload`,
     /// `enable --now` per timer); the wake SYSTEM timer follows in
-    /// [`Wizard::wake_step`]. Every failure here is non-fatal with the
-    /// manual commands printed.
-    fn timers_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
+    /// [`Wizard::wake_step`]. The ping timers of slots an earlier run
+    /// chose and this one did not are disabled and removed, not left
+    /// firing for a schedule nobody asked for. Every failure here is
+    /// non-fatal with the manual commands printed.
+    fn timers_step(
+        &mut self,
+        slots: &[String],
+        installed: &InstalledTimers,
+        report: &mut RunReport,
+    ) -> Result<()> {
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
         report.timer_slots = slots.to_vec();
 
@@ -1766,6 +1869,16 @@ impl<'a> Wizard<'a> {
                 }
             }
         }
+
+        let stale: Vec<String> = installed
+            .ping_slots
+            .iter()
+            .filter(|slot| !slots.contains(slot))
+            .map(|slot| format!("{}.timer", ping_unit_stem(slot)))
+            .collect();
+        // Not gating the enables below: a stale timer that will not go
+        // is no reason to leave the chosen ones off.
+        let retired = self.retire_user_timers(&stale, report)?;
 
         let mut timer_names = vec![HOLD_TIMER_UNIT.to_owned()];
         timer_names.extend(pings.iter().map(|pair| pair.timer_name.clone()));
@@ -1809,17 +1922,168 @@ impl<'a> Wizard<'a> {
                     .push(format!("systemctl --user enable --now {timer}"));
             }
             self.say("the user timers did not all come up — the wake timer is still attempted")?;
+        } else if !retired {
+            self.say("the timers of slots no longer chosen were not all removed")?;
+        }
+        if !(ok && retired) {
             self.say("finish the user timers by hand:")?;
             for command in &report.timers_manual {
                 self.say(&format!("  {command}"))?;
             }
         }
-        report.timers_ok = ok;
+        report.timers_ok = ok && retired;
 
         // The wake SYSTEM timer: independent of the user timers' fate
         // (a machine that never wakes still holds and pings fine while
         // it is up).
         self.wake_step(slots, report)
+    }
+
+    /// Disable (`--now`) and remove each user timer and the service of
+    /// the same stem. A timer that will not disable keeps its files, so
+    /// the manual command still has something to act on. Returns whether
+    /// every one went.
+    fn retire_user_timers(&mut self, timers: &[String], report: &mut RunReport) -> Result<bool> {
+        let mut ok = true;
+        for timer in timers {
+            let service = timer.replace(".timer", ".service");
+            match self.runner.systemctl_user(&["disable", "--now", timer]) {
+                Ok(output) if output.status.success() => {
+                    self.say(&format!("systemctl --user disable --now {timer} — ok"))?;
+                }
+                other => {
+                    ok = false;
+                    self.say(&format!(
+                        "systemctl --user disable --now {timer} failed: {}",
+                        stderr_of(&other)
+                    ))?;
+                    report
+                        .timers_manual
+                        .push(format!("systemctl --user disable --now {timer}"));
+                    continue;
+                }
+            }
+            for name in [timer, &service] {
+                match self.runner.remove_unit(name) {
+                    Ok(()) => {
+                        self.say(&format!("removed {name}"))?;
+                        report.timers_removed.push(name.clone());
+                    }
+                    Err(error) => {
+                        ok = false;
+                        self.say(&format!("removing {name} failed: {error:#}"))?;
+                        report
+                            .timers_manual
+                            .push(format!("rm {}", self.paths.units_dir.join(name).display()));
+                    }
+                }
+            }
+        }
+        Ok(ok)
+    }
+
+    /// The timers were declined while an earlier run's are installed:
+    /// disable and remove them all — the user units through the user
+    /// manager, the wake pair through the same sudo path that enabled
+    /// it. Non-fatal like the install, with the manual commands printed.
+    fn remove_timers_step(
+        &mut self,
+        installed: &InstalledTimers,
+        report: &mut RunReport,
+    ) -> Result<()> {
+        self.say("removing the wake/hold/ping timers an earlier run installed")?;
+        let mut timers = Vec::new();
+        if installed.hold {
+            timers.push(HOLD_TIMER_UNIT.to_owned());
+        }
+        timers.extend(
+            installed
+                .ping_slots
+                .iter()
+                .map(|slot| format!("{}.timer", ping_unit_stem(slot))),
+        );
+        let mut ok = self.retire_user_timers(&timers, report)?;
+        if !timers.is_empty() {
+            match self.runner.systemctl_user(&["daemon-reload"]) {
+                Ok(output) if output.status.success() => {
+                    self.say("systemctl --user daemon-reload — ok")?
+                }
+                other => {
+                    ok = false;
+                    self.say(&format!(
+                        "systemctl --user daemon-reload failed: {}",
+                        stderr_of(&other)
+                    ))?;
+                    report
+                        .timers_manual
+                        .push("systemctl --user daemon-reload".to_owned());
+                }
+            }
+        }
+        report.timers_ok = ok;
+        if !ok {
+            self.say("the user timers were not all removed; finish by hand:")?;
+            for command in &report.timers_manual {
+                self.say(&format!("  {command}"))?;
+            }
+        }
+
+        if !(installed.wake_timer || installed.wake_service) {
+            return Ok(());
+        }
+        // Only the units that exist: an install from before the wake
+        // service was written has the timer alone, and disabling a unit
+        // systemd has never heard of fails the whole call.
+        let mut wake = Vec::new();
+        if installed.wake_timer {
+            wake.push(WAKE_TIMER_UNIT);
+        }
+        if installed.wake_service {
+            wake.push(WAKE_SERVICE_UNIT);
+        }
+        self.say("disabling the wake system timer — sudo will be asked")?;
+        let mut args = vec!["disable", "--now"];
+        args.extend(&wake);
+        match self.runner.systemctl_system(&args) {
+            Ok(output) if output.status.success() => {
+                self.say(&format!("sudo systemctl {} — ok", args.join(" ")))?;
+                for name in &wake {
+                    match self.runner.remove_unit(name) {
+                        Ok(()) => {
+                            self.say(&format!("removed the staged {name}"))?;
+                            report.timers_removed.push((*name).to_owned());
+                        }
+                        Err(error) => {
+                            self.say(&format!("removing the staged {name} failed: {error:#}"))?;
+                            report
+                                .wake_manual
+                                .push(format!("rm {}", self.paths.units_dir.join(name).display()));
+                        }
+                    }
+                }
+            }
+            other => {
+                self.say(&format!(
+                    "disabling the wake system timer failed: {}",
+                    stderr_of(&other)
+                ))?;
+                // The staged files stay: the system manager may still
+                // link to them, and the manual disable needs them.
+                report.wake_manual = vec![
+                    format!("sudo systemctl {}", args.join(" ")),
+                    format!(
+                        "sudo rm -f /etc/systemd/system/{WAKE_TIMER_UNIT} \
+                         /etc/systemd/system/{WAKE_SERVICE_UNIT} && sudo systemctl daemon-reload"
+                    ),
+                ];
+                self.say("the wake timer is still enabled — it will keep waking the machine;")?;
+                self.say("finish by hand:")?;
+                for command in &report.wake_manual {
+                    self.say(&format!("  {command}"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The wake SYSTEM timer — the only root-level piece. The timer and
@@ -1989,25 +2253,35 @@ impl<'a> Wizard<'a> {
             None => "not imported".to_owned(),
         };
         self.say(&format!("  ledger    : {ledger}"))?;
-        let timers = if report.timer_slots.is_empty() {
-            "none chosen this run".to_owned()
+        let mut manual = Vec::new();
+        manual.extend(report.timers_manual.iter().cloned());
+        manual.extend(report.wake_manual.iter().cloned());
+        let removed = if report.timers_removed.is_empty() {
+            String::new()
         } else {
-            let mut manual = Vec::new();
-            manual.extend(report.timers_manual.iter().cloned());
-            manual.extend(report.wake_manual.iter().cloned());
-            if report.timers_ok && report.wake_enabled {
-                format!(
-                    "slots {} — hold+ping user timers installed and enabled; \
-                     wake system timer enabled",
-                    report.timer_slots.join(", ")
-                )
+            format!("; removed {}", report.timers_removed.join(", "))
+        };
+        let timers = if report.timer_slots.is_empty() {
+            if manual.is_empty() {
+                format!("none{removed}")
             } else {
                 format!(
-                    "slots {} — NOT fully up — finish by hand: {}",
-                    report.timer_slots.join(", "),
+                    "none — NOT fully removed{removed} — finish by hand: {}",
                     manual.join(" && ")
                 )
             }
+        } else if report.timers_ok && report.wake_enabled {
+            format!(
+                "slots {} — hold+ping user timers installed and enabled; \
+                 wake system timer enabled{removed}",
+                report.timer_slots.join(", ")
+            )
+        } else {
+            format!(
+                "slots {} — NOT fully up{removed} — finish by hand: {}",
+                report.timer_slots.join(", "),
+                manual.join(" && ")
+            )
         };
         self.say(&format!("  timers    : {timers}"))?;
         self.say("re-run `toker setup` any time to change anything.")?;
@@ -2196,6 +2470,8 @@ mod tests {
         message: String,
         options: Vec<String>,
         secret: bool,
+        /// The default offered, rendered (`None` when none was).
+        default: Option<String>,
     }
 
     /// The fake prompt: scripted answers in order, every question
@@ -2226,12 +2502,14 @@ mod tests {
             message: &str,
             options: &[&str],
             secret: bool,
+            default: Option<String>,
         ) -> Answer {
             self.asked.push(Asked {
                 kind,
                 message: message.to_owned(),
                 options: options.iter().map(|option| option.to_string()).collect(),
                 secret,
+                default,
             });
             self.answers.pop_front().unwrap_or_else(|| {
                 panic!("no scripted answer for {kind} {message:?} — script the run fully")
@@ -2244,23 +2522,29 @@ mod tests {
             &mut self,
             message: &str,
             options: &[&str],
-            _default: Option<usize>,
+            default: Option<usize>,
         ) -> Result<usize> {
-            match self.next("select", message, options, false) {
+            match self.next(
+                "select",
+                message,
+                options,
+                false,
+                default.map(|index| index.to_string()),
+            ) {
                 Answer::Select(index) => Ok(index),
                 other => panic!("select {message:?} was scripted {other:?}"),
             }
         }
 
-        fn confirm(&mut self, message: &str, _default: bool) -> Result<bool> {
-            match self.next("confirm", message, &[], false) {
+        fn confirm(&mut self, message: &str, default: bool) -> Result<bool> {
+            match self.next("confirm", message, &[], false, Some(default.to_string())) {
                 Answer::Confirm(yes) => Ok(yes),
                 other => panic!("confirm {message:?} was scripted {other:?}"),
             }
         }
 
-        fn text(&mut self, message: &str, _default: Option<&str>, secret: bool) -> Result<String> {
-            match self.next("text", message, &[], secret) {
+        fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String> {
+            match self.next("text", message, &[], secret, default.map(str::to_owned)) {
                 Answer::Text(answer) => Ok(answer),
                 other => panic!("text {message:?} was scripted {other:?}"),
             }
@@ -2283,6 +2567,7 @@ mod tests {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         system_calls: Arc<Mutex<Vec<Vec<String>>>>,
         installed: Arc<Mutex<Vec<(String, String)>>>,
+        removed: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeRunner {
@@ -2294,7 +2579,12 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 system_calls: Arc::new(Mutex::new(Vec::new())),
                 installed: Arc::new(Mutex::new(Vec::new())),
+                removed: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
@@ -2344,6 +2634,12 @@ mod tests {
                 .unwrap()
                 .push((name.to_owned(), contents.to_owned()));
             Ok(path)
+        }
+
+        fn remove_unit(&self, name: &str) -> Result<()> {
+            let _ = std::fs::remove_file(self.units_dir.join(name));
+            self.removed.lock().unwrap().push(name.to_owned());
+            Ok(())
         }
     }
 
@@ -2571,8 +2867,8 @@ default_backend_anthropic = "codex_sub"
     /// A full fresh-machine run: anthropic_sub, openrouter via env,
     /// awake on, the given port, yes to every detected frontend
     /// (claude, [workhorse,] opencode, shell rc — the caller splices
-    /// the workhorse confirm in where detection found it), and no
-    /// wake/hold/ping slots (the silent default).
+    /// the workhorse confirm in where detection found it), and no to
+    /// the wake/hold/ping timers (the default with none installed).
     fn answers_fresh(port: u16) -> Vec<Answer> {
         vec![
             select(0),               // anthropic backend: anthropic_sub
@@ -2585,7 +2881,7 @@ default_backend_anthropic = "codex_sub"
             confirm(true),           // opencode
             confirm(true),           // shell rc
             confirm(true),           // the opencode plugin (opt-out, on)
-            text(""),                // wake/hold/ping slots: none
+            confirm(false),          // wake/hold/ping timers: no
         ]
     }
 
@@ -2971,23 +3267,26 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(out.contains("[4/6] verify the service answers"), "{out}");
         assert!(out.contains("[5/6] wire the frontends"), "{out}");
         assert!(out.contains("[6/6] done"), "{out}");
-        // The slots question was asked (the last question of the run)
-        // and the empty answer skipped silently: no timer unit was
-        // installed, no enable attempted, nothing printed about wake.
+        // The timers question was asked (the last question of the
+        // run), defaulting to no with none installed, and the no
+        // installed nothing: no slots asked, no enable attempted,
+        // nothing printed about wake.
         let asked = rig.prompt.asked();
         assert!(
-            asked
-                .last()
-                .is_some_and(|asked| asked.message.contains("wake/hold/ping slots")),
-            "the slots question: {asked:?}"
+            asked.last().is_some_and(|asked| asked.kind == "confirm"
+                && asked.message.contains("wake/hold/ping timers")
+                && asked.default.as_deref() == Some("false")),
+            "the timers question: {asked:?}"
         );
         assert!(!out.contains("toker-hold"), "{out}");
         assert!(!out.contains("toker-ping"), "{out}");
         assert!(!out.contains("toker-wake"), "{out}");
         assert!(!out.contains("sudo"), "{out}");
+        assert!(rig.runner.removed().is_empty(), "nothing to remove");
+        assert!(rig.runner.system_calls().is_empty());
         assert!(
-            out.contains("timers    : none chosen this run"),
-            "the summary names the silent skip: {out}"
+            out.contains("timers    : none\n"),
+            "the summary names the decline: {out}"
         );
 
         // The fixture seeds were what the files said before the run —
@@ -3035,11 +3334,11 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         let mut rerun = Rig::at(
             root.clone(),
             vec![
-                select(0),     // keep the config
-                confirm(true), // claude: already wired
-                confirm(true), // opencode: already wired
-                confirm(true), // the shell rc: already wired
-                text(""),      // wake/hold/ping slots: none
+                select(0),      // keep the config
+                confirm(true),  // claude: already wired
+                confirm(true),  // opencode: already wired
+                confirm(true),  // the shell rc: already wired
+                confirm(false), // wake/hold/ping timers: no
             ],
             vec![active(), ok_empty(), ok_empty()],
         );
@@ -3079,10 +3378,13 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(report.units_ok);
         // The transcript pin: run two's first question was the
         // keep-vs-reconfigure select, the frontend questions were
-        // confirms, and the last question was the slots text (empty —
-        // the silent default).
+        // confirms, and the last question was the timers confirm (no —
+        // the default with none installed).
         let kinds: Vec<&str> = rerun.prompt.asked().iter().map(|a| a.kind).collect();
-        assert_eq!(kinds, ["select", "confirm", "confirm", "confirm", "text"]);
+        assert_eq!(
+            kinds,
+            ["select", "confirm", "confirm", "confirm", "confirm"]
+        );
 
         // The re-run detected everything and said so.
         let out = rerun.out();
@@ -3165,7 +3467,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
-                text(""),                // wake/hold/ping slots: none
+                confirm(false),          // wake/hold/ping timers: no
             ],
             vec![active(), ok_empty(), ok_empty()],
         );
@@ -3251,7 +3553,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // workhorse
-                text(""),                // wake/hold/ping slots: none
+                confirm(false),          // wake/hold/ping timers: no
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -3322,8 +3624,8 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 text(""),
                 confirm(true),
                 text(&port.to_string()),
-                text(""),      // wake/hold/ping slots: none
-                confirm(true), // import the predecessor's history
+                confirm(false), // wake/hold/ping timers: no
+                confirm(true),  // import the predecessor's history
             ],
             vec![inactive(), ok_empty(), ok_empty()],
         );
@@ -3378,7 +3680,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 answers[2] = select(1); // key source: literal in toker.toml
                 answers[3] = text(KEY); // the key itself, masked in the real UI
                 answers.truncate(6); // nothing past the port is asked
-                answers.push(text("")); // wake/hold/ping slots: none
+                answers.push(confirm(false)); // wake/hold/ping timers: no
                 answers
             },
             vec![inactive(), ok_empty(), ok_empty()],
@@ -3667,7 +3969,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers[10] = text("09:00, 12:30"); // the slots
+                answers.splice(10..11, [confirm(true), text("09:00, 12:30")]);
                 answers
             },
             vec![
@@ -3790,7 +4092,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-sudo-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers[10] = text("09:00"); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -3876,7 +4178,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-enable-refused",
             {
                 let mut answers = answers_fresh(port);
-                answers[10] = text("09:00"); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -3927,7 +4229,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             "timers-user-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers[10] = text("09:00"); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             vec![
@@ -3972,5 +4274,265 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         // The wake attempt still ran, and succeeded.
         assert!(report.wake_enabled);
         assert_eq!(rig.runner.system_calls().len(), 2);
+    }
+
+    /// Seed the scratch units dir with what an earlier run left there.
+    fn seed_units(rig: &Rig, names: &[&str]) {
+        let dir = rig.paths().units_dir;
+        std::fs::create_dir_all(&dir).expect("create the scratch units dir");
+        for name in names {
+            std::fs::write(dir.join(name), "[Unit]\n").expect("seed a unit");
+        }
+    }
+
+    fn strings(calls: Vec<Vec<&str>>) -> Vec<Vec<String>> {
+        calls
+            .into_iter()
+            .map(|call| call.into_iter().map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// A yes with an empty slot answer takes the default slots — the
+    /// predecessor's schedule — rather than meaning none.
+    #[tokio::test]
+    async fn accepting_with_an_empty_answer_installs_the_default_slots() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-default-slots",
+            {
+                let mut answers = answers_fresh(port);
+                answers.splice(10..11, [confirm(true), text("")]);
+                answers
+            },
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // daemon-reload (timers)
+                ok_empty(), // enable --now toker-hold.timer
+                ok_empty(), // enable --now toker-ping-0720.timer
+                ok_empty(), // enable --now toker-ping-1220.timer
+            ],
+        )
+        .with_system(vec![ok_empty(), ok_empty()]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert_eq!(report.timer_slots, ["07:20", "12:20"]);
+        assert!(report.timers_ok && report.wake_enabled);
+        let asked = rig.prompt.asked();
+        let n = asked.len();
+        assert_eq!(asked[n - 2].kind, "confirm");
+        assert_eq!(
+            asked[n - 2].default.as_deref(),
+            Some("false"),
+            "none installed"
+        );
+        assert_eq!(asked[n - 1].kind, "text");
+        assert_eq!(asked[n - 1].default.as_deref(), Some(DEFAULT_SLOTS));
+        assert!(
+            !asked[n - 1].message.contains("clear"),
+            "an empty answer is the default, so the prompt must not offer it as none"
+        );
+        let calls = rig.runner.calls();
+        assert_eq!(
+            calls[calls.len() - 2..],
+            strings(vec![
+                vec!["enable", "--now", "toker-ping-0720.timer"],
+                vec!["enable", "--now", "toker-ping-1220.timer"],
+            ])
+        );
+        assert!(rig.runner.removed().is_empty());
+    }
+
+    /// A no while an earlier run's timers are installed takes them all
+    /// out: the user pairs through the user manager, the wake timer
+    /// through sudo — here an install from before the wake service
+    /// existed, so only the timer is named to systemd.
+    #[tokio::test]
+    async fn declining_removes_the_timers_an_earlier_run_installed() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-decline-installed",
+            answers_fresh(port),
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // disable --now toker-hold.timer
+                ok_empty(), // disable --now toker-ping-0730.timer
+                ok_empty(), // daemon-reload (removal)
+            ],
+        )
+        .with_system(vec![ok_empty()]);
+        seed_units(
+            &rig,
+            &[
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                WAKE_TIMER_UNIT,
+            ],
+        );
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        let asked = rig.prompt.asked();
+        assert_eq!(
+            asked.last().and_then(|asked| asked.default.as_deref()),
+            Some("true"),
+            "installed timers make yes the default"
+        );
+        assert!(report.timer_slots.is_empty());
+        assert_eq!(
+            rig.runner.calls()[3..],
+            strings(vec![
+                vec!["disable", "--now", HOLD_TIMER_UNIT],
+                vec!["disable", "--now", "toker-ping-0730.timer"],
+                vec!["daemon-reload"],
+            ])
+        );
+        assert_eq!(
+            rig.runner.system_calls(),
+            strings(vec![vec!["disable", "--now", WAKE_TIMER_UNIT]])
+        );
+        assert_eq!(
+            report.timers_removed,
+            [
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                WAKE_TIMER_UNIT,
+            ]
+        );
+        let left: Vec<_> = std::fs::read_dir(rig.paths().units_dir)
+            .expect("the units dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with("toker-") && name != SOCKET_UNIT && name != SERVICE_UNIT
+            })
+            .collect();
+        assert!(left.is_empty(), "nothing of the timers is left: {left:?}");
+        let out = rig.out();
+        assert!(
+            out.contains("timers    : none; removed toker-hold.timer"),
+            "{out}"
+        );
+    }
+
+    /// A refused sudo on the decline leaves the wake pair staged, since
+    /// the system manager may still link to it, and says how to finish.
+    #[tokio::test]
+    async fn a_refused_wake_disable_keeps_the_staged_pair_and_says_so() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-decline-sudo-fail",
+            answers_fresh(port),
+            vec![inactive(), ok_empty(), ok_empty()],
+        )
+        .with_system(vec![Err(anyhow::anyhow!("sudo: a password is required"))]);
+        seed_units(&rig, &[WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("non-fatal");
+
+        assert_eq!(
+            rig.runner.system_calls(),
+            strings(vec![vec![
+                "disable",
+                "--now",
+                WAKE_TIMER_UNIT,
+                WAKE_SERVICE_UNIT
+            ]])
+        );
+        assert!(rig.runner.removed().is_empty(), "the staged pair stays");
+        assert!(rig.paths().units_dir.join(WAKE_TIMER_UNIT).exists());
+        assert_eq!(report.wake_manual.len(), 2, "{:?}", report.wake_manual);
+        let out = rig.out();
+        assert!(
+            out.contains("the wake timer is still enabled — it will keep waking the machine"),
+            "{out}"
+        );
+        assert!(out.contains("NOT fully removed"), "{out}");
+    }
+
+    /// A yes with a different slot list retires the ping pairs of the
+    /// slots it dropped — the old default's 07:30 here — and offers
+    /// the installed slots as the default.
+    #[tokio::test]
+    async fn a_changed_slot_list_retires_the_dropped_ping_timers() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-retire-stale",
+            {
+                let mut answers = answers_fresh(port);
+                answers.splice(10..11, [confirm(true), text("07:20, 12:20")]);
+                answers
+            },
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // disable --now toker-ping-0730.timer
+                ok_empty(), // daemon-reload (timers)
+                ok_empty(), // enable --now toker-hold.timer
+                ok_empty(), // enable --now toker-ping-0720.timer
+                ok_empty(), // enable --now toker-ping-1220.timer
+            ],
+        )
+        .with_system(vec![ok_empty(), ok_empty()]);
+        seed_units(
+            &rig,
+            &[
+                HOLD_TIMER_UNIT,
+                HOLD_SERVICE_UNIT,
+                "toker-ping-0730.timer",
+                "toker-ping-0730.service",
+                "toker-ping-1220.timer",
+                "toker-ping-1220.service",
+            ],
+        );
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        let asked = rig.prompt.asked();
+        let n = asked.len();
+        assert_eq!(asked[n - 2].default.as_deref(), Some("true"));
+        assert_eq!(
+            asked[n - 1].default.as_deref(),
+            Some("07:30, 12:20"),
+            "the installed slots are the default"
+        );
+        assert_eq!(
+            rig.runner.calls()[3],
+            ["disable", "--now", "toker-ping-0730.timer"]
+        );
+        assert_eq!(
+            report.timers_removed,
+            ["toker-ping-0730.timer", "toker-ping-0730.service"]
+        );
+        assert!(!rig.paths().units_dir.join("toker-ping-0730.timer").exists());
+        assert!(rig.paths().units_dir.join("toker-ping-1220.timer").exists());
+        assert!(report.timers_ok && report.wake_enabled);
+        assert!(
+            rig.out()
+                .contains("wake system timer enabled; removed toker-ping-0730.timer"),
+            "{}",
+            rig.out()
+        );
     }
 }
