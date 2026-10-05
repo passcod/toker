@@ -42,3 +42,10 @@ minutes (`RETRY_MS`). A row is written only when the held state flips (`kind =
 'awake'`), because the row is what separates "released because the sessions went
 quiet" from "the lock quietly failed". The whole evaluation runs under
 `catch_unwind`: the lock is not worth a request.
+
+A drained exit (`toker restart`, see [routing.md](routing.md)) kills the child
+itself and writes no row (`AwakeState::shut_down`). The PID watch would end it a
+moment later anyway; killing it first means no lock outlives the process, and
+nothing after it, the 60-second tick included, takes it back. No row, because a
+release row says the sessions went quiet, and at exit they need not have: the
+next instance reseeds the lanes and its first evaluation writes the hold again.

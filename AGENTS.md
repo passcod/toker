@@ -59,13 +59,15 @@ A change reaches live traffic only once the service runs the new binary;
 forgetting looks like the change not working.
 
 ```sh
-cargo install --path .
-systemctl --user restart toker.service
+cargo install --path . && toker restart
 ```
 
 The unit's `ExecStart` is whichever binary ran `toker setup`; if that was not
-the cargo-installed one, re-run setup. A restart aborts every in-flight stream.
-Clients retry, but the turn is lost, so restart when other sessions are quiet.
+the cargo-installed one, re-run setup. Do not restart with `systemctl --user
+restart toker.service`: it aborts every in-flight stream, and every other
+session loses its turn. `toker restart` waits until nothing is in flight, then
+has the service drain and exit for systemd to start the new binary, so no
+stream is cut. See [routing.md](docs/internals/routing.md).
 
 **Never point a frontend's `ANTHROPIC_BASE_URL` at a listener that is not up.**
 `settings.json` is hot-reloaded into running sessions, so pointing it at nothing

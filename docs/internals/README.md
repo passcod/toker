@@ -27,10 +27,10 @@ topic says that too.
 | Path | |
 | --- | --- |
 | `src/main.rs` | The CLI surface (clap). Every subcommand is a call into `cmds`. |
-| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, and the hidden timer verbs. |
+| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, `restart` (with its wait loop), and the hidden timer verbs. |
 | `src/config.rs` | `toker.toml` load: providers, protocol defaults, `[gates]`, `[notices]`, env overrides. |
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
-| `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick. |
+| `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick, the drain on shutdown. |
 | `src/server/anthropic.rs` | The Anthropic Messages frontend: release marker, quota gate, cold gate, compaction retarget, force-newest, model map, in that order. |
 | `src/server/proxy.rs` | The OpenAI-chat frontend (opencode → openrouter), with its own cold notice. |
 | `src/server/codex.rs` | The anthropic frontend's branch onto the codex backend: translate both ways instead of forwarding bytes. |

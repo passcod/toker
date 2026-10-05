@@ -85,13 +85,18 @@ reasons.
 
 4. **Bind `127.0.0.1` only.** The listener binds loopback (`server/mod.rs`, and
    `ListenStream=127.0.0.1:…` in the socket unit). toker answers
-   `/_toker/status`, `/_toker/models/merge` and `/_toker/session` itself; any
-   other `/_toker/` path is a local 404 and never leaves the proxy. Each demands
-   its verb in the `x-toker-control` header (`server/control.rs`), and
-   `models/merge` also a JSON body, so that a web page, which can reach
-   loopback, cannot drive one without a preflight nothing here answers.
-   `models/merge` can only add to the model store, for models already served.
-   Keep any new control path to the same terms, or better, do not add one.
+   `/_toker/status`, `/_toker/models/merge`, `/_toker/session` and
+   `/_toker/shutdown` itself; any other `/_toker/` path is a local 404 and
+   never leaves the proxy. Each demands its verb in the `x-toker-control`
+   header (`server/control.rs`), and the two POSTs, `models/merge` and
+   `shutdown`, also a JSON body, so that a web page, which can reach loopback,
+   cannot drive one without a preflight nothing here answers. `models/merge`
+   can only add to the model store, for models already served. `shutdown`
+   (`toker restart`'s) names the instance `status` reported and only drains:
+   the listener closes, every response under way finishes, and the process
+   exits for systemd to start again, so the worst a caller can do is a
+   restart that cuts nothing. Keep any new control path to the same terms, or
+   better, do not add one.
 
 5. **Never guess prices.** Verify against the published pricing page and move
    `catalog::pricing::VERIFIED_ON`; the context-window table has its own

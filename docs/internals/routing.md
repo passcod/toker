@@ -117,3 +117,40 @@ are passed in. That is what keeps a translated conversation's upstream prefix
 stable even though it never existed in the frontend's format. The first request
 of an existing conversation over a translated route still rebuilds the upstream
 cache once, because the upstream's prefix genuinely changed.
+
+## Restarting without cutting a stream
+
+`systemctl --user restart toker.service` stops the process with SIGTERM, and
+every response still streaming through it ends mid-turn. The client retries, but
+that turn is lost, in every session at once. `toker restart` replaces it:
+
+1. It polls `/_toker/status` once a second until `in_flight` reads zero on
+   `QUIET_POLLS` (3) polls in a row. `in_flight` counts only exchanges already
+   under way, and an agent's next request follows its tool calls after a short
+   gap, so a single idle reading can fall between two requests of one busy
+   turn. Ctrl-C here changes nothing; `--max-wait` gives up the same way.
+2. It posts `/_toker/shutdown` with the `instance` id status reported. A
+   mismatch is a 409, so a restart that raced another never stops an instance
+   it did not see.
+3. The server drains (`Server::serve_listener`, axum's graceful shutdown): it
+   stops accepting, lets every response under way finish, closes idle
+   keep-alive connections, then exits 0. There is no drain deadline, because
+   the point is never to cut a stream; a stalled upstream still fails after the
+   upstream idle timeout, as it would at any time.
+4. `Restart=always` in the service unit (`service_unit` in `setup/wizard.rs`)
+   restarts it after any exit, a clean one included. The socket unit keeps the
+   listening socket the whole time, so connections that arrive meanwhile queue
+   in the kernel and the next instance accepts them.
+5. The CLI polls status until a different `instance` answers, for up to 30
+   seconds. Uptime cannot tell the two apart: an instance asked to stop a
+   second after it started reads like its successor.
+
+Waiting for a quiet moment is not what keeps streams whole; the drain does that
+on its own. It keeps new requests from queueing behind a long one: from the
+moment the listener closes until the old process exits, nothing accepts them.
+`--now` skips the wait and accepts that queue.
+
+A `toker serve` run by hand has no systemd behind it: the drain still works, but
+nothing starts the next instance, and the CLI says so when its wait runs out. A
+toker from before this endpoint answers status without an `instance`, and the
+CLI refuses rather than falling back to a signal.
