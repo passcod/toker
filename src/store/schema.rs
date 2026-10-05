@@ -200,6 +200,16 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ALTER TABLE pings ADD COLUMN verified INTEGER;
     ALTER TABLE pings ADD COLUMN assumed INTEGER;
     "#,
+    // v5 — a lane index on the ledger. Capture now compares each request's
+    // system prompt with its lane's previous row, read from the ledger on
+    // every anthropic response, and keeps the ladders only where the
+    // prompt changed, so finding a baseline's rungs also walks back
+    // through the lane. Both reads are by session × tools hash, newest
+    // first; the session index alone would scan and sort a whole session
+    // per response. Existing rows are indexed, not rewritten.
+    r#"
+    CREATE INDEX requests_lane_idx ON requests (session_id, tools_hash, ts_ms);
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.

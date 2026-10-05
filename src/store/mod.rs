@@ -30,8 +30,9 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LocalisationRow, MeterRow, RebuildRow,
-    RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
+    CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, MeterRow,
+    RebuildRow, RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionSummary,
+    StoredLadders, is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingAction, PingRecord};
 
@@ -275,6 +276,44 @@ impl Store {
     /// for the rows a system-prompt change was attributed to.
     pub fn localisation_rows(&self, ids: &[i64]) -> Result<Vec<LocalisationRow>> {
         ledger::localisation_rows(&*self.conn()?, ids)
+    }
+
+    /// The lane's newest measurement row carrying a system prompt: the
+    /// baseline capture compares a new request's system prompt with. See
+    /// `ledger::lane_system_predecessor` for why the ledger, not the lane
+    /// table.
+    pub fn lane_system_predecessor(
+        &self,
+        session_id: &str,
+        tools_hash: &str,
+    ) -> Result<Option<LaneSystemRow>> {
+        ledger::lane_system_predecessor(&*self.conn()?, session_id, tools_hash)
+    }
+
+    /// The stored rungs of the system prompt `system_hash` in a lane, from
+    /// the newest row at or before `(ts_ms, id)` that kept them. See
+    /// `ledger::lane_system_ladders`.
+    pub fn lane_system_ladders(
+        &self,
+        session_id: &str,
+        tools_hash: &str,
+        system_hash: &str,
+        at_or_before: (i64, i64),
+    ) -> Result<Option<StoredLadders>> {
+        ledger::lane_system_ladders(
+            &*self.conn()?,
+            session_id,
+            tools_hash,
+            system_hash,
+            at_or_before,
+        )
+    }
+
+    /// Run raw SQL against the store: tests that need a ledger read to
+    /// fail use it to break the schema under the code being tested.
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str) -> Result<()> {
+        Ok(self.conn()?.execute_batch(sql)?)
     }
 
     /// Total ledger row count.
@@ -1300,6 +1339,81 @@ mod tests {
         assert_eq!(rows[0].cache_write_total, None);
         assert_eq!(rows[0].system_blocks, None);
         assert_eq!(rows[0].tools_hash, None);
+    }
+
+    #[test]
+    fn lane_system_reads_stay_in_the_lane_and_skip_proxy_rows() {
+        let store = mem_store();
+        let mut first = rebuild_row(100, "ses-a");
+        first.system_ladder = Some(r#"["r1"]"#.to_owned());
+        first.system_tail = Some(r#"["t1"]"#.to_owned());
+        store.record_request(&first).expect("record");
+        // Same prompt, ladders dropped.
+        store
+            .record_request(&rebuild_row(200, "ses-a"))
+            .expect("record");
+        // Another lane in the session, another session, and a proxy row,
+        // all newer: none is the lane's predecessor.
+        let mut other_tools = rebuild_row(300, "ses-a");
+        other_tools.tools_hash = Some("sha256:tools-2".to_owned());
+        other_tools.system_hash = Some("sha256:sys-9".to_owned());
+        store.record_request(&other_tools).expect("record");
+        let mut other_session = rebuild_row(300, "ses-b");
+        other_session.system_hash = Some("sha256:sys-9".to_owned());
+        store.record_request(&other_session).expect("record");
+        let mut proxy = rebuild_row(400, "ses-a");
+        proxy.kind = Some(RowKind::Error);
+        proxy.system_hash = Some("sha256:sys-9".to_owned());
+        store.record_request(&proxy).expect("record");
+
+        let prev = store
+            .lane_system_predecessor("ses-a", "sha256:tools-1")
+            .expect("read")
+            .expect("a predecessor");
+        assert_eq!(prev.ts_ms, 200);
+        assert_eq!(prev.system_hash, "sha256:sys-1");
+        assert_eq!(prev.system_chars, Some(43_696));
+        assert!(
+            store
+                .lane_system_predecessor("ses-c", "sha256:tools-1")
+                .expect("read")
+                .is_none(),
+            "a lane with no rows has no predecessor"
+        );
+
+        // The rungs come from the row that kept them, at or before the
+        // predecessor, and only for its hash.
+        let ladders = store
+            .lane_system_ladders(
+                "ses-a",
+                "sha256:tools-1",
+                "sha256:sys-1",
+                (prev.ts_ms, prev.id),
+            )
+            .expect("read");
+        assert_eq!(
+            ladders,
+            Some((Some(vec!["r1".to_owned()]), Some(vec!["t1".to_owned()])))
+        );
+        assert_eq!(
+            store
+                .lane_system_ladders("ses-a", "sha256:tools-1", "sha256:sys-1", (99, i64::MAX))
+                .expect("read"),
+            None,
+            "nothing before the first row"
+        );
+        assert_eq!(
+            store
+                .lane_system_ladders(
+                    "ses-a",
+                    "sha256:tools-1",
+                    "sha256:sys-2",
+                    (prev.ts_ms, prev.id)
+                )
+                .expect("read"),
+            None,
+            "another prompt's rungs are never borrowed"
+        );
     }
 
     #[test]

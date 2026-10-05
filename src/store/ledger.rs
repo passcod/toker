@@ -210,11 +210,20 @@ pub struct RequestRow {
     pub compact_generations: Option<i64>,
     /// Request was a summarisation pass (compaction), 0/1.
     pub summarising: Option<bool>,
-    /// System-prompt change event as JSON (digests/counts, no content).
+    /// Where the system prompt changed against the lane's previous row, as
+    /// `{delta, where}` (counts and offsets, no content), computed at
+    /// capture. NULL is not "unchanged": it is also every row before
+    /// capture-time localisation existed, a lane's first row, and a change
+    /// whose baseline ladders could not be found.
     pub system_change: Option<Value>,
-    /// System ladder summary, e.g. blocks/tools/messages tiers.
+    /// Cumulative system-text prefix digests (a JSON array as text). Kept
+    /// only on a lane's first row and on rows whose system prompt changed;
+    /// a row whose prompt matched its lane predecessor drops it, so the
+    /// latest row in the lane carrying the same `system_hash` holds it.
+    /// Earlier toker rows carry it on every row.
     pub system_ladder: Option<String>,
-    /// Digest of the system prompt tail.
+    /// System-text suffix digests (a JSON array as text), kept on the same
+    /// rows as `system_ladder`.
     pub system_tail: Option<String>,
     /// Quota gate was on when this row was written.
     pub gate_on: Option<bool>,
@@ -827,23 +836,21 @@ fn read_rebuild_row(row: &rusqlite::Row<'_>) -> Result<RebuildRow> {
 
 /// One row of the targeted localisation fetch: the heavy text columns
 /// the rebuild walk refuses to carry per row. Ladders and tails are
-/// JSON arrays of digests kept at rung-per-2 KiB / rung-per-8-to-64
+/// JSON arrays of digests kept at rung-per-8 KiB / rung-per-8-to-64
 /// byte density — roughly 1.7 KB per row against a ~0.4 KB block map —
 /// so they are fetched only for the rows a system-prompt change was
 /// actually attributed to (typically none at all; the handful at most).
 ///
-/// `system_change` rides the same query: the predecessor's capture-time
-/// localisation, which imported rows carry
-/// precomputed. The reference walk prefers it
-/// and re-derives from the ladders only where it is absent — toker
-/// itself never writes the column (the lane middleware has not landed),
-/// but the imported history carries it, and a localisation that
-/// ignored it would throw away the one bound the data actually has.
+/// `system_change` rides the same query: the capture-time localisation,
+/// which toker writes on a changed row and imported ctp rows carry too.
+/// The walk prefers it and re-derives from the ladders only where it is
+/// absent (older toker rows, and a change whose baseline capture could not
+/// find).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalisationRow {
     /// The row id the fetch was keyed on.
     pub id: i64,
-    /// Cumulative system-text digests every 2 KiB, oldest first.
+    /// Cumulative system-text digests every 8 KiB, oldest first.
     pub system_ladder: Option<Vec<String>>,
     /// Digests of the system text's last 8…256 bytes in 8-byte steps,
     /// then 320…1024 in 64-byte steps.
@@ -905,6 +912,102 @@ fn string_array(
         None => Ok(None),
         Some(value) => Ok(Some(serde_json::from_value(value)?)),
     }
+}
+
+/// The newest measurement row in a lane that carries a system prompt: the
+/// baseline a new request's system prompt is compared with at capture.
+/// The lane is `session_id` × `tools_hash` (the lane rule; a session is
+/// not a cache entry).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneSystemRow {
+    /// Row id.
+    pub id: i64,
+    /// Epoch milliseconds.
+    pub ts_ms: i64,
+    /// Digest of the full system prompt; never NULL here (the read
+    /// filters on it).
+    pub system_hash: String,
+    /// System prompt length in UTF-16 units.
+    pub system_chars: Option<i64>,
+    /// Per-block system digests/lengths as JSON.
+    pub system_blocks: Option<Value>,
+}
+
+/// The lane's newest measurement row with a system hash ([`LaneSystemRow`]).
+///
+/// Read from the ledger rather than the lane table: the ledger is never
+/// pruned, so a lane idle past the lane table's 30 days still has its
+/// baseline, and a restart loses nothing. Proxy-written rows carry no
+/// system hash and are excluded by kind as well, since a proxy row is not
+/// evidence about any prompt. Ordered by time, not id: imported rows were
+/// inserted after toker's own first rows.
+pub(super) fn lane_system_predecessor(
+    conn: &Connection,
+    session_id: &str,
+    tools_hash: &str,
+) -> Result<Option<LaneSystemRow>> {
+    super::row_of(
+        conn,
+        "SELECT id, ts_ms, system_hash, system_chars, system_blocks
+         FROM requests
+         WHERE session_id = ?1 AND tools_hash = ?2
+           AND kind IS NULL AND system_hash IS NOT NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        rusqlite::params![session_id, tools_hash],
+        |row| {
+            Ok(LaneSystemRow {
+                id: row.get("id")?,
+                ts_ms: row.get("ts_ms")?,
+                system_hash: row.get("system_hash")?,
+                system_chars: row.get("system_chars")?,
+                system_blocks: super::opt_json_from_text(row.get("system_blocks")?)?,
+            })
+        },
+    )
+}
+
+/// A system prompt's stored rungs: `(ladder, tail)`, each `None` where the
+/// row stored none (an empty ladder is stored as NULL).
+pub type StoredLadders = (Option<Vec<String>>, Option<Vec<String>>);
+
+/// The rungs of the newest row in a lane, at or before `(ts_ms, id)`, that
+/// carried the system prompt `system_hash` and kept its ladders.
+///
+/// Keyed on the hash, so the rungs found are always the rungs of that
+/// exact prompt: whichever row kept them, it measured the same text. Rows
+/// keep ladders only where the prompt changed or the lane began, so the
+/// predecessor itself usually has none and this finds the row that
+/// introduced its prompt. `None` when no such row exists, which says
+/// nothing about where a change was.
+pub(super) fn lane_system_ladders(
+    conn: &Connection,
+    session_id: &str,
+    tools_hash: &str,
+    system_hash: &str,
+    at_or_before: (i64, i64),
+) -> Result<Option<StoredLadders>> {
+    let (ts_ms, id) = at_or_before;
+    super::row_of(
+        conn,
+        "SELECT system_ladder, system_tail
+         FROM requests
+         WHERE session_id = ?1 AND tools_hash = ?2 AND system_hash = ?3
+           AND kind IS NULL
+           AND (system_ladder IS NOT NULL OR system_tail IS NOT NULL)
+           AND (ts_ms < ?4 OR (ts_ms = ?4 AND id <= ?5))
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        rusqlite::params![session_id, tools_hash, system_hash, ts_ms, id],
+        |row| {
+            let ladder = super::opt_json_from_text(row.get("system_ladder")?)?;
+            let tail = super::opt_json_from_text(row.get("system_tail")?)?;
+            // A rung list of the wrong shape localises nothing: absent,
+            // as in `localisation_rows`.
+            Ok((
+                string_array(ladder).ok().flatten(),
+                string_array(tail).ok().flatten(),
+            ))
+        },
+    )
 }
 
 /// Total row count — cheap enough for the TUI footer and `toker status`.
