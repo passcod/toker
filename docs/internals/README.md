@@ -28,7 +28,7 @@ plan](../plans/cutover.md).
 | Path | |
 | --- | --- |
 | `src/main.rs` | The CLI surface (clap). Every subcommand is a call into `cmds`. |
-| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `promote`, and the hidden timer verbs. |
+| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `promote`, and the hidden timer verbs. |
 | `src/config.rs` | `toker.toml` load: providers, protocol defaults, `[gates]`, `[notices]`, env overrides. |
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
 | `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick. |
@@ -53,6 +53,7 @@ plan](../plans/cutover.md).
 | `src/catalog/` | Hand-verified prices (`pricing.rs`) and context windows (`windows.rs`), each with a `VERIFIED_ON`; the providers' fetched model listings (`fetched.rs`). |
 | `src/store/` | The SQLite ledger (`ledger.rs`), the state tables (`state.rs`), and the append-only migrations (`schema.rs`). |
 | `src/import.rs` | `toker import`: ctp's `usage.jsonl` into the ledger, with a checkpoint. |
+| `src/export.rs` | `toker export`: the ledger as JSONL, and the strict `--since`/`--until`/`--kind` parsers. |
 | `src/timers.rs` | The wake/hold/ping verbs the systemd units run. |
 | `src/setup/` | The wizard and its tested halves: atomic config writes, frontend patchers, the wiring check, unit templates, the bundled opencode plugin. |
 | `src/tui/` | The dashboard: aggregation (`model.rs`, `quota.rs`, `rebuilds.rs`), rendering (`view.rs`), session labels from transcripts, locale formatting. |

@@ -1168,3 +1168,173 @@ fn parse_stored<T>(
         }),
     }
 }
+
+/// Which rows a full-ledger walk ([`for_each_export`], [`for_each_row`])
+/// visits. Every bound is optional; the default visits every row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFilter {
+    /// Only rows with `ts_ms >= since_ms`.
+    pub since_ms: Option<i64>,
+    /// Only rows with `ts_ms < until_ms` (exclusive, so consecutive
+    /// windows never share a row).
+    pub until_ms: Option<i64>,
+    /// Only rows whose `session_id` starts with this. A row with no
+    /// session id never matches a prefix.
+    pub session_prefix: Option<String>,
+    /// Which row kinds.
+    pub kind: KindFilter,
+}
+
+/// The kind half of a [`RequestFilter`]. Measurement and proxy rows are
+/// split by the presence of a kind, never by listing kinds (the
+/// [`is_api_measurement`] rule), so a kind added later lands on the
+/// proxy side without anyone remembering to list it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KindFilter {
+    /// Every row.
+    #[default]
+    All,
+    /// API measurements only (`kind IS NULL`).
+    Measurement,
+    /// Proxy-written rows only (`kind IS NOT NULL`).
+    Proxy,
+    /// One proxy-written kind.
+    Is(RowKind),
+}
+
+impl RequestFilter {
+    /// The WHERE clause and its bound parameters. Values are always
+    /// bound, never spliced, so a session prefix is data, not SQL.
+    fn where_clause(&self) -> (String, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value as Sql;
+        let mut terms = Vec::new();
+        let mut params = Vec::new();
+        if let Some(since) = self.since_ms {
+            params.push(Sql::Integer(since));
+            terms.push(format!("ts_ms >= ?{}", params.len()));
+        }
+        if let Some(until) = self.until_ms {
+            params.push(Sql::Integer(until));
+            terms.push(format!("ts_ms < ?{}", params.len()));
+        }
+        if let Some(prefix) = &self.session_prefix {
+            // substr rather than LIKE: a prefix holding `%` or `_` must
+            // match literally, and LIKE is case-insensitive for ASCII.
+            params.push(Sql::Text(prefix.clone()));
+            let n = params.len();
+            terms.push(format!("substr(session_id, 1, length(?{n})) = ?{n}"));
+        }
+        match self.kind {
+            KindFilter::All => {}
+            KindFilter::Measurement => terms.push("kind IS NULL".to_owned()),
+            KindFilter::Proxy => terms.push("kind IS NOT NULL".to_owned()),
+            KindFilter::Is(kind) => {
+                params.push(Sql::Text(kind.as_str().to_owned()));
+                terms.push(format!("kind = ?{}", params.len()));
+            }
+        }
+        let clause = if terms.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", terms.join(" AND "))
+        };
+        (clause, params)
+    }
+}
+
+/// The columns that hold JSON as text. The export nests these as JSON
+/// rather than as strings holding JSON, so `jq .rate_limits.util5h`
+/// works without a `fromjson`. `usage_raw` is byte-verbatim in the
+/// ledger; the export re-serialises it compactly (same values, same key
+/// order, possibly different whitespace), because a pretty-printed
+/// provider body would otherwise break the one-row-per-line contract.
+pub const JSON_TEXT_COLUMNS: &[&str] = &[
+    "usage_presence",
+    "usage_raw",
+    "rate_limits",
+    "system_blocks",
+    "system_change",
+    "system_ladder",
+    "system_tail",
+    "model_mappings",
+    "extra",
+    "betas",
+];
+
+/// Walk the filtered rows oldest first (`ts_ms`, then `id`), handing each
+/// to `emit` as a JSON object keyed by the ledger's own column names,
+/// in column order. Driven by the columns the query returns rather than
+/// by [`RequestRow`], so a column added by a later migration is
+/// exported the day it exists, and a stored value this binary does not
+/// understand (an unknown `kind`) is shown rather than refused.
+///
+/// NULL is omitted: a key that is absent means the ledger did not
+/// record it, and no absent value is ever written as zero or `""`.
+/// Values are as stored: integers (including the 0/1 boolean columns)
+/// as integers, reals as numbers, text as strings, and the
+/// [`JSON_TEXT_COLUMNS`] nested when they parse (kept as a string when
+/// they do not, so a malformed value is visible rather than dropped).
+/// `ts`, the RFC 3339 UTC rendering of `ts_ms`, leads each object: it is
+/// the one key that is not a column, there so a date can be grepped.
+///
+/// The rows stream from the cursor; nothing but the current row is held.
+pub(super) fn for_each_export(
+    conn: &Connection,
+    filter: &RequestFilter,
+    mut emit: impl FnMut(&serde_json::Map<String, Value>) -> std::io::Result<()>,
+) -> Result<()> {
+    use rusqlite::types::ValueRef;
+    let (clause, params) = filter.where_clause();
+    let sql = format!("SELECT * FROM requests {clause} ORDER BY ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        let mut object = serde_json::Map::new();
+        let ts_ms: i64 = row.get("ts_ms")?;
+        if let Ok(ts) = jiff::Timestamp::from_millisecond(ts_ms) {
+            object.insert("ts".to_owned(), Value::String(ts.to_string()));
+        }
+        for (index, name) in names.iter().enumerate() {
+            let value = match row.get_ref(index)? {
+                ValueRef::Null => continue,
+                ValueRef::Integer(n) => Value::from(n),
+                // JSON has no infinity; SQLite can hold one (never NaN).
+                ValueRef::Real(x) => serde_json::Number::from_f64(x)
+                    .map(Value::Number)
+                    .unwrap_or_else(|| Value::String(x.to_string())),
+                ValueRef::Text(bytes) => {
+                    let text = String::from_utf8_lossy(bytes);
+                    if JSON_TEXT_COLUMNS.contains(&name.as_str()) {
+                        serde_json::from_str(&text).unwrap_or(Value::String(text.into_owned()))
+                    } else {
+                        Value::String(text.into_owned())
+                    }
+                }
+                // No column is a BLOB; one would be a value nothing in
+                // toker wrote. Say so rather than dump its bytes.
+                ValueRef::Blob(bytes) => Value::String(format!("<blob of {} bytes>", bytes.len())),
+            };
+            object.insert(name.clone(), value);
+        }
+        emit(&object)?;
+    }
+    Ok(())
+}
+
+/// Walk the filtered rows oldest first as typed [`RequestRow`]s, one at
+/// a time from the cursor (the context-window watch's read).
+pub(super) fn for_each_row(
+    conn: &Connection,
+    filter: &RequestFilter,
+    mut visit: impl FnMut(RequestRow) -> Result<()>,
+) -> Result<()> {
+    let (clause, params) = filter.where_clause();
+    let sql = format!("SELECT * FROM requests {clause} ORDER BY ts_ms ASC, id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        visit(read_row(row)?)?;
+    }
+    Ok(())
+}

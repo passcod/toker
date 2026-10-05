@@ -8,7 +8,8 @@
 //! dashboard. The modules live in the `toker` library crate (src/lib.rs).
 
 use toker::cmds;
-use toker::store::CostKind;
+use toker::export;
+use toker::store::{CostKind, KindFilter, RequestFilter};
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -91,8 +92,28 @@ enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Emit the ledger as JSONL for greppability (plan: Storage).
-    Export,
+    /// Emit the ledger's rows as JSONL on stdout, oldest first, one
+    /// object per row keyed by column name; NULL columns are omitted.
+    Export {
+        /// Ledger path; TOKER_DB env or the config default when omitted.
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<PathBuf>,
+        /// Only rows at or after this time: RFC 3339
+        /// (2026-10-05T09:00:00Z) or a span before now (90m, 2h, 3d, 1w).
+        #[arg(long = "since", value_name = "TIME", value_parser = export::instant_arg)]
+        since: Option<i64>,
+        /// Only rows before this time (exclusive); same forms as --since.
+        #[arg(long = "until", value_name = "TIME", value_parser = export::instant_arg)]
+        until: Option<i64>,
+        /// Only rows whose session id starts with this.
+        #[arg(long = "session", value_name = "PREFIX")]
+        session: Option<String>,
+        /// Which rows: all (default), measurement (API measurements),
+        /// proxy (every proxy-written row), or one kind (blocked,
+        /// released, cold, cold-quiet, awake, error, fidelity-drift).
+        #[arg(long = "kind", value_name = "KIND", default_value = "all", value_parser = export::kind_arg)]
+        kind: KindFilter,
+    },
 
     /// A documented no-op: wake is owned by the systemd system timer
     /// (plan: Sleep lock, wake, ping). The predecessor's one-shot
@@ -142,14 +163,23 @@ fn main() -> anyhow::Result<()> {
             force,
             dry_run,
         } => cmds::import(from, db, cost_kind, force, dry_run),
-        Command::Export => not_implemented("export"),
+        Command::Export {
+            db,
+            since,
+            until,
+            session,
+            kind,
+        } => cmds::export(
+            db,
+            RequestFilter {
+                since_ms: since,
+                until_ms: until,
+                session_prefix: session,
+                kind,
+            },
+        ),
         Command::WakeArm => cmds::wake_arm(),
         Command::Hold { for_ } => cmds::hold(for_),
         Command::PingWindow { slot } => cmds::ping_window(slot),
     }
-}
-
-fn not_implemented(what: &str) -> anyhow::Result<()> {
-    eprintln!("not implemented yet: {what}");
-    Ok(())
 }

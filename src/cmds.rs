@@ -192,6 +192,30 @@ pub fn import(
     })
 }
 
+/// The ledger a reading verb opens: `--db` when given, else `TOKER_DB`
+/// or the config default (the config is read only when it is needed, so
+/// an explicit path works without one).
+fn ledger_path(db: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match db {
+        Some(db) => Ok(db),
+        None => Ok(Config::load()?.db_path),
+    }
+}
+
+/// `export`: the ledger's rows as JSONL on stdout (see [`crate::export`]
+/// for the format). The ledger is opened read-only, so a wrong path
+/// fails rather than creating one. A reader that goes away (`| head`)
+/// ends the export quietly with success: it got what it asked for.
+pub fn export(db: Option<PathBuf>, filter: crate::store::RequestFilter) -> anyhow::Result<()> {
+    let store = Store::open_read_only(ledger_path(db)?)?;
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    match crate::export::write_jsonl(&store, &filter, &mut out) {
+        Ok(_) => Ok(()),
+        Err(error) if crate::export::is_broken_pipe(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// A local-clock rendering of a row ts (the system zone; UTC-shaped on
 /// any failure — the timestamp is never hidden by a formatting error).
 fn fmt_ts(ts_ms: i64) -> String {

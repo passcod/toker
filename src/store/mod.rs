@@ -30,8 +30,8 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, DisplayRow, LocalisationRow, MeterRow, RebuildRow, RequestRow, RowKind,
-    SessionCostGroup, SessionSummary, is_api_measurement,
+    CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LocalisationRow, MeterRow, RebuildRow,
+    RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionSummary, is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingAction, PingRecord};
 
@@ -120,6 +120,42 @@ impl Store {
         Ok(store)
     }
 
+    /// Open an existing ledger for reading only: no file or directory is
+    /// created, no migration runs, and nothing (not even
+    /// `meta.created_at`) is written. The readers that are not the
+    /// service (`toker export`, `toker watch-context-window`) use this,
+    /// so pointing one at the wrong path fails instead of leaving an
+    /// empty ledger behind, and an older binary never migrates the live
+    /// file under the service.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Store> {
+        use rusqlite::OpenFlags;
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no ledger at {}", path.display()),
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+        if version < 1 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not a toker ledger (schema version 0)",
+                    path.display()
+                ),
+            )));
+        }
+        Ok(Store {
+            conn: Mutex::new(conn),
+        })
+    }
+
     /// The mutexed connection; every operation goes through this, so
     /// writes are ordered and no statement interleaves with another.
     ///
@@ -156,6 +192,29 @@ impl Store {
     pub fn requests_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<RequestRow>> {
         let limit = limit.min(i64::MAX as u64) as i64;
         ledger::requests_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The export walk: every row `filter` admits, oldest first, as a
+    /// JSON object keyed by column name, streamed from the cursor (see
+    /// `ledger::for_each_export` for the value rules). An error `emit`
+    /// returns ends the walk and comes back as [`Error::Io`], so a
+    /// closed pipe can be told apart from a store failure.
+    pub fn for_each_export(
+        &self,
+        filter: &RequestFilter,
+        emit: impl FnMut(&serde_json::Map<String, Value>) -> std::io::Result<()>,
+    ) -> Result<()> {
+        ledger::for_each_export(&*self.conn()?, filter, emit)
+    }
+
+    /// Every row `filter` admits, oldest first, as [`RequestRow`]s, one
+    /// at a time from the cursor.
+    pub fn for_each_request(
+        &self,
+        filter: &RequestFilter,
+        visit: impl FnMut(RequestRow) -> Result<()>,
+    ) -> Result<()> {
+        ledger::for_each_row(&*self.conn()?, filter, visit)
     }
 
     /// The quota panel's meter lookback: rows with `ts_ms >= ts_ms` that

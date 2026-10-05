@@ -109,6 +109,32 @@ mapping is behind the source.
 
 Not yet in toker (cutover plan, Gate D): `system_change` is not computed at
 capture time, so only imported rows carry it and the TUI localises system
-changes from the stored ladders instead; and `toker export`, the JSONL view of
-the ledger, is not implemented (it currently prints "not implemented" and exits
-0).
+changes from the stored ladders instead.
+
+## Export
+
+`toker export` (`export.rs`, over `Store::for_each_export`) writes the rows as
+JSONL, oldest first, streamed from the cursor. It is driven by the columns the
+query returns, not by `RequestRow`, so a column a later migration adds is
+exported the day it exists, and a stored value this binary does not understand
+is shown rather than refused.
+
+- Keys are the column names. The export uses the ledger's vocabulary so a key
+  means exactly what this page says the column means; ctp's camelCase would
+  make toker rows look like ctp rows while meaning something else.
+- NULL is omitted, never written as `null` or zero. A missing key is "not
+  recorded", and the same caution about earlier rows applies.
+- Values are as stored: the boolean columns are `0`/`1`. The JSON-text columns
+  (`JSON_TEXT_COLUMNS`: `rate_limits`, `extra`, `betas`, the ladders,
+  `usage_raw`, …) are nested, re-serialised compactly; `usage_raw`'s exact
+  bytes stay in the ledger.
+- `ts`, the RFC 3339 UTC form of `ts_ms`, is the one key that is not a column,
+  there so a date can be grepped.
+- `usage_raw` is exported: it is the provider's `usage` object (counts and
+  costs), which is all the recorders store there. Nothing that is not a column
+  is added, so the export can carry no content or credential the ledger does
+  not.
+
+Export opens the ledger read-only
+(`Store::open_read_only`): a wrong path fails instead of creating an empty
+ledger, and an older binary never migrates the live file.

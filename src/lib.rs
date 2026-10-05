@@ -19,6 +19,7 @@
 pub mod catalog;
 pub mod cmds;
 pub mod config;
+pub mod export;
 pub mod import;
 pub mod ir;
 pub mod middleware;
