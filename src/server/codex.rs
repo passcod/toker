@@ -36,7 +36,10 @@ use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
 use crate::server::InFlightGuard;
-use crate::server::proxy::{MAX_ERROR_BODY, buffer_up_to, plain_status, truncated_body};
+use crate::server::proxy::{
+    ErrorWire, MAX_ERROR_BODY, buffer_up_to, plain_status, transport_failure, truncated_body,
+    upstream_failure,
+};
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_codex_measurement};
@@ -142,7 +145,12 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         Ok(auth) => auth,
         Err(error) => {
             tracing::warn!(%error, "codex auth refresh failed");
-            return plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n");
+            // A fixed message, not the error's: it names local paths, and
+            // the log line above already has the detail.
+            return upstream_failure(
+                ErrorWire::Anthropic,
+                "toker upstream error: the codex login could not be refreshed",
+            );
         }
     };
 
@@ -162,7 +170,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::warn!(%error, "codex upstream request failed");
-            return plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n");
+            return transport_failure(ErrorWire::Anthropic, &error);
         }
     };
 
@@ -183,7 +191,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         // error naming the mapped type; the row records the real
         // upstream status with the same mapping.
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
-            return truncated_body();
+            return truncated_body(ErrorWire::Anthropic);
         };
         let error = parse_upstream_error(&buffered.bytes);
         let kind = translate::anthropic_error_type(&error);
@@ -249,7 +257,10 @@ async fn aggregated_turn(
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "codex stream failed mid-turn");
-                return plain_status(StatusCode::BAD_GATEWAY, "upstream stream failed\n");
+                return upstream_failure(
+                    ErrorWire::Anthropic,
+                    "toker upstream error: the stream failed before the turn ended",
+                );
             }
         };
         for event in sse.feed(&chunk) {
@@ -277,7 +288,10 @@ async fn aggregated_turn(
         // The stream closed before a terminator event (the codex client
         // treats this as an error; so does toker — never a partial row).
         tracing::warn!("codex stream closed before response.completed");
-        return plain_status(StatusCode::BAD_GATEWAY, "upstream stream failed\n");
+        return upstream_failure(
+            ErrorWire::Anthropic,
+            "toker upstream error: the stream failed before the turn ended",
+        );
     }
 
     let message = translate::message_from_capture(&model, &capture);

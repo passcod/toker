@@ -314,7 +314,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // provider status. The guard drops here too: the exchange is
             // over, however it ended.
             tracing::warn!(%error, "upstream request failed");
-            plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
+            transport_failure(ErrorWire::Openai, &error)
         }
     }
 }
@@ -341,7 +341,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
         Ok(upstream) => forward_upstream(upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
-            plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
+            transport_failure(ErrorWire::Openai, &error)
         }
     }
 }
@@ -423,7 +423,7 @@ pub(crate) async fn forward_upstream(
     // never priced), body forwarded unchanged.
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
-            return truncated_body();
+            return truncated_body(ErrorWire::Openai);
         };
         let error_type = parse_error_type(&buffered.bytes);
         let retry_after = retry_after_ms(&upstream_headers);
@@ -442,7 +442,7 @@ pub(crate) async fn forward_upstream(
 
     // Non-SSE: buffer, observe, forward the original bytes unchanged.
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
-        return truncated_body();
+        return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {
         tracing::warn!("non-streaming response exceeded the buffer cap; passed through unledgered");
@@ -623,11 +623,66 @@ pub(crate) async fn buffer_up_to(
     }
 }
 
+/// Which wire a proxy-generated failure answers on: the error has to be
+/// in the shape the route's own clients parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorWire {
+    /// The Messages routes: `{"type":"error","error":{…}}`.
+    Anthropic,
+    /// The chat-completions routes: `{"error":{…}}`.
+    Openai,
+}
+
+/// The 502 toker answers when the upstream gave it nothing to forward —
+/// the request never got a response, or the response died before its
+/// body was whole. A JSON error in the route's own wire shape, with the
+/// content-type set: a bare text body under a 502 reached claude as an
+/// unparseable error, where the predecessor answered an anthropic-shaped
+/// `api_error` the client already knows how to report and retry. No row:
+/// the status is toker's own, never a fabricated provider measurement.
+pub(crate) fn upstream_failure(wire: ErrorWire, message: &str) -> Response {
+    let body = match wire {
+        ErrorWire::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": message },
+        }),
+        ErrorWire::Openai => serde_json::json!({
+            "error": {
+                "message": message,
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            },
+        }),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    build_response(
+        StatusCode::BAD_GATEWAY,
+        headers,
+        Body::from(serde_json::to_vec(&body).unwrap_or_default()),
+    )
+}
+
+/// The 502 for a request that never got an upstream response (a refused
+/// connection, the read timeout before the headers). The transport's own
+/// error names what failed; it carries the URL but no credential, which
+/// travels in headers (invariant 2).
+pub(crate) fn transport_failure(wire: ErrorWire, error: &dyn std::fmt::Display) -> Response {
+    upstream_failure(wire, &format!("toker upstream error: {error}"))
+}
+
 /// The answer when [`buffer_up_to`] failed: the body never arrived
 /// whole, so nothing of it is forwarded and no row is written — the
 /// buffered mirror of an aborted stream.
-pub(crate) fn truncated_body() -> Response {
-    plain_status(StatusCode::BAD_GATEWAY, "upstream response failed\n")
+pub(crate) fn truncated_body(wire: ErrorWire) -> Response {
+    upstream_failure(
+        wire,
+        "toker upstream error: the response failed before its body was complete",
+    )
 }
 
 /// The response body for a buffered-then-maybe-overflowed response: the
@@ -788,7 +843,8 @@ pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::strip_provider_prefix;
+    use super::{ErrorWire, strip_provider_prefix, transport_failure};
+    use axum::http::{StatusCode, header};
 
     #[test]
     fn the_openrouter_prefix_strips_and_everything_else_goes_to_the_default() {
@@ -809,5 +865,48 @@ mod tests {
         // Other providers' prefixes are not toker's to intercept in
         // phase 1: they go to the default backend unchanged.
         assert_eq!(strip_provider_prefix("anthropic/claude-opus-5"), None);
+    }
+
+    async fn error_of(response: axum::response::Response) -> serde_json::Value {
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("a whole body");
+        serde_json::from_slice(&body).expect("a JSON error")
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_answers_in_the_route_s_own_error_shape() {
+        let anthropic = error_of(transport_failure(
+            ErrorWire::Anthropic,
+            &"connection refused",
+        ))
+        .await;
+        assert_eq!(
+            anthropic,
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "toker upstream error: connection refused",
+                },
+            })
+        );
+        let openai = error_of(transport_failure(ErrorWire::Openai, &"connection refused")).await;
+        assert_eq!(
+            openai,
+            serde_json::json!({
+                "error": {
+                    "message": "toker upstream error: connection refused",
+                    "type": "server_error",
+                    "param": null,
+                    "code": null,
+                },
+            })
+        );
     }
 }

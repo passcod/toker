@@ -80,9 +80,9 @@ use super::InFlightGuard;
 use super::Server;
 use super::codex;
 use super::proxy::{
-    MAX_ERROR_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_BUFFER, UpstreamBody, buffer_up_to,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_BUFFER, UpstreamBody, buffer_up_to,
     buffered_body, build_response, is_compressed, is_event_stream, plain_status, response_headers,
-    send_upstream, session_id, truncated_body,
+    send_upstream, session_id, transport_failure, truncated_body,
 };
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
@@ -942,7 +942,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // provider status. The guard drops here too: the exchange is
             // over, however it ended.
             tracing::warn!(%error, "upstream request failed");
-            plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
+            transport_failure(ErrorWire::Anthropic, &error)
         }
     }
 }
@@ -1071,7 +1071,7 @@ async fn transparent(server: Server, request: Request) -> Response {
         Ok(upstream) => forward_response(server, backend, upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
-            plain_status(StatusCode::BAD_GATEWAY, "upstream request failed\n")
+            transport_failure(ErrorWire::Anthropic, &error)
         }
     }
 }
@@ -1178,7 +1178,7 @@ async fn forward_response(
     // — never priced), body forwarded unchanged.
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
-            return truncated_body();
+            return truncated_body(ErrorWire::Anthropic);
         };
         let (error_type, error_message) = error_pair(&buffered.bytes);
         let retry_after = retry_after_ms(&upstream_headers);
@@ -1204,7 +1204,7 @@ async fn forward_response(
 
     // Non-SSE: buffer, observe, forward the original bytes unchanged.
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
-        return truncated_body();
+        return truncated_body(ErrorWire::Anthropic);
     };
     if buffered.rest.is_some() {
         tracing::warn!("non-streaming response exceeded the buffer cap; passed through unledgered");

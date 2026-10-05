@@ -1025,11 +1025,23 @@ async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
 
     let response = post_chat(addr, &chat_body("drop-mid", false)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let body = response.bytes().await.expect("the 502 itself is whole");
     assert!(
-        !body.starts_with(b"{"),
+        !body.windows(8).any(|window| window == b"gen-drop"),
         "none of the truncated body is forwarded"
     );
+    // OpenAI-shaped, the error object chat clients already parse.
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error");
+    assert_eq!(error["error"]["type"], "server_error");
+    assert!(error["error"]["message"].is_string());
+    assert!(error.get("type").is_none(), "not the anthropic envelope");
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(store.count_requests().expect("count"), 0);

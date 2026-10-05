@@ -1521,11 +1521,18 @@ async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
     for model in ["drop-mid", "drop-mid-401"] {
         let response = post_messages(addr, "/v1/messages", &[], &messages_body(model, false)).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{model}");
+        assert_eq!(content_type(&response), "application/json", "{model}");
         let body = response.bytes().await.expect("the 502 itself is whole");
         assert!(
-            !body.starts_with(b"{"),
+            !body.windows(7).any(|window| window == b"\"usage\""),
             "{model}: none of the truncated body is forwarded"
         );
+        // The error is anthropic-shaped, so the client reports and
+        // retries it like any API error instead of failing to parse it.
+        let error: Value = serde_json::from_slice(&body).expect("a JSON error");
+        assert_eq!(error["type"], "error", "{model}");
+        assert_eq!(error["error"]["type"], "api_error", "{model}");
+        assert!(error["error"]["message"].is_string(), "{model}");
     }
 
     assert_no_rows(&store).await;
@@ -1590,6 +1597,16 @@ async fn an_upstream_silent_before_its_headers_answers_502_after_the_idle_timeou
     .await
     .expect("the idle timeout covers the wait for headers");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(content_type(&response), "application/json");
+    let error: Value = response.json().await.expect("a JSON error");
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("toker upstream error: ")),
+        "the transport's failure, named as toker's: {error}"
+    );
 
     assert_no_rows(&store).await;
 }
@@ -1848,7 +1865,10 @@ async fn a_mapped_batch_records_which_requests_the_map_moved() {
 
     let sent: Value =
         serde_json::from_slice(&mock.captured()[0].body).expect("the forwarded batch is JSON");
-    assert_eq!(sent.pointer("/requests/0/params/model"), Some(&json!("err-401")));
+    assert_eq!(
+        sent.pointer("/requests/0/params/model"),
+        Some(&json!("err-401"))
+    );
     assert_eq!(
         sent.pointer("/requests/1/params/model"),
         Some(&json!("claude-sonnet-5")),
