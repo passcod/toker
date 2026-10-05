@@ -33,7 +33,8 @@ enum Command {
         /// The exact model identity, as the ledger recorded it.
         #[arg(long = "model")]
         model: String,
-        /// How many local days of service to grant, ending today.
+        /// How many days the model should hold after the grant, drawn
+        /// from days the ledger already holds, newest first.
         #[arg(long = "days", default_value_t = 7)]
         days: u32,
         /// A prompt ceiling to grant alongside the days, in tokens.

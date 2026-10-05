@@ -230,6 +230,12 @@ fn percent_decode(input: &str) -> String {
 /// the `known` list, so the caller learns the typo instead of a silent
 /// no-op.
 ///
+/// Every granted day must be one the store already holds for some model.
+/// The predecessor's promote tool only ever sent such days, but its
+/// endpoint took any strings; here a day outside the store answers **400**
+/// `invented days` naming them, and nothing is written. An invented day
+/// enlarges the bar's denominator for every family at once.
+///
 /// The reply carries the effect, not the intent: `target` is what the
 /// family's election now names, because a promotion does not guarantee the
 /// slot — a newer version may already hold it, and saying so beats leaving
@@ -315,6 +321,18 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
             });
             reply["known"] = json!(known);
             (StatusCode::NOT_FOUND, Json(reply)).into_response()
+        }
+        Ok(MergeOutcome::InventedDays(invented)) => {
+            // A grant may only hand over days the store already holds:
+            // an invented one enlarges every family's bar denominator.
+            // Refused whole, so a caller never half-applies a promotion.
+            let mut reply = json!({
+                "toker": "models-merge",
+                "ok": false,
+                "error": "invented days",
+            });
+            reply["days"] = json!(invented);
+            (StatusCode::BAD_REQUEST, Json(reply)).into_response()
         }
         Err(error) => {
             tracing::error!(%error, "models merge store failure");

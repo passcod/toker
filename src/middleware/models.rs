@@ -280,29 +280,102 @@ pub fn local_day(at_ms: i64, tz: &TimeZone) -> Option<String> {
     Some(zoned.date().to_string())
 }
 
-/// The promote verb's request body: the model identity, `days` as
-/// local dates ending today (the endpoint's shape — a sorted, deduped
-/// YYYY-MM-DD array — is built here so the verb is a thin POST), and
-/// `maxPrompt` only when a ceiling was asked for.
-pub fn promote_request_body(model: &str, days: u32, max_prompt: Option<u64>) -> serde_json::Value {
-    let tz = TimeZone::system();
-    let now = jiff::Zoned::now().with_time_zone(tz.clone());
-    let mut dates: Vec<String> = Vec::with_capacity(days as usize);
-    for back in 0..days as i64 {
-        // Day arithmetic cannot fail for a bounded span; a failure
-        // reads as one fewer granted day, never a wrong date.
-        if let Ok(date) = now
-            .date()
-            .checked_sub(jiff::SignedDuration::from_hours(24 * back))
-        {
-            dates.push(date.to_string());
+/// Every day the learned store holds for any model: the pool a promotion
+/// grants from, and the set whose size is the bar's denominator.
+fn day_pool(entries: &[ModelEntry]) -> BTreeSet<String> {
+    let mut pool = BTreeSet::new();
+    for entry in entries {
+        pool.extend(days_of(entry));
+    }
+    pool
+}
+
+/// What a promotion would grant: the model's days after the grant, drawn
+/// only from days the store already holds, and the arithmetic of the bar
+/// they are measured against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromotionPlan {
+    /// The exact identity being promoted.
+    pub model_id: String,
+    /// Days the whole store holds: the bar's denominator, which a
+    /// promotion never changes because it grants only from this pool.
+    pub active_days: usize,
+    /// The bar: the model must hold strictly more days than this.
+    pub needed: f64,
+    /// How many days the model held before the grant.
+    pub days_before: usize,
+    /// The model's days after the grant, sorted.
+    pub days: Vec<String>,
+    /// The days the grant adds, sorted.
+    pub granted: Vec<String>,
+}
+
+impl PromotionPlan {
+    /// The control endpoint's body: the model and its days after the
+    /// grant (the merge unions, so the days it already holds are a no-op).
+    pub fn request_body(&self) -> serde_json::Value {
+        serde_json::json!({ "model": self.model_id, "days": self.days })
+    }
+
+    /// The same grant as the store merge takes it, for applying it
+    /// without a running server.
+    pub fn incoming(&self) -> MergeIncoming {
+        MergeIncoming {
+            model_id: self.model_id.clone(),
+            days: self.days.clone(),
+            max_prompt: None,
         }
     }
-    let mut body = serde_json::json!({ "model": model, "days": dates });
-    if let Some(max_prompt) = max_prompt {
-        body["maxPrompt"] = serde_json::json!(max_prompt);
+}
+
+/// Why a promotion has nothing to plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromotionRefusal {
+    /// The model has never been served: a typo here would redirect a whole
+    /// family's traffic to an id the API rejects, which is a much worse
+    /// outcome than being told no. `known` is what the store has served.
+    Unseen { known: Vec<String> },
+}
+
+/// What it would take to make `model` hold `want` days, without waiting
+/// for them to accumulate.
+///
+/// Days are granted only from days the store already holds, newest first.
+/// Inventing dates would also enlarge [`active_days_of`], the denominator
+/// of the bar being cleared, so a grant of invented days could raise the
+/// bar it was meant to clear, and with it un-elect other families'
+/// targets.
+pub fn plan_promotion(
+    entries: &[ModelEntry],
+    model: &str,
+    want: usize,
+) -> Result<PromotionPlan, PromotionRefusal> {
+    let known = || PromotionRefusal::Unseen {
+        known: entries.iter().map(|entry| entry.model_id.clone()).collect(),
+    };
+    let Some(id) = model_identity(model) else {
+        return Err(known());
+    };
+    let Some(entry) = entries.iter().find(|entry| entry.model_id == id) else {
+        return Err(known());
+    };
+    let pool = day_pool(entries);
+    let before: BTreeSet<String> = days_of(entry).into_iter().collect();
+    let mut days = before.clone();
+    for day in pool.iter().rev() {
+        if days.len() >= want {
+            break;
+        }
+        days.insert(day.clone());
     }
-    body
+    Ok(PromotionPlan {
+        model_id: id,
+        active_days: pool.len(),
+        needed: requirement(pool.len()),
+        days_before: before.len(),
+        granted: days.difference(&before).cloned().collect(),
+        days: days.into_iter().collect(),
+    })
 }
 
 /// One incoming entry for a control-merge (the merge's `from` side,
@@ -311,9 +384,10 @@ pub fn promote_request_body(model: &str, days: u32, max_prompt: Option<u64>) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeIncoming {
     pub model_id: String,
-    /// Days the log already has, granted as-is (a promotion grants
-    /// only days the log already holds — inventing dates would also enlarge
-    /// `activeDaysOf`, the denominator of the bar being cleared).
+    /// Days to union in. Each must be a day the store already holds for
+    /// some model: inventing dates would enlarge `activeDaysOf`, the
+    /// denominator of the bar being cleared, and [`merge_learned`] refuses
+    /// a grant that carries one.
     pub days: Vec<String>,
     /// An empirical prompt ceiling to raise the stored one to.
     pub max_prompt: Option<i64>,
@@ -338,6 +412,11 @@ pub enum MergeOutcome {
     /// does on purpose — a typo here must not redirect a whole family's
     /// traffic to an id the API rejects.
     Unseen,
+    /// The grant carried days the store holds for no model; nothing was
+    /// written. Enforced here rather than trusted to the caller, because
+    /// the endpoint takes any strings and one invented day is enough to
+    /// move the bar for every family.
+    InventedDays(Vec<String>),
 }
 
 /// The learned store plus the in-memory recently-served map, over one
@@ -565,7 +644,8 @@ impl ModelStore {
     /// The models-merge semantics
     /// (`mergeSeen(into, from, {only: true})` — the control endpoint's one power):
     /// **only adds** days and maxPrompt for a model **already served**,
-    /// never creates one. Days union; the maxPrompt keeps the higher of
+    /// never creates one, and only days the store already holds for some
+    /// model, never invented ones. Days union; the maxPrompt keeps the higher of
     /// the two, so neither side can erase what the other has seen — which
     /// is what lets a promotion apply to a running process without racing
     /// its own writes.
@@ -576,38 +656,61 @@ impl ModelStore {
     /// "never creates or widens declared context capability" rule holds here
     /// because nothing here touches it.
     pub fn merge(&self, incoming: &MergeIncoming) -> crate::store::Result<MergeOutcome> {
-        let Some(mut entry) = self.store.load_model(&incoming.model_id)? else {
-            return Ok(MergeOutcome::Unseen);
-        };
-        let mut days: BTreeSet<String> = days_of(&entry).into_iter().collect();
-        days.extend(incoming.days.iter().cloned());
-        entry.days_json = Some(serde_json::Value::Array(
-            days.into_iter().map(serde_json::Value::String).collect(),
-        ));
-        if let Some(max_prompt) = incoming.max_prompt {
-            entry.max_prompt = Some(
-                entry
-                    .max_prompt
-                    .map_or(max_prompt, |prev| prev.max(max_prompt)),
-            );
-        }
-        self.store.upsert_model(&entry)?;
-        let target = match family_of(&entry.model_id) {
-            Some(family) => self.family_newest(&family.name)?,
-            None => None,
-        };
-        Ok(MergeOutcome::Merged {
-            entry: Box::new(entry),
-            target,
-        })
+        merge_learned(&self.store, incoming)
     }
+}
+
+/// [`ModelStore::merge`] over a bare store.
+pub fn merge_learned(
+    store: &Store,
+    incoming: &MergeIncoming,
+) -> crate::store::Result<MergeOutcome> {
+    let entries = store.load_models()?;
+    let Some(mut entry) = entries
+        .iter()
+        .find(|entry| entry.model_id == incoming.model_id)
+        .cloned()
+    else {
+        return Ok(MergeOutcome::Unseen);
+    };
+    let pool = day_pool(&entries);
+    let invented: Vec<String> = incoming
+        .days
+        .iter()
+        .filter(|day| !pool.contains(*day))
+        .cloned()
+        .collect();
+    if !invented.is_empty() {
+        return Ok(MergeOutcome::InventedDays(invented));
+    }
+    let mut days: BTreeSet<String> = days_of(&entry).into_iter().collect();
+    days.extend(incoming.days.iter().cloned());
+    entry.days_json = Some(serde_json::Value::Array(
+        days.into_iter().map(serde_json::Value::String).collect(),
+    ));
+    if let Some(max_prompt) = incoming.max_prompt {
+        entry.max_prompt = Some(
+            entry
+                .max_prompt
+                .map_or(max_prompt, |prev| prev.max(max_prompt)),
+        );
+    }
+    store.upsert_model(&entry)?;
+    let target = match family_of(&entry.model_id) {
+        Some(family) => newest_in_family(&store.load_models()?, &family.name),
+        None => None,
+    };
+    Ok(MergeOutcome::Merged {
+        entry: Box::new(entry),
+        target,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MergeIncoming, MergeOutcome, ModelStore, compaction_target_of, family_of, local_day,
-        newer_than, newest_in_family, requirement,
+        MergeIncoming, MergeOutcome, ModelStore, PromotionRefusal, compaction_target_of, family_of,
+        local_day, newer_than, newest_in_family, plan_promotion, requirement,
     };
     use crate::store::{ModelEntry, RequestRow, Store};
     use jiff::tz::TimeZone;
@@ -971,6 +1074,16 @@ mod tests {
         models
             .note_seen("claude-opus-5", 1_769_954_400_000, 100_000, &tz())
             .expect("note");
+        // Another family's days are days the store holds, so a grant may
+        // hand them over.
+        models
+            .store
+            .upsert_model(&entry(
+                "claude-sonnet-5",
+                &["2026-09-20", "2026-09-21"],
+                Some(1),
+            ))
+            .expect("upsert");
 
         // Additive: days union, maxPrompt maxes.
         let outcome = models
@@ -1035,7 +1148,95 @@ mod tests {
         );
         assert_eq!(
             models.known_models().expect("known"),
-            vec!["claude-opus-5".to_owned()]
+            vec!["claude-opus-5".to_owned(), "claude-sonnet-5".to_owned()]
+        );
+    }
+
+    #[test]
+    fn merge_refuses_days_the_store_does_not_hold() {
+        // Eight active days, so the bar is 4. One invented date would
+        // make it 4.5: a family whose target holds exactly five days
+        // keeps it, but the denominator has moved for everyone, which is
+        // why the merge refuses the whole grant rather than trusting
+        // the caller to send only held days.
+        let models = models();
+        let held: Vec<String> = (0..8).map(|i| format!("2026-09-2{i}")).collect();
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+        models
+            .store
+            .upsert_model(&entry("claude-sonnet-5", &held_refs, Some(1)))
+            .expect("upsert");
+        models
+            .store
+            .upsert_model(&entry("claude-opus-5", &["2026-09-27"], Some(1)))
+            .expect("upsert");
+
+        let outcome = models
+            .merge(&MergeIncoming {
+                model_id: "claude-opus-5".to_owned(),
+                days: vec!["2026-09-20".to_owned(), "2026-10-04".to_owned()],
+                max_prompt: Some(500_000),
+            })
+            .expect("merge");
+        assert_eq!(
+            outcome,
+            MergeOutcome::InventedDays(vec!["2026-10-04".to_owned()]),
+            "only the invented day is named"
+        );
+        assert_eq!(
+            models.store.load_model("claude-opus-5").expect("load"),
+            Some(entry("claude-opus-5", &["2026-09-27"], Some(1))),
+            "nothing was written, not even the held day or the ceiling"
+        );
+
+        // The unseen check runs first: a model the store never served is
+        // unseen whatever its days.
+        assert_eq!(
+            models
+                .merge(&MergeIncoming {
+                    model_id: "claude-haiku-5".to_owned(),
+                    days: vec!["2026-10-04".to_owned()],
+                    max_prompt: None,
+                })
+                .expect("merge"),
+            MergeOutcome::Unseen
+        );
+    }
+
+    // ── promotion planning ──────────────────────────────────────────
+
+    #[test]
+    fn a_promotion_grants_only_days_the_store_holds_newest_first() {
+        let held: Vec<String> = (0..8).map(|i| format!("2026-09-2{i}")).collect();
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+        let entries = vec![
+            entry("claude-opus-5", &held_refs, Some(150_000)),
+            entry("claude-opus-5-5", &["2026-09-27"], Some(4_000)),
+        ];
+        let plan = plan_promotion(&entries, "claude-opus-5-5", 5).expect("served");
+        assert_eq!(plan.model_id, "claude-opus-5-5");
+        assert_eq!(plan.active_days, 8, "the pool is the bar's denominator");
+        assert_eq!(plan.days_before, 1);
+        assert_eq!(
+            plan.granted,
+            vec!["2026-09-23", "2026-09-24", "2026-09-25", "2026-09-26"],
+            "the newest held days, skipping one it already holds"
+        );
+        assert_eq!(plan.days.len(), 5);
+        assert!(plan.days.iter().all(|day| held.contains(day)));
+
+        // Asking for more days than the store holds grants the whole
+        // pool and no more: the denominator is never enlarged.
+        let plan = plan_promotion(&entries, "claude-opus-5-5", 30).expect("served");
+        assert_eq!(plan.days, held);
+        assert_eq!(plan.active_days, 8);
+
+        // Unseen: refused with what is known, never invented.
+        assert_eq!(
+            plan_promotion(&entries, "claude-opus-6", 5),
+            Err(PromotionRefusal::Unseen {
+                known: vec!["claude-opus-5".to_owned(), "claude-opus-5-5".to_owned()]
+            })
         );
     }
 
@@ -1107,7 +1308,7 @@ mod tests {
         let MergeOutcome::Merged { entry, .. } = models
             .merge(&MergeIncoming {
                 model_id: "gpt-5.6-sol".to_owned(),
-                days: vec!["2026-10-01".to_owned()],
+                days: vec!["2026-02-02".to_owned()],
                 max_prompt: None,
             })
             .expect("merge")

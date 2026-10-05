@@ -2469,6 +2469,32 @@ async fn models_merge_endpoint_merges_served_models_and_moves_the_election() {
     );
     assert_eq!(entry.max_prompt, Some(200_000));
 
+    // Invented days: a date no model was served on is refused whole, so
+    // the bar's denominator (every held day) cannot be enlarged through
+    // the endpoint, and nothing in the grant is written.
+    let response = client()
+        .post(toker_url(addr, "/_toker/models/merge"))
+        .header("x-toker-control", "models-merge")
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({
+            "model": "claude-opus-5-5",
+            "days": ["2026-09-25", "2026-10-02", "2026-10-03"],
+            "maxPrompt": 900_000,
+        }))
+        .send()
+        .await
+        .expect("merge invented days");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("body");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"], json!("invented days"));
+    assert_eq!(body["days"], json!(["2026-10-02", "2026-10-03"]));
+    let after = store
+        .load_model("claude-opus-5-5")
+        .expect("load")
+        .expect("entry");
+    assert_eq!(after, entry, "a refused grant writes nothing");
+
     // Unknown model: 4xx naming the store's known identities — never a
     // silent refusal, never an invented entry.
     let response = client()

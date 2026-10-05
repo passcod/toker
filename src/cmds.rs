@@ -219,10 +219,8 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
 /// `toker promote` — the promote-model handover (the control
 /// endpoint is the same one the predecessor's promote script used):
 /// grant a served model the days (and optionally the prompt ceiling)
-/// to become its family's rewrite target early. `days` local dates
-/// ending today — the default of 7 clears the election bar at any log
-/// age (the bar caps at 7), so promote is a deliberate override, not a
-/// measurement.
+/// to become its family's rewrite target early. The days are drawn only
+/// from days the ledger already holds, newest first, up to `days` in all.
 pub fn promote(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -232,7 +230,20 @@ pub fn promote(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Res
 
 async fn promote_run(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let body = crate::middleware::models::promote_request_body(&model, days, max_prompt);
+    let store = Store::open(&config.db_path)?;
+    let entries = store.load_models()?;
+    let plan = match crate::middleware::models::plan_promotion(&entries, &model, days as usize) {
+        Ok(plan) => plan,
+        Err(crate::middleware::models::PromotionRefusal::Unseen { known }) => bail!(
+            "{model:?} has never served — the merge only promotes models \
+             the ledger has seen. Known: {}",
+            known.join(", ")
+        ),
+    };
+    let mut body = plan.request_body();
+    if let Some(max_prompt) = max_prompt {
+        body["maxPrompt"] = serde_json::json!(max_prompt);
+    }
     let url = format!("http://127.0.0.1:{}/_toker/models/merge", config.port);
     let client = reqwest::Client::builder().build()?;
     let response = client
