@@ -81,8 +81,8 @@ pub enum NoticeStyle {
     /// renders this and nothing else does.** Spelled `"insight"` before
     /// it carried toker's name; that spelling still reads as this.
     Block,
-    /// The content verbatim: opt-in, for frontends with no structured
-    /// format of their own.
+    /// The content in brackets: opt-in, for frontends with no structured
+    /// format of their own. The brackets are its only frame.
     Plain,
 }
 
@@ -147,7 +147,10 @@ pub fn render(style: NoticeStyle, level: NoticeLevel, content: &str) -> String {
         }
         NoticeStyle::Gfm => alert(&format!("> [!{}]", level.alert()), content),
         NoticeStyle::Toker => alert("> [!TOKER]", content),
-        NoticeStyle::Plain => content.to_owned(),
+        // Unframed, the brackets are what mark the text as harness output
+        // rather than the model's own words (the shape the client's own
+        // injected notices take); every other style's frame does that job.
+        NoticeStyle::Plain => format!("[{content}]"),
     }
 }
 
@@ -250,10 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_is_the_content_verbatim() {
+    fn plain_is_the_content_in_brackets() {
         for level in LEVELS {
-            assert_eq!(render(NoticeStyle::Plain, level, CONTENT), CONTENT);
-            assert_eq!(render(NoticeStyle::Plain, level, "a\nb"), "a\nb");
+            assert_eq!(
+                render(NoticeStyle::Plain, level, CONTENT),
+                format!("[{CONTENT}]")
+            );
+            assert_eq!(render(NoticeStyle::Plain, level, "a\nb"), "[a\nb]");
         }
     }
 
@@ -265,7 +271,7 @@ mod tests {
             render(NoticeStyle::Block, NoticeLevel::Caution, ""),
             format!("{BLOCK_HEADER}\n\n{BLOCK_FOOTER}")
         );
-        // The alerts: the bare marker; Plain: nothing.
+        // The alerts: the bare marker; Plain: its brackets.
         assert_eq!(
             render(NoticeStyle::Gfm, NoticeLevel::Caution, ""),
             "> [!CAUTION]"
@@ -274,7 +280,7 @@ mod tests {
             render(NoticeStyle::Toker, NoticeLevel::Caution, ""),
             "> [!TOKER]"
         );
-        assert_eq!(render(NoticeStyle::Plain, NoticeLevel::Caution, ""), "");
+        assert_eq!(render(NoticeStyle::Plain, NoticeLevel::Caution, ""), "[]");
     }
 
     #[test]

@@ -337,9 +337,9 @@ impl Blocking {
     /// this feature — the only place they learn which meter they hit, when
     /// it clears, and how to resume — so it says all three.
     ///
-    /// Bracketed and third-person on purpose: the client already injects
-    /// notices of that shape, so the model has an established convention
-    /// for reading one as harness output rather than as its own words. The
+    /// Third-person on purpose, and framed by the style (brackets in the
+    /// plain style), so the model reads it as harness output rather than
+    /// as its own words. The
     /// marker itself is deliberately not embedded — it would then sit in
     /// conversation history as assistant text.
     ///
@@ -367,10 +367,13 @@ impl Blocking {
         tz: &jiff::tz::TimeZone,
         style: NoticeStyle,
     ) -> String {
-        let when = resets_at
+        let spent = match resets_at
             .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
             .map(|timestamp| timestamp.to_zoned(tz.clone()).strftime("%H:%M").to_string())
-            .unwrap_or_else(|| "an unknown time".to_owned());
+        {
+            Some(when) => format!("is spent until {when}"),
+            None => "is spent, and its reset time is unknown".to_owned(),
+        };
         // Comma-grouped, never locale-moving — these figures
         // land in notices the tests assert on.
         let size = match context_tokens {
@@ -380,8 +383,8 @@ impl Blocking {
             _ => String::new(),
         };
         let content = format!(
-            "[Session stopped by toker: {} quota is spent, resets at {when}.{size} \
-             Reply with the release marker to continue and spend overage until then.]",
+            "Stopped by toker: the {} quota {spent}.{size}\n\
+             Reply with the release marker to continue on overage until then.",
             meter.notice_name(),
         );
         // A Caution: the session is stopped until the operator acts.
@@ -904,8 +907,7 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
-             Reply with the release marker to continue and spend overage until then.]"
+            "[Stopped by toker: the 5-hour quota is spent until 08:00.\nReply with the release marker to continue on overage until then.]"
         );
         // The context size rides in the same sentence, comma-grouped,
         // and is dropped entirely when unknown (never printed as zero).
@@ -917,9 +919,8 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            "[Session stopped by toker: 7-day quota is spent, resets at 08:00. \
-             This session's context is 123,456 tokens. \
-             Reply with the release marker to continue and spend overage until then.]"
+            "[Stopped by toker: the 7-day quota is spent until 08:00. \
+             This session's context is 123,456 tokens.\nReply with the release marker to continue on overage until then.]"
         );
         // A zero context is not a measurement: dropped like an absent one.
         assert_eq!(
@@ -942,8 +943,8 @@ mod tests {
         // No reset carried: name the ignorance, in the frozen wording.
         assert_eq!(
             Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain),
-            "[Session stopped by toker: 5-hour quota is spent, resets at an unknown time. \
-             Reply with the release marker to continue and spend overage until then.]"
+            "[Stopped by toker: the 5-hour quota is spent, and its reset time is unknown.\n\
+             Reply with the release marker to continue on overage until then.]"
         );
     }
 
@@ -955,10 +956,10 @@ mod tests {
         // the wrapper the client actually carries is part of the pinned
         // bytes now.
         let tz = utc();
-        let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
-                      This session's context is 9,872,344 tokens. \
-                      Reply with the release marker to continue and spend overage until then.]";
-        let expected = format!("> [!CAUTION]\n> {content}");
+        let expected = "> [!CAUTION]\n\
+                        > Stopped by toker: the 5-hour quota is spent until 08:00. \
+                        This session's context is 9,872,344 tokens.\n\
+                        > Reply with the release marker to continue on overage until then.";
         for _ in 0..3 {
             assert_eq!(
                 Blocking::notice(
@@ -983,8 +984,8 @@ mod tests {
                 &auckland,
                 NoticeStyle::default()
             ),
-            "> [!CAUTION]\n> [Session stopped by toker: 5-hour quota is spent, resets at 21:00. \
-            Reply with the release marker to continue and spend overage until then.]",
+            "> [!CAUTION]\n> Stopped by toker: the 5-hour quota is spent until 21:00.\n\
+             > Reply with the release marker to continue on overage until then.",
             "2026-01-27 08:00 UTC is 21:00 NZDT the same day"
         );
     }
@@ -995,8 +996,8 @@ mod tests {
         // wrapping differs. Plain is the pre-wrapper form, byte for byte;
         // gfm is the generic default (the block is claude's rendering).
         let tz = utc();
-        let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
-                      Reply with the release marker to continue and spend overage until then.]";
+        let content = "Stopped by toker: the 5-hour quota is spent until 08:00.\n\
+                       Reply with the release marker to continue on overage until then.";
         assert_eq!(
             Blocking::notice(
                 Meter::FiveHour,
@@ -1005,8 +1006,8 @@ mod tests {
                 &tz,
                 NoticeStyle::Plain
             ),
-            content,
-            "plain: the content verbatim — the unwrapped form, pinned"
+            format!("[{content}]"),
+            "plain: the content in brackets, its only frame"
         );
         assert_eq!(
             Blocking::notice(
@@ -1027,7 +1028,7 @@ mod tests {
                 &tz,
                 NoticeStyle::Toker
             ),
-            format!("> [!TOKER]\n> {content}"),
+            format!("> [!TOKER]\n> {}", content.replace('\n', "\n> ")),
             "toker: Workhorse's alert"
         );
         assert_eq!(
@@ -1038,7 +1039,7 @@ mod tests {
                 &tz,
                 NoticeStyle::Gfm
             ),
-            format!("> [!CAUTION]\n> {content}"),
+            format!("> [!CAUTION]\n> {}", content.replace('\n', "\n> ")),
             "gfm: the alert form, at the quota block's level"
         );
     }

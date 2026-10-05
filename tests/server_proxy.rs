@@ -1298,14 +1298,14 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
         .as_str()
         .expect("the notice text");
     assert!(
-        text.contains("prompt cache had expired after 11m idle"),
+        text.contains("prompt cache expired after 11m idle"),
         "{text}"
     );
     assert!(
-        text.contains("would re-read 500,000 tokens as fresh input"),
+        text.contains("re-reads 500,000 tokens as fresh input"),
         "{text}"
     );
-    assert!(text.contains("Fired once for that idle spell.]"), "{text}");
+    assert!(text.contains("Shown once per idle spell."), "{text}");
     // The GFM alert is the unprefixed default, at the cold notice's
     // warning level.
     assert!(text.contains("> [!WARNING]"), "{text}");
@@ -1637,7 +1637,7 @@ async fn the_openai_notice_renders_as_sse_for_stream_requests() {
         chunk["choices"][0]["delta"]["content"]
             .as_str()
             .expect("the notice text")
-            .contains("prompt cache had expired after 11m idle")
+            .contains("prompt cache expired after 11m idle")
     );
     assert_eq!(mock.captured().len(), 1, "upstream was never hit");
 

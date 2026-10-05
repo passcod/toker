@@ -1966,44 +1966,32 @@ impl ColdBlocking {
         let cheap = target
             .map(|target| format!(" The proxy would run it on {target}."))
             .unwrap_or_default();
-        let mut lines: Vec<String> = vec![
-            format!("[toker paused this session at {stamp}."),
-            String::new(),
-            format!(
-                "Its prompt cache had expired after {} idle, so the next \
-                 request would re-read {} tokens as fresh input{}.",
-                human_idle(idle_ms),
-                group(prompt),
-                if metered {
-                    " — what the rate-limit window meters"
-                } else {
-                    ""
-                },
-            ),
-        ];
+        let mut lines: Vec<String> = vec![format!(
+            "Paused by toker at {stamp}: the prompt cache expired after {} idle, \
+             so the next request re-reads {} tokens as fresh input{}.",
+            human_idle(idle_ms),
+            group(prompt),
+            if metered {
+                ", which the rate-limit window meters"
+            } else {
+                ""
+            },
+        )];
         if let Some(quota) = quota {
-            lines.push(String::new());
             lines.push(quota);
         }
         lines.extend([
-            String::new(),
             // The client writes the message to its transcript before the
             // request leaves, and this notice is appended after it as an
             // ordinary assistant turn, so both are still there.
-            "Nothing was lost; the message that prompted this is still above.".to_owned(),
             String::new(),
-            "The options at that point:".to_owned(),
+            "Your message is still above. Options:".to_owned(),
+            format!("- `/compact`: pay the re-read once for a small prefix.{cheap}"),
+            "- A new session: pay nothing, keep none of this context.".to_owned(),
+            "- Reply: carry on and pay the re-read.".to_owned(),
+            // Markdown would fold an unseparated line into the last item.
             String::new(),
-            format!(
-                "- `/compact` — pays the re-read once, leaving a small \
-                 prefix, so the next cold resume is cheap.{cheap}"
-            ),
-            "- a new session — pays nothing, and keeps none of this context.".to_owned(),
-            "- replying — carries on and pays the re-read; the model can \
-             already see the message."
-                .to_owned(),
-            String::new(),
-            "Fired once for that idle spell.]".to_owned(),
+            "Shown once per idle spell.".to_owned(),
         ]);
         // A Warning: advice the operator may act on or ignore.
         render(style, NoticeLevel::Warning, &lines.join("\n"))
@@ -3501,22 +3489,17 @@ mod tests {
         );
         assert_eq!(
             content,
-            "[toker paused this session at 08:00.\n\
+            "[Paused by toker at 08:00: the prompt cache expired after 2h 6m idle, so the \
+             next request re-reads 200,621 tokens as fresh input, which the rate-limit \
+             window meters.\n\
              \n\
-             Its prompt cache had expired after 2h 6m idle, so the next request would \
-             re-read 200,621 tokens as fresh input — what the rate-limit window meters.\n\
+             Your message is still above. Options:\n\
+             - `/compact`: pay the re-read once for a small prefix. The proxy would run \
+             it on claude-sonnet-5.\n\
+             - A new session: pay nothing, keep none of this context.\n\
+             - Reply: carry on and pay the re-read.\n\
              \n\
-             Nothing was lost; the message that prompted this is still above.\n\
-             \n\
-             The options at that point:\n\
-             \n\
-             - `/compact` — pays the re-read once, leaving a small prefix, so the next \
-             cold resume is cheap. The proxy would run it on claude-sonnet-5.\n\
-             - a new session — pays nothing, and keeps none of this context.\n\
-             - replying — carries on and pays the re-read; the model can already see \
-             the message.\n\
-             \n\
-             Fired once for that idle spell.]"
+             Shown once per idle spell.]"
         );
         // Purity (invariant 4): the same inputs render the same bytes,
         // every call, in every style.
@@ -3562,6 +3545,12 @@ mod tests {
             &utc(),
             NoticeStyle::Plain,
         );
+        // Plain's brackets are its frame; the other styles frame the bare
+        // content.
+        let content = content
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .expect("plain is bracketed");
         assert_eq!(
             ColdBlocking::notice(
                 47 * MIN,

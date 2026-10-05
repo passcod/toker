@@ -509,14 +509,14 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.starts_with("event: message_start\n"));
     assert!(
-        text.contains("prompt cache had expired after 2h idle"),
+        text.contains("prompt cache expired after 2h idle"),
         "{text}"
     );
     assert!(
-        text.contains("would re-read 200,000 tokens as fresh input"),
+        text.contains("re-reads 200,000 tokens as fresh input"),
         "{text}"
     );
-    assert!(text.contains("Fired once for that idle spell.]"), "{text}");
+    assert!(text.contains("Shown once per idle spell."), "{text}");
     // No model entry exists to resolve a compact target onto, so the
     // notice stays silent about one — an unarmed proxy promising a cheap
     // compaction would be the feature lying about its configuration.
