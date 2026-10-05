@@ -9,7 +9,7 @@
 //! Layout, phase 2:
 //!
 //! ```text
-//! ─ toker · live · last 30m · 2 sessions · 17 requests in window   12:34:56
+//! last 30m · 2 sessions · 17 requests       last req 12s ago · 12:34:56
 //! ┌ SESSIONS ────────────────────────────────────────────────────────┐
 //! │ table, sheds rightmost columns when the terminal narrows          │
 //! └────────────────────────────────────────────────────────────────────┘
@@ -29,8 +29,8 @@
 //! Invariant 3 in rendering: every unknown renders as an explicit string —
 //! `?` for unknown models and token counts, "no billed cost data",
 //! "no cost data: N", "no requests in window", `estimating`/`window
-//! rolled over`/`no data` for the meters — never as a confident
-//! zero.
+//! rolled over`/`no data` for the meters, `no data` for the header's
+//! freshness on an empty ledger — never as a confident zero.
 
 use jiff::tz::TimeZone;
 use ratatui::{
@@ -62,6 +62,15 @@ const BAR_WIDTH: u16 = 22;
 /// Past this a session is not mid-turn; the context list goes quiet
 /// about it.
 const IDLE_SECS: i64 = 180;
+
+/// The header's freshness stays green while the ledger's newest row is
+/// younger than this, and turns yellow past it (the predecessor's
+/// thresholds, kept so a glance reads the same).
+const FRESH_SECS: i64 = 30;
+
+/// Past this the proxy has been quiet long enough to look dead: the
+/// freshness turns red and counts in minutes.
+const STALE_SECS: i64 = 300;
 
 /// The context panel lists sessions with at least this many requests —
 /// occupancy is a claim about a conversation, and two rows say nothing
@@ -335,15 +344,46 @@ fn bottom_height(snap: &Snapshot) -> u16 {
     BOTTOM_HEIGHT.max((lines + 2) as u16) // + 2 border rows
 }
 
-/// Header line: the window summary and the clock at the right edge —
-/// `last 60m · 3 sessions · 1 idle · 83 requests`. No title (the
-/// dashboard has one job), no "live" (there is no pause to be not-live
-/// with), no ledger total (a lifetime row count answers nothing the
-/// window does not). An empty window says "no requests in window" —
-/// absence, not "0 requests".
+/// Header line: the window summary on the left, the freshness and the
+/// clock at the right edge —
+/// `last 60m · 3 sessions · 1 idle · 83 requests … last req 4s ago · 12:34:56`.
+/// No title (the dashboard has one job), no "live" (there is no pause
+/// to be not-live with), no ledger total (a lifetime row count answers
+/// nothing the window does not). An empty window says "no requests in
+/// window" — absence, not "0 requests".
+///
+/// The freshness is the age of the ledger's newest row of any kind
+/// ([`Snapshot::latest_row_ts_ms`]), and it renders whether or not the
+/// window holds rows: an empty window is exactly when it matters,
+/// because a dead proxy looks like a quiet one everywhere else.
+///
+/// A narrow header sheds in this order: the window summary first (it
+/// clips into whatever the right side leaves), then the clock (the
+/// time is on every other screen; nothing else says the proxy went
+/// quiet), then the "last req" label — the coloured age goes last.
 fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
+    let (age, age_style) = freshness(snap);
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let label = Span::styled("last req ", dim);
+    let age = Span::styled(age, age_style);
+    let levels = [
+        Line::from(vec![
+            label.clone(),
+            age.clone(),
+            Span::styled(" · ", dim),
+            Span::raw(clock).bold(),
+        ]),
+        Line::from(vec![label, age.clone()]),
+    ];
+    // Each level needs one blank cell before it, so a clipped summary
+    // never runs into the label; the age alone renders regardless.
+    let right_line = levels
+        .into_iter()
+        .find(|line| line.width() < area.width as usize)
+        .unwrap_or_else(|| Line::from(age));
+    let right_width = (right_line.width() + 1).min(area.width as usize) as u16;
     let [left, right] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(8)]).areas(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(area);
 
     let mut text = format!("last {}m", snap.window_mins);
     if snap.window_empty {
@@ -366,9 +406,34 @@ fn render_header(frame: &mut Frame, area: Rect, snap: &Snapshot, clock: &str) {
     }
     frame.render_widget(Paragraph::new(text.bold()), left);
     frame.render_widget(
-        Paragraph::new(clock).alignment(Alignment::Right).bold(),
+        Paragraph::new(right_line).alignment(Alignment::Right),
         right,
     );
+}
+
+/// The freshness text and its colour, the predecessor's format exactly:
+/// `Ns ago` green under [`FRESH_SECS`], yellow under [`STALE_SECS`],
+/// then `Nm ago` in red; `no data` in red on an empty ledger. The age
+/// is against the snapshot's `now_ms`, so it moves on the display tick
+/// like every other figure in the frame.
+fn freshness(snap: &Snapshot) -> (String, Style) {
+    let Some(latest) = snap.latest_row_ts_ms else {
+        return ("no data".to_owned(), Style::new().fg(Color::Red));
+    };
+    // Rounded to the nearest second, as the predecessor did; a row
+    // stamped ahead of the frame (rows land slightly out of order, and
+    // clocks drift) reads as 0s rather than a negative age.
+    let age = ((snap.now_ms - latest).max(0) + 500) / 1_000;
+    if age < FRESH_SECS {
+        (format!("{age}s ago"), Style::new().fg(Color::Green))
+    } else if age < STALE_SECS {
+        (format!("{age}s ago"), Style::new().fg(Color::Yellow))
+    } else {
+        (
+            format!("{}m ago", (age + 30) / 60),
+            Style::new().fg(Color::Red),
+        )
+    }
 }
 
 /// The sessions table (the reference's SESSIONS block). Column shedding
@@ -1500,6 +1565,7 @@ mod tests {
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
 
@@ -1898,6 +1964,119 @@ mod tests {
         let text = rendered(&snap, 80, 24);
         assert!(text.contains("no requests in window"));
         assert!(!text.contains("ledger"), "no lifetime count:\n{text}");
+    }
+
+    /// The header row as text plus the foreground colour of the cell
+    /// where `needle` starts in it.
+    fn header_fg(snap: &model::Snapshot, width: u16, needle: &str) -> (String, Color) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
+        let tz = utc();
+        terminal
+            .draw(|frame| super::render(frame, snap, "12:34:56", &tz))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let cells: Vec<&str> = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+        let row = cells.concat();
+        // Every header symbol is one ASCII-or-`·` cell, so a cell index
+        // is a char index of the joined row.
+        let at = row
+            .char_indices()
+            .position(|(i, _)| row[i..].starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not in header {row:?}"));
+        (row, buffer[(at as u16, 0)].fg)
+    }
+
+    fn with_latest(mut snap: model::Snapshot, latest: Option<i64>) -> model::Snapshot {
+        snap.latest_row_ts_ms = latest;
+        snap
+    }
+
+    #[test]
+    fn freshness_is_green_while_fresh() {
+        let snap = with_latest(snapshot(), Some(NOW - 4_000));
+        let (row, fg) = header_fg(&snap, 100, "4s ago");
+        assert_eq!(fg, Color::Green, "in {row:?}");
+        assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
+        assert!(row.contains("2 sessions"), "the summary stays: {row:?}");
+    }
+
+    #[test]
+    fn freshness_is_yellow_while_stale() {
+        let snap = with_latest(snapshot(), Some(NOW - 120_000));
+        let (row, fg) = header_fg(&snap, 100, "120s ago");
+        assert_eq!(fg, Color::Yellow, "in {row:?}");
+    }
+
+    #[test]
+    fn freshness_is_red_in_minutes_once_dead() {
+        let snap = with_latest(snapshot(), Some(NOW - 600_000));
+        let (row, fg) = header_fg(&snap, 100, "10m ago");
+        assert_eq!(fg, Color::Red, "in {row:?}");
+    }
+
+    #[test]
+    fn freshness_says_no_data_on_an_empty_ledger() {
+        let snap = with_latest(model::empty(30), None);
+        let (row, fg) = header_fg(&snap, 100, "no data");
+        assert_eq!(fg, Color::Red, "in {row:?}");
+        assert!(row.contains("last req no data"), "{row:?}");
+    }
+
+    #[test]
+    fn freshness_shows_when_the_window_is_empty() {
+        // The dead-proxy case: nothing in the window, but the ledger's
+        // newest row dates the last write.
+        let snap = model::aggregate(
+            &[],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            523,
+        );
+        let snap = with_latest(snap, Some(NOW - 2 * 3_600_000));
+        let (row, fg) = header_fg(&snap, 100, "120m ago");
+        assert_eq!(fg, Color::Red, "in {row:?}");
+        assert!(row.contains("no requests in window"), "{row:?}");
+    }
+
+    #[test]
+    fn freshness_rounds_and_switches_at_the_predecessor_thresholds() {
+        let at = |age_ms: i64| {
+            let mut snap = with_latest(model::empty(30), Some(NOW - age_ms));
+            snap.now_ms = NOW;
+            let (text, style) = super::freshness(&snap);
+            (text, style.fg.expect("coloured"))
+        };
+        assert_eq!(at(29_400), ("29s ago".into(), Color::Green));
+        assert_eq!(at(29_500), ("30s ago".into(), Color::Yellow));
+        assert_eq!(at(299_400), ("299s ago".into(), Color::Yellow));
+        assert_eq!(at(299_500), ("5m ago".into(), Color::Red));
+        // 5.5 minutes rounds up, as `Math.round` did.
+        assert_eq!(at(330_000), ("6m ago".into(), Color::Red));
+        // A row stamped after the frame is not a negative age.
+        assert_eq!(at(-5_000), ("0s ago".into(), Color::Green));
+    }
+
+    #[test]
+    fn narrow_header_sheds_summary_then_clock_then_label() {
+        let snap = with_latest(snapshot(), Some(NOW - 4_000));
+        // "last req 4s ago · 12:34:56" is 26 cells; one more for the gap.
+        let (row, _) = header_fg(&snap, 40, "4s ago");
+        assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
+        assert!(row.starts_with("last 30m"), "summary clips: {row:?}");
+        assert!(!row.contains("2 sessions"), "summary clips: {row:?}");
+
+        let (row, _) = header_fg(&snap, 20, "4s ago");
+        assert!(row.contains("last req 4s ago"), "{row:?}");
+        assert!(!row.contains("12:34:56"), "the clock goes next: {row:?}");
+
+        let (row, fg) = header_fg(&snap, 10, "4s ago");
+        assert!(!row.contains("last req"), "the label goes last: {row:?}");
+        assert_eq!(fg, Color::Green, "the coloured age survives");
     }
 
     #[test]

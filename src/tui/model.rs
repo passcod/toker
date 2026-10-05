@@ -42,6 +42,12 @@ pub(crate) struct Snapshot {
     pub now_ms: i64,
     /// Total rows in the ledger, from the count query.
     pub total_requests: i64,
+    /// The newest ledger row's timestamp, of any kind — the header's
+    /// freshness. `None` when the ledger is empty. It comes from its own
+    /// `MAX(ts_ms)` read, never from the window rows: a dead proxy
+    /// empties the window, and this age is how that gets noticed.
+    /// [`aggregate`] leaves it `None`; the display tick fills it.
+    pub latest_row_ts_ms: Option<i64>,
     /// API-measurement rows in the window (proxy-written kinds excluded).
     pub window_requests: usize,
     /// True when the window holds no rows at all — the explicit "no data"
@@ -553,6 +559,9 @@ pub(crate) fn aggregate(
         window_mins: window_mins as u64,
         now_ms,
         total_requests,
+        // Not a window figure: the display tick reads it separately
+        // (see the field) and sets it on the returned snapshot.
+        latest_row_ts_ms: None,
         window_requests,
         window_empty: rows.is_empty(),
         sessions,

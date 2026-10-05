@@ -238,6 +238,10 @@ fn refresh_display(
     let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
     let rows = store.display_rows_since(since, ROW_CAP)?;
     let total = store.count_requests()?;
+    // The header's freshness: the newest row of ANY kind in the whole
+    // ledger, not the window's — an empty window must still say how
+    // long ago the proxy last wrote anything.
+    let latest = store.latest_ts_ms()?;
     labels.start_refresh();
     let mut session_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for session_id in rows.iter().filter_map(|row| row.session_id.as_deref()) {
@@ -249,7 +253,7 @@ fn refresh_display(
             resolved.insert(session_id.to_owned(), label);
         }
     }
-    Ok(model::aggregate(
+    let mut snapshot = model::aggregate(
         &rows,
         quota,
         released,
@@ -259,7 +263,9 @@ fn refresh_display(
         window_mins,
         now_ms,
         total,
-    ))
+    );
+    snapshot.latest_row_ts_ms = latest;
+    Ok(snapshot)
 }
 
 /// The TUI's read-only mirror of the daemon's models caches — the
@@ -842,6 +848,34 @@ mod tests {
                 {"id": "openai/gpt-6-luna", "context_length": 250_000}
             ]
         })
+    }
+
+    /// The header's freshness comes from the whole ledger, not the
+    /// window: a row older than the window still dates the proxy's last
+    /// write while the window itself reads empty, and an empty ledger
+    /// leaves it absent.
+    #[test]
+    fn refresh_display_reads_freshness_past_the_window() {
+        let store = Store::open(":memory:").expect("open in-memory store");
+        let catalogs = crate::catalog::fetched::FetchedCatalogs::default();
+        let mut labels = super::labels::Labels::new(Vec::new());
+        let refresh = |labels: &mut super::labels::Labels| {
+            super::refresh_display(&store, 30, None, &HashSet::new(), None, &catalogs, labels)
+                .expect("refresh")
+        };
+
+        let empty = refresh(&mut labels);
+        assert!(empty.window_empty);
+        assert_eq!(empty.latest_row_ts_ms, None, "empty ledger: no freshness");
+
+        // An hour old: well outside the 30-minute window.
+        let old = jiff::Timestamp::now().as_millisecond() - 3_600_000;
+        store
+            .record_request(&super::testrows::bare(old))
+            .expect("record");
+        let snap = refresh(&mut labels);
+        assert!(snap.window_empty, "the row is outside the window");
+        assert_eq!(snap.latest_row_ts_ms, Some(old));
     }
 
     /// The mtime gate: a cache file is read when it first appears and

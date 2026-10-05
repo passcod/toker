@@ -196,6 +196,13 @@ impl Store {
         ledger::count_requests(&*self.conn()?)
     }
 
+    /// The newest ledger row's timestamp, of any kind; `None` when the
+    /// ledger is empty. The TUI header's freshness reads this rather
+    /// than the display window, so a dead proxy still shows its age.
+    pub fn latest_ts_ms(&self) -> Result<Option<i64>> {
+        ledger::latest_ts_ms(&*self.conn()?)
+    }
+
     /// The `/_toker/session` aggregate for one session id: the count and
     /// span of its measurement rows, token sums, the billed total, and
     /// the billed-cost breakdowns by serving provider and model (see
@@ -650,6 +657,21 @@ mod tests {
             "window past the newest row is empty"
         );
         assert_eq!(store.count_requests().expect("count"), 5);
+    }
+
+    #[test]
+    fn latest_ts_ms_is_the_newest_row_of_any_kind() {
+        let store = mem_store();
+        assert_eq!(store.latest_ts_ms().expect("empty"), None, "empty ledger");
+        // Out of insertion order, and the newest row a proxy-written
+        // kind: freshness counts every row, not only measurements.
+        for ts in [100, 300, 200] {
+            store.record_request(&bare_row(ts)).expect("record");
+        }
+        let mut error = bare_row(400);
+        error.kind = Some(RowKind::Error);
+        store.record_request(&error).expect("record");
+        assert_eq!(store.latest_ts_ms().expect("latest"), Some(400));
     }
 
     /// A row carrying only a gate flag (the cold-notice/release shape:

@@ -860,6 +860,17 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// The newest row's timestamp, of any kind; `None` on an empty ledger.
+/// `MAX` over the indexed `ts_ms` is answered from the index's last
+/// entry, so this stays cheap however large the ledger grows — the TUI
+/// asks it on every display tick.
+pub(super) fn latest_ts_ms(conn: &Connection) -> Result<Option<i64>> {
+    let ts = conn.query_row("SELECT MAX(ts_ms) FROM requests", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })?;
+    Ok(ts)
+}
+
 /// One `per_provider`/`per_model` group of a session's billed cost: the
 /// group's label, how many billed rows are in it, and their summed cost.
 /// A group exists because at least one billed row is in it, so `None`
