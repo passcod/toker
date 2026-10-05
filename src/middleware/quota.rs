@@ -895,33 +895,31 @@ mod tests {
 
     #[test]
     fn the_notice_names_the_meter_the_reset_and_the_resume_path() {
-        // Rendered Plain so these assertions pin the notice's CONTENT —
+        // Rendered Plain so these snapshots pin the notice's CONTENT —
         // the meter, the reset, the resume path — independent of any
         // wrapping style; the styles themselves are pinned below.
         let tz = utc();
-        assert_eq!(
+        insta::assert_snapshot!(
+            "plain_five_hour",
             Blocking::notice(
                 Meter::FiveHour,
                 Some(1_769_500_800),
                 None,
                 &tz,
                 NoticeStyle::Plain
-            ),
-            "[Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00.\nReply with the release marker to continue on overage until then.]"
+            )
         );
         // The context size rides in the same sentence, comma-grouped,
         // and is dropped entirely when unknown (never printed as zero).
-        assert_eq!(
-            Blocking::notice(
-                Meter::SevenDay,
-                Some(1_769_500_800),
-                Some(123_456),
-                &tz,
-                NoticeStyle::Plain
-            ),
-            "[Stopped by [toker](https://github.com/passcod/toker): the 7-day quota is spent until 08:00. \
-             This session's context is 123,456 tokens.\nReply with the release marker to continue on overage until then.]"
+        let with_context = Blocking::notice(
+            Meter::SevenDay,
+            Some(1_769_500_800),
+            Some(123_456),
+            &tz,
+            NoticeStyle::Plain,
         );
+        assert!(with_context.contains("123,456 tokens"), "{with_context}");
+        insta::assert_snapshot!("plain_seven_day_with_context", with_context);
         // A zero context is not a measurement: dropped like an absent one.
         assert_eq!(
             Blocking::notice(
@@ -941,10 +939,9 @@ mod tests {
             "a zero context is not a measurement: the known check is finite and > 0"
         );
         // No reset carried: name the ignorance, in the frozen wording.
-        assert_eq!(
-            Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain),
-            "[Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent, and its reset time is unknown.\n\
-             Reply with the release marker to continue on overage until then.]"
+        insta::assert_snapshot!(
+            "plain_reset_unknown",
+            Blocking::notice(Meter::FiveHour, None, None, &tz, NoticeStyle::Plain)
         );
     }
 
@@ -956,92 +953,95 @@ mod tests {
         // the wrapper the client actually carries is part of the pinned
         // bytes now.
         let tz = utc();
-        let expected = "> [!CAUTION]\n\
-                        > Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00. \
-                        This session's context is 9,872,344 tokens.\n\
-                        > Reply with the release marker to continue on overage until then.";
+        let render = || {
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                Some(9_872_344),
+                &tz,
+                NoticeStyle::default(),
+            )
+        };
+        let first = render();
         for _ in 0..3 {
-            assert_eq!(
-                Blocking::notice(
-                    Meter::FiveHour,
-                    Some(1_769_500_800),
-                    Some(9_872_344),
-                    &tz,
-                    NoticeStyle::default()
-                ),
-                expected
-            );
+            assert_eq!(render(), first);
         }
+        insta::assert_snapshot!("default_style", first);
         // The timezone is an input: a different zone renders different
         // bytes for the same instant, deterministically — inside the
         // same frozen wrapper.
         let auckland = jiff::tz::TimeZone::get("Pacific/Auckland").expect("IANA zone");
-        assert_eq!(
-            Blocking::notice(
-                Meter::FiveHour,
-                Some(1_769_500_800),
-                None,
-                &auckland,
-                NoticeStyle::default()
-            ),
-            "> [!CAUTION]\n> Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 21:00.\n\
-             > Reply with the release marker to continue on overage until then.",
-            "2026-01-27 08:00 UTC is 21:00 NZDT the same day"
+        let in_auckland = Blocking::notice(
+            Meter::FiveHour,
+            Some(1_769_500_800),
+            None,
+            &auckland,
+            NoticeStyle::default(),
         );
+        assert!(
+            in_auckland.contains("until 21:00."),
+            "2026-01-27 08:00 UTC is 21:00 NZDT the same day: {in_auckland}"
+        );
+        insta::assert_snapshot!("default_style_auckland", in_auckland);
     }
 
     #[test]
     fn the_notice_renders_in_the_configured_style() {
-        // One decision, three styles: the CONTENT is identical, only the
-        // wrapping differs. Plain is the pre-wrapper form, byte for byte;
-        // gfm is the generic default (the block is claude's rendering).
+        // One decision, every style: the CONTENT is identical, only the
+        // wrapping differs. Plain is the content in brackets (its bytes
+        // are pinned above); gfm is the generic default (the block is
+        // claude's rendering).
         let tz = utc();
-        let content = "Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00.\n\
-                       Reply with the release marker to continue on overage until then.";
+        let notice =
+            |style| Blocking::notice(Meter::FiveHour, Some(1_769_500_800), None, &tz, style);
+        let plain = notice(NoticeStyle::Plain);
+        let content = plain
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .expect("plain: the content in brackets, its only frame");
+        let block = notice(NoticeStyle::Block);
         assert_eq!(
-            Blocking::notice(
-                Meter::FiveHour,
-                Some(1_769_500_800),
-                None,
-                &tz,
-                NoticeStyle::Plain
-            ),
-            format!("[{content}]"),
-            "plain: the content in brackets, its only frame"
-        );
-        assert_eq!(
-            Blocking::notice(
-                Meter::FiveHour,
-                Some(1_769_500_800),
-                None,
-                &tz,
-                NoticeStyle::Block
-            ),
+            block,
             format!("{BLOCK_HEADER}\n{content}\n{BLOCK_FOOTER}"),
             "block: the frozen block around the same content"
         );
+        let toker = notice(NoticeStyle::Toker);
         assert_eq!(
-            Blocking::notice(
-                Meter::FiveHour,
-                Some(1_769_500_800),
-                None,
-                &tz,
-                NoticeStyle::Toker
-            ),
+            toker,
             format!("> [!TOKER]\n> {}", content.replace('\n', "\n> ")),
             "toker: Workhorse's alert"
         );
+        let gfm = notice(NoticeStyle::Gfm);
         assert_eq!(
-            Blocking::notice(
-                Meter::FiveHour,
-                Some(1_769_500_800),
-                None,
-                &tz,
-                NoticeStyle::Gfm
-            ),
+            gfm,
             format!("> [!CAUTION]\n> {}", content.replace('\n', "\n> ")),
             "gfm: the alert form, at the quota block's level"
         );
+        insta::assert_snapshot!("style_block", block);
+        insta::assert_snapshot!("style_toker", toker);
+        insta::assert_snapshot!("style_gfm", gfm);
+    }
+
+    #[test]
+    fn no_notice_carries_an_em_dash() {
+        // The notices hold no em dashes: every rendering the gate can
+        // write, in every style, is held to that outside any snapshot.
+        let tz = utc();
+        for meter in [Meter::FiveHour, Meter::SevenDay] {
+            for resets_at in [Some(1_769_500_800), None] {
+                for context in [None, Some(0), Some(123_456)] {
+                    for style in [
+                        NoticeStyle::Plain,
+                        NoticeStyle::Gfm,
+                        NoticeStyle::Toker,
+                        NoticeStyle::Block,
+                    ] {
+                        let notice = Blocking::notice(meter, resets_at, context, &tz, style);
+                        assert!(!notice.contains('\u{2014}'), "{notice}");
+                    }
+                }
+            }
+        }
     }
 
     // ── the synthetic turn: byte-pinned, both renderings ────────────────
@@ -1050,34 +1050,14 @@ mod tests {
 
     #[test]
     fn the_sse_turn_is_byte_pinned() {
+        // The exact event shape: a client renders it as a normal
+        // assistant message.
         let bytes = Blocking::sse_turn(PINNED_NOTICE, Some("claude-sonnet-5"));
-        let expected = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_toker_blocked\",\
-             \"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\
-             \"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\
-             \"usage\":{\"input_tokens\":0,\"output_tokens\":0,\
-             \"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n",
-            "event: content_block_start\n",
-            "data: {\"type\":\"content_block_start\",\"index\":0,\
-             \"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\
-             \"delta\":{\"type\":\"text_delta\",\"text\":\"[Stopped: quota is spent.]\"}}\n\n",
-            "event: content_block_stop\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\
-             \"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\
-             \"usage\":{\"output_tokens\":0}}\n\n",
-            "event: message_stop\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
-        );
-        assert_eq!(
-            std::str::from_utf8(&bytes).expect("utf-8"),
-            expected,
-            "the exact event shape: a client renders it as a normal assistant message"
-        );
+        let text = std::str::from_utf8(&bytes).expect("utf-8");
+        // A snapshot ignores trailing whitespace: the closing blank line
+        // that ends the last event is pinned here.
+        assert!(text.ends_with("\n\n"), "{text:?}");
+        insta::assert_snapshot!(text);
 
         // No model named: the "claude-opus-5" default.
         let bytes = Blocking::sse_turn("x", None);
@@ -1097,20 +1077,9 @@ mod tests {
 
     #[test]
     fn the_json_turn_is_byte_pinned() {
+        // A client that asked for a plain JSON Message gets exactly one.
         let bytes = Blocking::json_turn(PINNED_NOTICE, Some("claude-sonnet-5"));
-        assert_eq!(
-            bytes,
-            concat!(
-                "{\"id\":\"msg_toker_blocked\",\"type\":\"message\",\"role\":\"assistant\",",
-                "\"model\":\"claude-sonnet-5\",",
-                "\"content\":[{\"type\":\"text\",\"text\":\"[Stopped: quota is spent.]\"}],",
-                "\"stop_reason\":\"end_turn\",\"stop_sequence\":null,",
-                "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,",
-                "\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}",
-            )
-            .as_bytes(),
-            "a client that asked for a plain JSON Message gets exactly one"
-        );
+        insta::assert_snapshot!(std::str::from_utf8(&bytes).expect("utf-8"));
         let bytes = Blocking::json_turn("x", None);
         assert!(
             std::str::from_utf8(&bytes)

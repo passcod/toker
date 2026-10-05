@@ -1,0 +1,10 @@
+---
+source: src/middleware/cold.rs
+expression: notice
+---
+[Paused by [toker](https://github.com/passcod/toker) at 08:00: the prompt cache expired after 2h idle, so the next message re-reads 200,000 tokens into the prompt cache. You can:
+- `/compact`: pay the re-read once for a small prefix. The proxy would run it on claude-sonnet-5.
+- Start a new session: pay nothing, keep none of this context.
+- Reply: carry on and pay the re-read.
+
+The 5-hour window was already heading for its wall at 08:45, 1h 15m before it resets at 10:00; this re-read is up to about 6.2% of a window and brings that forward by 15m.]

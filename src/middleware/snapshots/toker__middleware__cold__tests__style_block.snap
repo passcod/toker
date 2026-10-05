@@ -1,0 +1,10 @@
+---
+source: src/middleware/cold.rs
+expression: "ColdBlocking::notice(47 * MIN, 200_000, None, None, 1_769_500_800_000, &utc(),\nstyle)"
+---
+`★ Toker ──────────────────────────────────────────`
+Paused by [toker](https://github.com/passcod/toker) at 08:00: the prompt cache expired after 47m idle, so the next message re-reads 200,000 tokens into the prompt cache. You can:
+- `/compact`: pay the re-read once for a small prefix.
+- Start a new session: pay nothing, keep none of this context.
+- Reply: carry on and pay the re-read.
+`──────────────────────────────────────────────────`

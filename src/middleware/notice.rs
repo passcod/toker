@@ -203,16 +203,22 @@ mod tests {
 
     #[test]
     fn block_wraps_the_content_verbatim_between_header_and_footer() {
-        // Byte-pinned: the plan's example, rendered whole — at either
-        // level, the block has no level of its own.
-        for level in LEVELS {
-            assert_eq!(
-                render(NoticeStyle::Block, level, CONTENT),
-                "`★ Toker ──────────────────────────────────────────`\n\
-                 You've hit the 5-hour limit for your current plan. It resets at 21:30.\n\
-                 `──────────────────────────────────────────────────`"
-            );
-        }
+        // The plan's example, rendered whole — at either level, the block
+        // has no level of its own.
+        let [caution, warning] = LEVELS.map(|level| render(NoticeStyle::Block, level, CONTENT));
+        assert_eq!(caution, warning, "the block has no level");
+        // The invariant, stated outside the snapshot so accepting a new
+        // snapshot cannot change it: the frozen header, the content
+        // verbatim, the frozen footer.
+        assert_eq!(
+            caution,
+            format!("{BLOCK_HEADER}\n{CONTENT}\n{BLOCK_FOOTER}")
+        );
+        insta::assert_snapshot!(caution, @r"
+        `★ Toker ──────────────────────────────────────────`
+        You've hit the 5-hour limit for your current plan. It resets at 21:30.
+        `──────────────────────────────────────────────────`
+        ");
         // Multi-line content passes through verbatim, untouched.
         assert_eq!(
             render(
@@ -226,14 +232,15 @@ mod tests {
 
     #[test]
     fn gfm_spells_the_level_and_prefixes_each_content_line() {
-        assert_eq!(
-            render(NoticeStyle::Gfm, NoticeLevel::Caution, CONTENT),
-            "> [!CAUTION]\n> You've hit the 5-hour limit for your current plan. It resets at 21:30."
-        );
-        assert_eq!(
-            render(NoticeStyle::Gfm, NoticeLevel::Warning, "line one\nline two"),
-            "> [!WARNING]\n> line one\n> line two"
-        );
+        insta::assert_snapshot!(render(NoticeStyle::Gfm, NoticeLevel::Caution, CONTENT), @r"
+        > [!CAUTION]
+        > You've hit the 5-hour limit for your current plan. It resets at 21:30.
+        ");
+        insta::assert_snapshot!(render(NoticeStyle::Gfm, NoticeLevel::Warning, "line one\nline two"), @r"
+        > [!WARNING]
+        > line one
+        > line two
+        ");
         // A trailing newline in the content is not a line, so it never
         // grows an empty `> ` continuation.
         assert_eq!(
@@ -242,19 +249,21 @@ mod tests {
                 NoticeLevel::Warning,
                 "line one\nline two\n"
             ),
-            "> [!WARNING]\n> line one\n> line two",
+            render(NoticeStyle::Gfm, NoticeLevel::Warning, "line one\nline two"),
             "a trailing newline is not a content line"
         );
     }
 
     #[test]
     fn toker_is_workhorses_alert_whatever_the_level() {
-        for level in LEVELS {
-            assert_eq!(
-                render(NoticeStyle::Toker, level, "line one\nline two"),
-                "> [!TOKER]\n> line one\n> line two"
-            );
-        }
+        let [caution, warning] =
+            LEVELS.map(|level| render(NoticeStyle::Toker, level, "line one\nline two"));
+        assert_eq!(caution, warning, "the level does not show");
+        insta::assert_snapshot!(caution, @r"
+        > [!TOKER]
+        > line one
+        > line two
+        ");
     }
 
     #[test]
@@ -277,15 +286,22 @@ mod tests {
             format!("{BLOCK_HEADER}\n\n{BLOCK_FOOTER}")
         );
         // The alerts: the bare marker; Plain: its brackets.
-        assert_eq!(
-            render(NoticeStyle::Gfm, NoticeLevel::Caution, ""),
-            "> [!CAUTION]"
-        );
-        assert_eq!(
-            render(NoticeStyle::Toker, NoticeLevel::Caution, ""),
-            "> [!TOKER]"
-        );
-        assert_eq!(render(NoticeStyle::Plain, NoticeLevel::Caution, ""), "[]");
+        insta::assert_snapshot!(render(NoticeStyle::Gfm, NoticeLevel::Caution, ""), @"> [!CAUTION]");
+        insta::assert_snapshot!(render(NoticeStyle::Toker, NoticeLevel::Caution, ""), @"> [!TOKER]");
+        insta::assert_snapshot!(render(NoticeStyle::Plain, NoticeLevel::Caution, ""), @"[]");
+    }
+
+    #[test]
+    fn no_frame_carries_an_em_dash() {
+        // The notices hold no em dashes (the compacted wording dropped
+        // them); every style's frame is held to the same rule, so a
+        // frame change cannot bring one back unnoticed.
+        for style in STYLES {
+            for level in LEVELS {
+                let rendered = render(style, level, "");
+                assert!(!rendered.contains('\u{2014}'), "{style:?}: {rendered}");
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,7 @@
+---
+source: src/middleware/quota.rs
+expression: in_auckland
+---
+> [!CAUTION]
+> Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 21:00.
+> Reply with the release marker to continue on overage until then.

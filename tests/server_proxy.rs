@@ -1302,18 +1302,14 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
     let text = value["choices"][0]["message"]["content"]
         .as_str()
         .expect("the notice text");
-    assert!(
-        text.contains("prompt cache expired after 11m idle"),
-        "{text}"
-    );
-    assert!(
-        text.contains("re-reads 500,000 tokens into the prompt cache"),
-        "{text}"
-    );
-    assert!(
-        text.contains("- Reply: carry on and pay the re-read."),
-        "{text}"
-    );
+    // The measured idle and prompt size, the rest pinned by the
+    // snapshot. The stamp is the server's wall clock in the system zone,
+    // so it is filtered out.
+    assert!(text.contains("11m"), "the measured idle: {text}");
+    assert!(text.contains("500,000"), "the measured prompt: {text}");
+    insta::with_settings!({filters => vec![(r" at \d{2}:\d{2}:", " at [HH:MM]:")]}, {
+        insta::assert_snapshot!(text);
+    });
     // The GFM alert is the unprefixed default, at the cold notice's
     // warning level.
     assert!(text.contains("> [!WARNING]"), "{text}");

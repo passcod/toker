@@ -1,0 +1,8 @@
+---
+source: src/middleware/quota.rs
+expression: block
+---
+`★ Toker ──────────────────────────────────────────`
+Stopped by [toker](https://github.com/passcod/toker): the 5-hour quota is spent until 08:00.
+Reply with the release marker to continue on overage until then.
+`──────────────────────────────────────────────────`

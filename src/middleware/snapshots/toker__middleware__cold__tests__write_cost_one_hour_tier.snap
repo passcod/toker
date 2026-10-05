@@ -1,0 +1,8 @@
+---
+source: src/middleware/cold.rs
+expression: hour
+---
+[Paused by [toker](https://github.com/passcod/toker) at 08:00: the prompt cache expired after 2h idle, so the next message re-reads 200,621 tokens into the prompt cache (×2 usage). You can:
+- `/compact`: pay the re-read once for a small prefix.
+- Start a new session: pay nothing, keep none of this context.
+- Reply: carry on and pay the re-read.]

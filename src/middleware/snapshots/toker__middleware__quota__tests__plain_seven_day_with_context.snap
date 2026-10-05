@@ -1,0 +1,6 @@
+---
+source: src/middleware/quota.rs
+expression: with_context
+---
+[Stopped by [toker](https://github.com/passcod/toker): the 7-day quota is spent until 08:00. This session's context is 123,456 tokens.
+Reply with the release marker to continue on overage until then.]

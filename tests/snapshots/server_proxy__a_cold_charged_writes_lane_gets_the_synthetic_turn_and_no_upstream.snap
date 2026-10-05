@@ -1,0 +1,9 @@
+---
+source: tests/server_proxy.rs
+expression: text
+---
+> [!WARNING]
+> Paused by [toker](https://github.com/passcod/toker) at [HH:MM]: the prompt cache expired after 11m idle, so the next message re-reads 500,000 tokens into the prompt cache. You can:
+> - `/compact`: pay the re-read once for a small prefix.
+> - Start a new session: pay nothing, keep none of this context.
+> - Reply: carry on and pay the re-read.

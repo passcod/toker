@@ -513,18 +513,21 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     let bytes = response.bytes().await.expect("notice bytes");
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.starts_with("event: message_start\n"));
-    assert!(
-        text.contains("prompt cache expired after 2h idle"),
-        "{text}"
-    );
-    assert!(
-        text.contains("re-reads 200,000 tokens into the prompt cache"),
-        "{text}"
-    );
-    assert!(
-        text.contains("- Reply: carry on and pay the re-read."),
-        "{text}"
-    );
+    // The notice the turn carries: its measured idle and prompt size,
+    // the rest pinned by the snapshot. The stamp is the server's wall
+    // clock in the system zone, so it is filtered out.
+    let notice = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "content_block_delta")
+        .and_then(|event| event["delta"]["text"].as_str().map(str::to_owned))
+        .expect("the notice delta");
+    assert!(notice.contains("2h"), "the measured idle: {notice}");
+    assert!(notice.contains("200,000"), "the measured prompt: {notice}");
+    insta::with_settings!({filters => vec![(r" at \d{2}:\d{2}:", " at [HH:MM]:")]}, {
+        insta::assert_snapshot!(notice);
+    });
     // No model entry exists to resolve a compact target onto, so the
     // notice stays silent about one — an unarmed proxy promising a cheap
     // compaction would be the feature lying about its configuration.

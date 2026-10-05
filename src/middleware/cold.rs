@@ -3577,16 +3577,7 @@ mod tests {
             &utc(),
             NoticeStyle::Plain,
         );
-        assert_eq!(
-            content,
-            "[Paused by [toker](https://github.com/passcod/toker) at 08:00: the prompt \
-             cache expired after 2h 6m idle, so the next message re-reads 200,621 tokens \
-             into the prompt cache. You can:\n\
-             - `/compact`: pay the re-read once for a small prefix. The proxy would run \
-             it on claude-sonnet-5.\n\
-             - Start a new session: pay nothing, keep none of this context.\n\
-             - Reply: carry on and pay the re-read.]"
-        );
+        insta::assert_snapshot!(content);
         // A known tier states the write's cost; an unknown one says nothing.
         let hour = ColdBlocking::notice_for(
             Some(2.0),
@@ -3598,10 +3589,9 @@ mod tests {
             &utc(),
             NoticeStyle::Plain,
         );
-        assert!(
-            hour.contains("200,621 tokens into the prompt cache (\u{d7}2 usage). You can:"),
-            "{hour}"
-        );
+        assert!(hour.contains("(\u{d7}2 usage)"), "{hour}");
+        assert!(!content.contains("usage)"), "{content}");
+        insta::assert_snapshot!("write_cost_one_hour_tier", hour);
         let five = ColdBlocking::notice_for(
             Some(1.25),
             2 * HOUR,
@@ -3697,6 +3687,23 @@ mod tests {
                 crate::middleware::notice::BLOCK_FOOTER
             )
         );
+        // The whole notice without a compaction target, in each framed
+        // style: the relations above hold them to the content, these
+        // show the bytes.
+        for style in [NoticeStyle::Gfm, NoticeStyle::Toker, NoticeStyle::Block] {
+            insta::assert_snapshot!(
+                format!("style_{}", style.name()),
+                ColdBlocking::notice(
+                    47 * MIN,
+                    200_000,
+                    None,
+                    None,
+                    1_769_500_800_000,
+                    &utc(),
+                    style
+                )
+            );
+        }
         // The default style is the generic GFM alert, like the quota gate.
         assert!(
             ColdBlocking::notice(
@@ -3745,24 +3752,9 @@ mod tests {
         // captured-fixture dialect.
         let sse = ColdBlocking::openai_turn(&content, Some("z-ai/glm-5.3"), true, NOW);
         let text = String::from_utf8(sse).expect("utf-8");
-        assert_eq!(
-            text,
-            format!(
-                "data: {}\n\ndata: [DONE]\n",
-                serde_json::json!({
-                    "id": "chatcmpl-toker-cold",
-                    "object": "chat.completion.chunk",
-                    "created": NOW / 1000,
-                    "model": "z-ai/glm-5.3",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": content},
-                        "finish_reason": null,
-                    }],
-                })
-            ),
-            "one content delta then [DONE], byte for byte"
-        );
+        // One content delta then [DONE], byte for byte.
+        assert!(text.ends_with("\n\ndata: [DONE]\n"), "{text}");
+        insta::assert_snapshot!(text);
 
         // An absent or empty model falls back to the stand-in; the bytes
         // are a pure function of the inputs.
@@ -3799,13 +3791,10 @@ mod tests {
             NoticeStyle::Plain,
         );
         assert!(
-            notice.contains(
-                "The 5-hour window was already heading for its wall at 08:45, \
-                 1h 15m before it resets at 10:00; this re-read is up to about 6.2% \
-                 of a window and brings that forward by 15m."
-            ),
+            notice.contains("08:45") && notice.contains("forward by 15m"),
             "{notice}"
         );
+        insta::assert_snapshot!("off_track_five_hour", notice);
 
         // An already-spent weekly meter, with a borrowed (bound) share:
         // "up to" like any share, and the share stays of a 5-HOUR window even though the
@@ -3831,12 +3820,11 @@ mod tests {
             NoticeStyle::Plain,
         );
         assert!(
-            notice.contains(
-                "The 7-day window was already spent, and this re-read is up \
-                 to about 6.2% of a 5-hour window."
-            ),
+            notice.contains("7-day window was already spent")
+                && notice.contains("6.2% of a 5-hour window"),
             "{notice}"
         );
+        insta::assert_snapshot!("spent_seven_day", notice);
         // An under-minute pull-in spends no line on "by 0m".
         let tiny = Outlook {
             pulled_in_ms: Some(30_000.0),
@@ -3889,6 +3877,57 @@ mod tests {
             NoticeStyle::Plain,
         );
         assert!(!notice.contains("window was"), "{notice}");
+    }
+
+    #[test]
+    fn no_notice_carries_an_em_dash() {
+        // The notices hold no em dashes: every rendering the gate can
+        // write, with or without a write cost, a target, and an outlook,
+        // in every style, is held to that outside any snapshot. (The
+        // cost's `\u{d7}` is fine: only U+2014 is banned.)
+        let off_track = Outlook {
+            known: true,
+            on_track: false,
+            meter: Some(Meter::FiveHour),
+            extra: Some(0.062),
+            bound: Some(false),
+            util: Some(0.95),
+            reset_at_ms: Some(1_769_500_800_000 + 2 * HOUR),
+            wall_at_ms: Some(1_769_500_800_000_f64 + 45.0 * MIN as f64),
+            pulled_in_ms: Some(15.0 * MIN as f64),
+        };
+        let spent_week = Outlook {
+            meter: Some(Meter::SevenDay),
+            bound: Some(true),
+            util: Some(0.999),
+            wall_at_ms: None,
+            pulled_in_ms: None,
+            ..off_track
+        };
+        for write_multiplier in [None, Some(2.0), Some(1.25)] {
+            for target in [None, Some("claude-sonnet-5")] {
+                for outlook in [None, Some(&off_track), Some(&spent_week)] {
+                    for style in [
+                        NoticeStyle::Plain,
+                        NoticeStyle::Gfm,
+                        NoticeStyle::Toker,
+                        NoticeStyle::Block,
+                    ] {
+                        let notice = ColdBlocking::notice_for(
+                            write_multiplier,
+                            2 * HOUR + 6 * MIN,
+                            200_621,
+                            target,
+                            outlook,
+                            1_769_500_800_000,
+                            &utc(),
+                            style,
+                        );
+                        assert!(!notice.contains('\u{2014}'), "{notice}");
+                    }
+                }
+            }
+        }
     }
 
     // ── the compaction retarget ─────────────────────────────────────
