@@ -3040,6 +3040,7 @@ fn apply_key(
 fn frontend_state(frontend: &Frontend, url: &UrlRead, toker_port: u16) -> String {
     let what = match frontend {
         Frontend::Opencode { .. } => "baseURL",
+        Frontend::Codex { .. } => "base_url",
         _ => "ANTHROPIC_BASE_URL",
     };
     match url {
