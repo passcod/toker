@@ -811,6 +811,58 @@ async fn models_passthrough_is_byte_identical_and_unledgered() {
 }
 
 #[tokio::test]
+async fn models_never_carries_an_anthropic_credential_to_openrouter() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(
+        upstream,
+        UNSET_KEY_ENV,
+        Some("sk-or-stored".to_owned()),
+    ))
+    .await;
+
+    // Claude's OAuth bearer, and an Anthropic API key in its own header:
+    // both are dropped, and the stored openrouter key takes the bearer's
+    // place as if the request had carried none.
+    let response = client()
+        .get(toker_url(addr, "/v1/models"))
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat01-claude-oauth")
+        .header("x-api-key", "sk-ant-api03-key")
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = mock.captured();
+    assert_eq!(
+        captured[0]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-or-stored"),
+        "the anthropic bearer is replaced by the stored key"
+    );
+    assert!(
+        captured[0].headers.get("x-api-key").is_none(),
+        "x-api-key never reaches openrouter"
+    );
+
+    // The frontend's own openrouter key still passes through verbatim.
+    let response = client()
+        .get(toker_url(addr, "/v1/models"))
+        .header(header::AUTHORIZATION, "Bearer sk-or-v1-client")
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.captured()[1]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-or-v1-client")
+    );
+}
+
+#[tokio::test]
 async fn non_json_bodies_forward_unchanged_with_no_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;

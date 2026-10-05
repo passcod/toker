@@ -60,6 +60,16 @@ pub trait Provider: Send + Sync {
     /// verification of the wiring (ledger-proxy lesson).
     fn inject_auth(&self, outgoing: &mut HeaderMap);
 
+    /// Remove from the outgoing headers any credential that belongs to a
+    /// different provider and must never reach this one. The server calls
+    /// this on every request, before the pass-through-when-present check,
+    /// so a frontend's credential for one backend cannot ride a route to
+    /// another. The default removes nothing: a provider that only ever
+    /// sees its own protocol's frontend has no foreign credential to meet.
+    fn strip_foreign_credentials(&self, outgoing: &mut HeaderMap) {
+        let _ = outgoing;
+    }
+
     /// The operator's model routing map for this backend, when one is
     /// configured (`[providers.<id>.model_map]`, the same
     /// env-typed pattern the predecessor used):

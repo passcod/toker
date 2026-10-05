@@ -3,10 +3,33 @@
 //! provider captured verbatim (ledger parity).
 
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
+
+/// Anthropic's key header. Openrouter takes its key as a bearer only, so
+/// this header on a request bound for openrouter is always another
+/// provider's credential.
+const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// Whether the request's `Authorization` carries an Anthropic credential.
+/// Claude's OAuth bearer (`sk-ant-oat…`) and Anthropic API keys
+/// (`sk-ant-api…`) share the `sk-ant-` prefix, and no openrouter key does
+/// (those are `sk-or-…`), so the prefix alone separates them. A denylist
+/// rather than an `sk-or-` allowlist: pass-through-when-present exists
+/// for whatever key the frontend brings, and the one credential known to
+/// arrive here by mistake is claude's, which an anthropic-shaped client
+/// sends on every path it calls, `/v1/models` included.
+fn carries_anthropic_credential(headers: &HeaderMap) -> bool {
+    headers.get_all(AUTHORIZATION).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| value.split_whitespace().last())
+            .is_some_and(|token| token.starts_with("sk-ant-"))
+    })
+}
 
 /// OpenRouter: upstream `https://openrouter.ai/api/v1`, `Authorization:
 /// Bearer <key>` injected only when the incoming request carries none.
@@ -54,6 +77,25 @@ impl Provider for OpenRouter {
         Url::parse(&url).expect("validated upstream base makes every endpoint valid")
     }
 
+    /// A bearer counts as the frontend's own openrouter credential unless
+    /// it is an Anthropic one, which [`Provider::strip_foreign_credentials`]
+    /// drops: the stored key then takes its place, as if the request had
+    /// carried none.
+    fn credential_present(&self, incoming: &HeaderMap) -> bool {
+        incoming.contains_key(AUTHORIZATION) && !carries_anthropic_credential(incoming)
+    }
+
+    /// Anthropic credentials never reach openrouter.ai: `/v1/models` is
+    /// served here for every frontend, and an anthropic-shaped client
+    /// calling it sends its anthropic key or claude's OAuth bearer, which
+    /// pass-through-when-present would otherwise forward verbatim.
+    fn strip_foreign_credentials(&self, outgoing: &mut HeaderMap) {
+        outgoing.remove(&X_API_KEY);
+        if carries_anthropic_credential(outgoing) {
+            outgoing.remove(AUTHORIZATION);
+        }
+    }
+
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
         let Some(key) = &self.api_key else {
             // No key: forward unauthenticated; openrouter's 401 body passes
@@ -73,8 +115,8 @@ impl Provider for OpenRouter {
 mod tests {
     use super::super::Provider;
     use super::OpenRouter;
-    use axum::http::HeaderMap;
     use axum::http::header::AUTHORIZATION;
+    use axum::http::{HeaderMap, HeaderValue};
 
     fn provider() -> OpenRouter {
         OpenRouter::new(
@@ -140,5 +182,39 @@ mod tests {
         let mut headers = HeaderMap::new();
         keyless.inject_auth(&mut headers);
         assert!(headers.get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn anthropic_credentials_are_foreign_and_never_count_as_present() {
+        let provider = provider();
+        for bearer in [
+            "Bearer sk-ant-oat01-claude-oauth",
+            "Bearer sk-ant-api03-key",
+            "bearer  sk-ant-api03-key",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_static(bearer));
+            headers.insert("x-api-key", HeaderValue::from_static("sk-ant-api03-key"));
+            assert!(
+                !provider.credential_present(&headers),
+                "{bearer:?} is not an openrouter credential"
+            );
+            provider.strip_foreign_credentials(&mut headers);
+            assert!(headers.get(AUTHORIZATION).is_none(), "{bearer:?} dropped");
+            assert!(headers.get("x-api-key").is_none(), "x-api-key dropped");
+        }
+
+        // The frontend's own openrouter key stays, verbatim.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-or-v1-own"),
+        );
+        assert!(provider.credential_present(&headers));
+        provider.strip_foreign_credentials(&mut headers);
+        assert_eq!(
+            headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-or-v1-own")
+        );
     }
 }

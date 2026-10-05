@@ -31,6 +31,7 @@
 //!    `accept-encoding: identity` forced (SSE observation needs plaintext),
 //!    and the stored credential injected only when the incoming request
 //!    carries no Authorization of its own (pass-through-when-present).
+//!    Another provider's credential is dropped first, never forwarded.
 //! 8. A client hangup aborts the upstream (the body stream's Drop fires
 //!    an [`AbortHandle`]); a hung-up stream records no row.
 //! 9. Response branches: SSE streams through with the side observation;
@@ -322,6 +323,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 /// `GET /v1/models` — transparent forwarding. The model list is not a
 /// usage path: no recording, no observation (plan: the frontend fetches
 /// it through the base URL; the simplest correct dogfooding behavior).
+/// Every frontend lands here, claude included, so the openrouter
+/// provider strips any Anthropic credential the request carries before
+/// it leaves (see [`Provider::strip_foreign_credentials`]).
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -369,6 +373,9 @@ pub(crate) async fn send_upstream(
     // the request goes unauthenticated and the upstream's 401 body passes
     // through — visibly verifying the wiring.
     let mut headers = upstream_request_headers(&parts.headers, session_header_names);
+    // Before injection, so a dropped foreign credential leaves room for
+    // the provider's own.
+    provider.strip_foreign_credentials(&mut headers);
     if !provider.credential_present(&parts.headers) {
         provider.inject_auth(&mut headers);
     }
