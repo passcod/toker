@@ -50,6 +50,7 @@ use crate::ir::AnthropicShape;
 use crate::middleware::cold::Outlook;
 use crate::middleware::lanes;
 use crate::middleware::quota::{Grant, Meter, group};
+use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
@@ -135,9 +136,23 @@ pub(crate) fn record_anthropic_measurement(
 
     let ledgered = match capture {
         Some(capture) if usage_bearing(capture) => {
+            // Compared before the insert, so the lane's previous row is
+            // still the newest one. Infallible: a failure records no
+            // change and keeps the ladders.
+            let system = ctx.shape.as_ref().map(|shape| {
+                system_change::capture(&ctx.server.store, ctx.session_id.as_deref(), shape)
+            });
             insert(
                 ctx,
-                measurement_row(ctx, ts_ms, duration_ms, &route, capture, rate_limits),
+                measurement_row(
+                    ctx,
+                    ts_ms,
+                    duration_ms,
+                    &route,
+                    capture,
+                    rate_limits,
+                    system.as_ref(),
+                ),
             );
             // The lane table and the learned store update alongside the
             // row, on the response identity —
@@ -398,7 +413,9 @@ fn ladder_json(rungs: &[String]) -> Option<String> {
 }
 
 /// The measurement row (kind `None` = a real API measurement). See the
-/// module docs for the anthropic-specific fields.
+/// module docs for the anthropic-specific fields. `system` is the
+/// capture-time comparison with the lane's previous row, `None` when the
+/// request had no shape.
 fn measurement_row(
     ctx: &AnthropicRecordCtx,
     ts_ms: i64,
@@ -406,7 +423,12 @@ fn measurement_row(
     route: &str,
     capture: &AnthropicCapture,
     rate_limits: Option<&Value>,
+    system: Option<&SystemCapture>,
 ) -> RequestRow {
+    // The ladders ride only a lane's first row and the rows whose system
+    // prompt changed; a row matching its predecessor drops them, as ctp's
+    // `loggableShape` did.
+    let ladders = shape_ladders(ctx.shape.as_ref(), system);
     let (cost_usd, cost_kind) = cost_of(capture, cost_kind_of(ctx.backend.id()));
     let shape = ctx.shape.as_ref();
     RequestRow {
@@ -463,11 +485,9 @@ fn measurement_row(
         system_messages: shape.and_then(|s| s.system_messages.map(i64_of)),
         compact_generations: shape.and_then(|s| s.compact_generations.map(i64_of)),
         summarising: shape.map(|s| s.summarising),
-        // Lane-localised system-change detection is the lanes unit's
-        // middleware, not this unit's.
-        system_change: None,
-        system_ladder: shape.and_then(|s| ladder_json(&s.system_ladder)),
-        system_tail: shape.and_then(|s| ladder_json(&s.system_tail)),
+        system_change: system.and_then(|system| system.change.clone()),
+        system_ladder: ladders.and_then(|s| ladder_json(&s.system_ladder)),
+        system_tail: ladders.and_then(|s| ladder_json(&s.system_tail)),
         // The armed state of each gate rides every row, because readers
         // cannot see the service's config (a `?` row would be a gate that
         // may simply have been off).
@@ -500,6 +520,14 @@ fn measurement_row(
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
     }
+}
+
+/// The shape whose ladders the row keeps, or `None` when it drops them.
+fn shape_ladders<'a>(
+    shape: Option<&'a AnthropicShape>,
+    system: Option<&SystemCapture>,
+) -> Option<&'a AnthropicShape> {
+    shape.filter(|_| system.is_none_or(|system| system.keep_ladders))
 }
 
 /// The error row (plan: non-2xx on a usage path): status, the error pair,

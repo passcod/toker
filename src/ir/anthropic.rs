@@ -620,9 +620,9 @@ pub struct AnthropicShape {
     /// minute. Which kind it is takes the tool set too — ask
     /// [`AnthropicShape::is_compaction`], never this field alone.
     pub summarising: bool,
-    /// Cumulative system-text digests every 2 KiB:
+    /// Cumulative system-text digests every 8 KiB (`LADDER_STEP`):
     /// the first rung that differs between two requests bounds the
-    /// change to a 2 KiB window. Complete steps only, so the final
+    /// change to one 8 KiB window. Complete steps only, so the final
     /// partial step is unmeasured — the tail ladder covers that gap.
     pub system_ladder: Vec<String>,
     /// Digests of the system text's last 8, 16, … 256 bytes (8-byte
@@ -741,7 +741,7 @@ pub(crate) fn begins_line(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Cumulative digests every 2 KiB of UTF-16 text. Rungs at complete steps
+/// Cumulative digests every 8 KiB of UTF-16 text. Rungs at complete steps
 /// only (`end < length`), so
 /// an exact multiple contributes no rung for its final step.
 fn prefix_ladder(units: &[u16]) -> Vec<String> {
@@ -752,6 +752,16 @@ fn prefix_ladder(units: &[u16]) -> Vec<String> {
         end += LADDER_STEP;
     }
     rungs
+}
+
+/// How many prefix rungs [`prefix_ladder`] cuts for a text of
+/// `text_length` UTF-16 units: one per complete step strictly inside the
+/// text. `pub(crate)`: a stored ladder whose length disagrees was cut to
+/// another geometry (ctp's first ladders stepped every 2 KiB, and its first
+/// tail reached 4 KiB), so comparing its rungs with today's would name
+/// windows the rungs never bounded.
+pub(crate) fn prefix_rungs(text_length: usize) -> usize {
+    text_length.saturating_sub(1) / LADDER_STEP
 }
 
 /// The tail-ladder offsets for a text of `text_length` UTF-16 units:
@@ -1371,6 +1381,21 @@ mod tests {
             parse(body.as_bytes()).anthropic().shape().system_ladder,
             vec![short_hash(exact.as_bytes())]
         );
+    }
+
+    #[test]
+    fn the_rung_count_matches_the_ladder_cut() {
+        for length in [0, 1, 8191, 8192, 8193, 16384, 16385, 40_000] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "model": "m", "system": "x".repeat(length), "messages": [],
+            }))
+            .expect("serialise");
+            assert_eq!(
+                parse(&body).anthropic().shape().system_ladder.len(),
+                super::prefix_rungs(length),
+                "{length} units"
+            );
+        }
     }
 
     #[test]

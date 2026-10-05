@@ -2881,3 +2881,78 @@ async fn promote_hands_the_grant_to_a_running_server() {
     );
     assert_eq!(entry.max_prompt, Some(480_000));
 }
+
+/// A tooled, non-streaming body whose system prompt is long enough to cut
+/// prefix rungs and a full tail, with `marker` 21 units before its end.
+fn system_body(marker: &str) -> Vec<u8> {
+    let system = format!("{}{marker}{}", "x".repeat(20_000), "y".repeat(20));
+    serde_json::to_vec(&json!({
+        "model": "claude-sonnet-5",
+        "stream": false,
+        "system": system,
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "Hi"}],
+    }))
+    .expect("serialise system body")
+}
+
+/// Send one system-prompt request and return the ledger's rows once its
+/// row has landed.
+async fn send_system(
+    addr: SocketAddr,
+    store: &Store,
+    marker: &str,
+    rows: usize,
+) -> Vec<RequestRow> {
+    let response = post_messages(addr, "/v1/messages", &[], &system_body(marker)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("body bytes");
+    let landed = wait_for_rows(store, rows).await;
+    assert_eq!(landed.len(), rows);
+    landed
+}
+
+#[tokio::test]
+async fn capture_localises_a_system_change_and_keeps_ladders_only_where_it_matters() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // The lane's first row keeps its ladders, as the baseline, and claims
+    // no change: there is nothing to compare with.
+    let rows = send_system(addr, &store, "A", 1).await;
+    assert!(rows[0].system_ladder.is_some() && rows[0].system_tail.is_some());
+    assert_eq!(rows[0].system_change, None);
+
+    // The same prompt again: no ladders, no change.
+    let rows = send_system(addr, &store, "A", 2).await;
+    assert_eq!(rows[1].system_ladder, None);
+    assert_eq!(rows[1].system_tail, None);
+    assert_eq!(rows[1].system_change, None);
+
+    // A changed prompt: localised against the first row's rungs (its
+    // predecessor dropped them), and its own ladders kept.
+    let rows = send_system(addr, &store, "B", 3).await;
+    assert!(rows[2].system_ladder.is_some() && rows[2].system_tail.is_some());
+    insta::assert_snapshot!(
+        rows[2].system_change.as_ref().expect("localised").to_string(),
+        @r#"{"delta":0,"where":"block 0 (20021 → 20021 chars), 16-24 bytes from the end"}"#
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_server_finds_the_lanes_baseline_in_the_ledger() {
+    let (_mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, None, "anthropic_sub");
+    let (addr, store) = spawn_toker(config.clone()).await;
+    send_system(addr, &store, "A", 1).await;
+    send_system(addr, &store, "A", 2).await;
+
+    // A new server over the same ledger: no in-memory state carries over,
+    // and the change is still localised.
+    let (addr, store) = spawn_toker(config).await;
+    let rows = send_system(addr, &store, "B", 3).await;
+    insta::assert_snapshot!(
+        rows[2].system_change.as_ref().expect("localised").to_string(),
+        @r#"{"delta":0,"where":"block 0 (20021 → 20021 chars), 16-24 bytes from the end"}"#
+    );
+}

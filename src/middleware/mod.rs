@@ -35,7 +35,11 @@
 //! - [`model_map`] — the model routing map: opaque
 //!   operator routing policy, the pure parse/match/rewrite interface the
 //!   `route-identity` parity case pins (config and server wiring are the
-//!   model-routing unit's).
+//!   model-routing unit's);
+//! - [`system_change`] — capture-time system-prompt change localisation:
+//!   the lane's previous row from the ledger, the change bounded to a
+//!   block, an 8 KiB step or a tail window, and the rule that keeps the
+//!   ladders only where the prompt changed or the lane began.
 
 pub mod awake;
 pub mod cold;
@@ -45,3 +49,4 @@ pub mod model_map;
 pub mod models;
 pub mod notice;
 pub mod quota;
+pub mod system_change;
