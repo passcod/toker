@@ -216,6 +216,48 @@ pub fn export(db: Option<PathBuf>, filter: crate::store::RequestFilter) -> anyho
     }
 }
 
+/// `watch-context-window`: one pass of the context-window watch (see
+/// [`crate::watch`]), printing each new proof once. `since_ms` wins
+/// when given; otherwise the state file's recorded start, else now,
+/// which is then recorded, so a monitor that re-runs the verb without a
+/// `--since` keeps one window. The state file defaults to the state dir
+/// beside the ledger. It is written only after the lines are printed,
+/// so a proof whose line never reached the reader prints again next
+/// pass.
+pub fn watch_context_window(
+    db: Option<PathBuf>,
+    since_ms: Option<i64>,
+    state_path: Option<PathBuf>,
+    prefixes: Vec<String>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let db = ledger_path(db)?;
+    let state_path = state_path.unwrap_or_else(|| crate::watch::default_state_path(&db));
+    let store = Store::open_read_only(&db)?;
+    let mut state = crate::watch::WatchState::load(&state_path)?;
+    let since_ms = since_ms
+        .or(state.since_ms)
+        .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond());
+    state.since_ms.get_or_insert(since_ms);
+    // The daemon's models caches, read and never fetched: a missing
+    // cache costs the fetched ceilings, not the pass.
+    let catalogs = crate::catalog::fetched::cache_dir()
+        .map(|dir| crate::catalog::fetched::load_cached(&dir))
+        .unwrap_or_default();
+    let windows = crate::watch::Windows::from_store(&store, &catalogs)?;
+    let lines = crate::watch::pass(&store, &windows, since_ms, &prefixes, &mut state)?;
+    let mut out = std::io::stdout().lock();
+    for line in &lines {
+        match writeln!(out, "{line}") {
+            Ok(()) => {}
+            // The reader left: leave the state alone so these print again.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    state.save(&state_path)
+}
+
 /// A local-clock rendering of a row ts (the system zone; UTC-shaped on
 /// any failure — the timestamp is never hidden by a formatting error).
 fn fmt_ts(ts_ms: i64) -> String {
@@ -507,7 +549,7 @@ fn unseen_message(model: &str, known: &[String]) -> String {
 
 /// A token count with thousands separators, as the predecessor printed
 /// them (`en-US`).
-fn thousands(count: i64) -> String {
+pub(crate) fn thousands(count: i64) -> String {
     let digits = count.unsigned_abs().to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {

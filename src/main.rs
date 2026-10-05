@@ -114,6 +114,27 @@ enum Command {
         #[arg(long = "kind", value_name = "KIND", default_value = "all", value_parser = export::kind_arg)]
         kind: KindFilter,
     },
+    /// Print a PROOF line, once each, when a served response proves a
+    /// context window: an exact 1M window holding a prompt over 200k,
+    /// or a prompt over a provider-declared ceiling. One pass per run;
+    /// meant to be re-run by a monitor.
+    WatchContextWindow {
+        /// Ledger path; TOKER_DB env or the config default when omitted.
+        #[arg(long = "db", value_name = "PATH")]
+        db: Option<PathBuf>,
+        /// Only rows at or after this time (RFC 3339, or a span before
+        /// now: 90m, 2h, 3d, 1w). Default: when the state file's first
+        /// pass ran, or now on a first pass.
+        #[arg(long = "since", value_name = "TIME", value_parser = export::instant_arg)]
+        since: Option<i64>,
+        /// The seen-set file. Default: watch-context-window.json beside
+        /// the ledger.
+        #[arg(long = "state", value_name = "PATH")]
+        state: Option<PathBuf>,
+        /// Only sessions whose id starts with one of these.
+        #[arg(value_name = "SESSION_PREFIX")]
+        sessions: Vec<String>,
+    },
 
     /// A documented no-op: wake is owned by the systemd system timer
     /// (plan: Sleep lock, wake, ping). The predecessor's one-shot
@@ -178,6 +199,12 @@ fn main() -> anyhow::Result<()> {
                 kind,
             },
         ),
+        Command::WatchContextWindow {
+            db,
+            since,
+            state,
+            sessions,
+        } => cmds::watch_context_window(db, since, state, sessions),
         Command::WakeArm => cmds::wake_arm(),
         Command::Hold { for_ } => cmds::hold(for_),
         Command::PingWindow { slot } => cmds::ping_window(slot),

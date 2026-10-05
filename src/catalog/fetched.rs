@@ -319,6 +319,27 @@ pub fn load_cache(dir: &Path, provider: &str) -> Option<(i64, Value)> {
     Some((fetched_at_ms, response))
 }
 
+/// Every source's catalogue as its cache file holds it, for a reader
+/// that must not fetch (`toker watch-context-window`). A source whose
+/// cache is absent, unreadable or unparseable is simply missing: its
+/// models resolve without a fetched window, never with a guessed one.
+/// Staleness is not checked, because a stale listing is still the
+/// provider's last word and the reader has no better one.
+pub fn load_cached(dir: &Path) -> FetchedCatalogs {
+    let mut catalogs = FetchedCatalogs::default();
+    for source in SOURCES {
+        let Some((fetched_at, response)) = load_cache(dir, source) else {
+            continue;
+        };
+        if let Some(parse) = parse_for(source)
+            && let Ok(catalog) = parse(&response, fetched_at)
+        {
+            catalogs.set(source, catalog);
+        }
+    }
+    catalogs
+}
+
 /// Persist one fetched response as a source's cache file: the setup
 /// wizard's atomic primitive (temp beside the target, fsync, re-parse,
 /// compare, rename), 0644 on a fresh file — machine-readable cache

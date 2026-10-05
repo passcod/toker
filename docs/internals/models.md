@@ -105,6 +105,17 @@ after one would be the rebuild all over again.
   fill. A declared ceiling is never evidence that this route has served a prompt
   of that size, and nothing raises `max_prompt` from one.
 
+`toker watch-context-window` (`watch.rs`) is the one place a declared or exact
+window is turned into a claim, and it claims only what a served response proves:
+an exact 1M window holding a prompt over 200k, or a prompt over a declared
+ceiling. Unknown windows and prompts under the threshold say nothing. It reads
+only rows from its `--since` (or the start its state file recorded), because
+without the bound the whole ledger replays as news, and it keeps a seen-set in
+a state file (beside the ledger unless `--state` names one) so each proof prints
+once. Like ctp's it has no compaction detector: within a lane a compaction and a
+subagent starting both look like the prompt collapsing, and nothing in the
+ledger separates them, so that negative evidence is left unreported.
+
 Identities are exact. Published dated snapshots fold into their catalogue key,
 but family resemblance never assigns a future model a limit, and a `claude-`
 prefix is not capability evidence. The 1M-context beta header selects a limit

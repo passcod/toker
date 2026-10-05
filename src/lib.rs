@@ -33,3 +33,4 @@ pub mod store;
 pub mod timers;
 pub mod translate;
 pub mod tui;
+pub mod watch;

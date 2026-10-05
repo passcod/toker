@@ -28,7 +28,7 @@ plan](../plans/cutover.md).
 | Path | |
 | --- | --- |
 | `src/main.rs` | The CLI surface (clap). Every subcommand is a call into `cmds`. |
-| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `promote`, and the hidden timer verbs. |
+| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, and the hidden timer verbs. |
 | `src/config.rs` | `toker.toml` load: providers, protocol defaults, `[gates]`, `[notices]`, env overrides. |
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
 | `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick. |
@@ -54,6 +54,7 @@ plan](../plans/cutover.md).
 | `src/store/` | The SQLite ledger (`ledger.rs`), the state tables (`state.rs`), and the append-only migrations (`schema.rs`). |
 | `src/import.rs` | `toker import`: ctp's `usage.jsonl` into the ledger, with a checkpoint. |
 | `src/export.rs` | `toker export`: the ledger as JSONL, and the strict `--since`/`--until`/`--kind` parsers. |
+| `src/watch.rs` | `toker watch-context-window`: one pass printing each new proof of a context window, with its seen-set state file. |
 | `src/timers.rs` | The wake/hold/ping verbs the systemd units run. |
 | `src/setup/` | The wizard and its tested halves: atomic config writes, frontend patchers, the wiring check, unit templates, the bundled opencode plugin. |
 | `src/tui/` | The dashboard: aggregation (`model.rs`, `quota.rs`, `rebuilds.rs`), rendering (`view.rs`), session labels from transcripts, locale formatting. |
@@ -62,4 +63,5 @@ plan](../plans/cutover.md).
 | `tests/server_*.rs` | End to end: the real router against mock upstreams that capture every byte. Spend no quota. |
 | `tests/*_prefix_stability.rs`, `ir_serialisation.rs`, `translate_corpus.rs` | Byte round-trips and prefix stability, per protocol and across the translated route. |
 | `tests/node_reference_*.rs` | ctp's own decision fixture, vendored at `tests/fixtures/ctp/node-reference-v1.json`, driven against the ports. |
+| `tests/cli_readers.rs` | `export` and `watch-context-window` as processes: flags, a closed pipe, the state file. |
 | `tests/tui_pty.rs` | The TUI's steady-state CPU probe under a pseudo-terminal. |

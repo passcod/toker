@@ -135,6 +135,6 @@ is shown rather than refused.
   is added, so the export can carry no content or credential the ledger does
   not.
 
-Export opens the ledger read-only
+Export and `watch-context-window` open the ledger read-only
 (`Store::open_read_only`): a wrong path fails instead of creating an empty
 ledger, and an older binary never migrates the live file.
