@@ -1700,14 +1700,16 @@ impl<'a> Wizard<'a> {
     /// default — empty — is no slots, skipped silently.
     fn ask_slots(&mut self) -> Result<Vec<String>> {
         // The advertised defaults (README: a window open for the
-        // morning, re-opened after lunch): 07:30's ping lands at 07:41
-        // and anchors the window at 07:30–12:30; 12:31's lands at
-        // 12:42 and anchors 12:30–17:30. Clearing the answer entirely
-        // is the explicit opt-out.
+        // morning, re-opened after lunch), the predecessor's schedule:
+        // a slot is the wake and hold, and its ping fires 11 minutes
+        // later. 07:20's ping at 07:31 anchors the window on
+        // floor(07:31, 10 min) = 07:30, ending 12:30; 12:20's at 12:31
+        // anchors 12:30–17:30. Clearing the answer entirely is the
+        // explicit opt-out.
         for _ in 0..3 {
             let answer = self.prompt.text(
                 "Weekday (Mon..Fri) wake/hold/ping slots (hh:mm, comma- or space-separated; clear for none)",
-                Some("07:30, 12:31"),
+                Some("07:20, 12:20"),
                 false,
             )?;
             if answer.trim().is_empty() {
