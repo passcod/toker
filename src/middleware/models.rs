@@ -308,6 +308,16 @@ pub struct PromotionPlan {
     pub days: Vec<String>,
     /// The days the grant adds, sorted.
     pub granted: Vec<String>,
+    /// The prompt ceiling the model had been observed holding before the
+    /// grant (`None`: never observed holding one).
+    pub max_prompt_before: Option<i64>,
+    /// The ceiling after the grant: the family's best observed, or the
+    /// explicit override, and never below what this model has itself
+    /// been observed holding.
+    pub max_prompt: Option<i64>,
+    /// Whether `max_prompt` came from an explicit override rather than the
+    /// family's best.
+    pub ceiling_explicit: bool,
     /// What the family's election names once the grant lands. A promotion
     /// does not guarantee the slot: a newer version may already hold it,
     /// and saying so beats leaving the caller to discover it.
@@ -323,8 +333,17 @@ impl PromotionPlan {
         self.days.len() as f64 > self.needed
     }
 
+    /// Does the grant raise the prompt ceiling?
+    pub fn raises_ceiling(&self) -> bool {
+        self.max_prompt > self.max_prompt_before
+    }
+
     pub fn request_body(&self) -> serde_json::Value {
-        serde_json::json!({ "model": self.model_id, "days": self.days })
+        let mut body = serde_json::json!({ "model": self.model_id, "days": self.days });
+        if let Some(max_prompt) = self.max_prompt {
+            body["maxPrompt"] = serde_json::json!(max_prompt);
+        }
+        body
     }
 
     /// The same grant as the store merge takes it, for applying it
@@ -333,7 +352,7 @@ impl PromotionPlan {
         MergeIncoming {
             model_id: self.model_id.clone(),
             days: self.days.clone(),
-            max_prompt: None,
+            max_prompt: self.max_prompt,
         }
     }
 }
@@ -370,10 +389,20 @@ pub enum PromotionRefusal {
 /// of the bar being cleared, so a grant of invented days could raise the
 /// bar it was meant to clear, and with it un-elect other families'
 /// targets.
+///
+/// The prompt ceiling rises to the family's best observed, because a
+/// promotion that left it at "seen holding 4,000 tokens" would apply to
+/// new conversations only, while [`fits_context`] declined every real
+/// one. That assumes a newer version of a family holds at least as much
+/// as an older one, so the plan reports it, and `ceiling` overrides it.
+/// It never goes below what the model has itself been observed holding:
+/// that is a measurement, and an explicit ceiling is a guess. This never
+/// creates or widens a declared context capability.
 pub fn plan_promotion(
     entries: &[ModelEntry],
     model: &str,
     want: Option<usize>,
+    ceiling: Option<i64>,
 ) -> Result<PromotionPlan, PromotionRefusal> {
     let known = || PromotionRefusal::Unseen {
         known: entries.iter().map(|entry| entry.model_id.clone()).collect(),
@@ -403,6 +432,18 @@ pub fn plan_promotion(
         }
         days.insert(day.clone());
     }
+    let family = family_of(&id);
+    let family_best = entries
+        .iter()
+        .filter(|other| {
+            other.model_id == id
+                || family_of(&other.model_id)
+                    .is_some_and(|f| family.as_ref().is_some_and(|family| f.name == family.name))
+        })
+        .filter_map(|other| other.max_prompt)
+        .max();
+    // `Option` orders `None` below any `Some`, so absence never wins.
+    let max_prompt = entry.max_prompt.max(ceiling.or(family_best));
     let mut after = entries.to_vec();
     if let Some(promoted) = after.iter_mut().find(|entry| entry.model_id == id) {
         promoted.days_json = Some(serde_json::Value::Array(
@@ -411,8 +452,9 @@ pub fn plan_promotion(
                 .map(serde_json::Value::String)
                 .collect(),
         ));
+        promoted.max_prompt = max_prompt;
     }
-    let target = family_of(&id).and_then(|family| newest_in_family(&after, &family.name));
+    let target = family.and_then(|family| newest_in_family(&after, &family.name));
     Ok(PromotionPlan {
         model_id: id,
         active_days: pool.len(),
@@ -420,6 +462,9 @@ pub fn plan_promotion(
         days_before: before.len(),
         granted: days.difference(&before).cloned().collect(),
         days: days.into_iter().collect(),
+        max_prompt_before: entry.max_prompt,
+        max_prompt,
+        ceiling_explicit: ceiling.is_some(),
         target,
     })
 }
@@ -756,7 +801,7 @@ pub fn merge_learned(
 mod tests {
     use super::{
         MergeIncoming, MergeOutcome, ModelStore, PromotionRefusal, compaction_target_of, family_of,
-        local_day, newer_than, newest_in_family, plan_promotion, requirement,
+        fits_context, local_day, newer_than, newest_in_family, plan_promotion, requirement,
     };
     use crate::store::{ModelEntry, RequestRow, Store};
     use jiff::tz::TimeZone;
@@ -1277,7 +1322,7 @@ mod tests {
                 entry("claude-opus-5", &pool_refs, Some(1)),
                 entry("claude-opus-5-5", &[newest], Some(1)),
             ];
-            let plan = plan_promotion(&entries, "claude-opus-5-5", None).expect("served");
+            let plan = plan_promotion(&entries, "claude-opus-5-5", None, None).expect("served");
             assert_eq!(plan.active_days, active);
             assert_eq!(plan.needed, bar, "the bar at {active} active days");
             assert_eq!(plan.days.len(), want, "the default at {active} active days");
@@ -1288,14 +1333,62 @@ mod tests {
                 "and moves the election at {active}"
             );
             // The bar, as a count, is one short.
-            let exact =
-                plan_promotion(&entries, "claude-opus-5-5", Some(bar as usize)).expect("served");
+            let exact = plan_promotion(&entries, "claude-opus-5-5", Some(bar as usize), None)
+                .expect("served");
             assert!(
                 !exact.qualifies(),
                 "exactly the bar is not enough at {active}"
             );
             assert_eq!(exact.target.as_deref(), Some("claude-opus-5"));
         }
+    }
+
+    #[test]
+    fn a_promotion_raises_the_ceiling_to_the_familys_best_by_default() {
+        let pool = span(9);
+        let pool_refs: Vec<&str> = pool.iter().map(String::as_str).collect();
+        let entries = vec![
+            entry("claude-opus-5", &pool_refs, Some(480_000)),
+            entry("claude-opus-4-8", &pool_refs[..1], Some(900_000)),
+            // Another family's bigger ceiling is no evidence for opus.
+            entry("claude-sonnet-5", &pool_refs[..1], Some(990_000)),
+            entry("claude-opus-5-5", &pool_refs[8..], Some(4_000)),
+        ];
+        let plan = plan_promotion(&entries, "claude-opus-5-5", None, None).expect("served");
+        assert_eq!(plan.max_prompt_before, Some(4_000));
+        assert_eq!(plan.max_prompt, Some(900_000), "the family's best");
+        assert!(plan.raises_ceiling());
+        assert!(!plan.ceiling_explicit);
+        assert_eq!(plan.request_body()["maxPrompt"], json!(900_000));
+
+        // Without the raise, every existing long conversation would be
+        // refused by the context guard; with it, the promotion applies to
+        // them too.
+        let mut after = entries.clone();
+        after[3].max_prompt = plan.max_prompt;
+        assert!(!fits_context(&entries, "claude-opus-5-5", 300_000));
+        assert!(fits_context(&after, "claude-opus-5-5", 300_000));
+
+        // An explicit ceiling overrides the family's best...
+        let plan =
+            plan_promotion(&entries, "claude-opus-5-5", None, Some(200_000)).expect("served");
+        assert_eq!(plan.max_prompt, Some(200_000));
+        assert!(plan.ceiling_explicit);
+        // ...but never goes below what the model was observed holding.
+        let plan = plan_promotion(&entries, "claude-opus-5-5", None, Some(1_000)).expect("served");
+        assert_eq!(plan.max_prompt, Some(4_000));
+        assert!(!plan.raises_ceiling());
+
+        // A family nothing has been observed holding a prompt in stays
+        // absent: never a guessed zero, and nothing to send.
+        let bare = vec![
+            entry("claude-haiku-5", &pool_refs, None),
+            entry("claude-haiku-5-5", &pool_refs[8..], None),
+        ];
+        let plan = plan_promotion(&bare, "claude-haiku-5-5", None, None).expect("served");
+        assert_eq!(plan.max_prompt, None);
+        assert!(!plan.raises_ceiling());
+        assert!(plan.request_body().get("maxPrompt").is_none());
     }
 
     #[test]
@@ -1309,7 +1402,7 @@ mod tests {
         ];
         // Five of nine clears a bar of 4.5: nothing to grant.
         assert_eq!(
-            plan_promotion(&entries, "claude-opus-5", None),
+            plan_promotion(&entries, "claude-opus-5", None, None),
             Err(PromotionRefusal::Already {
                 model_id: "claude-opus-5".to_owned(),
                 days: 5,
@@ -1318,10 +1411,10 @@ mod tests {
             })
         );
         // ...unless more days are asked for explicitly.
-        let plan = plan_promotion(&entries, "claude-opus-5", Some(7)).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-5", Some(7), None).expect("served");
         assert_eq!(plan.days.len(), 7);
         // An older version clears the bar but a newer one holds the slot.
-        let plan = plan_promotion(&entries, "claude-opus-4-8", None).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-4-8", None, None).expect("served");
         assert!(plan.qualifies());
         assert_eq!(plan.target.as_deref(), Some("claude-opus-5-5"));
     }
@@ -1334,7 +1427,7 @@ mod tests {
             entry("claude-opus-5", &held_refs, Some(150_000)),
             entry("claude-opus-5-5", &["2026-09-27"], Some(4_000)),
         ];
-        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(5)).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(5), None).expect("served");
         assert_eq!(plan.model_id, "claude-opus-5-5");
         assert_eq!(plan.active_days, 8, "the pool is the bar's denominator");
         assert_eq!(plan.days_before, 1);
@@ -1348,13 +1441,13 @@ mod tests {
 
         // Asking for more days than the store holds grants the whole
         // pool and no more: the denominator is never enlarged.
-        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(30)).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(30), None).expect("served");
         assert_eq!(plan.days, held);
         assert_eq!(plan.active_days, 8);
 
         // Unseen: refused with what is known, never invented.
         assert_eq!(
-            plan_promotion(&entries, "claude-opus-6", None),
+            plan_promotion(&entries, "claude-opus-6", None, None),
             Err(PromotionRefusal::Unseen {
                 known: vec!["claude-opus-5".to_owned(), "claude-opus-5-5".to_owned()]
             })

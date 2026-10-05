@@ -38,7 +38,9 @@ enum Command {
         /// fewest that clear the election's bar.
         #[arg(long = "days")]
         days: Option<u32>,
-        /// A prompt ceiling to grant alongside the days, in tokens.
+        /// The prompt ceiling to grant alongside the days, in tokens.
+        /// Default: the family's best observed. It only ever raises the
+        /// ceiling, and never declares context capacity.
         #[arg(long = "max-prompt")]
         max_prompt: Option<u64>,
     },

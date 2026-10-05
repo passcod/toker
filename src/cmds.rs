@@ -241,7 +241,8 @@ async fn promote_run(
     let store = Store::open(&config.db_path)?;
     let entries = store.load_models()?;
     let mut out = std::io::stdout();
-    let plan = match plan_promotion(&entries, &model, days.map(|days| days as usize)) {
+    let ceiling = max_prompt.map(|max_prompt| i64::try_from(max_prompt).unwrap_or(i64::MAX));
+    let plan = match plan_promotion(&entries, &model, days.map(|days| days as usize), ceiling) {
         Ok(plan) => plan,
         Err(PromotionRefusal::Unseen { known }) => bail!(unseen_message(&model, &known)),
         Err(PromotionRefusal::Already {
@@ -258,10 +259,7 @@ async fn promote_run(
         }
     };
     render_plan(&plan, &mut out)?;
-    let mut body = plan.request_body();
-    if let Some(max_prompt) = max_prompt {
-        body["maxPrompt"] = serde_json::json!(max_prompt);
-    }
+    let body = plan.request_body();
     let url = format!("http://127.0.0.1:{}/_toker/models/merge", config.port);
     let client = reqwest::Client::builder().build()?;
     let response = client
@@ -316,6 +314,23 @@ fn unseen_message(model: &str, known: &[String]) -> String {
     )
 }
 
+/// A token count with thousands separators, as the predecessor printed
+/// them (`en-US`).
+fn thousands(count: i64) -> String {
+    let digits = count.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if count < 0 {
+        out.insert(0, '-');
+    }
+    out
+}
+
 /// The plan, as the predecessor's promote script reported it: the bar and
 /// its denominator, the days before and after, whether the model now
 /// clears the bar, and what the family's election will name.
@@ -344,6 +359,30 @@ fn render_plan(
             "  qualifies    no: {} day(s) is not more than {}",
             plan.days.len(),
             plan.needed
+        )?;
+    }
+    if plan.raises_ceiling() {
+        writeln!(
+            out,
+            "  rewrite-safe {} → {} tokens",
+            thousands(plan.max_prompt_before.unwrap_or(0)),
+            thousands(plan.max_prompt.unwrap_or(0))
+        )?;
+        if plan.ceiling_explicit {
+            writeln!(out, "               set by --max-prompt.")?;
+        } else {
+            writeln!(
+                out,
+                "               raised to the family's best empirical bound, assuming a newer"
+            )?;
+            writeln!(
+                out,
+                "               version holds at least as much. --max-prompt=N to set it yourself."
+            )?;
+        }
+        writeln!(
+            out,
+            "               declared context capacity is separate and is not widened."
         )?;
     }
     let target = plan.target.as_deref().unwrap_or("nothing");
@@ -381,7 +420,7 @@ mod tests {
     }
 
     fn rendered(entries: &[ModelEntry], model: &str, days: Option<usize>) -> String {
-        let plan = plan_promotion(entries, model, days).expect("plans");
+        let plan = plan_promotion(entries, model, days, None).expect("plans");
         let mut out = Vec::new();
         render_plan(&plan, &mut out).expect("render");
         String::from_utf8(out).expect("utf-8")
@@ -430,6 +469,18 @@ mod tests {
             report.contains("target       claude-opus-5   ← below the bar"),
             "{report}"
         );
+
+        // The ceiling: raised to the family's best by default, and said so.
+        let entries = vec![
+            entry("claude-opus-5", &NINE, Some(480_000)),
+            entry("claude-opus-5-5", &["2026-09-28"], Some(4_000)),
+        ];
+        let report = rendered(&entries, "claude-opus-5-5", None);
+        assert!(
+            report.contains("rewrite-safe 4,000 → 480,000 tokens"),
+            "{report}"
+        );
+        assert!(report.contains("family's best empirical bound"), "{report}");
 
         // A newer version holds the slot.
         let entries = vec![
