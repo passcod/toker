@@ -8,7 +8,8 @@
 //!   rtcwake's job, not this one's). Root-level because the user
 //!   manager lacks `CAP_WAKE_ALARM`; it is the only root-level piece
 //!   toker has ([`crate::setup::wizard::wake_system_unit`] generates
-//!   it, the wizard enables it through sudo).
+//!   it and the `/bin/true` service it starts, the wizard enables them
+//!   through sudo).
 //! - **hold** — USER timers at the same slots running `toker hold
 //!   --for=15m`: a timer that elapses while the machine is suspended
 //!   fires on resume, and the hold then keeps the machine up those 15

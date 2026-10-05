@@ -42,8 +42,9 @@
 //! real offer in the toggles step: a free-form `hh:mm` slot list
 //! (strictly validated; the default, empty, skips silently), the hold
 //! and per-slot ping USER units through the ordinary user-manager
-//! path, and the wake SYSTEM timer — the only root-level piece —
-//! staged into the units dir and enabled by path through
+//! path, and the wake SYSTEM timer with the do-nothing service it
+//! starts — the only root-level pieces — staged into the units dir and
+//! linked and enabled by path through
 //! [`SystemRunner::systemctl_system`], which production runs as
 //! `sudo systemctl` (it says so first: sudo will be asked). Every
 //! timers failure is non-fatal with manual commands printed — a
@@ -82,6 +83,12 @@ pub const SERVICE_UNIT: &str = "toker.service";
 /// the system manager through sudo; `WakeSystem=true` needs
 /// `CAP_WAKE_ALARM`, which the user manager lacks.
 pub const WAKE_TIMER_UNIT: &str = "toker-wake.timer";
+
+/// The service the wake timer starts — staged and linked beside it.
+/// A timer with no unit to activate is refused by systemd, so without
+/// this the wake timer never armed at all: the first install shipped
+/// the timer alone.
+pub const WAKE_SERVICE_UNIT: &str = "toker-wake.service";
 
 /// The hold USER timer's name (same name, timer + service pair).
 pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
@@ -415,6 +422,25 @@ WakeSystem=true
 WantedBy=timers.target
 "#
     )
+}
+
+/// `toker-wake.service` — what [`wake_system_unit`] activates (by the
+/// shared name; no `Unit=` needed). It does nothing: the timer's
+/// `WakeSystem=true` is the whole job, and staying awake for the ping
+/// is the hold USER unit's, so the root-owned half has nothing in it to
+/// audit and never needs the user's session bus. systemd still refuses
+/// to start a timer whose unit does not exist, so it must be there.
+pub fn wake_system_service() -> String {
+    r#"[Unit]
+Description=toker wake service (the wake timer's unit; does nothing itself)
+
+[Service]
+# The wake is the whole job and the timer's WakeSystem does it; holding
+# the machine up afterwards is the toker-hold user unit's.
+Type=oneshot
+ExecStart=/bin/true
+"#
+    .to_owned()
 }
 
 /// `toker-hold.timer` + `toker-hold.service` — the hold USER units
@@ -1779,60 +1805,98 @@ impl<'a> Wizard<'a> {
         self.wake_step(slots, report)
     }
 
-    /// The wake SYSTEM timer — the only root-level piece. The unit is
-    /// staged where the wizard can write (the user units dir), then
-    /// enabled **by path** through `sudo systemctl enable --now`:
-    /// systemctl links a unit file outside the search paths into
-    /// `/etc/systemd/system` itself. Where the staging filesystem is
-    /// one the system manager refuses to link from (or sudo is
-    /// declined), the failure is non-fatal and the manual commands —
-    /// a plain copy into `/etc/systemd/system`, then enable by name —
-    /// are printed.
+    /// The wake SYSTEM timer — the only root-level piece. The timer and
+    /// the do-nothing service it activates are staged where the wizard
+    /// can write (the user units dir), the service is linked into the
+    /// system manager by path (`sudo systemctl link`), and the timer is
+    /// enabled by path (`sudo systemctl enable --now`): systemctl links
+    /// a unit file outside the search paths into `/etc/systemd/system`
+    /// itself. The service is linked rather than enabled because it has
+    /// no `[Install]` — the timer is what starts it. Where the staging
+    /// filesystem is one the system manager refuses to link from (or
+    /// sudo is declined), the failure is non-fatal and the manual
+    /// commands — a plain copy of both into `/etc/systemd/system`, then
+    /// enable by name — are printed.
     fn wake_step(&mut self, slots: &[String], report: &mut RunReport) -> Result<()> {
-        let contents = wake_system_unit(slots);
-        let staged = match self.runner.install_unit(WAKE_TIMER_UNIT, &contents) {
-            Ok(path) => {
-                self.say(&format!("staged {} ({})", WAKE_TIMER_UNIT, path.display()))?;
-                report.timers_installed.push(WAKE_TIMER_UNIT.to_owned());
-                path
-            }
-            Err(error) => {
-                report.wake_manual.push(format!(
-                    "write {WAKE_TIMER_UNIT} into /etc/systemd/system (contents below)"
-                ));
-                self.say(&format!("staging {WAKE_TIMER_UNIT} failed: {error:#}"))?;
-                self.say("  the unit contents, to place by hand into /etc/systemd/system:")?;
-                for line in contents.lines() {
-                    self.say(&format!("    | {line}"))?;
+        let units = [
+            (WAKE_SERVICE_UNIT, wake_system_service()),
+            (WAKE_TIMER_UNIT, wake_system_unit(slots)),
+        ];
+        let mut staged = Vec::new();
+        for (name, contents) in &units {
+            match self.runner.install_unit(name, contents) {
+                Ok(path) => {
+                    self.say(&format!("staged {} ({})", name, path.display()))?;
+                    report.timers_installed.push((*name).to_owned());
+                    staged.push(path.display().to_string());
                 }
-                self.say_wake_manual(report)?;
-                return Ok(());
+                Err(error) => {
+                    report.wake_manual.push(format!(
+                        "write {name} into /etc/systemd/system (contents below)"
+                    ));
+                    self.say(&format!("staging {name} failed: {error:#}"))?;
+                    self.say("  the unit contents, to place by hand into /etc/systemd/system:")?;
+                    for line in contents.lines() {
+                        self.say(&format!("    | {line}"))?;
+                    }
+                }
             }
-        };
+        }
+        if staged.len() != units.len() {
+            report.wake_manual.push(format!(
+                "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+            ));
+            self.say_wake_manual(report)?;
+            return Ok(());
+        }
+        let (service_path, timer_path) = (&staged[0], &staged[1]);
 
         self.say(
             "enabling the wake system timer — sudo will be asked \
              (WakeSystem=true needs the system manager: the user manager lacks CAP_WAKE_ALARM)",
         )?;
-        let by_path = staged.display().to_string();
-        match self.runner.systemctl_system(&["enable", "--now", &by_path]) {
+        let link = self.runner.systemctl_system(&["link", service_path]);
+        let linked = match &link {
             Ok(output) if output.status.success() => {
-                self.say(&format!("sudo systemctl enable --now {by_path} — ok"))?;
-                report.wake_enabled = true;
+                self.say(&format!("sudo systemctl link {service_path} — ok"))?;
+                true
             }
             other => {
                 self.say(&format!(
-                    "enabling the wake system timer failed: {}",
-                    stderr_of(&other)
+                    "linking the wake service failed: {}",
+                    stderr_of(other)
                 ))?;
-                report.wake_manual = vec![
-                    format!("sudo cp {by_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
-                    format!(
-                        "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
-                    ),
-                ];
-                self.say_wake_manual(report)?;
+                false
             }
+        };
+        let enabled = linked
+            && match self
+                .runner
+                .systemctl_system(&["enable", "--now", timer_path])
+            {
+                Ok(output) if output.status.success() => {
+                    self.say(&format!("sudo systemctl enable --now {timer_path} — ok"))?;
+                    true
+                }
+                other => {
+                    self.say(&format!(
+                        "enabling the wake system timer failed: {}",
+                        stderr_of(&other)
+                    ))?;
+                    false
+                }
+            };
+        if enabled {
+            report.wake_enabled = true;
+        } else {
+            report.wake_manual = vec![
+                format!("sudo cp {service_path} /etc/systemd/system/{WAKE_SERVICE_UNIT}"),
+                format!("sudo cp {timer_path} /etc/systemd/system/{WAKE_TIMER_UNIT}"),
+                format!(
+                    "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
+                ),
+            ];
+            self.say_wake_manual(report)?;
         }
         Ok(())
     }
@@ -2630,6 +2694,26 @@ OnCalendar=Mon..Fri 23:55
 [Install]
 WantedBy=timers.target
 "#
+        );
+
+        // The wake service: the timer's unit by the shared name, and
+        // nothing in it — the timer's WakeSystem is the whole job.
+        assert_eq!(
+            wake_system_service(),
+            r#"[Unit]
+Description=toker wake service (the wake timer's unit; does nothing itself)
+
+[Service]
+# The wake is the whole job and the timer's WakeSystem does it; holding
+# the machine up afterwards is the toker-hold user unit's.
+Type=oneshot
+ExecStart=/bin/true
+"#
+        );
+        assert_eq!(
+            WAKE_SERVICE_UNIT.strip_suffix(".service"),
+            WAKE_TIMER_UNIT.strip_suffix(".timer"),
+            "the timer activates the service by name, with no Unit= line"
         );
 
         // The hold pair: the slots verbatim, Persistent=false, and the
@@ -3565,7 +3649,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 ok_empty(), // enable --now toker-ping-1230.timer
             ],
         )
-        .with_system(vec![ok_empty()]);
+        .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -3596,9 +3680,10 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 (pings[0].service_name.clone(), pings[0].service.clone()),
                 (pings[1].timer_name.clone(), pings[1].timer.clone()),
                 (pings[1].service_name.clone(), pings[1].service.clone()),
+                (WAKE_SERVICE_UNIT.to_owned(), wake_system_service()),
                 (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
             ],
-            "socket, service, hold pair, one ping pair per slot, staged wake"
+            "socket, service, hold pair, one ping pair per slot, staged wake pair"
         );
 
         // The user-manager calls, in the wizard's exact order.
@@ -3618,17 +3703,23 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             .collect::<Vec<_>>(),
         );
 
-        // The wake enable: one sudo call, by path, into the system
-        // manager.
+        // The wake leg: two sudo calls, both by path — link the
+        // service the timer starts (it has no [Install] to enable),
+        // then enable the timer. A timer whose unit is missing is
+        // refused, which is how the first install never armed.
         let staged = rig.paths().units_dir.join(WAKE_TIMER_UNIT);
+        let staged_service = rig.paths().units_dir.join(WAKE_SERVICE_UNIT);
         assert_eq!(
             rig.runner.system_calls(),
-            vec![vec![
-                "enable".to_owned(),
-                "--now".to_owned(),
-                staged.display().to_string(),
-            ]],
-            "sudo systemctl enable --now <the staged unit's path>"
+            vec![
+                vec!["link".to_owned(), staged_service.display().to_string()],
+                vec![
+                    "enable".to_owned(),
+                    "--now".to_owned(),
+                    staged.display().to_string(),
+                ],
+            ],
+            "sudo systemctl link <service>, then enable --now <timer>"
         );
 
         assert_eq!(report.timer_slots, slots);
@@ -3706,8 +3797,13 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(!report.wake_enabled);
         let out = rig.out();
         assert!(
-            out.contains("enabling the wake system timer failed: sudo: command not found"),
+            out.contains("linking the wake service failed: sudo: command not found"),
             "{out}"
+        );
+        assert_eq!(
+            rig.runner.system_calls().len(),
+            1,
+            "the timer is not enabled once its service failed to link"
         );
         assert!(
             out.contains("the wake timer is NOT enabled — the machine will not wake for its slots"),
@@ -3721,6 +3817,12 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             staged.display()
         );
         assert!(out.contains(&cp), "the copy command: {out}");
+        let staged_service = rig.paths().units_dir.join(WAKE_SERVICE_UNIT);
+        let cp_service = format!(
+            "sudo cp {} /etc/systemd/system/{WAKE_SERVICE_UNIT}",
+            staged_service.display()
+        );
+        assert!(out.contains(&cp_service), "the service copy: {out}");
         assert!(
             out.contains(&format!(
                 "sudo systemctl daemon-reload && sudo systemctl enable --now {WAKE_TIMER_UNIT}"
@@ -3731,7 +3833,56 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             out.contains("NOT fully up"),
             "the summary carries it: {out}"
         );
-        assert!(report.wake_manual.len() == 2, "{:?}", report.wake_manual);
+        assert!(report.wake_manual.len() == 3, "{:?}", report.wake_manual);
+    }
+
+    /// The link succeeds but the enable is refused: the wake is still
+    /// reported down, with every manual command, not half-done.
+    #[tokio::test]
+    async fn a_refused_wake_enable_after_the_link_prints_manual_commands() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "timers-enable-refused",
+            {
+                let mut answers = answers_fresh(port);
+                answers[10] = text("09:00"); // one slot
+                answers
+            },
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // daemon-reload (timers)
+                ok_empty(), // enable --now toker-hold.timer
+                ok_empty(), // enable --now toker-ping-0900.timer
+            ],
+        )
+        .with_system(vec![
+            ok_empty(),
+            outcome(false, "", "Failed to enable unit: Unit file is masked.\n"),
+        ]);
+        seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+        seed_rc(&rig.root);
+
+        let report = rig
+            .run(VERIFY_TIMEOUT)
+            .await
+            .expect("a refused wake enable is non-fatal");
+
+        assert!(!report.wake_enabled);
+        assert_eq!(rig.runner.system_calls().len(), 2);
+        let out = rig.out();
+        assert!(
+            out.contains("enabling the wake system timer failed: Failed to enable unit"),
+            "{out}"
+        );
+        assert_eq!(report.wake_manual.len(), 3, "{:?}", report.wake_manual);
+        assert!(
+            report.wake_manual[0].ends_with(&format!("/etc/systemd/system/{WAKE_SERVICE_UNIT}")),
+            "{:?}",
+            report.wake_manual
+        );
     }
 
     /// The user-timers-failure leg: a failed daemon-reload after the
@@ -3755,7 +3906,7 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
                 reload_fails(), // daemon-reload (timers) — the user manager is gone
             ],
         )
-        .with_system(vec![ok_empty()]);
+        .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
         seed_opencode(&rig.root);
         seed_rc(&rig.root);
@@ -3789,6 +3940,6 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         );
         // The wake attempt still ran, and succeeded.
         assert!(report.wake_enabled);
-        assert_eq!(rig.runner.system_calls().len(), 1);
+        assert_eq!(rig.runner.system_calls().len(), 2);
     }
 }
