@@ -103,10 +103,8 @@ ping at 07:31 and 12:31, weekdays.
    of one row each and a "… N more" line; borders go before data; TOKENS
    never clips its hit-rate pair; slack goes under the content
    (`tui/view.rs:188-247`, `:323-336`).
-3. **Bottom strip.**
-   RATE & QUOTA takes the full width; SPEND renders only when it has billed
-   data; the bar shrinks before reset clocks drop; fix the missing gap at
-   `tui/view.rs:1364`.
+3. ~~**Bottom strip.**~~ Done: SPEND hidden without a cost, otherwise an
+   even split; meter lines keep their space and reset clock.
 4. **Sessions table.**
    Label column stays (titles over ids); an unlabelled session shows 8 chars
    of id; numbers right-aligned; `claude-` stripped from model; compactions
@@ -181,6 +179,14 @@ ping at 07:31 and 12:31, weekdays.
 23. OpenAI route: summarising exemption, a `cold-quiet` row when withheld,
     and no `/compact` promise it cannot keep (`server/proxy.rs:196-246`).
 24. Error rows keep `rateLimits` on 429s.
+25. **An unseparated quota weight is unknown.**
+    `QuotaFit` keeps only point weights (`middleware/cold.rs:1003`), so the
+    cold outlook trusts weights the data cannot measure: opus-5-5's fresh
+    weight fits at 0.009/Mtok with a spread reaching zero, against roughly
+    0.05-0.08 observed on live re-reads, and the outlook stayed quiet on
+    255k and 489k rebuilds.
+    Keep each weight's spread, and treat a weight whose spread reaches zero
+    as no weight, so the outlook answers unknown and the notice fires.
 
 ## Gate D: later
 
