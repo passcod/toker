@@ -131,6 +131,10 @@ impl Provider for AnthropicSub {
     fn meters(&self, headers: &HeaderMap) -> Option<Value> {
         parse_rate_limits(headers)
     }
+
+    fn is_meter_source(&self) -> bool {
+        true
+    }
 }
 
 impl Provider for AnthropicApi {
@@ -433,6 +437,8 @@ mod tests {
             api().meters(&headers).is_none(),
             "the API's RPM limits are not quota meters (plan: the sub is the only meter source)"
         );
+        assert!(sub().is_meter_source());
+        assert!(!api().is_meter_source());
 
         let bare = HeaderMap::new();
         assert_eq!(sub().meters(&bare), None);

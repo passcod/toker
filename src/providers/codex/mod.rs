@@ -496,6 +496,10 @@ impl Provider for CodexSub {
     fn meters(&self, headers: &HeaderMap) -> Option<Value> {
         parse_usage_limits(headers)
     }
+
+    fn is_meter_source(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

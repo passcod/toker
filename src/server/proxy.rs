@@ -19,14 +19,16 @@
 //!    makes that stable. Recorded as requested vs effective model.
 //! 6. **The cold-cache notice** (plan: Middleware — cold gate): the openai
 //!    path's own gate, on the lane the request itself keys (session ×
-//!    tools-hash) and the post-routing model. No quota outlook — this
-//!    backend has no meter source — and a per-model writes-free
-//!    exemption: when the fetched openrouter catalogue says the model's
-//!    cache writes cost nothing, the re-read the notice warns about is
-//!    free and the gate never fires for it. On fire: 200 with a
-//!    synthetic openai turn, a `cold` row, the lane marked noticed —
-//!    never an error status; the resend IS the release (there is no
-//!    marker on this wire).
+//!    tools-hash) and the post-routing model. A summarising request is
+//!    exempt, as on the anthropic path. No quota outlook — this backend
+//!    has no meter source — and a per-model writes-free exemption: when
+//!    the fetched openrouter catalogue says the model's cache writes cost
+//!    nothing, the re-read the notice warns about is free, and the
+//!    withheld notice is a `cold-quiet` row. On fire: 200 with a
+//!    synthetic openai turn naming no compaction target (this path never
+//!    retargets one), a `cold` row, the lane marked noticed — never an
+//!    error status; the resend IS the release (there is no marker on this
+//!    wire).
 //! 7. Upstream request with hop-by-hop headers stripped,
 //!    `accept-encoding: identity` forced (SSE observation needs plaintext),
 //!    and the stored credential injected only when the incoming request
@@ -64,7 +66,7 @@ use super::InFlightGuard;
 use super::Server;
 use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
-    record_openai_cold, retry_after_ms,
+    record_openai_cold, record_openai_cold_quiet, retry_after_ms,
 };
 
 /// Request bodies are buffered for gating and the fidelity check; 64 MiB
@@ -196,9 +198,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             idle_ms, prompt, ..
         } = cold::decide_cold(
             cold_lane.as_ref(),
-            // No summarising detection exists on this wire — the openai
-            // IR has no compaction shape, so nothing is exempt.
-            false,
+            // A summarising request forwards, as on the anthropic path:
+            // the notice exists to advise compacting, and stopping the
+            // compaction would halt the user a keystroke after telling
+            // them to go ahead.
+            gate_shape.as_ref().is_some_and(|shape| shape.summarising),
             gates.cold_min_tokens,
             Some(lanes::OPENAI_LANE_TTL_MS),
             now,
@@ -211,8 +215,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // fetched openrouter catalogue says this model's writes are
             // free, the warning buys nothing. Only a POSITIVE verdict
             // exempts; an unknown model never does (conservative: the
-            // gate applies). The skip records nothing — it is a debug
-            // line, observable without a row per request.
+            // gate applies).
             let writes_free = gate_model.as_deref().is_some_and(|model| {
                 server
                     .catalogs
@@ -222,24 +225,34 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     == Some(true)
             });
             if writes_free {
-                tracing::debug!(
-                    model = gate_model.as_deref().unwrap_or("?"),
-                    "cold gate skipped: the fetched catalogue says this model's cache writes are free"
-                );
-            } else {
-                // The compact model is resolved, not assumed — the same
-                // rule the anthropic gate keeps: the notice names the
-                // model a cheap `/compact` would actually run on, and
-                // stays silent about it when there is none.
-                let compact_on = server
-                    .models
-                    .compaction_target(&compact_spec(gates), prompt, None)
-                    .ok()
-                    .flatten();
-                let text = cold::ColdBlocking::notice(
+                // Withheld, and recorded as the anthropic path records it:
+                // a `cold-quiet` row saying why, so silence reads as a
+                // decision rather than a gate that stopped working. `at`
+                // and `noticed_at` are untouched — nothing was said and
+                // nothing reached upstream.
+                record_openai_cold_quiet(ColdOpenaiRecord {
+                    server: &server,
+                    started,
+                    session_id: session_id.as_deref(),
+                    tools_hash: gate_shape.as_ref().map(|shape| shape.tools_hash.as_str()),
                     idle_ms,
                     prompt,
-                    compact_on.as_deref(),
+                    req_messages: None,
+                    compact_target: None,
+                });
+            } else {
+                // No compaction target is named: this path never
+                // retargets a compaction, so a `/compact` here runs on
+                // whatever the client sends, and promising a cheaper one
+                // would be the notice lying about what the proxy does.
+                // And openrouter bills the re-read rather than metering
+                // it against a rate-limit window, so the notice does not
+                // say it does.
+                let text = cold::ColdBlocking::notice_for(
+                    server.openrouter.is_meter_source(),
+                    idle_ms,
+                    prompt,
+                    None,
                     None,
                     now,
                     &jiff::tz::TimeZone::system(),
@@ -275,7 +288,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                         .as_ref()
                         .and_then(|shape| shape.req_messages)
                         .map(|messages| messages as i64),
-                    compact_target: compact_on.as_deref(),
+                    compact_target: None,
                 });
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -462,19 +475,6 @@ pub(crate) async fn forward_upstream(
 /// is a later phase's work.
 pub(crate) fn strip_provider_prefix(model: &str) -> Option<&str> {
     model.strip_prefix("openrouter/")
-}
-
-/// The compaction retarget's model spec — the mirror of the anthropic
-/// path's (`crate::server::anthropic`): a family name resolved against
-/// what is actually in use (the default, "sonnet"), an explicit model
-/// id, or "off". The notice names a `/compact` target only when one
-/// resolves; an unarmed proxy promising a cheap compaction would be the
-/// feature lying about its own configuration.
-fn compact_spec(gates: &crate::config::GatesConfig) -> String {
-    gates
-        .compact_model
-        .clone()
-        .unwrap_or_else(|| "sonnet".to_owned())
 }
 
 /// The session identity from the configured header names, in priority

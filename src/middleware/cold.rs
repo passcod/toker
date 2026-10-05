@@ -1930,7 +1930,29 @@ impl ColdBlocking {
     /// compaction retarget actually resolved a model — an unarmed proxy
     /// promising a cheap compaction would be the feature lying about its
     /// own configuration.
+    ///
+    /// This is the notice for a backend whose quota is a rate-limit window
+    /// (see [`ColdBlocking::notice_for`] for one that is not).
     pub fn notice(
+        idle_ms: i64,
+        prompt: u64,
+        target: Option<&str>,
+        outlook: Option<&Outlook>,
+        at_ms: i64,
+        tz: &TimeZone,
+        style: NoticeStyle,
+    ) -> String {
+        Self::notice_for(true, idle_ms, prompt, target, outlook, at_ms, tz, style)
+    }
+
+    /// [`ColdBlocking::notice`], saying what the re-read is metered by
+    /// only where that is true: `metered` is whether the backend's quota
+    /// is a rate-limit window. Elsewhere (openrouter, the plain API) the
+    /// re-read is billed, not metered, and the notice says only what it
+    /// re-reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn notice_for(
+        metered: bool,
         idle_ms: i64,
         prompt: u64,
         target: Option<&str>,
@@ -1949,10 +1971,14 @@ impl ColdBlocking {
             String::new(),
             format!(
                 "Its prompt cache had expired after {} idle, so the next \
-                 request would re-read {} tokens as fresh input — what \
-                 the rate-limit window meters.",
+                 request would re-read {} tokens as fresh input{}.",
                 human_idle(idle_ms),
                 group(prompt),
+                if metered {
+                    " — what the rate-limit window meters"
+                } else {
+                    ""
+                },
             ),
         ];
         if let Some(quota) = quota {

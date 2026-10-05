@@ -1305,9 +1305,11 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
     assert!(text.contains("Fired once for that idle spell.]"), "{text}");
     // The GFM alert is the default style, like the quota gate's notice.
     assert!(text.contains("> [!NOTE]"), "{text}");
-    // No model entry exists to resolve a compact target onto, so the
-    // notice stays silent about one.
+    // This path never retargets a compaction, so the notice promises
+    // no cheaper one; and openrouter bills the re-read rather than
+    // metering it against a rate-limit window.
     assert!(!text.contains("The proxy would run it on"), "{text}");
+    assert!(!text.contains("rate-limit window"), "{text}");
     assert_eq!(
         value["usage"],
         serde_json::json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
@@ -1384,7 +1386,7 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
 }
 
 #[tokio::test]
-async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_no_row() {
+async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_cold_quiet() {
     let (mock, upstream) = spawn_mock().await;
     // The z-ai shape: the pricing object itemises prompt/completion/
     // cache-read and OMITS the write price — the documented free signal.
@@ -1426,13 +1428,23 @@ async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_no_row() {
     );
     assert_eq!(mock.captured().len(), 2, "the request really went upstream");
 
-    let rows = wait_for_rows(&store, 2).await;
+    let rows = wait_for_rows(&store, 3).await;
     assert!(
-        !rows
-            .iter()
-            .any(|row| matches!(row.kind, Some(RowKind::Cold | RowKind::ColdQuiet))),
-        "the exemption records no row — the skip is the debug line"
+        !rows.iter().any(|row| row.kind == Some(RowKind::Cold)),
+        "no notice was given"
     );
+    // The withheld notice is recorded, so a quiet spell reads as a
+    // decision rather than a gate that stopped working.
+    let quiet = rows
+        .iter()
+        .find(|row| row.kind == Some(RowKind::ColdQuiet))
+        .expect("a cold-quiet row says why the notice was withheld");
+    assert_eq!(quiet.frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(quiet.provider.as_deref(), Some("openrouter"));
+    assert_eq!(quiet.session_id.as_deref(), Some("ses-test-1"));
+    let extra = quiet.extra.as_ref().expect("the payload rides `extra`");
+    assert_eq!(extra["writesFree"], serde_json::json!(true));
+    assert_eq!(extra["lastPrompt"], serde_json::json!(500_000));
     assert_eq!(
         rows.iter().filter(|row| row.kind.is_none()).count(),
         2,
@@ -1452,6 +1464,44 @@ async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_no_row() {
         lane.updated_ms > poisoned_at,
         "the served response re-touched the lane"
     );
+}
+
+#[tokio::test]
+async fn a_summarising_request_on_a_cold_lane_forwards_without_a_notice() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let body = cold_body("big/charged-model", false);
+    seed_cold_lane(addr, &store, &body).await;
+
+    // The same lane, now asking for the summary the notice would advise:
+    // stopping it would halt the user a keystroke after telling them to
+    // go ahead.
+    let mut compaction: Value = serde_json::from_slice(&body).expect("cold body");
+    compaction["messages"] = serde_json::json!([{
+        "role": "user",
+        "content": "Your task is to create a detailed summary of the conversation so far.",
+    }]);
+    let compaction = serde_json::to_vec(&compaction).expect("compaction body");
+    assert_eq!(
+        cold_lane_key(&compaction),
+        cold_lane_key(&body),
+        "same lane"
+    );
+    let response = post_chat(addr, &compaction).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body");
+    assert_eq!(
+        bytes.as_ref(),
+        big_non_stream_body("big/charged-model").as_slice(),
+        "the upstream answered, not the gate"
+    );
+    assert_eq!(mock.captured().len(), 2);
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(
+        rows.iter().all(|row| row.kind.is_none()),
+        "no cold row, quiet or otherwise: {rows:?}"
+    );
+    assert_eq!(rows[1].summarising, Some(true));
 }
 
 #[tokio::test]

@@ -206,11 +206,8 @@ pub(crate) fn record_error(
 /// fields the anthropic cold row carries. And no model columns, like
 /// the anthropic cold row: the row is the gate's own event.
 ///
-/// The row's existence is also the exemption's absence: a model whose
-/// cache writes are free never produces this row (the skip is a debug
-/// log, deliberately — a quiet row per request would be noise the
-/// anthropic path's `cold-quiet` discipline reserves for measured
-/// withholdings).
+/// A model whose cache writes are free never produces this row; its
+/// withheld notice is a [`record_openai_cold_quiet`] row instead.
 pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
     let ColdOpenaiRecord {
         server,
@@ -304,6 +301,107 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
     }
     tracing::info!(
         "POST /v1/chat/completions → COLD {} idle {} · {} tokens",
+        session_id
+            .and_then(|session| session.get(0..8))
+            .unwrap_or("?"),
+        crate::middleware::cold::human_idle(idle_ms),
+        crate::middleware::quota::group(prompt),
+    );
+}
+
+/// The withheld-notice row for the openai path (the `kind: "cold-quiet"`
+/// row): the cold gate would have fired, but the fetched catalogue says
+/// this model's cache writes are free, so the re-read costs nothing and
+/// the interruption would buy nothing. Recorded, as the anthropic path's
+/// writes-free exemption is, because otherwise the notice count simply
+/// falls and no view can tell a quiet spell from a gate that stopped
+/// working — absence of instrumentation must never read as absence of the
+/// thing. Same keys as the anthropic `cold-quiet` row; no quota figures
+/// (no outlook on this path).
+pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
+    let ColdOpenaiRecord {
+        server,
+        started,
+        session_id,
+        tools_hash,
+        idle_ms,
+        prompt,
+        ..
+    } = record;
+    let row = RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(RowKind::ColdQuiet),
+        frontend: Some("openai_chat".to_owned()),
+        provider: Some(server.openrouter.id().to_owned()),
+        route: Some(format!("openai_chat:{}", server.openrouter.id())),
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: None,
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: tools_hash.map(str::to_owned),
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        // No quota gate on this path (see `record_openai_cold`).
+        gate_on: None,
+        cold_on: Some(true),
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: Some(json!({
+            "idleMs": idle_ms,
+            "lastPrompt": prompt,
+            "writesFree": true,
+            "quotaExtra": null,
+            "quotaBound": null,
+            "util5h": null,
+        })),
+        betas: None,
+        geo: None,
+        fast: None,
+    };
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "ledger insert failed");
+    }
+    tracing::info!(
+        "POST /v1/chat/completions → cold-quiet {} idle {} · {} tokens (cache writes free)",
         session_id
             .and_then(|session| session.get(0..8))
             .unwrap_or("?"),
@@ -579,7 +677,7 @@ fn measurement_row(
         }),
         system_messages: ctx.system_messages.map(i64_of),
         compact_generations: None,
-        summarising: None,
+        summarising: shape.map(|s| s.summarising),
         system_change: None,
         system_ladder: None,
         system_tail: None,

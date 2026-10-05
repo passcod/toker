@@ -92,4 +92,12 @@ pub trait Provider: Send + Sync {
         let _ = headers;
         None
     }
+
+    /// Whether this provider's quota is a rate-limit window — the
+    /// providers that override [`Provider::meters`]. Where it is not, a
+    /// re-read is billed rather than metered, and the cold notice must not
+    /// say otherwise.
+    fn is_meter_source(&self) -> bool {
+        false
+    }
 }

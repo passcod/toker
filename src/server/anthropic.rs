@@ -621,7 +621,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                             model_map::preview_mapped_model(backend.model_map(), &target)
                                 .map(str::to_owned)
                         });
-                    let text = cold::ColdBlocking::notice(
+                    let text = cold::ColdBlocking::notice_for(
+                        // The plain API bills the re-read; only a
+                        // rate-limit window meters it.
+                        backend.is_meter_source(),
                         idle_ms,
                         prompt,
                         compact_on.as_deref(),

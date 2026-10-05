@@ -52,7 +52,7 @@ pub const SENTINEL: &str = "$#$BURN$#$";
 // them carries, independently: a rewording of one does not take the
 // detection with it. Either is enough (measured against the predecessor's
 // documented detection rules).
-const COMPACT_PERFORMING: &[&str] = &[
+pub(crate) const COMPACT_PERFORMING: &[&str] = &[
     "Your task is to create a detailed summary of",
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
 ];
@@ -728,7 +728,7 @@ fn count_of(haystack: &str, needle: &str) -> u64 {
 /// both begin a line; quoted prose and listings carry them mid-line. The
 /// line anchor survives blocks being prepended — [`Message::text`] joins
 /// on a newline.
-fn begins_line(haystack: &str, needle: &str) -> bool {
+pub(crate) fn begins_line(haystack: &str, needle: &str) -> bool {
     let bytes = haystack.as_bytes();
     let mut from = 0;
     while let Some(at) = haystack[from..].find(needle) {

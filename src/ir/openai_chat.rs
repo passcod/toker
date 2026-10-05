@@ -15,6 +15,7 @@
 
 use serde_json::Value;
 
+use super::anthropic::{COMPACT_PERFORMING, begins_line};
 use super::{Request, short_hash};
 
 /// Read-only OpenAI Chat view over a [`Request`].
@@ -98,6 +99,19 @@ impl<'a> ChatBody<'a> {
 
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
+        // The summarisation instruction, detected as the anthropic view
+        // detects it: line-anchored in the LAST message, which must not be
+        // a tool result (a tool loop quoting the wording is not a request
+        // to summarise). Same wordings, because the clients that compact
+        // over this wire send the same prompt.
+        let summarising = messages.iter().last().is_some_and(|last| {
+            let text = last.text_parts().join("\n");
+            !matches!(last.role(), Some("tool" | "function"))
+                && COMPACT_PERFORMING
+                    .iter()
+                    .any(|marker| begins_line(&text, marker))
+        });
+
         Shape {
             req_bytes: self.request.req_bytes,
             // Row parity: null when `messages` is missing or not an array,
@@ -116,6 +130,7 @@ impl<'a> ChatBody<'a> {
             // digest of "" is a valid, comparable identity).
             system_hash: short_hash(system.as_bytes()),
             system_blocks,
+            summarising,
         }
     }
 }
@@ -328,6 +343,12 @@ pub struct Shape {
     /// system-family message, in order (mapped from
     /// Anthropic's top-level array to Chat's in-band system messages).
     pub system_blocks: Vec<BlockDigest>,
+    /// Whether the last message begins a line with a summarisation
+    /// instruction (the anthropic view's rule, same wordings). The cold
+    /// gate exempts it: the notice exists to advise compacting, and
+    /// stopping the compaction would halt the user a keystroke after
+    /// telling them to go ahead.
+    pub summarising: bool,
 }
 
 /// One system block's digest and length (no content — invariant 1).
@@ -406,6 +427,37 @@ mod tests {
         assert!(!parse(br#"{"stream":"yes"}"#).openai_chat().stream());
         // A non-string model is absent, not coerced.
         assert_eq!(parse(br#"{"model":5}"#).openai_chat().model(), None);
+    }
+
+    #[test]
+    fn summarising_is_the_last_message_s_line_anchored_instruction() {
+        let shape = |body: &serde_json::Value| {
+            parse(&serde_json::to_vec(body).expect("body"))
+                .openai_chat()
+                .shape()
+        };
+        let asked = serde_json::json!({"messages": [
+            {"role": "user", "content": "earlier"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "<reminder/>"},
+                {"type": "text", "text": "Your task is to create a detailed summary of the conversation so far."},
+            ]},
+        ]});
+        assert!(
+            shape(&asked).summarising,
+            "a prepended block keeps the line anchor"
+        );
+        // Discussed mid-line, or in an earlier message, is not asked.
+        let discussed = serde_json::json!({"messages": [
+            {"role": "user", "content": "Your task is to create a detailed summary of"},
+            {"role": "user", "content": "the prompt says: Your task is to create a detailed summary of"},
+        ]});
+        assert!(!shape(&discussed).summarising);
+        // A tool result quoting the wording is not a request to summarise.
+        let tool = serde_json::json!({"messages": [
+            {"role": "tool", "tool_call_id": "t", "content": "Your task is to create a detailed summary of"},
+        ]});
+        assert!(!shape(&tool).summarising);
     }
 
     #[test]
