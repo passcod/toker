@@ -150,7 +150,10 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     if path == "/_toker" || path.starts_with("/_toker/") {
         return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
     }
-    if server.default_anthropic().id() == "codex_sub" {
+    let Some(default) = server.default_anthropic() else {
+        return super::anthropic_not_configured();
+    };
+    if default.id() == "codex_sub" {
         return codex::anthropic_error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -166,6 +169,9 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
 /// exact-path rule: only `"/v1/messages"` gates.
 async fn usage_path(server: Server, request: Request, path: &'static str) -> Response {
     let started = Instant::now();
+    let Some(default_backend) = server.default_anthropic().cloned() else {
+        return super::anthropic_not_configured();
+    };
     let (parts, body) = request.into_parts();
 
     // Session identity and betas, read by name only — request headers are
@@ -210,7 +216,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // a clone): the cold gate and the retarget read it, and the row's
     // shape fields stay the PRE-transform shape's, in the same order.
     let mut gate_shape: Option<AnthropicShape> = None;
-    let mut backend = server.default_anthropic().clone();
+    let mut backend = default_backend;
     // The client's own wants: the client's own model and
     // whether it explicitly asked for a plain JSON Message — both read
     // BEFORE any transform, because the blocked answer renders the model
@@ -242,6 +248,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .as_deref()
             .and_then(|model| strip_anthropic_prefix(&server, model))
         {
+            // A prefix naming a backend whose block is absent: answered
+            // here, never sent to the default with the prefix still on.
+            let Some(provider) = provider else {
+                return super::anthropic_not_configured();
+            };
             // 5. A deliberate transform: forward the serialised IR (pure
             // and deterministic, so the upstream prefix stays stable),
             // recorded as requested vs effective — nothing is "forced".
@@ -1055,7 +1066,9 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
 async fn transparent(server: Server, request: Request) -> Response {
-    let backend = server.default_anthropic().clone();
+    let Some(backend) = server.default_anthropic().cloned() else {
+        return super::anthropic_not_configured();
+    };
     // The batch paths have no codex equivalent: the same typed error the
     // usage path answers for count_tokens and batch creation, rather
     // than an anthropic request sent to the codex upstream.
@@ -1094,15 +1107,16 @@ async fn transparent(server: Server, request: Request) -> Response {
 /// stripped from the model. Anything else — bare names, other protocols'
 /// prefixes — goes to the configured default, untransformed: routing the
 /// anthropic frontend to an openai backend is cross-protocol translation,
-/// a later phase's work, not a model-string edit.
+/// a later phase's work, not a model-string edit. The provider is `None`
+/// when the prefix names a backend whose block is absent.
 fn strip_anthropic_prefix<'a>(
     server: &'a Server,
     model: &'a str,
-) -> Option<(&'a Arc<dyn Provider>, &'a str)> {
+) -> Option<(Option<&'a Arc<dyn Provider>>, &'a str)> {
     if let Some(rest) = model.strip_prefix("anthropic_sub/") {
-        Some((&server.anthropic_sub, rest))
+        Some((server.anthropic_sub.as_ref(), rest))
     } else if let Some(rest) = model.strip_prefix("anthropic_api/") {
-        Some((&server.anthropic_api, rest))
+        Some((server.anthropic_api.as_ref(), rest))
     } else {
         model
             .strip_prefix("anthropic/")

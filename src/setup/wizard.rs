@@ -1079,8 +1079,14 @@ impl<'a> Wizard<'a> {
                 "{} — port {}, anthropic → {}, openai_chat → {}, awake {}, db {}",
                 self.paths.config_toml.display(),
                 config.port,
-                config.default_backend_anthropic,
-                config.default_backend_openai_chat,
+                config
+                    .default_backend_anthropic
+                    .as_deref()
+                    .unwrap_or("none"),
+                config
+                    .default_backend_openai_chat
+                    .as_deref()
+                    .unwrap_or("none"),
                 on_off(config.awake),
                 config.db_path.display(),
             ),
@@ -1236,7 +1242,7 @@ impl<'a> Wizard<'a> {
             options.push("codex_sub");
         }
         let current = existing
-            .map(|config| config.default_backend_anthropic.as_str())
+            .and_then(|config| config.default_backend_anthropic.as_deref())
             .unwrap_or("anthropic_sub");
         let default = options.iter().position(|option| *option == current);
         let picked = options[self.prompt.select(
@@ -1249,9 +1255,12 @@ impl<'a> Wizard<'a> {
         .to_owned();
         let anthropic_api_key = if picked == "anthropic_api" {
             let default_env = existing
-                .map(|config| config.anthropic_api.api_key_env.clone())
+                .and_then(|config| config.anthropic_api.as_ref())
+                .map(|api| api.api_key_env.clone())
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned());
-            let existing_literal = existing.and_then(|config| config.anthropic_api.api_key.clone());
+            let existing_literal = existing
+                .and_then(|config| config.anthropic_api.as_ref())
+                .and_then(|api| api.api_key.clone());
             Some(self.ask_api_key("anthropic_api", default_env, existing_literal)?)
         } else {
             None
@@ -1273,9 +1282,12 @@ impl<'a> Wizard<'a> {
         )?;
         let openrouter_key = if openrouter {
             let default_env = existing
-                .map(|config| config.openrouter.api_key_env.clone())
+                .and_then(|config| config.openrouter.as_ref())
+                .map(|openrouter| openrouter.api_key_env.clone())
                 .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned());
-            let existing_literal = existing.and_then(|config| config.openrouter.api_key.clone());
+            let existing_literal = existing
+                .and_then(|config| config.openrouter.as_ref())
+                .and_then(|openrouter| openrouter.api_key.clone());
             Some(self.ask_api_key("openrouter", default_env, existing_literal)?)
         } else {
             None
@@ -1414,19 +1426,24 @@ impl<'a> Wizard<'a> {
         ))?;
         self.say(&format!(
             "  anthropic → {}; openai_chat → {}",
-            config.default_backend_anthropic, config.default_backend_openai_chat
+            config
+                .default_backend_anthropic
+                .as_deref()
+                .unwrap_or("none"),
+            config
+                .default_backend_openai_chat
+                .as_deref()
+                .unwrap_or("none")
         ))?;
-        self.say(&key_line(
-            "openrouter",
-            &config.openrouter.api_key_env,
-            &config.openrouter.api_key,
-        ))?;
-        if config.default_backend_anthropic == "anthropic_api" {
+        if let Some(openrouter) = &config.openrouter {
             self.say(&key_line(
-                "anthropic_api",
-                &config.anthropic_api.api_key_env,
-                &config.anthropic_api.api_key,
+                "openrouter",
+                &openrouter.api_key_env,
+                &openrouter.api_key,
             ))?;
+        }
+        if let Some(api) = &config.anthropic_api {
+            self.say(&key_line("anthropic_api", &api.api_key_env, &api.api_key))?;
         }
         report.config_written = true;
         Ok(config)
@@ -2307,29 +2324,45 @@ fn apply_choices(
     db_explicit: bool,
 ) -> Result<()> {
     config.port = choices.port;
-    config.default_backend_anthropic = choices.anthropic_backend.clone();
-    if choices.anthropic_backend == "anthropic_api"
+    // A chosen backend gets its block (its presence is what enables it);
+    // an existing block keeps its hand edits.
+    match choices.anthropic_backend.as_str() {
+        "anthropic_sub" => {
+            config.anthropic_sub.get_or_insert_with(Default::default);
+        }
+        "anthropic_api" => {
+            config.anthropic_api.get_or_insert_with(Default::default);
+        }
+        "codex_sub" => {
+            config.codex_sub.get_or_insert_with(Default::default);
+        }
+        other => bail!("no anthropic backend named {other:?}"),
+    }
+    config.default_backend_anthropic = Some(choices.anthropic_backend.clone());
+    if let Some(api) = config.anthropic_api.as_mut()
+        && choices.anthropic_backend == "anthropic_api"
         && let Some(key) = &choices.anthropic_api_key
     {
         match key {
             KeyChoice::Env(name) => {
-                config.anthropic_api.api_key_env = name.clone();
-                config.anthropic_api.api_key = None;
+                api.api_key_env = name.clone();
+                api.api_key = None;
             }
-            KeyChoice::Literal(key) => config.anthropic_api.api_key = Some(key.clone()),
+            KeyChoice::Literal(key) => api.api_key = Some(key.clone()),
         }
     }
     if choices.openrouter {
-        config.default_backend_openai_chat = "openrouter".to_owned();
+        let openrouter = config.openrouter.get_or_insert_with(Default::default);
         if let Some(key) = &choices.openrouter_key {
             match key {
                 KeyChoice::Env(name) => {
-                    config.openrouter.api_key_env = name.clone();
-                    config.openrouter.api_key = None;
+                    openrouter.api_key_env = name.clone();
+                    openrouter.api_key = None;
                 }
-                KeyChoice::Literal(key) => config.openrouter.api_key = Some(key.clone()),
+                KeyChoice::Literal(key) => openrouter.api_key = Some(key.clone()),
             }
         }
+        config.default_backend_openai_chat = Some("openrouter".to_owned());
     }
     config.awake = choices.awake;
     if !db_explicit {

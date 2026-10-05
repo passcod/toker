@@ -503,28 +503,28 @@ fn test_config(
             "x-session-id".to_owned(),
         ],
         ping_header_name: "x-toker-ping".to_owned(),
-        default_backend_openai_chat: "openrouter".to_owned(),
-        openrouter: OpenRouterConfig {
+        default_backend_openai_chat: Some("openrouter".to_owned()),
+        openrouter: Some(OpenRouterConfig {
             upstream: unused_openrouter,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
-        default_backend_anthropic: default_backend.to_owned(),
-        anthropic_sub: AnthropicSubConfig {
+        }),
+        default_backend_anthropic: Some(default_backend.to_owned()),
+        anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: anthropic_upstream.clone(),
-        },
-        anthropic_api: AnthropicApiConfig {
+        }),
+        anthropic_api: Some(AnthropicApiConfig {
             model_map: None,
             upstream: anthropic_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key,
-        },
+        }),
         // The codex backend's config: never routed to in these suites
         // (the responses frontend lands later), pointed at an upstream
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
-        codex_sub: CodexSubConfig {
+        codex_sub: Some(CodexSubConfig {
             model_map: None,
             client_version: None,
             version_probe: false,
@@ -536,7 +536,7 @@ fn test_config(
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),
-        },
+        }),
         gates: toker::config::GatesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
@@ -1847,10 +1847,11 @@ async fn a_mapped_batch_records_which_requests_the_map_moved() {
     // row only when it fails, and that row is where the list must land.
     let (mock, upstream) = spawn_mock().await;
     let mut config = test_config(upstream, Some("sk-test".to_owned()), "anthropic_api");
-    config.anthropic_api.model_map = toker::middleware::model_map::parse_model_map(
-        r#"{"family:haiku": "err-401", "model:claude-opus-4-5": "claude-opus-5"}"#,
-    )
-    .expect("the test map parses");
+    config.anthropic_api.as_mut().expect("enabled").model_map =
+        toker::middleware::model_map::parse_model_map(
+            r#"{"family:haiku": "err-401", "model:claude-opus-4-5": "claude-opus-5"}"#,
+        )
+        .expect("the test map parses");
     let (addr, store) = spawn_toker(config).await;
 
     let body = json!({"requests": [

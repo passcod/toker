@@ -157,29 +157,29 @@ fn test_config(upstream: reqwest::Url) -> Config {
             "x-claude-code-session-id".to_owned(),
         ],
         ping_header_name: "x-toker-ping".to_owned(),
-        default_backend_openai_chat: "openrouter".to_owned(),
-        openrouter: OpenRouterConfig {
+        default_backend_openai_chat: Some("openrouter".to_owned()),
+        openrouter: Some(OpenRouterConfig {
             // Only the openai-isolation test routes here.
             upstream: openrouter_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
-        default_backend_anthropic: "anthropic_sub".to_owned(),
-        anthropic_sub: AnthropicSubConfig {
+        }),
+        default_backend_anthropic: Some("anthropic_sub".to_owned()),
+        anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: upstream.clone(),
-        },
-        anthropic_api: AnthropicApiConfig {
+        }),
+        anthropic_api: Some(AnthropicApiConfig {
             model_map: None,
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
+        }),
         // The codex backend's config: never routed to in these suites
         // (the responses frontend lands later), pointed at an upstream
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
-        codex_sub: CodexSubConfig {
+        codex_sub: Some(CodexSubConfig {
             model_map: None,
             client_version: None,
             version_probe: false,
@@ -191,7 +191,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),
-        },
+        }),
         gates: GatesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
@@ -780,10 +780,11 @@ async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet()
     // cold gate) moves claude-opus-5 onto a model whose listing entry
     // prices its cache writes at nothing — the exemption must see the
     // identity the upstream will actually bill.
-    config.anthropic_sub.model_map = toker::middleware::model_map::parse_model_map(
-        r#"{"model:claude-opus-5":"free/claude-sonnet"}"#,
-    )
-    .expect("the map parses");
+    config.anthropic_sub.as_mut().expect("enabled").model_map =
+        toker::middleware::model_map::parse_model_map(
+            r#"{"model:claude-opus-5":"free/claude-sonnet"}"#,
+        )
+        .expect("the map parses");
     // The backend's fetched catalogue: an entry whose pricing object is
     // itemised with the write price OMITTED — the documented free
     // signal. The real anthropic presence list carries no pricing at

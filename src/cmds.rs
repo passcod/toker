@@ -26,9 +26,15 @@ pub async fn serve() -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Arc::new(Store::open(&config.db_path)?);
     tracing::info!(
-        "serving openai_chat → {} , anthropic → {} (db: {})",
-        config.openrouter.upstream,
-        config.anthropic_sub.upstream,
+        "serving anthropic → {}, openai_chat → {} (db: {})",
+        config
+            .default_backend_anthropic
+            .as_deref()
+            .unwrap_or("not configured"),
+        config
+            .default_backend_openai_chat
+            .as_deref()
+            .unwrap_or("not configured"),
         config.db_path.display()
     );
     Server::new(config, store)?.serve().await
@@ -69,32 +75,50 @@ pub fn status() -> anyhow::Result<()> {
         config.session_header_names.join(", ")
     );
     println!(
-        "default backend (openai_chat): {}",
-        config.default_backend_openai_chat
-    );
-    println!(
         "default backend (anthropic): {}",
-        config.default_backend_anthropic
+        config
+            .default_backend_anthropic
+            .as_deref()
+            .unwrap_or("none — no anthropic backend is enabled")
+    );
+    println!(
+        "default backend (openai_chat): {}",
+        config
+            .default_backend_openai_chat
+            .as_deref()
+            .unwrap_or("none — no openai_chat backend is enabled")
     );
 
-    println!("openrouter: {}", config.openrouter.upstream);
-    let sources = config.openrouter.key_sources();
-    println!(
-        "openrouter api key: env {} ({}), literal ({})",
-        config.openrouter.api_key_env,
-        if sources.env_set { "set" } else { "unset" },
-        if sources.literal_set { "set" } else { "unset" },
-    );
-
-    println!("anthropic sub: {}", config.anthropic_sub.upstream);
-    println!("anthropic api: {}", config.anthropic_api.upstream);
-    let sources = config.anthropic_api.key_sources();
-    println!(
-        "anthropic api key: env {} ({}), literal ({})",
-        config.anthropic_api.api_key_env,
-        if sources.env_set { "set" } else { "unset" },
-        if sources.literal_set { "set" } else { "unset" },
-    );
+    // Enabled backends only: a block's presence is what enables one, so
+    // an absent block has nothing to report.
+    let enabled = config.enabled_backends();
+    if enabled.is_empty() {
+        println!("backends: none enabled — add a [providers.<name>] block or run `toker setup`");
+    }
+    if let Some(sub) = &config.anthropic_sub {
+        println!("anthropic_sub: {}", sub.upstream);
+    }
+    if let Some(api) = &config.anthropic_api {
+        println!("anthropic_api: {}", api.upstream);
+        println!(
+            "anthropic_api key: {}",
+            key_sources_line(&api.api_key_env, api.key_sources())
+        );
+    }
+    if let Some(codex) = &config.codex_sub {
+        println!(
+            "codex_sub: {} (login {})",
+            codex.upstream,
+            codex.auth_path.display()
+        );
+    }
+    if let Some(openrouter) = &config.openrouter {
+        println!("openrouter: {}", openrouter.upstream);
+        println!(
+            "openrouter key: {}",
+            key_sources_line(&openrouter.api_key_env, openrouter.key_sources())
+        );
+    }
 
     let rows = store.count_requests()?;
     println!("requests: {rows}");
@@ -103,6 +127,16 @@ pub fn status() -> anyhow::Result<()> {
         None => println!("last request: none"),
     }
     Ok(())
+}
+
+/// One api-key backend's key sources for `status`: which are set,
+/// never a value (invariant 2).
+fn key_sources_line(env: &str, sources: crate::config::KeySources) -> String {
+    format!(
+        "env {env} ({}), literal ({})",
+        if sources.env_set { "set" } else { "unset" },
+        if sources.literal_set { "set" } else { "unset" },
+    )
 }
 
 /// `tui`: the ratatui dashboard over the ledger (plan: TUI). `--db`

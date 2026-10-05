@@ -27,6 +27,14 @@
 //!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
 //!   everything but its control path.
 //!
+//! A backend is enabled by its `[providers.X]` block's presence. A
+//! protocol with no enabled backend answers its routes with a
+//! not-configured error in that protocol's own error shape
+//! ([`anthropic_not_configured`], [`openai_not_configured`]) and reaches
+//! no upstream; that includes the unmatched-path fallback, which is the
+//! anthropic default's. `GET /v1/models` is the openai backend's when
+//! there is one and the anthropic default's otherwise.
+//!
 //! Timeouts: axum applies no default request or idle timeout on the
 //! client side, so streams run as long as both ends keep the connection
 //! open — the plan's `requestTimeout = 0`; axum tears the connection down
@@ -55,7 +63,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
 use axum::Router;
 use axum::routing::{get, post};
 
@@ -121,22 +128,24 @@ pub struct Server {
     /// timeouts only — no overall deadline, so a stream lives as long as
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
-    /// Phase 1's one openai-chat backend; a trait object because routing
+    /// The one openai-chat backend; a trait object because routing
     /// selects by `provider/model` prefix and later phases add providers
-    /// to exactly this slot.
-    pub(crate) openrouter: Arc<dyn Provider>,
-    /// The anthropic subscription backend (the protocol default).
-    pub(crate) anthropic_sub: Arc<dyn Provider>,
+    /// to exactly this slot. Every backend slot is `None` when its
+    /// `[providers.X]` block is absent from the config: the routes that
+    /// would reach it answer a not-configured error instead.
+    pub(crate) openrouter: Option<Arc<dyn Provider>>,
+    /// The anthropic subscription backend.
+    pub(crate) anthropic_sub: Option<Arc<dyn Provider>>,
     /// The anthropic API backend.
-    pub(crate) anthropic_api: Arc<dyn Provider>,
+    pub(crate) anthropic_api: Option<Arc<dyn Provider>>,
     /// The codex subscription backend, as routing sees it (the trait
     /// object: prefix routing and the protocol default resolve by id).
-    pub(crate) codex_sub: Arc<dyn Provider>,
+    pub(crate) codex_sub: Option<Arc<dyn Provider>>,
     /// The codex subscription backend, concretely — the translation
     /// branch needs [`crate::providers::codex::CodexSub`]'s own methods
     /// (auth-for-turn, the codex header block) that the trait does not
     /// carry. Same allocation as [`Server::codex_sub`].
-    pub(crate) codex_turn: Arc<CodexSub>,
+    pub(crate) codex_turn: Option<Arc<CodexSub>>,
     /// In-flight usage-path requests (the anthropic `/v1/messages`
     /// non-ping ones and the openai chat completions — a running request
     /// holds the machine awake regardless of protocol): the sleep lock's
@@ -167,46 +176,43 @@ impl Server {
         store: Arc<Store>,
         spawner: Box<dyn LockSpawner>,
     ) -> anyhow::Result<Server> {
-        if config.default_backend_openai_chat != "openrouter" {
-            bail!(
-                "phase 1 wires only the openrouter backend, \
-                 default_backend_openai_chat = {:?} is not available yet",
-                config.default_backend_openai_chat
-            );
-        }
-        if !matches!(
-            config.default_backend_anthropic.as_str(),
-            "anthropic_sub" | "anthropic_api" | "codex_sub"
-        ) {
-            bail!(
-                "no anthropic backend named {:?} is wired",
-                config.default_backend_anthropic
-            );
-        }
+        // The config's own validation, again: a Config built by hand (the
+        // tests, any embedder) must not reach routing with a default that
+        // names a disabled backend — `default_anthropic` relies on it.
+        config.validate()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
-        let openrouter = Arc::new(OpenRouter::new(
-            config.openrouter.upstream.clone(),
-            config.openrouter.api_key(),
-        ));
-        let anthropic_sub = Arc::new(AnthropicSub::new(
-            config.anthropic_sub.upstream.clone(),
-            config.anthropic_sub.model_map.clone(),
-        ));
-        let anthropic_api = Arc::new(AnthropicApi::new(
-            config.anthropic_api.upstream.clone(),
-            config.anthropic_api.api_key(),
-            config.anthropic_api.model_map.clone(),
-        ));
-        let codex_turn = Arc::new(CodexSub::new(
-            config.codex_sub.upstream.clone(),
-            config.codex_sub.originator.clone(),
-            config.codex_sub.auth_path.clone(),
-            config.codex_sub.refresh_url.clone(),
-            config.codex_sub.model_map.clone(),
-            config.codex_sub.client_version.clone(),
-            config.codex_sub.version_probe,
-        )?);
-        let codex_sub: Arc<dyn Provider> = codex_turn.clone();
+        let openrouter = config.openrouter.as_ref().map(|openrouter| {
+            Arc::new(OpenRouter::new(
+                openrouter.upstream.clone(),
+                openrouter.api_key(),
+            )) as Arc<dyn Provider>
+        });
+        let anthropic_sub = config.anthropic_sub.as_ref().map(|sub| {
+            Arc::new(AnthropicSub::new(
+                sub.upstream.clone(),
+                sub.model_map.clone(),
+            )) as Arc<dyn Provider>
+        });
+        let anthropic_api = config.anthropic_api.as_ref().map(|api| {
+            Arc::new(AnthropicApi::new(
+                api.upstream.clone(),
+                api.api_key(),
+                api.model_map.clone(),
+            )) as Arc<dyn Provider>
+        });
+        let codex_turn = match &config.codex_sub {
+            Some(codex) => Some(Arc::new(CodexSub::new(
+                codex.upstream.clone(),
+                codex.originator.clone(),
+                codex.auth_path.clone(),
+                codex.refresh_url.clone(),
+                codex.model_map.clone(),
+                codex.client_version.clone(),
+                codex.version_probe,
+            )?)),
+            None => None,
+        };
+        let codex_sub = codex_turn.clone().map(|codex| codex as Arc<dyn Provider>);
 
         // The lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
@@ -263,19 +269,23 @@ impl Server {
 
     /// Resolve an anthropic backend by provider name — routing and the
     /// configured protocol default both resolve here (plan: Routing).
+    /// `None` for an unknown name and for a known backend whose block is
+    /// absent from the config.
     pub(crate) fn anthropic_backend(&self, name: &str) -> Option<&Arc<dyn Provider>> {
         match name {
-            "anthropic_sub" => Some(&self.anthropic_sub),
-            "anthropic_api" => Some(&self.anthropic_api),
-            "codex_sub" => Some(&self.codex_sub),
+            "anthropic_sub" => self.anthropic_sub.as_ref(),
+            "anthropic_api" => self.anthropic_api.as_ref(),
+            "codex_sub" => self.codex_sub.as_ref(),
             _ => None,
         }
     }
 
-    /// The configured default anthropic backend. Validated at startup.
-    pub(crate) fn default_anthropic(&self) -> &Arc<dyn Provider> {
-        self.anthropic_backend(&self.config.default_backend_anthropic)
-            .expect("default_backend_anthropic is validated at startup")
+    /// The configured default anthropic backend; `None` exactly when no
+    /// anthropic backend is enabled (validated at startup: a default
+    /// always names an enabled backend, and one is inferred whenever any
+    /// is enabled).
+    pub(crate) fn default_anthropic(&self) -> Option<&Arc<dyn Provider>> {
+        self.anthropic_backend(self.config.default_backend_anthropic.as_deref()?)
     }
 
     // ── the idle-sleep lock ──────────────────────────────────────────
@@ -457,45 +467,54 @@ impl Server {
             .set(source, catalog);
     }
 
-    /// The three models-catalogue sources as this server is configured
+    /// The models-catalogue sources as this server is configured
     /// (see [`crate::catalog::fetched`]): openrouter's public listing,
     /// anthropic's presence list, and the codex backend's own models
     /// endpoint. Built per refresh cycle so the codex credentials and
     /// client version are read fresh, never cached here.
+    ///
+    /// Only the enabled backends' sources: a disabled backend's catalogue
+    /// is never fetched (for codex that would read a login the operator
+    /// did not hand to toker).
     fn catalog_sources(&self) -> Vec<fetched::CatalogSource> {
-        vec![
-            fetched::CatalogSource {
+        let mut sources = Vec::new();
+        if let Some(openrouter) = &self.openrouter {
+            sources.push(fetched::CatalogSource {
                 provider: "openrouter",
                 // The upstream base already includes `/v1`, so the
                 // frontend's own models path is the endpoint (and the
                 // public listing needs no credential).
-                url: self.openrouter.endpoint("/v1/models"),
+                url: openrouter.endpoint("/v1/models"),
                 bearer: None,
-            },
-            fetched::CatalogSource {
+            });
+        }
+        if let Some(anthropic) = self.anthropic_sub.as_ref().or(self.anthropic_api.as_ref()) {
+            sources.push(fetched::CatalogSource {
                 provider: "anthropic",
                 // Deliberately uncredentialed (see the fetched module's
                 // docs): the 401 falls back to the hand-verified
                 // windows, which cover claude.
-                url: self.anthropic_sub.endpoint("/v1/models"),
+                url: anthropic.endpoint("/v1/models"),
                 bearer: None,
-            },
-            fetched::CatalogSource {
+            });
+        }
+        if let Some(codex) = &self.codex_turn {
+            sources.push(fetched::CatalogSource {
                 provider: "codex_sub",
                 // The codex CLI's own request shape: the version the
                 // handshake speaks rides as the client_version query.
                 // The stored login as-is, no refresh attempt — a stale
                 // token simply fails into the fallback.
-                url: self.codex_sub.endpoint(&format!(
+                url: codex.endpoint(&format!(
                     "/models?client_version={}",
-                    self.codex_turn.client_version()
+                    codex.client_version()
                 )),
-                bearer: self
-                    .codex_turn
+                bearer: codex
                     .auth()
                     .and_then(|auth| auth.access_token().map(str::to_owned)),
-            },
-        ]
+            });
+        }
+        sources
     }
 
     /// Refresh all three fetched catalogues into
@@ -560,6 +579,53 @@ impl Server {
             }
         });
     }
+}
+
+/// The header toker sets on its own not-configured answers, so the setup
+/// wizard's wiring probe can tell "toker answered for a protocol with no
+/// backend" from an upstream's verdict (see [`crate::setup::verify`]).
+pub const NOT_CONFIGURED_HEADER: &str = "x-toker-not-configured";
+
+/// The message both not-configured answers carry: what is missing and
+/// where it goes.
+fn not_configured_message(protocol: &str) -> String {
+    format!(
+        "toker has no {protocol} backend configured: add a [providers.<name>] block to \
+         toker.toml, or run `toker setup`"
+    )
+}
+
+/// The anthropic routes' answer when no anthropic backend is enabled: an
+/// anthropic-shaped error, so the client shows the message instead of
+/// failing to parse one. 404 rather than a 5xx, which the clients retry
+/// with backoff: no retry can configure a backend.
+pub(crate) fn anthropic_not_configured() -> axum::response::Response {
+    not_configured(proxy::ErrorWire::Anthropic, "anthropic")
+}
+
+/// The openai routes' answer when no openai-chat backend is enabled: the
+/// openai error shape, for the same reasons as
+/// [`anthropic_not_configured`].
+pub(crate) fn openai_not_configured() -> axum::response::Response {
+    not_configured(proxy::ErrorWire::Openai, "openai_chat")
+}
+
+fn not_configured(wire: proxy::ErrorWire, protocol: &'static str) -> axum::response::Response {
+    let mut response = proxy::error_response(
+        wire,
+        axum::http::StatusCode::NOT_FOUND,
+        proxy::WireError {
+            anthropic_type: "not_found_error",
+            openai_type: "invalid_request_error",
+            openai_code: Some("backend_not_configured"),
+        },
+        &not_configured_message(protocol),
+    );
+    response.headers_mut().insert(
+        NOT_CONFIGURED_HEADER,
+        axum::http::HeaderValue::from_static(protocol),
+    );
+    response
 }
 
 /// One in-flight request's hold on the sleep lock: increments on entry,
@@ -675,7 +741,7 @@ version_probe = false
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
             drift: None,
-            backend: server.default_anthropic().clone(),
+            backend: server.default_anthropic().expect("enabled").clone(),
             betas: None,
             shape: None,
             ping: false,

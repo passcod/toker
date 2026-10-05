@@ -54,32 +54,54 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         Ok(rows) => rows.last().map(|row| row.ts_ms),
         Err(error) => return store_error(error),
     };
-    let sources = server.config.openrouter.key_sources();
-    let anthropic_api_sources = server.config.anthropic_api.key_sources();
-    let body = json!({
-        "port": server.config.port,
-        "db_path": server.config.db_path.display().to_string(),
-        "session_header_names": server.config.session_header_names,
-        "default_backend_openai_chat": server.config.default_backend_openai_chat,
-        "default_backend_anthropic": server.config.default_backend_anthropic,
-        "providers": {
-            "openrouter": {
-                "upstream": server.config.openrouter.upstream.as_str(),
-                "api_key_env": server.config.openrouter.api_key_env,
+    // Enabled backends only: an absent block is a disabled backend, with
+    // nothing to report.
+    let config = &server.config;
+    let mut providers = serde_json::Map::new();
+    if let Some(sub) = &config.anthropic_sub {
+        providers.insert(
+            "anthropic_sub".to_owned(),
+            json!({ "upstream": sub.upstream.as_str() }),
+        );
+    }
+    if let Some(api) = &config.anthropic_api {
+        let sources = api.key_sources();
+        providers.insert(
+            "anthropic_api".to_owned(),
+            json!({
+                "upstream": api.upstream.as_str(),
+                "api_key_env": api.api_key_env,
                 // Key *sources* only — never values (invariant 2).
                 "api_key_env_set": sources.env_set,
                 "api_key_literal_set": sources.literal_set,
-            },
-            "anthropic_sub": {
-                "upstream": server.config.anthropic_sub.upstream.as_str(),
-            },
-            "anthropic_api": {
-                "upstream": server.config.anthropic_api.upstream.as_str(),
-                "api_key_env": server.config.anthropic_api.api_key_env,
-                "api_key_env_set": anthropic_api_sources.env_set,
-                "api_key_literal_set": anthropic_api_sources.literal_set,
-            },
-        },
+            }),
+        );
+    }
+    if let Some(codex) = &config.codex_sub {
+        providers.insert(
+            "codex_sub".to_owned(),
+            json!({ "upstream": codex.upstream.as_str() }),
+        );
+    }
+    if let Some(openrouter) = &config.openrouter {
+        let sources = openrouter.key_sources();
+        providers.insert(
+            "openrouter".to_owned(),
+            json!({
+                "upstream": openrouter.upstream.as_str(),
+                "api_key_env": openrouter.api_key_env,
+                "api_key_env_set": sources.env_set,
+                "api_key_literal_set": sources.literal_set,
+            }),
+        );
+    }
+    let body = json!({
+        "port": config.port,
+        "db_path": config.db_path.display().to_string(),
+        "session_header_names": config.session_header_names,
+        "default_backend_openai_chat": config.default_backend_openai_chat,
+        "default_backend_anthropic": config.default_backend_anthropic,
+        "providers": providers,
         "requests": rows,
         "last_request_ts_ms": last_request_ts_ms,
         "uptime_s": server.started.elapsed().as_secs(),

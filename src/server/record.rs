@@ -45,6 +45,11 @@ use crate::store::{CostKind, RequestRow, RowKind};
 
 use super::Server;
 
+/// The openai-chat path's one backend. Its rows are only ever written
+/// for a request that reached it, so the id is a constant rather than a
+/// lookup through the (optional) provider slot.
+const OPENAI_PROVIDER: &str = "openrouter";
+
 /// Everything a completion point knows about one request, minus the
 /// response itself.
 pub(crate) struct RecordCtx {
@@ -93,7 +98,7 @@ pub(crate) fn i64_of(value: u64) -> i64 {
 pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>, status: u16) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
-    let route = route_of(ctx);
+    let route = route_of();
 
     if let Some(digest) = &ctx.drift {
         insert(ctx, drift_row(ts_ms, &route, digest));
@@ -143,7 +148,7 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
         status,
         if capture.is_some() { "yes" } else { "no" },
         model.or(ctx.effective_model.as_deref()).unwrap_or("?"),
-        ctx.server.openrouter.id(),
+        OPENAI_PROVIDER,
         drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
@@ -165,7 +170,7 @@ pub(crate) fn record_error(
 ) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
-    let route = route_of(ctx);
+    let route = route_of();
 
     if let Some(digest) = &ctx.drift {
         insert(ctx, drift_row(ts_ms, &route, digest));
@@ -187,7 +192,7 @@ pub(crate) fn record_error(
         "POST /v1/chat/completions → {} ledgered=error model={} provider={}{} ({:.1}s)",
         status,
         ctx.effective_model.as_deref().unwrap_or("?"),
-        ctx.server.openrouter.id(),
+        OPENAI_PROVIDER,
         drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
@@ -225,8 +230,8 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::Cold),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(server.openrouter.id().to_owned()),
-        route: Some(format!("openai_chat:{}", server.openrouter.id())),
+        provider: Some(OPENAI_PROVIDER.to_owned()),
+        route: Some(route_of()),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,
@@ -334,8 +339,8 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::ColdQuiet),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(server.openrouter.id().to_owned()),
-        route: Some(format!("openai_chat:{}", server.openrouter.id())),
+        provider: Some(OPENAI_PROVIDER.to_owned()),
+        route: Some(route_of()),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,
@@ -432,8 +437,8 @@ pub(crate) struct ColdOpenaiRecord<'a> {
 }
 
 /// The route column, `frontend:backend`.
-fn route_of(ctx: &RecordCtx) -> String {
-    format!("openai_chat:{}", ctx.server.openrouter.id())
+fn route_of() -> String {
+    format!("openai_chat:{OPENAI_PROVIDER}")
 }
 
 /// Record one sleep-lock transition (the `kind: "awake"` row
@@ -630,7 +635,7 @@ fn measurement_row(
         duration_ms: Some(duration_ms),
         kind: None,
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(ctx.server.openrouter.id().to_owned()),
+        provider: Some(OPENAI_PROVIDER.to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
         ping: None,
@@ -720,7 +725,7 @@ fn error_row(
         duration_ms: Some(duration_ms),
         kind: Some(RowKind::Error),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(ctx.server.openrouter.id().to_owned()),
+        provider: Some(OPENAI_PROVIDER.to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
         ping: None,

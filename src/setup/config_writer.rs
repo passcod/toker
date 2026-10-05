@@ -123,10 +123,12 @@ default_backend_anthropic = "codex_sub"
 
         write_config(&path, |config| {
             anyhow::ensure!(
-                config.default_backend_anthropic == "codex_sub",
+                config.default_backend_anthropic.as_deref() == Some("codex_sub"),
                 "the fixture is read as it stands"
             );
-            config.default_backend_anthropic = "anthropic_sub".to_owned();
+            // A backend is enabled by its block: the flip adds one.
+            config.anthropic_sub.get_or_insert_with(Default::default);
+            config.default_backend_anthropic = Some("anthropic_sub".to_owned());
             Ok(())
         })
         .expect("write the flip");
@@ -155,9 +157,27 @@ default_backend_anthropic = "codex_sub"
         // The semantics that must survive: the flip, the map, and a
         // re-loadable file.
         let reloaded = Config::load_from(&path).expect("the written file loads");
-        assert_eq!(reloaded.default_backend_anthropic, "anthropic_sub");
+        assert_eq!(
+            reloaded.default_backend_anthropic.as_deref(),
+            Some("anthropic_sub")
+        );
         assert_eq!(reloaded.port, 18_123);
-        assert_eq!(reloaded.codex_sub.model_map, Some(expected_model_map()));
+        assert_eq!(
+            reloaded
+                .codex_sub
+                .as_ref()
+                .expect("still enabled")
+                .model_map,
+            Some(expected_model_map())
+        );
+        assert!(
+            text.contains("[providers.anthropic_sub]"),
+            "the enabled backend's block is written"
+        );
+        assert!(
+            !text.contains("[providers.openrouter]") && !text.contains("[providers.anthropic_api]"),
+            "a disabled backend's block is not: writing it would enable it"
+        );
 
         // Idempotence: a no-change re-run rewrites the same bytes.
         let once = fs::read(&path).expect("read once");
@@ -204,9 +224,10 @@ auth_path = "~/.codex/auth.json"
             reloaded.gates.cold_min_tokens, 60_000,
             "the asked-for change"
         );
-        assert_eq!(reloaded.openrouter.api_key.as_deref(), Some("literal-key"));
+        let openrouter = reloaded.openrouter.as_ref().expect("still enabled");
+        assert_eq!(openrouter.api_key.as_deref(), Some("literal-key"));
         assert_eq!(
-            reloaded.openrouter.upstream.as_str(),
+            openrouter.upstream.as_str(),
             "http://localhost:9/v1",
             "the upstream survived"
         );
@@ -215,7 +236,14 @@ auth_path = "~/.codex/auth.json"
         let expected_auth = PathBuf::from(std::env::var("HOME").expect("tests run with a home"))
             .join(".codex")
             .join("auth.json");
-        assert_eq!(reloaded.codex_sub.auth_path, expected_auth);
+        assert_eq!(
+            reloaded
+                .codex_sub
+                .as_ref()
+                .expect("still enabled")
+                .auth_path,
+            expected_auth
+        );
         let text = fs::read_to_string(&path).expect("read back");
         assert!(!text.contains("~/"), "the tilde form is written expanded");
     }
@@ -241,7 +269,7 @@ auth_path = "~/.codex/auth.json"
         let path = test_dir("invalid").join("toker.toml");
         fs::write(&path, "port = 19999\n").expect("write fixture");
         let error = write_config(&path, |config| {
-            config.default_backend_anthropic = "not-a-backend".to_owned();
+            config.default_backend_anthropic = Some("not-a-backend".to_owned());
             Ok(())
         })
         .expect_err("must refuse");
@@ -277,8 +305,8 @@ auth_path = "~/.codex/auth.json"
         let reloaded = Config::load_from(&path).expect("loads");
         assert_eq!(reloaded.port, 20_000);
         assert_eq!(
-            reloaded.default_backend_anthropic, "anthropic_sub",
-            "defaults intact"
+            reloaded.default_backend_anthropic, None,
+            "defaults intact: a fresh file enables no backend"
         );
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(

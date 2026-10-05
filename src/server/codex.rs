@@ -141,7 +141,12 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     // refresh failure is a toker-side failure: no upstream response, no
     // row, 502 — the same shape the byte-forward paths give.
     let now = now_ms() / 1000;
-    let auth = match server.codex_turn.auth_for_turn(&server.http, now).await {
+    // Only the codex backend routes here, and it exists only when its
+    // block does; the check keeps a broken invariant a typed answer.
+    let Some(codex) = server.codex_turn.clone() else {
+        return super::anthropic_not_configured();
+    };
+    let auth = match codex.auth_for_turn(&server.http, now).await {
         Ok(auth) => auth,
         Err(error) => {
             tracing::warn!(%error, "codex auth refresh failed");
@@ -154,10 +159,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         }
     };
 
-    let headers =
-        server
-            .codex_turn
-            .turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
+    let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
     let url = backend.endpoint("/responses");
     let upstream = match server
         .http

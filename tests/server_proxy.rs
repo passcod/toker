@@ -314,28 +314,28 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         db_path: test_dir("db").join("toker.db"),
         session_header_names: vec!["x-toker-session".to_owned(), "x-session-id".to_owned()],
         ping_header_name: "x-toker-ping".to_owned(),
-        default_backend_openai_chat: "openrouter".to_owned(),
-        openrouter: OpenRouterConfig {
+        default_backend_openai_chat: Some("openrouter".to_owned()),
+        openrouter: Some(OpenRouterConfig {
             upstream,
             api_key_env: api_key_env.to_owned(),
             api_key,
-        },
-        default_backend_anthropic: "anthropic_sub".to_owned(),
-        anthropic_sub: AnthropicSubConfig {
+        }),
+        default_backend_anthropic: Some("anthropic_sub".to_owned()),
+        anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: anthropic_upstream.clone(),
-        },
-        anthropic_api: AnthropicApiConfig {
+        }),
+        anthropic_api: Some(AnthropicApiConfig {
             model_map: None,
             upstream: anthropic_upstream,
             api_key_env: api_key_env.to_owned(),
             api_key: None,
-        },
+        }),
         // The codex backend's config: never routed to in these suites
         // (the responses frontend lands later), pointed at an upstream
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
-        codex_sub: CodexSubConfig {
+        codex_sub: Some(CodexSubConfig {
             model_map: None,
             client_version: None,
             version_probe: false,
@@ -347,7 +347,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),
-        },
+        }),
         gates: toker::config::GatesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
@@ -1639,4 +1639,118 @@ async fn the_openai_notice_renders_as_sse_for_stream_requests() {
 
     let rows = wait_for_rows(&store, 2).await;
     assert!(rows.iter().any(|row| row.kind == Some(RowKind::Cold)));
+}
+
+// ---------------------------------------------------------------------------
+// Optional backends
+// ---------------------------------------------------------------------------
+
+/// A catch-all upstream: every request, any path, is captured and
+/// answered 200 — so a request that should never have left toker shows
+/// up here whatever path it took.
+async fn spawn_catch_all() -> (MockState, reqwest::Url) {
+    let state = MockState::default();
+    let app = Router::new()
+        .fallback(mock_models)
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("mock binds");
+    let addr = listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("mock serves");
+    });
+    (state, format!("http://{addr}").parse().expect("mock url"))
+}
+
+#[tokio::test]
+async fn a_protocol_with_no_backend_answers_not_configured_and_reaches_no_upstream() {
+    let (mock, upstream) = spawn_catch_all().await;
+
+    // Only the anthropic subscription block, like this machine's config:
+    // the openai routes have no backend.
+    let mut config = test_config(upstream.join("v1").expect("v1"), UNSET_KEY_ENV, None);
+    config.openrouter = None;
+    config.default_backend_openai_chat = None;
+    config.anthropic_sub.as_mut().expect("enabled").upstream = upstream.clone();
+    config.anthropic_api = None;
+    config.codex_sub = None;
+    let (addr, store) = spawn_toker(config).await;
+
+    let response = post_chat(addr, &chat_body("z-ai/glm-5.3", false)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers()["x-toker-not-configured"],
+        "openai_chat",
+        "the probe-visible marker of toker's own answer"
+    );
+    let body: Value = response.json().await.expect("openai-shaped JSON");
+    assert_eq!(body["error"]["code"], "backend_not_configured");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("openai_chat")),
+        "{body}"
+    );
+
+    // A prefix naming a disabled anthropic backend is answered, never
+    // sent to the default with the prefix still on.
+    let response = client()
+        .post(toker_url(addr, "/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"anthropic_api/claude-opus-5","max_tokens":1,"messages":[]}"#)
+        .send()
+        .await
+        .expect("messages request");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = response.json().await.expect("anthropic-shaped JSON");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert!(mock.captured().is_empty(), "nothing reached any upstream");
+
+    // `/v1/models` is the anthropic default's when there is no openai
+    // backend: claude asks for it too.
+    let response = client()
+        .get(toker_url(addr, "/v1/models"))
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 1);
+    assert_eq!(mock.captured()[0].path, "/v1/models");
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(store.count_requests().expect("count"), 0, "no rows either");
+}
+
+#[tokio::test]
+async fn no_anthropic_backend_answers_every_anthropic_path_not_configured() {
+    let (mock, upstream) = spawn_catch_all().await;
+    let mut config = test_config(upstream.join("v1").expect("v1"), UNSET_KEY_ENV, None);
+    config.anthropic_sub = None;
+    config.anthropic_api = None;
+    config.codex_sub = None;
+    config.default_backend_anthropic = None;
+    let (addr, _store) = spawn_toker(config).await;
+
+    let requests = [
+        client()
+            .post(toker_url(addr, "/v1/messages"))
+            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[]}"#),
+        client()
+            .post(toker_url(addr, "/v1/messages/count_tokens"))
+            .body("{}"),
+        client().get(toker_url(addr, "/v1/messages/batches")),
+        // The unmatched-path fallback forwards to the default anthropic
+        // backend; with none, it answers too.
+        client().get(toker_url(addr, "/v1/files")),
+    ];
+    for request in requests {
+        let response = request.send().await.expect("request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["x-toker-not-configured"], "anthropic");
+        let body: Value = response.json().await.expect("anthropic-shaped JSON");
+        assert_eq!(body["error"]["type"], "not_found_error");
+    }
+    assert!(mock.captured().is_empty(), "nothing reached any upstream");
 }

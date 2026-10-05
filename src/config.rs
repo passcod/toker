@@ -50,9 +50,9 @@ pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
 /// The env var holding the OpenRouter API key.
 pub const DEFAULT_OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
-/// The phase-1 default backend for the openai_chat protocol. Only
-/// "openrouter" exists; [`crate::server::Server::new`] enforces it.
-pub const DEFAULT_BACKEND_OPENAI_CHAT: &str = "openrouter";
+/// The openai_chat protocol's backends, in preference order. Only
+/// openrouter exists.
+pub const OPENAI_CHAT_BACKENDS: &[&str] = &["openrouter"];
 
 /// Anthropic's upstream base — the API root, no `/v1` prefix: the
 /// frontend's `/v1/messages…` paths are already the upstream's paths.
@@ -61,10 +61,10 @@ pub const DEFAULT_ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 /// The env var holding the Anthropic API key.
 pub const DEFAULT_ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
-/// The default backend for the anthropic protocol (plan: Routing —
-/// configured default backend per frontend protocol; bare model names go
-/// to the protocol default).
-pub const DEFAULT_BACKEND_ANTHROPIC: &str = "anthropic_sub";
+/// The anthropic protocol's backends. The first is the historical
+/// default: a config that enables it among others and names no default
+/// keeps routing there, as every config before optional backends did.
+pub const ANTHROPIC_BACKENDS: &[&str] = &["anthropic_sub", "anthropic_api", "codex_sub"];
 
 /// The codex subscription backend's upstream: the ChatGPT backend API's
 /// codex root. Frontend paths append (`/responses` →
@@ -99,18 +99,23 @@ pub struct Config {
     /// request carried it is recorded but excluded from liveness (plan:
     /// Ping tagging).
     pub ping_header_name: String,
-    /// The default backend for the openai_chat protocol.
-    pub default_backend_openai_chat: String,
-    /// The openrouter provider block.
-    pub openrouter: OpenRouterConfig,
-    /// The default backend for the anthropic protocol.
-    pub default_backend_anthropic: String,
-    /// The anthropic subscription provider block.
-    pub anthropic_sub: AnthropicSubConfig,
-    /// The anthropic API provider block.
-    pub anthropic_api: AnthropicApiConfig,
-    /// The codex subscription provider block.
-    pub codex_sub: CodexSubConfig,
+    /// The default backend for the openai_chat protocol, always one of
+    /// the enabled providers; `None` when the protocol has no backend
+    /// (its routes then answer a not-configured error).
+    pub default_backend_openai_chat: Option<String>,
+    /// The openrouter provider block; `None` when absent, which is the
+    /// disabled state: a `[providers.X]` block's presence enables X.
+    pub openrouter: Option<OpenRouterConfig>,
+    /// The default backend for the anthropic protocol (plan: Routing —
+    /// bare model names go to the protocol default), always one of the
+    /// enabled providers; `None` when no anthropic backend is enabled.
+    pub default_backend_anthropic: Option<String>,
+    /// The anthropic subscription provider block (`None`: disabled).
+    pub anthropic_sub: Option<AnthropicSubConfig>,
+    /// The anthropic API provider block (`None`: disabled).
+    pub anthropic_api: Option<AnthropicApiConfig>,
+    /// The codex subscription provider block (`None`: disabled).
+    pub codex_sub: Option<CodexSubConfig>,
     /// The middleware gates block.
     pub gates: GatesConfig,
     /// The idle-sleep lock (on by default, disabled with exactly
@@ -315,6 +320,57 @@ pub struct CodexSubConfig {
     pub version_probe: bool,
 }
 
+/// The defaults of every provider block: what an empty `[providers.X]`
+/// block resolves to, and what the setup wizard writes when it enables a
+/// backend. The constants are known-good URLs, so the parses cannot fail.
+fn default_url(url: &str) -> reqwest::Url {
+    parse_upstream(url).expect("the built-in default URLs parse")
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        OpenRouterConfig {
+            upstream: default_url(DEFAULT_OPENROUTER_UPSTREAM),
+            api_key_env: DEFAULT_OPENROUTER_API_KEY_ENV.to_owned(),
+            api_key: None,
+        }
+    }
+}
+
+impl Default for AnthropicSubConfig {
+    fn default() -> Self {
+        AnthropicSubConfig {
+            upstream: default_url(DEFAULT_ANTHROPIC_UPSTREAM),
+            model_map: None,
+        }
+    }
+}
+
+impl Default for AnthropicApiConfig {
+    fn default() -> Self {
+        AnthropicApiConfig {
+            upstream: default_url(DEFAULT_ANTHROPIC_UPSTREAM),
+            model_map: None,
+            api_key_env: DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned(),
+            api_key: None,
+        }
+    }
+}
+
+impl Default for CodexSubConfig {
+    fn default() -> Self {
+        CodexSubConfig {
+            upstream: default_url(DEFAULT_CODEX_UPSTREAM),
+            originator: DEFAULT_CODEX_ORIGINATOR.to_owned(),
+            auth_path: expand_tilde(DEFAULT_CODEX_AUTH_PATH),
+            refresh_url: default_url(DEFAULT_CODEX_REFRESH_URL),
+            model_map: None,
+            client_version: None,
+            version_probe: true,
+        }
+    }
+}
+
 /// Resolve one provider's `[providers.<id>.model_map]` TOML table into the
 /// parsed, validated [`ModelMap`] (the committed parser's domain — the
 /// table is rendered as the JSON object it expects, so every selector
@@ -424,7 +480,16 @@ impl Config {
             let upstream = upstream
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
-            config.openrouter.upstream = parse_upstream(&upstream).context("TOKER_UPSTREAM")?;
+            let upstream = parse_upstream(&upstream).context("TOKER_UPSTREAM")?;
+            // The override moves an enabled backend; it never enables one.
+            // Failing the load instead would stop the service over a stray
+            // variable in the user manager's environment.
+            match config.openrouter.as_mut() {
+                Some(openrouter) => openrouter.upstream = upstream,
+                None => tracing::warn!(
+                    "TOKER_UPSTREAM is set but [providers.openrouter] is not: ignored"
+                ),
+            }
         }
 
         config.validate()?;
@@ -470,8 +535,8 @@ impl Config {
             db_path: Some(self.db_path.to_string_lossy().into_owned()),
             session_header_names: Some(self.session_header_names.clone()),
             ping_header_name: Some(self.ping_header_name.clone()),
-            default_backend_openai_chat: Some(self.default_backend_openai_chat.clone()),
-            default_backend_anthropic: Some(self.default_backend_anthropic.clone()),
+            default_backend_openai_chat: self.default_backend_openai_chat.clone(),
+            default_backend_anthropic: self.default_backend_anthropic.clone(),
             awake: Some(self.awake),
             transcript_roots: Some(
                 self.transcript_roots
@@ -479,30 +544,32 @@ impl Config {
                     .map(|root| root.to_string_lossy().into_owned())
                     .collect(),
             ),
+            // Only the enabled blocks: a block's presence is what enables
+            // its provider, so writing a disabled one would enable it.
             providers: FileProviders {
-                openrouter: Some(FileOpenRouter {
-                    upstream: Some(self.openrouter.upstream.to_string()),
-                    api_key_env: Some(self.openrouter.api_key_env.clone()),
-                    api_key: self.openrouter.api_key.clone(),
+                openrouter: self.openrouter.as_ref().map(|openrouter| FileOpenRouter {
+                    upstream: Some(openrouter.upstream.to_string()),
+                    api_key_env: Some(openrouter.api_key_env.clone()),
+                    api_key: openrouter.api_key.clone(),
                 }),
-                anthropic_sub: Some(FileAnthropicSub {
-                    upstream: Some(self.anthropic_sub.upstream.to_string()),
-                    model_map: self.anthropic_sub.model_map.as_ref().map(model_map_table),
+                anthropic_sub: self.anthropic_sub.as_ref().map(|sub| FileAnthropicSub {
+                    upstream: Some(sub.upstream.to_string()),
+                    model_map: sub.model_map.as_ref().map(model_map_table),
                 }),
-                anthropic_api: Some(FileAnthropicApi {
-                    upstream: Some(self.anthropic_api.upstream.to_string()),
-                    api_key_env: Some(self.anthropic_api.api_key_env.clone()),
-                    api_key: self.anthropic_api.api_key.clone(),
-                    model_map: self.anthropic_api.model_map.as_ref().map(model_map_table),
+                anthropic_api: self.anthropic_api.as_ref().map(|api| FileAnthropicApi {
+                    upstream: Some(api.upstream.to_string()),
+                    api_key_env: Some(api.api_key_env.clone()),
+                    api_key: api.api_key.clone(),
+                    model_map: api.model_map.as_ref().map(model_map_table),
                 }),
-                codex_sub: Some(FileCodexSub {
-                    upstream: Some(self.codex_sub.upstream.to_string()),
-                    originator: Some(self.codex_sub.originator.clone()),
-                    auth_path: Some(self.codex_sub.auth_path.to_string_lossy().into_owned()),
-                    refresh_url: Some(self.codex_sub.refresh_url.to_string()),
-                    client_version: self.codex_sub.client_version.clone(),
-                    version_probe: Some(self.codex_sub.version_probe),
-                    model_map: self.codex_sub.model_map.as_ref().map(model_map_table),
+                codex_sub: self.codex_sub.as_ref().map(|codex| FileCodexSub {
+                    upstream: Some(codex.upstream.to_string()),
+                    originator: Some(codex.originator.clone()),
+                    auth_path: Some(codex.auth_path.to_string_lossy().into_owned()),
+                    refresh_url: Some(codex.refresh_url.to_string()),
+                    client_version: codex.client_version.clone(),
+                    version_probe: Some(codex.version_probe),
+                    model_map: codex.model_map.as_ref().map(model_map_table),
                 }),
             },
             gates: FileGates {
@@ -522,120 +589,108 @@ impl Config {
     /// [`Config::load_from`]: every default applied, every block
     /// parsed. No env, no validation — both are the callers' side.
     fn resolve_file(file: FileConfig) -> anyhow::Result<Config> {
-        let openrouter = OpenRouterConfig {
-            upstream: parse_upstream(
-                file.providers
-                    .openrouter
-                    .as_ref()
-                    .and_then(|p| p.upstream.as_deref())
-                    .unwrap_or(DEFAULT_OPENROUTER_UPSTREAM),
-            )?,
-            api_key_env: file
-                .providers
-                .openrouter
-                .as_ref()
-                .and_then(|p| p.api_key_env.as_deref())
-                .unwrap_or(DEFAULT_OPENROUTER_API_KEY_ENV)
-                .to_owned(),
-            api_key: file
-                .providers
-                .openrouter
-                .as_ref()
-                .and_then(|p| p.api_key.clone()),
-        };
+        let FileProviders {
+            openrouter,
+            anthropic_sub,
+            anthropic_api,
+            codex_sub,
+        } = file.providers;
+        let openrouter = openrouter
+            .map(|block| -> anyhow::Result<OpenRouterConfig> {
+                Ok(OpenRouterConfig {
+                    upstream: parse_upstream(
+                        block
+                            .upstream
+                            .as_deref()
+                            .unwrap_or(DEFAULT_OPENROUTER_UPSTREAM),
+                    )?,
+                    api_key_env: block
+                        .api_key_env
+                        .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned()),
+                    api_key: block.api_key,
+                })
+            })
+            .transpose()?;
+        let anthropic_sub = anthropic_sub
+            .map(|block| -> anyhow::Result<AnthropicSubConfig> {
+                Ok(AnthropicSubConfig {
+                    upstream: parse_upstream(
+                        block
+                            .upstream
+                            .as_deref()
+                            .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
+                    )?,
+                    model_map: match &block.model_map {
+                        Some(table) => parse_model_map_table("anthropic_sub", table)?,
+                        None => None,
+                    },
+                })
+            })
+            .transpose()?;
+        let anthropic_api = anthropic_api
+            .map(|block| -> anyhow::Result<AnthropicApiConfig> {
+                Ok(AnthropicApiConfig {
+                    upstream: parse_upstream(
+                        block
+                            .upstream
+                            .as_deref()
+                            .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
+                    )?,
+                    model_map: match &block.model_map {
+                        Some(table) => parse_model_map_table("anthropic_api", table)?,
+                        None => None,
+                    },
+                    api_key_env: block
+                        .api_key_env
+                        .unwrap_or_else(|| DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned()),
+                    api_key: block.api_key,
+                })
+            })
+            .transpose()?;
+        let codex_sub = codex_sub
+            .map(|block| -> anyhow::Result<CodexSubConfig> {
+                Ok(CodexSubConfig {
+                    upstream: parse_upstream(
+                        block.upstream.as_deref().unwrap_or(DEFAULT_CODEX_UPSTREAM),
+                    )?,
+                    originator: block
+                        .originator
+                        .unwrap_or_else(|| DEFAULT_CODEX_ORIGINATOR.to_owned()),
+                    auth_path: expand_tilde(
+                        block
+                            .auth_path
+                            .as_deref()
+                            .unwrap_or(DEFAULT_CODEX_AUTH_PATH),
+                    ),
+                    refresh_url: parse_upstream(
+                        block
+                            .refresh_url
+                            .as_deref()
+                            .unwrap_or(DEFAULT_CODEX_REFRESH_URL),
+                    )?,
+                    model_map: match &block.model_map {
+                        Some(table) => parse_model_map_table("codex_sub", table)?,
+                        None => None,
+                    },
+                    client_version: block.client_version,
+                    version_probe: block.version_probe.unwrap_or(true),
+                })
+            })
+            .transpose()?;
 
-        let anthropic_sub = AnthropicSubConfig {
-            upstream: parse_upstream(
-                file.providers
-                    .anthropic_sub
-                    .as_ref()
-                    .and_then(|p| p.upstream.as_deref())
-                    .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
-            )?,
-            model_map: match file.providers.anthropic_sub.as_ref() {
-                Some(sub) => match &sub.model_map {
-                    Some(table) => parse_model_map_table("anthropic_sub", table)?,
-                    None => None,
-                },
-                None => None,
-            },
-        };
-        let anthropic_api = AnthropicApiConfig {
-            upstream: parse_upstream(
-                file.providers
-                    .anthropic_api
-                    .as_ref()
-                    .and_then(|p| p.upstream.as_deref())
-                    .unwrap_or(DEFAULT_ANTHROPIC_UPSTREAM),
-            )?,
-            model_map: match file.providers.anthropic_api.as_ref() {
-                Some(api) => match &api.model_map {
-                    Some(table) => parse_model_map_table("anthropic_api", table)?,
-                    None => None,
-                },
-                None => None,
-            },
-            api_key_env: file
-                .providers
-                .anthropic_api
-                .as_ref()
-                .and_then(|p| p.api_key_env.as_deref())
-                .unwrap_or(DEFAULT_ANTHROPIC_API_KEY_ENV)
-                .to_owned(),
-            api_key: file
-                .providers
-                .anthropic_api
-                .as_ref()
-                .and_then(|p| p.api_key.clone()),
-        };
-        let codex_sub = CodexSubConfig {
-            upstream: parse_upstream(
-                file.providers
-                    .codex_sub
-                    .as_ref()
-                    .and_then(|p| p.upstream.as_deref())
-                    .unwrap_or(DEFAULT_CODEX_UPSTREAM),
-            )?,
-            originator: file
-                .providers
-                .codex_sub
-                .as_ref()
-                .and_then(|p| p.originator.as_deref())
-                .unwrap_or(DEFAULT_CODEX_ORIGINATOR)
-                .to_owned(),
-            auth_path: expand_tilde(
-                file.providers
-                    .codex_sub
-                    .as_ref()
-                    .and_then(|p| p.auth_path.as_deref())
-                    .unwrap_or(DEFAULT_CODEX_AUTH_PATH),
-            ),
-            refresh_url: parse_upstream(
-                file.providers
-                    .codex_sub
-                    .as_ref()
-                    .and_then(|p| p.refresh_url.as_deref())
-                    .unwrap_or(DEFAULT_CODEX_REFRESH_URL),
-            )?,
-            model_map: match file.providers.codex_sub.as_ref() {
-                Some(sub) => match &sub.model_map {
-                    Some(table) => parse_model_map_table("codex_sub", table)?,
-                    None => None,
-                },
-                None => None,
-            },
-            client_version: file
-                .providers
-                .codex_sub
-                .as_ref()
-                .and_then(|p| p.client_version.clone()),
-            version_probe: file
-                .providers
-                .codex_sub
-                .as_ref()
-                .and_then(|p| p.version_probe)
-                .unwrap_or(true),
-        };
+        let enabled_anthropic: Vec<&str> = [
+            ("anthropic_sub", anthropic_sub.is_some()),
+            ("anthropic_api", anthropic_api.is_some()),
+            ("codex_sub", codex_sub.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+        let enabled_openai: Vec<&str> = openrouter
+            .is_some()
+            .then_some("openrouter")
+            .into_iter()
+            .collect();
 
         let config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
@@ -652,13 +707,17 @@ impl Config {
             ping_header_name: file
                 .ping_header_name
                 .unwrap_or_else(|| DEFAULT_PING_HEADER.to_owned()),
-            default_backend_openai_chat: file
-                .default_backend_openai_chat
-                .unwrap_or_else(|| DEFAULT_BACKEND_OPENAI_CHAT.to_owned()),
+            default_backend_openai_chat: default_backend(
+                "default_backend_openai_chat",
+                file.default_backend_openai_chat,
+                &enabled_openai,
+            )?,
             openrouter,
-            default_backend_anthropic: file
-                .default_backend_anthropic
-                .unwrap_or_else(|| DEFAULT_BACKEND_ANTHROPIC.to_owned()),
+            default_backend_anthropic: default_backend(
+                "default_backend_anthropic",
+                file.default_backend_anthropic,
+                &enabled_anthropic,
+            )?,
             anthropic_sub,
             anthropic_api,
             codex_sub,
@@ -718,30 +777,122 @@ impl Config {
         {
             bail!("cold_idle_min must be a non-negative number of minutes");
         }
-        // The anthropic protocol's backends are all wired (routing resolves
-        // by name; codex_sub serves through the translation pipeline), but
-        // the protocol default must name one of them — anything else cannot
-        // route anywhere.
-        if !matches!(
-            self.default_backend_anthropic.as_str(),
-            "anthropic_sub" | "anthropic_api" | "codex_sub"
-        ) {
-            bail!(
-                "default_backend_anthropic must be \"anthropic_sub\", \
-                 \"anthropic_api\", or \"codex_sub\", not {:?}",
-                self.default_backend_anthropic
-            );
-        }
+        // Each protocol default must name an enabled backend of that
+        // protocol: anything else cannot route anywhere. The load already
+        // checks this; the wizard's edits are re-checked here.
+        check_default(
+            "default_backend_anthropic",
+            self.default_backend_anthropic.as_deref(),
+            &self.enabled_anthropic(),
+            ANTHROPIC_BACKENDS,
+        )?;
+        check_default(
+            "default_backend_openai_chat",
+            self.default_backend_openai_chat.as_deref(),
+            &self.enabled_openai_chat(),
+            OPENAI_CHAT_BACKENDS,
+        )?;
         // The codex originator rides on every request header: an
         // unusable value would silently never reach the upstream.
-        if let Err(error) = axum::http::HeaderValue::from_str(&self.codex_sub.originator) {
+        if let Some(codex) = &self.codex_sub
+            && let Err(error) = axum::http::HeaderValue::from_str(&codex.originator)
+        {
             bail!(
                 "providers.codex_sub originator {:?} is not a valid header value: {error}",
-                self.codex_sub.originator
+                codex.originator
             );
         }
         Ok(())
     }
+}
+
+impl Config {
+    /// The enabled anthropic-protocol backends, in [`ANTHROPIC_BACKENDS`]
+    /// order.
+    pub fn enabled_anthropic(&self) -> Vec<&'static str> {
+        [
+            ("anthropic_sub", self.anthropic_sub.is_some()),
+            ("anthropic_api", self.anthropic_api.is_some()),
+            ("codex_sub", self.codex_sub.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect()
+    }
+
+    /// The enabled openai_chat-protocol backends.
+    pub fn enabled_openai_chat(&self) -> Vec<&'static str> {
+        self.openrouter
+            .is_some()
+            .then_some("openrouter")
+            .into_iter()
+            .collect()
+    }
+
+    /// Every enabled backend, anthropic protocol first.
+    pub fn enabled_backends(&self) -> Vec<&'static str> {
+        let mut all = self.enabled_anthropic();
+        all.extend(self.enabled_openai_chat());
+        all
+    }
+}
+
+/// A protocol's default backend: the named one when the file names it
+/// (checked against the enabled set by [`check_default`]), else the only
+/// enabled backend, else the historical default when it is among several
+/// enabled ones. Several enabled backends and no way to choose is an
+/// error rather than a guess: bare model names would otherwise route
+/// somewhere the operator never picked.
+fn default_backend(
+    key: &str,
+    named: Option<String>,
+    enabled: &[&str],
+) -> anyhow::Result<Option<String>> {
+    if named.is_some() {
+        return Ok(named);
+    }
+    match enabled {
+        [] => Ok(None),
+        [only] => Ok(Some((*only).to_owned())),
+        several if several.contains(&ANTHROPIC_BACKENDS[0]) => {
+            Ok(Some(ANTHROPIC_BACKENDS[0].to_owned()))
+        }
+        several => bail!(
+            "{key} is not set and several backends are enabled ({}): name one",
+            several.join(", ")
+        ),
+    }
+}
+
+/// A protocol default must name one of the protocol's enabled backends.
+fn check_default(
+    key: &str,
+    named: Option<&str>,
+    enabled: &[&str],
+    protocol: &[&str],
+) -> anyhow::Result<()> {
+    let Some(named) = named else {
+        if !enabled.is_empty() {
+            bail!(
+                "{key} must name one of the enabled backends ({})",
+                enabled.join(", ")
+            );
+        }
+        return Ok(());
+    };
+    if enabled.contains(&named) {
+        return Ok(());
+    }
+    if protocol.contains(&named) {
+        bail!(
+            "{key} = {named:?}, but [providers.{named}] is not in the config: \
+             a backend is enabled by its block's presence"
+        );
+    }
+    bail!(
+        "{key} must name one of {}, not {named:?}",
+        protocol.join(", ")
+    )
 }
 
 /// The `toker.toml` wire shape, serde-side. `deny_unknown_fields` so a
@@ -922,10 +1073,10 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_ANTHROPIC_UPSTREAM, DEFAULT_BACKEND_ANTHROPIC,
-        DEFAULT_CODEX_AUTH_PATH, DEFAULT_CODEX_ORIGINATOR, DEFAULT_CODEX_REFRESH_URL,
-        DEFAULT_CODEX_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS,
-        KeySources, OpenRouterConfig,
+        DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_ANTHROPIC_UPSTREAM, DEFAULT_CODEX_AUTH_PATH,
+        DEFAULT_CODEX_ORIGINATOR, DEFAULT_CODEX_REFRESH_URL, DEFAULT_CODEX_UPSTREAM,
+        DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources,
+        OpenRouterConfig,
     };
     use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
@@ -967,7 +1118,9 @@ mod tests {
     /// A config pointing at a scratch db, loadable without touching the
     /// user's real config or env.
     fn load_from(dir: &std::path::Path) -> super::Config {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         set_env("TOKER_PORT", None);
         set_env("TOKER_DB", None);
@@ -991,42 +1144,15 @@ mod tests {
             DEFAULT_SESSION_HEADERS.contains(&"x-claude-code-session-id"),
             "claude identifies itself by its own header"
         );
-        assert_eq!(config.default_backend_openai_chat, "openrouter");
-        assert_eq!(config.default_backend_anthropic, DEFAULT_BACKEND_ANTHROPIC);
-        // The codex defaults: the ChatGPT backend API's codex root, the
-        // codex CLI's own originator and login/refresh endpoints, the
-        // auth path tilde-expanded against $HOME.
-        assert_eq!(config.codex_sub.upstream.as_str(), DEFAULT_CODEX_UPSTREAM);
-        assert_eq!(config.codex_sub.originator, DEFAULT_CODEX_ORIGINATOR);
-        assert_eq!(
-            config.codex_sub.auth_path,
-            super::expand_tilde(DEFAULT_CODEX_AUTH_PATH),
-            "the default auth path is the codex CLI's, tilde-expanded"
-        );
-        assert_eq!(
-            config.codex_sub.refresh_url.as_str(),
-            DEFAULT_CODEX_REFRESH_URL
-        );
-        // No model map is configured anywhere by default: absence is the
-        // disabled state, the same as every other optional block.
-        assert_eq!(config.anthropic_sub.model_map, None);
-        assert_eq!(config.anthropic_api.model_map, None);
-        assert_eq!(config.codex_sub.model_map, None);
-        // The default constant is a bare host; the resolved Url carries
-        // its normalised trailing slash.
-        let default_upstream =
-            reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream");
-        assert_eq!(config.anthropic_sub.upstream, default_upstream);
-        assert_eq!(config.anthropic_api.upstream, default_upstream);
-        assert_eq!(
-            config.anthropic_api.api_key_env,
-            DEFAULT_ANTHROPIC_API_KEY_ENV
-        );
-        assert_eq!(config.anthropic_api.api_key, None);
-        assert_eq!(
-            config.openrouter.upstream.as_str(),
-            DEFAULT_OPENROUTER_UPSTREAM
-        );
+        // No block, no backend: a fresh config enables nothing, and
+        // neither protocol has a default to route to.
+        assert_eq!(config.openrouter, None);
+        assert_eq!(config.anthropic_sub, None);
+        assert_eq!(config.anthropic_api, None);
+        assert_eq!(config.codex_sub, None);
+        assert_eq!(config.default_backend_openai_chat, None);
+        assert_eq!(config.default_backend_anthropic, None);
+        assert!(config.enabled_backends().is_empty());
         // The quota gate is on by default: a proxy that silently stopped
         // gating is a proxy that quietly spends overage.
         assert!(config.gates.quota_enabled);
@@ -1055,13 +1181,162 @@ mod tests {
         // ~/.claude and $CLAUDE_CONFIG_DIR, and only a configured
         // harness adds more.
         assert!(config.transcript_roots.is_empty());
-        assert_eq!(config.openrouter.api_key_env, "OPENROUTER_API_KEY");
-        assert_eq!(config.openrouter.api_key, None);
         // The db defaults to the store's default path.
         assert_eq!(
             config.db_path,
             crate::store::default_db_path().expect("default db path")
         );
+    }
+
+    #[test]
+    fn an_empty_block_enables_its_backend_with_the_defaults() {
+        let dir = test_dir("empty-blocks");
+        fs::write(
+            dir.join("toker.toml"),
+            "[providers.openrouter]\n[providers.anthropic_sub]\n\
+             [providers.anthropic_api]\n[providers.codex_sub]\n",
+        )
+        .expect("write config");
+        let config = load_from(&dir);
+        assert_eq!(
+            config.enabled_backends(),
+            vec!["anthropic_sub", "anthropic_api", "codex_sub", "openrouter"]
+        );
+        // Several anthropic backends and no named default: the historical
+        // one, so a config written before backends were optional routes
+        // where it always did.
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("anthropic_sub")
+        );
+        // The only openai backend is the openai default.
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("openrouter")
+        );
+
+        // The codex defaults: the ChatGPT backend API's codex root, the
+        // codex CLI's own originator and login/refresh endpoints, the
+        // auth path tilde-expanded against $HOME.
+        let codex = config.codex_sub.as_ref().expect("codex enabled");
+        assert_eq!(codex.upstream.as_str(), DEFAULT_CODEX_UPSTREAM);
+        assert_eq!(codex.originator, DEFAULT_CODEX_ORIGINATOR);
+        assert_eq!(
+            codex.auth_path,
+            super::expand_tilde(DEFAULT_CODEX_AUTH_PATH),
+            "the default auth path is the codex CLI's, tilde-expanded"
+        );
+        assert_eq!(codex.refresh_url.as_str(), DEFAULT_CODEX_REFRESH_URL);
+        // No model map is configured anywhere by default: absence is the
+        // disabled state, the same as every other optional block.
+        let sub = config.anthropic_sub.as_ref().expect("sub enabled");
+        let api = config.anthropic_api.as_ref().expect("api enabled");
+        assert_eq!(sub.model_map, None);
+        assert_eq!(api.model_map, None);
+        assert_eq!(codex.model_map, None);
+        // The default constant is a bare host; the resolved Url carries
+        // its normalised trailing slash.
+        let default_upstream =
+            reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream");
+        assert_eq!(sub.upstream, default_upstream);
+        assert_eq!(api.upstream, default_upstream);
+        assert_eq!(api.api_key_env, DEFAULT_ANTHROPIC_API_KEY_ENV);
+        assert_eq!(api.api_key, None);
+        let openrouter = config.openrouter.as_ref().expect("openrouter enabled");
+        assert_eq!(openrouter.upstream.as_str(), DEFAULT_OPENROUTER_UPSTREAM);
+        assert_eq!(openrouter.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(openrouter.api_key, None);
+
+        // The Default impls the wizard enables a backend with are exactly
+        // what an empty block resolves to.
+        assert_eq!(*codex, super::CodexSubConfig::default());
+        assert_eq!(*sub, super::AnthropicSubConfig::default());
+        assert_eq!(*api, super::AnthropicApiConfig::default());
+        assert_eq!(*openrouter, super::OpenRouterConfig::default());
+    }
+
+    #[test]
+    fn a_default_must_name_an_enabled_backend() {
+        let dir = test_dir("default-enabled");
+        let load = |text: &str| {
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
+            fs::write(dir.join("toker.toml"), text).expect("write config");
+            super::Config::load()
+        };
+
+        // A known backend whose block is absent: the error says the block
+        // is what enables it.
+        let error =
+            load("default_backend_anthropic = \"anthropic_api\"\n[providers.anthropic_sub]\n")
+                .expect_err("a default naming a disabled backend must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("default_backend_anthropic")
+                && message.contains("[providers.anthropic_api]"),
+            "{message}"
+        );
+        let error = load("default_backend_openai_chat = \"openrouter\"\n")
+            .expect_err("no openrouter block, no openrouter default");
+        assert!(format!("{error:#}").contains("default_backend_openai_chat"));
+        // A backend of the other protocol is not a default for this one.
+        let error = load("default_backend_anthropic = \"openrouter\"\n[providers.openrouter]\n")
+            .expect_err("openrouter is not an anthropic backend");
+        assert!(format!("{error:#}").contains("default_backend_anthropic"));
+
+        // The only enabled backend is the inferred default.
+        let config = load("[providers.codex_sub]\n").expect("one backend loads");
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
+        assert_eq!(config.default_backend_openai_chat, None);
+        // Two enabled, neither the historical default, none named: an
+        // error rather than a guess.
+        let error = load("[providers.anthropic_api]\n[providers.codex_sub]\n")
+            .expect_err("an ambiguous default must fail");
+        assert!(format!("{error:#}").contains("name one"));
+        let config = load(
+            "default_backend_anthropic = \"codex_sub\"\n\
+             [providers.anthropic_api]\n[providers.codex_sub]\n",
+        )
+        .expect("a named default resolves the ambiguity");
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
+    }
+
+    #[test]
+    fn the_predecessor_shaped_config_keeps_its_behaviour() {
+        // The shape of the config this machine ran on before backends
+        // were optional: only the subscription block, the default named.
+        let dir = test_dir("predecessor-shaped");
+        fs::write(
+            dir.join("toker.toml"),
+            r#"
+port = 18123
+default_backend_anthropic = "anthropic_sub"
+awake = true
+
+[providers.anthropic_sub]
+upstream = "https://api.anthropic.com/"
+
+[gates]
+quota_enabled = true
+notice_style = "gfm"
+"#,
+        )
+        .expect("write config");
+        let config = load_from(&dir);
+        assert_eq!(config.enabled_backends(), vec!["anthropic_sub"]);
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("anthropic_sub")
+        );
+        assert_eq!(config.default_backend_openai_chat, None);
     }
 
     #[test]
@@ -1090,9 +1365,28 @@ api_key = "literal-key"
             config.session_header_names,
             vec!["x-toker-session".to_owned()]
         );
-        assert_eq!(config.openrouter.upstream.as_str(), "http://localhost:9/v1");
-        assert_eq!(config.openrouter.api_key_env, "TOKER_TEST_KEY_FILE");
-        assert_eq!(config.openrouter.api_key.as_deref(), Some("literal-key"));
+        assert_eq!(
+            config
+                .openrouter
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
+            "http://localhost:9/v1"
+        );
+        assert_eq!(
+            config.openrouter.as_ref().expect("enabled").api_key_env,
+            "TOKER_TEST_KEY_FILE"
+        );
+        assert_eq!(
+            config
+                .openrouter
+                .as_ref()
+                .expect("enabled")
+                .api_key
+                .as_deref(),
+            Some("literal-key")
+        );
     }
 
     #[test]
@@ -1114,36 +1408,65 @@ api_key = "ak-literal-test"
         )
         .expect("write config");
 
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
         let config = super::Config::load().expect("load config");
-        assert_eq!(config.default_backend_anthropic, "anthropic_api");
         assert_eq!(
-            config.anthropic_sub.upstream.as_str(),
+            config.default_backend_anthropic.as_deref(),
+            Some("anthropic_api")
+        );
+        assert_eq!(
+            config
+                .anthropic_sub
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
             "http://localhost:9/"
         );
         assert_eq!(
-            config.anthropic_api.upstream.as_str(),
+            config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
             "http://localhost:10/"
         );
         assert_eq!(
-            config.anthropic_api.api_key_env,
+            config.anthropic_api.as_ref().expect("enabled").api_key_env,
             "TOKER_TEST_ANTHROPIC_KEY_FILE"
         );
         assert_eq!(
-            config.anthropic_api.api_key.as_deref(),
+            config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .api_key
+                .as_deref(),
             Some("ak-literal-test")
         );
 
         // The shared KeySources resolution, mirroring openrouter's.
         set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", Some("ak-from-env"));
         assert_eq!(
-            config.anthropic_api.api_key().as_deref(),
+            config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .api_key()
+                .as_deref(),
             Some("ak-from-env")
         );
         assert_eq!(
-            config.anthropic_api.key_sources(),
+            config
+                .anthropic_api
+                .as_ref()
+                .expect("enabled")
+                .key_sources(),
             KeySources {
                 env_set: true,
                 literal_set: true
@@ -1152,15 +1475,11 @@ api_key = "ak-literal-test"
         set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
 
         // A config with no anthropic keys at all (a phase-1 toker.toml)
-        // still parses and resolves to the defaults — the defaults test's
-        // domain, here proven against a real file too.
+        // still parses, and enables no anthropic backend.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
         let config = super::Config::load().expect("phase-1 config parses");
-        assert_eq!(config.default_backend_anthropic, "anthropic_sub");
-        assert_eq!(
-            config.anthropic_sub.upstream,
-            reqwest::Url::parse(DEFAULT_ANTHROPIC_UPSTREAM).expect("default upstream")
-        );
+        assert_eq!(config.default_backend_anthropic, None);
+        assert_eq!(config.anthropic_sub, None);
     }
 
     #[test]
@@ -1177,20 +1496,35 @@ refresh_url = "http://localhost:10/oauth/token"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let config = super::Config::load().expect("load config");
         assert_eq!(
-            config.codex_sub.upstream.as_str(),
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
             "http://localhost:9/backend-api/codex"
         );
-        assert_eq!(config.codex_sub.originator, "my_tools_proxy");
         assert_eq!(
-            config.codex_sub.auth_path,
+            config.codex_sub.as_ref().expect("enabled").originator,
+            "my_tools_proxy"
+        );
+        assert_eq!(
+            config.codex_sub.as_ref().expect("enabled").auth_path,
             PathBuf::from("/tmp/opencode/some-login.json")
         );
         assert_eq!(
-            config.codex_sub.refresh_url.as_str(),
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .refresh_url
+                .as_str(),
             "http://localhost:10/oauth/token"
         );
 
@@ -1205,15 +1539,15 @@ auth_path = "~/.codex/auth.json"
         .expect("rewrite config");
         let config = super::Config::load().expect("load config");
         assert_eq!(
-            config.codex_sub.auth_path,
+            config.codex_sub.as_ref().expect("enabled").auth_path,
             super::expand_tilde("~/.codex/auth.json")
         );
 
-        // A phase-1 toker.toml (no codex block at all) parses with the
-        // defaults, and a typo'd key is an error, not a silent default.
+        // A phase-1 toker.toml (no codex block at all) parses with codex
+        // disabled, and a typo'd key is an error, not a silent default.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
         let config = super::Config::load().expect("phase-1 config parses");
-        assert_eq!(config.codex_sub.originator, super::DEFAULT_CODEX_ORIGINATOR);
+        assert_eq!(config.codex_sub, None);
 
         fs::write(
             dir.join("toker.toml"),
@@ -1256,13 +1590,21 @@ auth_path = "~/.codex/auth.json"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let config = super::Config::load().expect("load config");
 
         // Parsed into the committed policy: exact identity ahead of
         // family, published snapshots folding to their identities.
-        let codex_map = config.codex_sub.model_map.as_ref().expect("codex map");
+        let codex_map = config
+            .codex_sub
+            .as_ref()
+            .expect("enabled")
+            .model_map
+            .as_ref()
+            .expect("codex map");
         assert_eq!(
             model_map::preview_mapped_model(Some(codex_map), "claude-opus-5"),
             Some("gpt-5.6-sol")
@@ -1277,19 +1619,22 @@ auth_path = "~/.codex/auth.json"
             Some("claude-sonnet-5"),
             "an unmatched model is the identity"
         );
-        let sub_map = config.anthropic_sub.model_map.as_ref().expect("sub map");
+        let sub_map = config
+            .anthropic_sub
+            .as_ref()
+            .expect("enabled")
+            .model_map
+            .as_ref()
+            .expect("sub map");
         assert_eq!(
             model_map::preview_mapped_model(Some(sub_map), "claude-opus-4-5"),
             Some("claude-opus-4-8")
         );
-        // A backend with no table carries no policy, and one backend's
+        // A backend with no block carries no policy, and one backend's
         // map never answers for another's.
-        assert_eq!(config.anthropic_api.model_map, None);
+        assert_eq!(config.anthropic_api, None);
         assert_eq!(
-            model_map::preview_mapped_model(
-                config.anthropic_api.model_map.as_ref(),
-                "claude-opus-5"
-            ),
+            model_map::preview_mapped_model(None, "claude-opus-5"),
             Some("claude-opus-5")
         );
 
@@ -1331,11 +1676,24 @@ auth_path = "~/.codex/auth.json"
             .expect("rewrite config");
         let config = super::Config::load().expect("empty table parses");
         assert!(
-            config.codex_sub.model_map.is_some(),
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .model_map
+                .is_some(),
             "an empty table is an explicitly empty policy"
         );
         assert_eq!(
-            model_map::preview_mapped_model(config.codex_sub.model_map.as_ref(), "claude-opus-5"),
+            model_map::preview_mapped_model(
+                config
+                    .codex_sub
+                    .as_ref()
+                    .expect("enabled")
+                    .model_map
+                    .as_ref(),
+                "claude-opus-5"
+            ),
             Some("claude-opus-5")
         );
     }
@@ -1347,13 +1705,18 @@ auth_path = "~/.codex/auth.json"
         let dir = test_dir("codex-default");
         fs::write(
             dir.join("toker.toml"),
-            r#"default_backend_anthropic = "codex_sub""#,
+            "default_backend_anthropic = \"codex_sub\"\n[providers.codex_sub]\n",
         )
         .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let config = super::Config::load().expect("load config");
-        assert_eq!(config.default_backend_anthropic, "codex_sub");
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
     }
 
     #[test]
@@ -1367,7 +1730,9 @@ quota_enabled = false
 "#,
         )
         .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let config = super::Config::load().expect("load config");
         assert!(!config.gates.quota_enabled, "the file value is read");
@@ -1391,7 +1756,9 @@ quota_enabled = false
     fn the_cold_gate_block_is_read_and_validated() {
         let dir = test_dir("gates-cold");
         let load = |text: &str| {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
             super::Config::load()
@@ -1432,7 +1799,9 @@ quota_enabled = false
     fn notice_style_is_read_case_insensitively_and_unknown_values_fail() {
         let dir = test_dir("notice-style");
         let load = |text: &str| {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
             super::Config::load()
@@ -1490,7 +1859,9 @@ quota_enabled = false
             r#"default_backend_anthropic = "not-a-backend""#,
         )
         .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let error = super::Config::load().expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
@@ -1500,7 +1871,9 @@ quota_enabled = false
     fn the_awake_toggle_reads_the_file_and_defaults_on() {
         let dir = test_dir("awake-toggle");
         let load = |text: &str| {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
             super::Config::load()
@@ -1525,7 +1898,9 @@ quota_enabled = false
         // expands at lookup, against whatever home is running the view.
         let dir = test_dir("transcript-roots");
         let load = |text: &str| {
-            let _guard = env_lock().lock().unwrap();
+            let _guard = env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
             super::Config::load()
@@ -1563,7 +1938,9 @@ quota_enabled = false
         let dir = test_dir("ping-file");
         fs::write(dir.join("toker.toml"), r#"ping_header_name = "x-my-ping""#)
             .expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         let config = super::Config::load().expect("load config");
         assert_eq!(config.ping_header_name, "x-my-ping");
@@ -1585,7 +1962,9 @@ quota_enabled = false
     fn unknown_file_keys_are_errors_not_silent_defaults() {
         let dir = test_dir("unknown-key");
         fs::write(dir.join("toker.toml"), "prot = 1\n").expect("write config");
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         assert!(
             super::Config::load().is_err(),
@@ -1601,9 +1980,15 @@ quota_enabled = false
         // by a rewrite (see `crate::setup::config_writer`) — while
         // `load()` still layers the env over the same file for the
         // running daemon.
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("load-from");
-        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("write config");
+        fs::write(
+            dir.join("toker.toml"),
+            "port = 19999\n[providers.openrouter]\n",
+        )
+        .expect("write config");
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         set_env("TOKER_PORT", Some("20000"));
         set_env(
@@ -1619,12 +2004,34 @@ quota_enabled = false
             crate::store::default_db_path().expect("default db path"),
             "the db path is the file-or-default one, not TOKER_DB"
         );
-        assert_ne!(config.openrouter.upstream.as_str(), "http://from-env/v1");
+        assert_ne!(
+            config
+                .openrouter
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
+            "http://from-env/v1"
+        );
 
         let loaded = super::Config::load().expect("loads");
         assert_eq!(loaded.port, 20_000);
         assert_eq!(loaded.db_path, dir.join("elsewhere.db"));
-        assert_eq!(loaded.openrouter.upstream.as_str(), "http://from-env/v1");
+        assert_eq!(
+            loaded
+                .openrouter
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
+            "http://from-env/v1"
+        );
+
+        // The upstream override moves an enabled backend and never
+        // enables a disabled one.
+        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
+        let loaded = super::Config::load().expect("a stray override does not fail the load");
+        assert_eq!(loaded.openrouter, None);
 
         set_env("TOKER_PORT", None);
         set_env("TOKER_DB", None);
@@ -1633,7 +2040,9 @@ quota_enabled = false
 
     #[test]
     fn env_overrides_the_file() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("env");
         fs::write(
             dir.join("toker.toml"),
@@ -1649,7 +2058,15 @@ quota_enabled = false
         let config = super::Config::load().expect("load config");
         assert_eq!(config.port, 20000);
         assert_eq!(config.db_path, dir.join("env.db"));
-        assert_eq!(config.openrouter.upstream.as_str(), "http://from-env/v1");
+        assert_eq!(
+            config
+                .openrouter
+                .as_ref()
+                .expect("enabled")
+                .upstream
+                .as_str(),
+            "http://from-env/v1"
+        );
 
         set_env("TOKER_PORT", None);
         set_env("TOKER_DB", None);
@@ -1660,7 +2077,9 @@ quota_enabled = false
 
     #[test]
     fn bad_env_port_is_an_error() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("bad-port");
         set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
         set_env("TOKER_PORT", Some("not-a-port"));
@@ -1671,7 +2090,9 @@ quota_enabled = false
 
     #[test]
     fn api_key_env_wins_over_literal_then_none() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config = OpenRouterConfig {
             upstream: super::parse_upstream(DEFAULT_OPENROUTER_UPSTREAM).unwrap(),
             api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),

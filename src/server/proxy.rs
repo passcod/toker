@@ -81,6 +81,9 @@ pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
+    let Some(openrouter) = server.openrouter.clone() else {
+        return super::openai_not_configured();
+    };
     let (parts, body) = request.into_parts();
 
     // Session identity, read by name only — request headers are never
@@ -221,7 +224,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     .catalogs
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .cache_writes_free(server.openrouter.id(), model)
+                    .cache_writes_free(openrouter.id(), model)
                     == Some(true)
             });
             if writes_free {
@@ -249,7 +252,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 // it against a rate-limit window, so the notice does not
                 // say it does.
                 let text = cold::ColdBlocking::notice_for(
-                    server.openrouter.is_meter_source(),
+                    openrouter.is_meter_source(),
                     idle_ms,
                     prompt,
                     None,
@@ -307,7 +310,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // 7. Upstream; 8.-10. in forward_upstream.
     match send_upstream(
         &server,
-        server.openrouter.as_ref(),
+        openrouter.as_ref(),
         &parts,
         forward,
         // Sticky routing: openrouter consumes the session headers as its
@@ -336,7 +339,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 /// Every frontend lands here, claude included, so the openrouter
 /// provider strips any Anthropic credential the request carries before
 /// it leaves (see [`Provider::strip_foreign_credentials`]).
+///
+/// With no openrouter block the path is the default anthropic backend's,
+/// like any other path the routes do not claim: claude asks for it too,
+/// and only the openai backend makes it an openai route.
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
+    let Some(openrouter) = server.openrouter.clone() else {
+        return super::anthropic::unmatched(State(server), request).await;
+    };
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
@@ -348,7 +358,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
             );
         }
     };
-    match send_upstream(&server, server.openrouter.as_ref(), &parts, body, &[]).await {
+    match send_upstream(&server, openrouter.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => forward_upstream(upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
@@ -639,17 +649,46 @@ pub(crate) enum ErrorWire {
 /// `api_error` the client already knows how to report and retry. No row:
 /// the status is toker's own, never a fabricated provider measurement.
 pub(crate) fn upstream_failure(wire: ErrorWire, message: &str) -> Response {
+    error_response(
+        wire,
+        StatusCode::BAD_GATEWAY,
+        WireError {
+            anthropic_type: "api_error",
+            openai_type: "server_error",
+            openai_code: None,
+        },
+        message,
+    )
+}
+
+/// One proxy-generated error's type names, per wire: anthropic's
+/// `error.type`, and openai's `error.type` plus its optional `code`.
+pub(crate) struct WireError {
+    pub(crate) anthropic_type: &'static str,
+    pub(crate) openai_type: &'static str,
+    pub(crate) openai_code: Option<&'static str>,
+}
+
+/// A JSON error toker answers itself, in the route's own wire shape with
+/// the content-type set, so the client reports the message rather than
+/// failing to parse one.
+pub(crate) fn error_response(
+    wire: ErrorWire,
+    status: StatusCode,
+    kind: WireError,
+    message: &str,
+) -> Response {
     let body = match wire {
         ErrorWire::Anthropic => serde_json::json!({
             "type": "error",
-            "error": { "type": "api_error", "message": message },
+            "error": { "type": kind.anthropic_type, "message": message },
         }),
         ErrorWire::Openai => serde_json::json!({
             "error": {
                 "message": message,
-                "type": "server_error",
+                "type": kind.openai_type,
                 "param": null,
-                "code": null,
+                "code": kind.openai_code,
             },
         }),
     };
@@ -659,7 +698,7 @@ pub(crate) fn upstream_failure(wire: ErrorWire, message: &str) -> Response {
         HeaderValue::from_static("application/json"),
     );
     build_response(
-        StatusCode::BAD_GATEWAY,
+        status,
         headers,
         Body::from(serde_json::to_vec(&body).unwrap_or_default()),
     )

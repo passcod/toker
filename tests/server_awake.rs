@@ -226,28 +226,28 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
             "x-claude-code-session-id".to_owned(),
         ],
         ping_header_name: "x-toker-ping".to_owned(),
-        default_backend_openai_chat: "openrouter".to_owned(),
-        openrouter: OpenRouterConfig {
+        default_backend_openai_chat: Some("openrouter".to_owned()),
+        openrouter: Some(OpenRouterConfig {
             upstream: openrouter_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
-        default_backend_anthropic: "anthropic_sub".to_owned(),
-        anthropic_sub: AnthropicSubConfig {
+        }),
+        default_backend_anthropic: Some("anthropic_sub".to_owned()),
+        anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: upstream.clone(),
-        },
-        anthropic_api: AnthropicApiConfig {
+        }),
+        anthropic_api: Some(AnthropicApiConfig {
             model_map: None,
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
+        }),
         // The codex backend's config: never routed to in these suites
         // (the responses frontend lands later), pointed at an upstream
         // that never answers and an auth path that never exists — no
         // test may touch a real login.
-        codex_sub: CodexSubConfig {
+        codex_sub: Some(CodexSubConfig {
             model_map: None,
             client_version: None,
             version_probe: false,
@@ -259,7 +259,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),
-        },
+        }),
         gates: GatesConfig::default(),
         awake,
         transcript_roots: Vec::new(),

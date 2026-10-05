@@ -282,24 +282,24 @@ fn test_config(
             "x-session-id".to_owned(),
         ],
         ping_header_name: "x-toker-ping".to_owned(),
-        default_backend_openai_chat: "openrouter".to_owned(),
-        openrouter: OpenRouterConfig {
+        default_backend_openai_chat: Some("openrouter".to_owned()),
+        openrouter: Some(OpenRouterConfig {
             upstream: "http://127.0.0.1:9/v1".parse().expect("url"),
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
-        default_backend_anthropic: "codex_sub".to_owned(),
-        anthropic_sub: AnthropicSubConfig {
+        }),
+        default_backend_anthropic: Some("codex_sub".to_owned()),
+        anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: unused.clone(),
-        },
-        anthropic_api: AnthropicApiConfig {
+        }),
+        anthropic_api: Some(AnthropicApiConfig {
             model_map: None,
             upstream: unused,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key: None,
-        },
-        codex_sub: CodexSubConfig {
+        }),
+        codex_sub: Some(CodexSubConfig {
             client_version: Some("0.154.0".to_owned()),
             version_probe: false,
             model_map: family_map.then(|| {
@@ -313,7 +313,7 @@ fn test_config(
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("refresh url"),
-        },
+        }),
         gates: toker::config::GatesConfig::default(),
         awake: false,
         transcript_roots: Vec::new(),
