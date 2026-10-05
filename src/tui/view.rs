@@ -48,10 +48,10 @@ use super::rebuilds::REBUILD_MIN;
 use crate::catalog::windows::ContextWindow;
 use crate::middleware::cold::{Verdict, alongside, reset_label};
 
-/// Bottom panel row height while no quota section exists: SPEND and
-/// RATE side by side. Tall enough for the total line, the
-/// never-dropped "no cost data" line, and a few breakdown lines. The
-/// quota section grows it (see [`bottom_height`]).
+/// Bottom panel row height while SPEND renders beside RATE: tall
+/// enough for the total line, the never-dropped "no cost data" line,
+/// and a few breakdown lines. The quota section grows it (see
+/// [`bottom_height`]); without SPEND the strip is RATE's own height.
 const BOTTOM_HEIGHT: u16 = 9;
 
 /// The meter bar's width (22 cells), the widest
@@ -172,8 +172,10 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 ///
 /// The panels stack in the reference dashboard's order — SESSIONS /
 /// CONTEXT /
-/// TOKENS / CACHE REBUILDS, then the bottom strip holding the
-/// toker-only SPEND beside RATE & QUOTA — into a height budget
+/// TOKENS / CACHE REBUILDS, then the bottom strip holding RATE & QUOTA,
+/// with the toker-only SPEND beside it when the window carries a cost
+/// ([`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost))
+/// — into a height budget
 /// computed from the snapshot ([`panel_areas`]): lists grow into
 /// slack, and a short terminal sheds panel rows from the top of the
 /// middle (sessions first) rather than ever letting the quota block
@@ -186,10 +188,16 @@ pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZ
     render_context(frame, context, snap);
     render_tokens(frame, tokens, snap);
     render_rebuilds(frame, rebuilds, snap);
-    let [spend, rate] =
-        Layout::horizontal([Constraint::Fill(3), Constraint::Fill(2)]).areas(bottom);
-    render_spend(frame, spend, snap);
-    render_rate(frame, rate, snap, tz);
+    if snap.spend.carries_cost() {
+        // Even halves: the meters' reset clocks need the width as much
+        // as the breakdown lines do.
+        let [spend, rate] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(bottom);
+        render_spend(frame, spend, snap);
+        render_rate(frame, rate, snap, tz);
+    } else {
+        render_rate(frame, bottom, snap, tz);
+    }
 }
 
 /// The frame's panel areas, from the snapshot's content and the frame's
@@ -327,26 +335,31 @@ fn rebuilds_lines(snap: &Snapshot) -> usize {
     lines
 }
 
-/// The bottom row's height: the fixed [`BOTTOM_HEIGHT`] floor, grown to
-/// fit the quota section's lines when one exists — the reference
+/// The bottom row's height: RATE & QUOTA's own lines, floored at
+/// [`BOTTOM_HEIGHT`] while SPEND renders beside it (its breakdown has
+/// no line budget of its own) — the reference
 /// dashboard drops middle rows
 /// rather than let the quota block scroll off the bottom
 /// ("the part worth watching"); here the middle
 /// panels shed their rows first ([`middle_heights`]) and the bottom
 /// strip is pinned at whatever it needs.
 fn bottom_height(snap: &Snapshot) -> u16 {
-    let Some(quota) = &snap.quota else {
-        return BOTTOM_HEIGHT;
-    };
     let mut lines = 3; // per-minute, sparkline, errors/drift
-    lines += quota.meters.len();
-    if quota.spent_today.is_some() {
-        lines += 1;
+    if let Some(quota) = &snap.quota {
+        lines += quota.meters.len();
+        if quota.spent_today.is_some() {
+            lines += 1;
+        }
+        if quota.binding.is_some() {
+            lines += 1;
+        }
     }
-    if quota.binding.is_some() {
-        lines += 1;
+    let rate = (lines + 2) as u16; // + 2 border rows
+    if snap.spend.carries_cost() {
+        BOTTOM_HEIGHT.max(rate)
+    } else {
+        rate
     }
-    BOTTOM_HEIGHT.max((lines + 2) as u16) // + 2 border rows
 }
 
 /// Header line: the window summary on the left, the freshness and the
@@ -1188,13 +1201,11 @@ fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
 
 /// SPEND: billed total, per-provider·model breakdown, and the never-dropped
 /// "no cost data" count (invariant 3: a request whose cost the provider
-/// never reported is visible, not folded into the total).
+/// never reported is visible, not folded into the total). Rendered only
+/// when [`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost),
+/// so never over an empty window.
 fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let block = Block::bordered().title_top("SPEND");
-    if snap.window_empty {
-        frame.render_widget(Paragraph::new("no data in window").dim().block(block), area);
-        return;
-    }
     let spend = &snap.spend;
     let mut lines = Vec::with_capacity(3 + spend.breakdown.len());
     match spend.billed_total {
@@ -2189,8 +2200,9 @@ mod tests {
     #[test]
     fn quota_panel_renders_meters_spent_and_binding() {
         let snap = quota_snapshot();
-        // 200 columns: the rate panel's inner 78 hold every meter line
-        // at full width — bar, resets clock, status, verdict.
+        // 200 columns: the rate panel (alone: the fixture is unbilled)
+        // holds every meter line at full width — bar, resets clock,
+        // status, verdict.
         let text = rendered(&snap, 200, 30);
         assert!(text.contains("RATE & QUOTA"));
         // The 5-hour meter: measured burn that resets first, gated by
@@ -2257,16 +2269,92 @@ mod tests {
     #[test]
     fn a_narrow_panel_sheds_resets_and_status_but_keeps_the_verdicts() {
         let snap = quota_snapshot();
-        // 100 columns → the rate panel's inner 38: the resets clause
-        // and the status go, the bar shrinks, every verdict survives —
-        // the verdict is the last thing to go.
-        let text = rendered(&snap, 100, 30);
+        // 54 columns → the rate panel (alone: the fixture is unbilled)
+        // has inner 52: no meter's resets clause leaves the bar its
+        // floor, so the clauses and the status go and every verdict
+        // survives — the verdict is the last thing to go.
+        let text = rendered(&snap, 54, 30);
         assert!(!text.contains("resets"), "the resets clause is shed");
         assert!(!text.contains("rejected"), "the status is shed first");
         assert!(text.contains("gated · on track"));
         assert!(text.contains("stops ~Thu 01:55"));
         assert!(text.contains("estimating"));
         assert!(text.contains("today +6%  ·  30m <1%"), "spent stays");
+    }
+
+    /// The row index of the bottom strip's top border: the first row
+    /// holding the RATE & QUOTA title.
+    fn strip_top(text: &str) -> usize {
+        text.lines()
+            .position(|line| line.contains("RATE & QUOTA"))
+            .expect("the rate panel renders")
+    }
+
+    #[test]
+    fn an_unbilled_window_hides_spend_and_gives_quota_the_strip() {
+        // The quota fixture is subscription-shaped: no row is billed,
+        // so SPEND could only restate counts. RATE & QUOTA takes the
+        // whole width, and the strip is its natural height — three
+        // rate lines, three meters, spent, binding, and borders — not
+        // the nine-row floor SPEND's breakdown needs.
+        let snap = quota_snapshot();
+        assert!(!snap.spend.carries_cost());
+        let text = rendered(&snap, 100, 30);
+        assert!(!text.contains("SPEND"), "{text}");
+        assert!(!text.contains("no cost data"), "{text}");
+        let top = text.lines().nth(strip_top(&text)).expect("the top row");
+        assert!(top.starts_with("┌RATE & QUOTA"), "{top}");
+        assert!(top.ends_with('┐'), "{top}");
+        assert_eq!(text.lines().count() - strip_top(&text), 10, "{text}");
+
+        // With no quota section either, the strip is the rate panel's
+        // three lines and its borders.
+        let mut unpriced = display_bare(NOW - 60_000);
+        unpriced.session_id = Some("ses-x".into());
+        unpriced.model = Some("claude-opus-5".into());
+        unpriced.provider = Some("anthropic_sub".into());
+        let snap = model::aggregate(
+            &[unpriced],
+            None,
+            &HashSet::new(),
+            &no_labels(),
+            &FetchedCatalogs::default(),
+            None,
+            30,
+            NOW,
+            1,
+        );
+        assert_eq!(snap.spend.no_cost_data, 1);
+        let text = rendered(&snap, 100, 30);
+        assert!(!text.contains("SPEND"), "{text}");
+        assert_eq!(text.lines().count() - strip_top(&text), 5, "{text}");
+    }
+
+    #[test]
+    fn a_billed_window_splits_the_strip_evenly() {
+        // The shared fixture carries one billed request: SPEND renders
+        // on the left half and RATE & QUOTA on the right, at the
+        // nine-row floor SPEND's breakdown needs.
+        let snap = snapshot();
+        assert!(snap.spend.carries_cost());
+        let text = rendered(&snap, 100, 30);
+        let top: Vec<char> = text
+            .lines()
+            .nth(strip_top(&text))
+            .expect("the top row")
+            .chars()
+            .collect();
+        assert_eq!(top.len(), 100);
+        assert!(top[..50].iter().collect::<String>().starts_with("┌SPEND"));
+        assert_eq!(top[49], '┐');
+        assert!(
+            top[50..]
+                .iter()
+                .collect::<String>()
+                .starts_with("┌RATE & QUOTA"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count() - strip_top(&text), 9, "{text}");
     }
 
     /// One meter line's text at `width`, from the quota fixture's

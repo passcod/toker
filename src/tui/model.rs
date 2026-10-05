@@ -182,6 +182,22 @@ pub(crate) struct SpendAgg {
     pub other_cost_kinds: usize,
 }
 
+impl SpendAgg {
+    /// Whether the window carries a dollar figure worth a panel: a
+    /// billed total, or a breakdown line with its amount.
+    ///
+    /// The counts alone do not qualify. On a subscription backend no
+    /// row is ever billed, so "no billed cost data", "no cost data: N
+    /// reqs", and "N reqs with non-billed cost" are all the panel
+    /// could ever say — a standing restatement of the plan's shape,
+    /// not a reading, taking width the quota meters need. Once a cost
+    /// exists the unpriced count is the invariant-3 counter beside it,
+    /// so the panel and that line render together.
+    pub(crate) fn carries_cost(&self) -> bool {
+        self.billed_total.is_some() || !self.breakdown.is_empty()
+    }
+}
+
 /// One per-provider·model billed line.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProviderModelSpend {
@@ -889,6 +905,26 @@ mod tests {
         assert_eq!(entry.provider, None);
         assert_eq!(entry.model, None);
         assert_eq!(entry.billed, 9.0);
+    }
+
+    #[test]
+    fn counts_alone_carry_no_cost() {
+        // The subscription shape: unpriced and non-billed rows only.
+        // Every count is non-zero and there is still no dollar figure.
+        let mut priced_unkinded = display_bare(mins_ago(2));
+        priced_unkinded.cost_usd = Some(0.75);
+        let snap = agg(&[display_bare(mins_ago(3)), priced_unkinded], 2);
+        assert_eq!(snap.spend.no_cost_data, 1);
+        assert_eq!(snap.spend.other_cost_kinds, 1);
+        assert!(!snap.spend.carries_cost());
+        assert!(!agg(&[], 0).spend.carries_cost(), "an empty window");
+
+        // One billed row is a cost, even a zero one: a billed $0 is a
+        // reading, not absence.
+        let mut billed = display_bare(mins_ago(1));
+        billed.cost_usd = Some(0.0);
+        billed.cost_kind = Some(CostKind::Billed);
+        assert!(agg(&[billed], 1).spend.carries_cost());
     }
 
     #[test]
