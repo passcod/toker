@@ -246,6 +246,36 @@ pub(crate) struct Ui {
     pub no_color: bool,
     /// The `?` legend overlay is showing.
     pub legend: bool,
+    /// How far each list is scrolled (the mouse wheel over it).
+    pub scroll: Scroll,
+}
+
+/// Each list's scroll offset: the entries scrolled past its top. The
+/// loop holds it across frames; [`render`] clamps it to the list it
+/// finds, and reports the clamp back in [`Drawn`] so the stored offset
+/// never runs past the end (else a list scrolled too far would ignore
+/// the wheel on the way back until the overshoot was spent).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Scroll {
+    pub sessions: usize,
+    pub context: usize,
+}
+
+/// What a frame drew that the loop needs back: where each list landed,
+/// for hit-testing the wheel, and how far it can scroll.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    pub sessions: DrawnList,
+    pub context: DrawnList,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawnList {
+    /// The panel's whole area, frame included: the wheel over the title
+    /// scrolls it too.
+    pub area: Rect,
+    /// The furthest offset that still changes what shows.
+    pub max_offset: usize,
 }
 
 /// Whether `NO_COLOR`'s value asks for no colour: set and non-empty, the
@@ -264,14 +294,36 @@ pub(crate) fn no_color(value: Option<std::ffi::OsString>) -> bool {
 /// carries a cost
 /// ([`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost))
 /// — into the height plan [`plan_layout`] computes from the snapshot.
-pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZone, ui: &Ui) {
+/// The lists start at the [`Ui::scroll`] offsets.
+pub(crate) fn render(
+    frame: &mut Frame,
+    snap: &Snapshot,
+    clock: &str,
+    tz: &TimeZone,
+    ui: &Ui,
+) -> Drawn {
     let fmt = &ui.fmt;
     let layout = plan_layout(snap, frame.area());
     let chrome = layout.chrome;
 
     render_header(frame, layout.header, snap, clock);
-    render_sessions(frame, layout.sessions, chrome, snap, fmt);
-    render_context(frame, layout.context, chrome, snap, fmt);
+    let drawn = Drawn {
+        sessions: DrawnList {
+            area: layout.sessions,
+            max_offset: render_sessions(
+                frame,
+                layout.sessions,
+                chrome,
+                snap,
+                fmt,
+                ui.scroll.sessions,
+            ),
+        },
+        context: DrawnList {
+            area: layout.context,
+            max_offset: render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context),
+        },
+    };
     render_tokens(frame, layout.tokens, chrome, snap, fmt);
     render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
     if snap.spend.carries_cost() {
@@ -290,6 +342,7 @@ pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZ
     if ui.no_color {
         strip_colour(frame);
     }
+    drawn
 }
 
 /// Every colour off the finished frame, modifiers kept: `NO_COLOR` is
@@ -571,26 +624,63 @@ fn share_rows(need_s: u16, need_c: u16, avail: u16) -> (u16, u16) {
     (rows_s, rows_c)
 }
 
-/// A list's items cut to `room` rows: all of them when they fit; the
-/// top one alone at one row (a row is better spent on an entry than
-/// on a count of none shown); otherwise the top `room − 1` and the
-/// `more` line counting the rest.
-fn fit_list(
-    mut items: Vec<Line<'static>>,
-    room: usize,
-    more: impl Fn(usize) -> String,
-) -> Vec<Line<'static>> {
-    if items.len() <= room {
-        return items;
+/// Which of a list's `total` entries show in `room` rows, scrolled
+/// `offset` entries down: all of them when they fit; one entry alone at
+/// one row (a row is better spent on an entry than on a count of none
+/// shown); otherwise the entries from `offset`, under an "above" count
+/// once scrolled and over a "more" count while any are left below. The
+/// offset is clamped so the last entry, once reached, sits on the last
+/// row. At two rows a scrolled list in the middle drops the "above"
+/// count: an entry and the "more" line are worth more than two counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListWindow {
+    /// The furthest offset that still changes what shows.
+    max_offset: usize,
+    /// The count line over the entries, when it renders.
+    above: Option<usize>,
+    /// The entries that render.
+    shown: std::ops::Range<usize>,
+    /// The count line under the entries, when it renders.
+    below: Option<usize>,
+}
+
+fn list_window(total: usize, room: usize, offset: usize) -> ListWindow {
+    if total <= room || room == 0 {
+        return ListWindow {
+            max_offset: 0,
+            above: None,
+            shown: 0..total.min(room),
+            below: None,
+        };
     }
-    if room <= 1 {
-        items.truncate(room);
-        return items;
+    if room == 1 {
+        let offset = offset.min(total - 1);
+        return ListWindow {
+            max_offset: total - 1,
+            above: None,
+            shown: offset..offset + 1,
+            below: None,
+        };
     }
-    let hidden = items.len() - (room - 1);
-    items.truncate(room - 1);
-    items.push(Line::styled(more(hidden), Style::new().dim()));
-    items
+    let max_offset = total - (room - 1);
+    let offset = offset.min(max_offset);
+    let above = (offset > 0 && (room >= 3 || offset == max_offset)).then_some(offset);
+    let rows = room - usize::from(above.is_some());
+    if offset + rows >= total {
+        return ListWindow {
+            max_offset,
+            above,
+            shown: offset..total,
+            below: None,
+        };
+    }
+    let end = offset + rows - 1;
+    ListWindow {
+        max_offset,
+        above,
+        shown: offset..end,
+        below: Some(total - end),
+    }
 }
 
 /// The CONTEXT list's entries: sessions whose main lane has enough
@@ -786,9 +876,18 @@ fn freshness(snap: &Snapshot) -> (String, Style) {
 /// separators or a long model id size the column rather than clip in
 /// it. The label takes what is left; when that falls under
 /// [`LABEL_SHED_W`] columns shed in [`Col::SHED`] order.
-fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
+///
+/// Returns the furthest the table can scroll ([`list_window`]).
+fn render_sessions(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    fmt: &Fmt,
+    offset: usize,
+) -> usize {
     if area.height == 0 {
-        return;
+        return 0;
     }
     let inner = panel(frame, area, "SESSIONS", chrome);
     if snap.sessions.is_empty() {
@@ -798,7 +897,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
             "no sessions in window"
         };
         frame.render_widget(Paragraph::new(message).dim(), inner);
-        return;
+        return 0;
     }
 
     let cells: Vec<[Line<'static>; 9]> = snap
@@ -830,19 +929,18 @@ fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
         Cell::new(Line::styled(col.header(), dim).alignment(col.alignment()))
     }));
     // The rows the panel has room for, under the header row; a cut list
-    // ends in a count of what it left out.
+    // counts what it left out above and below.
     let room = inner.height.saturating_sub(1) as usize;
-    let total = snap.sessions.len();
-    let (shown, hidden) = if total <= room || room <= 1 {
-        (total.min(room), 0)
-    } else {
-        (room - 1, total - (room - 1))
-    };
+    let window = list_window(snap.sessions.len(), room, offset);
+    // The "above" count holds a blank row of the table, drawn over once
+    // the table is down: it sits under the header, inside the table.
+    let blank = window.above.map(|_| Row::new(Vec::<Cell>::new()));
     let rows = snap
         .sessions
         .iter()
         .zip(cells)
-        .take(shown)
+        .skip(window.shown.start)
+        .take(window.shown.len())
         .map(|(session, row)| {
             let mut out = vec![session_cell(session, label_w)];
             let mut row = row.map(Some);
@@ -855,18 +953,35 @@ fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
     let constraints = std::iter::once(label_w)
         .chain(kept.iter().map(|&i| widths[i]))
         .map(Constraint::Length);
+    let body = usize::from(window.above.is_some()) + window.shown.len();
     let table = Rect {
-        height: inner.height.min(1 + shown as u16),
+        height: inner.height.min(1 + body as u16),
         ..inner
     };
     frame.render_widget(
-        Table::new(rows, constraints).header(Row::new(header)),
+        Table::new(blank.into_iter().chain(rows), constraints).header(Row::new(header)),
         table,
     );
-    if hidden > 0 {
-        let s = if hidden == 1 { "" } else { "s" };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if let Some(above) = window.above {
         frame.render_widget(
-            Line::styled(format!("… {hidden} more session{s}"), Style::new().dim()),
+            Line::styled(
+                format!("… {above} session{} above", plural(above)),
+                Style::new().dim(),
+            ),
+            Rect {
+                y: table.y + 1,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+    if let Some(hidden) = window.below {
+        frame.render_widget(
+            Line::styled(
+                format!("… {hidden} more session{}", plural(hidden)),
+                Style::new().dim(),
+            ),
             Rect {
                 y: table.bottom(),
                 height: 1,
@@ -874,6 +989,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
             },
         );
     }
+    window.max_offset
 }
 
 /// The columns that survive at `available` cells (indices into
@@ -1091,14 +1207,23 @@ fn rel_age(delta_ms: i64) -> String {
 /// and an idle session is dimmed, because a session that is not about
 /// to do anything is not about to compact either. Past 80% a live
 /// session's bar turns red with the marker that says why.
-fn render_context(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
+///
+/// Returns the furthest the list can scroll ([`list_window`]).
+fn render_context(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    fmt: &Fmt,
+    offset: usize,
+) -> usize {
     if area.height == 0 {
-        return;
+        return 0;
     }
     let inner = panel(frame, area, "CONTEXT", chrome);
     if snap.window_empty {
         frame.render_widget(Paragraph::new("no data in window").dim(), inner);
-        return;
+        return 0;
     }
     let width = inner.width as usize;
 
@@ -1197,10 +1322,26 @@ fn render_context(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot
             Style::new().dim(),
         )));
     }
-    let lines = fit_list(lines, inner.height as usize, |hidden| {
-        format!("… {hidden} more")
-    });
+    let window = list_window(lines.len(), inner.height as usize, offset);
+    let dim = Style::new().dim();
+    let lines: Vec<Line<'static>> = window
+        .above
+        .map(|above| Line::styled(format!("… {above} above"), dim))
+        .into_iter()
+        .chain(
+            lines
+                .into_iter()
+                .skip(window.shown.start)
+                .take(window.shown.len()),
+        )
+        .chain(
+            window
+                .below
+                .map(|hidden| Line::styled(format!("… {hidden} more"), dim)),
+        )
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    window.max_offset
 }
 
 /// The CONTEXT panel's name line: the same name the sessions table
@@ -2174,6 +2315,7 @@ mod tests {
             fmt: Fmt::fixed(),
             no_color: false,
             legend: false,
+            scroll: super::Scroll::default(),
         }
     }
 
@@ -2475,7 +2617,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         let tz = utc();
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56", &tz, &plain()))
+            .draw(|frame| {
+                super::render(frame, snap, "12:34:56", &tz, &plain());
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let mut text = String::new();
@@ -2668,7 +2812,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
         let tz = utc();
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56", &tz, &plain()))
+            .draw(|frame| {
+                super::render(frame, snap, "12:34:56", &tz, &plain());
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let cells: Vec<&str> = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
@@ -2906,7 +3052,9 @@ mod tests {
         let snap = full_snapshot();
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("terminal");
         terminal
-            .draw(|frame| super::render(frame, &snap, "12:34:56", &utc(), &plain()))
+            .draw(|frame| {
+                super::render(frame, &snap, "12:34:56", &utc(), &plain());
+            })
             .expect("draw");
         let buffer = terminal.backend().buffer();
         let width = buffer.area.width;
@@ -3589,7 +3737,9 @@ mod tests {
         let draw = |snap: &model::Snapshot, ui: &super::Ui| {
             let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
             terminal
-                .draw(|frame| super::render(frame, snap, "12:34:56", &utc(), ui))
+                .draw(|frame| {
+                    super::render(frame, snap, "12:34:56", &utc(), ui);
+                })
                 .expect("draw");
             let buffer = terminal.backend().buffer();
             let mut text = String::new();
@@ -3636,7 +3786,9 @@ mod tests {
     ) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal
-            .draw(|frame| super::render(frame, snap, "12:34:56", &utc(), ui))
+            .draw(|frame| {
+                super::render(frame, snap, "12:34:56", &utc(), ui);
+            })
             .expect("draw");
         terminal.backend().buffer().clone()
     }
@@ -3911,26 +4063,76 @@ mod tests {
         assert_eq!(super::share_rows(1, 10, 7), (1, 6));
         // The floor: a row each.
         assert_eq!(super::share_rows(5, 5, 2), (1, 1));
+    }
 
-        let items = |n: usize| -> Vec<ratatui::text::Line<'static>> {
-            (0..n)
-                .map(|i| ratatui::text::Line::raw(format!("item {i}")))
-                .collect()
+    #[test]
+    fn a_list_window_counts_what_it_scrolled_past() {
+        let window = |above, shown, below, max_offset| super::ListWindow {
+            max_offset,
+            above,
+            shown,
+            below,
         };
-        let text = |lines: Vec<ratatui::text::Line<'static>>| -> Vec<String> {
-            lines.iter().map(|line| line.to_string()).collect()
+        // Fits: everything, nothing to scroll.
+        assert_eq!(super::list_window(2, 3, 5), window(None, 0..2, None, 0));
+        // Cut, at the top: the "more" count closes it.
+        assert_eq!(super::list_window(5, 3, 0), window(None, 0..2, Some(3), 3));
+        // Scrolled into the middle: a count on each side.
+        assert_eq!(
+            super::list_window(5, 3, 1),
+            window(Some(1), 1..2, Some(3), 3)
+        );
+        // At the end, and past it: the last entry on the last row.
+        assert_eq!(super::list_window(5, 3, 3), window(Some(3), 3..5, None, 3));
+        assert_eq!(super::list_window(5, 3, 9), window(Some(3), 3..5, None, 3));
+        // One row: an entry, not a count of none shown.
+        assert_eq!(super::list_window(5, 1, 0), window(None, 0..1, None, 4));
+        assert_eq!(super::list_window(5, 1, 2), window(None, 2..3, None, 4));
+        // Two rows in the middle: the entry and the "more" line.
+        assert_eq!(super::list_window(5, 2, 2), window(None, 2..3, Some(2), 4));
+        // No rows: nothing, and nothing to scroll.
+        assert_eq!(super::list_window(5, 0, 2), window(None, 0..0, None, 0));
+    }
+
+    #[test]
+    fn the_lists_scroll_to_their_offsets() {
+        let snap = full_snapshot();
+        let draw = |scroll: super::Scroll| {
+            let ui = super::Ui { scroll, ..plain() };
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            let mut drawn = super::Drawn::default();
+            terminal
+                .draw(|frame| {
+                    drawn = super::render(frame, &snap, "12:34:56", &utc(), &ui);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            (text, drawn)
         };
-        let more = |k: usize| format!("… {k} more");
-        assert_eq!(
-            text(super::fit_list(items(2), 3, more)),
-            ["item 0", "item 1"]
-        );
-        assert_eq!(
-            text(super::fit_list(items(5), 3, more)),
-            ["item 0", "item 1", "… 3 more"]
-        );
-        // One row: the top entry, not a count of none shown.
-        assert_eq!(text(super::fit_list(items(5), 1, more)), ["item 0"]);
+        // Unscrolled: the cut lists as ever, and each says how far it
+        // can go.
+        let (top, drawn) = draw(super::Scroll::default());
+        assert!(!top.contains("above"), "{top}");
+        assert!(drawn.sessions.max_offset > 0, "{drawn:?}");
+        assert!(drawn.context.max_offset > 0, "{drawn:?}");
+        // Scrolled to the end: the count moves to the top, and the
+        // bottom of each list is its last entry.
+        let (end, _) = draw(super::Scroll {
+            sessions: usize::MAX,
+            context: usize::MAX,
+        });
+        frame_snapshot("full_frame_100x30_scrolled", &end);
+        assert!(end.contains("… 2 sessions above"), "{end}");
+        assert!(end.contains("… 2 above"), "{end}");
+        assert!(!end.contains("more"), "{end}");
+        assert_ne!(top, end);
     }
 
     #[test]
@@ -3986,7 +4188,9 @@ mod tests {
         ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
             terminal
-                .draw(|frame| super::render(frame, &snap, "12:34:56", &utc(), &plain()))
+                .draw(|frame| {
+                    super::render(frame, &snap, "12:34:56", &utc(), &plain());
+                })
                 .expect("draw");
         }
     }

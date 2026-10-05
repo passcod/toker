@@ -134,6 +134,7 @@ pub fn run(
     let mut exe = reexec::ExeWatch::current();
     let mut terminal = ratatui::try_init()?;
     let restore = RestoreGuard;
+    crossterm::execute!(std::io::stdout(), WheelCapture(true))?;
 
     // The system zone, read once: every local clock the panels render
     // (the quota resets and runout labels) anchors here.
@@ -144,7 +145,9 @@ pub fn run(
         fmt: locale::Fmt::from_env(),
         no_color: view::no_color(std::env::var_os("NO_COLOR")),
         legend: false,
+        scroll: view::Scroll::default(),
     };
+    let mut drawn = view::Drawn::default();
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
@@ -212,7 +215,13 @@ pub fn run(
             }
             next_tick = Instant::now() + TICK;
         }
-        terminal.draw(|frame| view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui))?;
+        terminal.draw(|frame| {
+            drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+        })?;
+        // The list may have shrunk under its offset since the last
+        // frame: hold the offset at what the frame could show.
+        ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
+        ui.scroll.context = ui.scroll.context.min(drawn.context.max_offset);
 
         // Block until the next tick or an input event. The deadline was
         // set after the tick's work, so it is in the future unless the
@@ -225,9 +234,27 @@ pub fn run(
             continue;
         }
         let event = crossterm::event::read()?;
-        // Everything that is not a key press (resize, mouse-move, key
-        // release) falls through: the next draw re-renders at the new
-        // size (ratatui auto-resizes in draw).
+        // The wheel scrolls the list under the pointer, a row a notch.
+        if let crossterm::event::Event::Mouse(mouse) = event {
+            let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+            let delta = match mouse.kind {
+                crossterm::event::MouseEventKind::ScrollDown => 1,
+                crossterm::event::MouseEventKind::ScrollUp => -1,
+                _ => 0,
+            };
+            for (list, offset) in [
+                (drawn.sessions, &mut ui.scroll.sessions),
+                (drawn.context, &mut ui.scroll.context),
+            ] {
+                if delta != 0 && list.area.contains(at) {
+                    *offset = offset.saturating_add_signed(delta).min(list.max_offset);
+                }
+            }
+            continue;
+        }
+        // Everything else that is not a key press (resize, key release)
+        // falls through: the next draw re-renders at the new size
+        // (ratatui auto-resizes in draw).
         if let crossterm::event::Event::Key(key) = event {
             if key.kind != crossterm::event::KeyEventKind::Press {
                 continue;
@@ -663,11 +690,35 @@ fn clock(fmt: &locale::Fmt) -> String {
 /// the RAII half of teardown, covering `?` returns and panics. The panic
 /// hook `try_init` installed covers the other half, restoring before the
 /// panic message prints.
+///
+/// Mouse reporting is not the panic hook's to undo, so on a panic it
+/// goes off here, as the guard unwinds; left on, the shell after would
+/// read every click and wheel notch as escape-sequence garbage.
 struct RestoreGuard;
 
 impl Drop for RestoreGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), WheelCapture(false));
         let _ = ratatui::try_restore();
+    }
+}
+
+/// Mouse reporting for the wheel alone: xterm's normal tracking (1000:
+/// buttons, and the wheel as buttons 4 and 5) in SGR encoding (1006).
+/// Not crossterm's `EnableMouseCapture`, which also turns on any-motion
+/// tracking (1003): every pointer move over the dashboard would then be
+/// an event and a redraw, for nothing it uses.
+struct WheelCapture(bool);
+
+impl crossterm::Command for WheelCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        let set = if self.0 { 'h' } else { 'l' };
+        write!(f, "\x1b[?1000{set}\x1b[?1006{set}")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other("wheel capture is ANSI-only"))
     }
 }
 
