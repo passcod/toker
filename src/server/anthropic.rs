@@ -995,13 +995,7 @@ fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allo
     };
     server
         .store
-        .load_allowances()
-        .map(|allowances| {
-            allowances
-                .into_iter()
-                .filter(|allowance| allowance.session_id == session)
-                .collect()
-        })
+        .load_session_allowances(session)
         .unwrap_or_else(|error| {
             tracing::error!(%error, "allowances load failed");
             Vec::new()
@@ -1017,10 +1011,10 @@ fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allo
 fn prior_live(server: &Server, session: &str, meter: &str, now_ms: i64) -> Option<i64> {
     server
         .store
-        .load_allowances()
+        .load_session_allowances(session)
         .ok()?
         .into_iter()
-        .filter(|allowance| allowance.session_id == session && allowance.meter == meter)
+        .filter(|allowance| allowance.meter == meter)
         .map(|allowance| allowance.reset_value)
         .filter(|reset| reset.saturating_mul(1000) > now_ms)
         .max()

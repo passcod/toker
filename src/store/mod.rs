@@ -300,6 +300,18 @@ impl Store {
         state::load_allowances(&*self.conn()?)
     }
 
+    /// One session's allowances, ordered by meter, reset value (see
+    /// `state::load_session_allowances`): the gate's per-request read.
+    pub fn load_session_allowances(&self, session_id: &str) -> Result<Vec<Allowance>> {
+        state::load_session_allowances(&*self.conn()?, session_id)
+    }
+
+    /// Delete the allowances whose window has ended (see
+    /// `state::prune_allowances`). Returns how many went.
+    pub fn prune_allowances(&self, now_ms: i64) -> Result<u64> {
+        state::prune_allowances(&*self.conn()?, now_ms)
+    }
+
     /// Append one ping run.
     pub fn record_ping(&self, ping: &PingRecord) -> Result<()> {
         state::record_ping(&*self.conn()?, ping)
@@ -1920,6 +1932,70 @@ mod tests {
             .map(|lane| lane.key)
             .collect();
         assert_eq!(keys, vec!["lane-2", "lane-3", "lane-4", "lane-5"]);
+    }
+
+    #[test]
+    fn allowance_prune_drops_ended_windows_only() {
+        let store = mem_store();
+        // Epoch milliseconds now; resets are epoch seconds.
+        let now = 1_790_000_000_500;
+        let now_s = now / 1000;
+        let allowance = |session: &str, meter: &str, reset_value: i64| Allowance {
+            session_id: session.to_owned(),
+            meter: meter.to_owned(),
+            reset_value,
+        };
+        // A window that ended an hour ago: dead.
+        store
+            .record_allowance(&allowance("ses-a", "5h", now_s - 3600))
+            .expect("record");
+        // Resetting this very second: the gate already reads it as expired
+        // (`reset * 1000 <= now`), so the prune agrees.
+        store
+            .record_allowance(&allowance("ses-a", "7d", now_s))
+            .expect("record");
+        // One second ahead, and a week ahead: live.
+        store
+            .record_allowance(&allowance("ses-b", "5h", now_s + 1))
+            .expect("record");
+        store
+            .record_allowance(&allowance("ses-b", "7d", now_s + 7 * 86_400))
+            .expect("record");
+        // A reset far beyond any window (a unit mix-up, say) is kept: the
+        // prune only ever errs towards keeping.
+        store
+            .record_allowance(&allowance("ses-c", "5h", now * 1000))
+            .expect("record");
+
+        assert_eq!(store.prune_allowances(now).expect("prune"), 2);
+        let left: Vec<(String, String)> = store
+            .load_allowances()
+            .expect("allowances")
+            .into_iter()
+            .map(|row| (row.session_id, row.meter))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                ("ses-b".to_owned(), "5h".to_owned()),
+                ("ses-b".to_owned(), "7d".to_owned()),
+                ("ses-c".to_owned(), "5h".to_owned()),
+            ]
+        );
+        assert_eq!(store.prune_allowances(now).expect("prune again"), 0);
+
+        // The per-session read sees only that session's rows.
+        assert_eq!(
+            store.load_session_allowances("ses-b").expect("ses-b"),
+            vec![
+                allowance("ses-b", "5h", now_s + 1),
+                allowance("ses-b", "7d", now_s + 7 * 86_400),
+            ]
+        );
+        assert_eq!(
+            store.load_session_allowances("ses-a").expect("ses-a"),
+            Vec::new()
+        );
     }
 
     #[test]

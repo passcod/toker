@@ -260,9 +260,9 @@ pub fn grant_for(meters: Option<Meters<'_>>, now_ms: i64) -> Grant {
 /// reported reset**: an allowance cannot outlive its window, because a
 /// rolled window reports a different reset and no longer matches. Stale
 /// rows from rolled windows are inert by the same rule (enforcement needs
-/// no clock; the predecessor's load-time pruning was only housekeeping,
-/// and toker's
-/// keyed rows are its equivalent).
+/// no clock; pruning them, `Store::prune_allowances` on the server's
+/// state-prune tick as in the predecessor's load-time prune, is only
+/// housekeeping).
 ///
 /// Unknown meters forward (see the module docs): absence of
 /// instrumentation must never read as presence of the phenomenon.

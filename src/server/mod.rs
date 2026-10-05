@@ -432,7 +432,7 @@ impl Server {
         };
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
-        self.spawn_lane_prune();
+        self.spawn_state_prune();
         self.spawn_awake_timer();
         self.spawn_catalog_refresh();
         // A restart inside a live session takes the lock straight back.
@@ -463,11 +463,18 @@ impl Server {
         });
     }
 
-    /// The lane-table prune on a 30-second flush cadence
-    /// (never per request): a cheap SQL
-    /// statement on a timer — the upserts themselves go straight into the
-    /// store on every response, so nothing here carries state.
-    fn spawn_lane_prune(&self) {
+    /// The state-table prunes on the lanes' 30-second flush cadence
+    /// (never per request): cheap SQL statements on a timer — the
+    /// upserts themselves go straight into the store on every response,
+    /// so nothing here carries state. The first tick fires at startup,
+    /// so a restart clears what accumulated while the service was down.
+    ///
+    /// Allowances go once their window's reset has passed (ctp pruned
+    /// its `allowances.json` on every load and save to the same rule).
+    /// The gate reads one session's rows by the primary key, so the
+    /// table's size never lands on the request path; the prune keeps the
+    /// table, and the TUI's whole-table read, from growing without end.
+    fn spawn_state_prune(&self) {
         let store = self.store.clone();
         tokio::spawn(async move {
             let mut timer =
@@ -475,15 +482,24 @@ impl Server {
             loop {
                 timer.tick().await;
                 let now = record::now_ms();
+                // Either prune is never worth a request (invariant 3
+                // spirit): a failure retries on the next tick.
                 match store.prune_lanes(now, lanes::LANE_MAX, lanes::LANE_MAX_AGE_MS) {
                     Ok(0) => {}
                     Ok(count) => {
                         tracing::debug!("lane prune removed {count} lanes");
                     }
                     Err(error) => {
-                        // The prune is never worth a request (invariant 6
-                        // spirit): it retries on the next tick.
                         tracing::error!(%error, "lane prune failed");
+                    }
+                }
+                match store.prune_allowances(now) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        tracing::debug!("allowance prune removed {count} allowances");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "allowance prune failed");
                     }
                 }
             }

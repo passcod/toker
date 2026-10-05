@@ -58,9 +58,9 @@ pub struct ModelEntry {
 }
 
 /// One allowance row: a quota window opened against a meter, keyed by the
-/// reset value that ends it (plan: allowances keyed by reset value,
-/// self-expiring — old rows are simply never loaded again once their reset
-/// passes).
+/// reset value that ends it (plan: allowances keyed by reset value). A row
+/// whose reset has passed is inert, since no live meter reports it, and
+/// [`prune_allowances`] deletes it on the server's state-prune tick.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Allowance {
     pub session_id: String,
@@ -308,6 +308,45 @@ pub(super) fn load_allowances(conn: &Connection) -> Result<Vec<Allowance>> {
         [],
         read_allowance,
     )
+}
+
+/// One session's allowances, ordered by meter and reset value: the gate's
+/// per-request read. The primary key leads with `session_id`, so this is
+/// an index range rather than the whole table, which is what lets the
+/// table carry other sessions' rows until the prune takes them.
+pub(super) fn load_session_allowances(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<Allowance>> {
+    rows_of(
+        conn,
+        "SELECT session_id, meter, reset_value FROM allowances
+         WHERE session_id = ?1
+         ORDER BY meter, reset_value",
+        [session_id],
+        read_allowance,
+    )
+}
+
+/// Drop every allowance whose window has ended: its reset (epoch seconds)
+/// is at or before `now_ms`. That is exactly the gate's own expiry rule
+/// (`quota::expired`), so a pruned row is one the gate could no longer
+/// honour: an allowance un-gates a meter only when its reset equals the
+/// meter's reported reset, and a meter whose reset has passed is not
+/// exhausted, whatever its utilisation. No slack, as in ctp's
+/// `pruneAllowances`: a later reading of the same window cannot bring
+/// the row back to life, because that window's reset is already past.
+///
+/// The column is `NOT NULL` and a grant is only recorded for a reported
+/// reset, so there is no unknown-reset row to keep; a reset far in the
+/// future is kept, which is the safe way to be wrong. Returns how many
+/// rows went.
+pub(super) fn prune_allowances(conn: &Connection, now_ms: i64) -> Result<u64> {
+    let gone = conn.execute(
+        "DELETE FROM allowances WHERE reset_value <= ?1",
+        [now_ms.div_euclid(1000)],
+    )?;
+    Ok(gone as u64)
 }
 
 fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {

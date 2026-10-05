@@ -65,3 +65,21 @@ wrong at. The notice says "up to about" for that reason.
 If you change what the outlook does with a weight, check it against a re-read
 whose meter movement you can see in the ledger: a figure that only agrees with
 the fit agrees with itself.
+
+## Allowances outlive their window only as dead rows
+
+A release grants an allowance per exhausted meter, keyed by that meter's
+reported reset (`quota::grant_for`), and the gate honours it only while the
+meter still reports that reset. Once the reset passes, the meter is not
+exhausted (`quota::expired`) and the next window reports a new reset, so the row
+can never match again. Enforcement needs no prune; the table does.
+
+ctp dropped dead allowances whenever it loaded or saved `allowances.json`. toker
+deletes every row whose reset is at or before now (`Store::prune_allowances`) on
+the server's 30-second state-prune tick, beside the lane prune, starting at
+startup. That is the gate's own expiry rule with no slack, so it removes nothing
+the gate could still honour. The column is `NOT NULL` and a grant is recorded
+only for a reported reset, so there is no unknown-reset row to keep; a reset far
+in the future is kept. The gate reads one session's rows by primary key
+(`Store::load_session_allowances`) rather than the whole table, so neither the
+table's size nor the prune's cadence lands on the request path.

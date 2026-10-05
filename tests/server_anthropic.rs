@@ -2081,6 +2081,61 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
 }
 
 #[tokio::test]
+async fn the_gate_reads_only_the_session_s_own_allowances_and_survives_the_prune() {
+    // The gate loads one session's rows by key rather than the whole
+    // table; another session's allowance for the very window that is
+    // spent must not release this one, and pruning the ended windows
+    // must not change what the gate decides.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+    let held = |session: &str, reset_value: i64| Allowance {
+        session_id: session.to_owned(),
+        meter: "5h".to_owned(),
+        reset_value,
+    };
+    // This session's release for a window that has already rolled, and
+    // a neighbour's release for the current one.
+    store
+        .record_allowance(&held("ccses-42", reset5h - 5 * 3600))
+        .expect("record");
+    store
+        .record_allowance(&held("ccses-other", reset5h))
+        .expect("record");
+
+    let body = messages_body_no_stream("claude-opus-5");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("blocked bytes");
+    assert!(
+        mock.captured().is_empty(),
+        "blocked: nothing held for this window"
+    );
+
+    // The prune takes only the rolled window; the gate still blocks.
+    let now = jiff::Timestamp::now().as_millisecond();
+    assert_eq!(store.prune_allowances(now).expect("prune"), 1);
+    assert_eq!(
+        store.load_allowances().expect("allowances"),
+        vec![held("ccses-other", reset5h)]
+    );
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    response.bytes().await.expect("blocked bytes");
+    assert!(mock.captured().is_empty(), "still blocked after the prune");
+
+    // This session's own release for the current window forwards, and a
+    // prune leaves it in force.
+    store
+        .record_allowance(&held("ccses-42", reset5h))
+        .expect("record");
+    assert_eq!(store.prune_allowances(now).expect("prune"), 0);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("forwarded bytes");
+    assert_eq!(mock.captured().len(), 1, "released for this window");
+}
+
+#[tokio::test]
 async fn marker_stripping_is_unconditional_and_a_healthy_release_still_records() {
     // No poisoning at all: meters_state absent (cold start), unknown
     // meters forward — and the release is still granted and recorded

@@ -5,7 +5,8 @@ insert-only, one row per request, written only by `Store::record_request`
 (`store/ledger.rs` has the row type, `RequestRow`, whose fields match the
 columns one to one). The state tables beside it (lanes, learned models,
 allowances, pings, meter snapshots, meta) are read-modify-write and are not part
-of the record. Migrations are an append-only list gated by `PRAGMA user_version`
+of the record; lanes and allowances are pruned on a 30-second tick (see
+[lanes.md](lanes.md) and [quota.md](quota.md)). Migrations are an append-only list gated by `PRAGMA user_version`
 (`store/schema.rs`): never edit, reorder or delete an entry, because a database
 in the wild has had exactly the first *n* applied, by position.
 
