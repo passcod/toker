@@ -32,6 +32,13 @@
 //! field means "not recorded then", never zero (the schema's own
 //! contract) — is preserved throughout:
 //! every field but `ts` is an `Option` that stays `None` (invariant 3).
+//! A field [CtpRow] does not map is not an error — the row still
+//! imports — but it is not silent either: every unmapped field name is
+//! tallied by the number of imported rows that carried it, and the report
+//! lists the tally (names only, never values: invariant 1), split into
+//! fields the importer leaves out on purpose ([IGNORED_BY_DESIGN]) and
+//! fields it has never heard of, which would mean the mapping is behind
+//! the source.
 //! Imported rows are written to be indistinguishable from toker-written
 //! rows: kind-specific payloads ride the `extra` column in the same
 //! shapes toker's own writers use, and `awake` rows keep their
@@ -42,6 +49,7 @@
 //! `costUsd` is [CostKind::PlanEquivalent] by default ("what is the plan
 //! worth?"); `--cost-kind` re-labels api-era logs.
 
+use std::collections::BTreeMap;
 use std::fs::{File, Metadata};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -49,6 +57,7 @@ use std::str::FromStr;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -77,6 +86,16 @@ const BATCH_ROWS: usize = 4096;
 /// (suffixed with the source's canonical path, so the checkpoint travels
 /// with the file, not the path string it was first given by).
 const META_KEY_PREFIX: &str = "import.ctp:";
+
+/// Source fields the importer leaves out on purpose, with why. Each is
+/// counted under "ignored by design" rather than "unknown", so the unknown
+/// tally stays the signal that the mapping is behind the source.
+const IGNORED_BY_DESIGN: &[(&str, &str)] = &[(
+    "compacting",
+    "summarising's first name (2026-09-03, eleven minutes), matched \
+     anywhere in the body rather than in the last message — a different \
+     test, so not mapped onto summarising",
+)];
 
 /// `toker import` options, as the CLI resolves them.
 pub struct ImportOpts {
@@ -118,6 +137,9 @@ struct Outcome {
     /// The first malformed line, so the report can point at one concrete
     /// reason rather than only a count.
     first_malformed: Option<(u64, String)>,
+    /// Source field names [CtpRow] does not map → how many imported rows
+    /// carried each. Names only; a value is never kept.
+    unmapped: BTreeMap<String, u64>,
 }
 
 /// Run one import and print the report (the CLI entry point; the command
@@ -138,6 +160,17 @@ pub fn run(opts: ImportOpts) -> Result<()> {
     println!("skipped (duplicate):  {}", s.skipped_duplicate);
     if let Some((line, reason)) = &outcome.first_malformed {
         println!("first malformed line: {line}: {reason}");
+    }
+    let (by_design, unknown): (Vec<_>, Vec<_>) = outcome
+        .unmapped
+        .iter()
+        .partition(|(name, _)| ignored_by_design(name).is_some());
+    for (name, rows) in by_design {
+        let why = ignored_by_design(name).unwrap_or_default();
+        println!("unmapped (by design): {name} on {} — {why}", rows_of(*rows));
+    }
+    for (name, rows) in unknown {
+        println!("unmapped (unknown):   {name} on {}", rows_of(*rows));
     }
     if opts.dry_run {
         println!("(dry run — nothing inserted)");
@@ -213,6 +246,7 @@ fn run_(opts: &ImportOpts, batch_rows: usize) -> Result<Outcome> {
     let mut skipped_malformed = 0u64;
     let mut skipped_duplicate = 0u64;
     let mut first_malformed: Option<(u64, String)> = None;
+    let mut unmapped = BTreeMap::<String, u64>::new();
 
     let mut reader = BufReader::new(file);
     let mut raw = String::new();
@@ -254,7 +288,12 @@ fn run_(opts: &ImportOpts, batch_rows: usize) -> Result<Outcome> {
         }
         match serde_json::from_str::<CtpRow>(line) {
             Ok(ctp) => match map_row(&ctp, opts.cost_kind) {
-                Ok(row) => state.batch.push(row),
+                Ok(row) => {
+                    for name in ctp.unmapped.keys() {
+                        *unmapped.entry(name.clone()).or_default() += 1;
+                    }
+                    state.batch.push(row);
+                }
                 Err(reason) => {
                     skipped_malformed += 1;
                     first_malformed.get_or_insert((line_no, reason));
@@ -292,7 +331,25 @@ fn run_(opts: &ImportOpts, batch_rows: usize) -> Result<Outcome> {
             already_imported: tail && line_no == boundary,
         },
         first_malformed,
+        unmapped,
     })
+}
+
+/// "1 row", "26 rows".
+fn rows_of(n: u64) -> String {
+    if n == 1 {
+        "1 row".to_owned()
+    } else {
+        format!("{n} rows")
+    }
+}
+
+/// Why `name` is left out on purpose, when it is.
+fn ignored_by_design(name: &str) -> Option<&'static str> {
+    IGNORED_BY_DESIGN
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, why)| *why)
 }
 
 /// Flush one batch: rows are inserted in a single transaction (never a
@@ -429,6 +486,10 @@ fn mtime_ms(metadata: &Metadata) -> i64 {
 /// carry
 /// folded buckets, not the response's raw usage JSON) and `drift_digest`
 /// (a toker-only kind).
+///
+/// Any other source field lands in `unmapped`, so the importer can count
+/// it instead of dropping it unseen (the struct has no
+/// `deny_unknown_fields`: an unmapped field never fails a row).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CtpRow {
@@ -515,6 +576,12 @@ struct CtpRow {
     error_type: Option<String>,
     error_message: Option<String>,
     retry_after: Option<Value>,
+
+    /// Every field not named above, by name. [IgnoredAny] skips the value
+    /// without building it: the importer counts names and never keeps a
+    /// value (invariant 1).
+    #[serde(flatten)]
+    unmapped: BTreeMap<String, IgnoredAny>,
 }
 
 /// Map one parsed imported row onto the ledger row. Errors are per-line
@@ -771,8 +838,16 @@ mod tests {
         }
     }
 
+    /// Map one fixture row, which must use only mapped fields: the
+    /// fixtures span every era and kind, so a mapped field the flattened
+    /// catch-all swallowed would show up here.
     fn map(line: &str) -> RequestRow {
         let ctp: CtpRow = serde_json::from_str(line).expect("parse fixture row");
+        assert!(
+            ctp.unmapped.is_empty(),
+            "unmapped: {:?}",
+            ctp.unmapped.keys()
+        );
         map_row(&ctp, CostKind::PlanEquivalent).expect("map fixture row")
     }
 
@@ -1145,6 +1220,51 @@ mod tests {
         );
         assert!(checkpoint.first_line_hash.is_some());
         assert!(checkpoint.last_line_hash.is_some());
+    }
+
+    #[test]
+    fn unmapped_fields_are_counted_by_name_and_never_fail_a_row() {
+        let dir = test_dir("unmapped");
+        let from = dir.join("usage.jsonl");
+        // The early `compacting` rows of the real log, a field no era of
+        // the source wrote (a mapping gap), and an unknown-kind row whose
+        // unmapped field must not count: the row did not import.
+        let compacting = measurement(1).replace("{\"ts\"", "{\"compacting\":true,\"ts\"");
+        let unknown = measurement(2).replace(
+            "\"gateOn\"",
+            "\"frobnicate\":{\"secret\":\"do not echo\"},\"compacting\":true,\"gateOn\"",
+        );
+        let bad_kind =
+            measurement(3).replace("{\"ts\"", "{\"kind\":\"mystery\",\"frobnicate\":1,\"ts\"");
+        write_jsonl(&from, &[&compacting, &unknown, &bad_kind, &measurement(4)]);
+
+        let db = dir.join("toker.db");
+        let outcome = run_(&opts(from, db), 8).expect("import");
+        assert_eq!(
+            outcome.summary.rows_imported, 3,
+            "unmapped never fails a row"
+        );
+        assert_eq!(outcome.summary.skipped_malformed, 1);
+        assert_eq!(
+            outcome.unmapped,
+            BTreeMap::from([("compacting".to_owned(), 2), ("frobnicate".to_owned(), 1)]),
+            "names tallied per imported row, values never kept"
+        );
+        assert!(ignored_by_design("compacting").is_some());
+        assert!(ignored_by_design("frobnicate").is_none());
+        // The mapped half is untouched by the extra field.
+        let ctp: CtpRow = serde_json::from_str(&compacting).expect("parse");
+        let row = map_row(&ctp, CostKind::PlanEquivalent).expect("map");
+        assert_eq!(row, map(&measurement(1)));
+    }
+
+    #[test]
+    fn mapped_fields_never_count_as_unmapped() {
+        let dir = test_dir("mapped");
+        let from = dir.join("usage.jsonl");
+        write_jsonl(&from, &[&measurement(1), &measurement(2)]);
+        let outcome = run_(&opts(from, dir.join("toker.db")), 8).expect("import");
+        assert!(outcome.unmapped.is_empty(), "{:?}", outcome.unmapped);
     }
 
     #[test]
