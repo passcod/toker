@@ -678,7 +678,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     // The upstream body is the transform's bytes, asserted exactly: the
     // model changed, every cache_control went, and the mid-conversation
     // system message merged into the PRECEDING user turn as a
-    // [PROMPT_INJECTION]-prefixed block.
+    // [system]-prefixed block.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     assert_eq!(
@@ -696,7 +696,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
             "messages": [
                 {"role": "user", "content": [
                     {"type": "text", "text": "Earlier work."},
-                    {"type": "text", "text": "[PROMPT_INJECTION] [reminder]"},
+                    {"type": "text", "text": "[system] [reminder]"},
                 ]},
                 {"role": "user", "content": [
                     {"type": "text", "text": "Your task is to create a detailed summary of the conversation so far."},

@@ -1969,8 +1969,11 @@ impl ColdBlocking {
 
 /// The prefix of the merged block: Sonnet 5 does not
 /// accept mid-conversation `role: "system"` entries in `messages[]`, and
-/// Claude Code emits them routinely.
-const PROMPT_INJECTION: &str = "[PROMPT_INJECTION]";
+/// Claude Code emits them routinely. Model-visible text, so it is the
+/// predecessor's `[system]`, which says what the block was. A port once
+/// wrote `[PROMPT_INJECTION]` here, labelling the client's own
+/// instructions as an injection for the model to distrust.
+const MERGED_SYSTEM: &str = "[system]";
 
 /// What one retarget did. `to == from` is a same-model strip: a real
 /// transform (the breakpoints went) but not a downgrade — recording one
@@ -2063,7 +2066,7 @@ fn js_trim(text: &str) -> &str {
 ///   will read back is bought once and read never — and the 1-hour write
 ///   tier, which is what Claude Code uses, costs twice plain input;
 /// - mid-conversation system messages are merged into the **preceding**
-///   user turn, prefixed `[PROMPT_INJECTION]`, because Sonnet 5 does not
+///   user turn, prefixed `[system]`, because Sonnet 5 does not
 ///   accept them inside `messages[]`. Merging rather than converting adds
 ///   a block to a message that already exists, so the role sequence the
 ///   API sees is unchanged.
@@ -2145,7 +2148,7 @@ pub fn retarget_compaction(
         let mut content = host_blocks;
         content.push(serde_json::json!({
             "type": "text",
-            "text": format!("{PROMPT_INJECTION} {text}"),
+            "text": format!("{MERGED_SYSTEM} {text}"),
         }));
         if let Some(map) = new_host.as_object_mut() {
             map.insert("content".to_owned(), Value::Array(content));
@@ -3634,7 +3637,7 @@ mod tests {
         );
         // The exact bytes that go upstream: the model region changed, all
         // three cache_control positions went, and the system message
-        // merged into the PRECEDING user turn as a [PROMPT_INJECTION]
+        // merged into the PRECEDING user turn as a [system]
         // block — string content synthesised into a text block first.
         assert_eq!(
             request.serialise(),
@@ -3652,7 +3655,7 @@ mod tests {
                 "messages": [
                     {"role": "user", "content": [
                         {"type": "text", "text": "Earlier work."},
-                        {"type": "text", "text": "[PROMPT_INJECTION] [reminder]"},
+                        {"type": "text", "text": "[system] [reminder]"},
                     ]},
                     {"role": "user", "content": [
                         {"type": "text", "text": "Your task is to create a detailed summary of the conversation so far."},
@@ -3874,7 +3877,7 @@ mod tests {
         // original bytes except the value; everything the transform did not
         // reach is reproduced exactly, in its original position.
         assert!(retargeted.starts_with(
-            br#"{"stream":true,"temperature":0.7,"model":"claude-sonnet-5","top_k":42,"system":[{"type":"text","text":"You are careful."}],"messages":[{"role":"user","content":[{"type":"text","text":"Earlier work, untouched."},{"type":"text","text":"[PROMPT_INJECTION] mid reminder"}]},{"role":"user","content":[{"type":"text","text":"the last turn"},{"type":"text","text":"spare"}]}"#
+            br#"{"stream":true,"temperature":0.7,"model":"claude-sonnet-5","top_k":42,"system":[{"type":"text","text":"You are careful."}],"messages":[{"role":"user","content":[{"type":"text","text":"Earlier work, untouched."},{"type":"text","text":"[system] mid reminder"}]},{"role":"user","content":[{"type":"text","text":"the last turn"},{"type":"text","text":"spare"}]}"#
         ), "the untouched prefix is byte-stable; only the model value, the stripped breakpoints, and the merge point change");
         // The breakpoint that went is the only byte difference in the last
         // user turn: the blocks sit adjacent, exactly as a removal leaves
