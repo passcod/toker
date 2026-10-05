@@ -1,7 +1,8 @@
 //! Ratatui dashboard (plan: "TUI").
 //!
-//! A long-running terminal view over the SQLite ledger, refreshing ~every
-//! 2 s — the replacement for the predecessor's watched log script.
+//! A long-running terminal view over the SQLite ledger, ticking every
+//! second and re-reading only when the ledger changed — the replacement
+//! for the predecessor's watched log script.
 //! Phase 1 rendered the
 //! sessions, spend, and rate panels; phase 2 grows the rate panel into
 //! **rate & quota** (meter bars, forecasts, spent, binding — [quota]),
@@ -48,30 +49,44 @@ use crate::catalog::fetched::{self, FetchedCatalogs};
 use crate::middleware::cold::{OUTLOOK_LOOKBACK_MS, OUTLOOK_ROWS};
 use crate::store::Store;
 
-/// Refresh cadence: the plan's "~2 s refresh from SQLite" — for the
-/// DISPLAY window (sessions, spend, rate, context, tokens), which reads
-/// the store's narrow display projection (fifteen columns, no JSON
-/// parse per row — see [`refresh_display`]).
-const REFRESH: Duration = Duration::from_secs(2);
+/// The loop's tick. Every tick redraws, so the clock, the idle ages,
+/// and the window's aging advance by the second; what it READS is
+/// gated on the ledger having changed (see [`Cadence`]) — a quiet
+/// ledger costs one `PRAGMA data_version` per tick, not a window read.
+const TICK: Duration = Duration::from_secs(1);
 
-/// The meter-lookback cadence. The quota section reads a 7-day,
-/// 20 000-row window through the store's narrow meter projection (four
-/// columns, one JSON parse per row — see [`quota_snapshot`]) and
-/// aggregates burn rates over it — far heavier than the display read,
-/// and nothing about it changes on a 2-second scale: meters move on
-/// the upstream's window scale (hours), and the predecessor itself refit
-/// its quota
-/// model every 30 MINUTES. Refreshing it at the
-/// display cadence made the loop spin: the read overran the tick, the
-/// next deadline landed in the past, and `event::poll(0)` never
-/// blocked — 80% of a core, fixed here.
+/// The display window is re-read at least this often even when the
+/// ledger has not moved. The window itself needs no re-read to age:
+/// the cached rows are dropped in memory as they cross the boundary
+/// ([`DisplayWindow::age_out`]). The floor is for what lives outside
+/// the ledger — a session renamed in its transcript while its lane is
+/// quiet — so its label still catches up.
+const DISPLAY_FLOOR: Duration = Duration::from_secs(30);
+
+/// The least spacing of the heavy passes (quota and rebuilds) while
+/// new rows keep landing: a busy ledger moves `data_version` every
+/// tick, and the heavy reads must not follow it there.
+///
+/// The quota section reads a 7-day, 20 000-row window through the
+/// store's narrow meter projection (four columns, one JSON parse per
+/// row — see [`quota_snapshot`]) and aggregates burn rates over it —
+/// far heavier than the display read; meters move on the upstream's
+/// window scale (hours), and the predecessor itself refit its quota
+/// model every 30 MINUTES. Refreshing it at the display cadence once
+/// made the loop spin: the read overran the tick, the next deadline
+/// landed in the past, and `event::poll(0)` never blocked — 80% of a
+/// core. Hence this spacing, and every reschedule anchoring at the
+/// work's completion.
 ///
 /// The CACHE REBUILDS section reads on this same cadence
 /// ([`rebuild_snapshot`]): its lane walk needs the 24 h tail that
 /// provides each lane's pre-window predecessor (the anti-phantom
-/// rule), an order of magnitude more rows than the display window —
-/// and rebuild causes move on the conversation's scale, not the
-/// 2-second one.
+/// rule), an order of magnitude more rows than the display window.
+const QUOTA_MIN: Duration = Duration::from_secs(10);
+
+/// The heavy passes re-run at least this often with no new data: the
+/// quota section's forecasts and resets move with the clock, not only
+/// with rows.
 const QUOTA_REFRESH: Duration = Duration::from_secs(60);
 
 /// The rebuild walk's tail: 24 hours, strictly longer than the longest
@@ -117,17 +132,19 @@ pub fn run(
     // (the quota resets and runout labels) anchors here.
     let tz = jiff::tz::TimeZone::system();
     // The transcript roots, resolved once: session labels read only
-    // these, read-only, one tail per session per display tick.
+    // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
-    // Both deadlines start in the past: the first pass refreshes
-    // immediately. Every reschedule below anchors at the COMPLETION of
-    // the work, never its start — a read that overruns its interval
-    // delays the next one instead of collapsing the loop into a
-    // back-to-back refresh spin.
-    let mut next_display = Instant::now();
-    let mut next_quota = Instant::now();
+    let mut cadence = Cadence::default();
+    // The tick deadline starts in the past: the first pass reads
+    // immediately. It is rescheduled from the COMPLETION of the tick's
+    // work, never its start — a read that overruns the tick delays the
+    // next one instead of collapsing the loop into a back-to-back
+    // refresh spin.
+    let mut next_tick = Instant::now();
     let mut quota: Option<quota::QuotaAgg> = None;
     let mut rebuilds: Option<rebuilds::RebuildAgg> = None;
+    let mut released = std::collections::HashSet::new();
+    let mut window: Option<DisplayWindow> = None;
     // The daemon's models caches, read-only: loaded (or not) on the
     // quota cadence below, never fetched, never written.
     let mut model_caches = match fetched::cache_dir() {
@@ -142,37 +159,46 @@ pub fn run(
     };
     let mut snapshot = model::empty(window_mins);
     loop {
-        let now = Instant::now();
-        if now >= next_quota {
-            quota = quota_snapshot(&store, window_mins)?;
-            rebuilds = rebuild_snapshot(&store, window_mins)?;
-            // The cache read rides the quota cadence: three stat calls
-            // are free against a 60 s tick, and the files themselves
-            // only move on the daemon's 24 h cycle.
-            model_caches.refresh();
-            next_quota = Instant::now() + QUOTA_REFRESH;
-        }
-        if now >= next_display {
-            let released = released_sessions(&store, quota.as_ref())?;
-            snapshot = refresh_display(
-                &store,
-                window_mins,
-                quota.as_ref(),
-                &released,
-                rebuilds.as_ref(),
-                model_caches.catalogs(),
-                &mut labels,
-            )?;
-            next_display = Instant::now() + REFRESH;
+        if Instant::now() >= next_tick {
+            let due = cadence.due(Instant::now(), store.data_version()?);
+            if due.heavy {
+                quota = quota_snapshot(&store, window_mins)?;
+                rebuilds = rebuild_snapshot(&store, window_mins)?;
+                // The cache read rides the quota cadence: three stat
+                // calls are free against it, and the files themselves
+                // only move on the daemon's 24 h cycle.
+                model_caches.refresh();
+                cadence.heavy_done(Instant::now());
+            }
+            if due.read {
+                window = Some(read_window(&store, window_mins, &mut labels)?);
+                cadence.read_done(Instant::now());
+            }
+            // The allowances table changes only with the ledger, and a
+            // release's liveness only with the quota section's resets.
+            if due.read || due.heavy {
+                released = released_sessions(&store, quota.as_ref())?;
+            }
+            if let Some(window) = &mut window {
+                snapshot = window.snapshot(
+                    window_mins,
+                    quota.as_ref(),
+                    &released,
+                    rebuilds.as_ref(),
+                    model_caches.catalogs(),
+                );
+            }
+            next_tick = Instant::now() + TICK;
         }
         terminal.draw(|frame| view::render(frame, &snapshot, &clock(), &tz))?;
 
-        // Block until the sooner of the two deadlines or an input event
-        // — no busy loop, by construction (both deadlines are in the
-        // future after the reschedules above).
-        let timeout = next_display
-            .min(next_quota)
-            .saturating_duration_since(Instant::now());
+        // Block until the next tick or an input event. The deadline was
+        // set after the tick's work, so it is in the future unless the
+        // draw itself overran it; the floor keeps even that case a
+        // wait rather than a `poll(0)` spin.
+        let timeout = next_tick
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(50));
         if !crossterm::event::poll(timeout)? {
             continue;
         }
@@ -194,11 +220,11 @@ pub fn run(
                 {
                     break;
                 }
-                // r forces an immediate refresh on the next pass — both
-                // cadences, so a full reload is one keypress away.
+                // r forces an immediate full reload on the next pass —
+                // the window and the heavy sections, changed or not.
                 crossterm::event::KeyCode::Char('r') => {
-                    next_display = Instant::now();
-                    next_quota = Instant::now();
+                    cadence.force();
+                    next_tick = Instant::now();
                 }
                 _ => {}
             }
@@ -207,36 +233,105 @@ pub fn run(
     Ok(())
 }
 
-/// Reload the display window's rows and total, then aggregate with the
-/// CACHED quota and rebuild sections, the live-allowance set, and the
-/// loaded models catalogues. The read is the store's narrow display
+/// What the loop decides each tick (see [`Cadence::due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Due {
+    /// Re-read the display window.
+    read: bool,
+    /// Re-run the heavy passes (quota, rebuilds, models caches).
+    heavy: bool,
+}
+
+/// When the loop reads. The ledger's `PRAGMA data_version` (on the
+/// store's one connection — the counter is per-connection, and moves
+/// only for OTHER connections' commits, which every daemon write is)
+/// says whether anything landed since the last tick: the display
+/// window is re-read when it moved, or past [`DISPLAY_FLOOR`]; the
+/// heavy passes when it moved since they last ran and [`QUOTA_MIN`]
+/// has passed, or past [`QUOTA_REFRESH`] regardless. Pure over the
+/// instants it is handed, so the schedule is testable without a
+/// terminal or a clock.
+#[derive(Debug, Default)]
+struct Cadence {
+    /// The `data_version` the last tick saw; `None` before the first.
+    version: Option<i64>,
+    /// When the display window was last read.
+    read_at: Option<Instant>,
+    /// When the heavy passes last completed.
+    heavy_at: Option<Instant>,
+    /// Data landed since the heavy passes last ran.
+    heavy_stale: bool,
+}
+
+impl Cadence {
+    /// This tick's reads, given the version seen now.
+    fn due(&mut self, now: Instant, version: i64) -> Due {
+        let moved = self.version != Some(version);
+        self.version = Some(version);
+        self.heavy_stale |= moved;
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        let read = moved || since(self.read_at).is_none_or(|age| age >= DISPLAY_FLOOR);
+        let heavy = since(self.heavy_at)
+            .is_none_or(|age| age >= QUOTA_REFRESH || (self.heavy_stale && age >= QUOTA_MIN));
+        Due { read, heavy }
+    }
+
+    /// The display window was read at `at` (its completion).
+    fn read_done(&mut self, at: Instant) {
+        self.read_at = Some(at);
+    }
+
+    /// The heavy passes completed at `at`; they have seen every row up
+    /// to the version this tick read.
+    fn heavy_done(&mut self, at: Instant) {
+        self.heavy_at = Some(at);
+        self.heavy_stale = false;
+    }
+
+    /// The `r` key: the next tick reads everything.
+    fn force(&mut self) {
+        self.read_at = None;
+        self.heavy_at = None;
+    }
+}
+
+/// One display read, kept across ticks: the window's rows, the
+/// ledger's total and newest timestamp, and the session labels
+/// resolved for the rows' sessions. Between reads the loop only
+/// re-aggregates it against the advancing clock.
+#[derive(Debug)]
+struct DisplayWindow {
+    /// The window's rows, oldest first (the read's order).
+    rows: Vec<crate::store::DisplayRow>,
+    /// The ledger's total row count.
+    total: i64,
+    /// The newest ledger row's timestamp, of any kind.
+    latest: Option<i64>,
+    /// Labels for the rows' sessions, as of the read.
+    labels: HashMap<String, labels::Label>,
+}
+
+/// Read the display window's rows and total, and resolve the labels of
+/// the sessions in it. The read is the store's narrow display
 /// projection ([`Store::display_rows_since`]): the eighteen columns the
 /// aggregation consumes, no JSON parse per row — the full-row read
 /// this path used to pay cast 59 columns and parsed six JSON values
-/// per row, every 2 s (invariant 7). Errors propagate — with WAL and
-/// the store's 5 s busy timeout a read failure is real trouble, not a
-/// blip worth hiding behind a stale frame.
+/// per row (invariant 7). Errors propagate — with WAL and the store's
+/// 5 s busy timeout a read failure is real trouble, not a blip worth
+/// hiding behind a stale frame.
 ///
-/// Session labels resolve here, once per session per display tick
-/// ([`labels::Labels`], the labels' economics: a 2-second refresh
-/// re-reads each tail so a title that regenerates mid-session stays
-/// current) — never per render, which is why the label state is loop
-/// state passed in rather than a fresh read per frame. `catalogs` is
-/// the loop's loaded mirror of the daemon's models caches (see
-/// [`ModelCaches`]) — the fetched `Declared` ceilings the CTX column
-/// resolves through, read-only from disk.
-fn refresh_display(
+/// Session labels resolve here, once per session per read
+/// ([`labels::Labels`]) — never per render or per tick, which is why
+/// the label state is loop state passed in. A read follows every
+/// ledger change, so a title that regenerates mid-session stays
+/// current with the session's own traffic.
+fn read_window(
     store: &Store,
     window_mins: u64,
-    quota: Option<&quota::QuotaAgg>,
-    released: &std::collections::HashSet<String>,
-    rebuilds: Option<&rebuilds::RebuildAgg>,
-    catalogs: &FetchedCatalogs,
     labels: &mut labels::Labels,
-) -> anyhow::Result<model::Snapshot> {
+) -> anyhow::Result<DisplayWindow> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
-    let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
-    let rows = store.display_rows_since(since, ROW_CAP)?;
+    let rows = store.display_rows_since(window_start(now_ms, window_mins), ROW_CAP)?;
     let total = store.count_requests()?;
     // The header's freshness: the newest row of ANY kind in the whole
     // ledger, not the window's — an empty window must still say how
@@ -247,25 +342,63 @@ fn refresh_display(
     for session_id in rows.iter().filter_map(|row| row.session_id.as_deref()) {
         session_ids.insert(session_id);
     }
-    let mut resolved = std::collections::HashMap::new();
+    let mut resolved = HashMap::new();
     for session_id in session_ids {
         if let Some(label) = labels.resolve(session_id) {
             resolved.insert(session_id.to_owned(), label);
         }
     }
-    let mut snapshot = model::aggregate(
-        &rows,
-        quota,
-        released,
-        &resolved,
-        catalogs,
-        rebuilds.cloned(),
-        window_mins,
-        now_ms,
+    Ok(DisplayWindow {
+        rows,
         total,
-    );
-    snapshot.latest_row_ts_ms = latest;
-    Ok(snapshot)
+        latest,
+        labels: resolved,
+    })
+}
+
+/// The display window's oldest instant at `now_ms`.
+fn window_start(now_ms: i64, window_mins: u64) -> i64 {
+    now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64)
+}
+
+impl DisplayWindow {
+    /// Drop the rows that have crossed the window's start since the
+    /// read. The ledger is insert-only, so between reads the window
+    /// can only lose rows off its old end — and a new row, at any
+    /// timestamp, moves `data_version` and brings a fresh read.
+    fn age_out(&mut self, since: i64) {
+        let aged = self.rows.partition_point(|row| row.ts_ms < since);
+        self.rows.drain(..aged);
+    }
+
+    /// This tick's snapshot: the window aged to now, aggregated with
+    /// the CACHED quota and rebuild sections, the live-allowance set,
+    /// and the loaded models catalogues (`catalogs`, the loop's mirror
+    /// of the daemon's cache files — see [`ModelCaches`]).
+    fn snapshot(
+        &mut self,
+        window_mins: u64,
+        quota: Option<&quota::QuotaAgg>,
+        released: &std::collections::HashSet<String>,
+        rebuilds: Option<&rebuilds::RebuildAgg>,
+        catalogs: &FetchedCatalogs,
+    ) -> model::Snapshot {
+        let now_ms = jiff::Timestamp::now().as_millisecond();
+        self.age_out(window_start(now_ms, window_mins));
+        let mut snapshot = model::aggregate(
+            &self.rows,
+            quota,
+            released,
+            &self.labels,
+            catalogs,
+            rebuilds.cloned(),
+            window_mins,
+            now_ms,
+            self.total,
+        );
+        snapshot.latest_row_ts_ms = self.latest;
+        snapshot
+    }
 }
 
 /// The TUI's read-only mirror of the daemon's models caches — the
@@ -284,7 +417,7 @@ struct ModelCaches {
     dir: Option<PathBuf>,
     /// Per source: the mtime the loaded catalogue was read at.
     mtimes: HashMap<String, Option<std::time::SystemTime>>,
-    /// The loaded catalogues — what [`refresh_display`] consults.
+    /// The loaded catalogues — what [`DisplayWindow::snapshot`] consults.
     catalogs: FetchedCatalogs,
     /// How many cache files were (re)loaded — the tests' proof the
     /// mtime gate holds.
@@ -357,7 +490,7 @@ fn rebuild_snapshot(
     window_mins: u64,
 ) -> anyhow::Result<Option<rebuilds::RebuildAgg>> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
-    let since = now_ms.saturating_sub(window_mins.saturating_mul(60_000) as i64);
+    let since = window_start(now_ms, window_mins);
     let tail = now_ms.saturating_sub(REBUILD_TAIL_MS);
     let rows = store.rebuild_rows_since(tail, REBUILD_ROWS)?;
     let mut walk = rebuilds::classify(&rows, since);
@@ -388,7 +521,7 @@ fn rebuild_snapshot(
 /// released past), and the gate disarmed means nobody is being
 /// released past anything. The allowances table is small and
 /// self-expiring by its reset-keyed design, so the read is the whole
-/// table on the display tick — cheap, and filtered here.
+/// table on each display read — cheap, and filtered here.
 fn released_sessions(
     store: &Store,
     quota: Option<&quota::QuotaAgg>,
@@ -857,13 +990,14 @@ mod tests {
     /// write while the window itself reads empty, and an empty ledger
     /// leaves it absent.
     #[test]
-    fn refresh_display_reads_freshness_past_the_window() {
+    fn the_display_read_dates_freshness_past_the_window() {
         let store = Store::open(":memory:").expect("open in-memory store");
         let catalogs = crate::catalog::fetched::FetchedCatalogs::default();
         let mut labels = super::labels::Labels::new(Vec::new());
         let refresh = |labels: &mut super::labels::Labels| {
-            super::refresh_display(&store, 30, None, &HashSet::new(), None, &catalogs, labels)
-                .expect("refresh")
+            super::read_window(&store, 30, labels)
+                .expect("read")
+                .snapshot(30, None, &HashSet::new(), None, &catalogs)
         };
 
         let empty = refresh(&mut labels);
@@ -878,6 +1012,92 @@ mod tests {
         let snap = refresh(&mut labels);
         assert!(snap.window_empty, "the row is outside the window");
         assert_eq!(snap.latest_row_ts_ms, Some(old));
+    }
+
+    /// The tick's schedule: a quiet ledger reads nothing until the
+    /// display floor; a moved `data_version` re-reads the window that
+    /// tick, and the heavy passes no sooner than `QUOTA_MIN` after
+    /// their last run however often it moves — but at least every
+    /// `QUOTA_REFRESH` with no data at all.
+    #[test]
+    fn the_cadence_reads_on_change_and_spaces_the_heavy_passes() {
+        use super::{Cadence, DISPLAY_FLOOR, Due, QUOTA_MIN, QUOTA_REFRESH};
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut cadence = Cadence::default();
+        let both = Due {
+            read: true,
+            heavy: true,
+        };
+        let idle = Due {
+            read: false,
+            heavy: false,
+        };
+
+        assert_eq!(cadence.due(at(0), 7), both, "the first tick reads all");
+        cadence.read_done(at(0));
+        cadence.heavy_done(at(0));
+        assert_eq!(cadence.due(at(1), 7), idle, "a quiet ledger read");
+
+        // New data each second: the window follows it, the heavy
+        // passes wait out their spacing, then catch up once.
+        for second in 2..QUOTA_MIN.as_secs() {
+            let due = cadence.due(at(second), 7 + second as i64);
+            assert!(due.read && !due.heavy, "second {second}: {due:?}");
+            cadence.read_done(at(second));
+        }
+        let due = cadence.due(at(QUOTA_MIN.as_secs()), 100);
+        assert_eq!(due, both, "the spacing passed with new data waiting");
+        cadence.read_done(at(QUOTA_MIN.as_secs()));
+        cadence.heavy_done(at(QUOTA_MIN.as_secs()));
+
+        // Data that landed before a heavy pass does not call another.
+        let quiet = QUOTA_MIN.as_secs() * 2 + 1;
+        assert_eq!(cadence.due(at(quiet), 100), idle);
+
+        // Nothing new: the floors alone bring the reads back.
+        let floor = QUOTA_MIN.as_secs() + DISPLAY_FLOOR.as_secs();
+        assert_eq!(
+            cadence.due(at(floor), 100),
+            Due {
+                read: true,
+                heavy: false
+            }
+        );
+        cadence.read_done(at(floor));
+        let refresh = QUOTA_MIN.as_secs() + QUOTA_REFRESH.as_secs();
+        assert!(cadence.due(at(refresh), 100).heavy, "the heavy floor");
+
+        // The r key: everything, now.
+        let mut forced = Cadence::default();
+        forced.due(at(0), 1);
+        forced.read_done(at(0));
+        forced.heavy_done(at(0));
+        forced.force();
+        assert_eq!(forced.due(at(1), 1), both);
+    }
+
+    /// Between reads the window ages in memory: rows that cross its
+    /// start drop out on the tick that passes them, without a re-read.
+    #[test]
+    fn the_cached_window_ages_out_rows_past_its_start() {
+        let mut window = super::DisplayWindow {
+            rows: [100, 200, 200, 300]
+                .into_iter()
+                .map(super::testrows::display_bare)
+                .collect(),
+            total: 4,
+            latest: Some(300),
+            labels: HashMap::new(),
+        };
+        window.age_out(50);
+        assert_eq!(window.rows.len(), 4);
+        window.age_out(200);
+        let left: Vec<i64> = window.rows.iter().map(|row| row.ts_ms).collect();
+        assert_eq!(left, vec![200, 200, 300], "the start is inclusive");
+        window.age_out(301);
+        assert!(window.rows.is_empty());
+        assert_eq!(window.total, 4, "the ledger total is not the window's");
     }
 
     /// The mtime gate: a cache file is read when it first appears and

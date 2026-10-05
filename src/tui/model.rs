@@ -373,7 +373,7 @@ pub(crate) fn empty(window_mins: u64) -> Snapshot {
 /// the sessions holding a live allowance for the window now running
 /// (read from the allowances table against the quota section's
 /// current resets), `labels` the
-/// transcript-derived session labels resolved by the display tick
+/// transcript-derived session labels resolved by the display read
 /// (one read per session per refresh, [`super::labels::Labels`]), and
 /// `catalogs` the fetched models catalogues the TUI loaded read-only
 /// from the daemon's cache files (the per-provider `Declared` ceilings
@@ -1890,7 +1890,7 @@ mod tests {
              old read + aggregation (upper bound)      {:8.3} ms/refresh\n  \
              new read (display_rows_since)             {:8.3} ms/refresh\n  \
              new read + aggregation (the refresh)      {:8.3} ms/refresh\n  \
-             → {:.2}% of a core per 2 s tick (new), {:.2}% (old upper bound)",
+             → {:.2}% of a core at one refresh per 2 s (new), {:.2}% (old upper bound)",
             ms(old_read),
             ms(old_read + old_refresh),
             ms(new_read),

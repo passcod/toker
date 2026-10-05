@@ -526,8 +526,9 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 /// row, while the display read parses none (no JSON column is among
 /// the eighteen) — so adding a field to this type must be justified
 /// against the per-refresh cost of fetching it across up to the
-/// display window's 10 000-row cap, on the TUI's 2-second cadence: a
-/// field added here is a per-tick cost decision, made in the open.
+/// display window's 10 000-row cap, re-read on every ledger change
+/// (at most once a second): a field added here is a per-read cost
+/// decision, made in the open.
 ///
 /// The field set is the display aggregation's ACTUAL reads: the
 /// provider·model breakdown labels itself with the backend `provider`
@@ -695,13 +696,14 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 /// The narrow projection of a `requests` row for the cache-rebuilds
 /// walk (the TUI's third narrow row, beside [`MeterRow`] and
 /// [`DisplayRow`]): the classifier's actual reads, nothing else. The
-/// walk runs on the TUI's QUOTA cadence (60 s), not the display tick —
+/// walk runs on the TUI's QUOTA cadence (on new data at most every
+/// 10 s, and every 60 s regardless), not the display read —
 /// a lane walk needs the 24 h tail that provides each lane's
 /// pre-window predecessor (the anti-phantom rule, as the lane
 /// docs state it), and
 /// that tail is an order of magnitude more rows than the display
-/// window holds. Adding a field here is therefore a per-60 s cost
-/// decision across up to the rebuild tail's 20 000-row cap.
+/// window holds. Adding a field here is therefore a per-heavy-pass
+/// cost decision across up to the rebuild tail's 20 000-row cap.
 ///
 /// Field-by-field, against the classifier's reads:
 ///
@@ -916,7 +918,7 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
 /// The newest row's timestamp, of any kind; `None` on an empty ledger.
 /// `MAX` over the indexed `ts_ms` is answered from the index's last
 /// entry, so this stays cheap however large the ledger grows — the TUI
-/// asks it on every display tick.
+/// asks it on every display read.
 pub(super) fn latest_ts_ms(conn: &Connection) -> Result<Option<i64>> {
     let ts = conn.query_row("SELECT MAX(ts_ms) FROM requests", [], |row| {
         row.get::<_, Option<i64>>(0)

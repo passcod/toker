@@ -24,8 +24,9 @@
 //!   last [`TAIL_BYTES`] are ever read, and only the few small records
 //!   wanted are parsed out of them, newest first.
 //! - [`Labels`]: the per-refresh cache — one read per session per
-//!   refresh, never per render (the reference re-resolved on every
-//!   2-second render; the tick is that render here).
+//!   display read, never per render or per tick (the reference
+//!   re-resolved on every 2-second render; here a read follows each
+//!   ledger change).
 //!
 //! Failure is always "no label": a missing transcript, an unreadable
 //! one, a tail with nothing usable — the view falls back to the session
@@ -362,12 +363,13 @@ pub(crate) fn short_dir(cwd: Option<&str>) -> Option<String> {
 /// startup, plus the per-refresh resolution cache.
 ///
 /// [`Labels::resolve`] reads a session's transcript tail at most once
-/// per refresh (the loop's display tick) and caches the answer — `None`
+/// per refresh (the loop's display read) and caches the answer — `None`
 /// included, so a session with no name is not re-probed per row —
-/// the reference dashboard's economics: a 2-second refresh re-reads each
-/// tail
-/// (a title that regenerates mid-session stays current) and never pays
-/// twice within one frame. [`Labels::start_refresh`] is that tick.
+/// the reference dashboard's economics: each refresh re-reads each
+/// tail (a title that regenerates mid-session stays current) and never
+/// pays twice within one frame. [`Labels::start_refresh`] is that
+/// read; the loop makes one per ledger change, and at least every
+/// 30 s.
 pub(crate) struct Labels {
     /// The `projects/` roots to look in, resolved once.
     roots: Vec<PathBuf>,
@@ -398,7 +400,7 @@ impl Labels {
         }
     }
 
-    /// A new display tick: the next [`Labels::resolve`] reads the
+    /// A new display read: the next [`Labels::resolve`] reads the
     /// transcripts again. Per-refresh, not per-render — the snapshot a
     /// refresh builds carries the labels, so the renders between ticks
     /// never touch the filesystem at all.

@@ -222,6 +222,19 @@ impl Store {
         ledger::latest_ts_ms(&*self.conn()?)
     }
 
+    /// SQLite's `PRAGMA data_version` on this store's one connection: a
+    /// counter that moves whenever ANOTHER connection — another
+    /// process included, WAL or not — commits to the database, and
+    /// never for this connection's own commits. The TUI polls it each
+    /// second and re-reads the window only when it moved; the value is
+    /// per-connection, which is why this lives on the store that owns
+    /// the connection rather than opening one per check.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn()?
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     /// The `/_toker/session` aggregate for one session id: the count and
     /// span of its measurement rows, token sums, the billed total, and
     /// the billed-cost breakdowns by serving provider and model (see
@@ -573,6 +586,44 @@ mod tests {
             "row persisted across reopen"
         );
         assert_eq!(user_version(&reopened), schema::MIGRATIONS.len() as i64);
+    }
+
+    /// The TUI's change check: `data_version` holds still with no
+    /// writes, moves when another connection to the same file commits
+    /// (the daemon is another process; a second store is the same
+    /// shape), and does not move for this connection's own writes.
+    #[test]
+    fn data_version_moves_only_for_another_connections_commits() {
+        let dir = std::env::temp_dir().join(format!(
+            "toker-data-version-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let path = dir.join("toker.db");
+        let reader = Store::open(&path).expect("open the reader");
+        let writer = Store::open(&path).expect("open the writer");
+
+        let before = reader.data_version().expect("version");
+        assert_eq!(
+            reader.data_version().expect("version"),
+            before,
+            "moved idle"
+        );
+
+        writer.record_request(&bare_row(1_000)).expect("record");
+        let after = reader.data_version().expect("version");
+        assert_ne!(after, before, "another connection's commit went unseen");
+        assert_eq!(reader.data_version().expect("version"), after);
+
+        reader.record_request(&bare_row(2_000)).expect("record");
+        assert_eq!(
+            reader.data_version().expect("version"),
+            after,
+            "its own commit moved it"
+        );
+        drop((reader, writer));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
