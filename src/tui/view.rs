@@ -14,7 +14,7 @@
 //! │ table, sheds rightmost columns when the terminal narrows          │
 //! └────────────────────────────────────────────────────────────────────┘
 //! ┌ SPEND ─────────────┐ ┌ RATE & QUOTA ──────────────────────────────┐
-//! │ billed             │ │ 0.6/min  ▁▂▃█  errors: 0 · drift: 0        │
+//! │ billed             │ │ requests ▁▂··▃█ 0.6/min  1 error           │
 //! │ breakdown          │ │ 5-hour   ██░░░░  12%  resets 14:53 · on track
 //! │ no cost data: N    │ │ 7-day    ██████░  74%  resets Mon 05:00 · stops ~Thu 08:49
 //! └─────────────────────┘ │ overage  ██████░  64%  resets 1 Oct · estimating
@@ -354,7 +354,7 @@ fn rebuilds_lines(snap: &Snapshot) -> usize {
 /// panels shed their rows first ([`middle_heights`]) and the bottom
 /// strip is pinned at whatever it needs.
 fn bottom_height(snap: &Snapshot) -> u16 {
-    let mut lines = 3; // per-minute, sparkline, errors/drift
+    let mut lines = 1; // the requests line
     if let Some(quota) = &snap.quota {
         lines += quota.meters.len();
         if quota.spent_today.is_some() {
@@ -1240,45 +1240,14 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// RATE & QUOTA: requests per minute, the per-minute sparkline (minutes
-/// with errors flagged in red), the error/drift counters — and, when the
+/// RATE & QUOTA: the requests line (see [`requests_line`]) — and, when the
 /// snapshot carries a quota section, the plan's own meters with their
 /// reset clocks and forecasts, the `spent` line, and the `binding`
 /// claim (the reference's RATE & QUOTA block).
 fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone, fmt: &Fmt) {
     let block = Block::bordered().title_top("RATE & QUOTA");
     let inner = block.inner(area);
-    let mut lines = vec![Line::from(format!("{:.1}/min", snap.rate.per_minute))];
-
-    let buckets = &snap.rate.buckets;
-    let max = buckets.iter().map(|b| b.requests).max().unwrap_or(0);
-    // Keep the newest buckets when the terminal is too narrow for the
-    // whole window.
-    let shown = buckets.len().min(inner.width as usize);
-    let spans: Vec<Span> = buckets[buckets.len() - shown..]
-        .iter()
-        .map(|bucket| {
-            let block_char = if bucket.requests == 0 {
-                " "
-            } else {
-                let level = (bucket.requests * BLOCKS.len()).div_ceil(max);
-                BLOCKS[(level - 1).min(BLOCKS.len() - 1)]
-            };
-            if bucket.errors > 0 {
-                Span::styled(
-                    block_char,
-                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw(block_char)
-            }
-        })
-        .collect();
-    lines.push(Line::from(spans));
-    lines.push(Line::from(format!(
-        "errors: {} · drift: {}",
-        snap.errors, snap.drift
-    )));
+    let mut lines = vec![requests_line(snap, inner.width as usize)];
 
     // The quota lines: absent when the section is absent — an openai
     // window has no quota meters and no quota lines (the per-backend
@@ -1302,6 +1271,75 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone, fm
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` and
+/// `N drift` in red only when there are any — a zero would be a line of
+/// noise on every quiet frame. The sparkline spans the WHOLE window at
+/// any width: the minute buckets fold into fewer, wider ones (the
+/// reference's `min(40, max(10, W − 40))`), where the old line cut to
+/// the newest minutes and silently dropped the rest. An empty bucket is
+/// a dim `·`, so a quiet stretch reads as quiet rather than as a gap,
+/// and a bucket holding an error is red.
+fn requests_line(snap: &Snapshot, width: usize) -> Line<'static> {
+    let label = format!("  {:<9}", "requests");
+    let rate = format!(" {:.1}/min", snap.rate.per_minute);
+    let mut tail = Vec::new();
+    let red = Style::new().fg(Color::Red);
+    if snap.errors > 0 {
+        let s = if snap.errors == 1 { "" } else { "s" };
+        tail.push(Span::styled(format!("  {} error{s}", snap.errors), red));
+    }
+    if snap.drift > 0 {
+        tail.push(Span::styled(format!("  {} drift", snap.drift), red));
+    }
+    let fixed = label.width() + rate.width() + tail.iter().map(Span::width).sum::<usize>();
+
+    let minutes = &snap.rate.buckets;
+    let count = width
+        .saturating_sub(40)
+        .clamp(10, 40)
+        .min(minutes.len())
+        .min(width.saturating_sub(fixed));
+    let mut spans = vec![Span::raw(label)];
+    if count > 0 {
+        let folded = fold_buckets(minutes, count);
+        let max = folded.iter().map(|b| b.requests).max().unwrap_or(0);
+        spans.extend(folded.iter().map(|bucket| {
+            let glyph = if bucket.requests == 0 {
+                "·"
+            } else {
+                let level = (bucket.requests * BLOCKS.len()).div_ceil(max);
+                BLOCKS[(level - 1).min(BLOCKS.len() - 1)]
+            };
+            if bucket.errors > 0 {
+                Span::styled(glyph, red.add_modifier(Modifier::BOLD))
+            } else if bucket.requests == 0 {
+                Span::styled(glyph, Style::new().dim())
+            } else {
+                Span::raw(glyph)
+            }
+        }));
+    }
+    spans.push(Span::raw(rate));
+    spans.extend(tail);
+    Line::from(spans)
+}
+
+/// The window's minute buckets folded into `count` wider ones, oldest
+/// first: minute `i` of `n` lands in bucket `i × count / n`, the
+/// reference's time-to-bucket mapping at minute resolution.
+fn fold_buckets(
+    minutes: &[super::model::MinuteBucket],
+    count: usize,
+) -> Vec<super::model::MinuteBucket> {
+    let mut folded = vec![super::model::MinuteBucket::default(); count];
+    for (i, minute) in minutes.iter().enumerate() {
+        let bucket = &mut folded[i * count / minutes.len()];
+        bucket.requests += minute.requests;
+        bucket.errors += minute.errors;
+    }
+    folded
 }
 
 /// One meter line (the reference dashboard's exact line shape): the
@@ -1604,12 +1642,13 @@ mod tests {
     use crate::store::RowKind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier, Style};
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
 
     use super::super::labels::Label;
     use super::super::locale::Fmt;
+    use super::BLOCKS;
 
     const NOW: i64 = 1_769_000_000_000;
     const MIN: i64 = 60_000;
@@ -1955,14 +1994,87 @@ mod tests {
             "no cost data: 37 reqs",
             "$0.002130",
             "openrouter · z-ai/glm-5.3",
-            "errors: 1",
-            "drift: 0",
+            "1 error",
         ] {
             assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
         }
+        // A zero counter is noise on every quiet frame: absent.
+        assert!(!text.contains("drift"), "no zero drift in:\n{text}");
         // The per-minute ramp: counts 1..8 in consecutive minutes render
-        // as the full block ladder.
-        assert!(text.contains("▁▂▃▄▅▆▇█"), "sparkline ramp in:\n{text}");
+        // as the full block ladder once the panel has a bucket per
+        // minute (200 columns: 30 buckets for the 30-minute window).
+        let wide = rendered(&snapshot(), 200, 30);
+        assert!(wide.contains("▁▂▃▄▅▆▇█"), "sparkline ramp in:\n{wide}");
+    }
+
+    /// The requests line's text and the style of each of its cells.
+    fn requests_spans(snap: &model::Snapshot, width: usize) -> (String, Vec<(String, Style)>) {
+        let line = super::requests_line(snap, width);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let spans = line
+            .spans
+            .iter()
+            .map(|span| (span.content.to_string(), span.style))
+            .collect();
+        (text, spans)
+    }
+
+    #[test]
+    fn the_requests_line_folds_the_whole_window_into_its_width() {
+        let snap = snapshot();
+        // 98 cells: min(40, 98 − 40) = 40 buckets, capped at the
+        // window's 30 minutes — a bucket a minute, oldest first.
+        let (text, spans) = requests_spans(&snap, 98);
+        assert!(text.starts_with("  requests "), "{text:?}");
+        assert!(text.contains("▁▂▃▄▅▆▇█"), "{text:?}");
+        assert!(text.contains(" 1.3/min  1 error"), "{text:?}");
+        let sparkline: Vec<&(String, Style)> = spans[1..31].iter().collect();
+        assert_eq!(sparkline.len(), 30);
+        // Empty minutes are a dim dot, not a blank.
+        assert_eq!(sparkline[0].0, "·");
+        assert!(sparkline[0].1.add_modifier.contains(Modifier::DIM));
+        // The error row's minute is flagged red.
+        assert!(
+            sparkline
+                .iter()
+                .any(|(_, style)| style.fg == Some(Color::Red)),
+            "{spans:?}"
+        );
+
+        // 48 cells (a half strip at 100 columns): the floor of ten
+        // buckets, each three minutes wide — the whole window still,
+        // never only its newest ten minutes.
+        let (text, _) = requests_spans(&snap, 48);
+        let dots: String = text
+            .trim_start_matches("  requests ")
+            .chars()
+            .take_while(|ch| *ch == '·' || BLOCKS.contains(&ch.to_string().as_str()))
+            .collect();
+        assert_eq!(dots.chars().count(), 10, "{text:?}");
+        // The oldest twenty minutes are empty; the newest ten hold the
+        // ramp, folded.
+        assert!(dots.starts_with("·······"), "{text:?}");
+        assert!(!dots.ends_with('·'), "{text:?}");
+    }
+
+    #[test]
+    fn the_requests_line_names_errors_and_drift_only_when_present() {
+        let mut snap = snapshot();
+        snap.errors = 0;
+        let (text, _) = requests_spans(&snap, 98);
+        assert!(!text.contains("error"), "{text:?}");
+        assert!(!text.contains("drift"), "{text:?}");
+        snap.errors = 2;
+        snap.drift = 3;
+        let (text, spans) = requests_spans(&snap, 98);
+        assert!(text.ends_with("/min  2 errors  3 drift"), "{text:?}");
+        for (content, style) in spans.iter().rev().take(2) {
+            assert_eq!(style.fg, Some(Color::Red), "{content:?}");
+        }
     }
 
     #[test]
@@ -2318,8 +2430,8 @@ mod tests {
     fn an_unbilled_window_hides_spend_and_gives_quota_the_strip() {
         // The quota fixture is subscription-shaped: no row is billed,
         // so SPEND could only restate counts. RATE & QUOTA takes the
-        // whole width, and the strip is its natural height — three
-        // rate lines, three meters, spent, binding, and borders — not
+        // whole width, and the strip is its natural height — the
+        // requests line, three meters, spent, binding, and borders — not
         // the nine-row floor SPEND's breakdown needs.
         let snap = quota_snapshot();
         assert!(!snap.spend.carries_cost());
@@ -2329,10 +2441,10 @@ mod tests {
         let top = text.lines().nth(strip_top(&text)).expect("the top row");
         assert!(top.starts_with("┌RATE & QUOTA"), "{top}");
         assert!(top.ends_with('┐'), "{top}");
-        assert_eq!(text.lines().count() - strip_top(&text), 10, "{text}");
+        assert_eq!(text.lines().count() - strip_top(&text), 8, "{text}");
 
-        // With no quota section either, the strip is the rate panel's
-        // three lines and its borders.
+        // With no quota section either, the strip is the requests line
+        // and its borders.
         let mut unpriced = display_bare(NOW - 60_000);
         unpriced.session_id = Some("ses-x".into());
         unpriced.model = Some("claude-opus-5".into());
@@ -2351,7 +2463,7 @@ mod tests {
         assert_eq!(snap.spend.no_cost_data, 1);
         let text = rendered(&snap, 100, 30);
         assert!(!text.contains("SPEND"), "{text}");
-        assert_eq!(text.lines().count() - strip_top(&text), 5, "{text}");
+        assert_eq!(text.lines().count() - strip_top(&text), 3, "{text}");
     }
 
     #[test]
