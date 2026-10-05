@@ -751,7 +751,9 @@ impl ModelStore {
     }
 }
 
-/// [`ModelStore::merge`] over a bare store.
+/// [`ModelStore::merge`] over a bare store: the same validation and the
+/// same write, which the promote verb applies to the ledger directly when
+/// no server is listening to take the grant.
 pub fn merge_learned(
     store: &Store,
     incoming: &MergeIncoming,

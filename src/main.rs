@@ -43,6 +43,9 @@ enum Command {
         /// ceiling, and never declares context capacity.
         #[arg(long = "max-prompt")]
         max_prompt: Option<u64>,
+        /// Print what would be granted; change nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Run the ratatui dashboard (plan: TUI).
     Tui {
@@ -127,7 +130,8 @@ fn main() -> anyhow::Result<()> {
             model,
             days,
             max_prompt,
-        } => cmds::promote(model, days, max_prompt),
+            dry_run,
+        } => cmds::promote(model, days, max_prompt, dry_run),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Setup => cmds::setup(),
         Command::Status => cmds::status(),

@@ -2577,3 +2577,70 @@ async fn models_merge_endpoint_gates_and_validates_the_body() {
         );
     }
 }
+
+#[tokio::test]
+async fn promote_hands_the_grant_to_a_running_server() {
+    let (_mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, None, "anthropic_sub");
+    let db = config.db_path.clone();
+    let (addr, store) = spawn_toker(config).await;
+    let incumbent_days: Vec<String> = (0..9).map(|i| format!("2026-09-2{i}")).collect();
+    let incumbent_refs: Vec<&str> = incumbent_days.iter().map(String::as_str).collect();
+    store
+        .upsert_model(&toker::store::ModelEntry {
+            model_id: "claude-opus-5".to_owned(),
+            days_json: Some(json!(incumbent_refs)),
+            max_prompt: Some(480_000),
+            context_window_json: None,
+        })
+        .expect("upsert incumbent");
+    store
+        .upsert_model(&toker::store::ModelEntry {
+            model_id: "claude-opus-5-5".to_owned(),
+            days_json: Some(json!(["2026-09-28"])),
+            max_prompt: Some(4_000),
+            context_window_json: None,
+        })
+        .expect("upsert newcomer");
+
+    let mut out = Vec::new();
+    toker::cmds::promote_run(
+        &db,
+        addr.port(),
+        &toker::cmds::PromoteOpts {
+            model: "claude-opus-5-5".to_owned(),
+            days: None,
+            max_prompt: None,
+            dry_run: false,
+        },
+        &mut out,
+    )
+    .await
+    .expect("promotes through the server");
+    let report = String::from_utf8(out).expect("utf-8");
+    assert!(
+        report.contains("merged into the running server"),
+        "{report}"
+    );
+    assert!(
+        report.contains("opus now rewrites to claude-opus-5-5"),
+        "{report}"
+    );
+    // The bar at nine active days is 4.5, so the grant is five days, all
+    // of them held; the ceiling is the family's best.
+    let entry = store
+        .load_model("claude-opus-5-5")
+        .expect("load")
+        .expect("entry");
+    assert_eq!(
+        entry.days_json,
+        Some(json!([
+            "2026-09-24",
+            "2026-09-25",
+            "2026-09-26",
+            "2026-09-27",
+            "2026-09-28"
+        ]))
+    );
+    assert_eq!(entry.max_prompt, Some(480_000));
+}
