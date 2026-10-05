@@ -657,4 +657,50 @@ version_probe = false
             "no login in the scratch dir → no bearer (the request goes up cleanly and fails into the fallback)"
         );
     }
+
+    /// The mark before sending names what toker sent; the response may name
+    /// another identity (a host alias, an upstream substitution), and
+    /// recency must follow what actually served — as the predecessor's
+    /// every-row mark did.
+    #[test]
+    fn a_recorded_response_marks_the_model_it_named_as_served() {
+        use crate::server::record_anthropic::{AnthropicRecordCtx, record_anthropic_measurement};
+        let dir = crate::setup::test_dir("served-mark");
+        let server = server(&dir);
+        let ctx = AnthropicRecordCtx {
+            server: server.clone(),
+            started: std::time::Instant::now(),
+            path: "/v1/messages",
+            session_id: None,
+            requested_model: Some("claude-opus-5".to_owned()),
+            effective_model: Some("claude-opus-5".to_owned()),
+            drift: None,
+            backend: server.default_anthropic().clone(),
+            betas: None,
+            shape: None,
+            ping: false,
+            downgraded_from: None,
+            downgraded_to: None,
+            cache_stripped: None,
+            system_merged: None,
+            forced_from: None,
+            forced_to: None,
+            model_mappings: None,
+        };
+        let mut observer = crate::observe::AnthropicObserver::new();
+        observer.observe_json(
+            br#"{"type":"message","model":"claude-sonnet-5","usage":{"input_tokens":3,"output_tokens":1}}"#,
+        );
+        assert_eq!(server.models.last_served("claude-sonnet-5"), None);
+        record_anthropic_measurement(&ctx, observer.finish().as_ref(), None, 200);
+        assert!(
+            server.models.last_served("claude-sonnet-5").is_some(),
+            "the served identity is marked from the response"
+        );
+        assert_eq!(
+            server.models.last_served("claude-opus-5"),
+            None,
+            "the sent identity is not what the row marks"
+        );
+    }
 }

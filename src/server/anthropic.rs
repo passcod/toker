@@ -882,7 +882,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Not after: a lane deciding while this one is still in flight must see
     // the final effective model as in use. The response may later name a
     // different served identity; that remains authoritative for
-    // observations and accounting. In-memory and infallible, like an
+    // observations and accounting, and the row's insert marks it served
+    // too (`record_anthropic::insert`). In-memory and infallible, like an
     // in-memory map. Gated to the exact `/v1/messages` path.
     if path == "/v1/messages" {
         server.models.note_served(served_model.as_deref(), now_ms());

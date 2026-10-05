@@ -437,10 +437,21 @@ fn drift_note(ctx: &RecordCtx) -> String {
 
 /// Insert one row; a store failure loses the row, never the request
 /// (invariant 6) — it is logged as the visible breakage it is.
+///
+/// Every row the API answered also marks its model served, on the
+/// identity the RESPONSE named (the predecessor's `appendRow` did this
+/// for every row). The mark before sending covers a lane deciding while
+/// this request is in flight; this one covers what the upstream actually
+/// served, which a host-side alias or an upstream substitution can make
+/// differ from what was sent — and recency must follow the served
+/// identity. In-memory and infallible, so it cannot cost the row.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
+    ctx.server
+        .models
+        .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
 }
 
 /// The normalized token buckets from one capture (see the module docs for
