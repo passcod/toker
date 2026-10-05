@@ -179,6 +179,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     let status = upstream.status();
     let meter_snapshot = backend.meters(upstream.headers());
     if let Some(snapshot) = &meter_snapshot {
+        server.note_quota(backend.id(), snapshot);
         let row = crate::store::MetersSnapshot {
             updated_ms: now_ms(),
             snapshot: snapshot.clone(),

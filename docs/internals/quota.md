@@ -83,3 +83,26 @@ only for a reported reset, so there is no unknown-reset row to keep; a reset far
 in the future is kept. The gate reads one session's rows by primary key
 (`Store::load_session_allowances`) rather than the whole table, so neither the
 table's size nor the prune's cadence lands on the request path.
+
+## Console events
+
+The service logs a quota event when a meter-source backend's reading crosses
+80%, 90% or 100% of its short window (`info`, then `warn` at 100%), when the
+binding claim changes (`warn`, with the overage utilisation), and when the set
+of per-window statuses other than `allowed` changes to a non-empty one
+(`warn`). That is ctp's `noteQuota`, read with `journalctl --user -u toker`;
+`server/quota_events.rs` has it. Each fires once: a threshold re-arms when the
+window's reset changes or utilisation drops below 50%, and a status set is
+announced once per distinct set. The statuses are not enumerated: ctp had only
+seen `allowed`, and the ledger has since recorded `allowed_warning` and
+`rejected`. Replayed over the ledger's month of anthropic_sub readings, the
+rules produce about five events a day.
+
+The latches are in memory, one per backend. ctp started each process with them
+empty, so a restart at 85% announced 80% again. toker seeds a backend's latch
+from the meter snapshot the store kept from the previous process, read on the
+first reading after a restart and before that reading replaces it, so a restart
+repeats nothing already said about the same window. A stored snapshot whose
+window has ended seeds only the claim. A reading that carries no status at all
+leaves the status latch alone, where ctp cleared it and re-announced the same
+set on the next reading that had one.

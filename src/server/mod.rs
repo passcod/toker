@@ -61,6 +61,7 @@ pub(crate) mod anthropic;
 pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod proxy;
+pub(crate) mod quota_events;
 mod record;
 mod record_anthropic;
 
@@ -164,6 +165,9 @@ pub struct Server {
     pub(crate) awake: Option<Arc<Mutex<AwakeState>>>,
     /// Process start, for `/_toker/status` uptime.
     pub(crate) started: Instant,
+    /// The console quota events' per-backend latches (see
+    /// [`quota_events`]).
+    pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
 }
 
 impl Server {
@@ -280,7 +284,34 @@ impl Server {
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
             started: Instant::now(),
+            quota_events: Arc::default(),
         })
+    }
+
+    /// Announce what one response's meter snapshot says about its
+    /// backend's quota (see [`quota_events`]). Call it before the
+    /// snapshot is saved: the first reading after a restart seeds its
+    /// latch from the one the store still holds. Never fails and never
+    /// panics out (invariant 3): a lost announcement is the worst case.
+    pub(crate) fn note_quota(&self, backend: &str, snapshot: &serde_json::Value) {
+        let announced = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let prior = || match self.store.load_meters(backend) {
+                Ok(stored) => stored.map(|stored| stored.snapshot),
+                Err(error) => {
+                    tracing::error!(%error, "meter snapshot load for the quota latch failed");
+                    None
+                }
+            };
+            for event in self
+                .quota_events
+                .note(backend, snapshot, prior, record::now_ms())
+            {
+                quota_events::emit(backend, &event);
+            }
+        }));
+        if announced.is_err() {
+            tracing::error!("quota event check panicked");
+        }
     }
 
     /// Replace the upstream idle timeout ([`UPSTREAM_IDLE_TIMEOUT`] by

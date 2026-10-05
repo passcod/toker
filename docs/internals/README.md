@@ -35,6 +35,7 @@ plan](../plans/cutover.md).
 | `src/server/anthropic.rs` | The Anthropic Messages frontend: release marker, quota gate, cold gate, compaction retarget, force-newest, model map, in that order. |
 | `src/server/proxy.rs` | The OpenAI-chat frontend (opencode → openrouter), with its own cold notice. |
 | `src/server/codex.rs` | The anthropic frontend's branch onto the codex backend: translate both ways instead of forwarding bytes. |
+| `src/server/quota_events.rs` | Console quota events: threshold crossings, claim changes and non-`allowed` statuses, latched per backend. |
 | `src/server/control.rs` | The `/_toker/*` control endpoints and their header gate. |
 | `src/server/record.rs`, `record_anthropic.rs` | Row assembly at stream completion; store errors are logged, never raised. |
 | `src/ir/` | The request IR: a `serde_json::Value` with typed views per protocol (`anthropic.rs`, `openai_chat.rs`), the canonical IR for cross-protocol routes (`canonical.rs`), and the per-request fidelity check (`fidelity.rs`). |

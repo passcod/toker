@@ -1179,6 +1179,7 @@ async fn forward_response(
     // backend has meters to report (the sub; the API's RPM headers are
     // not quota meters and must not overwrite the gate's snapshot).
     if let Some(meters) = backend.meters(&upstream_headers) {
+        server.note_quota(backend.id(), &meters);
         let snapshot = MetersSnapshot {
             updated_ms: now_ms(),
             snapshot: meters,
