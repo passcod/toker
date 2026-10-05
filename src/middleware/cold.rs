@@ -1940,9 +1940,9 @@ pub struct ColdBlocking;
 impl ColdBlocking {
     /// The text the user sees — the whole interface of this feature.
     ///
-    /// Bracketed and third-person for the same reason the quota block
-    /// notice is: the client already injects notices of that shape, so the
-    /// model reads one as harness output rather than its own words.
+    /// Third-person and framed by its style (brackets only in the plain
+    /// style), for the same reason the quota block notice is: so the model
+    /// reads it as harness output rather than its own words.
     /// Written as a record of an event and stamped, because it is live for
     /// one turn and historical for the rest of the conversation. The
     /// options arrive as a markdown list, not a run-on line.

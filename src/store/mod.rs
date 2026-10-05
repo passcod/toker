@@ -55,8 +55,6 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("store mutex poisoned")]
-    MutexPoisoned,
     #[error("no data home: set XDG_DATA_HOME or HOME")]
     NoDataHome,
     #[error("unknown value {value:?} in column {column}")]
@@ -124,8 +122,18 @@ impl Store {
 
     /// The mutexed connection; every operation goes through this, so
     /// writes are ordered and no statement interleaves with another.
+    ///
+    /// A poisoned lock is recovered, not reported: recording swallows
+    /// store errors, so treating poison as one would leave the ledger dark
+    /// until a restart after any panic that happened while the lock was
+    /// held. The connection itself is consistent either way: every
+    /// statement is complete or not run, and a transaction dropped by the
+    /// unwind rolls back.
     fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| Error::MutexPoisoned)
+        Ok(self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
     }
 
     /// Append one request row. The only `requests` writer; there is no
@@ -727,6 +735,27 @@ mod tests {
             "window past the newest row is empty"
         );
         assert_eq!(store.count_requests().expect("count"), 5);
+    }
+
+    #[test]
+    fn a_panic_under_the_lock_does_not_darken_the_ledger() {
+        // Recording swallows store errors, so a poisoned lock reported as
+        // an error would stop every later row, silently, until a restart.
+        let store = mem_store();
+        std::thread::scope(|scope| {
+            let poisoned = scope
+                .spawn(|| {
+                    let _held = store.conn.lock().expect("lock");
+                    panic!("a panic while the store lock is held");
+                })
+                .join();
+            assert!(poisoned.is_err());
+        });
+        assert!(store.conn.is_poisoned());
+        store
+            .record_request(&bare_row(100))
+            .expect("records after poison");
+        assert_eq!(store.latest_ts_ms().expect("latest"), Some(100));
     }
 
     #[test]

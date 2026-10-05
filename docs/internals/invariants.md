@@ -53,10 +53,12 @@ reasons.
 
    Rust changes the failure mode, not the rule. A panic in a handler is
    contained to that connection's task rather than the process, but it still
-   drops that client's response. Worse, a panic while the store's mutex is held
-   poisons it, and `Store::conn` then answers `MutexPoisoned` to every later
-   call: the ledger goes dark until a restart, quietly, because recording
-   swallows store errors by design. So the observers are infallible by
+   drops that client's response. A panic while the store's mutex is held
+   poisons it; `Store::conn` used to answer every later call with an error,
+   which left the ledger dark until a restart, quietly, because recording
+   swallows store errors by design. It now recovers the guard (a dropped
+   transaction rolls back, so the connection stays consistent). Still, the
+   observers are infallible by
    construction and also run under `catch_unwind` (`observe_chunk` in
    `server/anthropic.rs`, the same in `server/proxy.rs`), the sleep-lock
    evaluation runs under one too, and recording logs a store error and moves on.

@@ -12,12 +12,11 @@
 //! **Status:** the pure decision interface, ported and pinned by the
 //! vendored `route-identity` parity case (the fixture vendored at
 //! `tests/fixtures/ctp/node-reference-v1.json`, driven by
-//! `tests/node_reference_parity.rs`). Config and the server's
-//! final routing stage are the model-routing unit's; until it lands,
-//! [`crate::middleware::force_newest`] consults nothing here (the
-//! predecessor previews
-//! the map before its served-recency lookup — with no map configured that
-//! preview is the identity, which is what the force decision assumes).
+//! `tests/node_reference_parity.rs`). The server applies the map as the
+//! final routing stage, and [`crate::middleware::force_newest`] previews
+//! it through `ForceContext::served_as` before its served-recency lookup,
+//! as the predecessor did (with no map configured that preview is the
+//! identity).
 //!
 //! **Why a lexical tree, not a re-serialisation** (the predecessor's
 //! rationale,
