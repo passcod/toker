@@ -1620,8 +1620,8 @@ impl<'a> Wizard<'a> {
                     "  note: toker runs as a socket-activated systemd user service, so it sees \
                      only the user manager's environment, not your shell's. Put {name} in \
                      ~/.config/environment.d/*.conf (read at login), or run \
-                     `systemctl --user set-environment {name}=…`; then restart toker.service \
-                     for a running service to pick it up"
+                     `systemctl --user set-environment {name}=…`; then `toker restart` for a \
+                     running service to pick it up"
                 ))?;
                 Ok(KeyChoice::Env(name))
             }
