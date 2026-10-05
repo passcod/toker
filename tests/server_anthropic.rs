@@ -65,16 +65,20 @@ impl Default for MockState {
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
+    method: String,
     path: String,
+    query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 }
 
 impl MockState {
-    fn capture(&self, path: &str, headers: &HeaderMap, body: Bytes) {
+    fn capture(&self, parts: &axum::http::request::Parts, body: Bytes) {
         self.requests.lock().unwrap().push(CapturedRequest {
-            path: path.to_owned(),
-            headers: headers.clone(),
+            method: parts.method.to_string(),
+            path: parts.uri.path().to_owned(),
+            query: parts.uri.query().map(str::to_owned),
+            headers: parts.headers.clone(),
             body,
         });
     }
@@ -187,7 +191,7 @@ async fn read_and_capture(mock: &MockState, request: Request) -> (String, Header
         .await
         .expect("mock reads body");
     let path = parts.uri.path().to_owned();
-    mock.capture(&path, &parts.headers, body.clone());
+    mock.capture(&parts, body.clone());
     let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let stream = json.get("stream") == Some(&Value::Bool(true));
     (path, parts.headers, json, stream)
@@ -308,6 +312,20 @@ async fn mock_batches(State(mock): State<MockState>, request: Request) -> Respon
     response
 }
 
+/// Any path the mock's own route table does not name: a distinctive
+/// status and body, metered, so a test can see the pass-through carried
+/// the upstream's answer back unchanged.
+async fn mock_unmatched(State(mock): State<MockState>, request: Request) -> Response {
+    let (_path, _headers, _json, _stream) = read_and_capture(&mock, request).await;
+    let mut response = raw_response(
+        StatusCode::IM_A_TEAPOT,
+        "application/octet-stream",
+        Bytes::from_static(b"upstream-unmatched-body"),
+    );
+    metered(&mut response, "0.33");
+    response
+}
+
 /// An SSE body that yields one chunk then never completes, marking its
 /// Drop so the test can see the upstream abort.
 struct Hanging {
@@ -341,6 +359,7 @@ async fn spawn_mock() -> (MockState, reqwest::Url) {
         .route("/v1/messages/batches/{id}", get(mock_batches))
         .route("/v1/messages/batches/{id}/results", get(mock_batches))
         .route("/v1/messages/batches/{id}/cancel", post(mock_batches))
+        .fallback(mock_unmatched)
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1056,6 +1075,115 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
         .expect("meters")
         .expect("the background batch poll fed the meters");
     assert_eq!(meters.snapshot, expected_rate_limits("0.55"));
+}
+
+#[tokio::test]
+async fn unmatched_paths_pass_through_with_method_query_and_body() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // A method, path, and query toker's route table names nowhere, with
+    // a body that is not JSON: all of it reaches the upstream unchanged.
+    let body = b"\x00not json, never parsed\xff".as_slice();
+    let response = client()
+        .put(toker_url(addr, "/v1/files/file_123?beta=true&limit=2"))
+        .header(header::AUTHORIZATION, "Bearer claude-oauth-token")
+        .header("x-claude-code-session-id", "ccses-42")
+        .header("x-toker-session", "addressed-to-the-proxy")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("unmatched request");
+    assert_eq!(
+        response.status(),
+        StatusCode::IM_A_TEAPOT,
+        "the upstream's status comes back"
+    );
+    let bytes = response.bytes().await.expect("unmatched bytes");
+    assert_eq!(bytes.as_ref(), b"upstream-unmatched-body");
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    let forwarded = &captured[0];
+    assert_eq!(forwarded.method, "PUT");
+    assert_eq!(forwarded.path, "/v1/files/file_123");
+    assert_eq!(forwarded.query.as_deref(), Some("beta=true&limit=2"));
+    assert_eq!(
+        forwarded.body.as_ref(),
+        body,
+        "the body forwards byte-identical"
+    );
+    let header_of = |name: &str| {
+        forwarded
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        header_of("authorization").as_deref(),
+        Some("Bearer claude-oauth-token"),
+        "the client's credential passes through"
+    );
+    assert_eq!(
+        header_of("x-claude-code-session-id").as_deref(),
+        Some("ccses-42"),
+        "claude's session header rides upstream, as on every anthropic path"
+    );
+    assert_eq!(header_of("x-toker-session"), None, "x-toker-* never leaves");
+    assert_eq!(header_of("accept-encoding").as_deref(), Some("identity"));
+
+    // A bodiless GET passes through the same way.
+    let response = client()
+        .get(toker_url(addr, "/v1/organizations/usage?days=7"))
+        .send()
+        .await
+        .expect("unmatched get");
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    let captured = mock.captured();
+    assert_eq!(captured[1].method, "GET");
+    assert_eq!(captured[1].path, "/v1/organizations/usage");
+    assert_eq!(captured[1].query.as_deref(), Some("days=7"));
+    assert!(captured[1].body.is_empty());
+
+    // Not a usage path: no row. The meters still feed, as on every
+    // response from the meter source.
+    assert_no_rows(&store).await;
+    let meters = store
+        .load_meters("anthropic_sub")
+        .expect("meters")
+        .expect("the pass-through response fed the meters");
+    assert_eq!(meters.snapshot, expected_rate_limits("0.33"));
+}
+
+#[tokio::test]
+async fn unmatched_toker_paths_stay_local() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    for path in ["/_toker/unknown", "/_toker/status/extra", "/_toker"] {
+        let response = client()
+            .get(toker_url(addr, path))
+            .header(header::AUTHORIZATION, "Bearer claude-oauth-token")
+            .send()
+            .await
+            .expect("toker request");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    // A known control path with the wrong method is axum's 405, not the
+    // fallback's forward.
+    let response = client()
+        .post(toker_url(addr, "/_toker/status"))
+        .send()
+        .await
+        .expect("toker request");
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    assert!(
+        mock.captured().is_empty(),
+        "the control namespace never reaches the upstream"
+    );
 }
 
 #[tokio::test]

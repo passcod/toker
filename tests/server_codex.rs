@@ -669,3 +669,46 @@ async fn count_tokens_on_a_codex_route_answers_a_typed_error() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(store.requests_since(0, 100).expect("rows").is_empty());
 }
+
+#[tokio::test]
+async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "unmatched",
+        upstream,
+        login_dir("unmatched").join("auth.json"),
+        false,
+    ))
+    .await;
+
+    // An unmatched path: the codex backend serves no anthropic paths, so
+    // the answer is anthropic's own 404 shape, not a forward.
+    let response = client()
+        .get(format!("http://{addr}/v1/files?limit=2"))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value =
+        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
+    assert_eq!(error["error"]["type"], "not_found_error");
+
+    // A batch GET: the same typed error as batch creation on this
+    // backend.
+    let response = client()
+        .get(format!("http://{addr}/v1/messages/batches/batch_123"))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value =
+        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "nothing forwarded"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(store.requests_since(0, 100).expect("rows").is_empty());
+}

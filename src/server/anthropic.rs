@@ -25,6 +25,9 @@
 //!   were.
 //! - The batch-result GETs and cancel — transparent forwarding, like the
 //!   openai path's `/v1/models`: no recording, no observation.
+//! - Every path the route table does not match — the router's fallback,
+//!   transparent forwarding the same way ([`unmatched`]), except the
+//!   `/_toker/` namespace, which never leaves the proxy.
 //!
 //! The pipeline mirrors the openai chat path ([`super::proxy`]) step for
 //! step, with the anthropic observer ([`AnthropicObserver`]) riding the
@@ -124,6 +127,38 @@ pub(crate) async fn batches_results(State(server): State<Server>, request: Reque
 /// `POST /v1/messages/batches/{id}/cancel` — transparent forwarding: batch
 /// management, not a usage path.
 pub(crate) async fn batches_cancel(State(server): State<Server>, request: Request) -> Response {
+    transparent(server, request).await
+}
+
+/// Any request the route table does not match: forwarded transparently
+/// to the default anthropic backend, as the predecessor forwarded every
+/// path but its control path. Claude calls more of the API than the
+/// routes above name, and a 404 from the proxy for a path the upstream
+/// serves breaks the client for nothing. Like the batch GETs, nothing is
+/// recorded or observed (the body is never parsed); the meters still
+/// feed.
+///
+/// Two answers stay local. The `/_toker/` namespace is the proxy's own,
+/// so a path under it that matches no control route is a 404 here,
+/// never a request to the provider. And the codex backend translates
+/// Messages turns into the Responses dialect rather than serving
+/// anthropic paths, so an unknown path routed to it has nothing upstream
+/// to reach: it answers anthropic's own 404 shape instead of forwarding
+/// a request the backend could only reject, with codex's bearer
+/// attached.
+pub(crate) async fn unmatched(State(server): State<Server>, request: Request) -> Response {
+    let path = request.uri().path();
+    if path == "/_toker" || path.starts_with("/_toker/") {
+        return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
+    }
+    if server.default_anthropic().id() == "codex_sub" {
+        return codex::anthropic_error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "this backend serves only the Messages API",
+            false,
+        );
+    }
     transparent(server, request).await
 }
 
@@ -988,13 +1023,26 @@ fn compact_spec(gates: &GatesConfig) -> String {
         .unwrap_or_else(|| "sonnet".to_owned())
 }
 
-/// Transparent forwarding (the batch-result paths): routed to the default
+/// Transparent forwarding (the batch-result paths and every unmatched
+/// path): routed to the default
 /// anthropic backend, auth rules applied, bytes both ways untouched — no
 /// recording, no observation, like the openai `/v1/models` path. The
 /// meters still feed: a background batch poll is exactly the call the
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
 async fn transparent(server: Server, request: Request) -> Response {
+    let backend = server.default_anthropic().clone();
+    // The batch paths have no codex equivalent: the same typed error the
+    // usage path answers for count_tokens and batch creation, rather
+    // than an anthropic request sent to the codex upstream.
+    if backend.id() == "codex_sub" {
+        return codex::anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "this backend does not support count_tokens or batch requests",
+            false,
+        );
+    }
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
@@ -1006,7 +1054,6 @@ async fn transparent(server: Server, request: Request) -> Response {
             );
         }
     };
-    let backend = server.default_anthropic().clone();
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => forward_response(server, backend, upstream, None, None).await,
         Err(error) => {

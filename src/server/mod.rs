@@ -22,6 +22,10 @@
 //! - `GET /_toker/status`, `POST /_toker/models/merge`,
 //!   `GET /_toker/session` — the control endpoints, gated by a custom
 //!   header ([`control`]); `session` is the attribution plugin's query.
+//!   Any other `/_toker/` path is a local 404.
+//! - Every other path — transparent forwarding to the default anthropic
+//!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
+//!   everything but its control path.
 //!
 //! Timeouts: none. Axum applies no default request or idle timeout, so
 //! streams run as long as both ends keep the connection open — the plan's
@@ -327,6 +331,12 @@ impl Server {
             .route("/_toker/status", get(control::status))
             .route("/_toker/session", get(control::session))
             .route("/_toker/models/merge", post(control::models_merge))
+            // Everything else passes through to the default anthropic
+            // backend, as the predecessor forwarded every path but its
+            // control path. A known path with the wrong method still
+            // answers axum's 405: the fallback catches unmatched paths
+            // only, and every listed route is one whose methods are known.
+            .fallback(anthropic::unmatched)
             .with_state(self.clone())
     }
 
