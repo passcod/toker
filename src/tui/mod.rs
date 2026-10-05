@@ -1297,14 +1297,19 @@ mod tests {
             "the fresh listing answers"
         );
 
-        // A source that appears later is picked up independently; the
-        // anthropic presence list parses ids and answers no windows.
+        // A source that appears later is picked up independently, and
+        // both anthropic backends read the anthropic listing.
         write_cache(
             &dir,
             "anthropic",
             REWRITTEN_AT,
             &serde_json::json!({
-                "data": [{"type": "model", "id": "claude-opus-5", "display_name": "Claude Opus 5"}]
+                "data": [{
+                    "type": "model",
+                    "id": "claude-opus-5",
+                    "display_name": "Claude Opus 5",
+                    "max_input_tokens": 1_000_000
+                }]
             }),
         );
         caches.refresh();
@@ -1314,8 +1319,8 @@ mod tests {
                 caches
                     .catalogs()
                     .context_window_of(provider, "claude-opus-5"),
-                None,
-                "the presence list answers ids, never windows"
+                Some(1_000_000),
+                "{provider} reads the anthropic listing's max_input_tokens"
             );
         }
         assert_eq!(

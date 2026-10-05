@@ -18,11 +18,14 @@
 //!   cache discipline — on-disk JSON cache, 300 s TTL, ETag
 //!   revalidation — is the pattern this unit's cache follows, on a
 //!   dashboard's cadence instead of a client's).
-//! - anthropic: `GET {base}/v1/models` — `{data: [{id, display_name,
-//!   created_at, …}]}`. The listing carries **no context length**, so
-//!   the anthropic catalogue is a *presence list*: it records which
-//!   models exist, every window stays `None`, and the hand-verified
-//!   windows remain authoritative there.
+//! - anthropic: `GET {base}/v1/models?limit=1000` — `{data: [{id,
+//!   display_name, created_at, max_input_tokens, max_tokens,
+//!   capabilities, …}]}`. `max_input_tokens` is the context window.
+//!   Earlier versions of the listing carried no window at all, so this
+//!   catalogue was once a presence list; an entry whose
+//!   `max_input_tokens` is absent, null or zero (the documented example
+//!   shows `0`) still parses as presence only. The hand-verified
+//!   windows stay authoritative for the models they name.
 //!
 //! ## Precedence (the reconciliation rule)
 //!
@@ -87,7 +90,7 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// The cache sources, as named in their cache files and keyed into
 /// [`FetchedCatalogs`]: openrouter (the public listing), anthropic (the
-/// presence list both anthropic backends share), codex_sub (the codex
+/// listing both anthropic backends share), codex_sub (the codex
 /// backend's own models endpoint).
 pub const SOURCES: &[&str] = &["openrouter", "anthropic", "codex_sub"];
 
@@ -112,8 +115,8 @@ pub struct FetchedModel {
     /// the lookup key, byte-exact against what the ledger recorded.
     pub id: String,
     /// The model's context window in tokens, when the listing named
-    /// one. `None` for anthropic's presence list, and for any entry
-    /// whose window field was absent or not a positive number —
+    /// one. `None` for any entry whose window field was absent or not
+    /// a positive number (an anthropic presence-only entry included) —
     /// never a fabricated window.
     pub context_window: Option<u64>,
     /// The whole provider entry, verbatim: the "other interesting
@@ -173,7 +176,7 @@ impl FetchedCatalog {
     /// simply absent) or prices it at zero. `Some(false)` when a
     /// positive price is named. `None` when the model is unknown to the
     /// catalogue, its entry carries no `pricing` object to read at all
-    /// (anthropic's presence list, the codex listing), or its write
+    /// (the anthropic and codex listings), or its write
     /// price is present but will not parse — absence is never a free
     /// verdict (invariant 3): unknown reads as charged, the
     /// conservative direction for a gate that fires.
@@ -215,16 +218,15 @@ impl FetchedCatalogs {
     }
 
     /// The cache source whose listing covers a backend by provider id:
-    /// both anthropic backends share anthropic's presence list,
+    /// both anthropic backends share anthropic's listing,
     /// openrouter and codex_sub are their own. A provider with no
     /// source has no fetched catalogue at all.
     fn source_of(provider: &str) -> Option<&'static str> {
         match provider {
             "openrouter" => Some("openrouter"),
             "codex_sub" => Some("codex_sub"),
-            // One upstream listing covers both anthropic backends —
-            // and it carries no windows or prices either way (the
-            // presence list).
+            // One upstream listing covers both anthropic backends; it
+            // carries windows but no prices.
             "anthropic_sub" | "anthropic_api" => Some("anthropic"),
             _ => None,
         }
@@ -541,13 +543,12 @@ pub fn parse_codex(response: &Value, fetched_at_ms: i64) -> anyhow::Result<Fetch
 }
 
 /// Parse anthropic's `GET /v1/models` listing: `{data: [{type: "model",
-/// id, display_name, created_at, …}]}` (the documented List Models
-/// shape; field names as the vendored protocol knowledge carries
-/// them). The listing carries **no context length** — this is a
-/// presence list: ids parse, every window stays `None`, and the
-/// hand-verified windows stay authoritative for anthropic. One page is
-/// parsed; pagination (`has_more`) is deliberately not followed — a
-/// presence list without windows has nothing to paginate for.
+/// id, display_name, created_at, max_input_tokens, max_tokens, …}]}`
+/// (the documented List Models shape). `max_input_tokens` is the
+/// window; an entry without a positive one is presence only, never a
+/// guessed window. One page is parsed: the source asks for the API's
+/// maximum page of 1000, far above anthropic's model count, so
+/// `has_more` is not followed.
 pub fn parse_anthropic(response: &Value, fetched_at_ms: i64) -> anyhow::Result<FetchedCatalog> {
     let data = response
         .get("data")
@@ -559,7 +560,7 @@ pub fn parse_anthropic(response: &Value, fetched_at_ms: i64) -> anyhow::Result<F
             let id = entry.get("id").and_then(Value::as_str)?;
             Some(FetchedModel {
                 id: id.to_owned(),
-                context_window: None,
+                context_window: window_at(entry, "max_input_tokens"),
                 raw: entry.clone(),
             })
         })
@@ -704,8 +705,10 @@ mod tests {
     }
 
     /// Anthropic's documented List Models shape: `{data: [{type:
-    /// "model", id, display_name, created_at}], has_more, first_id,
-    /// last_id}` — and NO context length anywhere.
+    /// "model", id, display_name, created_at, max_input_tokens,
+    /// max_tokens}], has_more, first_id, last_id}` (capabilities
+    /// elided). The second entry is the listing's older shape, with no
+    /// window field at all.
     fn anthropic_listing() -> Value {
         json!({
             "data": [
@@ -713,7 +716,9 @@ mod tests {
                     "type": "model",
                     "id": "claude-opus-4-5-20251101",
                     "display_name": "Claude Opus 4.5 (new)",
-                    "created_at": "2025-11-01T00:00:00Z"
+                    "created_at": "2025-11-01T00:00:00Z",
+                    "max_input_tokens": 200_000,
+                    "max_tokens": 64_000
                 },
                 {
                     "type": "model",
@@ -792,28 +797,42 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_is_a_presence_list_with_no_windows() {
+    fn anthropic_takes_max_input_tokens_as_the_window() {
         let catalog = parse_anthropic(&anthropic_listing(), NOW).expect("parse");
         let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929"]
         );
-        for model in &catalog.models {
-            assert_eq!(
-                model.context_window, None,
-                "the anthropic listing carries no context length — {} is presence only",
-                model.id
-            );
-        }
+        assert_eq!(
+            catalog.context_window_of("claude-opus-4-5-20251101"),
+            Some(200_000),
+            "max_input_tokens is the window, not max_tokens"
+        );
+        assert_eq!(
+            catalog.context_window_of("claude-sonnet-4-5-20250929"),
+            None,
+            "an entry in the older shape is presence only"
+        );
         assert_eq!(
             catalog.models[0].raw["display_name"], "Claude Opus 4.5 (new)",
             "raw kept for a later consumer"
         );
-        // Presence can never answer a ceiling — not for the listed
-        // ids, and not for anything else.
-        assert_eq!(catalog.context_window_of("claude-opus-4-5-20251101"), None);
+        // An unlisted id answers nothing.
         assert_eq!(catalog.context_window_of("claude-opus-5"), None);
+
+        // The documented example answers `0` for both limits, and the
+        // field is nullable: neither is a window.
+        let listing = json!({"data": [
+            {"id": "zero", "max_input_tokens": 0},
+            {"id": "null", "max_input_tokens": null},
+            {"id": "str", "max_input_tokens": "1000000"}
+        ]});
+        let catalog = parse_anthropic(&listing, NOW).expect("parse");
+        assert_eq!(catalog.models.len(), 3, "presence entries still parse");
+        for model in &catalog.models {
+            assert_eq!(model.context_window, None, "{} has no window", model.id);
+        }
     }
 
     /// A pricing-shaped openrouter listing for the cache-write rule:
@@ -913,8 +932,8 @@ mod tests {
         );
 
         // An entry with no pricing object says nothing about prices:
-        // unknown, never free — the anthropic presence list is exactly
-        // this shape, and anthropic does charge for cache writes.
+        // unknown, never free — the anthropic listing is exactly this
+        // shape, and anthropic does charge for cache writes.
         assert_eq!(catalog.cache_writes_free("unpriced/model"), None);
         assert_eq!(catalog.cache_writes_free("presence/only"), None);
 
@@ -950,14 +969,14 @@ mod tests {
             catalogs.cache_writes_free("openrouter", "openai/gpt-5.6-sol"),
             Some(false)
         );
-        // Both anthropic backends share the presence list, which carries
-        // no pricing object: unknown, never free — so the anthropic cold
+        // Both anthropic backends share one listing, which carries no
+        // pricing object: unknown, never free — so the anthropic cold
         // gate keeps firing for claude models against the real listing.
         for provider in ["anthropic_sub", "anthropic_api"] {
             assert_eq!(
                 catalogs.cache_writes_free(provider, "claude-opus-4-5-20251101"),
                 None,
-                "a presence entry has no prices to read"
+                "an anthropic entry has no prices to read"
             );
         }
         // A provider with no catalogue, and per-source isolation: a
@@ -1030,14 +1049,13 @@ mod tests {
                 }],
             },
         );
-        // The anthropic presence list: ids, no windows.
         catalogs.set(
             "anthropic",
             FetchedCatalog {
                 fetched_at_ms: NOW,
                 models: vec![FetchedModel {
                     id: "claude-opus-4-5-20251101".to_owned(),
-                    context_window: None,
+                    context_window: Some(200_000),
                     raw: json!({"id": "claude-opus-4-5-20251101"}),
                 }],
             },
@@ -1051,14 +1069,12 @@ mod tests {
             catalogs.context_window_of("codex_sub", "gpt-6-terra"),
             Some(200_000)
         );
-        // Both anthropic backends share the presence list: ids resolve,
-        // windows never do — the hand-verified catalogue stays
-        // authoritative there.
+        // Both anthropic backends share the one anthropic listing.
         for provider in ["anthropic_sub", "anthropic_api"] {
             assert_eq!(
                 catalogs.context_window_of(provider, "claude-opus-4-5-20251101"),
-                None,
-                "the presence list has no window to give"
+                Some(200_000),
+                "{provider} reads the shared anthropic listing"
             );
         }
         // A provider with no catalogue (unwired, or a serving-provider

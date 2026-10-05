@@ -802,7 +802,7 @@ async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet()
         .expect("the map parses");
     // The backend's fetched catalogue: an entry whose pricing object is
     // itemised with the write price OMITTED — the documented free
-    // signal. The real anthropic presence list carries no pricing at
+    // signal. The real anthropic listing carries no pricing at
     // all (unknown → the gate fires), so this fixture is the
     // cross-protocol wiring the exemption exists for.
     let catalog = toker::catalog::FetchedCatalog {

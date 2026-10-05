@@ -2044,15 +2044,14 @@ mod tests {
                 }],
             },
         );
-        // The anthropic presence list: ids, never windows.
         catalogs.set(
             "anthropic",
             FetchedCatalog {
                 fetched_at_ms: NOW,
                 models: vec![FetchedModel {
-                    id: "claude-opus-5".to_owned(),
-                    context_window: None,
-                    raw: json!({"id": "claude-opus-5"}),
+                    id: "claude-opus-6".to_owned(),
+                    context_window: Some(1_000_000),
+                    raw: json!({"id": "claude-opus-6", "max_input_tokens": 1_000_000}),
                 }],
             },
         );
@@ -2062,9 +2061,8 @@ mod tests {
         // - openrouter row on a catalogued claude id → hand-verified wins;
         // - codex_sub row on an uncatalogued codex slug → its listing;
         // - the same slug on openrouter (not listed there) → unknown;
-        // - anthropic row on an uncatalogued claude id → the presence
-        //   list has no window → unknown (hand-verified stays
-        //   authoritative);
+        // - anthropic row on an uncatalogued claude id → the anthropic
+        //   listing's window;
         // - an openrouter row whose model survived but whose naming
         //   row carried no provider → no catalogue consulted.
         let mut glm = display_bare(mins_ago(6));
@@ -2138,8 +2136,8 @@ mod tests {
         );
         assert_eq!(
             ctx_of("ses-future-claude"),
-            ContextWindow::Unknown,
-            "the anthropic presence list has no window to give — the hand-verified catalogue stays authoritative there"
+            ContextWindow::Declared { tokens: 1_000_000 },
+            "a claude model the hand-verified catalogue does not know takes the anthropic listing's window"
         );
         assert_eq!(
             ctx_of("ses-providerless"),
