@@ -107,10 +107,6 @@ The importer counts every ctp field it does not map, by name, split into fields
 left out on purpose and fields it has never heard of; an unknown one means the
 mapping is behind the source.
 
-Not yet in toker (cutover plan, Gate D): `system_change` is not computed at
-capture time, so only imported rows carry it and the TUI localises system
-changes from the stored ladders instead.
-
 ## Export
 
 `toker export` (`export.rs`, over `Store::for_each_export`) writes the rows as
@@ -138,3 +134,31 @@ is shown rather than refused.
 Export and `watch-context-window` open the ledger read-only
 (`Store::open_read_only`): a wrong path fails instead of creating an empty
 ledger, and an older binary never migrates the live file.
+
+## System prompt changes
+
+`system_change` (`{delta, where}`) and the ladders (`system_ladder`,
+`system_tail`) have three eras, and a reader must tell them apart:
+
+| Rows | `system_change` | Ladders |
+| --- | --- | --- |
+| Imported ctp rows | On changed rows, from ctp's in-memory lane map | Only on changed rows; every row from 2026-09-03 02:06Z to 07:50Z, cut to ctp's first geometry (2 KiB steps, a 4 KiB tail) |
+| toker, before capture-time localisation | Never | Every row |
+| toker, since | On changed rows | A lane's first row and changed rows |
+
+Capture (`middleware/system_change.rs`) compares each anthropic measurement
+with the newest measurement row in its lane that has a system hash, read from
+the ledger. The ledger, not ctp's map or the lane table, because neither of
+those survives: ctp's map was lost on every restart and the lane table is pruned
+at 30 days. Where the hashes match, the row drops its ladders. Where they
+differ, the rungs of the predecessor's prompt are found by its hash on the
+newest lane row that kept them, and the change is localised as ctp did:
+changed blocks, then the first differing 8 KiB step, then the tail window.
+
+So a NULL `system_change` is not "unchanged". It is also a lane's first row,
+every row before capture localised, a session-less row (no lane), and a change
+whose baseline could not be read or was cut to another geometry; in all of
+those the row keeps its ladders. Only a matching `system_hash` says the prompt
+held. The rebuild panel prefers the stored `where`, re-derives it from ladders
+where it is absent (finding a predecessor's dropped rungs by hash), and says
+"where unknown" when neither bounds anything.

@@ -44,6 +44,7 @@ plan](../plans/cutover.md).
 | `src/middleware/quota.rs` | The quota gate: exhaustion, expiry, allowances, the block notice. Pure. |
 | `src/middleware/cold.rs` | The cold gate, the compaction retarget, the burn ladder and the quota weight fit the outlook prices with. Pure apart from two store conveniences. |
 | `src/middleware/lanes.rs` | The lane table: key, TTL stickiness, response merge, restart reseed, prune policy, ping tag. |
+| `src/middleware/system_change.rs` | Capture-time system-prompt change localisation against the lane's previous ledger row, and which rows keep the ladders. |
 | `src/middleware/models.rs` | The learned model store: family election, days served, `max_prompt`, promotion. |
 | `src/middleware/force_newest.rs` | Moving a request onto its family's newest model where no cache can be lost. |
 | `src/middleware/model_map.rs` | The configured model routing map: model positions only, untouched bytes elsewhere. |

@@ -7,7 +7,11 @@ measuring a region where changes are 7 bytes, and session-level grouping where
 the cache works per lane. Neither errored; both produced confident, useless
 output. The ladder toker stores (`ir/anthropic.rs`: 8 KiB rungs, then 8-byte
 steps over the last 256 bytes and 64-byte steps to 1 KiB) is the corrected
-geometry, and the TUI re-derives rung offsets from the same constants.
+geometry, and the TUI re-derives rung offsets from the same constants. Capture
+checks a baseline's rung counts against that geometry before comparing, so
+rungs cut by ctp's older ladders are never read as today's. The ladders are kept
+only where a lane begins or its system prompt changes; see
+[ledger-schema.md](ledger-schema.md).
 
 When adding a probe, ask what size the thing you are looking for is.
 
