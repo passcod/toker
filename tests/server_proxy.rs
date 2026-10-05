@@ -1110,6 +1110,8 @@ async fn control_status_is_gated_and_secret_free() {
     assert_eq!(value["requests"], 0);
     assert_eq!(value["last_request_ts_ms"], Value::Null);
     assert!(value["uptime_s"].is_u64());
+    // The status request itself is not an upstream exchange.
+    assert_eq!(value["in_flight"], 0);
 
     // The merge endpoint is gated the same way: no verb → 403, and the
     // verb alone is not enough — a JSON content type is demanded too, so

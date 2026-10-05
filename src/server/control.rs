@@ -107,6 +107,10 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         "requests": rows,
         "last_request_ts_ms": last_request_ts_ms,
         "uptime_s": server.started.elapsed().as_secs(),
+        // Exchanges whose response has not finished (the sleep lock's own
+        // count). Zero is when a restart cuts nobody off: a restart aborts
+        // every response still streaming.
+        "in_flight": server.in_flight.load(std::sync::atomic::Ordering::SeqCst),
     });
     Json(body).into_response()
 }
