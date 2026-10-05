@@ -330,13 +330,7 @@ fn tools_body(model: &str, messages: usize) -> Vec<u8> {
 
 fn lane_key_of(body: &[u8]) -> String {
     let shape = IrRequest::parse(body).expect("parse").anthropic().shape();
-    format!(
-        "ccses-42|{}",
-        shape
-            .tools_hash
-            .as_deref()
-            .expect("the tools body has a hash")
-    )
+    format!("ccses-42|{}", shape.tools_hash)
 }
 
 /// The expected upstream bytes for a moved request: the model token
@@ -364,8 +358,7 @@ fn poisoned_lane(body: &[u8], updated_ms: i64, prompt: i64) -> Lane {
                 .expect("parse")
                 .anthropic()
                 .shape()
-                .tools_hash
-                .expect("hash"),
+                .tools_hash,
         ),
         updated_ms,
         prompt_tokens: Some(prompt),

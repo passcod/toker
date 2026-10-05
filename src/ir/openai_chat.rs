@@ -107,13 +107,10 @@ impl<'a> ChatBody<'a> {
                 .and_then(Value::as_array)
                 .map(|messages| messages.len() as u64),
             req_tools: tool_names.len() as u64,
-            // The predecessor hashed the empty join to a constant; toker records None
-            // for an empty tool list instead (absence ≠ zero, invariant 3).
-            // Lane behaviour is identical either way — every no-tools
-            // request shares one lane — but a no-tools lane key now shows a
-            // visible absence rather than a digest of nothing.
-            tools_hash: (!tool_names.is_empty())
-                .then(|| short_hash(tool_names.join("\0").as_bytes())),
+            // Hashed even when empty, as the anthropic view and the
+            // predecessor do: a tool-less request is a lane of its own,
+            // never laneless.
+            tools_hash: short_hash(tool_names.join("\0").as_bytes()),
             system_chars: system.chars().count() as u64,
             // Always present, even for an empty system (row parity: the
             // digest of "" is a valid, comparable identity).
@@ -319,10 +316,9 @@ pub struct Shape {
     pub req_tools: u64,
     /// Digest of the tool-name list joined with `\0`, in order (order
     /// matters as much as membership: tools render first, so any reordering
-    /// invalidates the entire prefix). `None` when the tool list is empty —
-    /// see [`ChatBody::shape`] for the deliberate divergence from the
-    /// predecessor's hash-of-empty-join.
-    pub tools_hash: Option<String>,
+    /// invalidates the entire prefix). An empty list hashes the empty
+    /// join, as the anthropic view does.
+    pub tools_hash: String,
     /// Total system text length in characters (Unicode scalar values).
     pub system_chars: u64,
     /// Digest of the concatenated system/developer text; always present,
@@ -399,8 +395,9 @@ mod tests {
         let shape = chat.shape();
         assert_eq!(shape.req_tools, 0);
         assert_eq!(
-            shape.tools_hash, None,
-            "no tools is absence, not hash(\"\")"
+            shape.tools_hash,
+            short_hash(b""),
+            "no tools is the empty list's lane, not no lane"
         );
         assert_eq!(shape.req_messages, Some(1));
 
@@ -430,7 +427,7 @@ mod tests {
         assert_eq!(shape.req_bytes, body.len() as u64);
         assert_eq!(shape.req_messages, Some(4));
         assert_eq!(shape.req_tools, 3);
-        assert_eq!(shape.tools_hash, Some(short_hash(b"a\0?\0custom")));
+        assert_eq!(shape.tools_hash, short_hash(b"a\0?\0custom"));
         assert_eq!(shape.system_chars, system.chars().count() as u64);
         assert_eq!(shape.system_hash, short_hash(system.as_bytes()));
         assert_eq!(

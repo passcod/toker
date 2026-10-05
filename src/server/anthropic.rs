@@ -471,7 +471,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let cold_armed = path == "/v1/messages" && server.config.gates.cold_enabled;
     let cold_lane_key = gate_shape
         .as_ref()
-        .and_then(|shape| shape.tools_hash.as_deref())
+        .map(|shape| shape.tools_hash.as_str())
         .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
     let cold_lane = cold_lane_key
         .as_ref()
@@ -541,11 +541,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         } else {
             fired
         };
-        let shape_for_rows = || {
-            gate_shape
-                .as_ref()
-                .and_then(|shape| shape.tools_hash.as_deref())
-        };
+        let shape_for_rows = || gate_shape.as_ref().map(|shape| shape.tools_hash.as_str());
         match verdict {
             // Quietened: the window is not projected to run out even with
             // the re-read. Recorded so silence is distinguishable from

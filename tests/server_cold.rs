@@ -293,13 +293,7 @@ fn tools_body(model: &str) -> Vec<u8> {
 
 fn lane_key_of(body: &[u8]) -> String {
     let shape = IrRequest::parse(body).expect("parse").anthropic().shape();
-    format!(
-        "ccses-42|{}",
-        shape
-            .tools_hash
-            .as_deref()
-            .expect("the tools body has a hash")
-    )
+    format!("ccses-42|{}", shape.tools_hash)
 }
 
 /// Poison the lane this body belongs to: a 200k prefix, idle for
@@ -314,8 +308,7 @@ fn poison_cold_lane(store: &Store, body: &[u8], idle_ms: i64) {
                     .expect("parse")
                     .anthropic()
                     .shape()
-                    .tools_hash
-                    .expect("hash"),
+                    .tools_hash,
             ),
             updated_ms: now_ms() - idle_ms,
             prompt_tokens: Some(200_000),

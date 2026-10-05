@@ -123,10 +123,7 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             &ctx.server.store,
             lanes::LaneResponse {
                 session_id: ctx.session_id.as_deref(),
-                tools_hash: ctx
-                    .shape
-                    .as_ref()
-                    .and_then(|shape| shape.tools_hash.as_deref()),
+                tools_hash: ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
                 at_ms: ts_ms,
                 prompt: held,
                 write_5m: 0,
@@ -558,7 +555,7 @@ fn measurement_row(
         req_bytes: shape.map(|s| i64_of(s.req_bytes)),
         req_messages: shape.and_then(|s| s.req_messages.map(i64_of)),
         req_tools: shape.map(|s| i64_of(s.req_tools)),
-        tools_hash: shape.and_then(|s| s.tools_hash.clone()),
+        tools_hash: shape.map(|s| s.tools_hash.clone()),
         system_chars: shape.map(|s| i64_of(s.system_chars)),
         system_hash: shape.map(|s| s.system_hash.clone()),
         system_blocks: shape.map(|s| {

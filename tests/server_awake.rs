@@ -331,6 +331,20 @@ async fn post_chat(addr: SocketAddr, body: &[u8]) -> reqwest::Response {
         .expect("chat request")
 }
 
+/// A request with no session header: it can never key a lane (a tool-less
+/// one with a session keys the empty tool list's), so whatever it holds
+/// is its own in-flight count alone.
+async fn post_sessionless(addr: SocketAddr, path: &str, body: &[u8]) -> reqwest::Response {
+    client()
+        .post(format!("http://{addr}{path}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("sessionless request")
+}
+
 /// Poll the ledger until it holds at least `count` awake rows.
 async fn wait_for_awake_rows(
     store: &Store,
@@ -380,7 +394,7 @@ fn lane_key_of(body: &[u8]) -> (String, String) {
         .expect("parse")
         .anthropic()
         .shape();
-    let tools = shape.tools_hash.expect("the tools body has a hash");
+    let tools = shape.tools_hash;
     (format!("ccses-42|{tools}"), tools)
 }
 
@@ -530,11 +544,11 @@ async fn lane_expiry_with_nothing_in_flight_releases_the_lock() {
     // the table just ages.
     poison_lane(&store, &body, now_ms() - 2 * HOUR, false);
 
-    // An openai request, session-tagged but lane-less: it is in flight
+    // An openai request, sessionless and so lane-less: it is in flight
     // while it runs (so the lock is not released mid-exchange), and its
     // END is what finds the expired lane and nothing in flight — the
     // release, on the shared lock, from the other protocol's path.
-    let response = post_chat(addr, &chat_body()).await;
+    let response = post_sessionless(addr, "/v1/chat/completions", &chat_body()).await;
     assert_eq!(response.status(), StatusCode::OK);
     response.text().await.expect("read body");
 
@@ -565,7 +579,7 @@ async fn an_in_flight_anthropic_request_holds_with_no_live_lanes() {
 
     // No lanes at all: the request itself is the hold, and the SSE
     // response's completion is the release.
-    let response = post_messages(addr, &bare_body("claude-opus-5"), false).await;
+    let response = post_sessionless(addr, "/v1/messages", &bare_body("claude-opus-5")).await;
     assert_eq!(response.status(), StatusCode::OK);
     let text = response.text().await.expect("read body");
     assert!(text.contains("message_stop"));
@@ -592,7 +606,7 @@ async fn an_in_flight_openai_request_holds_with_no_live_lanes() {
     let config = test_config(upstream, true);
     let (addr, store, probe) = spawn_toker(config).await;
 
-    let response = post_chat(addr, &chat_body()).await;
+    let response = post_sessionless(addr, "/v1/chat/completions", &chat_body()).await;
     assert_eq!(response.status(), StatusCode::OK);
     response.text().await.expect("read body");
 

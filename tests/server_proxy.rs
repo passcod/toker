@@ -465,10 +465,7 @@ fn cold_body(model: &str, stream: bool) -> Vec<u8> {
 /// tools hash).
 fn cold_lane_key(body: &[u8]) -> String {
     let shape = IrRequest::parse(body).expect("parse").openai_chat().shape();
-    format!(
-        "ses-test-1|{}",
-        shape.tools_hash.expect("the cold body carries tools")
-    )
+    format!("ses-test-1|{}", shape.tools_hash)
 }
 
 /// A fetched openrouter catalogue whose entries are raw listing objects

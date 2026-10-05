@@ -179,7 +179,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let cold_armed = server.config.gates.cold_enabled;
     let cold_lane_key = gate_shape
         .as_ref()
-        .and_then(|shape| shape.tools_hash.as_deref())
+        .map(|shape| shape.tools_hash.as_str())
         .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
     let cold_lane = cold_lane_key
         .as_ref()
@@ -264,9 +264,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     server: &server,
                     started,
                     session_id: session_id.as_deref(),
-                    tools_hash: gate_shape
-                        .as_ref()
-                        .and_then(|shape| shape.tools_hash.as_deref()),
+                    tools_hash: gate_shape.as_ref().map(|shape| shape.tools_hash.as_str()),
                     idle_ms,
                     prompt,
                     // The message count of the stopped request: the

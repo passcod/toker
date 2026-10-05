@@ -13,8 +13,8 @@
 //! weeks of production traffic — ported, not improved. Pieces:
 //!
 //! - the lane key ([`lane_key`] — toker keeps the predecessor's
-//!   `?`-collapse out: no
-//!   session or no tools-hash means no lane at all, per this unit's plan);
+//!   `?`-collapse out: no session, or a row older than the tools-hash,
+//!   means no lane at all; a tool-less request keys the empty list's lane);
 //! - the TTL stickiness rule ([`lane_ttl`]) and the openai path's
 //!   explicit TTL override ([`OPENAI_LANE_TTL_MS`],
 //!   [`LaneResponse::ttl_ms`]);
@@ -128,11 +128,12 @@ impl Ttl {
 /// The lane key: `sessionId|toolsHash`.
 ///
 /// `None` when either half is absent: a request without a session cannot be
-/// attributed to a conversation, and one without a tools-hash has no lane
-/// identity to compare against — the predecessor folded both into a shared
-/// `"?"` lane,
-/// which exists for its pre-`toolsHash` log rows; toker's rows always carry
-/// both when they carry either, so no lane is the cleaner answer.
+/// attributed to a conversation (deliberately — the predecessor folded every
+/// sessionless request into one shared `"?"` lane, a stranger's idle clock
+/// for everyone's), and a row without a tools-hash predates the field. A
+/// tool-less request is NOT tools-hash-less: its hash is the empty list's
+/// (`e3b0c44298fc`, the predecessor's `shortHash("")`), so it keys a lane
+/// of its own like any other tool set.
 pub fn lane_key(session_id: Option<&str>, tools_hash: Option<&str>) -> Option<String> {
     let session = session_id?;
     let tools = tools_hash?;

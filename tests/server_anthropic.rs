@@ -2393,11 +2393,12 @@ async fn lane_rows_written_on_response_upsert_not_duplicate() {
 }
 
 #[tokio::test]
-async fn a_request_without_both_halves_writes_no_lane() {
+async fn a_tool_less_request_keys_the_empty_list_s_lane_and_a_sessionless_one_none() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
-    // No tools → no tools-hash → no lane, but the row still records.
+    // No tools is a lane of its own — the empty list's hash, the key the
+    // predecessor's imported rows carry for the same requests.
     let response = post_messages(
         addr,
         "/v1/messages",
@@ -2408,9 +2409,36 @@ async fn a_request_without_both_halves_writes_no_lane() {
     assert_eq!(response.status(), StatusCode::OK);
     wait_for_rows(&store, 1).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        store.load_lanes().expect("lanes").is_empty(),
-        "no tools-hash, no lane"
+    let lanes = store.load_lanes().expect("lanes");
+    assert_eq!(
+        lanes
+            .iter()
+            .map(|lane| lane.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ccses-42|e3b0c44298fc"],
+        "a tool-less request keys the empty list's lane"
+    );
+    let rows = store.requests_since(0, 10).expect("rows");
+    assert_eq!(rows[0].tools_hash.as_deref(), Some("e3b0c44298fc"));
+
+    // Without a session there is no conversation to attribute it to:
+    // the row records, no lane does.
+    let response = client()
+        .post(toker_url(addr, "/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(tools_body("claude-opus-5", true))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await;
+    wait_for_rows(&store, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        store.load_lanes().expect("lanes").len(),
+        1,
+        "no sessionless lane"
     );
 
     // count_tokens carries the same pipeline but its responses hold no
@@ -2424,8 +2452,8 @@ async fn a_request_without_both_halves_writes_no_lane() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(store.load_lanes().expect("lanes").is_empty());
-    assert_eq!(mock.captured().len(), 2, "both requests still forwarded");
+    assert_eq!(store.load_lanes().expect("lanes").len(), 1);
+    assert_eq!(mock.captured().len(), 3, "every request still forwarded");
 }
 
 #[tokio::test]

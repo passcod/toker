@@ -201,14 +201,12 @@ impl<'a> AnthropicBody<'a> {
                 .and_then(Value::as_array)
                 .map(|messages| messages.len() as u64),
             req_tools: tool_names.len() as u64,
-            // The predecessor hashed the empty join to a constant; toker records None
-            // for an empty tool list instead (the same deliberate
-            // divergence as the openai view — see
-            // `openai_chat::Shape::tools_hash`; lane behaviour is
-            // identical, and a no-tools lane key shows a visible absence
-            // rather than a digest of nothing).
-            tools_hash: (!tool_names.is_empty())
-                .then(|| short_hash(tool_names.join("\0").as_bytes())),
+            // Hashed even when empty, as the predecessor did: a tool-less
+            // request (the title summariser, a one-shot) is a lane of its
+            // own, `session|e3b0c44298fc`, and the predecessor's imported
+            // rows already carry that key — recording `None` instead left
+            // those requests laneless and their imported lanes orphaned.
+            tools_hash: short_hash(tool_names.join("\0").as_bytes()),
             system_chars: system_units.len() as u64,
             // Always present, even for an empty system (row parity: the
             // digest of "" is a valid, comparable identity).
@@ -590,10 +588,10 @@ pub struct AnthropicShape {
     pub req_tools: u64,
     /// Digest of the tool-name list joined with `\0`, in order (order
     /// matters as much as membership: tools render first, so any
-    /// reordering invalidates the entire prefix). `None` when the tool
-    /// list is empty — the same deliberate divergence from the
-    /// hash-of-empty-join as `openai_chat::Shape::tools_hash`.
-    pub tools_hash: Option<String>,
+    /// reordering invalidates the entire prefix). An empty list hashes
+    /// the empty join, exactly as the predecessor's `shortHash("")`, so
+    /// tool-less requests key the same lane before and after import.
+    pub tools_hash: String,
     /// Total system text length in UTF-16 code units.
     pub system_chars: u64,
     /// Digest of the concatenated system text; always present, even when
@@ -1310,7 +1308,7 @@ mod tests {
         let body = br#"{"model":"m","tools":[{"name":"a"},{"type":"custom"},{"weird":true}],"messages":[]}"#;
         let shape = parse(body).anthropic().shape();
         assert_eq!(shape.req_tools, 3);
-        assert_eq!(shape.tools_hash, Some(short_hash(b"a\0custom\0?")));
+        assert_eq!(shape.tools_hash, short_hash(b"a\0custom\0?"));
 
         // Order matters as much as membership: a reorder is a different lane.
         let reordered = br#"{"model":"m","tools":[{"type":"custom"},{"name":"a"},{"weird":true}],"messages":[]}"#;
@@ -1319,7 +1317,7 @@ mod tests {
             reordered_hash, shape.tools_hash,
             "the join is order-sensitive"
         );
-        assert_eq!(reordered_hash, Some(short_hash(b"custom\0a\0?")));
+        assert_eq!(reordered_hash, short_hash(b"custom\0a\0?"));
     }
 
     #[test]
@@ -1331,7 +1329,10 @@ mod tests {
             "batches nests under requests[].params"
         );
         assert_eq!(shape.req_tools, 0);
-        assert_eq!(shape.tools_hash, None);
+        // The empty join's digest — the predecessor's key for a
+        // tool-less lane, which its imported rows carry.
+        assert_eq!(shape.tools_hash, short_hash(b""));
+        assert_eq!(shape.tools_hash, "e3b0c44298fc");
         assert_eq!(shape.system_chars, 0);
         assert_eq!(shape.system_hash, short_hash(b""));
         assert!(shape.system_blocks.is_empty());
