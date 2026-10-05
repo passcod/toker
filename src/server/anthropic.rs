@@ -1150,9 +1150,10 @@ async fn forward_response(
             tracing::error!(%error, "meter snapshot save failed");
         }
     }
-    // The row's own copy — this response's headers, parsed. Error rows
-    // take none of this (lean); the meters_state table took the update
-    // above regardless.
+    // The row's own copy — this response's headers, parsed, for the
+    // measurement row and the error row alike (a failure's meters are the
+    // only evidence of throttling); the meters_state table took the
+    // update above regardless.
     let rate_limits = parse_rate_limits(&upstream_headers);
 
     // Unexpected compression — shouldn't happen, identity is forced —
@@ -1185,6 +1186,7 @@ async fn forward_response(
             error_type,
             error_message,
             retry_after,
+            rate_limits.as_ref(),
         );
         let body = buffered_body(buffered);
         return build_response(status, response_headers(&upstream_headers, false), body);

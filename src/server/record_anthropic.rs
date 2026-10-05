@@ -21,13 +21,12 @@
 //!   its `anthropic-ratelimit-*` headers ([`parse_rate_limits`]); the
 //!   `meters_state` table gets the same update from every response on a
 //!   meter-source backend (the server does that, not this module). Error
-//!   rows carry none — lean, like the openai error rows; that is a
-//!   deliberate divergence from the predecessor, which embeds the
-//!   response's meters
-//!   on its error rows (its *blocked* rows do carry a stale copy —
-//!   [`record_anthropic_blocked`] ports that, since the stale snapshot is
-//!   the block's own provenance; an error row describes a response, which
-//!   has fresh headers of its own).
+//!   rows carry the failed response's own snapshot too, as the
+//!   predecessor's did: a 429 carries no usage, and its meters are the
+//!   only evidence of throttling the ledger gets (an earlier port left
+//!   them off as "lean", which erased exactly that). The *blocked* rows
+//!   carry a stale copy instead — [`record_anthropic_blocked`] ports
+//!   that, since the stale snapshot is the block's own provenance.
 //! - **`model` is the normalised identity, `raw_model` the wire form**
 //!   (the normalise/raw pair, as the predecessor named them).
 //! - **`betas`** is the request's `anthropic-beta` header split into
@@ -169,17 +168,19 @@ pub(crate) fn record_anthropic_measurement(
 }
 
 /// Record a non-2xx anthropic usage-path response (plan: Server core): an
-/// error row with status, the error pair, and retry-after — never priced,
-/// no usage buckets, **no `rate_limits`** (lean, like the openai error
-/// rows; the `meters_state` table still took the response's snapshot, the
-/// server did that before this ran) — plus the fidelity-drift row when the
-/// request drifted.
+/// error row with status, the error pair, retry-after, and the response's
+/// own `rate_limits` — never priced, no usage buckets — plus the
+/// fidelity-drift row when the request drifted. The meters ride the row
+/// because a failure carries no usage but is the only evidence of
+/// throttling (the predecessor's rule): a 429 with no meters on its row
+/// says only that something said no.
 pub(crate) fn record_anthropic_error(
     ctx: &AnthropicRecordCtx,
     status: u16,
     error_type: Option<String>,
     error_message: Option<String>,
     retry_after: Option<i64>,
+    rate_limits: Option<&Value>,
 ) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
@@ -192,12 +193,12 @@ pub(crate) fn record_anthropic_error(
         ctx,
         error_row(
             ctx,
-            ts_ms,
-            duration_ms,
+            (ts_ms, duration_ms),
             &route,
             status,
             (error_type, error_message),
             retry_after,
+            rate_limits,
         ),
     );
 
@@ -498,21 +499,22 @@ fn measurement_row(
 }
 
 /// The error row (plan: non-2xx on a usage path): status, the error pair,
-/// and retry-after; never priced, no usage, no `rate_limits` (lean, like
-/// the openai error rows — see the module docs for the deliberate
-/// divergence from the predecessor). The request's shape is not
+/// retry-after, and the response's own meters; never priced, no usage
+/// (see the module docs for why the meters stay). The request's shape is not
 /// re-measured on the way
-/// to a failure the provider already summarised. `error` is the
-/// `(type, message)` pair from the response's error object.
+/// to a failure the provider already summarised. `timing` is the row's
+/// `(ts_ms, duration_ms)`; `error` is the `(type, message)` pair from the
+/// response's error object.
 fn error_row(
     ctx: &AnthropicRecordCtx,
-    ts_ms: i64,
-    duration_ms: i64,
+    timing: (i64, i64),
     route: &str,
     status: u16,
     error: (Option<String>, Option<String>),
     retry_after_ms: Option<i64>,
+    rate_limits: Option<&Value>,
 ) -> RequestRow {
+    let (ts_ms, duration_ms) = timing;
     let (error_type, error_message) = error;
     RequestRow {
         id: None,
@@ -543,7 +545,7 @@ fn error_row(
         usage_raw: None,
         cost_usd: None,
         cost_kind: None,
-        rate_limits: None,
+        rate_limits: rate_limits.cloned(),
         req_bytes: None,
         req_messages: None,
         req_tools: None,

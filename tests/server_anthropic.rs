@@ -8,7 +8,7 @@
 //! claude's session header forwarded), responses pass through
 //! byte-identically, rows carry the right buckets/betas/rate_limits and
 //! the right cost kind per backend (plan_equivalent on the sub, estimated
-//! on the api), error rows stay lean (no rate_limits, never priced), the
+//! on the api), error rows keep their meters but are never priced, the
 //! meters_state table feeds from every response on the meter-source
 //! backend (not just accounted ones), fidelity drift is visible, and
 //! unaccounted paths (count_tokens, batches, compression, non-JSON)
@@ -1035,7 +1035,7 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
 }
 
 #[tokio::test]
-async fn non_2xx_forwards_the_body_and_records_a_lean_error_row_that_still_feeds_the_meters() {
+async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_meters() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1073,13 +1073,12 @@ async fn non_2xx_forwards_the_body_and_records_a_lean_error_row_that_still_feeds
     assert_eq!(row.requested_model.as_deref(), Some("err-401"));
     assert_eq!(row.effective_model.as_deref(), Some("err-401"));
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
-    // Lean, like the openai error rows: never priced, no usage, no
-    // rate_limits (the deliberate divergence from the predecessor,
-    // documented in the
-    // record module).
+    // Never priced, no usage — but the response's own meters stay on
+    // the row, as the predecessor's did: a failure's meters are the only
+    // evidence of throttling the ledger gets.
     assert_eq!(row.cost_usd, None);
     assert_eq!(row.cost_kind, None);
-    assert_eq!(row.rate_limits, None);
+    assert_eq!(row.rate_limits, Some(expected_rate_limits("0.77")));
     assert_eq!(row.usage_presence, None);
     assert_eq!(row.input, None);
     assert_eq!(row.usage_raw, None);
