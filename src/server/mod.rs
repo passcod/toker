@@ -27,6 +27,12 @@
 //!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
 //!   everything but its control path.
 //!
+//! Every route above also answers under a `/f/<frontend>` prefix: the
+//! router strips it before matching and keeps the name
+//! ([`FrontendName`]), which picks the frontend's gate-notice style
+//! (`[notices]`). Setup writes the prefix into the frontends it patches;
+//! an unprefixed request is an unknown frontend.
+//!
 //! A backend is enabled by its `[providers.X]` block's presence. A
 //! protocol with no enabled backend answers its routes with a
 //! not-configured error in that protocol's own error shape
@@ -367,8 +373,21 @@ impl Server {
         self.evaluate_awake();
     }
 
-    /// The full route table.
+    /// The full route table, behind the frontend-prefix strip: a request
+    /// to `/f/<frontend>/<path>` is routed as `/<path>`, with the
+    /// frontend's name riding along as a [`FrontendName`] extension (see
+    /// [`strip_frontend_prefix`]).
     pub fn router(&self) -> Router {
+        // The strip runs before routing because it wraps a router whose
+        // only route is the fallback: an outer layer sees the request
+        // first, and the inner router matches the rewritten path.
+        Router::new()
+            .fallback_service(self.routes())
+            .layer(axum::middleware::map_request(strip_frontend_prefix))
+    }
+
+    /// The route table itself, matched on unprefixed paths.
+    fn routes(&self) -> Router {
         Router::new()
             .route("/v1/chat/completions", post(proxy::chat_completions))
             .route("/v1/models", get(proxy::models))
@@ -597,6 +616,61 @@ impl Server {
             }
         });
     }
+}
+
+/// The frontend a request came through: the name in its base URL's
+/// `/f/<frontend>` prefix, which setup writes into each frontend it
+/// patches (`/f/claude`, `/f/workhorse`). Absent for an unprefixed
+/// request — an unknown frontend. It selects the gate notices' style
+/// ([`crate::config::NoticesConfig`]) and nothing else: routing ignores
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontendName(pub(crate) String);
+
+/// The frontend name a request carries, if it came through a prefix.
+pub(crate) fn frontend_of(extensions: &axum::http::Extensions) -> Option<&str> {
+    extensions
+        .get::<FrontendName>()
+        .map(|frontend| frontend.0.as_str())
+}
+
+/// Split `/f/<frontend>/<rest>` into the frontend name and `/<rest>`
+/// (`/` when nothing follows the name). `None` for any other path, and
+/// for a name outside [`crate::config::is_frontend_name`] — such a path
+/// is routed as it is, like any unknown path.
+fn split_frontend(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/f/")?;
+    let (name, rest) = match rest.find('/') {
+        Some(slash) => rest.split_at(slash),
+        None => (rest, "/"),
+    };
+    crate::config::is_frontend_name(name).then_some((name, rest))
+}
+
+/// The router's first step: strip a `/f/<frontend>` prefix off the
+/// request path (the query rides along untouched) and record the name.
+/// Never fails a request: a URI that would not rebuild is passed on as
+/// it came (invariant 3 — accounting never breaks a session).
+async fn strip_frontend_prefix(mut request: axum::extract::Request) -> axum::extract::Request {
+    let Some((name, rest)) = split_frontend(request.uri().path()) else {
+        return request;
+    };
+    let name = name.to_owned();
+    let path_and_query = match request.uri().query() {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest.to_owned(),
+    };
+    let mut parts = request.uri().clone().into_parts();
+    let Ok(path_and_query) = path_and_query.parse() else {
+        return request;
+    };
+    parts.path_and_query = Some(path_and_query);
+    let Ok(uri) = axum::http::Uri::from_parts(parts) else {
+        return request;
+    };
+    *request.uri_mut() = uri;
+    request.extensions_mut().insert(FrontendName(name));
+    request
 }
 
 /// The header toker sets on its own not-configured answers, so the setup

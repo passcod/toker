@@ -61,7 +61,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use jiff::tz::TimeZone;
 use serde_json::Value;
 
-use super::notice::{NoticeStyle, render};
+use super::notice::{NoticeLevel, NoticeStyle, render};
 use super::quota::{Meter, THRESHOLD, group};
 use crate::catalog::pricing::{normalise_model_id, price};
 use crate::catalog::windows::model_identity;
@@ -2005,7 +2005,8 @@ impl ColdBlocking {
             String::new(),
             "Fired once for that idle spell.]".to_owned(),
         ]);
-        render(style, &lines.join("\n"))
+        // A Warning: advice the operator may act on or ignore.
+        render(style, NoticeLevel::Warning, &lines.join("\n"))
     }
 
     /// The synthetic assistant turn id on the openai wire, so a reader of
@@ -3520,7 +3521,12 @@ mod tests {
         // Purity (invariant 4): the same inputs render the same bytes,
         // every call, in every style.
         for _ in 0..3 {
-            for style in [NoticeStyle::Plain, NoticeStyle::Gfm, NoticeStyle::Insight] {
+            for style in [
+                NoticeStyle::Plain,
+                NoticeStyle::Gfm,
+                NoticeStyle::Toker,
+                NoticeStyle::Block,
+            ] {
                 assert_eq!(
                     ColdBlocking::notice(
                         2 * HOUR + 6 * MIN,
@@ -3567,7 +3573,7 @@ mod tests {
                 NoticeStyle::Gfm
             ),
             format!(
-                "> [!NOTE]{}",
+                "> [!WARNING]{}",
                 content
                     .lines()
                     .map(|line| format!("\n> {line}"))
@@ -3582,12 +3588,12 @@ mod tests {
                 None,
                 1_769_500_800_000,
                 &utc(),
-                NoticeStyle::Insight
+                NoticeStyle::Block
             ),
             format!(
                 "{}\n{content}\n{}",
-                crate::middleware::notice::INSIGHT_HEADER,
-                crate::middleware::notice::INSIGHT_FOOTER
+                crate::middleware::notice::BLOCK_HEADER,
+                crate::middleware::notice::BLOCK_FOOTER
             )
         );
         // The default style is the generic GFM alert, like the quota gate.
@@ -3601,7 +3607,7 @@ mod tests {
                 &utc(),
                 NoticeStyle::default()
             )
-            .starts_with("> [!NOTE]\n> ")
+            .starts_with("> [!WARNING]\n> ")
         );
     }
 

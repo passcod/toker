@@ -120,6 +120,8 @@ pub struct Config {
     pub codex_sub: Option<CodexSubConfig>,
     /// The middleware gates block.
     pub gates: GatesConfig,
+    /// The `[notices]` table: how each frontend's gate notices render.
+    pub notices: NoticesConfig,
     /// The idle-sleep lock (on by default, disabled with exactly
     /// `awake = false`): while any
     /// lane is live or any request is in flight, hold an idle-only
@@ -151,12 +153,6 @@ pub struct GatesConfig {
     /// toggled strip would change the cached prefix of every conversation
     /// carrying a marker).
     pub quota_enabled: bool,
-    /// How the quota gate's notice is rendered (plan: "Native rendering
-    /// for gate notices"). The config's stand-in for the per-frontend
-    /// choice, until a client-selection mechanism exists: insight (the
-    /// default) for claude, gfm for Workhorse-style frontends, plain to
-    /// degrade.
-    pub notice_style: NoticeStyle,
     /// The cold gate (plan: "Cold gate"): a session
     /// resumed after its prompt cache expired would re-read its whole
     /// prefix as fresh input, so the gate interrupts once per idle spell
@@ -207,7 +203,6 @@ impl Default for GatesConfig {
     fn default() -> Self {
         GatesConfig {
             quota_enabled: true,
-            notice_style: NoticeStyle::default(),
             cold_enabled: true,
             cold_outlook: true,
             cold_min_tokens: crate::middleware::cold::DEFAULT_MIN_TOKENS,
@@ -216,6 +211,62 @@ impl Default for GatesConfig {
             force_newest: true,
         }
     }
+}
+
+/// The `[notices]` table, resolved (plan: "Native rendering for gate
+/// notices"): the notice style per frontend, the frontend being the name
+/// in the `/f/<frontend>` prefix of the base URL it was pointed at. An
+/// unprefixed request, or a frontend the table does not name, gets the
+/// `default` style.
+///
+/// The table's keys are frontend names plus `default`; the built-in
+/// entries ([`NoticesConfig::default`]) hold unless the file overrides
+/// them. The old `[gates] notice_style` key still loads, as the
+/// `default` it always effectively was (it applied to every client);
+/// naming both is an error rather than a silent precedence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoticesConfig {
+    /// The style for every frontend not named below.
+    pub default: NoticeStyle,
+    /// Per-frontend styles, by prefix name.
+    pub frontends: std::collections::BTreeMap<String, NoticeStyle>,
+}
+
+impl Default for NoticesConfig {
+    /// claude renders the insight-style block, Workhorse its own
+    /// `[!TOKER]` alert, everything else the GFM alert.
+    fn default() -> Self {
+        NoticesConfig {
+            default: NoticeStyle::Gfm,
+            frontends: [
+                ("claude".to_owned(), NoticeStyle::Block),
+                ("workhorse".to_owned(), NoticeStyle::Toker),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+}
+
+impl NoticesConfig {
+    /// The style for a request from `frontend` (`None`: unprefixed).
+    pub fn style_for(&self, frontend: Option<&str>) -> NoticeStyle {
+        frontend
+            .and_then(|name| self.frontends.get(name))
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
+/// Whether `name` can be a frontend's prefix name: lowercase ASCII
+/// letters, digits, `-` and `_`. The router accepts exactly these, so a
+/// table key outside them could never match a request.
+pub fn is_frontend_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// The openrouter provider block, resolved.
@@ -615,9 +666,19 @@ impl Config {
                     model_map: codex.model_map.as_ref().map(model_map_table),
                 }),
             },
+            notices: std::iter::once(("default".to_owned(), self.notices.default))
+                .chain(
+                    self.notices
+                        .frontends
+                        .iter()
+                        .map(|(name, style)| (name.clone(), *style)),
+                )
+                .collect(),
             gates: FileGates {
                 quota_enabled: Some(self.gates.quota_enabled),
-                notice_style: Some(self.gates.notice_style),
+                // Written as `[notices] default` instead: the rewrite
+                // moves an old file onto the new spelling.
+                notice_style: None,
                 cold_enabled: Some(self.gates.cold_enabled),
                 cold_outlook: Some(self.gates.cold_outlook),
                 cold_min_tokens: Some(self.gates.cold_min_tokens),
@@ -766,9 +827,9 @@ impl Config {
             anthropic_sub,
             anthropic_api,
             codex_sub,
+            notices: resolve_notices(file.notices, file.gates.notice_style)?,
             gates: GatesConfig {
                 quota_enabled: file.gates.quota_enabled.unwrap_or(true),
-                notice_style: file.gates.notice_style.unwrap_or_default(),
                 cold_enabled: file.gates.cold_enabled.unwrap_or(true),
                 cold_outlook: file.gates.cold_outlook.unwrap_or(true),
                 cold_min_tokens: file
@@ -882,6 +943,37 @@ impl Config {
     }
 }
 
+/// The `[notices]` table over the built-in entries, with the old
+/// `[gates] notice_style` read as the `default` (see [`NoticesConfig`]).
+fn resolve_notices(
+    table: std::collections::BTreeMap<String, NoticeStyle>,
+    old_default: Option<NoticeStyle>,
+) -> anyhow::Result<NoticesConfig> {
+    let mut notices = NoticesConfig::default();
+    if let Some(style) = old_default {
+        if table.contains_key("default") {
+            bail!(
+                "[gates] notice_style and [notices] default both set the default notice style: \
+                 keep only [notices] default (notice_style is its old spelling)"
+            );
+        }
+        notices.default = style;
+    }
+    for (name, style) in table {
+        if name == "default" {
+            notices.default = style;
+        } else if is_frontend_name(&name) {
+            notices.frontends.insert(name, style);
+        } else {
+            bail!(
+                "[notices] {name:?} is not a frontend name: the /f/<frontend> prefix takes \
+                 lowercase letters, digits, - and _"
+            );
+        }
+    }
+    Ok(notices)
+}
+
 /// A protocol's default backend: the named one when the file names it
 /// (checked against the enabled set by [`check_default`]), else the only
 /// enabled backend, else the historical default when it is among several
@@ -972,6 +1064,9 @@ pub(crate) struct FileConfig {
     transcript_roots: Option<Vec<String>>,
     providers: FileProviders,
     gates: FileGates,
+    /// Frontend name (or `default`) → notice style; see [`NoticesConfig`].
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    notices: std::collections::BTreeMap<String, NoticeStyle>,
 }
 
 /// The `[gates]` block of `toker.toml`, serde-side.
@@ -980,8 +1075,10 @@ pub(crate) struct FileConfig {
 pub(crate) struct FileGates {
     #[serde(skip_serializing_if = "Option::is_none")]
     quota_enabled: Option<bool>,
-    /// Parsed by [`NoticeStyle`]'s case-insensitive deserialiser; an
-    /// unknown value fails the load, like a typo'd key would.
+    /// The old spelling of `[notices] default`, still read (see
+    /// [`NoticesConfig`]) and never written. Parsed by [`NoticeStyle`]'s
+    /// case-insensitive deserialiser; an unknown value fails the load,
+    /// like a typo'd key would.
     #[serde(skip_serializing_if = "Option::is_none")]
     notice_style: Option<NoticeStyle>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1207,10 +1304,17 @@ mod tests {
         // The quota gate is on by default: a proxy that silently stopped
         // gating is a proxy that quietly spends overage.
         assert!(config.gates.quota_enabled);
-        // The notice renders in the default style (the generic GFM alert —
-        // the insight block is claude-only): a change here would change the
-        // bytes of every notice overnight.
-        assert_eq!(config.gates.notice_style, NoticeStyle::Gfm);
+        // Notices render per frontend: the block for claude, Workhorse's
+        // alert for Workhorse, the generic GFM alert for everything else.
+        // A change here would change the bytes of every notice overnight.
+        assert_eq!(config.notices, super::NoticesConfig::default());
+        assert_eq!(config.notices.style_for(None), NoticeStyle::Gfm);
+        assert_eq!(config.notices.style_for(Some("claude")), NoticeStyle::Block);
+        assert_eq!(
+            config.notices.style_for(Some("workhorse")),
+            NoticeStyle::Toker
+        );
+        assert_eq!(config.notices.style_for(Some("opencode")), NoticeStyle::Gfm);
         // The cold gate's defaults are the measured ones: on, outlook on,
         // the 175k
         // bar chosen against the log, the lane's own TTL tier as the idle
@@ -1848,8 +1952,8 @@ quota_enabled = false
     }
 
     #[test]
-    fn notice_style_is_read_case_insensitively_and_unknown_values_fail() {
-        let dir = test_dir("notice-style");
+    fn the_notices_table_is_read_over_the_defaults() {
+        let dir = test_dir("notices");
         let load = |text: &str| {
             let _guard = env_lock()
                 .lock()
@@ -1859,48 +1963,59 @@ quota_enabled = false
             super::Config::load()
         };
 
-        // Explicitly named styles load, whatever their casing.
+        // Named styles load whatever their casing; unnamed frontends keep
+        // their built-in entries.
+        let config = load("[notices]\ndefault = \"Plain\"\nopencode = \"TOKER\"\n")
+            .expect("the table loads");
+        assert_eq!(config.notices.style_for(None), NoticeStyle::Plain);
         assert_eq!(
-            load("[gates]\nnotice_style = \"plain\"\n")
-                .expect("plain loads")
-                .gates
-                .notice_style,
+            config.notices.style_for(Some("opencode")),
+            NoticeStyle::Toker
+        );
+        assert_eq!(config.notices.style_for(Some("claude")), NoticeStyle::Block);
+        assert_eq!(
+            config.notices.style_for(Some("elsewhere")),
             NoticeStyle::Plain
         );
-        assert_eq!(
-            load("[gates]\nnotice_style = \"Gfm\"\n")
-                .expect("gfm loads")
-                .gates
-                .notice_style,
-            NoticeStyle::Gfm
-        );
-        assert_eq!(
-            load("[gates]\nnotice_style = \"INSIGHT\"\n")
-                .expect("insight loads")
-                .gates
-                .notice_style,
-            NoticeStyle::Insight
-        );
+        let config = load("[notices]\nclaude = \"gfm\"\n").expect("an override loads");
+        assert_eq!(config.notices.style_for(Some("claude")), NoticeStyle::Gfm);
 
-        // Absent: the default (the generic GFM alert) — never a silent downgrade.
+        // The old [gates] key is the default it always effectively was;
+        // "insight" was the block's name then.
+        let config = load("[gates]\nnotice_style = \"insight\"\n").expect("the old key loads");
+        assert_eq!(config.notices.style_for(None), NoticeStyle::Block);
         assert_eq!(
-            load("port = 19999\n")
-                .expect("absent block parses")
-                .gates
-                .notice_style,
-            NoticeStyle::Gfm
+            config.notices.style_for(Some("workhorse")),
+            NoticeStyle::Toker
         );
+        // Both spellings at once is an error, not a silent precedence.
+        let error = load("[gates]\nnotice_style = \"gfm\"\n[notices]\ndefault = \"plain\"\n")
+            .expect_err("both spellings");
+        assert!(format!("{error:#}").contains("notice_style"));
 
         // An unknown value is a load error, not a silent default — the
-        // deny_unknown_fields precedent, on the value side. The plain
-        // Display is only the "parsing <path>" context; the alternate
-        // form carries the TOML error, whose snippet names the key.
-        let error = load("[gates]\nnotice_style = \"fancy\"\n").expect_err("unknown style");
-        let chain = format!("{error:#}");
+        // deny_unknown_fields precedent, on the value side. The alternate
+        // form carries the TOML error, whose snippet names the value.
+        let error = load("[notices]\nclaude = \"fancy\"\n").expect_err("unknown style");
+        assert!(format!("{error:#}").contains("fancy"));
+        // A key the prefix could never carry is refused, not ignored.
+        let error = load("[notices]\nClaude = \"plain\"\n").expect_err("not a frontend name");
+        assert!(format!("{error:#}").contains("Claude"));
+
+        // The rewrite writes the new spelling, defaults included, and
+        // drops the old key.
+        let config = load("[gates]\nnotice_style = \"plain\"\n").expect("loads");
+        let text = toml::to_string(&config.to_file()).expect("serialise");
+        assert!(!text.contains("notice_style"), "{text}");
         assert!(
-            chain.contains("notice_style") && chain.contains("fancy"),
-            "the error names the key and the value: {chain}"
+            text.contains("[notices]")
+                && text.contains("default = \"plain\"")
+                && text.contains("claude = \"block\"")
+                && text.contains("workhorse = \"toker\""),
+            "{text}"
         );
+        let reloaded = load(&text).expect("the rewrite loads");
+        assert_eq!(reloaded.notices, config.notices);
     }
 
     #[test]

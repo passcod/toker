@@ -8,28 +8,40 @@
 //! units, runs [`await_service_ready`] BEFORE touching any frontend
 //! config, and only patches frontends on a service that answered.
 //!
-//! The check itself is the wiring check used throughout this project:
-//! an **empty-body POST** to each usage path. toker forwards an
-//! unparseable body verbatim (the IR parse failing is the passthrough
-//! case, see `server::proxy` / `server::anthropic`), so the response
-//! that comes back is the **upstream's own verdict on an
-//! unauthenticated empty request** — typically its 401, the
-//! no-key-configured case the providers document as "visibly verifying
-//! the wiring". Any upstream verdict counts (401, 400, 404… a
-//! signed-always backend like codex_sub answers something other than
-//! 401 on its own paths): what is being proven is the whole chain —
-//! listener up, route answering, upstream round-tripping.
+//! The check is a list of [`Check`]s, each retried on [`POLL`] cadence
+//! until it answers or `timeout` runs out:
+//!
+//! - [`Check::Usage`] — an **empty-body POST** to a usage path, through
+//!   the exact prefix the frontend will be pointed at. toker forwards an
+//!   unparseable body verbatim (the IR parse failing is the passthrough
+//!   case, see `server::proxy` / `server::anthropic`), so the response
+//!   that comes back is the **upstream's own verdict on an
+//!   unauthenticated empty request** — typically its 401, the
+//!   no-key-configured case the providers document as "visibly verifying
+//!   the wiring". Any upstream verdict counts (401, 400, 404… a
+//!   signed-always backend like codex_sub answers something other than
+//!   401 on its own paths): what is being proven is the whole chain —
+//!   listener up, route answering, upstream round-tripping.
+//! - [`Check::Prefix`] — the frontend's `/f/<name>` prefix reaches
+//!   toker's own status endpoint. An upstream verdict on a prefixed
+//!   usage path cannot prove the prefix was stripped: a toker that
+//!   predates prefixes forwards `/f/claude/v1/messages` upstream as it
+//!   stands and relays the upstream's 404 — exactly what a frontend
+//!   patched to that prefix would then get on every request. Only a
+//!   toker that strips the prefix answers its own status there.
 //!
 //! What does NOT count as an answer: toker's own synthetic failure
 //! statuses (see [`TOKER_OWN_STATUSES`]) — the listener being up while
 //! the upstream round-trip is broken is exactly the state the wizard
-//! must not point clients into — and no response at all (connection
-//! refused while the units are still starting, a hung exchange). Both
-//! are retried on [`POLL`] cadence until `timeout`.
+//! must not point clients into — toker's not-configured answer (the
+//! path's protocol has no backend), and no response at all (connection
+//! refused while the units are still starting, a hung exchange).
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+
+use crate::server::NOT_CONFIGURED_HEADER;
 
 /// The probe cadence while waiting for the service to answer.
 const POLL: Duration = Duration::from_millis(250);
@@ -46,34 +58,51 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// wiring did not round-trip — not an answer, keep polling.
 const TOKER_OWN_STATUSES: &[u16] = &[502, 413];
 
-/// Which frontend usage paths answered the wiring probe, and with
-/// what upstream verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServiceReady {
-    /// The verdict on the empty-body POST to `/v1/messages` (the
-    /// anthropic path — typically 401), or `None` when it never
-    /// answered within the timeout.
-    pub messages: Option<u16>,
-    /// The verdict on the empty-body POST to `/v1/chat/completions`
-    /// (the openai-chat path), likewise.
-    pub chat_completions: Option<u16>,
+/// One thing the service must answer before any frontend is patched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    /// An empty-body POST to this usage path (prefix included) must carry
+    /// an upstream verdict back.
+    Usage(String),
+    /// toker's own status endpoint must answer under `/f/<this name>`.
+    Prefix(String),
 }
 
-impl ServiceReady {
-    /// Whether both frontend paths carry an upstream verdict — the
-    /// state the wizard requires before patching any frontend.
-    pub fn ready(&self) -> bool {
-        self.messages.is_some() && self.chat_completions.is_some()
+impl Check {
+    /// The path probed.
+    pub fn path(&self) -> String {
+        match self {
+            Check::Usage(path) => path.clone(),
+            Check::Prefix(name) => format!("/f/{name}/_toker/status"),
+        }
+    }
+
+    /// How the check reads in the wizard's output.
+    pub fn describe(&self) -> String {
+        match self {
+            Check::Usage(path) => format!("POST {path}"),
+            Check::Prefix(name) => format!("the /f/{name} prefix"),
+        }
     }
 }
 
-/// Poll toker on `127.0.0.1:{port}` until both usage paths answer with
-/// an upstream verdict (see the module docs), or `timeout` runs out.
-/// `Ok` carries which paths answered — on success, both; the per-path
-/// fields are the record the wizard displays. A timeout is an `Err`
-/// whose message says what each path last did, because the caller
-/// must NOT proceed to patching frontends (the ordering rule).
-pub async fn await_service_ready(port: u16, timeout: Duration) -> anyhow::Result<ServiceReady> {
+/// Every check that answered, with its verdict, in the order asked: the
+/// upstream's status for a usage check, toker's 200 for a prefix check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceReady {
+    pub answers: Vec<(Check, u16)>,
+}
+
+/// Poll toker on `127.0.0.1:{port}` until every check answers (see the
+/// module docs), or `timeout` runs out. `Ok` carries each check's
+/// verdict, the record the wizard displays. A timeout is an `Err` whose
+/// message says what each check last did, because the caller must NOT
+/// proceed to patching frontends (the ordering rule).
+pub async fn await_service_ready(
+    port: u16,
+    checks: &[Check],
+    timeout: Duration,
+) -> anyhow::Result<ServiceReady> {
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::builder()
         .timeout(PROBE_TIMEOUT)
@@ -81,39 +110,44 @@ pub async fn await_service_ready(port: u16, timeout: Duration) -> anyhow::Result
         .context("building the wiring-probe client")?;
     let deadline = Instant::now() + timeout;
 
-    let mut messages: Option<u16> = None;
-    let mut chat: Option<u16> = None;
-    let mut messages_last: Option<Seen> = None;
-    let mut chat_last: Option<Seen> = None;
+    let mut answered: Vec<Option<u16>> = vec![None; checks.len()];
+    let mut last: Vec<Option<Seen>> = vec![None; checks.len()];
     loop {
-        if messages.is_none() {
-            match probe(&client, &format!("{base}/v1/messages")).await {
-                Probe::Answered(status) => messages = Some(status),
-                Probe::TokerOwn(status) => messages_last = Some(Seen::TokerOwn(status)),
-                Probe::Unreachable => messages_last = Some(Seen::Unreachable),
+        for (index, check) in checks.iter().enumerate() {
+            if answered[index].is_some() {
+                continue;
+            }
+            match probe(&client, &base, check).await {
+                Probe::Answered(status) => answered[index] = Some(status),
+                Probe::Not(seen) => last[index] = Some(seen),
             }
         }
-        if chat.is_none() {
-            match probe(&client, &format!("{base}/v1/chat/completions")).await {
-                Probe::Answered(status) => chat = Some(status),
-                Probe::TokerOwn(status) => chat_last = Some(Seen::TokerOwn(status)),
-                Probe::Unreachable => chat_last = Some(Seen::Unreachable),
-            }
-        }
-        if messages.is_some() && chat.is_some() {
+        if answered.iter().all(Option::is_some) {
             return Ok(ServiceReady {
-                messages,
-                chat_completions: chat,
+                answers: checks
+                    .iter()
+                    .cloned()
+                    .zip(answered.into_iter().flatten())
+                    .collect(),
             });
         }
         if Instant::now() >= deadline {
+            let lines: Vec<String> = checks
+                .iter()
+                .enumerate()
+                .map(|(index, check)| {
+                    format!(
+                        "{}: {}",
+                        check.describe(),
+                        describe(answered[index], &last[index])
+                    )
+                })
+                .collect();
             bail!(
-                "toker at {base} did not answer every frontend path within {timeout:?} — \
-                 POST /v1/messages: {}; POST /v1/chat/completions: {}. The frontends are \
-                 NOT being patched: the ordering rule binds the socket and verifies it \
-                 before pointing clients at it",
-                describe(messages, messages_last),
-                describe(chat, chat_last),
+                "toker at {base} did not answer every check within {timeout:?} — {}. The \
+                 frontends are NOT being patched: the ordering rule binds the socket and \
+                 verifies it before pointing clients at it",
+                lines.join("; "),
             );
         }
         tokio::time::sleep(POLL).await;
@@ -122,43 +156,65 @@ pub async fn await_service_ready(port: u16, timeout: Duration) -> anyhow::Result
 
 /// What one probe saw.
 enum Probe {
-    /// An upstream verdict passed back through toker — an answer.
+    /// The answer the check wants.
     Answered(u16),
-    /// A response, but one of toker's own synthetic failure statuses.
-    TokerOwn(u16),
-    /// No HTTP exchange completed at all (refused, reset, timed out).
-    Unreachable,
+    /// Anything else.
+    Not(Seen),
 }
 
-/// The last thing an unanswered path did, for the timeout message.
+/// The last thing an unanswered check did, for the timeout message.
+#[derive(Clone)]
 enum Seen {
     TokerOwn(u16),
+    NotConfigured(String),
+    NoPrefix(u16),
     Unreachable,
 }
 
-/// Probe one usage path with an empty-body POST (see the module docs).
-async fn probe(client: &reqwest::Client, url: &str) -> Probe {
-    match client.post(url).body(String::new()).send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            if TOKER_OWN_STATUSES.contains(&status) {
-                Probe::TokerOwn(status)
+/// Probe one check (see the module docs).
+async fn probe(client: &reqwest::Client, base: &str, check: &Check) -> Probe {
+    let url = format!("{base}{}", check.path());
+    let request = match check {
+        Check::Usage(_) => client.post(&url).body(String::new()),
+        // The control header names the operation, as the endpoint
+        // requires; without it the answer is a 403, not a status.
+        Check::Prefix(_) => client.get(&url).header("x-toker-control", "status"),
+    };
+    let Ok(response) = request.send().await else {
+        return Probe::Not(Seen::Unreachable);
+    };
+    let status = response.status().as_u16();
+    match check {
+        Check::Usage(_) => {
+            if let Some(protocol) = response.headers().get(NOT_CONFIGURED_HEADER) {
+                let protocol = protocol.to_str().unwrap_or("?").to_owned();
+                Probe::Not(Seen::NotConfigured(protocol))
+            } else if TOKER_OWN_STATUSES.contains(&status) {
+                Probe::Not(Seen::TokerOwn(status))
             } else {
                 Probe::Answered(status)
             }
         }
-        Err(_) => Probe::Unreachable,
+        Check::Prefix(_) if status == 200 => Probe::Answered(status),
+        Check::Prefix(_) => Probe::Not(Seen::NoPrefix(status)),
     }
 }
 
-/// One path's line for the timeout message.
-fn describe(answered: Option<u16>, last: Option<Seen>) -> String {
+/// One check's line for the timeout message.
+fn describe(answered: Option<u16>, last: &Option<Seen>) -> String {
     match answered {
-        Some(status) => format!("answered {status} (the upstream's verdict)"),
+        Some(status) => format!("answered {status}"),
         None => match last {
             Some(Seen::TokerOwn(status)) => {
                 format!("toker's own {status} — the upstream did not round-trip")
             }
+            Some(Seen::NotConfigured(protocol)) => {
+                format!("toker has no {protocol} backend configured")
+            }
+            Some(Seen::NoPrefix(status)) => format!(
+                "answered {status}, not toker's status — the running toker does not strip \
+                 the prefix (an older build still serving? restart toker.service)"
+            ),
             _ => "no response".to_owned(),
         },
     }
@@ -168,20 +224,35 @@ fn describe(answered: Option<u16>, last: Option<Seen>) -> String {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A scratch axum server answering the two usage paths with fixed
-    /// statuses — an upstream stand-in, never the real toker (scratch
+    /// A scratch axum server answering the usage paths, prefixed or not,
+    /// with fixed statuses, and the prefixed status endpoint when
+    /// `strips` — an upstream stand-in, never the real toker (scratch
     /// ports only; the machine's live listener is never probed).
     async fn scratch_server(
         messages: StatusCode,
         chat: StatusCode,
+        strips: bool,
     ) -> (u16, tokio::task::JoinHandle<()>) {
+        let status = if strips {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
         let app = axum::Router::new()
             .route("/v1/messages", post(move || async move { messages }))
-            .route("/v1/chat/completions", post(move || async move { chat }));
+            .route(
+                "/f/{name}/v1/messages",
+                post(move || async move { messages }),
+            )
+            .route("/v1/chat/completions", post(move || async move { chat }))
+            .route(
+                "/f/{name}/_toker/status",
+                get(move || async move { status }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scratch");
@@ -202,22 +273,34 @@ mod tests {
         port
     }
 
+    fn both() -> Vec<Check> {
+        vec![
+            Check::Usage("/v1/messages".to_owned()),
+            Check::Usage("/v1/chat/completions".to_owned()),
+        ]
+    }
+
     #[tokio::test]
-    async fn a_ready_service_answers_both_paths_with_the_upstream_verdict() {
+    async fn a_ready_service_answers_every_check_with_the_upstream_verdict() {
         let (port, _server) =
-            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
-        let ready = await_service_ready(port, Duration::from_secs(5))
+            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, true).await;
+        let checks = vec![
+            Check::Prefix("claude".to_owned()),
+            Check::Usage("/f/claude/v1/messages".to_owned()),
+            Check::Usage("/v1/chat/completions".to_owned()),
+        ];
+        let ready = await_service_ready(port, &checks, Duration::from_secs(5))
             .await
-            .expect("both paths answer");
+            .expect("every check answers");
         assert_eq!(
-            ready,
-            ServiceReady {
-                messages: Some(401),
-                chat_completions: Some(401)
-            },
+            ready.answers,
+            vec![
+                (checks[0].clone(), 200),
+                (checks[1].clone(), 401),
+                (checks[2].clone(), 401),
+            ],
             "the classic wiring check: the unauthenticated upstream 401"
         );
-        assert!(ready.ready());
     }
 
     #[tokio::test]
@@ -225,20 +308,75 @@ mod tests {
         // A codex_sub-shaped route answers 404-ish on its own paths and
         // an empty chat body with a key configured draws a 400: any
         // upstream verdict proves the chain, not just the 401.
-        let (port, _server) = scratch_server(StatusCode::NOT_FOUND, StatusCode::BAD_REQUEST).await;
-        let ready = await_service_ready(port, Duration::from_secs(5))
+        let (port, _server) =
+            scratch_server(StatusCode::NOT_FOUND, StatusCode::BAD_REQUEST, true).await;
+        let ready = await_service_ready(port, &both(), Duration::from_secs(5))
             .await
             .expect("both paths answer");
-        assert_eq!(ready.messages, Some(404));
-        assert_eq!(ready.chat_completions, Some(400));
-        assert!(ready.ready());
+        assert_eq!(ready.answers[0].1, 404);
+        assert_eq!(ready.answers[1].1, 400);
+    }
+
+    #[tokio::test]
+    async fn a_toker_that_does_not_strip_the_prefix_is_not_ready() {
+        // The usage path through the prefix answers (an old toker relays
+        // the upstream's verdict on the unstripped path), but the
+        // prefix check sees no toker status: not ready, and the message
+        // says why.
+        let (port, _server) =
+            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED, false).await;
+        let checks = vec![
+            Check::Prefix("claude".to_owned()),
+            Check::Usage("/f/claude/v1/messages".to_owned()),
+        ];
+        let error = await_service_ready(port, &checks, Duration::from_millis(400))
+            .await
+            .expect_err("an unstripped prefix must never count");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("the /f/claude prefix") && message.contains("does not strip"),
+            "{message}"
+        );
+        assert!(message.contains("NOT being patched"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_not_configured_answer_is_not_an_answer() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    [(NOT_CONFIGURED_HEADER, "openai_chat")],
+                    "{}",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scratch");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("scratch serves");
+        });
+        let error = await_service_ready(
+            port,
+            &[Check::Usage("/v1/chat/completions".to_owned())],
+            Duration::from_millis(400),
+        )
+        .await
+        .expect_err("toker's own not-configured answer proves no upstream");
+        assert!(
+            format!("{error:#}").contains("no openai_chat backend configured"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
     async fn a_toker_own_status_is_not_an_answer_and_times_out_with_partial_info() {
         let (port, _server) =
-            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::BAD_GATEWAY).await;
-        let error = await_service_ready(port, Duration::from_millis(400))
+            scratch_server(StatusCode::UNAUTHORIZED, StatusCode::BAD_GATEWAY, true).await;
+        let error = await_service_ready(port, &both(), Duration::from_millis(400))
             .await
             .expect_err("a 502 chat path must never count as answering");
         let message = format!("{error:#}");
@@ -259,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_listening_times_out() {
         let port = dropped_port();
-        let error = await_service_ready(port, Duration::from_millis(300))
+        let error = await_service_ready(port, &both(), Duration::from_millis(300))
             .await
             .expect_err("nothing is listening");
         let message = format!("{error:#}");
@@ -300,10 +438,9 @@ mod tests {
             axum::serve(listener, app).await.expect("scratch serves");
         });
 
-        let ready = await_service_ready(port, Duration::from_secs(5))
+        let ready = await_service_ready(port, &both(), Duration::from_secs(5))
             .await
             .expect("the chat path comes good");
-        assert_eq!(ready.chat_completions, Some(401));
-        assert!(ready.ready());
+        assert_eq!(ready.answers[1].1, 401);
     }
 }

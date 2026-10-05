@@ -195,6 +195,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
                 .expect("codex refresh url"),
         }),
         gates: GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
         // suite (server_awake.rs) injects a fake spawner and turns it on.
@@ -521,8 +522,9 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     // compaction would be the feature lying about its configuration.
     assert!(!text.contains("The proxy would run it on"), "{text}");
     // The notice rides the configured style's wrapper, like the quota
-    // gate's (the GFM alert is the default).
-    assert!(text.contains("> [!NOTE]"), "{text}");
+    // gate's (the GFM alert is the unprefixed default, at the cold
+    // notice's warning level).
+    assert!(text.contains("> [!WARNING]"), "{text}");
 
     // Nothing reached upstream.
     assert!(mock.captured().is_empty(), "the gate answered, not the API");

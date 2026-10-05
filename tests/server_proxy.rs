@@ -351,6 +351,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
                 .expect("codex refresh url"),
         }),
         gates: toker::config::GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
         // suite (server_awake.rs) injects a fake spawner and turns it on.
@@ -1305,8 +1306,9 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
         "{text}"
     );
     assert!(text.contains("Fired once for that idle spell.]"), "{text}");
-    // The GFM alert is the default style, like the quota gate's notice.
-    assert!(text.contains("> [!NOTE]"), "{text}");
+    // The GFM alert is the unprefixed default, at the cold notice's
+    // warning level.
+    assert!(text.contains("> [!WARNING]"), "{text}");
     // This path never retargets a compaction, so the notice promises
     // no cheaper one; and openrouter bills the re-read rather than
     // metering it against a rate-limit window.
@@ -1827,4 +1829,32 @@ async fn an_unavailable_keyring_reads_as_no_key() {
             .is_none(),
         "no key, nothing injected"
     );
+}
+
+#[tokio::test]
+async fn the_frontend_prefix_is_stripped_before_routing() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    // toker's own endpoint under a prefix: what setup's verify probes
+    // before pointing a frontend at that prefix.
+    let response = client()
+        .get(toker_url(addr, "/f/claude/_toker/status"))
+        .header("x-toker-control", "status")
+        .send()
+        .await
+        .expect("status request");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A usage path under a prefix routes like the bare path, and the
+    // prefix never reaches the upstream.
+    let body = chat_body("z-ai/glm-5.3", false);
+    let response = client()
+        .post(toker_url(addr, "/f/opencode/v1/chat/completions"))
+        .body(body)
+        .send()
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured()[0].path, "/v1/chat/completions");
 }

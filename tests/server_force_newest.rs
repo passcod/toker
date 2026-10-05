@@ -210,6 +210,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         // poisoned prompt below the 175k bar keeps its notice out of the
         // way, isolating this unit's rewrite).
         gates: GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
         // suite (server_awake.rs) injects a fake spawner and turns it on.

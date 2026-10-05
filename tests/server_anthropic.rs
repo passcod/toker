@@ -540,6 +540,7 @@ fn test_config(
                 .expect("codex refresh url"),
         }),
         gates: toker::config::GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         // The sleep lock stays off in tests: the real spawner would take
         // a REAL idle-sleep lock on the host running the suite. The awake
         // suite (server_awake.rs) injects a fake spawner and turns it on.
@@ -1890,64 +1891,50 @@ async fn a_mapped_batch_records_which_requests_the_map_moved() {
 }
 
 #[tokio::test]
-async fn the_notice_style_threads_from_the_gates_config() {
-    // The default test above serves the insight block; these pin that
-    // the `[gates] notice_style` value reaches the served bytes — plain
-    // restores the pre-insight form, gfm serves the Workhorse-style
-    // alert. Same spent meter, same decision, only the wrapping moves.
+async fn the_notice_style_follows_the_frontend_prefix() {
+    // One spent meter, one decision: the frontend's base-URL prefix picks
+    // the wrapping through the `[notices]` table, and an unprefixed or
+    // unnamed frontend gets the table's default.
     let (mock, upstream) = spawn_mock().await;
     let mut config = test_config(upstream, None, "anthropic_sub");
-    config.gates.notice_style = NoticeStyle::Plain;
+    config.notices.default = NoticeStyle::Plain;
     let (addr, store) = spawn_toker(config).await;
     let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
-    let response = post_messages(
-        addr,
-        "/v1/messages",
-        &[],
-        &messages_body_no_stream("claude-opus-5"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
-    let notice = Blocking::notice(
-        Meter::FiveHour,
-        Some(reset5h),
-        None,
-        &tz,
-        NoticeStyle::Plain,
-    );
-    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
-    assert_eq!(
-        bytes.as_ref(),
-        expected.as_slice(),
-        "plain: the pre-insight form, served byte for byte"
-    );
+    for (path, style) in [
+        ("/v1/messages", NoticeStyle::Plain),
+        ("/f/claude/v1/messages", NoticeStyle::Block),
+        ("/f/workhorse/v1/messages", NoticeStyle::Toker),
+        ("/f/someone-else/v1/messages", NoticeStyle::Plain),
+    ] {
+        let response =
+            post_messages(addr, path, &[], &messages_body_no_stream("claude-opus-5")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bytes = response.bytes().await.expect("blocked bytes");
+        let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, style);
+        let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+        assert_eq!(
+            bytes.as_ref(),
+            expected.as_slice(),
+            "{path}: {style:?}, served byte for byte"
+        );
+    }
     assert!(mock.captured().is_empty());
+}
 
+#[tokio::test]
+async fn a_prefixed_request_is_forwarded_without_its_prefix() {
+    // The prefix is toker's, never the upstream's: the frontend's path
+    // and query arrive as they would unprefixed.
     let (mock, upstream) = spawn_mock().await;
-    let mut config = test_config(upstream, None, "anthropic_sub");
-    config.gates.notice_style = NoticeStyle::Gfm;
-    let (addr, store) = spawn_toker(config).await;
-    let (reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
-    let response = post_messages(
-        addr,
-        "/v1/messages",
-        &[],
-        &messages_body_no_stream("claude-opus-5"),
-    )
-    .await;
+    let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let body = messages_body("claude-opus-5", false);
+    let response = post_messages(addr, "/f/claude/v1/messages?beta=true", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.bytes().await.expect("blocked bytes");
-    let tz = jiff::tz::TimeZone::system();
-    let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), None, &tz, NoticeStyle::Gfm);
-    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
-    assert_eq!(
-        bytes.as_ref(),
-        expected.as_slice(),
-        "gfm: the alert form, served byte for byte"
-    );
-    assert!(mock.captured().is_empty());
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/messages");
+    assert_eq!(captured[0].query.as_deref(), Some("beta=true"));
 }
 
 #[tokio::test]

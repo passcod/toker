@@ -182,6 +182,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // ping header is recorded but excluded from liveness — the window
     // pinger's probe must never hold the sleep lock.
     let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    // The frontend's name from its base-URL prefix: picks the notices'
+    // style, nothing else.
+    let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
 
     // 1. Buffer the request body fully.
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -433,7 +436,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 resets_at,
                 context_tokens,
                 &jiff::tz::TimeZone::system(),
-                server.config.gates.notice_style,
+                server.config.notices.style_for(frontend.as_deref()),
             );
             let rendering = if stream_explicitly_false {
                 Rendering::Json
@@ -642,7 +645,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         outlook.as_ref(),
                         now,
                         &jiff::tz::TimeZone::system(),
-                        gates.notice_style,
+                        server.config.notices.style_for(frontend.as_deref()),
                     );
                     let rendering = if stream_explicitly_false {
                         Rendering::Json

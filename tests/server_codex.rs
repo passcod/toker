@@ -317,6 +317,7 @@ fn test_config(
                 .expect("refresh url"),
         }),
         gates: toker::config::GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         awake: false,
         transcript_roots: Vec::new(),
     }

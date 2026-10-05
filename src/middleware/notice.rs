@@ -2,70 +2,115 @@
 //! notices", docs/plans/toker-toolsuite.md:191). A blocked request is
 //! answered with a synthetic assistant turn, and the client renders that
 //! turn's text however it renders any assistant text — so a frontend with
-//! a structured format of its own should see the notice in it: claude's
-//! insight block, Workhorse's `> [!NOTE]` GFM alert, plain text
-//! everywhere else.
+//! a structured format of its own should see the notice in it.
 //!
-//! The choice is per-frontend-protocol in the plan's wording; until a
-//! client-selection mechanism exists it is a config knob —
-//! `[gates] notice_style` — threaded to the one place a notice is
-//! composed ([`crate::middleware::quota::Blocking::notice`]).
+//! The frontend is named by the `/f/<frontend>` prefix its base URL
+//! carries (the setup wizard writes `/f/claude` and `/f/workhorse`; see
+//! [`crate::server`]), and the `[notices]` config table maps a frontend
+//! to a [`NoticeStyle`] ([`crate::config::NoticesConfig`]): claude gets
+//! the insight-style block, Workhorse its `> [!TOKER]` alert, every other
+//! client (and an unprefixed base URL) the GFM alert.
 //!
-//! [`render`] is a pure function of (style, content), like every byte
-//! the gate emits (invariant 4, docs/plans/toker-toolsuite.md:93): a
-//! rendered notice enters replayed history, and the insight block's
-//! width is FROZEN for exactly that reason — a width that varied with
-//! anything (the content, the terminal, the version) would invalidate
-//! cache prefixes and replay.
+//! The [`NoticeLevel`] is the composer's, not the renderer's: the quota
+//! block is a [`NoticeLevel::Caution`], the cold notice a
+//! [`NoticeLevel::Warning`], decided where each notice is written.
+//!
+//! [`render`] is a pure function of (style, level, content), like every
+//! byte the gate emits (invariant 4, docs/plans/toker-toolsuite.md:93): a
+//! rendered notice enters replayed history, and the block's width is
+//! FROZEN for exactly that reason — a width that varied with anything
+//! (the content, the terminal, the version) would invalidate cache
+//! prefixes and replay.
 
 use serde::Deserializer;
 
-/// The insight block's header line: `★ Insight ` then dashes to 50
-/// columns (40 of them).
+/// The block style's header: `★ Toker ` then dashes to 50 columns (42 of
+/// them), wrapped in backticks. Claude Code renders its own explanatory
+/// insight lines as inline code — the backticks are what make this one
+/// look like those rather than like a line of prose dashes.
 ///
 /// The width is FROZEN for byte-stability (invariant 4): the block
 /// enters replayed history, and a width that varied with anything would
 /// invalidate cache prefixes / replay. Do not compute it, trim it, or
 /// fit it to content — it is a constant, byte-pinned by the tests below.
-pub const INSIGHT_HEADER: &str = "★ Insight ────────────────────────────────────────";
+pub const BLOCK_HEADER: &str = "`★ Toker ──────────────────────────────────────────`";
 
-/// The insight block's footer: 50 columns of dashes, matching
-/// [`INSIGHT_HEADER`]'s total width.
+/// The block style's footer: 50 columns of dashes, in backticks,
+/// matching [`BLOCK_HEADER`]'s width.
 ///
 /// FROZEN with the header — same invariant-4 rule, same byte pin.
-pub const INSIGHT_FOOTER: &str = "──────────────────────────────────────────────────";
+pub const BLOCK_FOOTER: &str = "`──────────────────────────────────────────────────`";
 
-/// How a gate notice is rendered — the `[gates] notice_style` config
-/// value. Deserialises case-insensitively (`"insight"`, `"Gfm"`,
-/// `"PLAIN"`, …); an unknown value is a config load error, not a silent
-/// default (the crate's deny_unknown_fields strictness).
+/// How serious a notice is, which the GFM style shows as its alert kind.
+/// The notice's composer decides it; the renderer only spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    /// A session stopped until the operator acts: the quota block.
+    Caution,
+    /// Advice the operator may act on or ignore: the cold notice.
+    Warning,
+}
+
+impl NoticeLevel {
+    /// The GFM alert kind.
+    fn alert(self) -> &'static str {
+        match self {
+            NoticeLevel::Caution => "CAUTION",
+            NoticeLevel::Warning => "WARNING",
+        }
+    }
+}
+
+/// How a gate notice is rendered for one frontend — a `[notices]` config
+/// value. Deserialises case-insensitively (`"block"`, `"Gfm"`, `"TOKER"`,
+/// …); an unknown value is a config load error, not a silent default (the
+/// crate's deny_unknown_fields strictness).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NoticeStyle {
-    /// Claude's insight block: the frozen header, the content lines
-    /// verbatim, the frozen footer. **Claude renders this and nothing else
-    /// does** — opt in per client only when every anthropic-frontend client
-    /// in play is claude Code.
-    Insight,
-    /// A GFM alert — `> [!NOTE]` then the content lines each prefixed
-    /// `> ` — the generic form: Workhorse, GitHub-ish renderers, and
-    /// anything that falls back to plain markdown all show it sensibly.
+    /// A GFM alert of the notice's level — `> [!CAUTION]` or
+    /// `> [!WARNING]`, then the content lines each prefixed `> `. The
+    /// generic form: GitHub-ish renderers show the alert, anything that
+    /// falls back to plain markdown shows a quote.
     #[default]
     Gfm,
-    /// The content verbatim: the degradation for frontends with no
-    /// structured format of their own.
+    /// Workhorse's own alert, `> [!TOKER]`, whatever the level: Workhorse
+    /// renders toker's notices as a kind of their own.
+    Toker,
+    /// The insight-style block claude renders: the frozen backticked
+    /// header and footer around the content lines verbatim. **Claude
+    /// renders this and nothing else does.** Spelled `"insight"` before
+    /// it carried toker's name; that spelling still reads as this.
+    Block,
+    /// The content verbatim: opt-in, for frontends with no structured
+    /// format of their own.
     Plain,
+}
+
+impl NoticeStyle {
+    /// The canonical config spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            NoticeStyle::Gfm => "gfm",
+            NoticeStyle::Toker => "toker",
+            NoticeStyle::Block => "block",
+            NoticeStyle::Plain => "plain",
+        }
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for NoticeStyle {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         match text.to_ascii_lowercase().as_str() {
-            "insight" => Ok(NoticeStyle::Insight),
             "gfm" => Ok(NoticeStyle::Gfm),
+            "toker" => Ok(NoticeStyle::Toker),
+            // "insight" is the block's spelling from before the
+            // per-frontend table; a config written then still loads.
+            "block" | "insight" => Ok(NoticeStyle::Block),
             "plain" => Ok(NoticeStyle::Plain),
             _ => Err(serde::de::Error::unknown_variant(
                 &text,
-                &["insight", "gfm", "plain"],
+                &["gfm", "toker", "block", "plain"],
             )),
         }
     }
@@ -73,176 +118,213 @@ impl<'de> serde::Deserialize<'de> for NoticeStyle {
 
 impl serde::Serialize for NoticeStyle {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // The canonical lowercase name — the exact inverse of the
+        // The canonical lowercase name — the inverse of the
         // case-insensitive deserialiser above, so a config value
-        // round-trips as its own example (`notice_style = "gfm"`).
-        // The setup wizard's `toker.toml` rewrite writes through here
-        // (see `crate::setup::config_writer`).
-        serializer.serialize_str(match self {
-            NoticeStyle::Insight => "insight",
-            NoticeStyle::Gfm => "gfm",
-            NoticeStyle::Plain => "plain",
-        })
+        // round-trips as its own example (`claude = "block"`). The setup
+        // wizard's `toker.toml` rewrite writes through here (see
+        // `crate::setup::config_writer`).
+        serializer.serialize_str(self.name())
     }
 }
 
-/// Render `content` in the style. Pure: the same (style, content) pair
-/// renders the same bytes on every call, forever (invariant 4 — a gate
-/// notice enters replayed history).
+/// Render `content` in the style at the level. Pure: the same (style,
+/// level, content) renders the same bytes on every call, forever
+/// (invariant 4 — a gate notice enters replayed history).
 ///
-/// Multi-line content passes through verbatim between the insight
-/// header and footer, and line by line under the GFM prefixes.
-pub fn render(style: NoticeStyle, content: &str) -> String {
+/// Multi-line content passes through verbatim between the block's header
+/// and footer, and line by line under the alert prefixes.
+pub fn render(style: NoticeStyle, level: NoticeLevel, content: &str) -> String {
     match style {
-        NoticeStyle::Insight => {
-            let mut out = String::with_capacity(
-                INSIGHT_HEADER.len() + content.len() + INSIGHT_FOOTER.len() + 2,
-            );
-            out.push_str(INSIGHT_HEADER);
+        NoticeStyle::Block => {
+            let mut out =
+                String::with_capacity(BLOCK_HEADER.len() + content.len() + BLOCK_FOOTER.len() + 2);
+            out.push_str(BLOCK_HEADER);
             out.push('\n');
             out.push_str(content);
             out.push('\n');
-            out.push_str(INSIGHT_FOOTER);
+            out.push_str(BLOCK_FOOTER);
             out
         }
-        NoticeStyle::Gfm => {
-            let mut out = String::from("> [!NOTE]");
-            for line in content.lines() {
-                out.push_str("\n> ");
-                out.push_str(line);
-            }
-            out
-        }
+        NoticeStyle::Gfm => alert(&format!("> [!{}]", level.alert()), content),
+        NoticeStyle::Toker => alert("> [!TOKER]", content),
         NoticeStyle::Plain => content.to_owned(),
     }
 }
 
+/// An alert marker line, then each content line under `> `.
+fn alert(marker: &str, content: &str) -> String {
+    let mut out = String::from(marker);
+    for line in content.lines() {
+        out.push_str("\n> ");
+        out.push_str(line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{INSIGHT_FOOTER, INSIGHT_HEADER, NoticeStyle, render};
+    use super::{BLOCK_FOOTER, BLOCK_HEADER, NoticeLevel, NoticeStyle, render};
 
     /// The plan's own example content.
     const CONTENT: &str = "You've hit the 5-hour limit for your current plan. It resets at 21:30.";
 
+    const STYLES: [NoticeStyle; 4] = [
+        NoticeStyle::Gfm,
+        NoticeStyle::Toker,
+        NoticeStyle::Block,
+        NoticeStyle::Plain,
+    ];
+    const LEVELS: [NoticeLevel; 2] = [NoticeLevel::Caution, NoticeLevel::Warning];
+
     #[test]
-    fn the_insight_constants_are_frozen_at_50_columns() {
-        // The exact strings, pinned — and their widths, stated: 10
-        // columns of label ("★ Insight ") + 40 of dashes = 50; the
-        // footer is 50 of dashes. FROZEN (invariant 4): the block
+    fn the_block_constants_are_frozen_at_50_columns_in_backticks() {
+        // The exact strings, pinned — and their widths, stated: 8 columns
+        // of label ("★ Toker ") + 42 of dashes = 50 inside the backticks;
+        // the footer is 50 of dashes. FROZEN (invariant 4): the block
         // enters replayed history, so a width that varied with anything
         // would invalidate cache prefixes / replay.
         assert_eq!(
-            INSIGHT_HEADER,
-            "★ Insight ────────────────────────────────────────"
+            BLOCK_HEADER,
+            "`★ Toker ──────────────────────────────────────────`"
         );
-        assert_eq!(INSIGHT_HEADER, format!("★ Insight {}", "─".repeat(40)));
-        assert_eq!(INSIGHT_HEADER.chars().count(), 50);
-        assert_eq!(INSIGHT_FOOTER, "─".repeat(50));
-        assert_eq!(INSIGHT_FOOTER.chars().count(), 50);
-        assert!(
-            INSIGHT_HEADER.starts_with("★ Insight "),
-            "the label is frozen too"
-        );
+        assert_eq!(BLOCK_HEADER, format!("`★ Toker {}`", "─".repeat(42)));
+        assert_eq!(BLOCK_HEADER.trim_matches('`').chars().count(), 50);
+        assert_eq!(BLOCK_FOOTER, format!("`{}`", "─".repeat(50)));
+        assert_eq!(BLOCK_FOOTER.trim_matches('`').chars().count(), 50);
     }
 
     #[test]
-    fn insight_wraps_the_content_verbatim_between_header_and_footer() {
-        // Byte-pinned: the plan's example, rendered whole.
-        assert_eq!(
-            render(NoticeStyle::Insight, CONTENT),
-            "★ Insight ────────────────────────────────────────\n\
-             You've hit the 5-hour limit for your current plan. It resets at 21:30.\n\
-             ──────────────────────────────────────────────────"
-        );
+    fn block_wraps_the_content_verbatim_between_header_and_footer() {
+        // Byte-pinned: the plan's example, rendered whole — at either
+        // level, the block has no level of its own.
+        for level in LEVELS {
+            assert_eq!(
+                render(NoticeStyle::Block, level, CONTENT),
+                "`★ Toker ──────────────────────────────────────────`\n\
+                 You've hit the 5-hour limit for your current plan. It resets at 21:30.\n\
+                 `──────────────────────────────────────────────────`"
+            );
+        }
         // Multi-line content passes through verbatim, untouched.
         assert_eq!(
-            render(NoticeStyle::Insight, "line one\nline two"),
-            format!("{INSIGHT_HEADER}\nline one\nline two\n{INSIGHT_FOOTER}")
+            render(
+                NoticeStyle::Block,
+                NoticeLevel::Warning,
+                "line one\nline two"
+            ),
+            format!("{BLOCK_HEADER}\nline one\nline two\n{BLOCK_FOOTER}")
         );
     }
 
     #[test]
-    fn gfm_prefixes_each_content_line_under_the_alert_marker() {
+    fn gfm_spells_the_level_and_prefixes_each_content_line() {
         assert_eq!(
-            render(NoticeStyle::Gfm, CONTENT),
-            "> [!NOTE]\n> You've hit the 5-hour limit for your current plan. It resets at 21:30."
-        );
-        // Every line gets the prefix; a trailing newline in the content
-        // is not a line, so it never grows an empty `> ` continuation.
-        assert_eq!(
-            render(NoticeStyle::Gfm, "line one\nline two"),
-            "> [!NOTE]\n> line one\n> line two"
+            render(NoticeStyle::Gfm, NoticeLevel::Caution, CONTENT),
+            "> [!CAUTION]\n> You've hit the 5-hour limit for your current plan. It resets at 21:30."
         );
         assert_eq!(
-            render(NoticeStyle::Gfm, "line one\nline two\n"),
-            "> [!NOTE]\n> line one\n> line two",
+            render(NoticeStyle::Gfm, NoticeLevel::Warning, "line one\nline two"),
+            "> [!WARNING]\n> line one\n> line two"
+        );
+        // A trailing newline in the content is not a line, so it never
+        // grows an empty `> ` continuation.
+        assert_eq!(
+            render(
+                NoticeStyle::Gfm,
+                NoticeLevel::Warning,
+                "line one\nline two\n"
+            ),
+            "> [!WARNING]\n> line one\n> line two",
             "a trailing newline is not a content line"
         );
     }
 
     #[test]
-    fn plain_is_the_content_verbatim() {
-        assert_eq!(render(NoticeStyle::Plain, CONTENT), CONTENT);
-        assert_eq!(render(NoticeStyle::Plain, "a\nb"), "a\nb");
+    fn toker_is_workhorses_alert_whatever_the_level() {
+        for level in LEVELS {
+            assert_eq!(
+                render(NoticeStyle::Toker, level, "line one\nline two"),
+                "> [!TOKER]\n> line one\n> line two"
+            );
+        }
     }
 
     #[test]
-    fn empty_content_renders_the_block_skeletons() {
-        // Insight: header, an empty line, footer — the content lines
-        // are "none", not "missing", so the block keeps its shape.
+    fn plain_is_the_content_verbatim() {
+        for level in LEVELS {
+            assert_eq!(render(NoticeStyle::Plain, level, CONTENT), CONTENT);
+            assert_eq!(render(NoticeStyle::Plain, level, "a\nb"), "a\nb");
+        }
+    }
+
+    #[test]
+    fn empty_content_renders_the_skeletons() {
+        // Block: header, an empty line, footer — the content lines are
+        // "none", not "missing", so the block keeps its shape.
         assert_eq!(
-            render(NoticeStyle::Insight, ""),
-            format!("{INSIGHT_HEADER}\n\n{INSIGHT_FOOTER}")
+            render(NoticeStyle::Block, NoticeLevel::Caution, ""),
+            format!("{BLOCK_HEADER}\n\n{BLOCK_FOOTER}")
         );
-        // Gfm: the bare alert marker; Plain: nothing.
-        assert_eq!(render(NoticeStyle::Gfm, ""), "> [!NOTE]");
-        assert_eq!(render(NoticeStyle::Plain, ""), "");
+        // The alerts: the bare marker; Plain: nothing.
+        assert_eq!(
+            render(NoticeStyle::Gfm, NoticeLevel::Caution, ""),
+            "> [!CAUTION]"
+        );
+        assert_eq!(
+            render(NoticeStyle::Toker, NoticeLevel::Caution, ""),
+            "> [!TOKER]"
+        );
+        assert_eq!(render(NoticeStyle::Plain, NoticeLevel::Caution, ""), "");
     }
 
     #[test]
     fn the_default_style_is_the_generic_gfm_alert() {
-        // Insight is claude-only rendering; GFM is the one every client
-        // family shows sensibly, and toker cannot yet tell clients apart.
+        // The style every unknown client gets: the one every client
+        // family shows sensibly.
         assert_eq!(NoticeStyle::default(), NoticeStyle::Gfm);
     }
 
     #[test]
     fn the_style_deserialises_case_insensitively_and_rejects_the_unknown() {
-        // Case-insensitive variant names, every casing pattern the
-        // config side can meet (the value is JSON-quoted by hand —
-        // from_str takes a document, not a bare word).
-        for text in ["insight", "INSIGHT", "Insight", "iNsIgHt"] {
-            assert_eq!(
-                serde_json::from_str::<NoticeStyle>(&format!("\"{text}\"")).expect("parses"),
-                NoticeStyle::Insight
-            );
-        }
-        for text in ["gfm", "GFM", "Gfm"] {
-            assert_eq!(
-                serde_json::from_str::<NoticeStyle>(&format!("\"{text}\"")).expect("parses"),
-                NoticeStyle::Gfm
-            );
-        }
-        for text in ["plain", "PLAIN", "Plain"] {
-            assert_eq!(
-                serde_json::from_str::<NoticeStyle>(&format!("\"{text}\"")).expect("parses"),
-                NoticeStyle::Plain
-            );
+        let parse = |text: &str| serde_json::from_str::<NoticeStyle>(&format!("\"{text}\""));
+        for (texts, style) in [
+            (&["gfm", "GFM", "Gfm"][..], NoticeStyle::Gfm),
+            (&["toker", "TOKER", "Toker"][..], NoticeStyle::Toker),
+            (&["block", "BLOCK", "Block"][..], NoticeStyle::Block),
+            // The block's earlier spelling still loads.
+            (&["insight", "INSIGHT", "iNsIgHt"][..], NoticeStyle::Block),
+            (&["plain", "PLAIN", "Plain"][..], NoticeStyle::Plain),
+        ] {
+            for text in texts {
+                assert_eq!(parse(text).expect("parses"), style, "{text}");
+            }
         }
         // An unknown value is an error, not a silent default — the
         // config's deny_unknown_fields strictness, on the value side.
         assert!(
-            serde_json::from_str::<NoticeStyle>("\"fancy\"").is_err(),
+            parse("fancy").is_err(),
             "an unknown style must fail to load"
         );
+        // Each style serialises as its canonical name, which parses back.
+        for style in STYLES {
+            let text = serde_json::to_string(&style).expect("serialises");
+            assert_eq!(text, format!("\"{}\"", style.name()));
+            assert_eq!(
+                serde_json::from_str::<NoticeStyle>(&text).expect("round-trips"),
+                style
+            );
+        }
     }
 
     #[test]
     fn render_is_pure() {
-        // Invariant 4: same (style, content) → same bytes, every call.
+        // Invariant 4: same (style, level, content) → same bytes, every
+        // call.
         for _ in 0..3 {
-            for style in [NoticeStyle::Insight, NoticeStyle::Gfm, NoticeStyle::Plain] {
-                assert_eq!(render(style, CONTENT), render(style, CONTENT));
+            for style in STYLES {
+                for level in LEVELS {
+                    assert_eq!(render(style, level, CONTENT), render(style, level, CONTENT));
+                }
             }
         }
     }

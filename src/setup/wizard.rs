@@ -717,16 +717,80 @@ enum UrlRead {
 /// ([`DEFAULT_PORT`] unless changed), never this.
 const CTP_PORT: u16 = 18_082;
 
-/// The loopback port a base URL points at, when it is in one of the
-/// wizard's own URL shapes at all (the patchers' hand-done precedent):
-/// the bare listener claude takes and the `/v1` form opencode takes.
-/// The port alone does not say whose listener it is; compare it with
-/// the configured port before calling it toker's. The one place a
-/// frontend base URL's shape is parsed, so a new shape is taught here.
-fn loopback_port_of(url: &str) -> Option<u16> {
+/// A loopback base URL in one of the wizard's own shapes, read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Loopback {
+    port: u16,
+    /// The `/f/<frontend>` prefix's name, when the URL carries one.
+    prefix: Option<String>,
+}
+
+/// The loopback port and frontend prefix a base URL points at, when it
+/// is in one of the wizard's own URL shapes at all (the patchers'
+/// hand-done precedent): the bare listener, the listener with a
+/// `/f/<frontend>` prefix the claude frontends take, and the `/v1` form
+/// opencode takes. The port alone does not say whose listener it is;
+/// compare it with the configured port before calling it toker's. The
+/// one place a frontend base URL's shape is parsed, so a new shape is
+/// taught here.
+fn loopback_of(url: &str) -> Option<Loopback> {
     let rest = url.strip_prefix("http://127.0.0.1:")?;
     let rest = rest.strip_suffix("/v1").unwrap_or(rest);
-    rest.parse().ok()
+    let (port, prefix) = match rest.split_once("/f/") {
+        Some((port, name)) if crate::config::is_frontend_name(name) => (port, Some(name)),
+        Some(_) => return None,
+        None => (rest, None),
+    };
+    Some(Loopback {
+        port: port.parse().ok()?,
+        prefix: prefix.map(str::to_owned),
+    })
+}
+
+/// Whether the config has a backend for a frontend protocol.
+fn protocol_enabled(config: &Config, protocol: &str) -> bool {
+    match protocol {
+        "openai_chat" => !config.enabled_openai_chat().is_empty(),
+        _ => !config.enabled_anthropic().is_empty(),
+    }
+}
+
+/// What verify must see answer before the frontends step: for each
+/// protocol with a backend, the usage path of every detected frontend
+/// that speaks it, through the very prefix it will be pointed at, plus
+/// that prefix reaching toker itself ([`verify::Check::Prefix`]); the
+/// bare usage path when no frontend of the protocol was detected.
+fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
+    let mut checks: Vec<verify::Check> = Vec::new();
+    let mut push = |check: verify::Check| {
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    };
+    for (protocol, bare) in [
+        ("anthropic", "/v1/messages"),
+        ("openai_chat", "/v1/chat/completions"),
+    ] {
+        if !protocol_enabled(config, protocol) {
+            continue;
+        }
+        let speakers: Vec<&Frontend> = detected
+            .frontends
+            .iter()
+            .map(|fd| &fd.frontend)
+            .filter(|frontend| frontend.protocol() == protocol)
+            .collect();
+        if speakers.is_empty() {
+            push(verify::Check::Usage(bare.to_owned()));
+        }
+        for frontend in speakers {
+            if let Some(name) = frontend.prefix() {
+                push(verify::Check::Prefix(name.to_owned()));
+            }
+            push(verify::Check::Usage(frontend.usage_path()));
+        }
+    }
+    checks
 }
 
 /// Walk `keys` through the JSON at `path` and read the string there —
@@ -1022,8 +1086,8 @@ impl<'a> Wizard<'a> {
         }
 
         if self.units_step(current.port, &mut report)? {
-            self.verify_step(current.port, &mut report).await?;
-            self.frontends_step(&detected, current.port, &mut report)?;
+            self.verify_step(&current, &detected, &mut report).await?;
+            self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
         }
         self.finish(&report)?;
@@ -1781,20 +1845,31 @@ impl<'a> Wizard<'a> {
     /// [`Step::VerifyService`] — the library's wiring check, the
     /// ordering rule's enforcement point. Failure aborts the wizard:
     /// the frontends are NOT touched, and the error says so.
-    async fn verify_step(&mut self, port: u16, report: &mut RunReport) -> Result<()> {
+    async fn verify_step(
+        &mut self,
+        config: &Config,
+        detected: &Detected,
+        report: &mut RunReport,
+    ) -> Result<()> {
         self.step(Step::VerifyService)?;
-        match verify::await_service_ready(port, self.verify_timeout).await {
+        let checks = verify_checks(config, detected);
+        if checks.is_empty() {
+            self.say("no backend is enabled — there is nothing to verify and nothing to wire")?;
+            bail!(
+                "the wizard stopped before the frontends step: no backend is enabled in {}; \
+                 re-run `toker setup` and reconfigure",
+                self.paths.config_toml.display()
+            );
+        }
+        match verify::await_service_ready(config.port, &checks, self.verify_timeout).await {
             Ok(ready) => {
-                self.say(&format!(
-                    "POST /v1/messages → {} (the upstream's verdict)",
-                    ready.messages.expect("ready means both paths answered"),
-                ))?;
-                self.say(&format!(
-                    "POST /v1/chat/completions → {}",
-                    ready
-                        .chat_completions
-                        .expect("ready means both paths answered"),
-                ))?;
+                for (check, status) in &ready.answers {
+                    let whose = match check {
+                        verify::Check::Usage(_) => " (the upstream's verdict)",
+                        verify::Check::Prefix(_) => " (toker's own status)",
+                    };
+                    self.say(&format!("{} → {status}{whose}", check.describe()))?;
+                }
                 report.verified = Some(ready);
                 Ok(())
             }
@@ -1820,15 +1895,36 @@ impl<'a> Wizard<'a> {
     fn frontends_step(
         &mut self,
         detected: &Detected,
-        port: u16,
+        config: &Config,
         report: &mut RunReport,
     ) -> Result<()> {
         self.step(Step::PatchFrontends)?;
+        let port = config.port;
         for detected in &detected.frontends {
             let frontend = &detected.frontend;
             let url = frontend.base_url(port);
             let name = frontend.describe();
-            let wired = matches!(&detected.url, UrlRead::Base(found) if loopback_port_of(found) == Some(port));
+            // A frontend whose protocol has no backend would get only
+            // not-configured errors from toker: it is left where it is.
+            if !protocol_enabled(config, frontend.protocol()) {
+                self.say(&format!(
+                    "{name}: not offered — no {} backend is enabled",
+                    frontend.protocol()
+                ))?;
+                report
+                    .left_unchanged
+                    .push(format!("{name} (no {} backend)", frontend.protocol()));
+                continue;
+            }
+            // Wired means this port AND this frontend's own prefix: a
+            // claude still on the bare listener is re-offered, so its
+            // notices can render in its own format.
+            let wired = matches!(
+                &detected.url,
+                UrlRead::Base(found) if loopback_of(found).is_some_and(|found| {
+                    found.port == port && found.prefix.as_deref() == frontend.prefix()
+                })
+            );
             let question = if wired {
                 format!("{name} already points at toker — leave it as is?")
             } else {
@@ -2457,9 +2553,13 @@ impl<'a> Wizard<'a> {
         self.say(&format!("  units     : {units}"))?;
         let verified = match &report.verified {
             Some(ready) => format!(
-                "answered ({}/{})",
-                ready.messages.unwrap_or(0),
-                ready.chat_completions.unwrap_or(0)
+                "answered ({})",
+                ready
+                    .answers
+                    .iter()
+                    .map(|(_, status)| status.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/")
             ),
             None if !report.units_ok => "not attempted (the units failed)".to_owned(),
             None => "not reached".to_owned(),
@@ -2639,11 +2739,23 @@ fn frontend_state(frontend: &Frontend, url: &UrlRead, toker_port: u16) -> String
             frontend.describe()
         ),
         UrlRead::NoBase => format!("{}: no {what} set", frontend.describe()),
-        UrlRead::Base(url) => match loopback_port_of(url) {
-            Some(port) if port == toker_port => {
-                format!("{}: points at toker (port {port})", frontend.describe())
+        UrlRead::Base(url) => match loopback_of(url) {
+            Some(found) if found.port == toker_port => {
+                let prefix = match (found.prefix.as_deref(), frontend.prefix()) {
+                    (found, wanted) if found == wanted => String::new(),
+                    (_, Some(wanted)) => {
+                        format!(" without its /f/{wanted} prefix — re-pointing adds it")
+                    }
+                    (Some(found), None) => format!(" through /f/{found}"),
+                    (None, None) => String::new(),
+                };
+                format!(
+                    "{}: points at toker (port {}){prefix}",
+                    frontend.describe(),
+                    found.port
+                )
             }
-            Some(CTP_PORT) => format!(
+            Some(found) if found.port == CTP_PORT => format!(
                 "{}: points at claude-token-proxy (port {CTP_PORT})",
                 frontend.describe()
             ),
@@ -3062,9 +3174,20 @@ mod tests {
     /// fixed verdicts — bound to an ephemeral loopback port, never the
     /// machine's live listener.
     async fn serve(messages: StatusCode, chat: StatusCode) -> (u16, JoinHandle<()>) {
+        // The prefixed paths too, and toker's own status under a
+        // prefix: the wizard verifies a frontend's prefix before
+        // patching it.
         let app = axum::Router::new()
             .route("/v1/messages", post(move || async move { messages }))
-            .route("/v1/chat/completions", post(move || async move { chat }));
+            .route(
+                "/f/{name}/v1/messages",
+                post(move || async move { messages }),
+            )
+            .route("/v1/chat/completions", post(move || async move { chat }))
+            .route(
+                "/f/{name}/_toker/status",
+                axum::routing::get(|| async { StatusCode::OK }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scratch");
@@ -3162,7 +3285,7 @@ mod tests {
         with_key(
             claude_fixture(),
             &["env", "ANTHROPIC_BASE_URL"],
-            &patchers::anthropic_base_url(port),
+            &patchers::frontend_base_url(port, "claude"),
         )
     }
 
@@ -3280,10 +3403,17 @@ WantedBy=sockets.target
         };
         let base = |url: &str| UrlRead::Base(url.to_owned());
 
-        // toker only on the configured port, in either of its shapes.
+        // toker only on the configured port, in any of its shapes; a
+        // claude still on the bare listener is told its prefix is
+        // missing.
+        assert_eq!(
+            frontend_state(&claude, &base("http://127.0.0.1:18123/f/claude"), 18_123),
+            "claude (/home/u/.claude/settings.json): points at toker (port 18123)"
+        );
         assert_eq!(
             frontend_state(&claude, &base("http://127.0.0.1:18123"), 18_123),
-            "claude (/home/u/.claude/settings.json): points at toker (port 18123)"
+            "claude (/home/u/.claude/settings.json): points at toker (port 18123) \
+             without its /f/claude prefix — re-pointing adds it"
         );
         assert_eq!(
             frontend_state(&opencode, &base("http://127.0.0.1:20000/v1"), 20_000),
@@ -3551,8 +3681,19 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert_eq!(
             report.verified,
             Some(ServiceReady {
-                messages: Some(401),
-                chat_completions: Some(401),
+                answers: vec![
+                    // The claude prefix reaches toker itself, then each
+                    // frontend's own path carries the upstream's verdict:
+                    // claude through its prefix, the shell rc bare,
+                    // opencode on the openai path.
+                    (verify::Check::Prefix("claude".to_owned()), 200),
+                    (
+                        verify::Check::Usage("/f/claude/v1/messages".to_owned()),
+                        401
+                    ),
+                    (verify::Check::Usage("/v1/messages".to_owned()), 401),
+                    (verify::Check::Usage("/v1/chat/completions".to_owned()), 401),
+                ],
             })
         );
         assert!(report.config_written);
@@ -3753,6 +3894,93 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
     }
 
     #[tokio::test]
+    async fn a_listener_that_does_not_strip_the_prefix_stops_the_wizard_before_claude() {
+        // An older toker still serving the socket: the prefixed usage
+        // path answers (it relays the upstream's verdict on the
+        // unstripped path), but its status is not under the prefix.
+        // claude's settings are hot-reloaded into live sessions, so
+        // pointing them at /f/claude there would break every session.
+        let app = axum::Router::new().fallback(|| async { StatusCode::UNAUTHORIZED });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scratch");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("scratch serves");
+        });
+        let mut rig = Rig::new(
+            "prefix-unstripped",
+            vec![
+                multi(&[0]), // anthropic_sub
+                confirm(true),
+                text(&port.to_string()),
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let before_claude = seed_claude(&rig.root);
+
+        let error = rig
+            .run(Duration::from_millis(600))
+            .await
+            .expect_err("the prefix never reached toker");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("the /f/claude prefix") && chain.contains("does not strip"),
+            "{chain}"
+        );
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before_claude,
+            "claude was not pointed at an unverified prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frontend_whose_protocol_has_no_backend_is_not_offered() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "no-anthropic",
+            vec![
+                multi(&[3]), // openrouter alone
+                select(0),   // its key: the frontend's own
+                confirm(true),
+                text(&port.to_string()),
+                confirm(true),  // opencode
+                confirm(true),  // the opencode plugin
+                confirm(false), // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let before_claude = seed_claude(&rig.root);
+        seed_opencode(&rig.root);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+        // Verify probed only the openai path; claude was never asked
+        // about and never touched.
+        assert_eq!(
+            report.verified.expect("verified").answers,
+            vec![(verify::Check::Usage("/v1/chat/completions".to_owned()), 401)]
+        );
+        assert!(
+            rig.out()
+                .contains("not offered — no anthropic backend is enabled")
+        );
+        assert!(
+            !rig.prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("claude")),
+            "{:?}",
+            rig.prompt.asked()
+        );
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before_claude
+        );
+        assert_eq!(report.patched.len(), 1, "opencode alone");
+    }
+
+    #[tokio::test]
     async fn a_failed_verify_stops_the_wizard_before_the_frontends() {
         let port = dropped_port();
         let mut rig = Rig::new(
@@ -3916,10 +4144,15 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
             .run(VERIFY_TIMEOUT)
             .await
             .expect("the with-workhorse run completes");
+        // Workhorse's own prefix, so its notices render as its own.
         assert_eq!(
             std::fs::read(with_dir.join(".workhorse/repos/.claude/settings.json"))
                 .expect("read the workhorse settings"),
-            claude_wired(port),
+            with_key(
+                claude_fixture(),
+                &["env", "ANTHROPIC_BASE_URL"],
+                &patchers::frontend_base_url(port, "workhorse"),
+            ),
         );
         assert!(
             report.patched.iter().any(|name| name.contains("Workhorse")),

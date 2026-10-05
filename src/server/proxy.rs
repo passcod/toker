@@ -94,6 +94,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // pinger's probe must never hold the sleep lock, on this path like
     // the anthropic one.
     let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    // The frontend's name from its base-URL prefix: picks the notice's
+    // style, nothing else.
+    let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
 
     // 1. Buffer the request body fully.
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
@@ -259,7 +262,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     None,
                     now,
                     &jiff::tz::TimeZone::system(),
-                    gates.notice_style,
+                    server.config.notices.style_for(frontend.as_deref()),
                 );
                 let body = cold::ColdBlocking::openai_turn(
                     &text,

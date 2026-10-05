@@ -263,6 +263,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
                 .expect("codex refresh url"),
         }),
         gates: GatesConfig::default(),
+        notices: toker::config::NoticesConfig::default(),
         awake,
         transcript_roots: Vec::new(),
     }

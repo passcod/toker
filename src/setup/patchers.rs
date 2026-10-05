@@ -11,10 +11,14 @@
 //! one of these.
 //!
 //! The URL shapes are the hand-done precedent on the reference machine,
-//! captured by [`anthropic_base_url`] and [`openai_base_url`]:
+//! captured by [`anthropic_base_url`], [`frontend_base_url`] and
+//! [`openai_base_url`]:
 //!
-//! - claude: `env.ANTHROPIC_BASE_URL` = `http://127.0.0.1:18123` — no
-//!   `/v1`, because the client appends `/v1/messages` itself;
+//! - claude: `env.ANTHROPIC_BASE_URL` = `http://127.0.0.1:18123/f/claude`
+//!   — no `/v1`, because the client appends `/v1/messages` itself, and
+//!   the `/f/claude` prefix names the frontend so toker can render its
+//!   notices in claude's own format (the router strips it); Workhorse's
+//!   repo settings take `/f/workhorse` the same way;
 //! - opencode: `provider.openrouter.options.baseURL` =
 //!   `http://127.0.0.1:18123/v1` — with `/v1`, the OpenAI client
 //!   convention, because the client appends `/chat/completions`.
@@ -53,6 +57,15 @@ pub const SHELL_VAR: &str = "ANTHROPIC_BASE_URL";
 /// this machine's `~/.claude/settings.json` carries.
 pub fn anthropic_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
+}
+
+/// The anthropic-protocol base URL for a toker port that names the
+/// frontend: the bare listener plus `/f/<frontend>`, which toker's router
+/// strips and keeps as the request's frontend (it picks the gate
+/// notices' style). The client appends `/v1/messages` after it as it
+/// would to the bare listener.
+pub fn frontend_base_url(port: u16, frontend: &str) -> String {
+    format!("http://127.0.0.1:{port}/f/{frontend}")
 }
 
 /// The openai-chat base URL for a toker port: with `/v1` — the OpenAI
@@ -281,12 +294,49 @@ impl Frontend {
     }
 
     /// The base URL this frontend wants for a toker port — the
-    /// hand-done shapes: anthropic-protocol frontends take the bare
-    /// listener, opencode takes the `/v1` form.
+    /// hand-done shapes: the claude frontends take the listener with
+    /// their `/f/<frontend>` prefix ([`Frontend::prefix`]), the generic
+    /// shell rc the bare listener, opencode the `/v1` form.
     pub fn base_url(&self, port: u16) -> String {
+        match (self, self.prefix()) {
+            (Frontend::Opencode { .. }, _) => openai_base_url(port),
+            (_, Some(name)) => frontend_base_url(port, name),
+            (_, None) => anthropic_base_url(port),
+        }
+    }
+
+    /// The frontend name this frontend's base URL carries as its
+    /// `/f/<name>` prefix, which selects its notice style. `None` for
+    /// the generic shell rc (any tool may read it, so it names no one)
+    /// and for opencode, whose notices take the default style.
+    pub fn prefix(&self) -> Option<&'static str> {
         match self {
-            Frontend::Opencode { .. } => openai_base_url(port),
-            _ => anthropic_base_url(port),
+            Frontend::Claude { .. } => Some("claude"),
+            Frontend::ClaudeWorkhorse { .. } => Some("workhorse"),
+            Frontend::Opencode { .. } | Frontend::ShellRc { .. } => None,
+        }
+    }
+
+    /// The frontend protocol this frontend speaks: `anthropic` or
+    /// `openai_chat`. A frontend is offered only when its protocol has a
+    /// backend enabled.
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Frontend::Opencode { .. } => "openai_chat",
+            _ => "anthropic",
+        }
+    }
+
+    /// The usage path this frontend's requests reach toker on, prefix
+    /// included — the path the setup wizard probes before patching.
+    pub fn usage_path(&self) -> String {
+        let route = match self.protocol() {
+            "openai_chat" => "/v1/chat/completions",
+            _ => "/v1/messages",
+        };
+        match self.prefix() {
+            Some(name) => format!("/f/{name}{route}"),
+            None => route.to_owned(),
         }
     }
 
@@ -612,10 +662,19 @@ mod tests {
         let shell = Frontend::ShellRc {
             rc: PathBuf::from("/z"),
         };
-        assert_eq!(claude.base_url(18_123), "http://127.0.0.1:18123");
-        assert_eq!(workhorse.base_url(18_123), "http://127.0.0.1:18123");
+        // The claude frontends name themselves through the prefix; the
+        // generic shell rc names no one.
+        assert_eq!(claude.base_url(18_123), "http://127.0.0.1:18123/f/claude");
+        assert_eq!(
+            workhorse.base_url(18_123),
+            "http://127.0.0.1:18123/f/workhorse"
+        );
         assert_eq!(shell.base_url(18_123), "http://127.0.0.1:18123");
         assert_eq!(opencode.base_url(18_123), "http://127.0.0.1:18123/v1");
+        assert_eq!(claude.usage_path(), "/f/claude/v1/messages");
+        assert_eq!(workhorse.usage_path(), "/f/workhorse/v1/messages");
+        assert_eq!(shell.usage_path(), "/v1/messages");
+        assert_eq!(opencode.usage_path(), "/v1/chat/completions");
     }
 
     #[test]

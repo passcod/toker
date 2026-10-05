@@ -39,7 +39,7 @@
 
 use serde_json::Value;
 
-use super::notice::{NoticeStyle, render};
+use super::notice::{NoticeLevel, NoticeStyle, render};
 use crate::store::Allowance;
 
 /// A meter is exhausted when its utilisation reaches this fraction of the
@@ -343,11 +343,11 @@ impl Blocking {
     /// marker itself is deliberately not embedded — it would then sit in
     /// conversation history as assistant text.
     ///
-    /// The content is then wrapped per `style` ([`render`]): the frontend's
-    /// own structured format where one exists (claude's insight block by
-    /// default, a GFM alert for Workhorse-style frontends), plain text
-    /// otherwise. The style is the caller's config threading; here it is
-    /// just one more input.
+    /// The content is then wrapped per `style` ([`render`]) at the
+    /// [`NoticeLevel::Caution`] level — a stopped session — decided here,
+    /// where the notice is written. The style is the frontend's (the
+    /// server resolves it from the request's `/f/<frontend>` prefix
+    /// through `[notices]`); here it is just one more input.
     ///
     /// Pure function of its inputs, style included (invariant 4): the
     /// reset time renders in the passed timezone, to the minute (`%H:%M`,
@@ -384,7 +384,8 @@ impl Blocking {
              Reply with the release marker to continue and spend overage until then.]",
             meter.notice_name(),
         );
-        render(style, &content)
+        // A Caution: the session is stopped until the operator acts.
+        render(style, NoticeLevel::Caution, &content)
     }
 
     /// A synthetic assistant turn carrying `text`, in the requested
@@ -531,7 +532,7 @@ mod tests {
         Allowance, Blocking, GateDecision, Meter, Meters, Rendering, THRESHOLD, decide,
         exhausted_meters, expired, grant_for,
     };
-    use crate::middleware::notice::{INSIGHT_FOOTER, INSIGHT_HEADER, NoticeStyle};
+    use crate::middleware::notice::{BLOCK_FOOTER, BLOCK_HEADER, NoticeStyle};
     use serde_json::json;
 
     /// A spent 5-hour window with its reset comfortably in the future, and
@@ -957,7 +958,7 @@ mod tests {
         let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
                       This session's context is 9,872,344 tokens. \
                       Reply with the release marker to continue and spend overage until then.]";
-        let expected = format!("> [!NOTE]\n> {content}");
+        let expected = format!("> [!CAUTION]\n> {content}");
         for _ in 0..3 {
             assert_eq!(
                 Blocking::notice(
@@ -982,7 +983,7 @@ mod tests {
                 &auckland,
                 NoticeStyle::default()
             ),
-            "> [!NOTE]\n> [Session stopped by toker: 5-hour quota is spent, resets at 21:00. \
+            "> [!CAUTION]\n> [Session stopped by toker: 5-hour quota is spent, resets at 21:00. \
             Reply with the release marker to continue and spend overage until then.]",
             "2026-01-27 08:00 UTC is 21:00 NZDT the same day"
         );
@@ -992,7 +993,7 @@ mod tests {
     fn the_notice_renders_in_the_configured_style() {
         // One decision, three styles: the CONTENT is identical, only the
         // wrapping differs. Plain is the pre-wrapper form, byte for byte;
-        // gfm is the default (generic — insight rendering is claude-only).
+        // gfm is the generic default (the block is claude's rendering).
         let tz = utc();
         let content = "[Session stopped by toker: 5-hour quota is spent, resets at 08:00. \
                       Reply with the release marker to continue and spend overage until then.]";
@@ -1005,7 +1006,7 @@ mod tests {
                 NoticeStyle::Plain
             ),
             content,
-            "plain: the content verbatim — the pre-insight form, pinned"
+            "plain: the content verbatim — the unwrapped form, pinned"
         );
         assert_eq!(
             Blocking::notice(
@@ -1013,10 +1014,21 @@ mod tests {
                 Some(1_769_500_800),
                 None,
                 &tz,
-                NoticeStyle::Insight
+                NoticeStyle::Block
             ),
-            format!("{INSIGHT_HEADER}\n{content}\n{INSIGHT_FOOTER}"),
-            "insight: the frozen block around the same content"
+            format!("{BLOCK_HEADER}\n{content}\n{BLOCK_FOOTER}"),
+            "block: the frozen block around the same content"
+        );
+        assert_eq!(
+            Blocking::notice(
+                Meter::FiveHour,
+                Some(1_769_500_800),
+                None,
+                &tz,
+                NoticeStyle::Toker
+            ),
+            format!("> [!TOKER]\n> {content}"),
+            "toker: Workhorse's alert"
         );
         assert_eq!(
             Blocking::notice(
@@ -1026,8 +1038,8 @@ mod tests {
                 &tz,
                 NoticeStyle::Gfm
             ),
-            format!("> [!NOTE]\n> {content}"),
-            "gfm: the alert form"
+            format!("> [!CAUTION]\n> {content}"),
+            "gfm: the alert form, at the quota block's level"
         );
     }
 
@@ -1131,7 +1143,7 @@ mod tests {
     #[test]
     fn the_rendered_notice_rides_in_both_turn_renderings() {
         // The wiring the server does — notice(style) → blocked_turn —
-        // carries the RENDERED notice, block and all: the insight block
+        // carries the RENDERED notice, block and all: the toker block
         // is part of both the SSE and the JSON body bytes (invariant 4).
         // JSON escapes the block's newlines as `\n`; everything else
         // (the star, the dashes) rides the text field raw.
@@ -1141,7 +1153,7 @@ mod tests {
             Some(1_769_500_800),
             None,
             &tz,
-            NoticeStyle::Insight,
+            NoticeStyle::Block,
         );
         let sse_bytes = Blocking::sse_turn(&rendered, Some("claude-opus-5"));
         let json_bytes = Blocking::json_turn(&rendered, Some("claude-opus-5"));
@@ -1150,14 +1162,14 @@ mod tests {
         for body in [&sse, &json] {
             assert!(
                 body.contains(&rendered.replace('\n', "\\n")),
-                "the insight block rides the turn body, its newlines JSON-escaped"
+                "the block rides the turn body, its newlines JSON-escaped"
             );
             assert!(
-                body.contains(INSIGHT_HEADER),
+                body.contains(BLOCK_HEADER),
                 "the frozen header is in the body"
             );
             assert!(
-                body.contains(INSIGHT_FOOTER),
+                body.contains(BLOCK_FOOTER),
                 "the frozen footer is in the body"
             );
         }

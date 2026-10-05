@@ -13,9 +13,10 @@
 //! - [`patchers`] — one pure-file patch per frontend (claude user +
 //!   Workhorse settings, opencode, the generic shell rc), plus the
 //!   [`patchers::Frontend`] enum the wizard composes.
-//! - [`verify`] — [`verify::await_service_ready`], the empty-body-POST
-//!   wiring check the wizard runs after the units are up and before
-//!   any frontend is pointed at toker.
+//! - [`verify`] — [`verify::await_service_ready`], the wiring check
+//!   the wizard runs after the units are up and before any frontend is
+//!   pointed at toker: an empty-body POST through each frontend's own
+//!   prefix, and the prefix reaching toker's own status.
 //! - [`wizard`] — the interactive flow: the questions, the systemd
 //!   unit installation, and the report, all behind testable seams
 //!   ([`wizard::Prompt`], [`wizard::SystemRunner`], [`wizard::Paths`])
@@ -46,9 +47,12 @@ pub enum Step {
     /// socket binds.**
     InstallUnits,
     /// Verify the live service end-to-end
-    /// ([`verify::await_service_ready`]): both usage paths must answer
-    /// with the upstream's verdict. **The ordering rule's enforcement
-    /// point** — no frontend is patched until this passes.
+    /// ([`verify::await_service_ready`]): the usage path of every
+    /// enabled protocol must answer with the upstream's verdict, through
+    /// the very `/f/<frontend>` prefix each frontend will be pointed at,
+    /// and that prefix must reach toker itself. **The ordering rule's
+    /// enforcement point** — no frontend is patched until this passes,
+    /// because a frontend's settings hot-reload into its live sessions.
     VerifyService,
     /// Point the frontends at toker ([`patchers`]): claude (user +
     /// Workhorse repo settings — both required, directory-scoped
