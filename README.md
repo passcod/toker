@@ -90,3 +90,5 @@ last 60m · 10 sessions · 6 idle · 327 requests                               
 │  binding  five_hour                                                                                    │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Click a session in SESSIONS or CONTEXT to see it in full: its id and title, the model it asked for against the one it was sent on, its context and totals, and its quota gate. From there you can open the gate without typing a marker: `o` releases it to the end of the plan, `b` (pressed twice) releases it into overage, and `x` closes it again. A release from the TUI applies to the current 5-hour window even before the session is stopped.

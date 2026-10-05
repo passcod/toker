@@ -350,6 +350,12 @@ impl Store {
         ledger::session_summary(&*self.conn()?, session_id)
     }
 
+    /// One session's newest API measurement row (see
+    /// `ledger::latest_session_row`).
+    pub fn latest_session_row(&self, session_id: &str) -> Result<Option<RequestRow>> {
+        ledger::latest_session_row(&*self.conn()?, session_id)
+    }
+
     /// Upsert one lane (caller owns the read-modify-write cycle).
     pub fn upsert_lane(&self, lane: &Lane) -> Result<()> {
         state::upsert_lane(&*self.conn()?, lane)
@@ -2140,6 +2146,38 @@ mod tests {
             .map(|lane| lane.key)
             .collect();
         assert_eq!(keys, vec!["lane-2", "lane-3", "lane-4", "lane-5"]);
+    }
+
+    /// The newest measurement of one session: proxy rows and other
+    /// sessions' rows never answer, and a session without a measurement
+    /// is `None`.
+    #[test]
+    fn latest_session_row_is_the_session_s_newest_measurement() {
+        let store = mem_store();
+        let row = |ts_ms: i64, session: &str, model: &str| {
+            let mut row = bare_row(ts_ms);
+            row.session_id = Some(session.to_owned());
+            row.requested_model = Some(model.to_owned());
+            row
+        };
+        store
+            .record_request(&row(1_000, "ses-a", "old"))
+            .expect("record");
+        store
+            .record_request(&row(2_000, "ses-a", "new"))
+            .expect("record");
+        store
+            .record_request(&row(3_000, "ses-b", "other"))
+            .expect("record");
+        let mut blocked = row(4_000, "ses-a", "blocked");
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
+        let latest = store
+            .latest_session_row("ses-a")
+            .expect("read")
+            .expect("a row");
+        assert_eq!(latest.requested_model.as_deref(), Some("new"));
+        assert_eq!(store.latest_session_row("ses-none").expect("read"), None);
     }
 
     #[test]

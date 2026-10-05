@@ -76,6 +76,15 @@ either fails, the gate stops the session again, and only the burn marker goes
 further. The request that crosses 100% may still be billed partly as overage:
 the meters only say so in its response, after it was sent.
 
+The TUI's session popup grants the same two releases without a marker, and
+ahead of time: the current 5-hour window whether or not it is exhausted, the
+7-day window only when it is (`quota::grant_ahead`), so a release for the
+afternoon still cannot become one for the week. BURN there takes two presses.
+Its Close control deletes the session's allowances, so the gate applies again
+from the next request. Both write through `release.rs`, the same code the
+markers use, and the gate needs no signal: it loads the session's allowances
+on every request.
+
 Both kinds are allowance rows, told apart by the `release` column. A second
 release for the same window only widens it: burn over over makes it overage,
 over over burn leaves it overage. The TUI marks a session `$` for overage and

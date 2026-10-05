@@ -169,7 +169,12 @@ fn key_sources_line(env: &str, sources: crate::config::KeySources) -> String {
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
     let db_path = db.unwrap_or(config.db_path);
-    crate::tui::run(&db_path, window_mins, &config.transcript_roots)
+    crate::tui::run(
+        &db_path,
+        window_mins,
+        &config.transcript_roots,
+        &config.gates,
+    )
 }
 
 /// `import`: ingest the predecessor proxy's usage.jsonl into the ledger

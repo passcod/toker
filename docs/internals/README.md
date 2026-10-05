@@ -41,6 +41,7 @@ topic says that too.
 | `src/translate/` | Cross-protocol translation, Anthropic Messages ↔ codex Responses. Pure. |
 | `src/observe/` | The side-parser riding each response stream: SSE splitting and usage capture. Infallible. |
 | `src/middleware/quota.rs` | The quota gate: exhaustion, expiry, allowances, the block notice. Pure. |
+| `src/release.rs` | Granting and revoking releases: the allowance rows and the `released`/`revoked` ledger rows, shared by the markers and the TUI. |
 | `src/middleware/cold.rs` | The cold gate, the compaction retarget, the burn ladder and the quota weight fit the outlook prices with. Pure apart from two store conveniences. |
 | `src/middleware/lanes.rs` | The lane table: key, TTL stickiness, response merge, restart reseed, prune policy, ping tag. |
 | `src/middleware/system_change.rs` | Capture-time system-prompt change localisation against the lane's previous ledger row, and which rows keep the ladders. |
@@ -57,7 +58,7 @@ topic says that too.
 | `src/watch.rs` | `toker watch-context-window`: one pass printing each new proof of a context window, with its seen-set state file. |
 | `src/timers.rs` | The wake/hold/ping verbs the systemd units run. |
 | `src/setup/` | The wizard and its tested halves: atomic config writes, frontend patchers, the wiring check, unit templates, the bundled opencode plugin. |
-| `src/tui/` | The dashboard: aggregation (`model.rs`, `quota.rs`, `rebuilds.rs`), rendering (`view.rs`), session labels from transcripts, locale formatting. |
+| `src/tui/` | The dashboard: aggregation (`model.rs`, `quota.rs`, `rebuilds.rs`), rendering (`view.rs`), the session detail popup and its gate controls (`detail.rs`), session labels from transcripts, locale formatting. |
 | `plugins/opencode/toker-cost/` | The opencode sidebar plugin; `setup/plugin.rs` embeds it. |
 | `systemd/` | Hand-installed units from before the wizard; `toker setup` writes its own from templates in `setup/wizard.rs`. |
 | `tests/server_*.rs` | End to end: the real router against mock upstreams that capture every byte. Spend no quota. |

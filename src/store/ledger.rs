@@ -1022,6 +1022,25 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// One session's newest API measurement row (kind NULL), whole: the
+/// TUI's session detail reads the models a request asked for and was
+/// served on from it. `None` when the session has no measurement. The
+/// lane index leads with `session_id`, so the read is that session's
+/// rows, not the ledger's.
+pub(super) fn latest_session_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<RequestRow>> {
+    super::row_of(
+        conn,
+        "SELECT * FROM requests
+         WHERE session_id = ?1 AND kind IS NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        [session_id],
+        read_row,
+    )
+}
+
 /// The newest row's timestamp, of any kind; `None` on an empty ledger.
 /// `MAX` over the indexed `ts_ms` is answered from the index's last
 /// entry, so this stays cheap however large the ledger grows — the TUI

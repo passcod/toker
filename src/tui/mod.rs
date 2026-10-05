@@ -26,6 +26,10 @@
 //!   classification over the store's rebuild-tail projection.
 //! - [view]: snapshot + frame in, pixels out, via ratatui. Rendering is
 //!   exercised with ratatui's `TestBackend`, never a real terminal.
+//! - [detail]: the session popup a click opens, with the session's
+//!   fuller details and its quota gate controls. The one place the
+//!   dashboard writes: its grants and revokes go through
+//!   [`crate::release`], the writes the release markers make.
 //! - [reexec]: the loop's watch on its own binary, so a dashboard left
 //!   open across an install restarts as the new one.
 //! - [`run`]: the loop wiring them to the store. Reads tolerate a
@@ -37,6 +41,7 @@
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
 
+mod detail;
 mod labels;
 mod locale;
 mod model;
@@ -127,6 +132,7 @@ pub fn run(
     db_path: &Path,
     window_mins: u64,
     extra_transcript_roots: &[PathBuf],
+    gates: &crate::config::GatesConfig,
 ) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
     // Taken before the terminal: the file this process was started
@@ -146,6 +152,8 @@ pub fn run(
         no_color: view::no_color(std::env::var_os("NO_COLOR")),
         legend: false,
         scroll: view::Scroll::default(),
+        gate_armed: gates.quota_enabled,
+        detail: None,
     };
     let mut drawn = view::Drawn::default();
     // The transcript roots, resolved once: session labels read only
@@ -213,6 +221,19 @@ pub fn run(
                     model_caches.catalogs(),
                 );
             }
+            if let Some(popup) = &mut ui.detail {
+                // An unconfirmed BURN lapses.
+                if popup
+                    .burn_armed_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    popup.burn_armed_until = None;
+                }
+                // The popup follows the ledger like the panels do.
+                if due.read || due.heavy {
+                    popup.detail = load_detail(&store, &snapshot, &popup.detail.session);
+                }
+            }
             next_tick = Instant::now() + TICK;
         }
         terminal.draw(|frame| {
@@ -234,17 +255,50 @@ pub fn run(
             continue;
         }
         let event = crossterm::event::read()?;
-        // The wheel scrolls the list under the pointer, a row a notch.
+        // The wheel scrolls the list under the pointer, a row a notch; a
+        // click opens a session's detail, or acts in the open one.
         if let crossterm::event::Event::Mouse(mouse) = event {
             let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if mouse.kind
+                == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            {
+                match (&mut ui.detail, &drawn.popup) {
+                    (Some(popup), Some(drawn_popup)) => match drawn_popup.control_at(at) {
+                        Some(control) => {
+                            if act(&store, gates, popup, control, &snapshot) {
+                                ui.detail = None;
+                            }
+                            cadence.force();
+                            next_tick = Instant::now();
+                        }
+                        None if !drawn_popup.area.contains(at) => ui.detail = None,
+                        None => {}
+                    },
+                    _ => {
+                        let clicked = drawn
+                            .sessions
+                            .session_at(at)
+                            .or_else(|| drawn.context.session_at(at));
+                        if let Some(session) = clicked {
+                            ui.legend = false;
+                            ui.detail = Some(view::Popup {
+                                detail: load_detail(&store, &snapshot, session),
+                                burn_armed_until: None,
+                                message: None,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
             let delta = match mouse.kind {
                 crossterm::event::MouseEventKind::ScrollDown => 1,
                 crossterm::event::MouseEventKind::ScrollUp => -1,
                 _ => 0,
             };
             for (list, offset) in [
-                (drawn.sessions, &mut ui.scroll.sessions),
-                (drawn.context, &mut ui.scroll.context),
+                (&drawn.sessions, &mut ui.scroll.sessions),
+                (&drawn.context, &mut ui.scroll.context),
             ] {
                 if delta != 0 && list.area.contains(at) {
                     *offset = offset.saturating_add_signed(delta).min(list.max_offset);
@@ -269,9 +323,31 @@ pub fn run(
                 {
                     break;
                 }
-                // ? toggles the legend over the frame; Esc closes it.
-                crossterm::event::KeyCode::Char('?') => ui.legend = !ui.legend,
-                crossterm::event::KeyCode::Esc => ui.legend = false,
+                // ? toggles the legend over the frame; Esc closes it, or
+                // the detail popup. The two are never open together.
+                crossterm::event::KeyCode::Char('?') => {
+                    ui.legend = !ui.legend;
+                    ui.detail = None;
+                }
+                crossterm::event::KeyCode::Esc => {
+                    ui.legend = false;
+                    ui.detail = None;
+                }
+                // The detail popup's controls, by key.
+                crossterm::event::KeyCode::Char(key @ ('o' | 'b' | 'x')) if ui.detail.is_some() => {
+                    let control = match key {
+                        'o' => detail::Control::Over,
+                        'b' => detail::Control::Burn,
+                        _ => detail::Control::Close,
+                    };
+                    if let Some(popup) = &mut ui.detail
+                        && act(&store, gates, popup, control, &snapshot)
+                    {
+                        ui.detail = None;
+                    }
+                    cadence.force();
+                    next_tick = Instant::now();
+                }
                 // r forces an immediate full reload on the next pass —
                 // the window and the heavy sections, changed or not.
                 crossterm::event::KeyCode::Char('r') => {
@@ -295,6 +371,64 @@ pub fn run(
         )));
     }
     Ok(())
+}
+
+/// Read one session's detail, with its row from the current snapshot.
+fn load_detail(store: &Store, snapshot: &model::Snapshot, session: &str) -> detail::Detail {
+    let agg = snapshot.sessions.iter().find(|agg| agg.session == session);
+    detail::Detail::load(store, session, agg)
+}
+
+/// How long an armed BURN waits for its confirmation.
+const BURN_CONFIRM: Duration = Duration::from_secs(5);
+
+/// Act on one of the detail popup's controls, returning whether the
+/// popup should close. A control that cannot act says why; BURN arms on
+/// its first press and grants on a second inside [`BURN_CONFIRM`]; a
+/// grant or a revoke goes through [`crate::release`], the writes the
+/// markers make, and its outcome or error lands in the popup's message
+/// rather than ending the dashboard. The popup's data is re-read after
+/// a write so it shows what the session now holds.
+fn act(
+    store: &Store,
+    gates: &crate::config::GatesConfig,
+    popup: &mut view::Popup,
+    control: detail::Control,
+    snapshot: &model::Snapshot,
+) -> bool {
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    if control == detail::Control::Dismiss {
+        return true;
+    }
+    if let Some(reason) = detail::availability(&popup.detail, control, gates.quota_enabled, now_ms)
+    {
+        popup.message = Some(format!("{}: {reason}", control.key()));
+        return false;
+    }
+    if control == detail::Control::Burn && popup.burn_armed_until.is_none() {
+        popup.burn_armed_until = Some(Instant::now() + BURN_CONFIRM);
+        popup.message = Some("press burn again to release into overage".to_owned());
+        return false;
+    }
+    popup.burn_armed_until = None;
+    let session = popup.detail.session.clone();
+    popup.message = Some(match control.release() {
+        Some(release) => {
+            match crate::release::grant_from_tui(store, &session, release, gates, now_ms) {
+                Ok(_) => match release {
+                    crate::ir::Release::Plan => "released to the end of the plan".to_owned(),
+                    crate::ir::Release::Overage => "released into overage".to_owned(),
+                },
+                Err(error) => format!("release failed: {error}"),
+            }
+        }
+        None => match crate::release::revoke_from_tui(store, &session, gates, now_ms) {
+            Ok(_) => "gate closed".to_owned(),
+            Err(error) => format!("close failed: {error}"),
+        },
+    });
+    popup.detail = load_detail(store, snapshot, &session);
+    false
 }
 
 /// What the loop decides each tick (see [`Cadence::due`]).
@@ -1049,6 +1183,7 @@ mod tests {
     //! reads exactly the way the TUI's own ticks do and writes
     //! nothing).
 
+    use super::{detail, model, testrows, view};
     use crate::tui::model::Released;
     use std::collections::HashMap;
 
@@ -1088,6 +1223,111 @@ mod tests {
                 {"id": "openai/gpt-6-luna", "context_length": 250_000}
             ]
         })
+    }
+
+    /// The popup's controls through the loop's own handler: BURN arms
+    /// on its first press and grants on its second, OVER grants at once,
+    /// Close revokes, and a control that cannot act says why and writes
+    /// nothing. Each outcome lands in the popup's message, and its data
+    /// is re-read to show what the session now holds.
+    #[test]
+    fn the_popup_controls_grant_arm_and_revoke() {
+        use crate::ir::Release;
+        use crate::store::MetersSnapshot;
+        let store = Store::open(":memory:").expect("store");
+        let now = jiff::Timestamp::now();
+        let mut row = testrows::bare(now.as_millisecond() - 60_000);
+        row.session_id = Some("ses-act".to_owned());
+        row.provider = Some("anthropic_sub".to_owned());
+        store.record_request(&row).expect("record");
+        store
+            .save_meters(
+                "anthropic_sub",
+                &MetersSnapshot {
+                    updated_ms: now.as_millisecond(),
+                    snapshot: serde_json::json!({
+                        "util5h": 0.5, "reset5h": now.as_second() + 3600,
+                        "util7d": 0.2, "reset7d": now.as_second() + 86_400,
+                        "overageInUse": false,
+                    }),
+                },
+            )
+            .expect("meters");
+        let snapshot = model::empty(30);
+        let gates = crate::config::GatesConfig {
+            quota_enabled: true,
+            ..Default::default()
+        };
+        let mut popup = view::Popup {
+            detail: super::load_detail(&store, &snapshot, "ses-act"),
+            burn_armed_until: None,
+            message: None,
+        };
+        let held = |store: &Store| -> Vec<Release> {
+            store
+                .load_session_allowances("ses-act")
+                .expect("allowances")
+                .into_iter()
+                .map(|allowance| allowance.release)
+                .collect()
+        };
+
+        // Nothing held: Close cannot act, and says so.
+        assert!(!super::act(
+            &store,
+            &gates,
+            &mut popup,
+            detail::Control::Close,
+            &snapshot
+        ));
+        assert_eq!(popup.message.as_deref(), Some("x: nothing held"));
+
+        // BURN's first press only arms it.
+        assert!(!super::act(
+            &store,
+            &gates,
+            &mut popup,
+            detail::Control::Burn,
+            &snapshot
+        ));
+        assert!(popup.burn_armed_until.is_some());
+        assert!(held(&store).is_empty(), "an armed burn grants nothing");
+        // The second grants, and disarms.
+        super::act(&store, &gates, &mut popup, detail::Control::Burn, &snapshot);
+        assert_eq!(popup.burn_armed_until, None);
+        assert_eq!(held(&store), vec![Release::Overage]);
+        assert_eq!(popup.message.as_deref(), Some("released into overage"));
+        assert_eq!(popup.detail.allowances.len(), 1, "the data was re-read");
+
+        // Close revokes; OVER then grants the plan release on one press.
+        super::act(
+            &store,
+            &gates,
+            &mut popup,
+            detail::Control::Close,
+            &snapshot,
+        );
+        assert!(held(&store).is_empty());
+        assert_eq!(popup.message.as_deref(), Some("gate closed"));
+        super::act(&store, &gates, &mut popup, detail::Control::Over, &snapshot);
+        assert_eq!(held(&store), vec![Release::Plan]);
+
+        // Dismiss asks the loop to close the popup.
+        assert!(super::act(
+            &store,
+            &gates,
+            &mut popup,
+            detail::Control::Dismiss,
+            &snapshot
+        ));
+
+        // With the gate off, nothing acts.
+        let off = crate::config::GatesConfig {
+            quota_enabled: false,
+            ..Default::default()
+        };
+        super::act(&store, &off, &mut popup, detail::Control::Over, &snapshot);
+        assert_eq!(popup.message.as_deref(), Some("o: gate off"));
     }
 
     /// The header's freshness comes from the whole ledger, not the

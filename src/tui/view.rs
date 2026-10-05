@@ -249,6 +249,22 @@ pub(crate) struct Ui {
     pub legend: bool,
     /// How far each list is scrolled (the mouse wheel over it).
     pub scroll: Scroll,
+    /// The quota gate is armed in the config the service reads: the
+    /// detail popup's grant controls need it.
+    pub gate_armed: bool,
+    /// The session detail popup, when one is open.
+    pub detail: Option<Popup>,
+}
+
+/// An open session detail popup: its data and its controls' state.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Popup {
+    pub detail: super::detail::Detail,
+    /// BURN was pressed once and waits for its confirmation until then;
+    /// the loop clears it when the time passes.
+    pub burn_armed_until: Option<std::time::Instant>,
+    /// The last action's outcome or error, shown under the controls.
+    pub message: Option<String>,
 }
 
 /// Each list's scroll offset: the entries scrolled past its top. The
@@ -264,19 +280,41 @@ pub(crate) struct Scroll {
 
 /// What a frame drew that the loop needs back: where each list landed,
 /// for hit-testing the wheel, and how far it can scroll.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
     pub sessions: DrawnList,
     pub context: DrawnList,
+    /// Where the detail popup and its controls landed, when it showed.
+    pub popup: Option<super::detail::DrawnPopup>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DrawnList {
     /// The panel's whole area, frame included: the wheel over the title
     /// scrolls it too.
     pub area: Rect,
     /// The furthest offset that still changes what shows.
     pub max_offset: usize,
+    /// Where each session row landed, for the click handler: recorded as
+    /// the panel lays out, never recomputed from the offset.
+    pub rows: Vec<Hit>,
+}
+
+/// One clickable session row: its screen rectangle and session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Hit {
+    pub area: Rect,
+    pub session: String,
+}
+
+impl DrawnList {
+    /// The session whose row holds `at`, if any.
+    pub(crate) fn session_at(&self, at: ratatui::layout::Position) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|hit| hit.area.contains(at))
+            .map(|hit| hit.session.as_str())
+    }
 }
 
 /// Whether `NO_COLOR`'s value asks for no colour: set and non-empty, the
@@ -308,22 +346,28 @@ pub(crate) fn render(
     let chrome = layout.chrome;
 
     render_header(frame, layout.header, snap, clock);
-    let drawn = Drawn {
+    let (sessions_offset, sessions_rows) = render_sessions(
+        frame,
+        layout.sessions,
+        chrome,
+        snap,
+        fmt,
+        ui.scroll.sessions,
+    );
+    let (context_offset, context_rows) =
+        render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context);
+    let mut drawn = Drawn {
         sessions: DrawnList {
             area: layout.sessions,
-            max_offset: render_sessions(
-                frame,
-                layout.sessions,
-                chrome,
-                snap,
-                fmt,
-                ui.scroll.sessions,
-            ),
+            max_offset: sessions_offset,
+            rows: sessions_rows,
         },
         context: DrawnList {
             area: layout.context,
-            max_offset: render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context),
+            max_offset: context_offset,
+            rows: context_rows,
         },
+        popup: None,
     };
     render_tokens(frame, layout.tokens, chrome, snap, fmt);
     render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
@@ -337,8 +381,21 @@ pub(crate) fn render(
     } else {
         render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
     }
+    // The overlays are exclusive (the loop opens one by closing the
+    // other); the legend wins if both are ever set.
     if ui.legend {
         render_legend(frame);
+    } else if let Some(popup) = &ui.detail {
+        drawn.popup = Some(super::detail::render(
+            frame,
+            &popup.detail,
+            ui.gate_armed,
+            popup.burn_armed_until.is_some(),
+            popup.message.as_deref(),
+            snap.now_ms,
+            tz,
+            fmt,
+        ));
     }
     if ui.no_color {
         strip_colour(frame);
@@ -893,9 +950,9 @@ fn render_sessions(
     snap: &Snapshot,
     fmt: &Fmt,
     offset: usize,
-) -> usize {
+) -> (usize, Vec<Hit>) {
     if area.height == 0 {
-        return 0;
+        return (0, Vec::new());
     }
     let inner = panel(frame, area, "SESSIONS", chrome);
     if snap.sessions.is_empty() {
@@ -905,7 +962,7 @@ fn render_sessions(
             "no sessions in window"
         };
         frame.render_widget(Paragraph::new(message).dim(), inner);
-        return 0;
+        return (0, Vec::new());
     }
 
     let cells: Vec<[Line<'static>; 9]> = snap
@@ -966,6 +1023,22 @@ fn render_sessions(
         height: inner.height.min(1 + body as u16),
         ..inner
     };
+    // Each shown row sits under the header, and under the "above" line
+    // when there is one.
+    let first_y = table.y + 1 + u16::from(window.above.is_some());
+    let hits = snap.sessions[window.shown.clone()]
+        .iter()
+        .enumerate()
+        .map(|(index, session)| Hit {
+            area: Rect {
+                y: first_y + index as u16,
+                height: 1,
+                ..inner
+            },
+            session: session.session.clone(),
+        })
+        .filter(|hit| hit.area.bottom() <= table.bottom())
+        .collect();
     frame.render_widget(
         Table::new(blank.into_iter().chain(rows), constraints).header(Row::new(header)),
         table,
@@ -997,7 +1070,7 @@ fn render_sessions(
             },
         );
     }
-    window.max_offset
+    (window.max_offset, hits)
 }
 
 /// The columns that survive at `available` cells (indices into
@@ -1197,7 +1270,7 @@ fn unknown_or_grouped(fmt: &Fmt, value: Option<i64>) -> String {
 }
 
 /// Rough relative age for the LAST column.
-fn rel_age(delta_ms: i64) -> String {
+pub(super) fn rel_age(delta_ms: i64) -> String {
     let secs = delta_ms / 1_000;
     if secs < 10 {
         "now".to_string()
@@ -1226,24 +1299,28 @@ fn render_context(
     snap: &Snapshot,
     fmt: &Fmt,
     offset: usize,
-) -> usize {
+) -> (usize, Vec<Hit>) {
     if area.height == 0 {
-        return 0;
+        return (0, Vec::new());
     }
     let inner = panel(frame, area, "CONTEXT", chrome);
     if snap.window_empty {
         frame.render_widget(Paragraph::new("no data in window").dim(), inner);
-        return 0;
+        return (0, Vec::new());
     }
     let width = inner.width as usize;
 
     let mut lines = Vec::new();
+    // The session each line is for, in step with `lines`: an entry is
+    // exactly one line (the idle note rides inline).
+    let mut line_sessions: Vec<String> = Vec::new();
     let mut listed = 0;
     for session in &snap.sessions {
         if session.lane_requests < CONTEXT_MIN_REQUESTS {
             continue;
         }
         listed += 1;
+        line_sessions.push(session.session.clone());
         let idle = snap.now_ms - session.latest_ts_ms >= IDLE_SECS * 1_000;
         let idle_note = idle.then(|| {
             Line::from(Span::styled(
@@ -1333,6 +1410,21 @@ fn render_context(
         )));
     }
     let window = list_window(lines.len(), inner.height as usize, offset);
+    let first_y = inner.y + u16::from(window.above.is_some());
+    let hits = line_sessions
+        .into_iter()
+        .enumerate()
+        .skip(window.shown.start)
+        .take(window.shown.len())
+        .map(|(index, session)| Hit {
+            area: Rect {
+                y: first_y + (index - window.shown.start) as u16,
+                height: 1,
+                ..inner
+            },
+            session,
+        })
+        .collect();
     let dim = Style::new().dim();
     let lines: Vec<Line<'static>> = window
         .above
@@ -1351,7 +1443,7 @@ fn render_context(
         )
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
-    window.max_offset
+    (window.max_offset, hits)
 }
 
 /// The CONTEXT panel's name line: the same name the sessions table
@@ -2331,6 +2423,8 @@ mod tests {
             no_color: false,
             legend: false,
             scroll: super::Scroll::default(),
+            gate_armed: true,
+            detail: None,
         }
     }
 
@@ -4183,6 +4277,65 @@ mod tests {
         assert!(end.contains("… 2 above"), "{end}");
         assert!(!end.contains("more"), "{end}");
         assert_ne!(top, end);
+    }
+
+    /// The click map: every recorded row rectangle sits on the screen
+    /// row that shows that session's name, unscrolled and scrolled to
+    /// the end, in both lists; the "above" and "more" lines are not
+    /// clickable.
+    #[test]
+    fn the_click_map_lands_on_the_rows_that_show_each_session() {
+        let snap = full_snapshot();
+        for scroll in [
+            super::Scroll::default(),
+            super::Scroll {
+                sessions: usize::MAX,
+                context: usize::MAX,
+            },
+        ] {
+            let ui = super::Ui { scroll, ..plain() };
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+            let mut drawn = super::Drawn::default();
+            terminal
+                .draw(|frame| {
+                    drawn = super::render(frame, &snap, "12:34:56", &utc(), &ui);
+                })
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let row_text = |y: u16| -> String {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            };
+            for list in [&drawn.sessions, &drawn.context] {
+                assert!(!list.rows.is_empty(), "{list:?}");
+                for hit in &list.rows {
+                    let session = snap
+                        .sessions
+                        .iter()
+                        .find(|session| session.session == hit.session)
+                        .expect("a hit names a listed session");
+                    let name: String = super::session_name_or_id(session)
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    let shown = super::clip(&name, 8);
+                    let text = row_text(hit.area.y);
+                    assert!(
+                        text.contains(&shown),
+                        "{shown:?} on row {}: {text}",
+                        hit.area.y
+                    );
+                    assert!(!text.contains("above") && !text.contains("more"));
+                    assert!(list.area.contains(hit.area.as_position()));
+                }
+            }
+            let first = &drawn.sessions.rows[0];
+            assert_eq!(
+                drawn.sessions.session_at(first.area.as_position()),
+                Some(first.session.as_str())
+            );
+        }
     }
 
     #[test]

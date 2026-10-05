@@ -59,7 +59,7 @@
 //!   holds no anthropic credential, so the daily refresh only reads the
 //!   cache, and the fetch instead borrows the subscription bearer of a
 //!   request passing through to `anthropic_sub`
-//!   ([`crate::server::Server::borrow_catalog_credential`]): only while
+//!   (`Server::borrow_catalog_credential`): only while
 //!   the catalogue is stale, at most once an hour, and for that one GET.
 //!   The bearer is never stored, cached or logged. The subscription
 //!   bearer reads the listing with the `oauth-2025-04-20` beta flag
