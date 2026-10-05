@@ -379,6 +379,8 @@ pub struct Paths {
     /// The codex CLI's shared login — `codex_sub` is offered as an
     /// anthropic backend only when it exists.
     pub codex_auth: PathBuf,
+    /// The codex CLI's user configuration.
+    pub codex_config: PathBuf,
     /// The state dir (the ledger's parent): the only path the
     /// hardened service unit may write.
     pub state_dir: PathBuf,
@@ -407,6 +409,7 @@ impl Paths {
             shell_rcs: vec![home.join(".bashrc"), home.join(".zshrc")],
             ctp_usage: data_home.join("claude-token-proxy").join("usage.jsonl"),
             codex_auth: home.join(".codex").join("auth.json"),
+            codex_config: home.join(".codex").join("config.toml"),
             state_dir: data_home.join("toker"),
             opencode_plugins_dir: config_home.join("opencode").join("plugins"),
         })
@@ -424,6 +427,7 @@ impl Paths {
             shell_rcs: vec![root.join(".bashrc"), root.join(".zshrc")],
             ctp_usage: root.join(".local/share/claude-token-proxy/usage.jsonl"),
             codex_auth: root.join(".codex/auth.json"),
+            codex_config: root.join(".codex/config.toml"),
             state_dir: root.join(".local/share/toker"),
             opencode_plugins_dir: root.join(".config/opencode/plugins"),
         }
@@ -840,6 +844,7 @@ fn loopback_of(url: &str) -> Option<Loopback> {
 fn protocol_enabled(config: &Config, protocol: &str) -> bool {
     match protocol {
         "openai_chat" => !config.enabled_openai_chat().is_empty(),
+        "openai_responses" => config.codex_sub.is_some(),
         _ => !config.enabled_anthropic().is_empty(),
     }
 }
@@ -859,6 +864,7 @@ fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
     for (protocol, bare) in [
         ("anthropic", "/v1/messages"),
         ("openai_chat", "/v1/chat/completions"),
+        ("openai_responses", "/v1/responses"),
     ] {
         if !protocol_enabled(config, protocol) {
             continue;
@@ -906,6 +912,33 @@ fn read_json_url(path: &Path, keys: &[&str]) -> UrlRead {
         Some(url) => UrlRead::Base(url.to_owned()),
         None => UrlRead::NoBase,
     }
+}
+
+/// Read the base URL of the provider Codex currently selects. A malformed
+/// TOML file is reported as unreadable and is never overwritten by setup.
+fn read_codex_url(path: &Path) -> UrlRead {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return UrlRead::Missing,
+        Err(_) => return UrlRead::Unparseable,
+    };
+    let document = match text.parse::<toml_edit::DocumentMut>() {
+        Ok(document) => document,
+        Err(_) => return UrlRead::Unparseable,
+    };
+    let Some(provider) = document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+    else {
+        return UrlRead::NoBase;
+    };
+    document
+        .get("model_providers")
+        .and_then(|providers| providers.get(provider))
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(toml_edit::Item::as_str)
+        .map(|url| UrlRead::Base(url.to_owned()))
+        .unwrap_or(UrlRead::NoBase)
 }
 
 /// The `ANTHROPIC_BASE_URL` export a shell rc carries (first match
@@ -1276,6 +1309,15 @@ impl<'a> Wizard<'a> {
             frontends.push(FrontendDetected {
                 frontend: Frontend::Opencode {
                     config: self.paths.opencode_config.clone(),
+                },
+                url,
+            });
+        }
+        if self.paths.codex_auth.exists() || self.paths.codex_config.exists() {
+            let url = read_codex_url(&self.paths.codex_config);
+            frontends.push(FrontendDetected {
+                frontend: Frontend::Codex {
+                    config: self.paths.codex_config.clone(),
                 },
                 url,
             });
@@ -3028,6 +3070,9 @@ fn what_changed(frontend: &Frontend, url: &str) -> String {
             format!("env.{} = {url}", patchers::SHELL_VAR)
         }
         Frontend::Opencode { .. } => format!("provider.openrouter.options.baseURL = {url}"),
+        Frontend::Codex { .. } => {
+            format!("model_provider = toker; model_providers.toker.base_url = {url}")
+        }
         Frontend::ShellRc { .. } => {
             format!("export {}=\"{url}\"", patchers::SHELL_VAR)
         }
@@ -4288,6 +4333,7 @@ default_backend_anthropic = "codex_sub"
                 text("not-a-port"),      // a bad port is re-asked, not fatal
                 text(&port.to_string()), // the scratch port
                 confirm(true),           // claude
+                confirm(true),           // codex
                 confirm(false),          // wake/hold/ping timers: no
             ],
             vec![active(), ok_empty(), ok_empty()],
@@ -4330,7 +4376,7 @@ default_backend_anthropic = "codex_sub"
         );
 
         assert!(report.config_written);
-        assert_eq!(report.patched.len(), 1, "only claude was detected");
+        assert_eq!(report.patched.len(), 2, "claude and codex were detected");
         // The existing config (no port key → the default 18123) was
         // reconfigured onto the scratch port with the socket detected
         // ACTIVE — the wizard printed the restart note instead of
@@ -4348,6 +4394,12 @@ default_backend_anthropic = "codex_sub"
             std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
             claude_wired(port),
         );
+        let codex = std::fs::read_to_string(rig.root.join(".codex/config.toml"))
+            .expect("read codex config");
+        assert!(codex.contains("model_provider = \"toker\""));
+        assert!(codex.contains(&format!(
+            "base_url = \"http://127.0.0.1:{port}/f/codex/v1\""
+        )));
     }
 
     #[tokio::test]

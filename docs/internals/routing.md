@@ -13,6 +13,7 @@ serves them all, because the paths do not collide:
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
 | OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter` |
+| OpenAI Responses | `/v1/responses` | `codex_sub` |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
@@ -31,9 +32,10 @@ Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
 `/_toker/` namespace, which never leaves the proxy.
 
-The OpenAI Responses frontend (`/v1/responses`, for driving toker from the codex
-CLI) is designed but not served yet; `proto/openai_responses.rs` is a
-placeholder.
+The Responses route is native: Codex request and SSE response bytes pass through
+unchanged while the Responses observer records usage and meters. Toker always
+replaces the frontend credential with its shared Codex login before the request
+leaves loopback.
 
 ### What differs per backend
 
@@ -66,8 +68,9 @@ Every route also answers under `/f/<name>`. The router strips the prefix before
 matching (`strip_frontend_prefix` in `server/mod.rs`) and keeps the name, which
 picks the frontend's notice style from `[notices]` and is recorded on the row's
 `extra.frontend`. Setup writes the prefix into each frontend it patches
-(`/f/claude`, `/f/workhorse`); an unprefixed request is an unknown frontend and
-gets the default style. Names are lowercase ASCII letters, digits, `-` and `_`
+(`/f/claude`, `/f/workhorse`, `/f/codex`); an unprefixed request is an unknown
+frontend and gets the default style. Names are lowercase ASCII letters, digits,
+`-` and `_`
 (`config::is_frontend_name`), and a `[notices]` key outside that set could never
 match, so it is refused.
 

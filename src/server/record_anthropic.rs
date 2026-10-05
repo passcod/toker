@@ -1227,9 +1227,14 @@ pub(crate) fn record_codex_measurement(
     capture: &crate::providers::codex::TurnCapture,
     meters: Option<Value>,
     _status: u16,
+    frontend_protocol: &'static str,
 ) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
+    let route = format!("{frontend_protocol}:{}", ctx.backend.id());
+    if let Some(digest) = &ctx.drift {
+        insert(ctx, drift_row(ts_ms, &route, digest));
+    }
     let usage = capture.usage();
     let shape = ctx.shape.as_ref();
 
@@ -1272,9 +1277,9 @@ pub(crate) fn record_codex_measurement(
         ts_ms,
         duration_ms: Some(duration_ms),
         kind: None,
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol.to_owned()),
         provider: Some(ctx.backend.id().to_owned()),
-        route: Some(route_of(ctx)),
+        route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
         // The response's own slug is authoritative (the routing unit's
@@ -1419,7 +1424,13 @@ pub(crate) fn record_codex_error(
     error_type: &str,
     message: &str,
     resets_at: Option<i64>,
+    frontend_protocol: &'static str,
 ) {
+    let ts_ms = now_ms();
+    let route = format!("{frontend_protocol}:{}", ctx.backend.id());
+    if let Some(digest) = &ctx.drift {
+        insert(ctx, drift_row(ts_ms, &route, digest));
+    }
     let mut extra = serde_json::Map::new();
     extra.insert("error_message".to_owned(), json!(message));
     if let Some(resets_at) = resets_at {
@@ -1427,12 +1438,12 @@ pub(crate) fn record_codex_error(
     }
     let row = RequestRow {
         id: None,
-        ts_ms: now_ms(),
+        ts_ms,
         duration_ms: Some(elapsed_ms(ctx.started)),
         kind: Some(RowKind::Error),
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol.to_owned()),
         provider: Some(ctx.backend.id().to_owned()),
-        route: Some(route_of(ctx)),
+        route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
         model: None,

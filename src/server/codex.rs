@@ -22,22 +22,27 @@
 //! on EVERY response — the "not just accounted ones" rule.
 
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
 use super::Server;
-use crate::ir::{AnthropicShape, Request as IrRequest};
+use crate::ir::{AnthropicShape, Fidelity, Request as IrRequest, compare};
+use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, buffer_up_to, plain_status, transport_failure, truncated_body,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, buffered_body, build_response,
+    is_compressed, plain_status, response_headers, session_id, transport_failure, truncated_body,
     upstream_failure,
 };
 use crate::server::record::now_ms;
@@ -66,6 +71,298 @@ pub(crate) struct CodexTurn {
     pub(crate) served_model: Option<String>,
     /// Whether the client explicitly asked for a plain JSON Message.
     pub(crate) stream_explicitly_false: bool,
+}
+
+const ANTHROPIC_FRONTEND: &str = "anthropic";
+const RESPONSES_FRONTEND: &str = "openai_responses";
+
+/// Native Codex CLI usage path. The request and response bytes stay in the
+/// Responses dialect end-to-end; observation is side-band only.
+pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
+    let started = Instant::now();
+    let Some(backend) = server.codex_sub.clone() else {
+        return super::responses_not_configured();
+    };
+    let Some(codex) = server.codex_turn.clone() else {
+        return super::responses_not_configured();
+    };
+    let (parts, body) = request.into_parts();
+    let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "responses request body exceeded toker's cap");
+            return plain_status(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds toker's 64 MiB cap\n",
+            );
+        }
+    };
+    let in_flight = Some(server.begin_in_flight());
+    let header_session = session_id(&server.config.session_header_names, &parts.headers);
+    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
+
+    let parsed = IrRequest::parse(&original).ok();
+    let body_session = parsed
+        .as_ref()
+        .and_then(|request| request.openai_responses().prompt_cache_key())
+        .map(str::to_owned);
+    let cache_key = body_session
+        .clone()
+        .or_else(|| header_session.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let model = parsed
+        .as_ref()
+        .and_then(|request| request.openai_responses().model())
+        .map(str::to_owned);
+    let drift =
+        parsed
+            .as_ref()
+            .and_then(|request| match compare(&original, &request.serialise()) {
+                Fidelity::Exact => None,
+                Fidelity::Drift { digest, .. } => Some(digest),
+            });
+    let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
+        server: server.clone(),
+        started,
+        path: "/v1/responses",
+        session_id: body_session.or(header_session),
+        requested_model: model.clone(),
+        effective_model: model.clone(),
+        drift,
+        backend: backend.clone(),
+        betas: None,
+        shape: Some(request.openai_responses().shape()),
+        ping,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        forced_from: None,
+        forced_to: None,
+        model_mappings: None,
+        frontend,
+    });
+
+    let auth = match codex.auth_for_turn(&server.http, now_ms() / 1000).await {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::warn!(%error, "codex auth refresh failed");
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker upstream error: the codex login could not be refreshed",
+            );
+        }
+    };
+    let thread_id = parts
+        .headers
+        .get("thread-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(&cache_key);
+    let request_id = parts
+        .headers
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let headers = codex.turn_headers(auth.as_ref(), &cache_key, thread_id, &request_id);
+    let suffix = parts
+        .uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/v1/responses")
+        .strip_prefix("/v1")
+        .unwrap_or("/responses");
+    let upstream = match server
+        .http
+        .post(backend.endpoint(suffix))
+        .headers(headers)
+        .body(original)
+        .send()
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            tracing::warn!(%error, "codex upstream request failed");
+            return transport_failure(ErrorWire::Openai, &error);
+        }
+    };
+
+    native_response(server, backend, upstream, record, in_flight).await
+}
+
+async fn native_response(
+    server: Server,
+    backend: Arc<dyn Provider>,
+    upstream: reqwest::Response,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+) -> Response {
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let meters = backend.meters(&headers);
+    if let Some(snapshot) = &meters {
+        server.note_quota(backend.id(), snapshot);
+        if let Err(error) = server.store.save_meters(
+            backend.id(),
+            &crate::store::MetersSnapshot {
+                updated_ms: now_ms(),
+                snapshot: snapshot.clone(),
+            },
+        ) {
+            tracing::error!(%error, "codex meter snapshot save failed");
+        }
+    }
+
+    if is_compressed(&headers) {
+        tracing::debug!("compressed codex response passed through unledgered");
+        return build_response(
+            status,
+            response_headers(&headers, true),
+            Body::from_stream(upstream.bytes_stream()),
+        );
+    }
+    if !status.is_success() {
+        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            return truncated_body(ErrorWire::Openai);
+        };
+        if buffered.rest.is_none()
+            && let Some(ctx) = record.as_ref()
+        {
+            let error = parse_upstream_error(&buffered.bytes);
+            let kind = error
+                .kind
+                .as_deref()
+                .or(error.code.as_deref())
+                .unwrap_or("api_error");
+            let message = error
+                .message
+                .as_deref()
+                .or(error.code.as_deref())
+                .unwrap_or("upstream error");
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                kind,
+                message,
+                error.resets_at,
+                RESPONSES_FRONTEND,
+            );
+        }
+        return build_response(
+            status,
+            response_headers(&headers, false),
+            buffered_body(buffered),
+        );
+    }
+
+    let state = NativeStreamState {
+        upstream,
+        parser: ResponsesSse::new(),
+        capture: TurnCapture::new(),
+        done: false,
+        failure: None,
+        record,
+        meters,
+        in_flight,
+    };
+    let stream = futures::stream::unfold(state, |mut state| async move {
+        if state.done {
+            return state.failure.take().map(|error| (Err(error), state));
+        }
+        match state.upstream.chunk().await {
+            Ok(Some(chunk)) => {
+                state.observe(&chunk);
+                if state.capture.turn_ended() {
+                    state.finish();
+                }
+                Some((Ok(chunk), state))
+            }
+            Ok(None) => {
+                if let Some(event) = state.parser.finish() {
+                    state.capture.observe(&event);
+                }
+                if state.capture.turn_ended() || state.capture.error().is_some() {
+                    state.finish();
+                    None
+                } else {
+                    tracing::warn!("codex stream closed before a final response event");
+                    state.record = None;
+                    state.done = true;
+                    drop(state.in_flight.take());
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "codex stream closed before a final response event",
+                        )),
+                        state,
+                    ))
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "codex stream failed mid-turn");
+                state.record = None;
+                state.done = true;
+                drop(state.in_flight.take());
+                Some((Err(std::io::Error::other(error)), state))
+            }
+        }
+    });
+    build_response(
+        status,
+        response_headers(&headers, false),
+        Body::from_stream(stream),
+    )
+}
+
+struct NativeStreamState {
+    upstream: reqwest::Response,
+    parser: ResponsesSse,
+    capture: TurnCapture,
+    done: bool,
+    failure: Option<std::io::Error>,
+    record: Option<AnthropicRecordCtx>,
+    meters: Option<Value>,
+    in_flight: Option<InFlightGuard>,
+}
+
+impl NativeStreamState {
+    fn observe(&mut self, bytes: &[u8]) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            for event in self.parser.feed(bytes) {
+                self.capture.observe(&event);
+            }
+        }));
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        let Some(ctx) = self.record.as_ref() else {
+            return;
+        };
+        if let Some(error) = self.capture.error() {
+            let kind = error
+                .kind
+                .as_deref()
+                .or(error.code.as_deref())
+                .unwrap_or("api_error");
+            let message = error
+                .message
+                .as_deref()
+                .or(error.code.as_deref())
+                .unwrap_or("upstream error");
+            record_codex_error(ctx, 200, kind, message, error.resets_at, RESPONSES_FRONTEND);
+        } else {
+            record_codex_measurement(
+                ctx,
+                &self.capture,
+                self.meters.clone(),
+                200,
+                RESPONSES_FRONTEND,
+            );
+        }
+        drop(self.in_flight.take());
+    }
 }
 
 /// One turn: translate, send, translate back, record.
@@ -119,6 +416,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                     "invalid_request_error",
                     &message,
                     None,
+                    ANTHROPIC_FRONTEND,
                 );
             }
             return anthropic_error_response(
@@ -205,7 +503,14 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             .or_else(|| error.kind.clone())
             .unwrap_or_else(|| "upstream error".to_owned());
         if let Some(ctx) = record.as_ref() {
-            record_codex_error(ctx, status.as_u16(), kind, &message, error.resets_at);
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                kind,
+                &message,
+                error.resets_at,
+                ANTHROPIC_FRONTEND,
+            );
         }
         return anthropic_error_response(status, kind, &message, !stream_explicitly_false);
     }
@@ -283,7 +588,14 @@ async fn aggregated_turn(
             .or_else(|| error.kind.clone())
             .unwrap_or_else(|| "upstream error".to_owned());
         if let Some(ctx) = record.as_ref() {
-            record_codex_error(ctx, 200, kind, &message, error.resets_at);
+            record_codex_error(
+                ctx,
+                200,
+                kind,
+                &message,
+                error.resets_at,
+                ANTHROPIC_FRONTEND,
+            );
         }
         return anthropic_error_response(StatusCode::OK, kind, &message, false);
     }
@@ -299,7 +611,7 @@ async fn aggregated_turn(
 
     let message = translate::message_from_capture(&model, &capture);
     if let Some(ctx) = record.as_ref() {
-        record_codex_measurement(ctx, &capture, meters, 200);
+        record_codex_measurement(ctx, &capture, meters, 200, ANTHROPIC_FRONTEND);
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -446,9 +758,22 @@ impl StreamState {
                 .or_else(|| error.code.clone())
                 .or_else(|| error.kind.clone())
                 .unwrap_or_else(|| "upstream error".to_owned());
-            record_codex_error(ctx, 200, kind, &message, error.resets_at);
+            record_codex_error(
+                ctx,
+                200,
+                kind,
+                &message,
+                error.resets_at,
+                ANTHROPIC_FRONTEND,
+            );
         } else if self.capture.turn_ended() {
-            record_codex_measurement(ctx, &self.capture, self.meters.clone(), 200);
+            record_codex_measurement(
+                ctx,
+                &self.capture,
+                self.meters.clone(),
+                200,
+                ANTHROPIC_FRONTEND,
+            );
         }
         // A stream that died without a terminator never reaches here
         // ([`StreamState::fail`]), and a hung-up client produces no row.

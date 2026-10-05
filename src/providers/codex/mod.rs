@@ -10,7 +10,7 @@
 //! request wire types, the responses-dialect SSE parser, and the
 //! `x-codex-*` usage-limit meters. The routing unit that serves
 //! `/v1/responses` onto this backend lands later (plan: the OpenAI
-//! Responses frontend adapter, [crate::proto::openai_responses]); HTTP
+//! Responses frontend adapter, [`crate::proto::openai_responses`]); HTTP
 //! only for now — the CLI's websocket transport and zstd request
 //! compression are not replicated.
 //!

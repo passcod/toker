@@ -49,6 +49,7 @@ pub mod anthropic;
 pub mod canonical;
 pub mod fidelity;
 pub mod openai_chat;
+pub mod openai_responses;
 
 pub use anthropic::{
     AnthropicBody, AnthropicBodyMut, AnthropicShape, CompactMarker, PLAN_SENTINEL, Release,

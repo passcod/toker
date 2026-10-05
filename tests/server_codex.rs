@@ -396,6 +396,102 @@ fn client() -> reqwest::Client {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn native_responses_passes_bytes_through_and_records_as_codex() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "native",
+        upstream,
+        login_dir("native").join("auth.json"),
+        false,
+    ))
+    .await;
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-5.6-sol",
+        "prompt_cache_key": "codex-session-1",
+        "instructions": "private instructions",
+        "input": [{"role": "user", "content": "private prompt"}],
+        "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+        "stream": true,
+    }))
+    .expect("request body");
+
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer frontend-must-not-pass")
+        .header("thread-id", "thread-native")
+        .header("x-client-request-id", "request-native")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = response.bytes().await.expect("response bytes");
+    assert_eq!(response_bytes, fixture("01_tool_call_turn.sse"));
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[0].body, body, "the request was not re-rendered");
+    assert_eq!(
+        requests[0].headers.get("session-id").unwrap(),
+        "codex-session-1"
+    );
+    assert_eq!(
+        requests[0].headers.get("thread-id").unwrap(),
+        "thread-native"
+    );
+    assert_eq!(
+        requests[0].headers.get("x-client-request-id").unwrap(),
+        "request-native"
+    );
+    assert_ne!(
+        requests[0].headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer frontend-must-not-pass"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.frontend.as_deref(), Some("openai_responses"));
+    assert_eq!(row.route.as_deref(), Some("openai_responses:codex_sub"));
+    assert_eq!(row.provider.as_deref(), Some("codex_sub"));
+    assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
+    assert_eq!(row.requested_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(row.req_messages, Some(1));
+    assert_eq!(row.req_tools, Some(1));
+    assert_eq!(row.system_chars, Some(20));
+    assert_eq!(
+        row.extra.as_ref().and_then(|extra| extra.get("frontend")),
+        Some(&json!("codex"))
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_native_body_is_forwarded_unchanged_and_not_ledgered() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "native-invalid",
+        upstream,
+        login_dir("native-invalid").join("auth.json"),
+        false,
+    ))
+    .await;
+    let body = Bytes::from_static(b"not json at all");
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .body(body.clone())
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = response.bytes().await.expect("body");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, body);
+    assert!(wait_for_rows(&store, 0).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_streaming_turn_translates_both_ways_and_records() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(

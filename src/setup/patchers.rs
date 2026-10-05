@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde_json::{Map, Value};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::setup::atomic::{atomic_patch_json, atomic_patch_json_if_changed, atomic_write_bytes};
 
@@ -74,6 +75,12 @@ pub fn frontend_base_url(port: u16, frontend: &str) -> String {
 /// carries under `provider.openrouter.options.baseURL`.
 pub fn openai_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
+}
+
+/// The Responses base URL Codex appends `/responses` to. The frontend
+/// prefix keeps native Codex attribution distinct from translated traffic.
+pub fn responses_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/f/codex/v1")
 }
 
 // ── the patchers ────────────────────────────────────────────────────────
@@ -179,6 +186,52 @@ pub fn patch_opencode(path: &Path, base_url: &str) -> anyhow::Result<()> {
         Ok(())
     })
     .with_context(|| format!("patching opencode config at {}", path.display()))
+}
+
+/// Point Codex at toker through a named custom Responses provider. The
+/// document editor preserves comments, ordering, and every unrelated key.
+pub fn patch_codex(path: &Path, base_url: &str) -> anyhow::Result<()> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut document = existing
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parsing codex config at {}", path.display()))?;
+    document["model_provider"] = value("toker");
+    if document.get("model_providers").is_none() {
+        document["model_providers"] = Item::Table(Table::new());
+    }
+    let providers = document["model_providers"]
+        .as_table_like_mut()
+        .context("codex config: model_providers is not a table — refusing to overwrite it")?;
+    if providers.get("toker").is_none() {
+        providers.insert("toker", Item::Table(Table::new()));
+    }
+    let provider = providers
+        .get_mut("toker")
+        .and_then(Item::as_table_like_mut)
+        .context("codex config: model_providers.toker is not a table — refusing to overwrite it")?;
+    provider.insert("name", value("toker"));
+    provider.insert("base_url", value(base_url));
+    provider.insert("wire_api", value("responses"));
+    provider.insert("requires_openai_auth", value(false));
+    provider.insert("supports_websockets", value(false));
+
+    let rendered = document.to_string();
+    if rendered == existing {
+        return Ok(());
+    }
+    let intended = rendered.into_bytes();
+    atomic_write_bytes(path, &intended, Some(0o600), |_temp, written| {
+        let checked = std::str::from_utf8(written).context("written codex config is not UTF-8")?;
+        checked
+            .parse::<DocumentMut>()
+            .context("written codex config does not parse")?;
+        Ok(())
+    })
+    .with_context(|| format!("patching codex config at {}", path.display()))
 }
 
 /// The generic-frontend option: toker's export block in a shell rc —
@@ -327,6 +380,8 @@ pub enum Frontend {
         /// The opencode.json to patch.
         config: PathBuf,
     },
+    /// Codex's user configuration (`~/.codex/config.toml`).
+    Codex { config: PathBuf },
     /// A shell rc's `# toker` export block — the generic frontend
     /// option ([`patch_shell_rc`]).
     ShellRc {
@@ -353,6 +408,7 @@ impl Frontend {
     pub fn base_url(&self, port: u16) -> String {
         match (self, self.prefix()) {
             (Frontend::Opencode { .. }, _) => openai_base_url(port),
+            (Frontend::Codex { .. }, _) => responses_base_url(port),
             (_, Some(name)) => frontend_base_url(port, name),
             (_, None) => anthropic_base_url(port),
         }
@@ -366,6 +422,7 @@ impl Frontend {
         match self {
             Frontend::Claude { .. } => Some("claude"),
             Frontend::ClaudeWorkhorse { .. } => Some("workhorse"),
+            Frontend::Codex { .. } => Some("codex"),
             Frontend::Opencode { .. } | Frontend::ShellRc { .. } => None,
         }
     }
@@ -376,6 +433,7 @@ impl Frontend {
     pub fn protocol(&self) -> &'static str {
         match self {
             Frontend::Opencode { .. } => "openai_chat",
+            Frontend::Codex { .. } => "openai_responses",
             _ => "anthropic",
         }
     }
@@ -385,6 +443,7 @@ impl Frontend {
     pub fn usage_path(&self) -> String {
         let route = match self.protocol() {
             "openai_chat" => "/v1/chat/completions",
+            "openai_responses" => "/v1/responses",
             _ => "/v1/messages",
         };
         match self.prefix() {
@@ -400,6 +459,7 @@ impl Frontend {
             Frontend::Claude { settings } => patch_claude(settings, base_url),
             Frontend::ClaudeWorkhorse { settings } => patch_claude(settings, base_url),
             Frontend::Opencode { config } => patch_opencode(config, base_url),
+            Frontend::Codex { config } => patch_codex(config, base_url),
             Frontend::ShellRc { rc } => patch_shell_rc(rc, base_url),
         }
     }
@@ -412,6 +472,7 @@ impl Frontend {
                 format!("claude in the Workhorse repos ({})", settings.display())
             }
             Frontend::Opencode { config } => format!("opencode ({})", config.display()),
+            Frontend::Codex { config } => format!("codex ({})", config.display()),
             Frontend::ShellRc { rc } => format!("shell rc ({})", rc.display()),
         }
     }
@@ -938,7 +999,6 @@ mod tests {
         assert!(format!("{error:#}").contains("reading"));
         assert_eq!(fs::read(&path).expect("read back"), b"export A=\xff");
     }
-
     fn picker_row(model: &str) -> Value {
         json!({"model": model, "label": model, "description": "d", "behavesAs": "claude-sonnet-5"})
     }
@@ -1036,5 +1096,47 @@ mod tests {
             assert!(patch_model_picker(&path, &[picker_row("openrouter/a/b")]).is_err());
             assert_eq!(fs::read(&path).expect("read"), bytes, "{name}: untouched");
         }
+    }
+
+    #[test]
+    fn codex_patch_preserves_unrelated_toml_and_is_idempotent() {
+        let path = test_dir("codex").join("config.toml");
+        fs::write(
+            &path,
+            "# keep this comment\nmodel = \"gpt-5\"\nmodel_provider = \"openai\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
+        )
+        .expect("write codex config");
+        let url = "http://127.0.0.1:18123/f/codex/v1";
+        patch_codex(&path, url).expect("patch");
+        let once = fs::read_to_string(&path).expect("read");
+        assert!(once.starts_with("# keep this comment\nmodel = \"gpt-5\"\n"));
+        assert!(once.contains("[projects.\"/work\"]\ntrust_level = \"trusted\""));
+        let document = once.parse::<DocumentMut>().expect("parse result");
+        assert_eq!(document["model_provider"].as_str(), Some("toker"));
+        assert_eq!(
+            document["model_providers"]["toker"]["base_url"].as_str(),
+            Some(url)
+        );
+        assert_eq!(
+            document["model_providers"]["toker"]["wire_api"].as_str(),
+            Some("responses")
+        );
+        assert_eq!(
+            document["model_providers"]["toker"]["requires_openai_auth"].as_bool(),
+            Some(false)
+        );
+        patch_codex(&path, url).expect("repatch");
+        assert_eq!(fs::read_to_string(&path).expect("read again"), once);
+    }
+
+    #[test]
+    fn codex_patch_refuses_a_non_table_provider_without_clobbering() {
+        let path = test_dir("codex-refuse").join("config.toml");
+        let before = "model_providers = \"not a table\"\n";
+        fs::write(&path, before).expect("write codex config");
+        let error = patch_codex(&path, "http://127.0.0.1:18123/f/codex/v1")
+            .expect_err("refuse malformed provider shape");
+        assert!(format!("{error:#}").contains("model_providers is not a table"));
+        assert_eq!(fs::read_to_string(&path).expect("read back"), before);
     }
 }

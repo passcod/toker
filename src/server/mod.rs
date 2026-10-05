@@ -464,6 +464,7 @@ impl Server {
     fn routes(&self) -> Router {
         Router::new()
             .route("/v1/chat/completions", post(proxy::chat_completions))
+            .route("/v1/responses", post(codex::responses))
             .route("/v1/models", get(proxy::models))
             .route("/v1/messages", post(anthropic::messages))
             .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
@@ -954,6 +955,10 @@ pub(crate) fn anthropic_not_configured() -> axum::response::Response {
 /// [`anthropic_not_configured`].
 pub(crate) fn openai_not_configured() -> axum::response::Response {
     not_configured(proxy::ErrorWire::Openai, "openai_chat")
+}
+
+pub(crate) fn responses_not_configured() -> axum::response::Response {
+    not_configured(proxy::ErrorWire::Openai, "openai_responses")
 }
 
 fn not_configured(wire: proxy::ErrorWire, protocol: &'static str) -> axum::response::Response {

@@ -1,7 +1,7 @@
 # toker — unified local proxy toolsuite
 
 Date: 2026-10-03
-Status: phases 1-2 shipped; codex_sub backend + translation shipped and live through the canonical IR (claude → toker → codex sub); the Responses FRONTEND endpoint (/v1/responses for driving toker from the codex CLI) is phase 3's remaining half. Dogfooding live: opencode → openrouter and claude → codex_sub, both through one toker.
+Status: phases 1-3 shipped; codex_sub supports translated Anthropic traffic and the native Responses frontend (`/v1/responses`) used by the Codex CLI. Dogfooding live: opencode → openrouter, claude → codex_sub, and codex → codex_sub through one toker.
 
 ## Purpose
 
