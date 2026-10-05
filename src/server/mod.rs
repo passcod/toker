@@ -844,6 +844,7 @@ version_probe = false
             forced_from: None,
             forced_to: None,
             model_mappings: None,
+            frontend: None,
         };
         let mut observer = crate::observe::AnthropicObserver::new();
         observer.observe_json(

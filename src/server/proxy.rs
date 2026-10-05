@@ -163,6 +163,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         gate_model = effective_model.clone();
         gate_shape = Some(shape.clone());
         record = Some(RecordCtx {
+            frontend: frontend.clone(),
             server: server.clone(),
             started,
             // Cloned, not moved: the cold gate below still keys the lane
@@ -237,6 +238,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 // and `noticed_at` are untouched — nothing was said and
                 // nothing reached upstream.
                 record_openai_cold_quiet(ColdOpenaiRecord {
+                    frontend: frontend.as_deref(),
                     server: &server,
                     started,
                     session_id: session_id.as_deref(),
@@ -280,6 +282,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     tracing::error!(%error, "lane notice mark failed");
                 }
                 record_openai_cold(ColdOpenaiRecord {
+                    frontend: frontend.as_deref(),
                     server: &server,
                     started,
                     session_id: session_id.as_deref(),

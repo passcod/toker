@@ -330,6 +330,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     backend.id(),
                     &merged,
                     meters_snapshot.as_ref(),
+                    frontend.as_deref(),
                 );
             }
 
@@ -359,6 +360,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // record context.
         served_model = effective_model.clone();
         record = Some(AnthropicRecordCtx {
+            frontend: frontend.clone(),
             server: server.clone(),
             started,
             path,
@@ -453,6 +455,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 },
             );
             record_anthropic_blocked(BlockedRecord {
+                frontend: frontend.as_deref(),
                 server: &server,
                 started,
                 path,
@@ -571,6 +574,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 outlook,
             } => {
                 record_anthropic_cold_quiet(ColdRecord {
+                    frontend: frontend.as_deref(),
                     server: &server,
                     started,
                     path,
@@ -602,6 +606,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 // spell is judged again — the withheld-notice discipline.
                 if writes_free {
                     record_anthropic_cold_quiet(ColdRecord {
+                        frontend: frontend.as_deref(),
                         server: &server,
                         started,
                         path,
@@ -663,6 +668,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         tracing::error!(%error, "lane notice mark failed");
                     }
                     record_anthropic_cold(ColdRecord {
+                        frontend: frontend.as_deref(),
                         server: &server,
                         started,
                         path,

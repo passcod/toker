@@ -1938,6 +1938,32 @@ async fn a_prefixed_request_is_forwarded_without_its_prefix() {
 }
 
 #[tokio::test]
+async fn rows_name_the_prefixed_frontend_in_extra() {
+    // The `frontend` column stays the protocol (and `route` stays built
+    // from it); the client's own name rides in `extra`, only when a
+    // prefix named it.
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (_reset5h, _snapshot) = poison_meters(&store, 1.0, 3600);
+    for path in ["/f/claude/v1/messages", "/v1/messages"] {
+        let response =
+            post_messages(addr, path, &[], &messages_body_no_stream("claude-opus-5")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let rows = wait_for_rows(&store, 2).await;
+    for row in &rows {
+        assert_eq!(row.kind, Some(RowKind::Blocked));
+        assert_eq!(row.frontend.as_deref(), Some("anthropic"));
+        assert_eq!(row.route.as_deref(), Some("anthropic:anthropic_sub"));
+    }
+    let named: Vec<Option<&Value>> = rows
+        .iter()
+        .map(|row| row.extra.as_ref().and_then(|extra| extra.get("frontend")))
+        .collect();
+    assert_eq!(named, vec![Some(&json!("claude")), None]);
+}
+
+#[tokio::test]
 async fn an_expired_spent_reading_fails_open_and_forwards() {
     // The rule that un-wedges the gate: a blocked request can never
     // refresh meters, so a reading whose window has already passed must

@@ -74,6 +74,31 @@ pub(crate) struct RecordCtx {
     pub(crate) shape: Option<Shape>,
     /// System-family message count, for the row's `system_messages`.
     pub(crate) system_messages: Option<u64>,
+    /// The frontend's name from its `/f/<frontend>` prefix, recorded in
+    /// `extra` ([`with_frontend`]).
+    pub(crate) frontend: Option<String>,
+}
+
+/// Note the frontend a row's request came through, from its
+/// `/f/<frontend>` base-URL prefix, as `extra.frontend`. The `frontend`
+/// column already names the frontend *protocol* (`anthropic`,
+/// `openai_chat`) and `route` is built from it, so the client's own name
+/// rides in `extra` instead; an unprefixed request adds nothing, which
+/// reads as "unknown", never as a name.
+pub(crate) fn with_frontend(mut row: RequestRow, frontend: Option<&str>) -> RequestRow {
+    let Some(frontend) = frontend else {
+        return row;
+    };
+    match &mut row.extra {
+        Some(Value::Object(extra)) => {
+            extra.insert("frontend".to_owned(), json!(frontend));
+        }
+        // Every row kind's extra is an object or absent; anything else
+        // is left as it is rather than overwritten.
+        Some(_) => {}
+        None => row.extra = Some(json!({ "frontend": frontend })),
+    }
+    row
 }
 
 /// Epoch milliseconds now. The clock's only role: row fields.
@@ -223,6 +248,7 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         prompt,
         req_messages,
         compact_target,
+        frontend,
     } = record;
     let row = RequestRow {
         id: None,
@@ -301,6 +327,7 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -331,6 +358,7 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         tools_hash,
         idle_ms,
         prompt,
+        frontend,
         ..
     } = record;
     let row = RequestRow {
@@ -402,6 +430,7 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -434,6 +463,8 @@ pub(crate) struct ColdOpenaiRecord<'a> {
     /// The model the notice promised a cheap `/compact` on, when one
     /// resolved.
     pub(crate) compact_target: Option<&'a str>,
+    /// The frontend's prefix name, for `extra.frontend`.
+    pub(crate) frontend: Option<&'a str>,
 }
 
 /// The route column, `frontend:backend`.
@@ -549,6 +580,7 @@ fn drift_note(ctx: &RecordCtx) -> String {
 /// differ from what was sent — and recency must follow the served
 /// identity. In-memory and infallible, so it cannot cost the row.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
+    let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }

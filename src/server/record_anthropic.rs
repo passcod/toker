@@ -55,7 +55,7 @@ use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
 
 use super::Server;
-use super::record::{elapsed_ms, i64_of, now_ms};
+use super::record::{elapsed_ms, i64_of, now_ms, with_frontend};
 
 /// Everything a completion point knows about one anthropic request,
 /// minus the response itself.
@@ -106,6 +106,9 @@ pub(crate) struct AnthropicRecordCtx {
     /// Batch model-map provenance (the per-request
     /// from→to list), when the request was a batch the map claimed.
     pub(crate) model_mappings: Option<Value>,
+    /// The frontend's name from its `/f/<frontend>` prefix, recorded in
+    /// `extra` ([`with_frontend`]).
+    pub(crate) frontend: Option<String>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -236,6 +239,7 @@ fn drift_note(ctx: &AnthropicRecordCtx) -> String {
 /// differ from what was sent — and recency must follow the served
 /// identity. In-memory and infallible, so it cannot cost the row.
 fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
+    let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -673,6 +677,7 @@ pub(crate) fn record_anthropic_released(
     backend_id: &str,
     grant: &Grant,
     stale_meters: Option<&Value>,
+    frontend: Option<&str>,
 ) {
     let row = RequestRow {
         id: None,
@@ -748,6 +753,7 @@ pub(crate) fn record_anthropic_released(
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -782,6 +788,8 @@ pub(crate) struct BlockedRecord<'a> {
     pub(crate) context_tokens: Option<u64>,
     /// The snapshot the block was decided on — the stale copy.
     pub(crate) stale_meters: Option<&'a Value>,
+    /// The frontend's prefix name, for `extra.frontend`.
+    pub(crate) frontend: Option<&'a str>,
 }
 
 /// Record the quota-block row (the `kind: "blocked"` row).
@@ -807,6 +815,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         resets_at,
         context_tokens,
         stale_meters,
+        frontend,
     } = record;
     let row = RequestRow {
         id: None,
@@ -877,6 +886,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -921,6 +931,7 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         // own existence says so.
         writes_free: _,
         gate_on,
+        frontend,
     } = record;
     let outlook = outlook.cloned();
     let row = RequestRow {
@@ -994,6 +1005,7 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
@@ -1040,6 +1052,8 @@ pub(crate) struct ColdRecord<'a> {
     /// Whether the quota gate is armed (a view
     /// reading this row cannot infer the toggle from anywhere else).
     pub(crate) gate_on: bool,
+    /// The frontend's prefix name, for `extra.frontend`.
+    pub(crate) frontend: Option<&'a str>,
 }
 
 /// The withheld-notice row (the `kind: "cold-quiet"` row).
@@ -1072,6 +1086,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         outlook,
         writes_free,
         gate_on,
+        frontend,
         ..
     } = record;
     let outlook = outlook.cloned();
@@ -1146,6 +1161,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         geo: None,
         fast: None,
     };
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
