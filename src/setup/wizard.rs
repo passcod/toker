@@ -703,7 +703,8 @@ pub struct RunReport {
     /// The unit names installed this run (installs that failed are
     /// absent; the manual commands carry them).
     pub units_installed: Vec<String>,
-    /// Every unit install and systemctl step succeeded.
+    /// The state dir was created (or already existed), and every unit
+    /// install and systemctl step succeeded.
     pub units_ok: bool,
     /// The commands to finish by hand when [`RunReport::units_ok`] is
     /// false.
@@ -1286,9 +1287,10 @@ impl<'a> Wizard<'a> {
 
     // ── step 3: install + start the units ─────────────────────────
 
-    /// [`Step::InstallUnits`] — generate the units (functions of the
-    /// configured port, this binary, and the state dir), install them,
-    /// `daemon-reload`, `enable --now toker.socket`. Every failure is
+    /// [`Step::InstallUnits`] — create the state dir, generate the
+    /// units (functions of the configured port, this binary, and the
+    /// state dir), install them, `daemon-reload`, `enable --now
+    /// toker.socket`. Every failure is
     /// non-fatal and reported with the manual commands — but the
     /// return value is the spine: `false` means the run stops here
     /// (no verify, no frontends, no import).
@@ -1301,7 +1303,22 @@ impl<'a> Wizard<'a> {
         ];
 
         let mut ok = true;
-        let mut write_failures: Vec<String> = Vec::new();
+        let mut manual: Vec<String> = Vec::new();
+
+        // The service's ReadWritePaths names the state dir, and systemd
+        // fails the namespace setup (226/NAMESPACE) when it is missing,
+        // before the binary's own `Store::open` could create it — and
+        // under ProtectHome=read-only the service could not create it
+        // anyway. So the wizard does, before anything can start.
+        if let Err(error) = std::fs::create_dir_all(&self.paths.state_dir) {
+            ok = false;
+            self.say(&format!(
+                "creating the state dir {} failed: {error}",
+                self.paths.state_dir.display()
+            ))?;
+            manual.push(format!("mkdir -p {}", self.paths.state_dir.display()));
+        }
+
         for (name, contents) in &units {
             match self.runner.install_unit(name, contents) {
                 Ok(path) => {
@@ -1315,7 +1332,7 @@ impl<'a> Wizard<'a> {
                     for line in contents.lines() {
                         self.say(&format!("    | {line}"))?;
                     }
-                    write_failures.push(format!(
+                    manual.push(format!(
                         "write {name} into {}",
                         self.paths.units_dir.join(name).display()
                     ));
@@ -1356,7 +1373,7 @@ impl<'a> Wizard<'a> {
         }
 
         if !ok {
-            report.units_manual = write_failures;
+            report.units_manual = manual;
             report
                 .units_manual
                 .push("systemctl --user daemon-reload".to_owned());
@@ -2729,6 +2746,10 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
         assert!(report.config_written);
         assert!(!report.config_kept);
         assert!(report.units_ok);
+        assert!(
+            rig.paths().state_dir.is_dir(),
+            "the state dir exists before the service could need it"
+        );
         assert_eq!(report.port, port);
 
         // The frontends: patched to this run's port, byte-for-byte.
@@ -3220,6 +3241,66 @@ ExecStart="/opt/toker/toker" ping-window --slot=09:00
 
         // And the summary named only the SOURCE, never the value.
         assert!(out.contains("the literal in toker.toml"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_state_dir_that_cannot_be_created_is_reported_with_manual_commands() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "state-dir-fail",
+            vec![
+                select(0),
+                confirm(true),
+                select(0),
+                text(""),
+                confirm(true),
+                text(&port.to_string()),
+            ],
+            // is-active only: with the state dir missing, nothing may
+            // start, so reload and enable must never be called.
+            vec![inactive()],
+        );
+        let before_claude = seed_claude(&rig.root);
+        // A file where the state dir belongs: create_dir_all fails.
+        let state_dir = rig.paths().state_dir;
+        std::fs::create_dir_all(state_dir.parent().expect("the data dir"))
+            .expect("create the data dir");
+        std::fs::write(&state_dir, "").expect("block the state dir");
+
+        let report = rig
+            .run(Duration::from_millis(300))
+            .await
+            .expect("a failed state dir is reported, not an error");
+
+        assert!(!report.units_ok);
+        assert_eq!(report.units_installed.len(), 2, "the files installed fine");
+        assert_eq!(report.verified, None, "verify was never attempted");
+        assert_eq!(report.patched.len(), 0, "no frontend was touched");
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before_claude
+        );
+        assert_eq!(
+            rig.runner.calls(),
+            vec![vec!["is-active".to_owned(), SOCKET_UNIT.to_owned()]],
+            "no systemctl step ran after the state dir failed"
+        );
+        let mkdir = format!("mkdir -p {}", state_dir.display());
+        assert_eq!(
+            report.units_manual.first(),
+            Some(&mkdir),
+            "the state dir comes first in the manual commands"
+        );
+        let out = rig.out();
+        assert!(
+            out.contains(&format!(
+                "creating the state dir {} failed",
+                state_dir.display()
+            )),
+            "{out}"
+        );
+        assert!(out.contains(&format!("  {mkdir}")), "{out}");
+        assert!(out.contains("no frontend was touched"), "{out}");
     }
 
     #[tokio::test]
