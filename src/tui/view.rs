@@ -239,6 +239,17 @@ const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█
 /// formatter, resolved once at startup.
 pub(crate) struct Ui {
     pub fmt: Fmt,
+    /// `NO_COLOR` was set (see [`no_color`]): the frame renders without
+    /// colour.
+    pub no_color: bool,
+    /// The `?` legend overlay is showing.
+    pub legend: bool,
+}
+
+/// Whether `NO_COLOR`'s value asks for no colour: set and non-empty, the
+/// convention's own rule (an empty value is the same as unset).
+pub(crate) fn no_color(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 /// The whole frame. `clock` is the preformatted HH:MM:SS string and
@@ -274,6 +285,88 @@ pub(crate) fn render(frame: &mut Frame, snap: &Snapshot, clock: &str, tz: &TimeZ
     } else {
         render_rate(frame, bottom, snap, tz, fmt);
     }
+    if ui.legend {
+        render_legend(frame);
+    }
+    if ui.no_color {
+        strip_colour(frame);
+    }
+}
+
+/// Every colour off the finished frame, modifiers kept: `NO_COLOR` is
+/// about colour, and bold and dim still carry meaning without it (a dim
+/// `-`, an idle age). Done once over the buffer rather than at each
+/// style site, so no panel can forget it.
+fn strip_colour(frame: &mut Frame) {
+    for cell in frame.buffer_mut().content.iter_mut() {
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+    }
+}
+
+/// The legend's rows: a glyph or marker, and what it means.
+const LEGEND: [(&str, &str); 17] = [
+    (
+        "↑",
+        "served on a newer model: bright on the latest turn, dim earlier",
+    ),
+    ("$", "released past the armed quota gate for this window"),
+    ("↺", "compactions so far; - for none"),
+    ("-", "not reported, which is not zero"),
+    ("?", "unknown: model, context ceiling, or token count"),
+    (
+        "≥",
+        "a floor: some rows unknown, or the span predates the data",
+    ),
+    ("<1%", "spent less than the meter's 1% step shows"),
+    (
+        "·",
+        "no requests in that slice of the window; red holds an error",
+    ),
+    ("on track", "the meter resets before it runs out"),
+    ("estimating", "too little data to separate burn from noise"),
+    ("stops ~T", "reaches the armed gate's threshold at T"),
+    ("out ~T", "runs out at T"),
+    ("gated ·", "past the gate; the countdown is to exhaustion"),
+    (
+        "on track?",
+        "a trailing ?: the gate's state is assumed, not observed",
+    ),
+    ("last req", "green under 30s, yellow under 5m, red beyond"),
+    ("ctx", "green: native 1M; yellow: another known ceiling"),
+    ("idle", "dim once a session has been quiet 3m"),
+];
+
+/// The `?` overlay: what the dashboard's glyphs and markers mean,
+/// centred over the frame and clipped to it.
+fn render_legend(frame: &mut Frame) {
+    let key_w = LEGEND.iter().map(|(key, _)| key.width()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = LEGEND
+        .iter()
+        .map(|(key, meaning)| {
+            Line::from(vec![
+                Span::styled(format!("{key:<key_w$}"), Style::new().bold()),
+                Span::raw("  "),
+                Span::raw(*meaning),
+            ])
+        })
+        .collect();
+    lines.push(Line::styled("? or Esc closes", Style::new().dim()));
+    let text_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let area = frame.area();
+    let width = (text_w + 4).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::bordered()
+        .title_top("LEGEND")
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// The frame's panel areas, from the snapshot's content and the frame's
@@ -1327,31 +1420,31 @@ fn render_spend(frame: &mut Frame, area: Rect, snap: &Snapshot) {
     let mut lines = Vec::with_capacity(3 + spend.breakdown.len());
     match spend.billed_total {
         Some(total) => lines.push(Line::from(format!(
-            "billed: {} ({} reqs)",
+            "billed: {} ({})",
             usd(total),
-            spend.billed_requests
+            reqs(spend.billed_requests)
         ))),
         None => lines.push(Line::from("billed: no billed cost data")),
     }
     // Positioned third-from-last at worst and second here: this line is
     // the invariant-3 counter, so it must never scroll out of view.
     lines.push(Line::from(format!(
-        "no cost data: {} reqs",
-        spend.no_cost_data
+        "no cost data: {}",
+        reqs(spend.no_cost_data)
     )));
     for entry in &spend.breakdown {
         lines.push(Line::from(format!(
-            "{} · {}  {} · {} reqs",
+            "{} · {}  {} · {}",
             entry.provider.as_deref().unwrap_or(NO_SESSION),
             entry.model.as_deref().unwrap_or(NO_SESSION),
             usd(entry.billed),
-            entry.requests
+            reqs(entry.requests)
         )));
     }
     if spend.other_cost_kinds > 0 {
         lines.push(Line::from(format!(
-            "{} reqs with non-billed cost",
-            spend.other_cost_kinds
+            "{} with non-billed cost",
+            reqs(spend.other_cost_kinds)
         )));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1643,8 +1736,11 @@ fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
                     return ("<1%".to_owned(), true);
                 }
                 (
+                    // The floor marker replaces the sign rather than
+                    // joining it: `≥3%` already says "at least this much
+                    // more".
                     if floor {
-                        format!("≥+{pct}%")
+                        format!("≥{pct}%")
                     } else {
                         format!("+{pct}%")
                     },
@@ -1663,7 +1759,9 @@ fn spent_line(today: Spent, window: Spent, window_mins: u64) -> Line<'static> {
         }
     };
     Line::from(vec![
-        Span::raw("  spent   "),
+        // The meter lines' label column (`padEnd(9)`), so the figures
+        // start under the bars.
+        Span::raw(format!("  {:<9}", "spent")),
         Span::styled("today ", Style::new().dim()),
         Span::styled(today_text, dim_of(today_dim)),
         Span::styled("  ·  ", Style::new().dim()),
@@ -1713,6 +1811,15 @@ fn bar(frac: f64, w: u16) -> String {
     let fill = (f * w as f64).round() as usize;
     let fill = fill.min(w);
     "█".repeat(fill) + &"░".repeat(w.saturating_sub(fill))
+}
+
+/// A request count with its noun: `1 req`, `2 reqs`.
+fn reqs(count: usize) -> String {
+    if count == 1 {
+        "1 req".to_owned()
+    } else {
+        format!("{count} reqs")
+    }
 }
 
 /// Dollar formatting for the spend panel.
@@ -1785,7 +1892,11 @@ mod tests {
     /// The pinned formats: the expected strings below hold on any host,
     /// whatever its locale.
     fn plain() -> super::Ui {
-        super::Ui { fmt: Fmt::fixed() }
+        super::Ui {
+            fmt: Fmt::fixed(),
+            no_color: false,
+            legend: false,
+        }
     }
 
     /// A fixed zone keeps the pinned clock strings independent of the
@@ -2796,7 +2907,7 @@ mod tests {
     #[test]
     fn spent_line_renders_all_five_states() {
         // The README's `spent` table, one line each: a total, a
-        // quantisation ceiling (<1%), a floor (≥+N%), idle, and no
+        // quantisation ceiling (<1%), a floor (≥N%), idle, and no
         // data — the last three dim, and none of them a zero.
         let line = |today: Spent, window: Spent| {
             let mut text = String::new();
@@ -2817,7 +2928,7 @@ mod tests {
                     floor: false
                 }
             ),
-            "  spent   today +3%  ·  30m <1%"
+            "  spent    today +3%  ·  30m <1%"
         );
         assert_eq!(
             line(
@@ -2827,11 +2938,11 @@ mod tests {
                 },
                 Spent::Idle
             ),
-            "  spent   today ≥+6%  ·  30m idle"
+            "  spent    today ≥6%  ·  30m idle"
         );
         assert_eq!(
             line(Spent::NoData, Spent::NoData),
-            "  spent   today no data  ·  30m no data"
+            "  spent    today no data  ·  30m no data"
         );
     }
 
@@ -3156,6 +3267,7 @@ mod tests {
         };
         let fr = super::Ui {
             fmt: Fmt::new(None, Some(&locale("fr-FR"))),
+            ..plain()
         };
         let text = draw(&full_snapshot(), &fr);
         assert!(text.contains("470\u{202f}893 / 1M"), "{text}");
@@ -3163,6 +3275,7 @@ mod tests {
 
         let lakh = super::Ui {
             fmt: Fmt::new(None, Some(&locale("en-IN"))),
+            ..plain()
         };
         let text = draw(&full_snapshot(), &lakh);
         assert!(text.contains("4,70,893 / 1M"), "{text}");
@@ -3171,10 +3284,101 @@ mod tests {
         // fixture strings elsewhere are the 24-hour fallback.
         let us = super::Ui {
             fmt: Fmt::new(Some(&locale("en-US")), None),
+            ..plain()
         };
         let text = draw(&quota_snapshot(), &us);
         assert!(text.contains("resets 3:53"), "{text}");
         assert!(text.contains("PM · gated · on track"), "{text}");
+    }
+
+    /// The frame's buffer at `width`×`height` under `ui`.
+    fn buffer_with(
+        snap: &model::Snapshot,
+        width: u16,
+        height: u16,
+        ui: &super::Ui,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| super::render(frame, snap, "12:34:56", &utc(), ui))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn no_color_strips_every_colour_and_keeps_the_modifiers() {
+        assert!(super::no_color(Some("1".into())));
+        assert!(!super::no_color(Some("".into())), "empty is unset");
+        assert!(!super::no_color(None));
+
+        let snap = full_snapshot();
+        let coloured = buffer_with(&snap, 120, 40, &plain());
+        assert!(
+            coloured.content.iter().any(|cell| cell.fg != Color::Reset),
+            "the fixture renders colour"
+        );
+        let ui = super::Ui {
+            no_color: true,
+            ..plain()
+        };
+        let plain_buffer = buffer_with(&snap, 120, 40, &ui);
+        assert!(
+            plain_buffer
+                .content
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset)
+        );
+        // The text is untouched, and dim still marks what it marked.
+        for (a, b) in coloured.content.iter().zip(&plain_buffer.content) {
+            assert_eq!(a.symbol(), b.symbol());
+            assert_eq!(a.modifier, b.modifier);
+        }
+    }
+
+    #[test]
+    fn the_legend_overlays_the_frame_when_toggled() {
+        let snap = full_snapshot();
+        let text_of = |buffer: &ratatui::buffer::Buffer| {
+            let mut text = String::new();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    text.push_str(buffer[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            text
+        };
+        let off = text_of(&buffer_with(&snap, 100, 30, &plain()));
+        assert!(!off.contains("LEGEND"), "{off}");
+        let ui = super::Ui {
+            legend: true,
+            ..plain()
+        };
+        let on = text_of(&buffer_with(&snap, 100, 30, &ui));
+        for expected in [
+            "LEGEND",
+            "served on a newer model",
+            "compactions so far",
+            "not reported, which is not zero",
+            "<1%",
+            "estimating",
+            "green under 30s",
+            "? or Esc closes",
+        ] {
+            assert!(on.contains(expected), "{expected:?} in:\n{on}");
+        }
+        // Small terminals clip the overlay rather than panic.
+        let _ = buffer_with(&snap, 20, 8, &ui);
+        let _ = buffer_with(&snap, 1, 1, &ui);
+    }
+
+    #[test]
+    fn spend_counts_one_request_in_the_singular() {
+        let mut snap = snapshot();
+        snap.spend.billed_requests = 1;
+        let text = rendered(&snap, 100, 30);
+        assert!(text.contains("billed: $0.002130 (1 req)"), "{text}");
+        assert!(!text.contains("1 reqs"), "{text}");
     }
 
     #[test]

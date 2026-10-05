@@ -134,8 +134,10 @@ pub fn run(
     let tz = jiff::tz::TimeZone::system();
     // The display locale, resolved once (see [locale]): clocks and
     // grouped counts follow it; nothing model-visible does.
-    let ui = view::Ui {
+    let mut ui = view::Ui {
         fmt: locale::Fmt::from_env(),
+        no_color: view::no_color(std::env::var_os("NO_COLOR")),
+        legend: false,
     };
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
@@ -226,6 +228,9 @@ pub fn run(
                 {
                     break;
                 }
+                // ? toggles the legend over the frame; Esc closes it.
+                crossterm::event::KeyCode::Char('?') => ui.legend = !ui.legend,
+                crossterm::event::KeyCode::Esc => ui.legend = false,
                 // r forces an immediate full reload on the next pass —
                 // the window and the heavy sections, changed or not.
                 crossterm::event::KeyCode::Char('r') => {
