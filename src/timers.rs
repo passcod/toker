@@ -1168,11 +1168,13 @@ mod tests {
         assert!(slept[..5].iter().all(|span| *span == super::HOLD_TICK));
         assert_eq!(slept[5], Duration::from_secs(2));
         assert_eq!(*clock.now.lock().unwrap(), utc_ms(7, 20) + 27_000);
+        // The hold and the unhold are printed, each a whole line.
         let out = String::from_utf8(out).expect("utf-8");
-        assert_eq!(
-            out, "holding the idle-sleep lock for 0.45 minutes\nreleased the idle-sleep lock\n",
-            "the hold and the unhold are printed"
-        );
+        assert!(out.ends_with('\n'), "{out:?}");
+        insta::assert_snapshot!(out, @r"
+        holding the idle-sleep lock for 0.45 minutes
+        released the idle-sleep lock
+        ");
     }
 
     #[test]
@@ -1533,18 +1535,9 @@ mod tests {
         // boundary it predicted from the FIRE time (09:12 → 14:10, not
         // the slot's 14:00) and the one the ledger reported back.
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains(
-                "slot 09:00: opening the quota window (scheduled 09:11, expecting it to end 14:10)"
-            ),
-            "{out}"
-        );
-        assert!(out.contains("slot 09:00: running 1 min late"), "{out}");
+        assert!(out.contains("1 min late"), "{out}");
         assert!(out.contains("claude exited 0"), "{out}");
-        assert!(
-            out.contains("the ledger confirms the window is open until 14:10"),
-            "{out}"
-        );
+        insta::assert_snapshot!(out);
         let pings: Vec<PingRecord> = Store::open(&db)
             .expect("open")
             .pings_since(0, 10)
@@ -1581,10 +1574,8 @@ mod tests {
         .expect("the window did open, just not where predicted");
 
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("the window is open until 14:00, not the expected 14:10"),
-            "{out}"
-        );
+        assert!(out.contains("14:00") && out.contains("14:10"), "{out}");
+        insta::assert_snapshot!(out);
         let pings = Store::open(&db)
             .expect("open")
             .pings_since(0, 10)
@@ -1656,11 +1647,8 @@ mod tests {
         )
         .expect("the row landed");
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("slot 09:00: the last window ended at 09:10"),
-            "{out}"
-        );
-        assert!(out.contains("boundary unverified, expected 14:10"), "{out}");
+        assert!(out.contains("unverified"), "{out}");
+        insta::assert_snapshot!(out);
         let pings = Store::open(&db)
             .expect("open")
             .pings_since(0, 10)
@@ -1798,10 +1786,7 @@ mod tests {
         // the failure, not a panic.
         let out = String::from_utf8(out).expect("utf-8");
         assert!(out.contains("claude exited 1"), "{out}");
-        assert!(
-            out.contains("no ping row landed in the ledger — the window did not open"),
-            "{out}"
-        );
+        insta::assert_snapshot!(out);
         assert!(format!("{error:#}").contains("did not open"), "{error:#}");
         // The failed run is still recorded.
         let pings: Vec<PingRecord> = Store::open(&db)
@@ -1835,11 +1820,8 @@ mod tests {
         .expect_err("nothing was sent");
 
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("claude could not run: claude: command not found"),
-            "{out}"
-        );
-        assert!(out.contains("no ping row landed"), "{out}");
+        assert!(out.contains("claude: command not found"), "{out}");
+        insta::assert_snapshot!(out);
         assert!(format!("{error:#}").contains("did not open"), "{error:#}");
     }
 
@@ -1872,10 +1854,8 @@ mod tests {
         .expect("the row lands on the retry");
 
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("the ledger confirms the window is open until 14:10"),
-            "{out}"
-        );
+        assert!(out.contains("confirms"), "{out}");
+        insta::assert_snapshot!(out);
     }
 
     #[test]
@@ -2016,10 +1996,8 @@ mod tests {
 
         assert!(client.calls().is_empty(), "nothing was sent");
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("slot 09:00: no ping — a window is already open until 13:00"),
-            "{out}"
-        );
+        assert!(out.contains("until 13:00"), "{out}");
+        insta::assert_snapshot!(out, @"slot 09:00: no ping — a window is already open until 13:00");
         let pings = Store::open(&db)
             .expect("open")
             .pings_since(0, 10)
@@ -2066,10 +2044,8 @@ mod tests {
         .expect("the ping goes out");
         assert_eq!(client.calls().len(), 1, "the ping was sent");
         let out = String::from_utf8(out).expect("utf-8");
-        assert!(
-            out.contains("no window reading in the ledger, assuming none is open"),
-            "{out}"
-        );
+        assert!(out.contains("no window reading"), "{out}");
+        insta::assert_snapshot!(out);
         let pings = Store::open(&db)
             .expect("open")
             .pings_since(0, 10)

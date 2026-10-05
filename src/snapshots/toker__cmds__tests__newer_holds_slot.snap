@@ -1,0 +1,9 @@
+---
+source: src/cmds.rs
+expression: report
+---
+claude-opus-5
+  bar          seen on more than 4.5 of 9 active day(s)
+  days         1 → 5  (+4 granted from days the ledger already holds)
+  qualifies    yes
+  target       claude-opus-5-5   ← a newer version still holds the slot

@@ -1,0 +1,9 @@
+---
+source: src/timers.rs
+expression: out
+---
+slot 09:00: no window reading in the ledger, assuming none is open
+slot 09:00: opening the quota window (scheduled 09:11, expecting it to end 14:10)
+slot 09:00: running 1 min late (within the 10 min guard)
+slot 09:00: claude could not run: claude: command not found
+slot 09:00: no ping row landed in the ledger — the window did not open

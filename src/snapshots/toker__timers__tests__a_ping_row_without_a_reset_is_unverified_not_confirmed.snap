@@ -1,0 +1,9 @@
+---
+source: src/timers.rs
+expression: out
+---
+slot 09:00: the last window ended at 09:10
+slot 09:00: opening the quota window (scheduled 09:11, expecting it to end 14:10)
+slot 09:00: running 1 min late (within the 10 min guard)
+slot 09:00: claude exited 0
+slot 09:00: the ping row landed without a 5-hour reset — boundary unverified, expected 14:10

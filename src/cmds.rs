@@ -619,29 +619,14 @@ mod tests {
         ];
         let report = rendered(&entries, "claude-opus-5-5", None);
         assert!(
-            report.contains("bar          seen on more than 4.5 of 9 active day(s)"),
-            "{report}"
-        );
-        assert!(
-            report.contains("days         1 → 5  (+4 granted from days the ledger already holds)"),
-            "{report}"
-        );
-        assert!(report.contains("qualifies    yes"), "{report}");
-        assert!(
-            report.contains("target       claude-opus-5-5\n"),
+            !report.contains('\u{2190}'),
             "no slot note when the model takes it: {report}"
         );
+        insta::assert_snapshot!("qualifies", report);
 
         // Too few days asked for: it says so, and who keeps the slot.
         let report = rendered(&entries, "claude-opus-5-5", Some(4));
-        assert!(
-            report.contains("qualifies    no: 4 day(s) is not more than 4.5"),
-            "{report}"
-        );
-        assert!(
-            report.contains("target       claude-opus-5   ← below the bar"),
-            "{report}"
-        );
+        insta::assert_snapshot!("too_few_days", report);
 
         // The ceiling: raised to the family's best by default, and said so.
         let entries = vec![
@@ -649,11 +634,8 @@ mod tests {
             entry("claude-opus-5-5", &["2026-09-28"], Some(4_000)),
         ];
         let report = rendered(&entries, "claude-opus-5-5", None);
-        assert!(
-            report.contains("rewrite-safe 4,000 → 480,000 tokens"),
-            "{report}"
-        );
-        assert!(report.contains("family's best empirical bound"), "{report}");
+        assert!(report.contains("480,000"), "{report}");
+        insta::assert_snapshot!("ceiling_raised", report);
 
         // A newer version holds the slot.
         let entries = vec![
@@ -661,11 +643,7 @@ mod tests {
             entry("claude-opus-5", &["2026-09-28"], Some(150_000)),
         ];
         let report = rendered(&entries, "claude-opus-5", None);
-        assert!(
-            report
-                .contains("target       claude-opus-5-5   ← a newer version still holds the slot"),
-            "{report}"
-        );
+        insta::assert_snapshot!("newer_holds_slot", report);
     }
 
     /// A fresh ledger in a directory of its own, holding the given
@@ -784,12 +762,8 @@ mod tests {
             .await
             .expect("dry run");
         let report = String::from_utf8(out).expect("utf-8");
-        assert!(
-            report.contains("days         1 → 5  (+4 granted"),
-            "{report}"
-        );
-        assert!(report.contains("qualifies    yes"), "{report}");
-        assert!(report.contains("--dry-run, nothing written."), "{report}");
+        assert!(report.contains("--dry-run"), "{report}");
+        insta::assert_snapshot!(report);
         assert!(
             listener.accept().is_err(),
             "a dry run never contacts the server"

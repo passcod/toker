@@ -1,0 +1,15 @@
+---
+source: src/cmds.rs
+expression: report
+---
+claude-opus-5-5
+  bar          seen on more than 4.5 of 9 active day(s)
+  days         1 → 5  (+4 granted from days the ledger already holds)
+  qualifies    yes
+  rewrite-safe 4,000 → 480,000 tokens
+               raised to the family's best empirical bound, assuming a newer
+               version holds at least as much. --max-prompt=N to set it yourself.
+               declared context capacity is separate and is not widened.
+  target       claude-opus-5-5
+
+  --dry-run, nothing written.
