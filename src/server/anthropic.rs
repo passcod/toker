@@ -403,14 +403,24 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if let GateDecision::Block { meter, resets_at } = decision {
             // Answer 200 with a synthetic assistant turn, never an error
             // status — measured against a real client (see the module
-            // docs). The context size is the session's largest lane's,
-            // which the lane table does not track yet: `None`, so the
-            // notice drops the clause rather than guessing (absence ≠
-            // zero, invariant 3).
+            // docs). The context size is the session's largest lane's, so
+            // the choice the block forces (resume this conversation when
+            // the quota resets, or start clean) can be made from the
+            // notice. A sessionless request, a store error, or a session
+            // the table has forgotten is `None`, and the notice drops the
+            // clause rather than guessing (absence ≠ zero, invariant 3) —
+            // a lost clause, never a lost answer.
+            let context_tokens = session_id.as_deref().and_then(|session| {
+                server
+                    .store
+                    .load_lanes()
+                    .ok()
+                    .and_then(|lanes| lanes::session_prompt(&lanes, session))
+            });
             let text = Blocking::notice(
                 meter,
                 resets_at,
-                None,
+                context_tokens,
                 &jiff::tz::TimeZone::system(),
                 server.config.gates.notice_style,
             );
@@ -436,10 +446,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 backend_id: backend.id(),
                 meter,
                 resets_at,
-                // The lane table does not track prompts yet: `None`, so
-                // the notice drops the clause rather than guessing
-                // (absence ≠ zero, invariant 3).
-                context_tokens: None,
+                // The same figure the notice states, or `None` where the
+                // lane table cannot say — "not recorded", never "empty".
+                context_tokens,
                 stale_meters: meters_snapshot.as_ref(),
             });
             return build_response(StatusCode::OK, headers, Body::from(body));

@@ -139,6 +139,31 @@ pub fn lane_key(session_id: Option<&str>, tools_hash: Option<&str>) -> Option<St
     Some(format!("{session}|{tools}"))
 }
 
+/// The size of a session's context, as the quota block reports it: the
+/// prompt its **largest** lane holds (the predecessor's `sessionPrompt`).
+///
+/// The largest lane, because a session is not a cache entry: the request
+/// that hits the wall may be a subagent or a two-token title summariser,
+/// and reporting its lane would answer a question nobody asked. The main
+/// agent is the conversation being decided about, and it is the big one.
+///
+/// `None` rather than zero for a session the table does not know: the
+/// table forgets lanes (a prune, a fresh store), so absence means "not
+/// recorded", and the notice drops the clause rather than claiming an
+/// empty conversation. A lane with no positive prompt does not count —
+/// a bad record costs a clause, never a wrong one.
+pub fn session_prompt(lanes: &[Lane], session_id: &str) -> Option<u64> {
+    lanes
+        .iter()
+        // Split at the first separator rather than testing a prefix: "s1"
+        // must not collect "s10"'s lanes.
+        .filter(|lane| lane.key.split('|').next() == Some(session_id))
+        .filter_map(|lane| lane.prompt_tokens)
+        .filter(|prompt| *prompt > 0)
+        .max()
+        .map(|prompt| prompt as u64)
+}
+
 /// The cache TTL tier a lane carries, given what this request wrote
 /// (the stickiness rule, ported exactly).
 ///
@@ -475,7 +500,7 @@ fn forced_from_row(row: &RequestRow) -> Option<Forced> {
 mod tests {
     use super::{
         Forced, LANE_MAX_AGE_MS, LaneResponse, Ttl, is_ping, lane_key, lane_ttl, lanes_from_rows,
-        note_lane_response, reseed,
+        note_lane_response, reseed, session_prompt,
     };
     use crate::store::{Lane, RequestRow, RowKind, Store};
     use std::collections::BTreeMap;
@@ -1026,6 +1051,41 @@ mod tests {
         // Idempotent: re-running over the same inputs changes nothing.
         reseed(&store, &seed).expect("reseed again");
         assert_eq!(store.load_lanes().expect("lanes").len(), 3);
+    }
+
+    // ── the session's context size ─────────────────────────────────
+
+    fn lane_of(key: &str, prompt: Option<i64>) -> Lane {
+        Lane {
+            key: key.to_owned(),
+            session_id: key.split('|').next().map(str::to_owned),
+            tools_hash: key.split('|').nth(1).map(str::to_owned),
+            updated_ms: 1_000,
+            prompt_tokens: prompt,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+        }
+    }
+
+    #[test]
+    fn the_session_prompt_is_its_largest_lane_and_never_a_neighbour_s() {
+        let lanes = vec![
+            lane_of("s1|main", Some(412_000)),
+            // The title summariser: tiny, and not the conversation.
+            lane_of("s1|e3b0c44298fc", Some(2_000)),
+            // "s10" shares the prefix "s1" and must not be collected.
+            lane_of("s10|main", Some(900_000)),
+            lane_of("s2|main", Some(0)),
+            lane_of("s3|main", None),
+        ];
+        assert_eq!(session_prompt(&lanes, "s1"), Some(412_000));
+        // A zero or unrecorded prompt is absence, not an empty context.
+        assert_eq!(session_prompt(&lanes, "s2"), None);
+        assert_eq!(session_prompt(&lanes, "s3"), None);
+        assert_eq!(session_prompt(&lanes, "unknown"), None);
     }
 
     // ── the prune policy is asserted at the store level;

@@ -1749,6 +1749,65 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
 }
 
 #[tokio::test]
+async fn a_block_states_the_size_of_the_session_s_largest_lane() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let (reset5h, _) = poison_meters(&store, 1.0, 3600);
+    // The main agent's lane, the tool-less title summariser's, and a
+    // stranger's bigger one: the notice reports the conversation being
+    // decided about, which is the session's largest lane — never the lane
+    // of the request that happened to hit the wall, never another session.
+    for (key, prompt) in [
+        ("ccses-42|main", 412_345),
+        ("ccses-42|e3b0c44298fc", 2_000),
+        ("ccses-420|main", 900_000),
+    ] {
+        let (session, tools) = key.split_once('|').expect("a lane key");
+        store
+            .upsert_lane(&toker::store::Lane {
+                key: key.to_owned(),
+                session_id: Some(session.to_owned()),
+                tools_hash: Some(tools.to_owned()),
+                updated_ms: 1_000,
+                prompt_tokens: Some(prompt),
+                ttl: None,
+                ping: None,
+                noticed_at: None,
+                forced_from: None,
+                forced_to: None,
+            })
+            .expect("seed lane");
+    }
+
+    let body = messages_body_no_stream("claude-opus-5");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("blocked bytes");
+    let tz = jiff::tz::TimeZone::system();
+    let notice = Blocking::notice(
+        Meter::FiveHour,
+        Some(reset5h),
+        Some(412_345),
+        &tz,
+        NoticeStyle::Gfm,
+    );
+    assert!(notice.contains("This session's context is 412,345 tokens."));
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    assert_eq!(bytes.as_ref(), expected.as_slice());
+    assert!(mock.captured().is_empty());
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows[0]
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("context_tokens")),
+        Some(&json!(412_345)),
+        "the row carries the figure the notice stated"
+    );
+}
+
+#[tokio::test]
 async fn the_notice_style_threads_from_the_gates_config() {
     // The default test above serves the insight block; these pin that
     // the `[gates] notice_style` value reaches the served bytes — plain
