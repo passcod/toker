@@ -3,7 +3,7 @@
 //! cannot drive it without an unanswered preflight)").
 //!
 //! Gate: the `x-toker-control` header must carry the operation's verb
-//! (`status`, `models-merge`, `session`). A page that cannot set a custom
+//! (`status`, `models-merge`, `session`, `shutdown`). A page that cannot set a custom
 //! header without an unanswered CORS preflight can never pass the gate. A
 //! wrong or missing gate is a 403 naming what is missing — loopback-only, no
 //! discovery value to suppress.
@@ -23,6 +23,13 @@
 //! what the store already knows, and only for models it has served — the
 //! worst it can do is what promote-model does on purpose. The custom
 //! header and the JSON content type are what keep a web page out.
+//!
+//! `/_toker/shutdown` is `toker restart`'s second step: the CLI waits
+//! for a quiet moment on `status`, then asks this instance, by the id
+//! `status` gave it, to drain and exit; systemd starts the next one. It
+//! is gated exactly like `models/merge`. The worst a caller can do with
+//! it is what `systemctl --user restart` does, minus cutting streams:
+//! the drain lets every response under way finish.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -111,6 +118,11 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         // count). Zero is when a restart cuts nobody off: a restart aborts
         // every response still streaming.
         "in_flight": server.in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        // Which process answered: `toker restart` waits for this to
+        // change after it asks for a shutdown.
+        "instance": &*server.instance,
+        "started_ms": server.started_ms,
+        "version": env!("CARGO_PKG_VERSION"),
     });
     Json(body).into_response()
 }
@@ -367,6 +379,69 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
             merge_error(StatusCode::INTERNAL_SERVER_ERROR, "store failure")
         }
     }
+}
+
+/// `POST /_toker/shutdown` — drain and exit, for `toker restart`.
+///
+/// Body: `{"instance": id}`, the id `/_toker/status` reported. The gate is
+/// `models/merge`'s: a wrong verb, method, or content type is a 403. A body
+/// that is not that object is a 400; an id that is not this instance's is
+/// a 409 carrying the current one, so a restart that raced another never
+/// stops an instance it did not see. Otherwise the answer is 202 and the
+/// drain begins (see [`Server::serve_listener`]): this response finishes
+/// like every other, then the listener closes. The path is never
+/// forwarded, whatever the outcome.
+pub(crate) async fn shutdown(State(server): State<Server>, request: Request) -> Response {
+    if !control_token_ok(request.headers(), "shutdown") {
+        return forbidden();
+    }
+    let (parts, body) = request.into_parts();
+    if parts.method != Method::POST || !json_content_type(&parts.headers) {
+        return forbidden();
+    }
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_CONTROL_BODY).await else {
+        return shutdown_error(StatusCode::BAD_REQUEST, "unparseable request");
+    };
+    let incoming: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return shutdown_error(StatusCode::BAD_REQUEST, "unparseable request"),
+    };
+    let Some(instance) = incoming.get("instance").and_then(Value::as_str) else {
+        return shutdown_error(StatusCode::BAD_REQUEST, "unparseable request");
+    };
+    if instance != &*server.instance {
+        let mut reply = json!({
+            "toker": "shutdown",
+            "ok": false,
+            "error": "instance mismatch",
+        });
+        reply["instance"] = json!(&*server.instance);
+        return (StatusCode::CONFLICT, Json(reply)).into_response();
+    }
+    let in_flight = server.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    server.begin_shutdown();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "toker": "shutdown",
+            "ok": true,
+            "instance": &*server.instance,
+            "in_flight": in_flight,
+        })),
+    )
+        .into_response()
+}
+
+fn shutdown_error(status: StatusCode, error: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "toker": "shutdown",
+            "ok": false,
+            "error": error,
+        })),
+    )
+        .into_response()
 }
 
 /// `content-type` starts with `application/json`

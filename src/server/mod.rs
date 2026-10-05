@@ -20,8 +20,9 @@
 //!   - The batch-result GETs (and cancel) — transparent forwarding like
 //!     `/v1/models`.
 //! - `GET /_toker/status`, `POST /_toker/models/merge`,
-//!   `GET /_toker/session` — the control endpoints, gated by a custom
-//!   header ([`control`]); `session` is the attribution plugin's query.
+//!   `GET /_toker/session`, `POST /_toker/shutdown` — the control
+//!   endpoints, gated by a custom header ([`control`]); `session` is the
+//!   attribution plugin's query, `shutdown` is `toker restart`'s drain.
 //!   Any other `/_toker/` path is a local 404.
 //! - Every other path — transparent forwarding to the default anthropic
 //!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
@@ -165,6 +166,19 @@ pub struct Server {
     pub(crate) awake: Option<Arc<Mutex<AwakeState>>>,
     /// Process start, for `/_toker/status` uptime.
     pub(crate) started: Instant,
+    /// This process's identity in `/_toker/status`, a random id drawn
+    /// once at construction. `toker restart` tells the new instance from
+    /// the old by it: uptime alone cannot, since an instance asked to
+    /// shut down a second after it started reads the same as its
+    /// successor.
+    pub(crate) instance: Arc<str>,
+    /// Process start on the wall clock (ms since the epoch), for status.
+    pub(crate) started_ms: i64,
+    /// Fired by `POST /_toker/shutdown`: [`Server::serve_listener`]
+    /// stops accepting, drains every open connection, and returns. A
+    /// `Notify` keeps the permit when nothing waits yet, so a request
+    /// that lands before the listener awaits is not lost.
+    pub(crate) shutdown: Arc<tokio::sync::Notify>,
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
@@ -284,6 +298,9 @@ impl Server {
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
             started: Instant::now(),
+            instance: Arc::from(uuid::Uuid::new_v4().simple().to_string()),
+            started_ms: now_ms(),
+            shutdown: Arc::default(),
             quota_events: Arc::default(),
         })
     }
@@ -440,6 +457,7 @@ impl Server {
             .route("/_toker/status", get(control::status))
             .route("/_toker/session", get(control::session))
             .route("/_toker/models/merge", post(control::models_merge))
+            .route("/_toker/shutdown", post(control::shutdown))
             // Everything else passes through to the default anthropic
             // backend, as the predecessor forwarded every path but its
             // control path. A known path with the wrong method still
@@ -451,7 +469,9 @@ impl Server {
 
     /// Listen and serve: a socket-activated listener (`LISTEN_FDS`, via
     /// [`listenfd`]) when systemd handed us one, else a direct loopback
-    /// bind for dev and tests.
+    /// bind for dev and tests. Returns once a `POST /_toker/shutdown`
+    /// has drained (see [`Server::serve_listener`]), and the process then
+    /// exits 0; under systemd, `Restart=always` starts the next instance.
     pub async fn serve(self) -> anyhow::Result<()> {
         let mut listenfd = listenfd::ListenFd::from_env();
         let listener = match listenfd.take_tcp_listener(0)? {
@@ -468,8 +488,67 @@ impl Server {
         self.spawn_catalog_refresh();
         // A restart inside a live session takes the lock straight back.
         self.evaluate_awake();
-        axum::serve(listener, self.router()).await?;
+        self.serve_listener(listener).await
+    }
+
+    /// Serve the router on `listener` until a shutdown request, then
+    /// drain: stop accepting, let every response under way finish (SSE
+    /// streams included), close idle keep-alive connections, and return.
+    ///
+    /// The drain has no deadline of its own, because the point of the
+    /// shutdown is never to cut a stream. It is bounded anyway: a stalled
+    /// upstream fails after [`UPSTREAM_IDLE_TIMEOUT`] like any other, and
+    /// a client that hangs up ends its exchange.
+    ///
+    /// Dropping the listener closes this process's descriptor only. Under
+    /// socket activation systemd keeps its own, so connections that arrive
+    /// during the drain queue in the kernel for the next instance; on a
+    /// direct bind the port closes and they are refused.
+    ///
+    /// The background tasks [`Server::serve`] spawns are not stopped here:
+    /// they end with the runtime, when the process exits.
+    pub async fn serve_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        let shutdown = self.shutdown.clone();
+        axum::serve(listener, self.router())
+            .with_graceful_shutdown(async move { shutdown.notified().await })
+            .await?;
+        tracing::info!("drained; exiting");
+        self.release_awake_for_exit();
         Ok(())
+    }
+
+    /// Ask [`Server::serve_listener`] to drain and return.
+    pub(crate) fn begin_shutdown(&self) {
+        tracing::info!(
+            in_flight = self.in_flight.load(Ordering::SeqCst),
+            "shutdown requested; draining"
+        );
+        self.shutdown.notify_one();
+    }
+
+    /// This instance's id, as `/_toker/status` reports it.
+    pub fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// Drop the sleep lock for good, writing no row. The lock is the
+    /// inhibitor child, which would die with this process anyway; killing
+    /// it here means a drained exit never leaves one behind, even for the
+    /// moment before the PID watch notices. No row, because a release row
+    /// says the sessions went quiet, and at exit they need not have: the
+    /// next instance reseeds the lanes and takes the lock straight back.
+    /// After this the timer and any late evaluation leave the lock alone.
+    fn release_awake_for_exit(&self) {
+        let Some(awake) = &self.awake else {
+            return;
+        };
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut state = match awake.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.shut_down();
+        }));
     }
 
     /// The sleep lock's wall-clock re-evaluation on a 60-second

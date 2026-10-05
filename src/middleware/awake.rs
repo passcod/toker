@@ -396,6 +396,9 @@ pub struct AwakeState {
     /// The latest decision's want (for inspection; the transitions carry
     /// it).
     want: bool,
+    /// Set by [`AwakeState::shut_down`] at a drained exit: from then on
+    /// nothing takes the lock again and nothing writes a row.
+    shut: bool,
 }
 
 impl AwakeState {
@@ -411,6 +414,7 @@ impl AwakeState {
             complained: false,
             logged_held: false,
             want: false,
+            shut: false,
         }
     }
 
@@ -429,6 +433,9 @@ impl AwakeState {
     /// `want` differing from `held`
     /// is itself row-worthy: it is a lock that could not be taken.
     pub fn evaluate(&mut self, decision: &AwakeDecision, now: i64) -> Option<AwakeTransition> {
+        if self.shut {
+            return None;
+        }
         // The exit check, polled at evaluation time: a child that
         // ended on its own while still wanted means the lock is gone.
         // Our own release clears `child` first, so it never lands here.
@@ -496,6 +503,17 @@ impl AwakeState {
     fn release(&mut self) {
         if let Some(mut child) = self.child.take() {
             self.complained = false;
+            child.kill();
+        }
+    }
+
+    /// Release the lock for the process's exit, with no transition: the
+    /// exit is not the sessions going quiet, so it gets no release row.
+    /// Every later [`AwakeState::evaluate`] is a no-op, so the wall-clock
+    /// timer cannot take the lock back while the process winds down.
+    pub fn shut_down(&mut self) {
+        self.shut = true;
+        if let Some(mut child) = self.child.take() {
             child.kill();
         }
     }
@@ -933,6 +951,33 @@ mod tests {
     fn command() -> InhibitCommand {
         inhibit_command("linux", None, everything_exists, "toker", "why", 1)
             .expect("the test platform table")
+    }
+
+    /// A drained exit kills the held child and reports nothing: the
+    /// sessions did not go quiet, the process is leaving. Nothing after it
+    /// takes the lock back, whatever the decision says.
+    #[test]
+    fn shutting_down_kills_the_lock_without_a_row_and_never_retakes_it() {
+        let fake = FakeSpawner::default();
+        let mut state = AwakeState::new(Some(command()), Box::new(fake.clone()));
+        assert!(
+            state
+                .evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW)
+                .is_some()
+        );
+        assert!(state.held());
+
+        state.shut_down();
+        assert!(!state.held());
+        assert_eq!(fake.kills(), 1, "the exit kills the inhibitor");
+
+        assert_eq!(
+            state.evaluate(&hold(Some(NOW + HOUR), "1 live lane"), NOW + 60_000),
+            None,
+            "no row after the exit"
+        );
+        assert_eq!(fake.attempts(), 1, "and no new child");
+        assert!(!state.held());
     }
 
     #[test]
