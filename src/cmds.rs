@@ -220,26 +220,44 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
 /// endpoint is the same one the predecessor's promote script used):
 /// grant a served model the days (and optionally the prompt ceiling)
 /// to become its family's rewrite target early. The days are drawn only
-/// from days the ledger already holds, newest first, up to `days` in all.
-pub fn promote(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
+/// from days the ledger already holds, newest first; by default just
+/// enough to clear the election's bar (see
+/// [`crate::middleware::models::plan_promotion`]).
+pub fn promote(model: String, days: Option<u32>, max_prompt: Option<u64>) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(promote_run(model, days, max_prompt))
 }
 
-async fn promote_run(model: String, days: u32, max_prompt: Option<u64>) -> anyhow::Result<()> {
+async fn promote_run(
+    model: String,
+    days: Option<u32>,
+    max_prompt: Option<u64>,
+) -> anyhow::Result<()> {
+    use crate::middleware::models::{PromotionRefusal, plan_promotion};
+
     let config = Config::load()?;
     let store = Store::open(&config.db_path)?;
     let entries = store.load_models()?;
-    let plan = match crate::middleware::models::plan_promotion(&entries, &model, days as usize) {
+    let mut out = std::io::stdout();
+    let plan = match plan_promotion(&entries, &model, days.map(|days| days as usize)) {
         Ok(plan) => plan,
-        Err(crate::middleware::models::PromotionRefusal::Unseen { known }) => bail!(
-            "{model:?} has never served — the merge only promotes models \
-             the ledger has seen. Known: {}",
-            known.join(", ")
-        ),
+        Err(PromotionRefusal::Unseen { known }) => bail!(unseen_message(&model, &known)),
+        Err(PromotionRefusal::Already {
+            model_id,
+            days,
+            active_days,
+            needed,
+        }) => {
+            println!(
+                "{model_id} already qualifies: seen on {days} day(s), more than \
+                 {needed} of {active_days} active — nothing to do."
+            );
+            return Ok(());
+        }
     };
+    render_plan(&plan, &mut out)?;
     let mut body = plan.request_body();
     if let Some(max_prompt) = max_prompt {
         body["maxPrompt"] = serde_json::json!(max_prompt);
@@ -261,32 +279,168 @@ async fn promote_run(model: String, days: u32, max_prompt: Option<u64>) -> anyho
             .and_then(|targets| targets.as_object())
             .cloned()
             .unwrap_or_default();
+        println!("\n  merged into the running server");
         for (family, target) in targets {
-            println!("{family} → {target}");
+            println!(
+                "  {family} now rewrites to {}",
+                target.as_str().unwrap_or("nothing")
+            );
         }
         return Ok(());
     }
     if let Some("unseen") = reply.get("error").and_then(serde_json::Value::as_str) {
-        let known = reply
+        let known: Vec<String> = reply
             .get("known")
             .and_then(|known| known.as_array())
             .map(|known| {
                 known
                     .iter()
-                    .filter_map(|model| model.as_str())
-                    .collect::<Vec<_>>()
+                    .filter_map(|model| model.as_str().map(str::to_owned))
+                    .collect()
             })
             .unwrap_or_default();
-        bail!(
-            "{model:?} has never served — the merge only promotes models \
-         the ledger has seen. Known: {}",
-            known.join(", ")
-        );
+        bail!(unseen_message(&model, &known));
     }
     bail!("the merge refused: {} {}", status.as_u16(), reply)
+}
+
+/// The refusal for a model the ledger has never served — almost always a
+/// typo, and promoting an id the API rejects would redirect a whole
+/// family's traffic to a dead end.
+fn unseen_message(model: &str, known: &[String]) -> String {
+    format!(
+        "{model} has never been served through toker. Promoting a model id \
+         the API will reject would redirect a whole family's traffic to a \
+         dead end; use it once, then promote it.\n  known: {}",
+        known.join(", ")
+    )
+}
+
+/// The plan, as the predecessor's promote script reported it: the bar and
+/// its denominator, the days before and after, whether the model now
+/// clears the bar, and what the family's election will name.
+fn render_plan(
+    plan: &crate::middleware::models::PromotionPlan,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    writeln!(out, "{}", plan.model_id)?;
+    writeln!(
+        out,
+        "  bar          seen on more than {} of {} active day(s)",
+        plan.needed, plan.active_days
+    )?;
+    writeln!(
+        out,
+        "  days         {} → {}  (+{} granted from days the ledger already holds)",
+        plan.days_before,
+        plan.days.len(),
+        plan.granted.len()
+    )?;
+    if plan.qualifies() {
+        writeln!(out, "  qualifies    yes")?;
+    } else {
+        writeln!(
+            out,
+            "  qualifies    no: {} day(s) is not more than {}",
+            plan.days.len(),
+            plan.needed
+        )?;
+    }
+    let target = plan.target.as_deref().unwrap_or("nothing");
+    let held = if plan.target.as_deref() == Some(plan.model_id.as_str()) {
+        ""
+    } else if plan.target.is_none() && plan.qualifies() {
+        "   ← it belongs to no family, so no election names it"
+    } else if plan.qualifies() {
+        "   ← a newer version still holds the slot"
+    } else {
+        "   ← below the bar, so the slot is not this model's"
+    };
+    writeln!(out, "  target       {target}{held}")
 }
 
 pub fn wake_arm() -> anyhow::Result<()> {
     println!("{}", crate::timers::WAKE_ARM_NOTE);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_plan;
+    use crate::middleware::models::plan_promotion;
+    use crate::store::ModelEntry;
+    use serde_json::json;
+
+    fn entry(model_id: &str, days: &[&str], max_prompt: Option<i64>) -> ModelEntry {
+        ModelEntry {
+            model_id: model_id.to_owned(),
+            days_json: Some(json!(days)),
+            max_prompt,
+            context_window_json: None,
+        }
+    }
+
+    fn rendered(entries: &[ModelEntry], model: &str, days: Option<usize>) -> String {
+        let plan = plan_promotion(entries, model, days).expect("plans");
+        let mut out = Vec::new();
+        render_plan(&plan, &mut out).expect("render");
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    const NINE: [&str; 9] = [
+        "2026-09-20",
+        "2026-09-21",
+        "2026-09-22",
+        "2026-09-23",
+        "2026-09-24",
+        "2026-09-25",
+        "2026-09-26",
+        "2026-09-27",
+        "2026-09-28",
+    ];
+
+    #[test]
+    fn the_report_names_the_bar_the_days_and_the_effect() {
+        let entries = vec![
+            entry("claude-opus-5", &NINE, Some(150_000)),
+            entry("claude-opus-5-5", &["2026-09-28"], Some(150_000)),
+        ];
+        let report = rendered(&entries, "claude-opus-5-5", None);
+        assert!(
+            report.contains("bar          seen on more than 4.5 of 9 active day(s)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("days         1 → 5  (+4 granted from days the ledger already holds)"),
+            "{report}"
+        );
+        assert!(report.contains("qualifies    yes"), "{report}");
+        assert!(
+            report.contains("target       claude-opus-5-5\n"),
+            "no slot note when the model takes it: {report}"
+        );
+
+        // Too few days asked for: it says so, and who keeps the slot.
+        let report = rendered(&entries, "claude-opus-5-5", Some(4));
+        assert!(
+            report.contains("qualifies    no: 4 day(s) is not more than 4.5"),
+            "{report}"
+        );
+        assert!(
+            report.contains("target       claude-opus-5   ← below the bar"),
+            "{report}"
+        );
+
+        // A newer version holds the slot.
+        let entries = vec![
+            entry("claude-opus-5-5", &NINE, Some(150_000)),
+            entry("claude-opus-5", &["2026-09-28"], Some(150_000)),
+        ];
+        let report = rendered(&entries, "claude-opus-5", None);
+        assert!(
+            report
+                .contains("target       claude-opus-5-5   ← a newer version still holds the slot"),
+            "{report}"
+        );
+    }
 }

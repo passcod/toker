@@ -308,11 +308,21 @@ pub struct PromotionPlan {
     pub days: Vec<String>,
     /// The days the grant adds, sorted.
     pub granted: Vec<String>,
+    /// What the family's election names once the grant lands. A promotion
+    /// does not guarantee the slot: a newer version may already hold it,
+    /// and saying so beats leaving the caller to discover it.
+    pub target: Option<String>,
 }
 
 impl PromotionPlan {
     /// The control endpoint's body: the model and its days after the
     /// grant (the merge unions, so the days it already holds are a no-op).
+    /// Does the model clear the bar once the grant lands? A grant cannot
+    /// move the bar, since every day it hands over is already counted.
+    pub fn qualifies(&self) -> bool {
+        self.days.len() as f64 > self.needed
+    }
+
     pub fn request_body(&self) -> serde_json::Value {
         serde_json::json!({ "model": self.model_id, "days": self.days })
     }
@@ -335,10 +345,25 @@ pub enum PromotionRefusal {
     /// family's traffic to an id the API rejects, which is a much worse
     /// outcome than being told no. `known` is what the store has served.
     Unseen { known: Vec<String> },
+    /// The model already holds more days than the bar asks: nothing to
+    /// grant.
+    Already {
+        model_id: String,
+        days: usize,
+        active_days: usize,
+        needed: f64,
+    },
 }
 
-/// What it would take to make `model` hold `want` days, without waiting
-/// for them to accumulate.
+/// What it would take to make `model` its family's target now, without
+/// waiting for the days to accumulate.
+///
+/// By default the grant is the smallest whole number of days that clears
+/// the bar, `floor(needed) + 1`: the election wants strictly more days than
+/// the bar, so a grant of exactly the bar falls one short. It is always
+/// reachable, since the bar is at most half the active days. `want`
+/// overrides the count; a model that already clears the bar is refused as
+/// [`PromotionRefusal::Already`] unless `want` asks for more than it holds.
 ///
 /// Days are granted only from days the store already holds, newest first.
 /// Inventing dates would also enlarge [`active_days_of`], the denominator
@@ -348,7 +373,7 @@ pub enum PromotionRefusal {
 pub fn plan_promotion(
     entries: &[ModelEntry],
     model: &str,
-    want: usize,
+    want: Option<usize>,
 ) -> Result<PromotionPlan, PromotionRefusal> {
     let known = || PromotionRefusal::Unseen {
         known: entries.iter().map(|entry| entry.model_id.clone()).collect(),
@@ -360,7 +385,17 @@ pub fn plan_promotion(
         return Err(known());
     };
     let pool = day_pool(entries);
+    let needed = requirement(pool.len());
     let before: BTreeSet<String> = days_of(entry).into_iter().collect();
+    if before.len() as f64 > needed && want.is_none_or(|want| want <= before.len()) {
+        return Err(PromotionRefusal::Already {
+            model_id: id,
+            days: before.len(),
+            active_days: pool.len(),
+            needed,
+        });
+    }
+    let want = want.unwrap_or(needed.floor() as usize + 1);
     let mut days = before.clone();
     for day in pool.iter().rev() {
         if days.len() >= want {
@@ -368,13 +403,24 @@ pub fn plan_promotion(
         }
         days.insert(day.clone());
     }
+    let mut after = entries.to_vec();
+    if let Some(promoted) = after.iter_mut().find(|entry| entry.model_id == id) {
+        promoted.days_json = Some(serde_json::Value::Array(
+            days.iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ));
+    }
+    let target = family_of(&id).and_then(|family| newest_in_family(&after, &family.name));
     Ok(PromotionPlan {
         model_id: id,
         active_days: pool.len(),
-        needed: requirement(pool.len()),
+        needed,
         days_before: before.len(),
         granted: days.difference(&before).cloned().collect(),
         days: days.into_iter().collect(),
+        target,
     })
 }
 
@@ -1205,6 +1251,81 @@ mod tests {
 
     // ── promotion planning ──────────────────────────────────────────
 
+    /// `count` consecutive September/October days, oldest first.
+    fn span(count: usize) -> Vec<String> {
+        let start = jiff::civil::date(2026, 9, 1);
+        (0..count)
+            .map(|i| {
+                start
+                    .checked_add(jiff::Span::new().days(i as i64))
+                    .expect("in range")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_default_grant_clears_the_bar_on_young_and_mature_logs() {
+        // (active days, bar, default count): the bar is min(7, active/2)
+        // and the election wants strictly more, so the default is
+        // floor(bar) + 1. A grant of exactly the bar falls one short.
+        for (active, bar, want) in [(2, 1.0, 2), (3, 1.5, 2), (9, 4.5, 5), (30, 7.0, 8)] {
+            let pool = span(active);
+            let pool_refs: Vec<&str> = pool.iter().map(String::as_str).collect();
+            let newest = pool_refs[active - 1];
+            let entries = vec![
+                entry("claude-opus-5", &pool_refs, Some(1)),
+                entry("claude-opus-5-5", &[newest], Some(1)),
+            ];
+            let plan = plan_promotion(&entries, "claude-opus-5-5", None).expect("served");
+            assert_eq!(plan.active_days, active);
+            assert_eq!(plan.needed, bar, "the bar at {active} active days");
+            assert_eq!(plan.days.len(), want, "the default at {active} active days");
+            assert!(plan.qualifies(), "the default clears the bar at {active}");
+            assert_eq!(
+                plan.target.as_deref(),
+                Some("claude-opus-5-5"),
+                "and moves the election at {active}"
+            );
+            // The bar, as a count, is one short.
+            let exact =
+                plan_promotion(&entries, "claude-opus-5-5", Some(bar as usize)).expect("served");
+            assert!(
+                !exact.qualifies(),
+                "exactly the bar is not enough at {active}"
+            );
+            assert_eq!(exact.target.as_deref(), Some("claude-opus-5"));
+        }
+    }
+
+    #[test]
+    fn a_promotion_reports_already_and_a_slot_still_held() {
+        let pool = span(9);
+        let pool_refs: Vec<&str> = pool.iter().map(String::as_str).collect();
+        let entries = vec![
+            entry("claude-opus-5-5", &pool_refs, Some(1)),
+            entry("claude-opus-5", &pool_refs[..5], Some(1)),
+            entry("claude-opus-4-8", &pool_refs[..1], Some(1)),
+        ];
+        // Five of nine clears a bar of 4.5: nothing to grant.
+        assert_eq!(
+            plan_promotion(&entries, "claude-opus-5", None),
+            Err(PromotionRefusal::Already {
+                model_id: "claude-opus-5".to_owned(),
+                days: 5,
+                active_days: 9,
+                needed: 4.5,
+            })
+        );
+        // ...unless more days are asked for explicitly.
+        let plan = plan_promotion(&entries, "claude-opus-5", Some(7)).expect("served");
+        assert_eq!(plan.days.len(), 7);
+        // An older version clears the bar but a newer one holds the slot.
+        let plan = plan_promotion(&entries, "claude-opus-4-8", None).expect("served");
+        assert!(plan.qualifies());
+        assert_eq!(plan.target.as_deref(), Some("claude-opus-5-5"));
+    }
+
     #[test]
     fn a_promotion_grants_only_days_the_store_holds_newest_first() {
         let held: Vec<String> = (0..8).map(|i| format!("2026-09-2{i}")).collect();
@@ -1213,7 +1334,7 @@ mod tests {
             entry("claude-opus-5", &held_refs, Some(150_000)),
             entry("claude-opus-5-5", &["2026-09-27"], Some(4_000)),
         ];
-        let plan = plan_promotion(&entries, "claude-opus-5-5", 5).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(5)).expect("served");
         assert_eq!(plan.model_id, "claude-opus-5-5");
         assert_eq!(plan.active_days, 8, "the pool is the bar's denominator");
         assert_eq!(plan.days_before, 1);
@@ -1227,13 +1348,13 @@ mod tests {
 
         // Asking for more days than the store holds grants the whole
         // pool and no more: the denominator is never enlarged.
-        let plan = plan_promotion(&entries, "claude-opus-5-5", 30).expect("served");
+        let plan = plan_promotion(&entries, "claude-opus-5-5", Some(30)).expect("served");
         assert_eq!(plan.days, held);
         assert_eq!(plan.active_days, 8);
 
         // Unseen: refused with what is known, never invented.
         assert_eq!(
-            plan_promotion(&entries, "claude-opus-6", 5),
+            plan_promotion(&entries, "claude-opus-6", None),
             Err(PromotionRefusal::Unseen {
                 known: vec!["claude-opus-5".to_owned(), "claude-opus-5-5".to_owned()]
             })

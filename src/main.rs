@@ -34,9 +34,10 @@ enum Command {
         #[arg(long = "model")]
         model: String,
         /// How many days the model should hold after the grant, drawn
-        /// from days the ledger already holds, newest first.
-        #[arg(long = "days", default_value_t = 7)]
-        days: u32,
+        /// from days the ledger already holds, newest first. Default: the
+        /// fewest that clear the election's bar.
+        #[arg(long = "days")]
+        days: Option<u32>,
         /// A prompt ceiling to grant alongside the days, in tokens.
         #[arg(long = "max-prompt")]
         max_prompt: Option<u64>,
