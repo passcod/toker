@@ -417,7 +417,13 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 # the system manager and `toker setup` enables it through sudo. Wakes
 # from suspend only — a machine that is powered off stays off.
 WakeSystem=true
-{on_calendar}
+{on_calendar}# A missed wake is not worth honouring late: the ping would refuse its
+# slot anyway, and a wake at an arbitrary hour is what this avoids. To
+# the second, because the default accuracy lets systemd fire up to a
+# minute late, which eats into the hold's margin before the ping.
+Persistent=false
+AccuracySec=1s
+
 [Install]
 WantedBy=timers.target
 "#
@@ -467,6 +473,9 @@ Description=toker hold timer (holds the idle-sleep lock {HOLD_UNIT_FOR} after ea
 # A hold re-run hours after a missed slot would hold the machine up for
 # nothing — the ping it protects never fires that late either.
 Persistent=false
+# To the second, beside the wake: systemd's default accuracy of a
+# minute could start the hold after the machine has dozed off again.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
@@ -536,6 +545,10 @@ Description=toker ping timer (opens the {slot} quota window, {PING_DELAY_MINUTES
 # verb's lateness guard refuses those anyway.
 OnCalendar={mask} {fire}
 Persistent=false
+# The window anchors on the 10-minute grid, so the fire time is the
+# boundary: systemd's default accuracy of a minute could push a ping
+# across a grid line and move the boundary with it.
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
@@ -2676,8 +2689,7 @@ WantedBy=sockets.target
         let slots = ["09:00".to_owned(), "23:55".to_owned()];
 
         // The wake SYSTEM unit: one OnCalendar= per slot, WakeSystem,
-        // timers.target — and nothing else (no Persistent: a wake
-        // timer's default is what the semantics want).
+        // no catch-up, to the second, timers.target.
         let wake = wake_system_unit(&slots);
         assert_eq!(
             wake,
@@ -2692,6 +2704,12 @@ Description=toker wake timer (wakes the machine at the chosen slots)
 WakeSystem=true
 OnCalendar=Mon..Fri 09:00
 OnCalendar=Mon..Fri 23:55
+# A missed wake is not worth honouring late: the ping would refuse its
+# slot anyway, and a wake at an arbitrary hour is what this avoids. To
+# the second, because the default accuracy lets systemd fire up to a
+# minute late, which eats into the hold's margin before the ping.
+Persistent=false
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
@@ -2736,6 +2754,9 @@ OnCalendar=Mon..Fri 23:55
 # A hold re-run hours after a missed slot would hold the machine up for
 # nothing — the ping it protects never fires that late either.
 Persistent=false
+# To the second, beside the wake: systemd's default accuracy of a
+# minute could start the hold after the machine has dozed off again.
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
@@ -2777,6 +2798,10 @@ Description=toker ping timer (opens the 09:00 quota window, 11 m after the slot)
 # verb's lateness guard refuses those anyway.
 OnCalendar=Mon..Fri 09:11
 Persistent=false
+# The window anchors on the 10-minute grid, so the fire time is the
+# boundary: systemd's default accuracy of a minute could push a ping
+# across a grid line and move the boundary with it.
+AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
