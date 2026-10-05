@@ -967,6 +967,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         );
     }
 
+    // A stale anthropic models catalogue refreshes on this request's
+    // own bearer when toker holds no key (spawned; never waited on).
+    server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
+
     // 6. Upstream; 7.-9. in forward_response. Session headers pass
     // through (see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.

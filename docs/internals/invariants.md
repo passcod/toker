@@ -25,6 +25,13 @@ reasons.
      injects `x-api-key` only when the request carries neither `x-api-key` nor
      `authorization`. On the openai path another provider's credential is
      dropped before the stored one is injected, never forwarded.
+   - One request toker makes itself uses a passing credential: the anthropic
+     models listing, which names each model's context window. With no API key
+     stored, toker has no other way to read it. While that catalogue is stale,
+     a subscription request's bearer is copied into one background GET of
+     `/v1/models`, at most once an hour, and dropped when the GET ends. It is
+     marked sensitive, and never stored, cached or logged; the cache file holds
+     the listing only. `Server::borrow_catalog_credential` has the conditions.
    - The codex backend is the exception: it always signs itself and strips
      whatever `authorization` the frontend brought first. That value is a
      frontend-to-toker arrangement (claude sends a dummy bearer), and forwarding

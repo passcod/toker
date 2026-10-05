@@ -54,11 +54,16 @@
 //! ## Auth per source (invariant 2)
 //!
 //! - openrouter's `/models` is public — fetched with no credential.
-//! - anthropic's `/v1/models` requires auth, and toker deliberately
-//!   sends none: the request 401s and falls back to cache/empty. The
-//!   anthropic catalogue is a presence list and the hand-verified
-//!   catalogue covers claude — a credential would buy nothing worth
-//!   carrying.
+//! - anthropic's `/v1/models` requires auth. With an `anthropic_api`
+//!   key, the daily refresh sends it as `x-api-key`. Without one, toker
+//!   holds no anthropic credential, so the daily refresh only reads the
+//!   cache, and the fetch instead borrows the subscription bearer of a
+//!   request passing through to `anthropic_sub`
+//!   ([`crate::server::Server::borrow_catalog_credential`]): only while
+//!   the catalogue is stale, at most once an hour, and for that one GET.
+//!   The bearer is never stored, cached or logged. The subscription
+//!   bearer reads the listing with the `oauth-2025-04-20` beta flag
+//!   (checked against the live endpoint on 2026-10-06).
 //! - codex's `{base}/models` needs the codex bearer: the provider's
 //!   stored login is used as-is, **no refresh attempt** — a stale
 //!   token simply fails into the fallback.
@@ -264,10 +269,24 @@ pub struct CatalogSource {
     /// The GET URL, query included (the codex `client_version` rides
     /// here, like the codex CLI's own request).
     pub url: reqwest::Url,
-    /// A bearer token for the `authorization` header when the endpoint
-    /// needs one (codex); `None` for openrouter (public) and anthropic
-    /// (deliberately uncredentialed).
-    pub bearer: Option<String>,
+    /// The request headers: the credential when the endpoint needs one
+    /// (codex's bearer, anthropic's key or a borrowed bearer), and
+    /// anthropic's version header. Credential values are marked
+    /// sensitive so a `Debug` of the map never prints them.
+    pub headers: reqwest::header::HeaderMap,
+    /// Whether this source may GET at all. `false` for a source toker
+    /// holds no credential for (anthropic without an API key): the
+    /// fetch would only 401, so refresh answers from the cache alone.
+    pub fetch: bool,
+}
+
+/// The bearer `authorization` header for a source, marked sensitive.
+/// `None` when the token is not a valid header value: the source goes
+/// without it and 401s visibly, never a panic over a credential.
+pub fn bearer_header(token: &str) -> Option<reqwest::header::HeaderValue> {
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 /// `$XDG_DATA_HOME/toker/models-cache`, falling back to
@@ -405,6 +424,11 @@ pub async fn refresh(
         return Ok(catalog);
     }
 
+    // A source with no credential to send answers from the cache alone.
+    if !source.fetch {
+        return Ok(stale_or_empty(cached, parse, now_ms));
+    }
+
     // Stale or absent: one GET, then parse and persist. Any failure —
     // network, status, body, shape, or a zero-model listing — degrades
     // below, never propagates.
@@ -442,30 +466,31 @@ pub async fn refresh(
     if let Some(catalog) = fetched {
         return Ok(catalog);
     }
+    Ok(stale_or_empty(cached, parse, now_ms))
+}
 
-    // The stale cache — however old — beats an empty answer.
+/// The stale cache — however old — beats an empty answer; with nothing
+/// cached that parses, an empty catalogue.
+fn stale_or_empty(cached: Option<(i64, Value)>, parse: Parse, now_ms: i64) -> FetchedCatalog {
     if let Some((fetched_at, response)) = &cached
         && let Ok(catalog) = parse(response, *fetched_at)
     {
-        return Ok(catalog);
+        return catalog;
     }
-    Ok(FetchedCatalog {
+    FetchedCatalog {
         fetched_at_ms: now_ms,
         models: Vec::new(),
-    })
+    }
 }
 
-/// One GET against a source's endpoint: the 10 s budget, the bearer
-/// when the source carries one (invalid header bytes skip the header —
-/// the upstream 401s visibly, never a panic over a credential), and
-/// any non-2xx status is the failure that refresh falls back from.
+/// One GET against a source's endpoint: the 10 s budget, the source's
+/// headers, and any non-2xx status is the failure that refresh falls
+/// back from.
 async fn fetch_once(source: &CatalogSource, http: &reqwest::Client) -> anyhow::Result<Value> {
-    let mut request = http.get(source.url.clone()).timeout(FETCH_TIMEOUT);
-    if let Some(bearer) = &source.bearer
-        && let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {bearer}"))
-    {
-        request = request.header(reqwest::header::AUTHORIZATION, value);
-    }
+    let request = http
+        .get(source.url.clone())
+        .timeout(FETCH_TIMEOUT)
+        .headers(source.headers.clone());
     let response = request
         .send()
         .await
@@ -1283,7 +1308,8 @@ mod tests {
         CatalogSource {
             provider: "openrouter",
             url: format!("{url}v1/models").parse().expect("source url"),
-            bearer: None,
+            headers: Default::default(),
+            fetch: true,
         }
     }
 
@@ -1445,6 +1471,39 @@ mod tests {
         );
     }
 
+    /// A source with nothing to authenticate with never GETs: a stale
+    /// cache answers as it is, and no cache is an empty catalogue.
+    #[tokio::test]
+    async fn a_cache_only_source_answers_from_the_cache_without_a_request() {
+        let dir = test_dir("cache-only");
+        let (seen, url) = spawn_models_mock(StatusCode::OK, anthropic_listing()).await;
+        let source = CatalogSource {
+            provider: "anthropic",
+            url: format!("{url}v1/models").parse().expect("source url"),
+            headers: Default::default(),
+            fetch: false,
+        };
+        let http = reqwest::Client::new();
+
+        let empty = refresh(&source, &dir, &http, NOW).await.expect("refresh");
+        assert!(empty.models.is_empty(), "nothing cached: absence");
+
+        super::persist(
+            &dir,
+            "anthropic",
+            NOW - 2 * CACHE_TTL_MS,
+            &anthropic_listing(),
+        )
+        .expect("seed");
+        let stale = refresh(&source, &dir, &http, NOW).await.expect("refresh");
+        assert_eq!(stale.fetched_at_ms, NOW - 2 * CACHE_TTL_MS);
+        assert_eq!(
+            stale.context_window_of("claude-opus-4-5-20251101"),
+            Some(200_000)
+        );
+        assert!(seen_of(&seen).is_empty(), "a cache-only source never GETs");
+    }
+
     #[tokio::test]
     async fn the_codex_fetch_carries_the_bearer_and_the_client_version_query() {
         let dir = test_dir("codex-fetch");
@@ -1454,7 +1513,13 @@ mod tests {
             url: format!("{url}models?client_version=0.154.0")
                 .parse()
                 .expect("source url"),
-            bearer: Some("codex-test-bearer".to_owned()),
+            headers: [(
+                axum::http::header::AUTHORIZATION,
+                super::bearer_header("codex-test-bearer").expect("valid bearer"),
+            )]
+            .into_iter()
+            .collect(),
+            fetch: true,
         };
         let http = reqwest::Client::new();
         let catalog = refresh(&source, &dir, &http, NOW).await.expect("refresh");
@@ -1490,7 +1555,8 @@ mod tests {
             url: "https://openrouter.ai/api/v1/models"
                 .parse()
                 .expect("openrouter models url"),
-            bearer: None,
+            headers: Default::default(),
+            fetch: true,
         };
         let http = reqwest::Client::new();
         let catalog = refresh(&source, &dir, &http, NOW)

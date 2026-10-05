@@ -67,11 +67,12 @@ mod record;
 mod record_anthropic;
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::routing::{get, post};
 
 use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
@@ -90,6 +91,20 @@ use record::now_ms;
 /// use, which is far more than the lane table or the served-model map look
 /// back over.
 const SEED_ROWS: u64 = 20_000;
+
+/// How long after one borrowed anthropic catalogue fetch before another
+/// may start. The borrow fires from the request path while the catalogue
+/// is stale, so an endpoint that keeps failing would otherwise be called
+/// on every turn.
+const CATALOG_BORROW_RETRY_MS: i64 = 60 * 60 * 1000;
+
+/// The `anthropic-version` the models listing is requested at, the API's
+/// only stable version.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// The beta flag a subscription bearer needs on the API's own paths; the
+/// listing answered 200 with it when checked.
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
 /// How long the upstream may go silent — no response headers, no body
 /// bytes — before toker gives up on it. Time between reads, never a
@@ -133,6 +148,15 @@ pub struct Server {
     /// future `/_toker` endpoint can read them without touching disk;
     /// the TUI reads the same data from the cache files, read-only.
     pub(crate) catalogs: Arc<std::sync::RwLock<FetchedCatalogs>>,
+    /// The models-cache directory, set once the background refresh
+    /// starts ([`Server::spawn_catalog_refresh`]). Until then, and so in
+    /// every test that only drives the router, the borrowed anthropic
+    /// fetch never runs and nothing touches the real cache.
+    pub(crate) catalog_dir: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// When the last borrowed anthropic catalogue fetch started (unix
+    /// ms, 0 for never): the single-flight claim and the retry backoff
+    /// of [`Server::borrow_catalog_credential`].
+    pub(crate) catalog_borrowed_at: Arc<AtomicI64>,
     /// The shared upstream HTTP client. Connect and between-reads idle
     /// timeouts only — no overall deadline, so a stream lives as long as
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
@@ -295,6 +319,8 @@ impl Server {
             codex_turn,
             models,
             catalogs: Arc::new(std::sync::RwLock::new(FetchedCatalogs::default())),
+            catalog_dir: Arc::default(),
+            catalog_borrowed_at: Arc::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
             started: Instant::now(),
@@ -632,7 +658,7 @@ impl Server {
 
     /// The models-catalogue sources as this server is configured
     /// (see [`crate::catalog::fetched`]): openrouter's public listing,
-    /// anthropic's presence list, and the codex backend's own models
+    /// anthropic's listing, and the codex backend's own models
     /// endpoint. Built per refresh cycle so the codex credentials and
     /// client version are read fresh, never cached here.
     ///
@@ -648,18 +674,19 @@ impl Server {
                 // frontend's own models path is the endpoint (and the
                 // public listing needs no credential).
                 url: openrouter.endpoint("/v1/models"),
-                bearer: None,
+                headers: HeaderMap::new(),
+                fetch: true,
             });
         }
         if let Some(anthropic) = self.anthropic_sub.as_ref().or(self.anthropic_api.as_ref()) {
-            sources.push(fetched::CatalogSource {
-                provider: "anthropic",
-                // Deliberately uncredentialed (see the fetched module's
-                // docs): the 401 falls back to the hand-verified
-                // windows, which cover claude.
-                url: anthropic.endpoint("/v1/models"),
-                bearer: None,
-            });
+            // The stored API key when there is one. Without it toker
+            // holds no anthropic credential, and the source reads the
+            // cache only: the borrowed fetch fills it.
+            let source = match self.stored_anthropic_key() {
+                Some(key) => anthropic_catalog_source(anthropic.as_ref(), key, true),
+                None => anthropic_catalog_source(anthropic.as_ref(), HeaderMap::new(), false),
+            };
+            sources.push(source);
         }
         if let Some(codex) = &self.codex_turn {
             sources.push(fetched::CatalogSource {
@@ -672,9 +699,12 @@ impl Server {
                     "/models?client_version={}",
                     codex.client_version()
                 )),
-                bearer: codex
+                headers: codex
                     .auth()
-                    .and_then(|auth| auth.access_token().map(str::to_owned)),
+                    .and_then(|auth| auth.access_token().and_then(fetched::bearer_header))
+                    .map(|value| [(header::AUTHORIZATION, value)].into_iter().collect())
+                    .unwrap_or_default(),
+                fetch: true,
             });
         }
         sources
@@ -687,8 +717,7 @@ impl Server {
     /// its previous entry (an empty swap would throw away good data
     /// over bookkeeping). Failures log at debug and retry next cycle.
     async fn refresh_catalogs(&self) {
-        let Ok(dir) = fetched::cache_dir() else {
-            tracing::debug!("no data home; models catalogues disabled");
+        let Some(dir) = self.catalog_dir.get() else {
             return;
         };
         let previous = self
@@ -698,7 +727,7 @@ impl Server {
             .clone();
         let mut next = FetchedCatalogs::default();
         for source in self.catalog_sources() {
-            match fetched::refresh(&source, &dir, &self.http, record::now_ms()).await {
+            match fetched::refresh(&source, dir, &self.http, record::now_ms()).await {
                 Ok(catalog) => {
                     tracing::debug!(
                         provider = source.provider,
@@ -732,6 +761,15 @@ impl Server {
     /// fetch is bounded by [`fetched::FETCH_TIMEOUT`], and every
     /// failure is the refresh chain's own fallback plus a debug log.
     fn spawn_catalog_refresh(&self) {
+        match fetched::cache_dir() {
+            Ok(dir) => {
+                let _ = self.catalog_dir.set(dir);
+            }
+            Err(_) => {
+                tracing::debug!("no data home; models catalogues disabled");
+                return;
+            }
+        }
         let server = self.clone();
         tokio::spawn(async move {
             let tick = Duration::from_millis(fetched::CACHE_TTL_MS as u64);
@@ -739,6 +777,96 @@ impl Server {
             loop {
                 timer.tick().await;
                 server.refresh_catalogs().await;
+            }
+        });
+    }
+
+    /// The `anthropic_api` backend's stored key as the listing's
+    /// headers, marked sensitive; `None` without that backend or a key.
+    fn stored_anthropic_key(&self) -> Option<HeaderMap> {
+        let api = self.anthropic_api.as_ref()?;
+        let mut headers = HeaderMap::new();
+        api.inject_auth(&mut headers);
+        if headers.is_empty() {
+            return None;
+        }
+        for value in headers.values_mut() {
+            value.set_sensitive(true);
+        }
+        Some(headers)
+    }
+
+    /// Fetch the anthropic models listing with the bearer of a request on
+    /// its way to `anthropic_sub`, when toker holds no anthropic key of
+    /// its own (see the fetched module's auth notes). Called from the
+    /// usage path before the request goes upstream; it only ever spawns,
+    /// so the request never waits on it and nothing here can fail it.
+    ///
+    /// It does nothing unless every condition holds: the background
+    /// refresh is running, the backend is the subscription, no API key
+    /// is stored, the request carries a bearer, the catalogue in memory
+    /// is empty or older than [`fetched::CACHE_TTL_MS`], and no borrowed
+    /// fetch started within [`CATALOG_BORROW_RETRY_MS`]. The bearer is
+    /// moved into that one GET and dropped with it.
+    pub(crate) fn borrow_catalog_credential(&self, backend: &dyn Provider, incoming: &HeaderMap) {
+        let Some(dir) = self.catalog_dir.get().cloned() else {
+            return;
+        };
+        if backend.id() != "anthropic_sub" || self.stored_anthropic_key().is_some() {
+            return;
+        }
+        let Some(authorization) = incoming.get(header::AUTHORIZATION) else {
+            return;
+        };
+        let now = now_ms();
+        let fresh = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get("anthropic")
+            .is_some_and(|catalog| {
+                // An empty catalogue is stamped with the time of the
+                // failure that produced it: absence, never freshness.
+                !catalog.models.is_empty()
+                    && now.saturating_sub(catalog.fetched_at_ms) < fetched::CACHE_TTL_MS
+            });
+        if fresh {
+            return;
+        }
+        let last = self.catalog_borrowed_at.load(Ordering::SeqCst);
+        if now.saturating_sub(last) < CATALOG_BORROW_RETRY_MS
+            || self
+                .catalog_borrowed_at
+                .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let mut authorization = authorization.clone();
+        authorization.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, authorization);
+        headers.insert(
+            HeaderName::from_static("anthropic-beta"),
+            HeaderValue::from_static(ANTHROPIC_OAUTH_BETA),
+        );
+        let source = anthropic_catalog_source(backend, headers, true);
+        let server = self.clone();
+        tokio::spawn(async move {
+            match fetched::refresh(&source, &dir, &server.http, now_ms()).await {
+                Ok(catalog) if !catalog.models.is_empty() => {
+                    tracing::debug!(
+                        "anthropic models catalogue refreshed on a borrowed credential: {} models",
+                        catalog.models.len()
+                    );
+                    server.install_catalog("anthropic", catalog);
+                }
+                Ok(_) => {
+                    tracing::debug!("borrowed anthropic models fetch left the catalogue empty");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "borrowed anthropic models fetch failed");
+                }
             }
         });
     }
@@ -863,12 +991,36 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// The anthropic models source: the listing at the API's largest page
+/// (no account sees anywhere near 1000 models, so one page is the whole
+/// listing), the version header, and `credential` — the stored key, a
+/// borrowed bearer, or nothing for a cache-only source.
+fn anthropic_catalog_source(
+    anthropic: &dyn Provider,
+    credential: HeaderMap,
+    fetch: bool,
+) -> fetched::CatalogSource {
+    let mut headers = credential;
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    fetched::CatalogSource {
+        provider: "anthropic",
+        url: anthropic.endpoint("/v1/models?limit=1000"),
+        headers,
+        fetch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Server;
     use crate::config::Config;
     use crate::store::Store;
+    use axum::http::{HeaderMap, HeaderValue, header};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     /// A server over a scratch config whose providers point at
     /// unreachable localhost ports (nothing contacts them at
@@ -878,6 +1030,12 @@ mod tests {
     /// the built-in floor and the bearer absent — hermetic, never the
     /// real `~/.codex`.
     fn server(dir: &std::path::Path) -> Server {
+        server_with(dir, "http://localhost:10", "")
+    }
+
+    /// [`server`], with the anthropic upstream and extra config blocks
+    /// given.
+    fn server_with(dir: &std::path::Path, anthropic: &str, extra: &str) -> Server {
         std::fs::write(
             dir.join("toker.toml"),
             format!(
@@ -889,12 +1047,13 @@ db_path = ":memory:"
 upstream = "http://localhost:9/v1"
 
 [providers.anthropic_sub]
-upstream = "http://localhost:10"
+upstream = "{anthropic}"
 
 [providers.codex_sub]
 upstream = "http://localhost:11/backend-api/codex"
 auth_path = {auth_path:?}
 version_probe = false
+{extra}
 "#,
                 auth_path = dir.join("auth.json"),
             ),
@@ -907,7 +1066,7 @@ version_probe = false
 
     /// The three sources the background task refreshes: the openrouter
     /// models path off the `/v1` base (public, unauthenticated),
-    /// anthropic's presence list (deliberately uncredentialed), and
+    /// anthropic's listing (cache-only: no API key is stored), and
     /// the codex backend's own endpoint with the client_version query
     /// and the stored bearer — none in the scratch setup.
     #[test]
@@ -918,14 +1077,22 @@ version_probe = false
 
         assert_eq!(sources[0].provider, "openrouter");
         assert_eq!(sources[0].url.as_str(), "http://localhost:9/v1/models");
-        assert_eq!(sources[0].bearer, None, "the openrouter listing is public");
+        assert!(
+            sources[0].headers.is_empty(),
+            "the openrouter listing is public"
+        );
 
         assert_eq!(sources[1].provider, "anthropic");
-        assert_eq!(sources[1].url.as_str(), "http://localhost:10/v1/models");
         assert_eq!(
-            sources[1].bearer, None,
-            "anthropic is called WITHOUT credentials — the 401 falls back to the hand-verified windows"
+            sources[1].url.as_str(),
+            "http://localhost:10/v1/models?limit=1000"
         );
+        assert!(
+            !sources[1].fetch,
+            "no stored key: the daily refresh reads the cache, never a certain 401"
+        );
+        assert!(!sources[1].headers.contains_key(header::AUTHORIZATION));
+        assert!(!sources[1].headers.contains_key("x-api-key"));
 
         assert_eq!(sources[2].provider, "codex_sub");
         assert_eq!(
@@ -936,10 +1103,243 @@ version_probe = false
             ),
             "the codex CLI's own request shape: the version the handshake speaks rides as the query"
         );
-        assert_eq!(
-            sources[2].bearer, None,
+        assert!(
+            sources[2].headers.is_empty(),
             "no login in the scratch dir → no bearer (the request goes up cleanly and fails into the fallback)"
         );
+    }
+
+    /// With an `anthropic_api` key stored, the daily refresh fetches the
+    /// anthropic listing with it, as `x-api-key` marked sensitive.
+    #[test]
+    fn a_stored_api_key_credentials_the_daily_anthropic_fetch() {
+        let dir = crate::setup::test_dir("catalog-sources-key");
+        let server = server_with(
+            &dir,
+            "http://localhost:10",
+            r#"
+[providers.anthropic_api]
+upstream = "http://localhost:10"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "ak-literal-test"
+"#,
+        );
+        let sources = server.catalog_sources();
+        let anthropic = sources
+            .iter()
+            .find(|source| source.provider == "anthropic")
+            .expect("the anthropic source");
+        assert!(anthropic.fetch);
+        let key = anthropic.headers.get("x-api-key").expect("the stored key");
+        assert_eq!(key, "ak-literal-test");
+        assert!(key.is_sensitive(), "a Debug of the source never prints it");
+        assert_eq!(anthropic.headers["anthropic-version"], "2023-06-01");
+        assert!(!anthropic.headers.contains_key(header::AUTHORIZATION));
+    }
+
+    /// One recorded models request's headers, by name.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        uri: String,
+        authorization: Option<String>,
+        beta: Option<String>,
+        version: Option<String>,
+    }
+
+    /// An anthropic upstream that answers `/v1/models` with `status` and a
+    /// one-model listing, recording each request.
+    async fn models_upstream(
+        status: axum::http::StatusCode,
+    ) -> (Arc<std::sync::Mutex<Vec<Seen>>>, String) {
+        use axum::extract::{Request, State};
+        use axum::response::IntoResponse;
+        type Log = Arc<std::sync::Mutex<Vec<Seen>>>;
+        async fn models(
+            State((seen, status)): State<(Log, axum::http::StatusCode)>,
+            request: Request,
+        ) -> axum::response::Response {
+            let named = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            };
+            seen.lock().unwrap().push(Seen {
+                uri: request.uri().to_string(),
+                authorization: named("authorization"),
+                beta: named("anthropic-beta"),
+                version: named("anthropic-version"),
+            });
+            let body = serde_json::json!({"data": [{
+                "type": "model",
+                "id": "claude-sonnet-9",
+                "max_input_tokens": 1_000_000
+            }]});
+            (status, axum::Json(body)).into_response()
+        }
+        let seen: Log = Arc::default();
+        let app = axum::Router::new()
+            .route("/v1/models", axum::routing::get(models))
+            .with_state((seen.clone(), status));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock binds");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("mock serves") });
+        (seen, format!("http://{addr}"))
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header"),
+        );
+        headers
+    }
+
+    /// Wait for the spawned borrowed fetch to settle: either the
+    /// catalogue lands or `requests` requests have been seen and a beat
+    /// has passed for the install.
+    async fn settle(server: &Server, seen: &Arc<std::sync::Mutex<Vec<Seen>>>, requests: usize) {
+        for _ in 0..200 {
+            let installed = server
+                .catalogs
+                .read()
+                .unwrap()
+                .get("anthropic")
+                .is_some_and(|catalog| !catalog.models.is_empty());
+            if installed || seen.lock().unwrap().len() >= requests {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A subscription request's bearer fetches a missing anthropic
+    /// listing once: with the version and oauth beta headers, into the
+    /// in-memory catalogue and the cache file. Once the catalogue is
+    /// fresh, later requests fetch nothing.
+    #[tokio::test]
+    async fn a_subscription_bearer_fills_a_missing_anthropic_catalogue_once() {
+        let dir = crate::setup::test_dir("catalog-borrow");
+        let (seen, upstream) = models_upstream(axum::http::StatusCode::OK).await;
+        let server = server_with(&dir, &upstream, "");
+        let cache = dir.join("models-cache");
+        server.catalog_dir.set(cache.clone()).expect("unset");
+        let sub = server.anthropic_sub.clone().expect("sub");
+
+        server.borrow_catalog_credential(sub.as_ref(), &bearer("sk-ant-oat01-test"));
+        settle(&server, &seen, 1).await;
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![Seen {
+                uri: "/v1/models?limit=1000".to_owned(),
+                authorization: Some("Bearer sk-ant-oat01-test".to_owned()),
+                beta: Some("oauth-2025-04-20".to_owned()),
+                version: Some("2023-06-01".to_owned()),
+            }]
+        );
+        assert_eq!(
+            server
+                .catalogs
+                .read()
+                .unwrap()
+                .context_window_of("anthropic_sub", "claude-sonnet-9"),
+            Some(1_000_000)
+        );
+        let cached = std::fs::read_to_string(cache.join("anthropic.json")).expect("persisted");
+        assert!(
+            !cached.contains("sk-ant-oat01-test"),
+            "the cache holds the listing, never the credential"
+        );
+
+        // Fresh now: the next request borrows nothing, even past the
+        // retry backoff.
+        server.catalog_borrowed_at.store(0, Ordering::SeqCst);
+        server.borrow_catalog_credential(sub.as_ref(), &bearer("sk-ant-oat01-test"));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A failing listing is retried no sooner than the backoff, however
+    /// many requests pass through meanwhile.
+    #[tokio::test]
+    async fn a_failed_borrowed_fetch_waits_out_the_backoff() {
+        let dir = crate::setup::test_dir("catalog-borrow-401");
+        let (seen, upstream) = models_upstream(axum::http::StatusCode::UNAUTHORIZED).await;
+        let server = server_with(&dir, &upstream, "");
+        server
+            .catalog_dir
+            .set(dir.join("models-cache"))
+            .expect("unset");
+        let sub = server.anthropic_sub.clone().expect("sub");
+
+        for _ in 0..5 {
+            server.borrow_catalog_credential(sub.as_ref(), &bearer("t"));
+        }
+        settle(&server, &seen, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "one attempt per backoff");
+
+        // Past the backoff, the next request tries again.
+        server.catalog_borrowed_at.store(
+            super::now_ms() - super::CATALOG_BORROW_RETRY_MS,
+            Ordering::SeqCst,
+        );
+        server.borrow_catalog_credential(sub.as_ref(), &bearer("t"));
+        settle(&server, &seen, 2).await;
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// Nothing is borrowed before the refresh task sets the cache dir
+    /// (every router-only test), for a request with no bearer, for the
+    /// API backend, or when an API key is stored.
+    #[tokio::test]
+    async fn the_borrow_stays_quiet_when_it_should() {
+        let dir = crate::setup::test_dir("catalog-borrow-quiet");
+        let (seen, upstream) = models_upstream(axum::http::StatusCode::OK).await;
+        let server = server_with(&dir, &upstream, "");
+        let sub = server.anthropic_sub.clone().expect("sub");
+
+        server.borrow_catalog_credential(sub.as_ref(), &bearer("t"));
+        server
+            .catalog_dir
+            .set(dir.join("models-cache"))
+            .expect("unset");
+        server.borrow_catalog_credential(sub.as_ref(), &HeaderMap::new());
+
+        let keyed_dir = crate::setup::test_dir("catalog-borrow-keyed");
+        let keyed = server_with(
+            &keyed_dir,
+            &upstream,
+            &format!(
+                r#"
+[providers.anthropic_api]
+upstream = "{upstream}"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "ak-literal-test"
+"#
+            ),
+        );
+        keyed
+            .catalog_dir
+            .set(keyed_dir.join("models-cache"))
+            .expect("unset");
+        let api = keyed.anthropic_api.clone().expect("api");
+        keyed.borrow_catalog_credential(api.as_ref(), &bearer("t"));
+        let keyed_sub = keyed.anthropic_sub.clone().expect("sub");
+        keyed.borrow_catalog_credential(keyed_sub.as_ref(), &bearer("t"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(server.catalog_borrowed_at.load(Ordering::SeqCst), 0);
     }
 
     /// The mark before sending names what toker sent; the response may name

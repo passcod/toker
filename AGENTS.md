@@ -31,9 +31,11 @@ The full text and the incidents behind them are in
    digests, and whether a fixed marker string matched.
 2. **Credentials pass through, or are stored where the design says, and are
    never logged or printed.** A request that brings its own credential keeps it
-   (codex is the one backend that always signs itself). A key handed to toker
-   lives in the keyring, an env var, or as a literal in the 0600 `toker.toml`.
-   Request headers are read by name, never captured wholesale.
+   (codex is the one backend that always signs itself), and the anthropic
+   models fetch may borrow a passing subscription bearer for one GET. A key
+   handed to toker lives in the keyring, an env var, or as a literal in the
+   0600 `toker.toml`. Request headers are read by name, never captured
+   wholesale.
 3. **Accounting must never break a session; only a gate may stop one.**
    Observation runs under `catch_unwind`, and recording logs and swallows its
    errors. Gate decisions go through `quota::decide` or `cold::decide_cold`, and
