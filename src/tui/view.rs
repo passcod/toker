@@ -59,6 +59,11 @@ const BOTTOM_HEIGHT: u16 = 9;
 /// letting the line wrap or the verdict clip.
 const BAR_WIDTH: u16 = 22;
 
+/// The narrowest the meter bar shrinks to before the line sheds a
+/// clause instead: below this a bar stops reading as a share, while
+/// the reset clock is the meter's other answer.
+const BAR_MIN_WIDTH: usize = 10;
+
 /// Past this a session is not mid-turn; the context list goes quiet
 /// about it.
 const IDLE_SECS: i64 = 180;
@@ -1288,10 +1293,11 @@ fn render_rate(frame: &mut Frame, area: Rect, snap: &Snapshot, tz: &TimeZone) {
 }
 
 /// One meter line (the reference dashboard's exact line shape): the
-/// label, a utilisation bar coloured by how much is left, and — shed
-/// before anything else when the panel narrows, never wrapped — the
-/// resets clock and the forecast verdict. The verdict is the last
-/// thing to go; the status is the first.
+/// label, a utilisation bar coloured by how much is left, and — never
+/// wrapped — the status, the resets clock, and the forecast verdict.
+/// As the panel narrows the bar shrinks to [`BAR_MIN_WIDTH`] first,
+/// then the status goes, then the resets clock; the verdict is the
+/// last thing to go.
 fn meter_line(
     meter: &MeterPanel,
     gate_assumed: bool,
@@ -1349,8 +1355,10 @@ fn meter_line(
         .filter(|status| *status != "allowed")
         .map(str::to_owned);
 
-    // Compose the right side, shedding as the panel narrows: the status
-    // first, then the resets clause, the verdict last.
+    // Compose the right side, shedding as the panel narrows: the bar
+    // shrinks to its floor first, then the status goes, then the
+    // resets clause, the verdict last. The reset clock is half of what
+    // a meter answers, so it outlives the bar's last dozen cells.
     // Where the reference cuts the bar string mid-glyph at
     // this point, the bar here shrinks instead — every surviving piece
     // keeps its styling and a partial bar still reads as a bar.
@@ -1367,20 +1375,23 @@ fn meter_line(
         right.push_str(&verdict_full);
         right
     };
-    let mut use_status = status.as_deref();
-    let mut use_resets = resets.as_deref();
-    let mut right = with(use_status, use_resets);
-    if 17 + len(&right) + BAR_WIDTH as usize > width {
-        use_status = None;
-        right = with(None, use_resets);
-    }
-    if 17 + len(&right) + BAR_WIDTH as usize > width {
-        use_resets = None;
-        right = with(None, None);
-    }
-    let bar_width = width
-        .saturating_sub(17 + len(&right))
-        .min(BAR_WIDTH as usize) as u16;
+    let pct = format!("{:>3}%", (meter.util * 100.0).round() as i64);
+    let label = format!("  {:<9}", meter.label);
+    // Everything on the line but the bar and the right side: the label
+    // column, the space before the percentage, the percentage, and the
+    // one space that always separates it from the right side — the gap
+    // once dropped that space and printed "11%on track".
+    let fixed = len(&label) + 1 + len(&pct) + 1;
+    let bar_room = |right: &str| width.saturating_sub(fixed + len(right));
+    let (use_status, use_resets) = [
+        (status.as_deref(), resets.as_deref()),
+        (None, resets.as_deref()),
+    ]
+    .into_iter()
+    .find(|&(status, resets)| bar_room(&with(status, resets)) >= BAR_MIN_WIDTH)
+    .unwrap_or((None, None));
+    let right = with(use_status, use_resets);
+    let bar_width = bar_room(&right).min(BAR_WIDTH as usize) as u16;
 
     // A reading from a window that has rolled is dimmed along with its
     // bar: the verdict says so in words, but a bright 95% next to it
@@ -1391,14 +1402,13 @@ fn meter_line(
         _ if meter.util > 0.8 => Style::new().fg(Color::Yellow),
         _ => Style::new().fg(Color::Green),
     };
-    let pct = format!("{:>3}%", (meter.util * 100.0).round() as i64);
-    let left = format!("  {:<9}{} {}", meter.label, bar(meter.util, bar_width), pct);
+    let left = format!("{label}{} {pct}", bar(meter.util, bar_width));
 
     // The styled left side: the label plain, the bar and its
     // percentage in the bar's colour.
     let left_spans = || -> Vec<Span<'static>> {
         vec![
-            Span::raw(format!("  {:<9}", meter.label)),
+            Span::raw(label.clone()),
             Span::styled(bar(meter.util, bar_width), bar_style),
             Span::raw(" "),
             Span::styled(pct.clone(), bar_style),
@@ -1426,8 +1436,9 @@ fn meter_line(
         spans
     };
 
-    if 16 + bar_width as usize + 1 + len(&right) <= width {
-        let gap = width - 16 - bar_width as usize - 1 - len(&right);
+    if fixed + bar_width as usize + len(&right) <= width {
+        // At least the one separating space, by construction of `fixed`.
+        let gap = width - (fixed - 1) - bar_width as usize - len(&right);
         let mut spans = left_spans();
         spans.push(Span::raw(" ".repeat(gap)));
         spans.extend(right_spans());
@@ -2256,6 +2267,80 @@ mod tests {
         assert!(text.contains("stops ~Thu 01:55"));
         assert!(text.contains("estimating"));
         assert!(text.contains("today +6%  ·  30m <1%"), "spent stays");
+    }
+
+    /// One meter line's text at `width`, from the quota fixture's
+    /// meter labelled `label`.
+    fn meter_text(snap: &model::Snapshot, label: &str, width: u16) -> String {
+        let quota = snap.quota.as_ref().expect("the fixture has meters");
+        let meter = quota
+            .meters
+            .iter()
+            .find(|meter| meter.label == label)
+            .expect("the fixture has this meter");
+        super::meter_line(meter, quota.gate_assumed, width, NOW, &utc())
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn a_meter_line_always_spaces_its_percentage_from_the_right_side() {
+        // The gap once subtracted the separating space without
+        // emitting it: at the width that left the bar exactly its
+        // room, the line read "11%on track". Every width from the
+        // degenerate (the left side cut so the verdict survives) to the
+        // full line keeps the space, and the line never overruns its
+        // width once the verdict itself fits.
+        let snap = quota_snapshot();
+        for label in ["5-hour", "7-day", "overage"] {
+            for width in 24..=90u16 {
+                let text = meter_text(&snap, label, width);
+                assert!(
+                    text.chars().count() <= width as usize,
+                    "{label} at {width} overruns: {text:?}"
+                );
+                if let Some(at) = text.find('%') {
+                    assert_eq!(
+                        text[at + 1..].chars().next(),
+                        Some(' '),
+                        "{label} at {width}: {text:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_bar_shrinks_before_the_reset_clock_drops() {
+        let snap = quota_snapshot();
+        // 60 cells: the full 22-cell bar beside the resets clause
+        // needs 70, so the bar used to keep its width and the clock
+        // went. Now the bar gives up cells first: the resets clause
+        // stays and the bar takes the 12 cells left.
+        let text = meter_text(&snap, "5-hour", 60);
+        assert_eq!(
+            text,
+            format!(
+                "  5-hour   {}  32% resets 15:53 · gated · on track",
+                "█".repeat(4) + &"░".repeat(8)
+            )
+        );
+        // The status still goes before the clock: with it, the bar
+        // would fall under its floor.
+        let text = meter_text(&snap, "overage", 60);
+        assert_eq!(
+            text,
+            format!(
+                "  overage  {}  64% resets 10 Feb · estimating",
+                "█".repeat(11) + &"░".repeat(6)
+            )
+        );
+        // Under the floor the clock goes and the bar grows back.
+        let text = meter_text(&snap, "5-hour", 50);
+        assert!(!text.contains("resets"), "{text:?}");
+        assert!(text.ends_with(" gated · on track"), "{text:?}");
     }
 
     #[test]
