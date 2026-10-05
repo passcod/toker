@@ -26,7 +26,7 @@ to see the dashboard.
 
 The name of the game is to optimise for cache hit rate; how that works out depends on your frontend (claude, opencode, codex...) and your backend (anthropic, openai, openrouter...). A "cache rebuilds" view explains how you lost your cache; you can then figure out how to optimise your tool loadout, your system prompt generation, etc.
 
-When you leave a context-heavy session for too long and cache goes cold, Toker knows. If you message a session with more than 175k tokens in its context and with a cache that's likely cold, Toker first stops you; you can choose to start a new session, compact (see below), or keep going and eat the uncached writes. If cache writes are free at the backend, this doesn't apply.
+When you leave a context-heavy session for too long and cache goes cold, Toker knows. If you message a session with more than 175k tokens in its context, with a cache that's likely cold, and loading it into cache would make the window (if applicable) run out faster than normal, Toker first stops you; you can choose to start a new session, compact (see below), or keep going and eat the uncached writes. If cache writes are free at the backend, this doesn't apply.
 
 When using an Anthropic subscription (e.g. Pro, Max, Team), you also have 5-hour and weekly limits, after which you run into expensive overage. Toker shows where you're at, and prevents you from running out, so you can max out on concurrency and the proxy will stop your sessions before they cost money... unless you provide the release token (`$#$BURN$#$`), which lets you deliberately burn overage.
 
