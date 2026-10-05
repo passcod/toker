@@ -459,6 +459,47 @@ pub(super) fn meter_rows_since(conn: &Connection, ts_ms: i64, limit: i64) -> Res
     )
 }
 
+/// The furthest 5-hour reset, in epoch seconds, that any API-measured
+/// row from `provider` logged at or after `ts_ms` reports; with
+/// `ping_only`, only rows the ping header tagged. `None` when no such row
+/// carries a numeric `reset5h`.
+///
+/// The furthest, not the newest: requests finish out of order, each
+/// response carrying the figure from when it was served, so any row
+/// claiming a window runs until T is proof that it does. And only
+/// `kind IS NULL` rows: a blocked or released row's `rate_limits` is the
+/// proxy's own last-seen copy, so reading it would report the proxy's
+/// staleness as the API's (both learned in the predecessor's log).
+pub(super) fn furthest_reset5h(
+    conn: &Connection,
+    provider: &str,
+    ts_ms: i64,
+    ping_only: bool,
+) -> Result<Option<i64>> {
+    let furthest = conn.query_row(
+        "SELECT MAX(CAST(json_extract(rate_limits, '$.reset5h') AS INTEGER)) FROM requests
+         WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND rate_limits IS NOT NULL
+           AND json_type(rate_limits, '$.reset5h') IN ('integer', 'real')
+           AND (?3 = 0 OR ping = 1)",
+        (ts_ms, provider, ping_only),
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(furthest)
+}
+
+/// Whether any API-measured row from `provider` logged at or after
+/// `ts_ms` carries the ping tag — the readback's "did the ping land at
+/// all", separate from whether it carried a reading.
+pub(super) fn ping_landed(conn: &Connection, provider: &str, ts_ms: i64) -> Result<bool> {
+    let landed = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM requests
+         WHERE ts_ms >= ?1 AND kind IS NULL AND provider = ?2 AND ping = 1)",
+        (ts_ms, provider),
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(landed)
+}
+
 /// Read one narrow meter row by column name. Unknown `kind` values are
 /// an error, not a silent `None` — the kind column drives the span
 /// total's proxy-row exclusion, and a corrupted value must never

@@ -64,7 +64,7 @@ use jiff::tz::TimeZone;
 
 use crate::middleware::awake::{InhibitCommand, LockSpawner};
 use crate::setup::patchers::anthropic_base_url;
-use crate::store::{PingRecord, RequestRow, Store};
+use crate::store::{PingAction, PingRecord, Store};
 
 /// The ping timer's offset from its slot: 11 minutes after the wake
 /// slot — the machine has woken and settled, and the hold still has
@@ -111,8 +111,12 @@ const READBACK_ATTEMPTS: usize = 10;
 /// The pause between readback attempts.
 const READBACK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How many rows the readback window reads.
-const READBACK_ROWS: u64 = 1_000;
+/// The anthropic subscription backend's provider id
+/// ([`crate::providers::anthropic::AnthropicSub`]'s): the only meter
+/// source, and the only backend whose requests open a 5-hour window. A
+/// ping routed to any other backend opens nothing, so its rows must not
+/// read as the window opening.
+const SUB_PROVIDER: &str = "anthropic_sub";
 
 // ── the slot clock ─────────────────────────────────────────────────────
 
@@ -244,11 +248,18 @@ pub fn scheduled_fire_ms(occurrence_ms: i64) -> i64 {
     occurrence_ms + PING_DELAY_MINUTES * 60_000
 }
 
-/// The boundary of the quota window a ping at this slot opens:
-/// `floor(slot, ANCHOR_STEP_MS) + WINDOW_MS` — anchored to the
-/// 10-minute grid the windows' phase snaps to, ending 5 h later.
-pub fn window_boundary_ms(occurrence_ms: i64) -> i64 {
-    occurrence_ms - occurrence_ms.rem_euclid(ANCHOR_STEP_MS) + WINDOW_MS
+/// The boundary of the quota window a request at `at_ms` opens:
+/// `floor(at, ANCHOR_STEP_MS) + WINDOW_MS` — a window is anchored to the
+/// request that opens it, on the 10-minute grid, ending 5 h later
+/// (measured across 38 windows in the predecessor's log). Pass the time
+/// the ping actually fires, not its slot: the first version floored the
+/// slot, which is 11 minutes earlier and so predicted a boundary 10
+/// minutes early whenever the two straddled a grid line — 07:20's
+/// window "ending 12:20" when the 07:31 ping opens one ending 12:30.
+/// Floored on the epoch, not local clock fields, which is where the API
+/// does it.
+pub fn window_boundary_ms(at_ms: i64) -> i64 {
+    at_ms - at_ms.rem_euclid(ANCHOR_STEP_MS) + WINDOW_MS
 }
 
 /// A wall-clock `hh:mm` rendering of an instant (the notices' frozen
@@ -346,12 +357,14 @@ impl CommandRunner for ProcessCommandRunner {
 /// the reason said), then send one tiny request as a client — `claude
 /// -p` with `ANTHROPIC_BASE_URL` at toker's port and
 /// `ANTHROPIC_CUSTOM_HEADERS` carrying `ping_header: 1` — and read the
-/// ledger back to confirm a `ping: true` row landed. The row's absence
-/// is a failure report, not a crash.
+/// ledger back: did a `ping: true` row land on the anthropic sub, and
+/// which 5-hour reset did it report. The row's absence is a failure
+/// report, not a crash.
 ///
 /// The run (never a refusal) is recorded in the `pings` table with its
-/// exit code, duration, and the boundary it aimed at. `now_ms` and `tz`
-/// resolve the slot; `sleep` paces the readback's retries.
+/// slot, action, exit code, duration, the boundary predicted from the
+/// fire time, the boundary observed, and whether they matched. `now_ms`
+/// and `tz` resolve the slot; `sleep` paces the readback's retries.
 pub fn ping_window(
     out: &mut dyn Write,
     config: &PingConfig<'_>,
@@ -368,7 +381,6 @@ pub fn ping_window(
         bail!("the slot could not be resolved on this clock");
     };
     let fire = scheduled_fire_ms(occurrence);
-    let boundary = window_boundary_ms(occurrence);
     let lateness = now_ms - fire;
     let slot_hhmm = slot.hhmm();
 
@@ -383,10 +395,13 @@ pub fn ping_window(
         bail!("{reason}");
     }
 
+    // Predicted from when the ping fires, which is when the request
+    // that anchors the window goes out — not from the slot.
+    let boundary = window_boundary_ms(now_ms);
     say(
         out,
         &format!(
-            "slot {slot_hhmm}: opening the quota window (fires {}, ends {})",
+            "slot {slot_hhmm}: opening the quota window (scheduled {}, expecting it to end {})",
             hhmm_of(fire, tz),
             hhmm_of(boundary, tz),
         ),
@@ -415,6 +430,9 @@ pub fn ping_window(
     let output = runner.run("claude", &["-p", "hi"], &env);
     let duration_ms = started.elapsed().as_millis() as i64;
     let exit_code = output.as_ref().ok().and_then(|output| output.status.code());
+    let completed = matches!(&output, Ok(output) if output.status.success());
+    // Deliberately only the exit code, never the output: a reply is
+    // completion content, which nothing toker writes may hold.
     match &output {
         Ok(output) => say(
             out,
@@ -432,7 +450,8 @@ pub fn ping_window(
     // The readback: the row lands when the response completes
     // server-side, which can be a moment after the client exits — poll
     // briefly rather than declare failure on a race. A store that
-    // cannot be read at all is a real error.
+    // cannot be read at all is a real error. Only the sub's rows count:
+    // a ping the router sent anywhere else opened no window.
     let store = Store::open(config.db_path)
         .with_context(|| format!("opening the ledger at {}", config.db_path.display()))?;
     let mut landed = false;
@@ -440,13 +459,26 @@ pub fn ping_window(
         if attempt > 0 {
             sleep(READBACK_INTERVAL);
         }
-        if let Ok(rows) = store.requests_since(now_ms, READBACK_ROWS)
-            && rows.iter().any(|row: &RequestRow| row.ping == Some(true))
-        {
+        if let Ok(true) = store.ping_landed(SUB_PROVIDER, now_ms) {
             landed = true;
             break;
         }
     }
+    // The boundary the API gave, read off the rows the ping produced:
+    // a prediction printed as a fact is the predecessor's recurring
+    // failure mode. `since` is what keeps it honest — the ledger already
+    // holds the previous window's reset, and without the cutoff a ping
+    // that changed nothing would report that as its own.
+    let observed = if landed {
+        store
+            .furthest_reset5h(SUB_PROVIDER, now_ms, true)
+            .ok()
+            .flatten()
+            .map(|reset_s| reset_s.saturating_mul(1000))
+    } else {
+        None
+    };
+    let verified = observed.map(|observed| observed == boundary);
 
     if let Err(error) = store.record_ping(&PingRecord {
         id: None,
@@ -454,6 +486,15 @@ pub fn ping_window(
         exit_code: exit_code.map(i64::from),
         duration_ms: Some(duration_ms),
         boundary_ms: Some(boundary),
+        slot: Some(slot_hhmm.clone()),
+        action: Some(if completed {
+            PingAction::Ping
+        } else {
+            PingAction::Failed
+        }),
+        observed_ms: observed,
+        verified,
+        assumed: None,
     }) {
         say(
             out,
@@ -461,15 +502,7 @@ pub fn ping_window(
         )?;
     }
 
-    if landed {
-        say(
-            out,
-            &format!(
-                "slot {slot_hhmm}: the ledger confirms the ping row landed — the window is open"
-            ),
-        )?;
-        Ok(())
-    } else {
+    if !landed {
         say(
             out,
             &format!(
@@ -478,6 +511,39 @@ pub fn ping_window(
         )?;
         bail!("no ping row landed in the ledger — the window did not open");
     }
+    match observed {
+        Some(observed) if observed == boundary => say(
+            out,
+            &format!(
+                "slot {slot_hhmm}: the ledger confirms the window is open until {}",
+                hhmm_of(observed, tz)
+            ),
+        )?,
+        // A mismatch means the measured rule has moved. Say so rather
+        // than quietly reporting the reading and leaving the prediction
+        // wrong forever.
+        Some(observed) => say(
+            out,
+            &format!(
+                "slot {slot_hhmm}: the window is open until {}, not the expected {} — \
+                 the floor-to-10-minutes rule may no longer hold",
+                hhmm_of(observed, tz),
+                hhmm_of(boundary, tz),
+            ),
+        )?,
+        None => say(
+            out,
+            &format!(
+                "slot {slot_hhmm}: the ping row landed without a 5-hour reset — \
+                 boundary unverified, expected {}",
+                hhmm_of(boundary, tz)
+            ),
+        )?,
+    }
+    if !completed {
+        bail!("claude did not exit cleanly, though its ping row landed");
+    }
+    Ok(())
 }
 
 /// One line to the verb's output (stdout in production, the captured
@@ -495,7 +561,7 @@ mod tests {
     };
     use crate::middleware::awake::{InhibitCommand, InhibitLock, LockSpawner};
     use crate::setup::test_dir;
-    use crate::store::{PingRecord, RequestRow, Store};
+    use crate::store::{PingAction, PingRecord, RequestRow, Store};
     use jiff::tz::TimeZone;
     use std::process::Output;
     use std::sync::Arc;
@@ -671,11 +737,20 @@ mod tests {
     }
 
     #[test]
-    fn the_boundary_floors_the_slot_to_ten_minutes_and_adds_five_hours() {
-        // An on-grid slot: its own time + 5 h.
+    fn the_boundary_floors_the_fire_time_to_ten_minutes_and_adds_five_hours() {
+        // An on-grid time: its own time + 5 h.
         assert_eq!(window_boundary_ms(utc_ms(9, 0)), utc_ms(14, 0));
-        // An off-grid slot: floored to the grid first.
+        // An off-grid time: floored to the grid first.
         assert_eq!(window_boundary_ms(utc_ms(9, 7)), utc_ms(14, 0));
+        // The default schedule: the 07:20 slot's ping fires at 07:31 and
+        // opens a window ending 12:30, and the 12:20 slot's fires at
+        // 12:31, ending 17:30. Flooring the SLOT instead would say 12:20
+        // and 17:20 — the bug this replaced.
+        let morning = scheduled_fire_ms(utc_ms(7, 20));
+        assert_eq!(morning, utc_ms(7, 31));
+        assert_eq!(window_boundary_ms(morning), utc_ms(12, 30));
+        let afternoon = scheduled_fire_ms(utc_ms(12, 20));
+        assert_eq!(window_boundary_ms(afternoon), utc_ms(17, 30));
         assert_eq!(window_boundary_ms(utc_ms(9, 59)), utc_ms(14, 50));
         assert_eq!(
             window_boundary_ms(utc_ms(23, 59)),
@@ -957,13 +1032,22 @@ mod tests {
         }
     }
 
-    /// A scratch ledger with one `ping: true` row at `ts_ms`.
-    fn seeded_ping_row(db: &std::path::Path, ts_ms: i64) {
-        let store = Store::open(db).expect("open the scratch ledger");
+    /// A scratch ledger with one `ping: true` row at `ts_ms`, served by
+    /// the anthropic sub and reporting a 5-hour reset at `reset_ms`.
+    fn seeded_ping_row(db: &std::path::Path, ts_ms: i64, reset_ms: i64) {
         let mut row = bare_row();
         row.ts_ms = ts_ms;
         row.ping = Some(true);
-        store.record_request(&row).expect("seed the ping row");
+        row.provider = Some("anthropic_sub".to_owned());
+        row.rate_limits = Some(serde_json::json!({"util5h": 0.0, "reset5h": reset_ms / 1000}));
+        seed(db, &row);
+    }
+
+    fn seed(db: &std::path::Path, row: &RequestRow) {
+        Store::open(db)
+            .expect("open the scratch ledger")
+            .record_request(row)
+            .expect("seed the row");
     }
 
     fn no_sleep() -> impl FnMut(Duration) {
@@ -989,8 +1073,9 @@ mod tests {
         let dir = test_dir("ping-lands");
         let db = dir.join("toker.db");
         let now = utc_ms(9, 12); // One minute past the 09:11 fire time.
-        // The row lands a moment after the run starts.
-        seeded_ping_row(&db, now + 1_000);
+        // The row lands a moment after the run starts, reporting the
+        // reset the rule predicts from 09:12: floor to 09:10, plus 5 h.
+        seeded_ping_row(&db, now + 1_000, utc_ms(14, 10));
 
         let client = ScriptedClient::new(0);
         let mut out = Vec::new();
@@ -1035,16 +1120,19 @@ mod tests {
         );
 
         // The outcome is printed, and the run is recorded with the
-        // boundary it aimed at.
+        // boundary it predicted from the FIRE time (09:12 → 14:10, not
+        // the slot's 14:00) and the one the ledger reported back.
         let out = String::from_utf8(out).expect("utf-8");
         assert!(
-            out.contains("slot 09:00: opening the quota window (fires 09:11, ends 14:00)"),
+            out.contains(
+                "slot 09:00: opening the quota window (scheduled 09:11, expecting it to end 14:10)"
+            ),
             "{out}"
         );
         assert!(out.contains("slot 09:00: running 1 min late"), "{out}");
         assert!(out.contains("claude exited 0"), "{out}");
         assert!(
-            out.contains("the ledger confirms the ping row landed"),
+            out.contains("the ledger confirms the window is open until 14:10"),
             "{out}"
         );
         let pings: Vec<PingRecord> = Store::open(&db)
@@ -1053,8 +1141,126 @@ mod tests {
             .expect("pings");
         assert_eq!(pings.len(), 1);
         assert_eq!(pings[0].exit_code, Some(0));
-        assert_eq!(pings[0].boundary_ms, Some(utc_ms(14, 0)));
+        assert_eq!(pings[0].boundary_ms, Some(utc_ms(14, 10)));
+        assert_eq!(pings[0].observed_ms, Some(utc_ms(14, 10)));
+        assert_eq!(pings[0].verified, Some(true));
+        assert_eq!(pings[0].action, Some(PingAction::Ping));
+        assert_eq!(pings[0].slot.as_deref(), Some("09:00"));
         assert_eq!(pings[0].ts_ms, now);
+    }
+
+    #[test]
+    fn a_boundary_other_than_predicted_is_recorded_unverified_and_said() {
+        let dir = test_dir("ping-mismatch");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        // The API anchored somewhere else: the rule has moved.
+        seeded_ping_row(&db, now + 1_000, utc_ms(14, 0));
+
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &ScriptedClient::new(0),
+            &mut sleep,
+        )
+        .expect("the window did open, just not where predicted");
+
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains("the window is open until 14:00, not the expected 14:10"),
+            "{out}"
+        );
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings[0].boundary_ms, Some(utc_ms(14, 10)), "the prediction");
+        assert_eq!(pings[0].observed_ms, Some(utc_ms(14, 0)), "the reading");
+        assert_eq!(pings[0].verified, Some(false));
+    }
+
+    #[test]
+    fn the_readback_reads_only_what_this_ping_produced_on_the_sub() {
+        let dir = test_dir("ping-readback-scope");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        // The previous window's reading, logged before this run: it must
+        // not pass for the ping's own boundary.
+        seeded_ping_row(&db, now - 60_000, utc_ms(14, 10));
+        // A ping row routed to the plain API: it opened no window.
+        let mut api = bare_row();
+        api.ts_ms = now + 1_000;
+        api.ping = Some(true);
+        api.provider = Some("anthropic_api".to_owned());
+        api.rate_limits = Some(serde_json::json!({"reset5h": utc_ms(14, 10) / 1000}));
+        seed(&db, &api);
+        // A sub row that is not a measurement (a gate's copy of the
+        // meters) and an untagged session's row.
+        let mut blocked = bare_row();
+        blocked.ts_ms = now + 1_000;
+        blocked.ping = Some(true);
+        blocked.provider = Some("anthropic_sub".to_owned());
+        blocked.kind = Some(crate::store::RowKind::Blocked);
+        blocked.rate_limits = Some(serde_json::json!({"reset5h": utc_ms(14, 10) / 1000}));
+        seed(&db, &blocked);
+
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        let error = super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &ScriptedClient::new(0),
+            &mut sleep,
+        )
+        .expect_err("nothing the ping produced on the sub landed");
+        assert!(format!("{error:#}").contains("did not open"), "{error:#}");
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings[0].observed_ms, None, "no reading was invented");
+        assert_eq!(pings[0].verified, None, "nothing to compare");
+    }
+
+    #[test]
+    fn a_ping_row_without_a_reset_is_unverified_not_confirmed() {
+        let dir = test_dir("ping-no-reset");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        let mut row = bare_row();
+        row.ts_ms = now + 1_000;
+        row.ping = Some(true);
+        row.provider = Some("anthropic_sub".to_owned());
+        seed(&db, &row);
+
+        let mut out = Vec::new();
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut out,
+            &ping_config(&db, "x-toker-ping"),
+            "09:00",
+            now,
+            &utc(),
+            &ScriptedClient::new(0),
+            &mut sleep,
+        )
+        .expect("the row landed");
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.contains("boundary unverified, expected 14:10"), "{out}");
+        let pings = Store::open(&db)
+            .expect("open")
+            .pings_since(0, 10)
+            .expect("pings");
+        assert_eq!(pings[0].observed_ms, None);
+        assert_eq!(pings[0].verified, None);
     }
 
     #[test]
@@ -1102,7 +1308,7 @@ mod tests {
         // Exactly at the fire time, and exactly at the 10-minute guard:
         // admitted (the guard is strictly MORE than).
         for now in [slot_fire, slot_fire + LATENESS_LIMIT_MINUTES * 60_000] {
-            seeded_ping_row(&db, now + 1_000);
+            seeded_ping_row(&db, now + 1_000, window_boundary_ms(now));
             let mut out = Vec::new();
             let mut sleep = no_sleep();
             super::ping_window(
@@ -1159,11 +1365,11 @@ mod tests {
         let now = utc_ms(9, 12);
         // A ledger with a NON-ping row in the window: not the row the
         // readback wants.
-        let store = Store::open(&db).expect("open");
         let mut row = bare_row();
         row.ts_ms = now + 1_000;
         row.ping = None;
-        store.record_request(&row).expect("seed an ordinary row");
+        row.provider = Some("anthropic_sub".to_owned());
+        seed(&db, &row);
 
         let mut out = Vec::new();
         let mut sleep = no_sleep();
@@ -1194,6 +1400,7 @@ mod tests {
             .expect("pings");
         assert_eq!(pings.len(), 1);
         assert_eq!(pings[0].exit_code, Some(1));
+        assert_eq!(pings[0].action, Some(PingAction::Failed));
     }
 
     #[test]
@@ -1238,7 +1445,7 @@ mod tests {
         let mut sleep = move |_span: Duration| {
             attempts += 1;
             if attempts == 1 {
-                seeded_ping_row(&db_late, now + 1_000);
+                seeded_ping_row(&db_late, now + 1_000, utc_ms(14, 10));
             }
         };
 
@@ -1256,7 +1463,7 @@ mod tests {
 
         let out = String::from_utf8(out).expect("utf-8");
         assert!(
-            out.contains("the ledger confirms the ping row landed"),
+            out.contains("the ledger confirms the window is open until 14:10"),
             "{out}"
         );
     }

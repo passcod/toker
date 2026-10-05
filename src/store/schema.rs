@@ -184,6 +184,22 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT 'anthropic_sub', updated_ms, snapshot FROM meters_state;
     DROP TABLE meters_state;
     "#,
+    // v4 — pings record what the run decided and what it achieved, as the
+    // predecessor's pings.json did: the slot it served, the action
+    // ('ping', 'skip' while a window is already open, 'failed' when the
+    // client did not complete), the boundary read back off the ledger
+    // (observed_ms, beside boundary_ms, the prediction), whether the two
+    // matched, and whether the decision was assumed for want of any
+    // meter reading. A prediction recorded as if it were the outcome is
+    // the failure this exists to prevent. Additive ALTER TABLE only; a v3
+    // row reads every new column as NULL — unknown, not "no".
+    r#"
+    ALTER TABLE pings ADD COLUMN slot TEXT;
+    ALTER TABLE pings ADD COLUMN action TEXT;
+    ALTER TABLE pings ADD COLUMN observed_ms INTEGER;
+    ALTER TABLE pings ADD COLUMN verified INTEGER;
+    ALTER TABLE pings ADD COLUMN assumed INTEGER;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.

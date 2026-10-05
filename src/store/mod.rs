@@ -33,7 +33,7 @@ pub use ledger::{
     CostKind, DisplayRow, LocalisationRow, MeterRow, RebuildRow, RequestRow, RowKind,
     SessionCostGroup, SessionSummary, is_api_measurement,
 };
-pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingRecord};
+pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingAction, PingRecord};
 
 use std::env;
 use std::fs;
@@ -158,6 +158,25 @@ impl Store {
     pub fn meter_rows_since(&self, ts_ms: i64, limit: u64) -> Result<Vec<MeterRow>> {
         let limit = limit.min(i64::MAX as u64) as i64;
         ledger::meter_rows_since(&*self.conn()?, ts_ms, limit)
+    }
+
+    /// The furthest 5-hour reset (epoch seconds) reported by
+    /// API-measured rows from `provider` logged at or after `ts_ms`,
+    /// optionally only ping-tagged ones (see `ledger::furthest_reset5h`
+    /// for why the furthest and why only measurements).
+    pub fn furthest_reset5h(
+        &self,
+        provider: &str,
+        ts_ms: i64,
+        ping_only: bool,
+    ) -> Result<Option<i64>> {
+        ledger::furthest_reset5h(&*self.conn()?, provider, ts_ms, ping_only)
+    }
+
+    /// Whether a ping-tagged API-measured row from `provider` was logged
+    /// at or after `ts_ms`.
+    pub fn ping_landed(&self, provider: &str, ts_ms: i64) -> Result<bool> {
+        ledger::ping_landed(&*self.conn()?, provider, ts_ms)
     }
 
     /// The display tick's window read (sessions/spend/rate/context/
@@ -355,8 +374,8 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, CostKind, DisplayRow, Error, Lane, MetersSnapshot, ModelEntry, PingRecord,
-        RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
+        Allowance, CostKind, DisplayRow, Error, Lane, MetersSnapshot, ModelEntry, PingAction,
+        PingRecord, RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -820,6 +839,90 @@ mod tests {
         match store.meter_rows_since(0, 10) {
             Err(Error::UnknownDbValue { column: "kind", .. }) => {}
             other => panic!("unknown kind must error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_furthest_reset_reads_only_measurements_from_the_provider() {
+        let store = mem_store();
+        let row = |ts_ms: i64, provider: &str, ping: Option<bool>, reset: serde_json::Value| {
+            let mut row = bare_row(ts_ms);
+            row.provider = Some(provider.to_owned());
+            row.ping = ping;
+            row.rate_limits = Some(json!({"util5h": 0.1, "reset5h": reset}));
+            row
+        };
+        // Out of order: the furthest reset wins, not the newest row's.
+        store
+            .record_request(&row(1_000, "anthropic_sub", None, json!(500)))
+            .expect("record");
+        store
+            .record_request(&row(2_000, "anthropic_sub", Some(true), json!(700)))
+            .expect("record");
+        store
+            .record_request(&row(3_000, "anthropic_sub", None, json!(600)))
+            .expect("record");
+        // Another backend, a proxy-written copy, and a non-numeric
+        // reset: none of them is a reading.
+        store
+            .record_request(&row(3_000, "anthropic_api", Some(true), json!(9_000)))
+            .expect("record");
+        let mut blocked = row(3_000, "anthropic_sub", None, json!(9_000));
+        blocked.kind = Some(RowKind::Blocked);
+        store.record_request(&blocked).expect("record");
+        store
+            .record_request(&row(3_000, "anthropic_sub", None, json!("9000")))
+            .expect("record");
+
+        assert_eq!(
+            store
+                .furthest_reset5h("anthropic_sub", 0, false)
+                .expect("read"),
+            Some(700)
+        );
+        assert_eq!(
+            store
+                .furthest_reset5h("anthropic_sub", 2_500, false)
+                .expect("read"),
+            Some(600),
+            "the cutoff drops older rows"
+        );
+        assert_eq!(
+            store
+                .furthest_reset5h("anthropic_sub", 2_500, true)
+                .expect("read"),
+            None,
+            "no ping-tagged reading after the cutoff"
+        );
+        assert_eq!(
+            store.furthest_reset5h("codex_sub", 0, false).expect("read"),
+            None
+        );
+
+        assert!(store.ping_landed("anthropic_sub", 2_000).expect("read"));
+        assert!(!store.ping_landed("anthropic_sub", 2_001).expect("read"));
+        assert!(
+            store.ping_landed("anthropic_api", 2_001).expect("read"),
+            "the API's own ping row is still that provider's"
+        );
+    }
+
+    #[test]
+    fn pings_reject_unknown_stored_actions() {
+        let store = mem_store();
+        {
+            let conn = store.conn.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO pings (ts_ms, action) VALUES (1, 'mystery')",
+                [],
+            )
+            .expect("insert bogus action");
+        }
+        match store.pings_since(0, 10) {
+            Err(Error::UnknownDbValue {
+                column: "action", ..
+            }) => {}
+            other => panic!("unknown action must error, got {other:?}"),
         }
     }
 
@@ -1543,6 +1646,11 @@ mod tests {
             exit_code: Some(0),
             duration_ms: Some(1_234),
             boundary_ms: Some(2_400),
+            slot: Some("07:20".to_owned()),
+            action: Some(PingAction::Ping),
+            observed_ms: Some(2_400),
+            verified: Some(true),
+            assumed: Some(false),
         };
         store.record_ping(&ping).expect("record ping");
         let mut got = store.pings_since(0, 10).expect("pings");
@@ -1558,6 +1666,11 @@ mod tests {
             exit_code: Some(1),
             duration_ms: None,
             boundary_ms: None,
+            slot: None,
+            action: None,
+            observed_ms: None,
+            verified: None,
+            assumed: None,
         };
         store.record_ping(&late).expect("record ping");
         let ts: Vec<i64> = store

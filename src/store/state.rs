@@ -11,7 +11,7 @@
 
 use serde_json::Value;
 
-use super::{Result, row_of, rows_of};
+use super::{Error, Result, row_of, rows_of};
 use rusqlite::Connection;
 
 /// One lane row: `key` is the composite `"sessionId|toolsHash"` (plan: Lane
@@ -68,7 +68,8 @@ pub struct Allowance {
     pub reset_value: i64,
 }
 
-/// One ping run (plan: ping windows).
+/// One ping run (plan: ping windows). Every field but `ts_ms` is
+/// `None` on a row written before migration v4 added it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PingRecord {
     /// Row id, assigned on insert; `None` while inserting.
@@ -76,7 +77,54 @@ pub struct PingRecord {
     pub ts_ms: i64,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    /// The predicted boundary: `floor(fire time, 10 min) + 5 h`.
     pub boundary_ms: Option<i64>,
+    /// The slot this run served, `hh:mm`.
+    pub slot: Option<String>,
+    /// What the run did.
+    pub action: Option<PingAction>,
+    /// The boundary the ledger reported back: for a ping, the 5-hour
+    /// reset on the rows it produced; for a skip, the reset of the window
+    /// already open. `None` when the ledger could not say.
+    pub observed_ms: Option<i64>,
+    /// Whether the observed boundary matched the prediction; `None` when
+    /// there was nothing to compare.
+    pub verified: Option<bool>,
+    /// The decision to ping was taken for want of any meter reading,
+    /// not because one showed no window open.
+    pub assumed: Option<bool>,
+}
+
+/// What one ping run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingAction {
+    /// Sent the client request.
+    Ping,
+    /// A window was already open, so nothing was sent.
+    Skip,
+    /// The client did not run or did not exit cleanly.
+    Failed,
+}
+
+impl PingAction {
+    /// The stored string form.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Skip => "skip",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Parse the stored string form; `None` for unknown values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "ping" => Some(Self::Ping),
+            "skip" => Some(Self::Skip),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 /// The last meter snapshot for one meter-source backend (plan: Server
@@ -272,13 +320,19 @@ fn read_allowance(row: &rusqlite::Row<'_>) -> Result<Allowance> {
 
 pub(super) fn record_ping(conn: &Connection, ping: &PingRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO pings (ts_ms, exit_code, duration_ms, boundary_ms)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO pings (ts_ms, exit_code, duration_ms, boundary_ms,
+                            slot, action, observed_ms, verified, assumed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             ping.ts_ms,
             ping.exit_code,
             ping.duration_ms,
             ping.boundary_ms,
+            ping.slot.as_deref(),
+            ping.action.map(PingAction::as_str),
+            ping.observed_ms,
+            ping.verified,
+            ping.assumed,
         ),
     )?;
     Ok(())
@@ -305,6 +359,17 @@ fn read_ping(row: &rusqlite::Row<'_>) -> Result<PingRecord> {
         exit_code: row.get("exit_code")?,
         duration_ms: row.get("duration_ms")?,
         boundary_ms: row.get("boundary_ms")?,
+        slot: row.get("slot")?,
+        action: match row.get::<_, Option<String>>("action")? {
+            None => None,
+            Some(text) => Some(PingAction::parse(&text).ok_or(Error::UnknownDbValue {
+                column: "action",
+                value: text,
+            })?),
+        },
+        observed_ms: row.get("observed_ms")?,
+        verified: row.get("verified")?,
+        assumed: row.get("assumed")?,
     })
 }
 
