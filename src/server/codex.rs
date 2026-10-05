@@ -42,8 +42,8 @@ use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCa
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, buffered_body, build_response,
-    is_compressed, plain_status, response_headers, session_id, transport_failure, truncated_body,
-    upstream_failure,
+    forward_upstream, is_compressed, plain_status, response_headers, session_id, transport_failure,
+    truncated_body, upstream_failure, upstream_request_headers,
 };
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
@@ -75,6 +75,40 @@ pub(crate) struct CodexTurn {
 
 const ANTHROPIC_FRONTEND: &str = "anthropic";
 const RESPONSES_FRONTEND: &str = "openai_responses";
+
+/// Codex's model catalogue, in the exact shape the CLI expects.
+///
+/// `/v1/models` is a frontend spelling only. The subscription backend's
+/// catalogue lives at `/models?client_version=...`; returning OpenRouter's
+/// list here makes Codex miss the exact slug and fall back to guessed model
+/// metadata. This path is not usage and writes no ledger row.
+pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
+    let Some(codex) = server.codex_turn.clone() else {
+        return super::responses_not_configured();
+    };
+    let auth = match codex
+        .auth_for_turn(&server.http, jiff::Timestamp::now().as_second())
+        .await
+    {
+        Ok(auth) => auth,
+        Err(error) => {
+            tracing::warn!(%error, "codex auth refresh failed for models catalogue");
+            return transport_failure(ErrorWire::Openai, &error);
+        }
+    };
+    let mut url = codex.endpoint("/models");
+    url.query_pairs_mut()
+        .append_pair("client_version", &codex.client_version());
+    let mut headers = upstream_request_headers(request.headers(), &[]);
+    headers.extend(codex.models_headers(auth.as_ref()));
+    match server.http.get(url).headers(headers).send().await {
+        Ok(upstream) => forward_upstream(upstream, None, None).await,
+        Err(error) => {
+            tracing::warn!(%error, "codex models upstream request failed");
+            transport_failure(ErrorWire::Openai, &error)
+        }
+    }
+}
 
 /// Native Codex CLI usage path. The request and response bytes stay in the
 /// Responses dialect end-to-end; observation is side-band only.

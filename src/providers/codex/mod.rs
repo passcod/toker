@@ -287,6 +287,26 @@ impl CodexSub {
         insert(&mut headers, "content-type", "application/json");
         headers
     }
+
+    /// The codex client's identity/auth block for `GET /models`.
+    ///
+    /// The catalogue handshake uses the same bearer, account, originator,
+    /// version, and user-agent as a turn, but it is an ordinary JSON GET:
+    /// there are no session/thread ids and no request content type.
+    pub fn models_headers(&self, auth: Option<&CodexAuth>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        auth_headers(auth, &mut headers);
+        insert(&mut headers, "originator", &self.originator);
+        let client_version = self.client_version();
+        insert(&mut headers, "version", &client_version);
+        insert(
+            &mut headers,
+            "user-agent",
+            &user_agent(&self.originator, &client_version),
+        );
+        insert(&mut headers, "accept", "application/json");
+        headers
+    }
 }
 
 /// The codex auth headers for one outgoing request — and the

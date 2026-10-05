@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use bytes::Bytes;
 use serde_json::{Value, json};
 
@@ -142,7 +142,10 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
         .await
         .expect("mock reads body");
     mock.requests.lock().unwrap().push(CapturedRequest {
-        path: parts.uri.path().to_owned(),
+        path: parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string),
         headers: parts.headers.clone(),
         body: body.clone(),
     });
@@ -211,6 +214,32 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
         }
     };
     metered(&mut response);
+    response
+}
+
+async fn mock_models(State(mock): State<MockState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 1024)
+        .await
+        .expect("mock reads models body");
+    mock.requests.lock().unwrap().push(CapturedRequest {
+        path: parts
+            .uri
+            .path_and_query()
+            .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string),
+        headers: parts.headers,
+        body,
+    });
+    let mut response = raw_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from_static(
+            br#"{"models":[{"slug":"gpt-5.6-sol","context_window":272000,"max_context_window":872000}]}"#,
+        ),
+    );
+    response
+        .headers_mut()
+        .insert(header::ETAG, HeaderValue::from_static("\"catalog-v1\""));
     response
 }
 
@@ -328,6 +357,7 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
     let mock = MockState::default();
     let app = Router::new()
         .route("/backend-api/codex/responses", post(mock_responses))
+        .route("/backend-api/codex/models", get(mock_models))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -396,6 +426,54 @@ fn client() -> reqwest::Client {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn codex_models_uses_the_subscription_catalogue_and_exact_slug() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(
+        "models",
+        upstream,
+        login_dir("models").join("auth.json"),
+        false,
+    ))
+    .await;
+
+    let response = client()
+        .get(format!("http://{addr}/f/codex/v1/models"))
+        .header(header::AUTHORIZATION, "Bearer frontend-must-not-pass")
+        .header(header::IF_NONE_MATCH, "\"catalog-v0\"")
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::ETAG).unwrap(),
+        "\"catalog-v1\""
+    );
+    let body: Value = response.json().await.expect("catalogue JSON");
+    assert_eq!(body["models"][0]["slug"], "gpt-5.6-sol");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        "/backend-api/codex/models?client_version=0.154.0"
+    );
+    assert_eq!(requests[0].headers.get("version").unwrap(), "0.154.0");
+    assert_eq!(
+        requests[0].headers.get("originator").unwrap(),
+        "codex_cli_rs"
+    );
+    assert_eq!(
+        requests[0].headers.get(header::IF_NONE_MATCH).unwrap(),
+        "\"catalog-v0\""
+    );
+    assert_ne!(
+        requests[0].headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer frontend-must-not-pass"
+    );
+    assert!(requests[0].body.is_empty());
+}
+
+#[tokio::test]
 async fn native_responses_passes_bytes_through_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(
@@ -460,6 +538,19 @@ async fn native_responses_passes_bytes_through_and_records_as_codex() {
     assert_eq!(row.req_messages, Some(1));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
+    assert_eq!(row.input, Some(658));
+    assert_eq!(row.cache_read, Some(512));
+    assert_eq!(row.cache_write_total, Some(64));
+    assert_eq!(row.cache_write_1h, Some(64));
+    assert_eq!(row.output, Some(210));
+    assert_eq!(row.reasoning, Some(96));
+    let summary = store
+        .session_summary("codex-session-1")
+        .expect("session summary");
+    assert_eq!(summary.input, Some(658));
+    assert_eq!(summary.cache_read, Some(512));
+    assert_eq!(summary.cache_write_total, Some(64));
+    assert_eq!(summary.output, Some(210));
     assert_eq!(
         row.extra.as_ref().and_then(|extra| extra.get("frontend")),
         Some(&json!("codex"))

@@ -1,5 +1,5 @@
-//! Session labels: what a session is about, from Claude Code's own
-//! transcript of it.
+//! Session labels: what a session is about, from each frontend's own
+//! local session metadata.
 //!
 //! The ledger never records content (invariant 1), so it can say how big
 //! a session is but not which one it is. Claude Code already keeps a
@@ -251,6 +251,159 @@ pub(crate) fn opencode_db_default() -> Option<PathBuf> {
     Some(data_home.join("opencode").join("opencode.db"))
 }
 
+/// Codex's state root: `CODEX_HOME`, or `~/.codex` when it is unset.
+pub(crate) fn codex_home_default() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(".codex"))
+}
+
+/// Codex's title and cwd for one thread, read from its own index and the
+/// first `session_meta` line of its rollout. The prompt is deliberately not
+/// read: labels stay metadata-only, and nothing returned here enters the
+/// ledger (invariant 1).
+#[cfg(test)]
+pub(crate) fn codex_label(sid: &str, home: &Path) -> Option<Label> {
+    if !safe_session_id(sid) {
+        return None;
+    }
+    codex_labels(home).remove(sid)
+}
+
+fn safe_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Load the recent Codex index and join its entries to rollout metadata in
+/// one bounded pass. The TUI builds this map once per refresh; resolving many
+/// rows must not rescan the session tree once per row.
+fn codex_labels(home: &Path) -> HashMap<String, Label> {
+    let Some(text) = codex_index_tail(&home.join("session_index.jsonl")) else {
+        return HashMap::new();
+    };
+    let mut labels = HashMap::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(sid) = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|sid| safe_session_id(sid))
+        else {
+            continue;
+        };
+        let title = value
+            .get("thread_name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|title| clean(Some(title.to_owned())));
+        labels.insert(
+            sid.to_owned(),
+            Label {
+                cwd: None,
+                title,
+                prompt: None,
+            },
+        );
+    }
+    let ids: Vec<String> = labels.keys().cloned().collect();
+    for (sid, path) in find_codex_rollouts(&ids, &home.join("sessions")) {
+        if let Some(label) = labels.get_mut(&sid) {
+            label.cwd = codex_rollout_cwd(&sid, &path);
+        }
+    }
+    labels
+}
+
+fn codex_index_tail(index: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(index).ok()?;
+    let size = file.metadata().ok()?.len();
+    let start = size.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = vec![0; (size - start) as usize];
+    let read = file.read(&mut bytes).ok()?;
+    bytes.truncate(read);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        let first_nl = text.find('\n')?;
+        text.drain(..=first_nl);
+    }
+    Some(text)
+}
+
+/// The rollout layout is `sessions/YYYY/MM/DD/rollout-…-{sid}.jsonl`.
+/// Walk exactly those three directory levels, never symlinks or an
+/// unbounded tree supplied by a ledger session id.
+fn find_codex_rollouts(ids: &[String], sessions: &Path) -> Vec<(String, PathBuf)> {
+    let mut found = Vec::new();
+    let mut level = vec![sessions.to_path_buf()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for dir in level {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    next.push(entry.path());
+                }
+            }
+        }
+        level = next;
+    }
+    for dir in level {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(sid) = ids
+                .iter()
+                .find(|sid| name.ends_with(&format!("-{sid}.jsonl")))
+            {
+                found.push((sid.clone(), entry.path()));
+            }
+        }
+    }
+    found
+}
+
+fn codex_rollout_cwd(sid: &str, path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len().min(HEAD_BYTES);
+    let mut bytes = vec![0; size as usize];
+    let read = file.read(&mut bytes).ok()?;
+    bytes.truncate(read);
+    let whole = bytes.iter().position(|byte| *byte == b'\n')?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes[..whole]).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let recorded_id = payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(serde_json::Value::as_str)?;
+    if recorded_id != sid {
+        return None;
+    }
+    payload
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|cwd| clean(Some(cwd.to_owned())))
+}
+
 /// The label a transcript tail carries; `head`, the start of the same
 /// transcript, is looked in for a custom title only when the tail has
 /// none. Only the few small records wanted are parsed —
@@ -425,6 +578,10 @@ pub(crate) struct Labels {
     roots: Vec<PathBuf>,
     /// The opencode session store, when its default location exists.
     opencode_db: Option<PathBuf>,
+    /// Codex's local metadata root, when it exists.
+    codex_home: Option<PathBuf>,
+    /// Codex labels loaded together once per refresh.
+    codex_labels: HashMap<String, Label>,
     /// Labels resolved this refresh, keyed by session id.
     resolved: HashMap<String, Option<Label>>,
 }
@@ -433,9 +590,13 @@ impl Labels {
     /// The label state over resolved roots (see [`transcript_roots`])
     /// and the opencode store's default location.
     pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
+        let codex_home = codex_home_default().filter(|home| home.is_dir());
+        let codex_labels = codex_home.as_deref().map(codex_labels).unwrap_or_default();
         Labels {
             roots,
             opencode_db: opencode_db_default().filter(|db| db.is_file()),
+            codex_home,
+            codex_labels,
             resolved: HashMap::new(),
         }
     }
@@ -446,6 +607,20 @@ impl Labels {
         Labels {
             roots,
             opencode_db: Some(db),
+            codex_home: None,
+            codex_labels: HashMap::new(),
+            resolved: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_codex_home(roots: Vec<PathBuf>, home: PathBuf) -> Self {
+        let codex_labels = codex_labels(&home);
+        Labels {
+            roots,
+            opencode_db: None,
+            codex_home: Some(home),
+            codex_labels,
             resolved: HashMap::new(),
         }
     }
@@ -456,10 +631,16 @@ impl Labels {
     /// never touch the filesystem at all.
     pub(crate) fn start_refresh(&mut self) {
         self.resolved.clear();
+        self.codex_labels = self
+            .codex_home
+            .as_deref()
+            .map(codex_labels)
+            .unwrap_or_default();
     }
 
     /// The session's label, reading its transcript tail once per
-    /// refresh, then opencode's session store. `None` when neither
+    /// refresh, then opencode's session store, then Codex's local metadata.
+    /// `None` when none
     /// carries one — a row without a name, never an error. The two
     /// id shapes never overlap (claude's UUIDs vs opencode's `ses_…`),
     /// so the order is a formality, not a precedence.
@@ -467,11 +648,13 @@ impl Labels {
         if let Some(hit) = self.resolved.get(sid) {
             return hit.clone();
         }
-        let label = session_label(sid, &self.roots, TAIL_BYTES).or_else(|| {
-            self.opencode_db
-                .as_deref()
-                .and_then(|db| opencode_label(sid, db))
-        });
+        let label = session_label(sid, &self.roots, TAIL_BYTES)
+            .or_else(|| {
+                self.opencode_db
+                    .as_deref()
+                    .and_then(|db| opencode_label(sid, db))
+            })
+            .or_else(|| self.codex_labels.get(sid).cloned());
         self.resolved.insert(sid.to_owned(), label.clone());
         label
     }
@@ -1199,6 +1382,86 @@ mod tests {
         // The refresh cache: a second resolve never re-reads (the map
         // is keyed; this pins the fall-through result cached the same).
         assert_eq!(labels.resolve("ses_ft_1"), Some(hit));
+    }
+
+    #[test]
+    fn codex_metadata_labels_a_session_without_reading_its_content() {
+        let home = scratch("codex-labels");
+        let sid = "01a10cf0-240f-79b1-bc6c-1b3fb7fb5762";
+        std::fs::write(
+            home.join("session_index.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"id": sid, "thread_name": "Old title"}),
+                json!({"id": sid, "thread_name": "Fix Codex metadata"}),
+            ),
+        )
+        .expect("write index");
+        let day = home.join("sessions/2026/10/06");
+        std::fs::create_dir_all(&day).expect("create rollout day");
+        std::fs::write(
+            day.join(format!("rollout-2026-10-06T00-00-00-{sid}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": sid, "cwd": "/home/user/code/rust/toker"}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {"message": "CONTENT CANARY must never become a label"}
+                }),
+            ),
+        )
+        .expect("write rollout");
+
+        let label = super::codex_label(sid, &home).expect("Codex label");
+        assert_eq!(label.title.as_deref(), Some("Fix Codex metadata"));
+        assert_eq!(label.cwd.as_deref(), Some("/home/user/code/rust/toker"));
+        assert_eq!(label.prompt, None);
+
+        let mut labels = Labels::with_codex_home(Vec::new(), home.clone());
+        assert_eq!(labels.resolve(sid), Some(label.clone()));
+        std::fs::write(
+            home.join("session_index.jsonl"),
+            format!("{}\n", json!({"id": sid, "thread_name": "Updated title"})),
+        )
+        .expect("rewrite index");
+        assert_eq!(labels.resolve(sid), Some(label), "cached within a refresh");
+        labels.start_refresh();
+        assert_eq!(
+            labels.resolve(sid).and_then(|label| label.title),
+            Some("Updated title".to_owned())
+        );
+    }
+
+    #[test]
+    fn codex_metadata_rejects_unsafe_and_mismatched_ids() {
+        let home = scratch("codex-label-safety");
+        assert_eq!(super::codex_label("../auth", &home), None);
+
+        let sid = "01a10cf0-240f-79b1-bc6c-1b3fb7fb5762";
+        std::fs::write(
+            home.join("session_index.jsonl"),
+            format!("{}\n", json!({"id": sid, "thread_name": "Safe"})),
+        )
+        .expect("write index");
+        let day = home.join("sessions/2026/10/06");
+        std::fs::create_dir_all(&day).expect("create rollout day");
+        std::fs::write(
+            day.join(format!("rollout-x-{sid}.jsonl")),
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "a-different-session", "cwd": "/wrong"}
+                })
+            ),
+        )
+        .expect("write rollout");
+        let label = super::codex_label(sid, &home).expect("title still labels");
+        assert_eq!(label.title.as_deref(), Some("Safe"));
+        assert_eq!(label.cwd, None, "mismatched rollout metadata is ignored");
     }
 
     /// The real machine's store, read-only: the newest sessions the

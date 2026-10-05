@@ -358,6 +358,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 /// like any other path the routes do not claim: claude asks for it too,
 /// and only the openai backend makes it an openai route.
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
+    if super::frontend_of(request.extensions()) == Some("codex") {
+        return super::codex::models(State(server), request).await;
+    }
     let Some(openrouter) = server.openrouter.clone() else {
         return super::anthropic::unmatched(State(server), request).await;
     };

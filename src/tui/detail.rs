@@ -339,10 +339,12 @@ pub(crate) fn lines(
                 vec![
                     Span::styled("in ", dim),
                     Span::raw(fmt.grouped(summary.input)),
-                    Span::styled(", out ", dim),
-                    Span::raw(fmt.grouped(summary.output)),
                     Span::styled(", cache read ", dim),
                     Span::raw(fmt.grouped(summary.cache_read)),
+                    Span::styled(", cache write ", dim),
+                    Span::raw(fmt.grouped(summary.cache_write_total)),
+                    Span::styled(", out ", dim),
+                    Span::raw(fmt.grouped(summary.output)),
                 ],
             ));
             if let Some(billed) = summary.billed_total {
@@ -596,6 +598,7 @@ mod tests {
             row.forced_to = Some("claude-opus-5-5".to_owned());
             row.input = Some(prompt);
             row.cache_read = Some(0);
+            row.cache_write_total = Some(0);
             row.cache_write_5m = Some(0);
             row.cache_write_1h = Some(0);
             row.output = Some(900);
@@ -721,6 +724,10 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("2 requests"), "{all}");
+        assert!(
+            all.contains("in 92,000, cache read 0, cache write 0, out 1,800"),
+            "{all}"
+        );
         assert!(all.contains("armed; 5h 100%"), "{all}");
         assert!(all.contains("overage for 5h until"), "{all}");
         // Aged out of the window: said so, not zeroed.

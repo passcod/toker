@@ -19,7 +19,7 @@ expression: text
            │         12 messages, - compactions                                        │            
            │ window  2 requests, output 1,800                                          │            
            │ session 2 requests since 03:31, last 1m                                   │            
-           │         in 92,000, out 1,800, cache read 0                                │            
+           │         in 92,000, cache read 0, cache write 0, out 1,800                 │            
            │ gate    armed; 5h 40% resets 04:33; 7d 31% resets Sun 03:33               │            
            │ held    nothing                                                           │            
            │                                                                           │            
