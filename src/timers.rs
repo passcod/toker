@@ -91,6 +91,9 @@ pub const ANCHOR_STEP_MS: i64 = 10 * 60_000;
 /// (11 m after the slot) always fires inside the hold.
 pub const HOLD_UNIT_FOR: &str = "15m";
 
+/// How often the hold looks at the wall clock and the lock.
+pub const HOLD_TICK: Duration = Duration::from_secs(5);
+
 /// The hold's inhibitor `--why` (the daemon's hold says "agent sessions
 /// are live"; this one says what it is for instead).
 pub const HOLD_WHY: &str = "wake hold timer";
@@ -295,15 +298,25 @@ fn hhmm_of(ms: i64, tz: &TimeZone) -> String {
 /// own lock (if it holds one) is a separate inhibitor held and
 /// released separately.
 ///
+/// The span is measured against the wall clock, ticking every
+/// [`HOLD_TICK`], not slept in one go: a sleep is monotonic and stops
+/// while the machine is suspended, so a manual suspend mid-span used to
+/// stretch the hold by however long the machine slept — and the span is
+/// about the clock, not about uptime. Each tick also checks the lock is
+/// still there; a lock that died on its own (the session bus went away)
+/// ends the verb with an error rather than a hold that holds nothing.
+///
 /// `command` is this platform's lock (the caller probes
 /// [`crate::middleware::awake::platform_command`]; tests pass a fixed
-/// one); `sleep` paces the span (production sleeps, tests record).
-/// The hold and release are printed to `out`.
+/// one); `now_ms` reads the wall clock and `sleep` paces the ticks
+/// (production reads and sleeps, tests drive a fake clock). The hold
+/// and release are printed to `out`.
 pub fn hold_lock(
     out: &mut dyn Write,
     minutes: f64,
     command: Option<InhibitCommand>,
     spawner: &mut dyn LockSpawner,
+    now_ms: &mut dyn FnMut() -> i64,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<()> {
     let Some(command) = command else {
@@ -316,9 +329,20 @@ pub fn hold_lock(
         out,
         &format!("holding the idle-sleep lock for {minutes} minutes"),
     )?;
-    // `as u64` saturates: a parser-valid span is positive and finite,
+    // `as i64` saturates: a parser-valid span is positive and finite,
     // and a pub caller cannot panic the verb with a negative one.
-    sleep(Duration::from_millis((minutes * 60_000.0) as u64));
+    let until = now_ms().saturating_add((minutes * 60_000.0) as i64);
+    loop {
+        let remaining = until - now_ms();
+        if remaining <= 0 {
+            break;
+        }
+        sleep(HOLD_TICK.min(Duration::from_millis(remaining as u64)));
+        if lock.exited() {
+            say(out, "the idle-sleep lock was lost")?;
+            bail!("the idle-sleep lock was lost before the span ended");
+        }
+    }
     lock.kill();
     say(out, "released the idle-sleep lock")?;
     Ok(())
@@ -1045,6 +1069,8 @@ mod tests {
         attempts: Arc<AtomicUsize>,
         kills: Arc<AtomicUsize>,
         fail: Arc<AtomicBool>,
+        /// Set to make the taken lock report its child gone.
+        dead: Arc<AtomicBool>,
     }
 
     impl LockSpawner for FakeSpawner {
@@ -1055,12 +1081,14 @@ mod tests {
             }
             Ok(Box::new(FakeLock {
                 kills: self.kills.clone(),
+                dead: self.dead.clone(),
             }))
         }
     }
 
     struct FakeLock {
         kills: Arc<AtomicUsize>,
+        dead: Arc<AtomicBool>,
     }
 
     impl InhibitLock for FakeLock {
@@ -1068,7 +1096,39 @@ mod tests {
             self.kills.fetch_add(1, Ordering::SeqCst);
         }
         fn exited(&mut self) -> bool {
-            false
+            self.dead.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A fake wall clock the hold's sleeps advance: each sleep moves it
+    /// by the span slept plus whatever `jump` says for that tick (a
+    /// suspend), and every span is recorded.
+    struct FakeClock {
+        now: Arc<Mutex<i64>>,
+        slept: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl FakeClock {
+        fn new() -> FakeClock {
+            FakeClock {
+                now: Arc::new(Mutex::new(utc_ms(7, 20))),
+                slept: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn now(&self) -> impl FnMut() -> i64 + use<> {
+            let now = self.now.clone();
+            move || *now.lock().unwrap()
+        }
+
+        fn sleep(&self, mut jump: impl FnMut(usize) -> i64) -> impl FnMut(Duration) {
+            let now = self.now.clone();
+            let slept = self.slept.clone();
+            move |span: Duration| {
+                let mut slept = slept.lock().unwrap();
+                slept.push(span);
+                *now.lock().unwrap() += span.as_millis() as i64 + jump(slept.len());
+            }
         }
     }
 
@@ -1081,12 +1141,18 @@ mod tests {
     #[test]
     fn hold_takes_the_lock_for_the_span_then_releases_it() {
         let fake = FakeSpawner::default();
-        let slept: Arc<Mutex<Vec<Duration>>> = Arc::new(Mutex::new(Vec::new()));
+        let clock = FakeClock::new();
         let mut out = Vec::new();
-        let mut sleep = |span: Duration| slept.lock().unwrap().push(span);
 
-        hold_lock(&mut out, 0.5, hold_command(), &mut fake.clone(), &mut sleep)
-            .expect("the hold takes and releases");
+        hold_lock(
+            &mut out,
+            0.45,
+            hold_command(),
+            &mut fake.clone(),
+            &mut clock.now(),
+            &mut clock.sleep(|_| 0),
+        )
+        .expect("the hold takes and releases");
 
         assert_eq!(
             fake.attempts.load(Ordering::SeqCst),
@@ -1095,13 +1161,68 @@ mod tests {
         );
         assert_eq!(fake.kills.load(Ordering::SeqCst), 1, "released by kill");
         // The span is exactly the parsed minutes (fractional minutes
-        // are the seam the tests and short manual holds use).
-        assert_eq!(*slept.lock().unwrap(), vec![Duration::from_millis(30_000)]);
+        // are the seam the tests and short manual holds use), ticked in
+        // 5 s steps with the last one cut to what remains.
+        let slept = clock.slept.lock().unwrap().clone();
+        assert_eq!(slept.len(), 6, "{slept:?}");
+        assert!(slept[..5].iter().all(|span| *span == super::HOLD_TICK));
+        assert_eq!(slept[5], Duration::from_secs(2));
+        assert_eq!(*clock.now.lock().unwrap(), utc_ms(7, 20) + 27_000);
         let out = String::from_utf8(out).expect("utf-8");
         assert_eq!(
-            out, "holding the idle-sleep lock for 0.5 minutes\nreleased the idle-sleep lock\n",
+            out, "holding the idle-sleep lock for 0.45 minutes\nreleased the idle-sleep lock\n",
             "the hold and the unhold are printed"
         );
+    }
+
+    #[test]
+    fn a_suspend_mid_hold_counts_against_the_span() {
+        // The machine is suspended for 20 minutes during the second
+        // tick. A monotonic sleep would hold for 15 minutes of uptime
+        // after that; the wall clock says the span is over.
+        let fake = FakeSpawner::default();
+        let clock = FakeClock::new();
+        hold_lock(
+            &mut Vec::new(),
+            15.0,
+            hold_command(),
+            &mut fake.clone(),
+            &mut clock.now(),
+            &mut clock.sleep(|tick| if tick == 2 { 20 * 60_000 } else { 0 }),
+        )
+        .expect("the hold ends");
+        assert_eq!(clock.slept.lock().unwrap().len(), 2, "released on waking");
+        assert_eq!(fake.kills.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_hold_whose_lock_dies_exits_with_an_error() {
+        let fake = FakeSpawner::default();
+        let clock = FakeClock::new();
+        let dead = fake.dead.clone();
+        let mut out = Vec::new();
+        let error = hold_lock(
+            &mut out,
+            15.0,
+            hold_command(),
+            &mut fake.clone(),
+            &mut clock.now(),
+            &mut clock.sleep(move |tick| {
+                if tick == 3 {
+                    dead.store(true, Ordering::SeqCst);
+                }
+                0
+            }),
+        )
+        .expect_err("a lost lock ends the hold");
+        assert!(format!("{error:#}").contains("lock was lost"), "{error:#}");
+        assert_eq!(
+            clock.slept.lock().unwrap().len(),
+            3,
+            "noticed on the tick it died, not at the span's end"
+        );
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(out.ends_with("the idle-sleep lock was lost\n"), "{out}");
     }
 
     #[test]
@@ -1112,6 +1233,7 @@ mod tests {
             15.0,
             None,
             &mut FakeSpawner::default(),
+            &mut || 0,
             &mut |_| {},
         )
         .expect_err("no platform lock");
@@ -1128,6 +1250,7 @@ mod tests {
             15.0,
             hold_command(),
             &mut fake.clone(),
+            &mut || 0,
             &mut |_| {},
         )
         .expect_err("the spawn failed");

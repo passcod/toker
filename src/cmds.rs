@@ -172,6 +172,7 @@ pub fn hold(for_arg: String) -> anyhow::Result<()> {
             crate::timers::HOLD_WHY,
         ),
         &mut spawner,
+        &mut || jiff::Timestamp::now().as_millisecond(),
         &mut |span| std::thread::sleep(span),
     )
 }
