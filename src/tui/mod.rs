@@ -26,6 +26,8 @@
 //!   classification over the store's rebuild-tail projection.
 //! - [view]: snapshot + frame in, pixels out, via ratatui. Rendering is
 //!   exercised with ratatui's `TestBackend`, never a real terminal.
+//! - [reexec]: the loop's watch on its own binary, so a dashboard left
+//!   open across an install restarts as the new one.
 //! - [`run`]: the loop wiring them to the store. Reads tolerate a
 //!   concurrently-writing daemon — WAL plus the store's busy timeout
 //!   already cover it (see `store` module docs).
@@ -40,6 +42,7 @@ mod locale;
 mod model;
 mod quota;
 mod rebuilds;
+mod reexec;
 mod view;
 
 use std::collections::HashMap;
@@ -126,8 +129,11 @@ pub fn run(
     extra_transcript_roots: &[PathBuf],
 ) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
+    // Taken before the terminal: the file this process was started
+    // from, while it is still the one on disk.
+    let mut exe = reexec::ExeWatch::current();
     let mut terminal = ratatui::try_init()?;
-    let _restore = RestoreGuard;
+    let restore = RestoreGuard;
 
     // The system zone, read once: every local clock the panels render
     // (the quota resets and runout labels) anchors here.
@@ -166,8 +172,16 @@ pub fn run(
         }
     };
     let mut snapshot = model::empty(window_mins);
+    let mut upgraded = false;
     loop {
         if Instant::now() >= next_tick {
+            // One stat a tick: the binary was replaced (an install), so
+            // hand over to the new one rather than keep showing the
+            // old code's view.
+            if exe.as_mut().is_some_and(reexec::ExeWatch::check) {
+                upgraded = true;
+                break;
+            }
             let due = cadence.due(Instant::now(), store.data_version()?);
             if due.heavy {
                 quota = quota_snapshot(&store, window_mins)?;
@@ -240,6 +254,18 @@ pub fn run(
                 _ => {}
             }
         }
+    }
+    if upgraded && let Some(exe) = exe {
+        // The terminal goes back first, so the new binary's own init
+        // starts from a clean one and a failed exec leaves the shell
+        // usable.
+        drop(terminal);
+        drop(restore);
+        let error = reexec::exec(exe.path());
+        return Err(anyhow::Error::new(error).context(format!(
+            "tui: re-exec of the upgraded {} failed",
+            exe.path().display()
+        )));
     }
     Ok(())
 }
