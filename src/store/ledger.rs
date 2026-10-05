@@ -27,6 +27,8 @@ pub enum RowKind {
     Cold,
     /// Cold gate active but the notice was withheld — silence ≠ breakage.
     ColdQuiet,
+    /// A recap on a cold lane was answered by the gate, never forwarded.
+    ColdRecap,
     /// Sleep-lock wake/sleep transition.
     Awake,
     /// Non-2xx on a usage path; `status`/`error_type`/`retry_after_ms` set, never priced.
@@ -45,6 +47,7 @@ impl RowKind {
             Self::Released => "released",
             Self::Cold => "cold",
             Self::ColdQuiet => "cold-quiet",
+            Self::ColdRecap => "cold-recap",
             Self::Awake => "awake",
             Self::Error => "error",
             Self::FidelityDrift => "fidelity-drift",
@@ -59,6 +62,7 @@ impl RowKind {
             "released" => Some(Self::Released),
             "cold" => Some(Self::Cold),
             "cold-quiet" => Some(Self::ColdQuiet),
+            "cold-recap" => Some(Self::ColdRecap),
             "awake" => Some(Self::Awake),
             "error" => Some(Self::Error),
             "fidelity-drift" => Some(Self::FidelityDrift),

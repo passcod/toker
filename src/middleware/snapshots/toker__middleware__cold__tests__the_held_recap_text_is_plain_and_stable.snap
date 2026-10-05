@@ -1,0 +1,5 @@
+---
+source: src/middleware/cold.rs
+expression: RECAP_HELD
+---
+Recap held by toker: the cache is cold, and a recap would re-read the whole session.

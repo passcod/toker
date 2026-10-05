@@ -87,8 +87,8 @@ use super::proxy::{
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
     AnthropicRecordCtx, BlockedRecord, ColdRecord, error_pair, record_anthropic_blocked,
-    record_anthropic_cold, record_anthropic_cold_quiet, record_anthropic_error,
-    record_anthropic_measurement, record_anthropic_released,
+    record_anthropic_cold, record_anthropic_cold_quiet, record_anthropic_cold_recap,
+    record_anthropic_error, record_anthropic_measurement, record_anthropic_released,
 };
 use crate::middleware::model_map;
 
@@ -484,7 +484,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let gates = &server.config.gates;
         let now = now_ms();
         let min_idle_ms = cold_idle_ms(gates);
-        let summarising = gate_shape.as_ref().is_some_and(|shape| shape.summarising);
+        let turn = match gate_shape.as_ref() {
+            Some(shape) if shape.summarising => cold::Turn::Summarising,
+            Some(shape) if shape.recap => cold::Turn::Recap,
+            _ => cold::Turn::Ordinary,
+        };
         // Twice, deliberately: the first call is
         // the cheap one and decides whether anything would fire at all;
         // only then is the outlook worth measuring — a weight refit over
@@ -492,7 +496,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // stopped and far too much for every request.
         let fired = cold::decide_cold(
             cold_lane.as_ref(),
-            summarising,
+            turn,
             gates.cold_min_tokens,
             min_idle_ms,
             now,
@@ -539,7 +543,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         } else if matches!(fired, cold::ColdDecision::Notice { .. }) {
             cold::decide_cold(
                 cold_lane.as_ref(),
-                summarising,
+                turn,
                 gates.cold_min_tokens,
                 min_idle_ms,
                 now,
@@ -557,6 +561,47 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // said, nothing reached upstream), so the lane stays cold and
             // a later request in the same idle spell is judged again
             // against meters that may have tightened.
+            // A recap on a cold lane: answered here, never forwarded,
+            // and the lane untouched (neither `at` nor `noticed_at`), so
+            // the notice stays armed for the prompt the user sends next
+            // and a compaction still sees the lane cold.
+            cold::ColdDecision::Recap { idle_ms, prompt } => {
+                record_anthropic_cold_recap(ColdRecord {
+                    frontend: frontend.as_deref(),
+                    server: &server,
+                    started,
+                    path,
+                    session_id: session_id.as_deref(),
+                    backend_id: backend.id(),
+                    tools_hash: shape_for_rows(),
+                    idle_ms,
+                    prompt,
+                    outlook: None,
+                    writes_free: false,
+                    req_messages: gate_shape
+                        .as_ref()
+                        .and_then(|shape| shape.req_messages)
+                        .map(|messages| messages as i64),
+                    compact_target: None,
+                    gate_on: server.config.gates.quota_enabled,
+                });
+                let rendering = if stream_explicitly_false {
+                    Rendering::Json
+                } else {
+                    Rendering::Sse
+                };
+                let body =
+                    Blocking::blocked_turn(cold::RECAP_HELD, client_model.as_deref(), rendering);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    match rendering {
+                        Rendering::Sse => header::HeaderValue::from_static("text/event-stream"),
+                        Rendering::Json => header::HeaderValue::from_static("application/json"),
+                    },
+                );
+                return build_response(StatusCode::OK, headers, Body::from(body));
+            }
             cold::ColdDecision::Quiet {
                 idle_ms,
                 prompt,

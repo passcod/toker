@@ -81,6 +81,7 @@ fn expected_shape(
         compact_generations,
         summarising,
         compact_marker: None,
+        recap: false,
         system_ladder,
         system_tail,
     }

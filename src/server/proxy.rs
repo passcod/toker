@@ -210,7 +210,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // the notice exists to advise compacting, and stopping the
             // compaction would halt the user a keystroke after telling
             // them to go ahead.
-            gate_shape.as_ref().is_some_and(|shape| shape.summarising),
+            if gate_shape.as_ref().is_some_and(|shape| shape.summarising) {
+                cold::Turn::Summarising
+            } else {
+                cold::Turn::Ordinary
+            },
             gates.cold_min_tokens,
             Some(lanes::OPENAI_LANE_TTL_MS),
             now,

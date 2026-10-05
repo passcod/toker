@@ -167,7 +167,20 @@ pub fn lane_is_cold(
 
 // ── the decision ─────────────────────────────────────────────────────
 
-/// Notice, withheld notice, or forward — the cold gate's whole answer.
+/// What kind of turn a request is, as far as the cold gate cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// Anything the client means to continue the conversation with.
+    Ordinary,
+    /// Carries the summarisation prompt: forwarded, never interrupted.
+    Summarising,
+    /// Claude Code's recap ([`crate::ir::AnthropicShape::recap`]): a
+    /// fork of the whole conversation for one UI-only line.
+    Recap,
+}
+
+/// Notice, withheld notice, held recap, or forward — the cold gate's
+/// whole answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColdDecision {
     /// Not this gate's business: warm, small, already spoken about,
@@ -192,11 +205,28 @@ pub enum ColdDecision {
         prompt: u64,
         outlook: Option<Outlook>,
     },
+    /// A recap on a cold lane: answered with [`RECAP_HELD`], never sent
+    /// upstream, and the lane left exactly as it was.
+    Recap { idle_ms: i64, prompt: u64 },
 }
+
+/// The held recap's reply. Claude Code shows a recap as one dim line
+/// outside the transcript, so this is plain text with no notice frame;
+/// fixed, so it is byte-stable like every gate's text.
+pub const RECAP_HELD: &str =
+    "Recap held by toker: the cache is cold, and a recap would re-read the whole session.";
 
 /// Notice or forward (ported exactly,
 /// with the suppression's verdict folded into [`ColdDecision::Quiet`]).
 ///
+/// - A **recap** on a cold lane is held ([`ColdDecision::Recap`]),
+///   before the once-per-spell rule and the outlook. Forwarding one buys
+///   the whole re-read for a sentence of UI text: on 2026-10-06 a recap
+///   fired three seconds after a notice (the synthetic turn's end resets
+///   Claude Code's own staleness clock), the gate had already spoken, and
+///   it rewrote 405k of cache for $3.26. Holding it never spends the
+///   notice either, which a recap arriving first would otherwise take,
+///   letting the real prompt after it through unwarned.
 /// - A **summarising** request forwards: the notice exists to advise
 ///   `/compact`, and stopping one would halt the user a keystroke after
 ///   telling them to go ahead. This refusal is about interrupting, not
@@ -214,14 +244,14 @@ pub enum ColdDecision {
 ///   a turn the user never saw.
 pub fn decide_cold(
     lane: Option<&Lane>,
-    summarising: bool,
+    turn: Turn,
     min_tokens: u64,
     min_idle_ms: Option<i64>,
     now_ms: i64,
     outlook: Option<&Outlook>,
     request_bound: Option<u64>,
 ) -> ColdDecision {
-    if summarising {
+    if turn == Turn::Summarising {
         return ColdDecision::Forward;
     }
     // The lane says what was cached; only the request says what this send
@@ -240,6 +270,12 @@ pub fn decide_cold(
     let Some(cold) = coldness(Some(lane), min_tokens, min_idle_ms, now_ms) else {
         return ColdDecision::Forward;
     };
+    if turn == Turn::Recap {
+        return ColdDecision::Recap {
+            idle_ms: cold.idle_ms,
+            prompt: cold.prompt,
+        };
+    }
     if lane
         .noticed_at
         .is_some_and(|noticed| noticed >= lane.updated_ms)
@@ -2316,10 +2352,10 @@ pub fn retarget_compaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        Burn, ColdBlocking, ColdDecision, DEFAULT_MIN_TOKENS, METER_5H, Outlook, RetargetOutcome,
-        Verdict, burn_rate, burn_rate_samples, cheaper_of, coldness, decide_cold, fit_quota_model,
-        human_idle, lane_is_cold, outlook_of, outlook_over, outlook_target, project_to,
-        quota_outlook, retarget_compaction, ttl_of,
+        Burn, ColdBlocking, ColdDecision, DEFAULT_MIN_TOKENS, METER_5H, Outlook, RECAP_HELD,
+        RetargetOutcome, Turn, Verdict, burn_rate, burn_rate_samples, cheaper_of, coldness,
+        decide_cold, fit_quota_model, human_idle, lane_is_cold, outlook_of, outlook_over,
+        outlook_target, project_to, quota_outlook, retarget_compaction, ttl_of,
     };
     use crate::ir::Request;
     use crate::middleware::notice::NoticeStyle;
@@ -2624,6 +2660,91 @@ mod tests {
     // ── the decision ────────────────────────────────────────────────
 
     #[test]
+    fn a_recap_on_a_cold_lane_is_held_whether_or_not_the_notice_fired() {
+        let cold = lane(NOW - 2 * HOUR, 200_000, None);
+        let held = ColdDecision::Recap {
+            idle_ms: 2 * HOUR,
+            prompt: 200_000,
+        };
+        assert_eq!(
+            decide_cold(
+                Some(&cold),
+                Turn::Recap,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
+            held
+        );
+        // Already spoken about this spell: an ordinary turn forwards (the
+        // resend is the override), a recap is still held.
+        let mut noticed = cold.clone();
+        noticed.noticed_at = Some(NOW - 1_000);
+        assert_eq!(
+            decide_cold(
+                Some(&noticed),
+                Turn::Ordinary,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
+            ColdDecision::Forward
+        );
+        assert_eq!(
+            decide_cold(
+                Some(&noticed),
+                Turn::Recap,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
+            held
+        );
+        // Warm, or too small to matter: a recap forwards like any turn.
+        let warm = lane(NOW - 60_000, 200_000, None);
+        assert_eq!(
+            decide_cold(
+                Some(&warm),
+                Turn::Recap,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
+            ColdDecision::Forward
+        );
+        assert_eq!(
+            decide_cold(
+                Some(&cold),
+                Turn::Recap,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                Some(10)
+            ),
+            ColdDecision::Forward
+        );
+    }
+
+    #[test]
+    fn the_held_recap_text_is_plain_and_stable() {
+        assert!(!RECAP_HELD.contains('\u{2014}'), "no em dash");
+        assert!(
+            RECAP_HELD.len() < 400,
+            "Claude Code caps a recap at 400 chars"
+        );
+        insta::assert_snapshot!(RECAP_HELD);
+    }
+
+    #[test]
     fn a_summarising_request_forwards_even_on_a_cold_lane() {
         // THE compaction-vs-notice answer: the notice exists to advise
         // `/compact`, so it never interrupts one — and the refusal is on
@@ -2632,14 +2753,22 @@ mod tests {
         // `lane_is_cold` for the cache question instead.
         let cold = lane(NOW - 2 * HOUR, 200_000, None);
         assert_eq!(
-            decide_cold(Some(&cold), true, DEFAULT_MIN_TOKENS, None, NOW, None, None),
+            decide_cold(
+                Some(&cold),
+                Turn::Summarising,
+                DEFAULT_MIN_TOKENS,
+                None,
+                NOW,
+                None,
+                None
+            ),
             ColdDecision::Forward
         );
         // Without the flag, the same lane notices.
         assert!(matches!(
             decide_cold(
                 Some(&cold),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2660,7 +2789,7 @@ mod tests {
         assert_eq!(
             decide_cold(
                 Some(&noticed),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2678,7 +2807,7 @@ mod tests {
         assert!(matches!(
             decide_cold(
                 Some(&re_armed),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2691,7 +2820,7 @@ mod tests {
         assert_eq!(
             decide_cold(
                 Some(&lane(NOW - 2 * HOUR, 200_000, None)),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2721,7 +2850,7 @@ mod tests {
         assert_eq!(
             decide_cold(
                 Some(&marked),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2783,7 +2912,7 @@ mod tests {
         assert!(matches!(
             decide_cold(
                 Some(&cold),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2795,7 +2924,7 @@ mod tests {
         assert_eq!(
             decide_cold(
                 Some(&cold),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2828,7 +2957,7 @@ mod tests {
         assert_eq!(
             decide_cold(
                 Some(&cold),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,
@@ -2847,7 +2976,7 @@ mod tests {
         assert!(matches!(
             decide_cold(
                 Some(&cold),
-                false,
+                Turn::Ordinary,
                 DEFAULT_MIN_TOKENS,
                 None,
                 NOW,

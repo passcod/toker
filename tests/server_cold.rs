@@ -606,6 +606,109 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     assert_no_more_rows(&store, 2).await;
 }
 
+/// Claude Code's recap: the main conversation, tools included, with the
+/// recap prompt appended as the last turn and a hook's system message
+/// after it.
+fn recap_body() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "stream": true,
+        "tools": [
+            {"name": "Read", "input_schema": {"type": "object"}},
+            {"name": "Bash", "input_schema": {"type": "object"}},
+        ],
+        "messages": [
+            {"role": "user", "content": "x".repeat(400_000)},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "The user stepped away and is coming back. Recap in under 40 words."},
+            {"role": "system", "content": [{"type": "text", "text": "[hook output]"}]},
+        ],
+    }))
+    .expect("serialise recap body")
+}
+
+/// The delta text of a synthetic SSE turn.
+fn delta_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "content_block_delta")
+        .and_then(|event| event["delta"]["text"].as_str().map(str::to_owned))
+        .expect("a delta")
+}
+
+// The 2026-10-06 incident in both orders: a recap after the notice was
+// forwarded and rewrote the whole cache, and a recap before the prompt
+// would have spent the notice on a UI-only line.
+#[tokio::test]
+async fn a_recap_on_a_cold_lane_is_held_without_spending_the_notice() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream)).await;
+
+    let prompt = tools_body("claude-opus-5");
+    let recap = recap_body();
+    assert_eq!(lane_key_of(&prompt), lane_key_of(&recap), "one lane");
+    poison_cold_lane(&store, &prompt, 2 * 3_600_000);
+
+    // The recap first: held, not forwarded, and the lane untouched.
+    let response = post_messages(addr, &recap).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = delta_text(&response.bytes().await.expect("bytes"));
+    assert!(text.starts_with("Recap held by toker"), "{text}");
+    assert!(mock.captured().is_empty(), "the gate answered, not the API");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::ColdRecap));
+    assert_eq!(extra_of(&rows[0])["lastPrompt"], json!(200_000));
+    let lane = store
+        .load_lane(&lane_key_of(&prompt))
+        .expect("load")
+        .expect("lane");
+    assert_eq!(lane.noticed_at, None, "the notice is still armed");
+
+    // So the real prompt still gets the notice.
+    let response = post_messages(addr, &prompt).await;
+    let text = delta_text(&response.bytes().await.expect("bytes"));
+    assert!(text.contains("200,000"), "the notice: {text}");
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[1].kind, Some(RowKind::Cold));
+
+    // The recap after the notice: still held, where the resend rule
+    // used to forward it into a full rebuild.
+    let response = post_messages(addr, &recap).await;
+    let text = delta_text(&response.bytes().await.expect("bytes"));
+    assert!(text.starts_with("Recap held by toker"), "{text}");
+    assert!(mock.captured().is_empty(), "still nothing upstream");
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows[2].kind, Some(RowKind::ColdRecap));
+
+    // And the user's resend forwards as before.
+    let response = post_messages(addr, &prompt).await;
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        non_stream_body("claude-opus-5").as_slice()
+    );
+    wait_for_rows(&store, 4).await;
+    assert_no_more_rows(&store, 4).await;
+}
+
+// A warm lane forwards a recap: it reads the cache like any turn, and
+// the row says it was one.
+#[tokio::test]
+async fn a_recap_on_a_warm_lane_forwards_and_is_marked() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream)).await;
+    let recap = recap_body();
+    poison_cold_lane(&store, &recap, 60_000);
+
+    let response = post_messages(addr, &recap).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 1, "forwarded");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None);
+    assert_eq!(extra_of(&rows[0])["recap"], json!(true));
+}
+
 #[tokio::test]
 async fn an_on_track_outlook_withholds_the_notice_and_records_cold_quiet() {
     let (mock, upstream) = spawn_mock().await;

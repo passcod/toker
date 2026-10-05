@@ -809,6 +809,7 @@ mod tests {
             RowKind::Released,
             RowKind::Cold,
             RowKind::ColdQuiet,
+            RowKind::ColdRecap,
             RowKind::Awake,
             RowKind::Error,
             RowKind::FidelityDrift,

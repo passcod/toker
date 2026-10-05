@@ -107,7 +107,11 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
                 let summarising = input.get("summarising") == Some(&Value::Bool(true));
                 let decision = cold::decide_cold(
                     lane.as_ref(),
-                    summarising,
+                    if summarising {
+                        cold::Turn::Summarising
+                    } else {
+                        cold::Turn::Ordinary
+                    },
                     cold::DEFAULT_MIN_TOKENS,
                     None,
                     now_ms,

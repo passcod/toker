@@ -82,6 +82,10 @@ pub(crate) const COMPACT_PERFORMING: &[&str] = &[
     "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.",
 ];
 const COMPACT_RESUMED: &str = "This session is being continued from a previous conversation";
+// The opening sentence of Claude Code's recap prompt (its "away summary"),
+// matched at a line start in the last turn like the compaction wordings.
+// Only whether it matched is recorded (invariant 1).
+const RECAP_PROMPT: &str = "The user stepped away and is coming back.";
 
 // Ladder geometry. `pub(crate)`: the TUI's
 // rebuild localisation re-derives rung offsets from the same geometry the
@@ -209,6 +213,7 @@ impl<'a> AnthropicBody<'a> {
 
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
         let (compact_generations, summarising, compact_marker) = compaction_of(messages.parts);
+        let recap = last_turn_begins_line(messages.parts, &[RECAP_PROMPT]);
         let system_messages = {
             let count = messages
                 .iter()
@@ -241,6 +246,7 @@ impl<'a> AnthropicBody<'a> {
             compact_generations,
             summarising,
             compact_marker,
+            recap,
             system_ladder: prefix_ladder(&system_units),
             system_tail: suffix_ladder(&system_units),
         }
@@ -660,6 +666,12 @@ pub struct AnthropicShape {
     /// Where a summarisation wording sits near the end, matched or not
     /// ([`CompactMarker`]). Diagnostic only: nothing acts on it.
     pub compact_marker: Option<CompactMarker>,
+    /// Whether this is Claude Code's recap: the last non-system message
+    /// begins a line with the recap prompt. A recap forks the whole
+    /// conversation, tools and cache parameters included, for one line of
+    /// UI text that never enters the transcript, so the cold gate holds it
+    /// on a cold lane ([`crate::middleware::cold::Turn::Recap`]).
+    pub recap: bool,
     /// Cumulative system-text digests every 8 KiB (`LADDER_STEP`):
     /// the first rung that differs between two requests bounds the
     /// change to one 8 KiB window. Complete steps only, so the final
@@ -746,16 +758,24 @@ fn compaction_of(messages: &[Value]) -> (Option<u64>, bool, Option<CompactMarker
     let generations = count_of(&Message { value: first }.text(), COMPACT_RESUMED);
     let compact_generations = (generations > 0).then_some(generations);
 
-    let summarising = messages
+    let summarising = last_turn_begins_line(messages, COMPACT_PERFORMING);
+    (compact_generations, summarising, compact_marker(messages))
+}
+
+/// Whether the last non-system message begins a line with any of
+/// `markers` and carries no tool result: the position rules a fixed
+/// prompt Claude Code appends to the conversation is matched under
+/// ([`compaction_of`] has the reasons).
+fn last_turn_begins_line(messages: &[Value], markers: &[&str]) -> bool {
+    messages
         .iter()
         .rposition(|value| Message { value }.role() != Some("system"))
         .is_some_and(|at| {
             let last = Message {
                 value: &messages[at],
             };
-            !last.has_tool_result() && begins_line_any(&last.text(), COMPACT_PERFORMING)
-        });
-    (compact_generations, summarising, compact_marker(messages))
+            !last.has_tool_result() && begins_line_any(&last.text(), markers)
+        })
 }
 
 /// How many messages from the end [`compact_marker`] looks at: enough to
@@ -1408,6 +1428,30 @@ mod tests {
         // A system message carrying the wording is not the prompt.
         let in_system = body_of(vec![user_text("Earlier."), system_text(PREAMBLE)]);
         assert!(!parse(&in_system).anthropic().shape().summarising);
+    }
+
+    #[test]
+    fn a_recap_is_its_prompt_opening_the_last_turn() {
+        const RECAP: &str = "The user stepped away and is coming back. Recap in under 40 words.";
+        let recap = body_of(vec![
+            user_text("Earlier."),
+            assistant_text("Done."),
+            user_text(RECAP),
+            system_text("hook output"),
+        ]);
+        let shape = parse(&recap).anthropic().shape();
+        assert!(shape.recap);
+        assert!(!shape.summarising);
+
+        // Quoted mid-line, or anywhere but the last turn, it is not one.
+        let quoted = body_of(vec![user_text(&format!("It said '{RECAP}' to me."))]);
+        assert!(!parse(&quoted).anthropic().shape().recap);
+        let earlier = body_of(vec![
+            user_text(RECAP),
+            assistant_text("A recap."),
+            user_text("Carry on."),
+        ]);
+        assert!(!parse(&earlier).anthropic().shape().recap);
     }
 
     #[test]

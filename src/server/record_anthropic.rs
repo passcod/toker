@@ -517,13 +517,25 @@ fn measurement_row(
         retry_after_ms: None,
         // Where a summarisation wording sat, when one was near the end:
         // the evidence the detector's position rules are checked against.
-        extra: shape
-            .and_then(|s| s.compact_marker.as_ref())
-            .map(|marker| json!({ "compactMarker": marker.to_json() })),
+        extra: shape.and_then(shape_extra),
         betas: ctx.betas.as_ref().map(|betas| betas.to_string()),
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
     }
+}
+
+/// The shape's diagnostics for a measurement row's `extra`: where a
+/// compaction wording sat, and whether the request was a recap (so what
+/// forwarded recaps cost stays measurable). `None` when neither applies.
+fn shape_extra(shape: &AnthropicShape) -> Option<Value> {
+    let mut extra = serde_json::Map::new();
+    if let Some(marker) = &shape.compact_marker {
+        extra.insert("compactMarker".to_owned(), marker.to_json());
+    }
+    if shape.recap {
+        extra.insert("recap".to_owned(), Value::Bool(true));
+    }
+    (!extra.is_empty()).then_some(Value::Object(extra))
 }
 
 /// The shape whose ladders the row keeps, or `None` when it drops them.
@@ -883,6 +895,18 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
 /// those gets counted as an observation of the API. No usage, never
 /// priced.
 pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
+    write_cold_row(record, RowKind::Cold, "COLD");
+}
+
+/// The held-recap row: the `cold` row's payload under its own kind, so a
+/// held recap is visible without reading as a notice (the lane reseed
+/// restores `noticed_at` from `cold` rows only, and a held recap must not
+/// spend the notice).
+pub(crate) fn record_anthropic_cold_recap(record: ColdRecord<'_>) {
+    write_cold_row(record, RowKind::ColdRecap, "RECAP held");
+}
+
+fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
     let ColdRecord {
         server,
         started,
@@ -906,7 +930,7 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         id: None,
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
-        kind: Some(RowKind::Cold),
+        kind: Some(kind),
         frontend: Some("anthropic".to_owned()),
         provider: Some(backend_id.to_owned()),
         route: Some(format!("anthropic:{backend_id}")),
@@ -978,7 +1002,7 @@ pub(crate) fn record_anthropic_cold(record: ColdRecord<'_>) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
-        "POST {path} → COLD {} idle {} · {} tokens",
+        "POST {path} → {verb} {} idle {} · {} tokens",
         session_id
             .and_then(|session| session.get(0..8))
             .unwrap_or("?"),
