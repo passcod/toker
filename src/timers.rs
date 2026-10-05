@@ -58,7 +58,7 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::Output;
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -112,6 +112,19 @@ const READBACK_ATTEMPTS: usize = 10;
 
 /// The pause between readback attempts.
 const READBACK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The model the ping asks for when `TOKER_PING_MODEL` does not say:
+/// the cheapest. A ping buys a window's phase, and any model opens it.
+pub const PING_MODEL: &str = "haiku";
+
+/// What the ping says. Any prompt opens the window; the reply is never
+/// read or kept (it is completion content).
+const PING_PROMPT: &str = "Reply with the single word: ok";
+
+/// How long the client may take before it is killed. The predecessor's
+/// figure: a ping is one tiny request, and one hung past this has
+/// already missed the bucket it was aiming at.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The anthropic subscription backend's provider id
 /// ([`crate::providers::anthropic::AnthropicSub`]'s): the only meter
@@ -325,6 +338,25 @@ pub struct PingConfig<'a> {
     /// The configured ping header's name (the client's
     /// `ANTHROPIC_CUSTOM_HEADERS` entry).
     pub ping_header: &'a str,
+    /// The claude CLI to run (`TOKER_PING_CLAUDE`, else `claude` on
+    /// PATH).
+    pub claude: &'a str,
+    /// The model the ping asks for (`TOKER_PING_MODEL`, else
+    /// [`PING_MODEL`]).
+    pub model: &'a str,
+}
+
+/// One client run: what to run, where, and for how long.
+pub struct Invocation<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    /// Overrides on top of the inherited environment.
+    pub env: &'a [(&'a str, String)],
+    /// The working directory: a fresh empty one, so no project
+    /// `CLAUDE.md` is picked up and paid for.
+    pub cwd: &'a Path,
+    /// Past this the child is killed and the run is an `Err`.
+    pub timeout: Duration,
 }
 
 /// How the ping shells out to the claude CLI. Production runs the real
@@ -334,23 +366,88 @@ pub struct PingConfig<'a> {
 /// through toker, to the subscription — and toker adds exactly two
 /// variables: the base URL and the ping header.
 pub trait CommandRunner {
-    /// Run `program` with `args` and the `env` overrides, to
-    /// completion. A non-zero exit is `Ok(Output)` — the caller reads
-    /// the status; `Err` is "the command could not run at all".
-    fn run(&self, program: &str, args: &[&str], env: &[(&str, String)]) -> Result<Output>;
+    /// Run the invocation to completion. A non-zero exit is
+    /// `Ok(status)` — the caller reads it; `Err` is "the command could
+    /// not run at all, or was killed at its timeout". Only the status
+    /// comes back: the child's output is a reply, which is completion
+    /// content and never read.
+    fn run(&self, invocation: &Invocation<'_>) -> Result<ExitStatus>;
 }
 
 /// The real runner: std::process, inheriting the parent's environment
-/// (so the child keeps whatever login it has) plus the overrides.
+/// (so the child keeps whatever login it has) plus the overrides, with
+/// its output discarded.
 pub struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
-    fn run(&self, program: &str, args: &[&str], env: &[(&str, String)]) -> Result<Output> {
-        std::process::Command::new(program)
-            .args(args)
-            .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
-            .output()
-            .with_context(|| format!("running {program} {}", args.join(" ")))
+    fn run(&self, invocation: &Invocation<'_>) -> Result<ExitStatus> {
+        use std::process::Stdio;
+        let what = || format!("{} {}", invocation.program, invocation.args.join(" "));
+        // Discarded rather than piped: nothing reads it, and an unread
+        // pipe that fills would stall the child until the timeout.
+        let mut child = std::process::Command::new(invocation.program)
+            .args(invocation.args)
+            .envs(
+                invocation
+                    .env
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str())),
+            )
+            .current_dir(invocation.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("running {}", what()))?;
+        let deadline = std::time::Instant::now() + invocation.timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("waiting on {}", what()))?
+            {
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "{} timed out after {} s and was killed",
+                    what(),
+                    invocation.timeout.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// A fresh, empty working directory for the client, removed on drop.
+/// Fresh rather than the temp root itself, so whatever lands in the
+/// temp root can never be read as a project for the ping to load.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new() -> Result<ScratchDir> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "toker-ping-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating the ping's working dir {}", path.display()))?;
+        Ok(ScratchDir(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -508,19 +605,41 @@ pub fn ping_window(
             format!("{}: 1", config.ping_header),
         ),
     ];
+    // The cheapest request that opens a window: the smallest model, and
+    // --strict-mcp-config to skip the configured MCP servers, whose tool
+    // definitions the ping has no use for (measured by the predecessor:
+    // 56,583 fresh tokens down to 45,096). The rest is Claude Code's own
+    // system prompt and global memory, which a ping cannot shed — the
+    // credentials it needs live in the config dir it would have to
+    // abandon to do so.
+    let args = [
+        "-p",
+        PING_PROMPT,
+        "--model",
+        config.model,
+        "--strict-mcp-config",
+    ];
     let started = std::time::Instant::now();
-    let output = runner.run("claude", &["-p", "hi"], &env);
+    let output = ScratchDir::new().and_then(|cwd| {
+        runner.run(&Invocation {
+            program: config.claude,
+            args: &args,
+            env: &env,
+            cwd: &cwd.0,
+            timeout: PING_TIMEOUT,
+        })
+    });
     let duration_ms = started.elapsed().as_millis() as i64;
-    let exit_code = output.as_ref().ok().and_then(|output| output.status.code());
-    let completed = matches!(&output, Ok(output) if output.status.success());
+    let exit_code = output.as_ref().ok().and_then(|status| status.code());
+    let completed = matches!(&output, Ok(status) if status.success());
     // Deliberately only the exit code, never the output: a reply is
     // completion content, which nothing toker writes may hold.
     match &output {
-        Ok(output) => say(
+        Ok(status) => say(
             out,
             &format!(
                 "slot {slot_hhmm}: claude exited {}",
-                output.status.code().unwrap_or(-1)
+                status.code().unwrap_or(-1)
             ),
         )?,
         Err(error) => say(
@@ -645,7 +764,7 @@ mod tests {
     use crate::setup::test_dir;
     use crate::store::{PingAction, PingRecord, RequestRow, Store};
     use jiff::tz::TimeZone;
-    use std::process::Output;
+    use std::process::ExitStatus;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -995,9 +1114,18 @@ mod tests {
 
     // ── ping-window ────────────────────────────────────────────────
 
-    /// One recorded client invocation: the program, its args, and the
-    /// env overrides it was given.
-    type ClientCall = (String, Vec<String>, Vec<(String, String)>);
+    /// One recorded client invocation: the program, its args, the env
+    /// overrides it was given, its working dir (and whether that was an
+    /// existing, empty directory when it ran), and its timeout.
+    #[derive(Clone)]
+    struct ClientCall {
+        program: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: std::path::PathBuf,
+        cwd_fresh: bool,
+        timeout: Duration,
+    }
 
     /// The scripted client: records every invocation's shape, answers
     /// with a fixed exit code, and lands the rows its request would have
@@ -1040,19 +1168,20 @@ mod tests {
     }
 
     impl CommandRunner for ScriptedClient {
-        fn run(
-            &self,
-            program: &str,
-            args: &[&str],
-            env: &[(&str, String)],
-        ) -> anyhow::Result<Output> {
-            self.calls.lock().unwrap().push((
-                program.to_owned(),
-                args.iter().map(|arg| arg.to_string()).collect(),
-                env.iter()
+        fn run(&self, invocation: &super::Invocation<'_>) -> anyhow::Result<ExitStatus> {
+            self.calls.lock().unwrap().push(ClientCall {
+                program: invocation.program.to_owned(),
+                args: invocation.args.iter().map(|arg| arg.to_string()).collect(),
+                env: invocation
+                    .env
+                    .iter()
                     .map(|(name, value)| ((*name).to_owned(), value.clone()))
                     .collect(),
-            ));
+                cwd: invocation.cwd.to_owned(),
+                cwd_fresh: std::fs::read_dir(invocation.cwd)
+                    .is_ok_and(|mut entries| entries.next().is_none()),
+                timeout: invocation.timeout,
+            });
             if self.fail {
                 anyhow::bail!("claude: command not found");
             }
@@ -1063,11 +1192,7 @@ mod tests {
             }
             use std::os::unix::process::ExitStatusExt;
             // A wait status, not a code: the code rides the high byte.
-            Ok(Output {
-                status: std::process::ExitStatus::from_raw(self.exit_code << 8),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })
+            Ok(ExitStatus::from_raw(self.exit_code << 8))
         }
     }
 
@@ -1178,6 +1303,8 @@ mod tests {
             db_path: db,
             port: PORT,
             ping_header: header,
+            claude: "claude",
+            model: super::PING_MODEL,
         }
     }
 
@@ -1206,15 +1333,31 @@ mod tests {
         )
         .expect("the ping lands");
 
-        // The invocation's shape: claude -p with a tiny prompt, and the
-        // two env vars — the base URL from the port, the ping header by
+        // The invocation's shape: claude -p with a tiny prompt, on the
+        // cheapest model with no MCP servers loaded, from a fresh empty
+        // directory that is gone afterwards, bounded at 120 s — and the
+        // two env vars: the base URL from the port, the ping header by
         // the CONFIGURED name carrying the frozen literal 1.
         let calls = client.calls();
         assert_eq!(calls.len(), 1, "exactly one tiny request");
-        assert_eq!(calls[0].0, "claude");
-        assert_eq!(calls[0].1, vec!["-p".to_owned(), "hi".to_owned()]);
+        assert_eq!(calls[0].program, "claude");
+        assert_eq!(
+            calls[0].args,
+            vec![
+                "-p",
+                "Reply with the single word: ok",
+                "--model",
+                "haiku",
+                "--strict-mcp-config"
+            ]
+        );
+        assert!(calls[0].cwd_fresh, "an empty dir: no project CLAUDE.md");
+        assert!(calls[0].cwd.starts_with(std::env::temp_dir()));
+        assert_ne!(calls[0].cwd, std::env::temp_dir(), "a dir of its own");
+        assert!(!calls[0].cwd.exists(), "removed after the run");
+        assert_eq!(calls[0].timeout, Duration::from_secs(120));
         let env: std::collections::BTreeMap<&str, &str> = calls[0]
-            .2
+            .env
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
             .collect();
@@ -1581,6 +1724,59 @@ mod tests {
             out.contains("the ledger confirms the window is open until 14:10"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_configured_claude_and_model_are_what_runs() {
+        let dir = test_dir("ping-overrides");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 10));
+        let mut config = ping_config(&db, "x-toker-ping");
+        config.claude = "/opt/claude/bin/claude";
+        config.model = "sonnet";
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut Vec::new(),
+            &config,
+            "09:00",
+            now,
+            &utc(),
+            &client,
+            &mut sleep,
+        )
+        .expect("the ping lands");
+        let calls = client.calls();
+        assert_eq!(calls[0].program, "/opt/claude/bin/claude");
+        assert_eq!(calls[0].args[2..4], ["--model", "sonnet"]);
+    }
+
+    #[test]
+    fn the_process_runner_kills_a_child_at_its_timeout() {
+        // A real child, but never claude: a shell that outlives its
+        // timeout, and one that exits on its own.
+        let cwd = test_dir("ping-runner");
+        let slow = super::ProcessCommandRunner
+            .run(&super::Invocation {
+                program: "/bin/sh",
+                args: &["-c", "sleep 5"],
+                env: &[],
+                cwd: &cwd,
+                timeout: Duration::from_millis(200),
+            })
+            .expect_err("killed at the timeout");
+        assert!(format!("{slow:#}").contains("timed out"), "{slow:#}");
+
+        let status = super::ProcessCommandRunner
+            .run(&super::Invocation {
+                program: "/bin/sh",
+                args: &["-c", "test \"$PWD\" = \"$EXPECTED\" && exit 3"],
+                env: &[("EXPECTED", cwd.display().to_string())],
+                cwd: &cwd,
+                timeout: Duration::from_secs(10),
+            })
+            .expect("it ran");
+        assert_eq!(status.code(), Some(3), "ran in the given dir, status back");
     }
 
     // ── the skip ───────────────────────────────────────────────────

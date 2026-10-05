@@ -183,10 +183,17 @@ pub fn hold(for_arg: String) -> anyhow::Result<()> {
 /// exit.
 pub fn ping_window(slot: String) -> anyhow::Result<()> {
     let config = Config::load()?;
+    // The predecessor's CTP_PING_CLAUDE and CTP_PING_MODEL, renamed: a
+    // claude that is not on the unit's PATH, or a model to try.
+    let claude = std::env::var("TOKER_PING_CLAUDE").unwrap_or_else(|_| "claude".to_owned());
+    let model =
+        std::env::var("TOKER_PING_MODEL").unwrap_or_else(|_| crate::timers::PING_MODEL.to_owned());
     let ping = crate::timers::PingConfig {
         db_path: &config.db_path,
         port: config.port,
         ping_header: &config.ping_header_name,
+        claude: &claude,
+        model: &model,
     };
     let mut out = std::io::stdout();
     let now = jiff::Timestamp::now().as_millisecond();

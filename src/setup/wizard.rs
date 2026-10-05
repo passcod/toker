@@ -550,10 +550,12 @@ Type=oneshot
 # claude -p as a CLIENT of toker: the request lands on the ledger with
 # ping: true — on-ledger, and never holding the sleep lock. User
 # services start with a minimal environment, so the common user-local
-# bin dirs ride along on PATH. A real start timeout, generous for a
-# tiny request: a hung child must not suppress the next slot's ping.
+# bin dirs ride along on PATH (TOKER_PING_CLAUDE names one that is
+# not). The verb kills claude at 120 s itself; the start timeout is only
+# a backstop above that and the readback, so a hung verb cannot
+# suppress the next slot's ping.
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-TimeoutStartSec=10m
+TimeoutStartSec=3m
 ExecStart="{exe}" ping-window --slot={slot}
 "#,
                 exe = exe.display(),
@@ -2790,10 +2792,12 @@ Type=oneshot
 # claude -p as a CLIENT of toker: the request lands on the ledger with
 # ping: true — on-ledger, and never holding the sleep lock. User
 # services start with a minimal environment, so the common user-local
-# bin dirs ride along on PATH. A real start timeout, generous for a
-# tiny request: a hung child must not suppress the next slot's ping.
+# bin dirs ride along on PATH (TOKER_PING_CLAUDE names one that is
+# not). The verb kills claude at 120 s itself; the start timeout is only
+# a backstop above that and the readback, so a hung verb cannot
+# suppress the next slot's ping.
 Environment="PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-TimeoutStartSec=10m
+TimeoutStartSec=3m
 ExecStart="/opt/toker/toker" ping-window --slot=09:00
 "#
         );
