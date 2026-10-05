@@ -446,8 +446,10 @@ struct LayoutPlan {
 /// Only a terminal too short even for that cuts whole rows from the top
 /// of the middle, never the quota block — "the part worth watching".
 ///
-/// The plan is top-aligned: on a tall terminal the spare rows sit below
-/// the content rather than padding an empty SESSIONS box.
+/// The plan fills the page: on a tall terminal the rows the lists do
+/// not need are split between SESSIONS and CONTEXT (SESSIONS takes the
+/// odd one), so the bottom strip sits on the last row rather than
+/// above a run of blank ones.
 fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
     let sessions_head = u16::from(!snap.sessions.is_empty()); // the table's header row
     let sessions_need = snap.sessions.len().max(1) as u16;
@@ -479,6 +481,8 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
             continue;
         };
         let (rows_s, rows_c) = share_rows(sessions_need, context_need, avail);
+        let spare = avail - rows_s - rows_c;
+        let (rows_s, rows_c) = (rows_s + spare.div_ceil(2), rows_c + spare / 2);
         return stack(
             area,
             chrome,
@@ -3070,7 +3074,7 @@ mod tests {
     }
 
     /// The bottom strip's rows: its top border to the last bottom
-    /// border (the plan is top-aligned, so blank rows may follow).
+    /// border.
     fn strip_height(text: &str) -> usize {
         let last = text
             .lines()
@@ -3782,28 +3786,34 @@ mod tests {
     }
 
     #[test]
-    fn a_tall_terminal_leaves_its_spare_rows_below_the_content() {
+    fn a_tall_terminal_shares_its_spare_rows_between_the_lists() {
         let snap = full_snapshot();
         let text = rendered(&snap, 160, 60);
         let rows = rows_of(&text);
         // Boxed, every list whole, no "… more".
         assert!(text.contains("┌SESSIONS"), "{text}");
         assert!(!text.contains("more"), "{text}");
-        // The SESSIONS box is exactly its header and four rows: the
-        // slack is not padding in it.
-        let top = rows
-            .iter()
-            .position(|row| row.starts_with("┌SESSIONS"))
-            .expect("the box");
-        assert!(rows[top + 6].starts_with('└'), "{text}");
-        // The strip closes the content, and blank rows follow it.
-        let last = rows
-            .iter()
-            .rposition(|row| !row.is_empty())
-            .expect("content");
-        assert!(rows[last].starts_with('└'), "{text}");
-        assert!(rows[last - 2].starts_with("┌RATE & QUOTA"), "{text}");
-        assert!(last < 40, "the spare rows sit below: {text}");
+        // The strip closes the page on its last row: no blank rows
+        // below the content.
+        assert_eq!(rows.len(), 60, "{text}");
+        assert!(rows[59].starts_with('└'), "{text}");
+        // The slack went into the two lists, half each (SESSIONS takes
+        // the odd row): each box is taller than its content by the same
+        // amount, give or take one.
+        let top = |title: &str| {
+            rows.iter()
+                .position(|row| row.starts_with(title))
+                .expect("the box")
+        };
+        let sessions = top("┌CONTEXT") - top("┌SESSIONS");
+        let context = top("┌TOKENS") - top("┌CONTEXT");
+        let sessions_pad = sessions - (2 + 1 + snap.sessions.len());
+        let context_pad = context - (2 + super::context_rows(&snap));
+        assert!(sessions_pad > 0, "{text}");
+        assert!(
+            sessions_pad == context_pad || sessions_pad == context_pad + 1,
+            "sessions +{sessions_pad}, context +{context_pad}: {text}"
+        );
     }
 
     #[test]
