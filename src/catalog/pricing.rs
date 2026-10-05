@@ -16,7 +16,7 @@
 /// The date this table was last verified against the provider's pricing
 /// page (the banner prints it, and re-verifying
 /// is a human duty that moves this date).
-pub const VERIFIED_ON: &str = "2026-09-03";
+pub const VERIFIED_ON: &str = "2026-10-05";
 
 /// Server-side web search bills per call, not per token
 /// ($10 per 1,000 requests).
@@ -60,6 +60,8 @@ static PRICING: &[(&str, Rates)] = &[
     ("claude-mythos-5-1", rates(10.0, 50.0, 12.5, 20.0, 0.25)),
     ("claude-fable-5", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
     ("claude-mythos-5", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
+    // Opus 5.5 reads its cache at 0.05x input, not the usual 0.1x.
+    ("claude-opus-5-5", rates(4.0, 20.0, 5.0, 8.0, 0.2)),
     ("claude-opus-5", rates(5.0, 25.0, 6.25, 10.0, 0.5)),
     ("claude-opus-4-8", rates(5.0, 25.0, 6.25, 10.0, 0.5)),
     ("claude-opus-4-7", rates(5.0, 25.0, 6.25, 10.0, 0.5)),
@@ -67,6 +69,7 @@ static PRICING: &[(&str, Rates)] = &[
     ("claude-opus-4-5", rates(5.0, 25.0, 6.25, 10.0, 0.5)),
     // $2/$10 is the standard price. The increase to $3/$15 announced for
     // 2026-09-01 was cancelled; the launch rate became permanent.
+    ("claude-sonnet-5-5", rates(2.0, 10.0, 2.5, 4.0, 0.2)),
     ("claude-sonnet-5", rates(2.0, 10.0, 2.5, 4.0, 0.2)),
     ("claude-sonnet-4-6", rates(3.0, 15.0, 3.75, 6.0, 0.3)),
     ("claude-sonnet-4-5", rates(3.0, 15.0, 3.75, 6.0, 0.3)),
@@ -80,6 +83,9 @@ static PRICING: &[(&str, Rates)] = &[
 /// Fast mode (`/fast` in Claude Code) reprices the base rates; the cache
 /// multipliers then apply on top of the fast base.
 static FAST_PRICING: &[(&str, Rates)] = &[
+    // $8/$40 published; the cache multipliers stack on the fast base, and
+    // Opus 5.5's read multiplier is 0.05x.
+    ("claude-opus-5-5", rates(8.0, 40.0, 10.0, 16.0, 0.4)),
     ("claude-opus-5", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
     ("claude-opus-4-8", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
 ];
@@ -233,7 +239,7 @@ mod tests {
     fn verified_on_is_pinned_to_the_verified_date() {
         // The freshness discipline: the date must
         // exist and be date-shaped; re-verification moves it deliberately.
-        assert_eq!(VERIFIED_ON, "2026-09-03");
+        assert_eq!(VERIFIED_ON, "2026-10-05");
         assert!(
             VERIFIED_ON.len() == 10 && VERIFIED_ON.as_bytes()[4] == b'-',
             "YYYY-MM-DD shaped"
@@ -253,8 +259,11 @@ mod tests {
             ("claude-fable-5-1", rates(10.0, 50.0, 12.5, 20.0, 0.25)),
             ("claude-mythos-5-1", rates(10.0, 50.0, 12.5, 20.0, 0.25)),
             ("claude-mythos-5", rates(10.0, 50.0, 12.5, 20.0, 1.0)),
+            // Opus 5.5 reads at 0.05x, and must not resolve to Opus 5.
+            ("claude-opus-5-5", rates(4.0, 20.0, 5.0, 8.0, 0.2)),
             ("claude-opus-5", rates(5.0, 25.0, 6.25, 10.0, 0.5)),
             ("claude-opus-4-1", rates(15.0, 75.0, 18.75, 30.0, 1.5)),
+            ("claude-sonnet-5-5", rates(2.0, 10.0, 2.5, 4.0, 0.2)),
             ("claude-sonnet-5", rates(2.0, 10.0, 2.5, 4.0, 0.2)),
             ("claude-sonnet-4-6", rates(3.0, 15.0, 3.75, 6.0, 0.3)),
             ("claude-haiku-4-5", rates(1.0, 5.0, 1.25, 2.0, 0.1)),
@@ -328,6 +337,11 @@ mod tests {
         let fast48 = price("claude-opus-4-8", true, None).expect("priced");
         assert!(fast48.fast);
         assert_eq!(fast48.rates, rates(10.0, 50.0, 12.5, 20.0, 1.0));
+
+        // Opus 5.5's fast base is $8/$40, its read still at 0.05x.
+        let fast55 = price("claude-opus-5-5", true, None).expect("priced");
+        assert!(fast55.fast);
+        assert_eq!(fast55.rates, rates(8.0, 40.0, 10.0, 16.0, 0.4));
 
         // Sonnet 5 does not: a fast request prices at base, flagged as not
         // fast-repriced.
