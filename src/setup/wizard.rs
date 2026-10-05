@@ -2705,6 +2705,17 @@ fn apply_choices(
         )?;
     }
     config.awake = choices.awake;
+    // Workhorse runs its agents under a config directory of its own, so
+    // their transcripts (and the custom titles it names sessions with)
+    // are outside `~/.claude`, and without this root every Workhorse
+    // row in the dashboard showed only its session id. Added, never
+    // removed: a root the operator listed by hand stays.
+    if paths.workhorse_repos.is_dir() {
+        let root = paths.workhorse_repos.join(".claude");
+        if !config.transcript_roots.contains(&root) {
+            config.transcript_roots.push(root);
+        }
+    }
     if !db_explicit {
         config.db_path = paths.db_path();
     }
@@ -4138,6 +4149,14 @@ default_backend_anthropic = "codex_sub"
                 .iter()
                 .any(|asked| asked.message.contains("Workhorse")),
         );
+        // Its transcripts are under its own config directory, so the
+        // dashboard can only name its sessions with that root listed.
+        assert_eq!(
+            Config::load_from(&with.toml_path())
+                .expect("the written config loads")
+                .transcript_roots,
+            vec![with_dir.join(".workhorse/repos/.claude")],
+        );
 
         // Without the dir: never asked about, never patched.
         let mut without = Rig::new(
@@ -4162,6 +4181,12 @@ default_backend_anthropic = "codex_sub"
             without.prompt.asked()
         );
         assert!(!report.patched.iter().any(|name| name.contains("Workhorse")),);
+        assert!(
+            Config::load_from(&without.toml_path())
+                .expect("the written config loads")
+                .transcript_roots
+                .is_empty(),
+        );
         assert!(
             without
                 .out()
