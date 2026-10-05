@@ -31,8 +31,8 @@ mod state;
 
 pub use ledger::{
     CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, MeterRow,
-    RebuildRow, RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionSummary,
-    StoredLadders, is_api_measurement,
+    ModelObservation, OBSERVATION_BUCKET_MS, RebuildRow, RequestFilter, RequestRow, RowKind,
+    SessionCostGroup, SessionSummary, StoredLadders, is_api_measurement,
 };
 pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingAction, PingRecord};
 
@@ -186,6 +186,12 @@ impl Store {
     pub fn record_requests(&self, rows: &[RequestRow]) -> Result<(Option<i64>, Option<i64>)> {
         let mut conn = self.conn()?;
         ledger::insert_batch(&mut conn, rows)
+    }
+
+    /// Every served model's largest prompt per quarter hour, over the whole
+    /// ledger (see `ledger::model_observations`).
+    pub fn model_observations(&self) -> Result<Vec<ModelObservation>> {
+        ledger::model_observations(&*self.conn()?)
     }
 
     /// Rows with `ts_ms >= ts_ms`, oldest first; when the window holds more

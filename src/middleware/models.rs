@@ -565,8 +565,9 @@ pub struct ModelStore {
 
 impl ModelStore {
     /// Build the store, seeding the recently-served map from the ledger
-    /// tail. `covered` is [`Self::covered_since`]'s input: `None` when `rows` is
-    /// the whole ledger, else the tail's oldest ts.
+    /// tail `rows` and the learned entries from the whole ledger in
+    /// `store`. `covered` is [`Self::covered_since`]'s input: `None` when
+    /// `rows` is the whole ledger, else the tail's oldest ts.
     pub fn seeded(store: Arc<Store>, rows: &[RequestRow], covered: Option<i64>) -> ModelStore {
         let mut served_on = BTreeMap::new();
         for row in rows {
@@ -586,41 +587,44 @@ impl ModelStore {
             served_on: Mutex::new(served_on),
             covered_since: covered,
         };
-        models.reseed_days(rows);
+        models.reseed_days();
         models
     }
 
-    /// Rebuild the durable learned entries from the ledger rows: union
+    /// Rebuild the durable learned entries from the whole ledger: union
     /// the days, max the maxPrompt — never invent either. The election
     /// reads the TABLE (its days are the bar's denominator), so an
     /// imported ledger keeps its learning on the very first start, and
     /// the table can never drift below what the ledger provably holds.
     /// Idempotent: unions and maxes only add.
-    fn reseed_days(&self, rows: &[RequestRow]) {
+    ///
+    /// The whole ledger, not the startup tail the lanes seed from: the
+    /// tail is the newest 20,000 rows, and a ceiling proven further back
+    /// was lost to it (see [`Store::model_observations`]).
+    fn reseed_days(&self) {
+        let observations = match self.store.model_observations() {
+            Ok(observations) => observations,
+            Err(error) => {
+                // Accounting never breaks a session: the table keeps what
+                // it held, and record-time learning carries on.
+                tracing::warn!(%error, "learned model reseed failed to read the ledger");
+                return;
+            }
+        };
         let tz = TimeZone::system();
         // (days, max_prompt) per identity, accumulated in memory first —
-        // one upsert per model at the end, not one per row.
+        // one upsert per model at the end, not one per bucket.
         let mut learned: BTreeMap<String, (BTreeSet<String>, i64)> = BTreeMap::new();
-        for row in rows {
-            // Proxy-written rows are not measurements.
-            if row.kind.is_some() {
-                continue;
-            }
-            let Some(model) = row.raw_model.as_deref().or(row.model.as_deref()) else {
+        for observation in observations {
+            let Some(id) = model_identity(&observation.model) else {
                 continue;
             };
-            let Some(id) = model_identity(model) else {
+            let Some(day) = local_day(observation.bucket_ms, &tz) else {
                 continue;
             };
-            let Some(day) = local_day(row.ts_ms, &tz) else {
-                continue;
-            };
-            let held = row.input.unwrap_or(0)
-                + row.cache_read.unwrap_or(0)
-                + row.cache_write_total.unwrap_or(0);
             let entry = learned.entry(id).or_insert_with(|| (BTreeSet::new(), 0));
             entry.0.insert(day);
-            entry.1 = entry.1.max(held);
+            entry.1 = entry.1.max(observation.held);
         }
         for (id, (days, max_prompt)) in learned {
             let mut entry = self
@@ -842,10 +846,11 @@ pub fn merge_learned(
 #[cfg(test)]
 mod tests {
     use super::{
-        MergeIncoming, MergeOutcome, ModelStore, PromotionRefusal, compaction_target_of, family_of,
-        fits_context, local_day, newer_than, newest_in_family, plan_promotion, requirement,
+        MergeIncoming, MergeOutcome, ModelStore, PromotionRefusal, compaction_target_of, days_of,
+        family_of, fits_context, local_day, newer_than, newest_in_family, plan_promotion,
+        requirement,
     };
-    use crate::store::{ModelEntry, RequestRow, Store};
+    use crate::store::{ModelEntry, RequestRow, RowKind, Store};
     use jiff::tz::TimeZone;
     use serde_json::json;
     use std::sync::Arc;
@@ -1202,6 +1207,52 @@ mod tests {
             Some(5_000),
             "a cut tail vouches only from its first row"
         );
+    }
+
+    #[test]
+    fn the_learned_table_reseeds_from_the_whole_ledger_not_the_tail() {
+        // The startup tail cut off the rows that proved claude-sonnet-5
+        // at 398k, so its ceiling stayed at the 248k served since. The
+        // reseed reads the ledger itself; the tail passed in is empty.
+        let store = mem_store();
+        // The reseed groups by the system zone's days, as the server does.
+        let tz = TimeZone::system();
+        let at = 1_769_954_400_000; // a fixed instant
+        let mut old = bare_row();
+        old.ts_ms = at;
+        old.raw_model = Some("claude-sonnet-5".to_owned());
+        old.input = Some(90);
+        old.cache_read = Some(397_677);
+        old.cache_write_total = Some(537);
+        let mut later = old.clone();
+        later.ts_ms = at + 3 * 86_400_000;
+        later.cache_read = Some(248_000);
+        later.cache_write_total = None;
+        // A proxy-written row is not an observation, however large.
+        let mut notice = old.clone();
+        notice.ts_ms = at + 86_400_000;
+        notice.kind = Some(RowKind::Cold);
+        notice.cache_read = Some(900_000);
+        for row in [&old, &later, &notice] {
+            store.record_request(row).expect("insert");
+        }
+
+        let models = ModelStore::seeded(store.clone(), &[], Some(at + 5 * 86_400_000));
+        let entry = store
+            .load_model("claude-sonnet-5")
+            .expect("load")
+            .expect("learned");
+        assert_eq!(entry.max_prompt, Some(398_304));
+        assert_eq!(
+            days_of(&entry),
+            vec![
+                local_day(old.ts_ms, &tz).expect("day"),
+                local_day(later.ts_ms, &tz).expect("day"),
+            ],
+            "the notice's day is not a served day"
+        );
+        // The served-recency map still comes from the tail alone.
+        assert_eq!(models.last_served("claude-sonnet-5"), None);
     }
 
     // ── merge (only: true) ──────────────────────────────────────────

@@ -34,6 +34,13 @@ Days are local calendar days, because "seen on seven separate days" is a
 statement about how someone works, not about UTC. The timezone is an input
 (`local_day`), and tests pin theirs.
 
+The learned table (days and `max_prompt` per identity) is learned on every
+response and rebuilt at startup from the whole ledger, in quarter-hour buckets
+so the read stays small. Until 2026-10-06 the rebuild read only the 20,000-row
+tail the lanes seed from, which dropped every day and ceiling older than that,
+imported ctp history included: `claude-sonnet-5` held 11 days and a 248k
+ceiling against 25 days and 398k in the ledger.
+
 Unpublished dated Claude identities (a `claude-…` id ending in an eight-digit
 date the catalogue does not know) have no family at all, so their observed days
 or prompt sizes cannot authorise routing traffic to a different identity.
