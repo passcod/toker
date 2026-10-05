@@ -1,0 +1,7 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{out}---\\n{error:#}\")"
+---
+waiting for 1 response in flight to finish (Ctrl-C leaves toker untouched)
+---
+no quiet moment within 30ms (--max-wait): 1 response in flight at the last look. toker was not restarted.

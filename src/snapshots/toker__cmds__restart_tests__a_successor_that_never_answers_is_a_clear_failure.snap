@@ -1,0 +1,7 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{out}---\\n{error:#}\")"
+---
+toker 0ld1d0ld is draining and will exit; waiting for systemd to start the next one
+---
+no new toker answered on 127.0.0.1:20000 within 100ms of the shutdown. The old instance may still be draining a long response; under systemd `Restart=always` starts the next one once it exits (see `systemctl --user status toker.service`). A hand-run `toker serve` is not restarted.

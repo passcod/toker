@@ -48,6 +48,21 @@ enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// Restart the running service without cutting a response: wait for
+    /// a moment with nothing in flight, ask it to drain and exit, and wait
+    /// for systemd to start the new binary. Ctrl-C while waiting leaves it
+    /// untouched.
+    Restart {
+        /// Give up without restarting if no quiet moment comes within this
+        /// span: a whole number with a unit (90s, 10m, 1h).
+        #[arg(long = "max-wait", value_name = "SPAN", value_parser = cmds::wait_arg)]
+        max_wait: Option<std::time::Duration>,
+        /// Do not wait for a quiet moment. The old instance still finishes
+        /// every response under way before it exits; new connections wait
+        /// for the next instance meanwhile.
+        #[arg(long = "now", conflicts_with = "max_wait")]
+        now: bool,
+    },
     /// Run the ratatui dashboard (plan: TUI).
     Tui {
         /// Dashboard window length in minutes. Default 60: the
@@ -174,6 +189,7 @@ fn main() -> anyhow::Result<()> {
             max_prompt,
             dry_run,
         } => cmds::promote(model, days, max_prompt, dry_run),
+        Command::Restart { max_wait, now } => cmds::restart(max_wait, now),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Setup => cmds::setup(),
         Command::Status => cmds::status(),

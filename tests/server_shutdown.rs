@@ -6,6 +6,8 @@
 //! connections are no longer accepted, and the serve call returns once
 //! the stream is done. The sleep lock is on over a fake spawner (never a
 //! real inhibitor), to show the exit kills it without writing a row.
+//! Last, `toker restart` runs over HTTP against it, with a second server
+//! on the same port standing in for systemd's restart.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -427,4 +429,47 @@ async fn a_stream_under_way_finishes_byte_for_byte_while_new_connections_are_ref
     assert_eq!(toker.probe.spawns.load(Ordering::SeqCst), 1);
     assert_eq!(toker.probe.kills.load(Ordering::SeqCst), 1);
     assert_eq!(awake_rows(&toker.store), vec![true]);
+}
+
+#[tokio::test]
+async fn restart_waits_hands_over_and_sees_the_new_instance() {
+    use toker::cmds::{HttpControl, Pacing, RestartOpts, restart_run};
+
+    let (_mock, upstream) = spawn_mock().await;
+    let old = spawn_toker(test_config(upstream.clone()), 0).await;
+    let port = old.addr.port();
+    let old_instance = old.instance.clone();
+
+    // What systemd's `Restart=always` does, in miniature: once the old
+    // instance has returned, a new one serves the same port.
+    let successor = tokio::spawn(async move {
+        old.served
+            .await
+            .expect("old serve task")
+            .expect("old drained cleanly");
+        spawn_toker(test_config(upstream), port).await
+    });
+
+    let pacing = Pacing {
+        poll: Duration::from_millis(20),
+        request_timeout: Duration::from_secs(2),
+        up_timeout: Duration::from_secs(10),
+    };
+    let mut out = Vec::new();
+    restart_run(
+        &HttpControl::new(port, pacing.request_timeout).expect("client"),
+        port,
+        &RestartOpts::default(),
+        &pacing,
+        &mut out,
+    )
+    .await
+    .expect("restart succeeds");
+    let new = successor.await.expect("successor");
+    assert_ne!(new.instance, old_instance);
+    let out = String::from_utf8(out).expect("utf-8");
+    assert!(
+        out.contains(&format!("toker {} is up", &new.instance[..8])),
+        "{out}"
+    );
 }

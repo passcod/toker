@@ -1,0 +1,5 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{error:#}\")"
+---
+the toker on 127.0.0.1:20000 predates `toker restart`: it cannot drain on request. Restart it once with `systemctl --user restart toker.service`, which cuts any response under way, and use `toker restart` from then on.

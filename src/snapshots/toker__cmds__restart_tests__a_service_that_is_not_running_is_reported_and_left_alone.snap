@@ -1,0 +1,5 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{error:#}\")"
+---
+nothing is listening on 127.0.0.1:20000: toker is not running. Nothing was restarted; `systemctl --user start toker.socket` starts it.

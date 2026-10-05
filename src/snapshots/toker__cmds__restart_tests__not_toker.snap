@@ -1,0 +1,5 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{error:#}\")"
+---
+something on 127.0.0.1:20000 answered the status request with 404, so it is not toker. Nothing was restarted.

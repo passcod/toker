@@ -11,6 +11,8 @@
 //! store → server; the interactive wizard; the resolved-config/ledger
 //! summary (plan: Credentials — status reports which key sources are in
 //! use, never the values); and the ratatui dashboard (plan: TUI).
+//! `restart` drives the running service's `/_toker/status` and
+//! `/_toker/shutdown` to restart it without cutting a response.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -631,6 +633,394 @@ fn render_plan(
     writeln!(out, "  target       {target}{held}")
 }
 
+// ── toker restart ──────────────────────────────────────────────────────
+
+/// How many idle readings in a row, a poll apart, make a quiet moment.
+/// `in_flight` counts only exchanges already under way, and an agent's
+/// next request follows its tool calls after a short gap, so one idle
+/// reading can land between two requests of a busy turn. Three readings a
+/// poll apart outlast the usual gap; a request that still slips in is not
+/// cut, the drain lets it finish, it only delays the new instance.
+pub const QUIET_POLLS: u32 = 3;
+
+/// The restart's timings: the poll cadence, how long one control request
+/// may take, and how long the new instance may take to answer.
+#[derive(Debug, Clone)]
+pub struct Pacing {
+    pub poll: std::time::Duration,
+    /// Per request. Under socket activation a status request sent while
+    /// the old instance drains waits in the socket's queue until the next
+    /// instance accepts it, so this is generous.
+    pub request_timeout: std::time::Duration,
+    /// From the shutdown request to the new instance answering.
+    pub up_timeout: std::time::Duration,
+}
+
+impl Pacing {
+    /// The real cadence: a poll a second, and 30 s for systemd to bring
+    /// the next instance up (`RestartSec=1`, plus the startup seed).
+    pub const REAL: Pacing = Pacing {
+        poll: std::time::Duration::from_secs(1),
+        request_timeout: std::time::Duration::from_secs(10),
+        up_timeout: std::time::Duration::from_secs(30),
+    };
+}
+
+/// What `toker restart` was asked to do.
+#[derive(Debug, Clone, Default)]
+pub struct RestartOpts {
+    /// Give up, restarting nothing, if no quiet moment comes in this long.
+    pub max_wait: Option<std::time::Duration>,
+    /// Skip the wait. The shutdown still drains: nothing is cut, but the
+    /// new instance starts only after the responses under way finish.
+    pub now: bool,
+}
+
+/// Why a control request got no HTTP answer.
+#[derive(Debug, Clone)]
+pub enum ControlError {
+    /// Nothing accepted the connection.
+    Down,
+    /// Connected, but no answer within the request timeout.
+    Timeout,
+    /// Anything else, described.
+    Failed(String),
+}
+
+/// A control endpoint's answer: the status code, and the body when it was
+/// JSON.
+#[derive(Debug, Clone)]
+pub struct ControlReply {
+    pub status: u16,
+    pub body: Option<serde_json::Value>,
+}
+
+/// The two control requests `toker restart` makes. A seam so the wait
+/// loop runs in tests against a script; [`HttpControl`] is the real one.
+pub trait Control {
+    /// `GET /_toker/status`.
+    fn status(&self) -> impl Future<Output = Result<ControlReply, ControlError>>;
+    /// `POST /_toker/shutdown` for the named instance.
+    fn shutdown(&self, instance: &str) -> impl Future<Output = Result<ControlReply, ControlError>>;
+}
+
+/// [`Control`] over HTTP to the toker on a loopback port.
+pub struct HttpControl {
+    base: String,
+    client: reqwest::Client,
+}
+
+impl HttpControl {
+    pub fn new(port: u16, timeout: std::time::Duration) -> reqwest::Result<HttpControl> {
+        Ok(HttpControl {
+            base: format!("http://127.0.0.1:{port}"),
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                // A fresh connection per request. A pooled one to the old
+                // instance would outlive its listener, and a status sent
+                // on it after the shutdown would ask the wrong process.
+                .pool_max_idle_per_host(0)
+                .build()?,
+        })
+    }
+
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<ControlReply, ControlError> {
+        let response = request.send().await.map_err(classify)?;
+        let status = response.status().as_u16();
+        let body = response.json().await.ok();
+        Ok(ControlReply { status, body })
+    }
+}
+
+fn classify(error: reqwest::Error) -> ControlError {
+    if error.is_connect() {
+        ControlError::Down
+    } else if error.is_timeout() {
+        ControlError::Timeout
+    } else {
+        ControlError::Failed(error.to_string())
+    }
+}
+
+impl Control for HttpControl {
+    fn status(&self) -> impl Future<Output = Result<ControlReply, ControlError>> {
+        self.send(
+            self.client
+                .get(format!("{}/_toker/status", self.base))
+                .header("x-toker-control", "status"),
+        )
+    }
+
+    fn shutdown(&self, instance: &str) -> impl Future<Output = Result<ControlReply, ControlError>> {
+        self.send(
+            self.client
+                .post(format!("{}/_toker/shutdown", self.base))
+                .header("x-toker-control", "shutdown")
+                .json(&serde_json::json!({ "instance": instance })),
+        )
+    }
+}
+
+/// What one status reading says.
+struct Reading {
+    in_flight: u64,
+    instance: String,
+    version: Option<String>,
+    uptime_s: Option<u64>,
+}
+
+/// Why a status answer is not a reading.
+enum Unreadable {
+    /// Not toker's status at all.
+    NotToker(u16),
+    /// toker's status, from a build without `in_flight` and `instance`,
+    /// which also has no shutdown endpoint.
+    Predates,
+}
+
+fn reading(reply: &ControlReply) -> Result<Reading, Unreadable> {
+    use serde_json::Value;
+    let body = match &reply.body {
+        Some(body) if reply.status == 200 && body.get("requests").is_some() => body,
+        _ => return Err(Unreadable::NotToker(reply.status)),
+    };
+    let in_flight = body.get("in_flight").and_then(Value::as_u64);
+    let instance = body.get("instance").and_then(Value::as_str);
+    let (Some(in_flight), Some(instance)) = (in_flight, instance) else {
+        return Err(Unreadable::Predates);
+    };
+    Ok(Reading {
+        in_flight,
+        instance: instance.to_owned(),
+        version: body
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        uptime_s: body.get("uptime_s").and_then(Value::as_u64),
+    })
+}
+
+/// The first eight characters of an instance id, enough to tell two apart.
+fn short(instance: &str) -> &str {
+    instance.get(..8).unwrap_or(instance)
+}
+
+fn responses(count: u64) -> String {
+    match count {
+        1 => "1 response".to_owned(),
+        count => format!("{count} responses"),
+    }
+}
+
+/// A duration as `--max-wait` takes it.
+fn span(duration: std::time::Duration) -> String {
+    let millis = duration.as_millis();
+    if !millis.is_multiple_of(1000) {
+        format!("{millis}ms")
+    } else if millis.is_multiple_of(3_600_000) {
+        format!("{}h", millis / 3_600_000)
+    } else if millis.is_multiple_of(60_000) {
+        format!("{}m", millis / 60_000)
+    } else {
+        format!("{}s", millis / 1000)
+    }
+}
+
+/// Parse `--max-wait`: a whole, positive number with one unit, `s`, `m`
+/// or `h` (`90s`, `10m`, `1h`). Anything else is an error, so a typo never
+/// turns into waiting forever or not at all.
+pub fn wait_arg(text: &str) -> Result<std::time::Duration, String> {
+    let expected = "expected a whole number with a unit: 90s, 10m, 1h";
+    let unit = match text.chars().last() {
+        Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 3_600,
+        _ => return Err(format!("{text:?} is not a span: {expected}")),
+    };
+    let digits = &text[..text.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("{text:?} is not a span: {expected}"));
+    }
+    match digits.parse::<u64>().ok().and_then(|n| n.checked_mul(unit)) {
+        Some(0) => Err(format!("{text:?} is no wait at all: use --now to skip it")),
+        Some(seconds) => Ok(std::time::Duration::from_secs(seconds)),
+        None => Err(format!("{text:?} is too long")),
+    }
+}
+
+/// `toker restart`: wait for the running toker to go quiet, ask it to
+/// drain and exit, and wait for systemd to start the next one.
+pub fn restart(max_wait: Option<std::time::Duration>, now: bool) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let pacing = Pacing::REAL;
+    let control = HttpControl::new(config.port, pacing.request_timeout)?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(restart_run(
+            &control,
+            config.port,
+            &RestartOpts { max_wait, now },
+            &pacing,
+            &mut std::io::stdout(),
+        ))
+}
+
+/// The restart over an explicit [`Control`], writing its report to `out`.
+/// `port` is for the messages only. Ctrl-C at any point before the
+/// shutdown request leaves toker exactly as it was; after it, the drain
+/// and the restart go on without this command.
+pub async fn restart_run(
+    control: &impl Control,
+    port: u16,
+    opts: &RestartOpts,
+    pacing: &Pacing,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let address = format!("127.0.0.1:{port}");
+    let read = |result: Result<ControlReply, ControlError>| -> anyhow::Result<Reading> {
+        let reply = match result {
+            Ok(reply) => reply,
+            // With the socket unit active, the connection itself starts
+            // the service; refused means neither is up. Starting them is
+            // systemd's job, not this command's.
+            Err(ControlError::Down) => bail!(
+                "nothing is listening on {address}: toker is not running. Nothing was \
+                 restarted; `systemctl --user start toker.socket` starts it."
+            ),
+            Err(ControlError::Timeout) => bail!(
+                "toker on {address} did not answer within {}. Nothing was restarted.",
+                span(pacing.request_timeout)
+            ),
+            Err(ControlError::Failed(error)) => {
+                bail!("asking toker on {address} for its status failed: {error}")
+            }
+        };
+        match reading(&reply) {
+            Ok(reading) => Ok(reading),
+            Err(Unreadable::NotToker(status)) => bail!(
+                "something on {address} answered the status request with {status}, so it \
+                 is not toker. Nothing was restarted."
+            ),
+            Err(Unreadable::Predates) => bail!(
+                "the toker on {address} predates `toker restart`: it cannot drain on \
+                 request. Restart it once with `systemctl --user restart toker.service`, \
+                 which cuts any response under way, and use `toker restart` from then on."
+            ),
+        }
+    };
+
+    let started = tokio::time::Instant::now();
+    let mut current = read(control.status().await)?;
+    let mut quiet = 0;
+    let mut shown = None;
+    loop {
+        if opts.now {
+            if current.in_flight > 0 {
+                writeln!(
+                    out,
+                    "not waiting (--now): {} in flight will finish before the old instance exits",
+                    responses(current.in_flight)
+                )?;
+            }
+            break;
+        }
+        if current.in_flight == 0 {
+            quiet += 1;
+            if quiet >= QUIET_POLLS {
+                break;
+            }
+        } else {
+            quiet = 0;
+            if shown.is_none() {
+                writeln!(
+                    out,
+                    "waiting for {} in flight to finish (Ctrl-C leaves toker untouched)",
+                    responses(current.in_flight)
+                )?;
+            } else if shown != Some(current.in_flight) {
+                writeln!(out, "  {} in flight", current.in_flight)?;
+            }
+            shown = Some(current.in_flight);
+        }
+        if let Some(max_wait) = opts.max_wait
+            && started.elapsed() >= max_wait
+        {
+            bail!(
+                "no quiet moment within {} (--max-wait): {} in flight at the last look. \
+                 toker was not restarted.",
+                span(max_wait),
+                responses(current.in_flight)
+            );
+        }
+        tokio::time::sleep(pacing.poll).await;
+        current = read(control.status().await)?;
+    }
+
+    let old = current.instance;
+    match control.shutdown(&old).await {
+        Ok(reply) if reply.status == 202 => {}
+        Ok(reply) if reply.status == 409 => bail!(
+            "toker on {address} is no longer the instance that was idle (another restart?). \
+             Nothing was restarted by this command; run it again."
+        ),
+        Ok(reply) => bail!(
+            "toker on {address} refused the shutdown request ({}). Nothing was restarted.",
+            reply.status
+        ),
+        Err(ControlError::Down) => bail!(
+            "toker on {address} went away before the shutdown request reached it; \
+             systemd may be restarting it already."
+        ),
+        Err(ControlError::Timeout) => bail!(
+            "the shutdown request to {address} got no answer within {}: the old instance \
+             may or may not be draining.",
+            span(pacing.request_timeout)
+        ),
+        Err(ControlError::Failed(error)) => bail!(
+            "the shutdown request to {address} failed ({error}): the old instance may or \
+             may not be draining."
+        ),
+    }
+    writeln!(
+        out,
+        "toker {} is draining and will exit; waiting for systemd to start the next one",
+        short(&old)
+    )?;
+
+    // Until the deadline anything goes: refused while nothing listens,
+    // a timeout while the connection queues, the old instance itself if
+    // the drain has not closed its listener yet. Only a new id ends it.
+    let deadline = tokio::time::Instant::now() + pacing.up_timeout;
+    loop {
+        tokio::time::sleep(pacing.poll).await;
+        if let Ok(reply) = control.status().await
+            && let Ok(reading) = reading(&reply)
+            && reading.instance != old
+        {
+            writeln!(
+                out,
+                "toker {} is up: version {}, up {}s",
+                short(&reading.instance),
+                reading.version.as_deref().unwrap_or("unknown"),
+                reading
+                    .uptime_s
+                    .map_or_else(|| "?".to_owned(), |uptime| uptime.to_string()),
+            )?;
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "no new toker answered on {address} within {} of the shutdown. The old \
+                 instance may still be draining a long response; under systemd \
+                 `Restart=always` starts the next one once it exits (see `systemctl --user \
+                 status toker.service`). A hand-run `toker serve` is not restarted.",
+                span(pacing.up_timeout)
+            );
+        }
+    }
+}
+
 /// `wake-arm`: a documented no-op — on Linux, wake is owned by the
 /// systemd system timer (`WakeSystem=true`), which `toker setup`
 /// installs and enables. The predecessor's one-shot `pmset schedule
@@ -892,5 +1282,220 @@ mod tests {
         .expect_err("no ledger");
         assert!(error.to_string().contains("no ledger"), "{error}");
         assert!(!db.exists());
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::{
+        Control, ControlError, ControlReply, Pacing, QUIET_POLLS, RestartOpts, restart_run,
+        wait_arg,
+    };
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const OLD: &str = "0ld1d0ld00000000000000000000000a";
+    const NEW: &str = "n3wn3wn300000000000000000000000b";
+
+    /// A scripted control: status answers in order, the last repeating
+    /// forever; every shutdown request recorded and accepted.
+    struct Script {
+        statuses: Mutex<VecDeque<Result<ControlReply, ControlError>>>,
+        status_calls: Mutex<usize>,
+        shutdowns: Mutex<Vec<String>>,
+    }
+
+    impl Script {
+        fn new(statuses: Vec<Result<ControlReply, ControlError>>) -> Script {
+            Script {
+                statuses: Mutex::new(statuses.into()),
+                status_calls: Mutex::new(0),
+                shutdowns: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn shutdowns(&self) -> Vec<String> {
+            self.shutdowns.lock().unwrap().clone()
+        }
+    }
+
+    impl Control for Script {
+        async fn status(&self) -> Result<ControlReply, ControlError> {
+            *self.status_calls.lock().unwrap() += 1;
+            let mut statuses = self.statuses.lock().unwrap();
+            if statuses.len() > 1 {
+                statuses.pop_front().expect("non-empty")
+            } else {
+                statuses.front().cloned().expect("a script has an answer")
+            }
+        }
+
+        async fn shutdown(&self, instance: &str) -> Result<ControlReply, ControlError> {
+            self.shutdowns.lock().unwrap().push(instance.to_owned());
+            Ok(ControlReply {
+                status: 202,
+                body: Some(json!({"toker": "shutdown", "ok": true})),
+            })
+        }
+    }
+
+    fn status(in_flight: u64, instance: &str) -> Result<ControlReply, ControlError> {
+        Ok(ControlReply {
+            status: 200,
+            body: Some(json!({
+                "requests": 12,
+                "in_flight": in_flight,
+                "instance": instance,
+                "version": "0.1.0",
+                "uptime_s": if instance == NEW { 0 } else { 5_000 },
+            })),
+        })
+    }
+
+    fn pacing() -> Pacing {
+        Pacing {
+            poll: Duration::from_millis(2),
+            request_timeout: Duration::from_secs(10),
+            up_timeout: Duration::from_millis(100),
+        }
+    }
+
+    async fn run(script: &Script, opts: RestartOpts) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let result = restart_run(script, 20000, &opts, &pacing(), &mut out).await;
+        (result, String::from_utf8(out).expect("utf-8"))
+    }
+
+    #[tokio::test]
+    async fn an_idle_toker_is_restarted_after_the_quiet_polls_and_says_little() {
+        let mut statuses: Vec<_> = (0..QUIET_POLLS).map(|_| status(0, OLD)).collect();
+        // After the shutdown: the old instance a moment longer, nothing
+        // listening, then the successor.
+        statuses.extend([status(0, OLD), Err(ControlError::Down), status(0, NEW)]);
+        let script = Script::new(statuses);
+        let (result, out) = run(&script, RestartOpts::default()).await;
+        result.expect("restarts");
+        assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        assert_eq!(
+            *script.status_calls.lock().unwrap(),
+            QUIET_POLLS as usize + 3
+        );
+        insta::assert_snapshot!(out);
+    }
+
+    #[tokio::test]
+    async fn a_busy_toker_is_waited_for_and_an_idle_reading_between_requests_is_not_enough() {
+        let script = Script::new(vec![
+            status(2, OLD),
+            status(2, OLD),
+            status(1, OLD),
+            // One idle reading between two requests resets nothing but
+            // itself: the count of quiet readings starts over.
+            status(0, OLD),
+            status(1, OLD),
+            status(0, OLD),
+            status(0, OLD),
+            status(0, OLD),
+            status(0, NEW),
+        ]);
+        let (result, out) = run(&script, RestartOpts::default()).await;
+        result.expect("restarts");
+        assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        assert_eq!(*script.status_calls.lock().unwrap(), 9);
+        insta::assert_snapshot!(out);
+    }
+
+    #[tokio::test]
+    async fn max_wait_expiring_restarts_nothing() {
+        let script = Script::new(vec![status(1, OLD)]);
+        let (result, out) = run(
+            &script,
+            RestartOpts {
+                max_wait: Some(Duration::from_millis(30)),
+                now: false,
+            },
+        )
+        .await;
+        let error = result.expect_err("gives up");
+        assert!(script.shutdowns().is_empty(), "no shutdown was sent");
+        insta::assert_snapshot!(format!("{out}---\n{error:#}"));
+    }
+
+    #[tokio::test]
+    async fn now_skips_the_wait_but_says_what_is_still_running() {
+        let script = Script::new(vec![status(2, OLD), status(0, NEW)]);
+        let (result, out) = run(
+            &script,
+            RestartOpts {
+                max_wait: None,
+                now: true,
+            },
+        )
+        .await;
+        result.expect("restarts");
+        assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        insta::assert_snapshot!(out);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_is_not_running_is_reported_and_left_alone() {
+        let script = Script::new(vec![Err(ControlError::Down)]);
+        let (result, out) = run(&script, RestartOpts::default()).await;
+        let error = result.expect_err("nothing to restart");
+        assert!(script.shutdowns().is_empty());
+        assert_eq!(out, "");
+        insta::assert_snapshot!(format!("{error:#}"));
+    }
+
+    #[tokio::test]
+    async fn a_toker_without_the_endpoint_or_something_else_is_refused() {
+        // A toker from before `instance` was in status: no shutdown to ask.
+        let script = Script::new(vec![Ok(ControlReply {
+            status: 200,
+            body: Some(json!({"requests": 3, "uptime_s": 9})),
+        })]);
+        let error = run(&script, RestartOpts::default())
+            .await
+            .0
+            .expect_err("predates");
+        assert!(script.shutdowns().is_empty());
+        insta::assert_snapshot!("predates", format!("{error:#}"));
+
+        // Some other server on the port.
+        let script = Script::new(vec![Ok(ControlReply {
+            status: 404,
+            body: None,
+        })]);
+        let error = run(&script, RestartOpts::default())
+            .await
+            .0
+            .expect_err("not toker");
+        assert!(script.shutdowns().is_empty());
+        insta::assert_snapshot!("not_toker", format!("{error:#}"));
+    }
+
+    #[tokio::test]
+    async fn a_successor_that_never_answers_is_a_clear_failure() {
+        let mut statuses: Vec<_> = (0..QUIET_POLLS).map(|_| status(0, OLD)).collect();
+        statuses.push(Err(ControlError::Down));
+        let script = Script::new(statuses);
+        let (result, out) = run(&script, RestartOpts::default()).await;
+        let error = result.expect_err("never up");
+        assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        insta::assert_snapshot!(format!("{out}---\n{error:#}"));
+    }
+
+    #[test]
+    fn max_wait_parses_strictly() {
+        assert_eq!(wait_arg("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(wait_arg("10m"), Ok(Duration::from_secs(600)));
+        assert_eq!(wait_arg("1h"), Ok(Duration::from_secs(3_600)));
+        for bad in [
+            "", "10", "m", "1.5m", "-1m", "10 m", "10min", "1d", "0s", "+5m",
+        ] {
+            assert!(wait_arg(bad).is_err(), "{bad:?} must not parse");
+        }
     }
 }

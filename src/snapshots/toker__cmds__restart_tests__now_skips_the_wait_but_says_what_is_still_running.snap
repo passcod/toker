@@ -1,0 +1,7 @@
+---
+source: src/cmds.rs
+expression: out
+---
+not waiting (--now): 2 responses in flight will finish before the old instance exits
+toker 0ld1d0ld is draining and will exit; waiting for systemd to start the next one
+toker n3wn3wn3 is up: version 0.1.0, up 0s
