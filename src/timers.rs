@@ -344,6 +344,34 @@ pub struct PingConfig<'a> {
     /// The model the ping asks for (`TOKER_PING_MODEL`, else
     /// [`PING_MODEL`]).
     pub model: &'a str,
+    /// The `ANTHROPIC_CUSTOM_HEADERS` the verb inherited, which the ping
+    /// header joins rather than replaces.
+    pub custom_headers: Option<&'a str>,
+}
+
+/// `ANTHROPIC_CUSTOM_HEADERS` with the ping header added: newline-
+/// separated `Name: Value` lines, claude's format, so whatever headers
+/// the environment already carries ride along on the ping too. The
+/// first version set the variable outright, dropping them.
+///
+/// Any existing line for the ping header itself is replaced rather than
+/// kept: the daemon tags only the exact value `1`, so a stray
+/// `Name: 0` would leave the ping counted as a session, holding the
+/// machine awake. Names compare case-insensitively, as HTTP's do.
+pub fn with_ping_header(existing: Option<&str>, name: &str) -> String {
+    let mut lines: Vec<&str> = existing
+        .unwrap_or_default()
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            line.split_once(':')
+                .is_none_or(|(header, _)| !header.trim().eq_ignore_ascii_case(name))
+        })
+        .collect();
+    let ours = format!("{name}: 1");
+    lines.push(&ours);
+    lines.join("\n")
 }
 
 /// One client run: what to run, where, and for how long.
@@ -602,7 +630,7 @@ pub fn ping_window(
         ("ANTHROPIC_BASE_URL", anthropic_base_url(config.port)),
         (
             "ANTHROPIC_CUSTOM_HEADERS",
-            format!("{}: 1", config.ping_header),
+            with_ping_header(config.custom_headers, config.ping_header),
         ),
     ];
     // The cheapest request that opens a window: the smallest model, and
@@ -1305,6 +1333,7 @@ mod tests {
             ping_header: header,
             claude: "claude",
             model: super::PING_MODEL,
+            custom_headers: None,
         }
     }
 
@@ -1723,6 +1752,62 @@ mod tests {
         assert!(
             out.contains("the ledger confirms the window is open until 14:10"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn the_ping_header_joins_the_existing_custom_headers() {
+        use super::with_ping_header;
+        assert_eq!(with_ping_header(None, "x-toker-ping"), "x-toker-ping: 1");
+        assert_eq!(
+            with_ping_header(Some(""), "x-toker-ping"),
+            "x-toker-ping: 1"
+        );
+        // Existing lines are kept, in order, tidied of blanks and padding.
+        assert_eq!(
+            with_ping_header(Some("x-team: maui\n\n  x-trace: on  \n"), "x-toker-ping"),
+            "x-team: maui\nx-trace: on\nx-toker-ping: 1"
+        );
+        // A line for the ping header itself is replaced, whatever its
+        // case or value — only `1` tags a ping.
+        assert_eq!(
+            with_ping_header(Some("X-Toker-Ping: 0\nx-team: maui"), "x-toker-ping"),
+            "x-team: maui\nx-toker-ping: 1"
+        );
+        // A header that merely starts with the name is someone else's.
+        assert_eq!(
+            with_ping_header(Some("x-toker-ping-extra: 1"), "x-toker-ping"),
+            "x-toker-ping-extra: 1\nx-toker-ping: 1"
+        );
+    }
+
+    #[test]
+    fn inherited_custom_headers_reach_the_client() {
+        let dir = test_dir("ping-headers");
+        let db = dir.join("toker.db");
+        let now = utc_ms(9, 12);
+        let client = ScriptedClient::landing_ping(&db, now + 1_000, utc_ms(14, 10));
+        let mut config = ping_config(&db, "x-toker-ping");
+        config.custom_headers = Some("x-team: maui");
+        let mut sleep = no_sleep();
+        super::ping_window(
+            &mut Vec::new(),
+            &config,
+            "09:00",
+            now,
+            &utc(),
+            &client,
+            &mut sleep,
+        )
+        .expect("the ping lands");
+        let calls = client.calls();
+        assert!(
+            calls[0].env.contains(&(
+                "ANTHROPIC_CUSTOM_HEADERS".to_owned(),
+                "x-team: maui\nx-toker-ping: 1".to_owned()
+            )),
+            "{:?}",
+            calls[0].env
         );
     }
 

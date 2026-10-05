@@ -188,12 +188,14 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
     let claude = std::env::var("TOKER_PING_CLAUDE").unwrap_or_else(|_| "claude".to_owned());
     let model =
         std::env::var("TOKER_PING_MODEL").unwrap_or_else(|_| crate::timers::PING_MODEL.to_owned());
+    let custom_headers = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
     let ping = crate::timers::PingConfig {
         db_path: &config.db_path,
         port: config.port,
         ping_header: &config.ping_header_name,
         claude: &claude,
         model: &model,
+        custom_headers: custom_headers.as_deref(),
     };
     let mut out = std::io::stdout();
     let now = jiff::Timestamp::now().as_millisecond();
