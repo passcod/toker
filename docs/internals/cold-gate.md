@@ -112,6 +112,36 @@ that helps; it would trade a free read for a full-price rebuild. The whole
 saving lives in the cold case, which is the case `retarget_compaction` is
 licensed for.
 
+## A recap is held, not forwarded
+
+Claude Code's recap (its "away summary": "The user stepped away and is coming
+back. Recap in under 40 words…") is a fork of the main conversation, with the
+same tools, the same cache parameters, and the main model. Its reply is shown as
+a dim line in the UI and never enters the transcript. Claude Code skips a recap
+when it thinks the cache is stale, but it judges that on its own clock, which
+the end of any turn resets, a synthetic notice turn included.
+
+On 2026-10-06 the notice answered a prompt on a lane idle 8h 49m and holding
+485k tokens, and a recap followed three seconds later. The gate had already
+spoken that idle spell, so it forwarded the recap as it would the user's resend,
+and the recap rewrote 405k of cache ($3.26) for a sentence. The user was already
+typing `/compact`, which then found the lane warm and ran on Opus.
+
+So `decide_cold` takes the kind of turn (`Turn`), and a recap on a cold lane
+gets `ColdDecision::Recap`. That verdict comes before the once-per-spell rule,
+because forwarding a recap is never the user choosing to pay for the re-read,
+and before the outlook and the writes-free exemption, because a recap's value
+does not depend on what the re-read costs. The reply is `RECAP_HELD`, plain
+text with no notice frame since it is not a transcript turn, and the row is
+`cold-recap`.
+
+A held recap leaves the lane as it found it: neither `at` nor `noticed_at`
+moves. A recap arriving *before* the prompt would otherwise take the notice
+itself, spending it on a UI-only line and letting the real prompt through
+unwarned. The lane reseed restores `noticed_at` from `cold` rows only, which is
+why the held recap has its own kind. Detection is `AnthropicShape::recap`, under
+the same position rules as a compaction (see [compaction.md](compaction.md)).
+
 ## Two clocks, not one
 
 A lane record carries `updated_ms` (ctp's `at`) and `noticed_at`, and conflating

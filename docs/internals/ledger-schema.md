@@ -33,6 +33,7 @@ staleness back as the API's, which is how a 77-second observed lag first read as
 | `revoked` | The TUI's Close control deleted a session's allowances. `extra.allowances` counts them, `extra.via` is `tui`, and `rate_limits` is a last-seen copy. |
 | `cold` | The cold notice fired. No `rate_limits`. |
 | `cold-quiet` | A cold notice was withheld. `extra` carries `quotaExtra` (the re-read's estimated share of a 5-hour window), `quotaBound` (true where that weight was borrowed, so an upper bound), and `util5h` (the utilisation the decision rested on, from the burn, not the last-seen copy). The request itself went through, so an ordinary row follows. |
+| `cold-recap` | A Claude Code recap on a cold lane was answered by the gate and never forwarded. `extra` carries the `cold` row's `idleMs`, `lastPrompt` and `reqMessages`. The lane is untouched, so the notice is still armed. Absent before 2026-10-06. |
 | `awake` | The sleep lock changed hands. No `rate_limits`, and no frontend, provider or route: the lock is not a route. |
 | `error` | A non-2xx on a usage path: `status`, `error_type`, `retry_after_ms`. Never priced. |
 | `fidelity-drift` | Re-serialisation diverged from the client's bytes; `drift_digest` says where. The original bytes were forwarded. |
@@ -64,6 +65,9 @@ regression.
 - `ping` marks a request the window pinger sent.
 - `extra.frontend` is the `/f/<frontend>` name the request came through; absent
   on unprefixed requests and on every row before prefixes existed.
+- `extra.recap` is `true` on a measurement row that was a Claude Code recap
+  forwarded upstream (a warm lane's). Absent before 2026-10-06, when recaps were
+  not detected.
 - `extra.compactMarker` says where a compaction wording sat when one appeared in
   the last four messages, matched or not: `fromEnd`, `role`, `trailing` (the
   roles after it), `lineStart`, `toolResult`. Absent before 2026-10-06.
