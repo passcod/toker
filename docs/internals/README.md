@@ -27,7 +27,7 @@ topic says that too.
 | Path | |
 | --- | --- |
 | `src/main.rs` | The CLI surface (clap). Every subcommand is a call into `cmds`. |
-| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, `restart` (with its wait loop), and the hidden timer verbs. |
+| `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, `restart` (with its wait loop), `picker sync`, and the hidden timer verbs. |
 | `src/config.rs` | `toker.toml` load: providers, protocol defaults, `[gates]`, `[notices]`, env overrides. |
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
 | `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick, the drain on shutdown. |
@@ -53,6 +53,7 @@ topic says that too.
 | `src/providers/` | Backends: `anthropic.rs` (sub and API, and the meter-header parser), `openrouter.rs`, `codex/` (login, wire types, SSE, meters). |
 | `src/catalog/` | Hand-verified prices (`pricing.rs`) and context windows (`windows.rs`), each with a `VERIFIED_ON`; the providers' fetched model listings (`fetched.rs`). |
 | `src/store/` | The SQLite ledger (`ledger.rs`), the state tables (`state.rs`), and the append-only migrations (`schema.rs`). |
+| `src/picker.rs` | Claude Code `/model` rows for openrouter models: the rules, the built-in set, matching against openrouter's listing, and `toker picker sync`. |
 | `src/import.rs` | `toker import`: ctp's `usage.jsonl` into the ledger, with a checkpoint. |
 | `src/export.rs` | `toker export`: the ledger as JSONL, and the strict `--since`/`--until`/`--kind` parsers. |
 | `src/watch.rs` | `toker watch-context-window`: one pass printing each new proof of a context window, with its seen-set state file. |

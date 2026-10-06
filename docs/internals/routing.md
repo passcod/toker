@@ -11,7 +11,7 @@ serves them all, because the paths do not collide:
 
 | Protocol | Paths | Backends |
 | --- | --- | --- |
-| Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `codex_sub` (translated) |
+| Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
 | OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter` |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
@@ -20,8 +20,8 @@ Each protocol has a default (`default_backend_anthropic`,
 name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
 `anthropic/…` (the protocol default) and `openrouter/…` are stripped and routed
 (`strip_anthropic_prefix` in `server/anthropic.rs`, `strip_provider_prefix` in
-`server/proxy.rs`), and the row records both `requested_model` and
-`effective_model`. A prefix naming a backend whose block is absent is answered
+`server/proxy.rs`; `openrouter/` on both protocols), and the row records both
+`requested_model` and `effective_model`. A prefix naming a backend whose block is absent is answered
 locally, never sent to the default with the prefix still on. A protocol with no
 enabled backend answers its routes with a not-configured error in that
 protocol's own shape, carrying the `x-toker-not-configured` header, and reaches
@@ -41,7 +41,7 @@ placeholder.
 | --- | --- | --- | --- |
 | `anthropic_sub` | the client's own OAuth bearer, passed through | `anthropic-ratelimit-*` headers, the quota gate's only source | `plan_equivalent` (list price on a subscription) |
 | `anthropic_api` | `x-api-key`, injected only when the request has none | none (its RPM headers are not quota meters and must never overwrite the gate's snapshot) | `estimated` |
-| `openrouter` | stored key, injected only when the request has none | none | `billed`, from `usage.cost` |
+| `openrouter` | stored key, injected only when the request has none; an Anthropic credential is dropped first | none | `billed`, from `usage.cost`, on the OpenAI-chat route; none on the Anthropic route (see below) |
 | `codex_sub` | always toker-signed from `~/.codex/auth.json` | `x-codex-*` headers, stored per backend, not gated | NULL: no per-token price to verify |
 
 The three cost kinds are never conflated (`CostKind`).
@@ -78,6 +78,64 @@ upstream as it stands and relays the upstream's 404, which is exactly what a
 frontend patched to that prefix would then get on every request. So the check
 also asks for toker's own status through the prefix, which only a toker that
 strips it can answer.
+
+## OpenRouter models in Claude Code's `/model` picker
+
+OpenRouter serves the Anthropic Messages wire itself, at `…/api/v1/messages`,
+which the openrouter provider's `endpoint` already maps `/v1/messages` onto. So
+an `openrouter/<id>` model on the anthropic frontend is a same-protocol
+byte-forward with the prefix stripped. The client's own credential is Claude's
+OAuth bearer, meant for Anthropic: `OpenRouter::strip_foreign_credentials` drops
+any `sk-ant-` bearer and `x-api-key`, and the stored openrouter key goes in its
+place. Nothing of the subscription's reaches openrouter.ai.
+
+Two rewrites stay off this route (`picks_from_anthropic_catalogue`): the
+compaction retarget and force-newest both pick a bare `claude-*` id from the
+Anthropic catalogue, which on openrouter would move the conversation off the
+model the user picked. Codex keeps them, because its model map turns those ids
+into codex ones. The quota gate is subscription-only already; the cold gate
+runs, and since openrouter is no meter source its notice says the re-read is
+billed.
+
+Rows on this route carry no cost. The catalogue prices Anthropic's own API,
+not openrouter's providers or the other labs' models, so an estimate from it
+would be a guessed price. Whether OpenRouter's Anthropic endpoint reports
+`usage.cost` the way its chat endpoint does is not yet checked; until it is,
+absence is the truthful answer. Also unchecked: whether `count_tokens` is
+served there, and which of Claude Code's request fields (beta flags,
+`thinking`, `output_config.effort`, `context_management`) non-Anthropic models
+accept. A model that refuses one answers with openrouter's own error, passed
+through.
+
+### How the rows get into the picker
+
+Claude Code 2.1.280 was read for this (2026-10-06), and it offers three ways to
+add models to `/model`; only one works on a subscription:
+
+- Gateway discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) fetches
+  `<ANTHROPIC_BASE_URL>/v1/models` at launch, but only with a credential from
+  `ANTHROPIC_AUTH_TOKEN`, an API key, or `apiKeyHelper`. The claude.ai login does
+  not count, and setting any of those three replaces the OAuth bearer on
+  `/v1/messages` as well, ending subscription passthrough. It also drops every
+  id not matching `/(claude|anthropic)/i`.
+- The subscription's own additions come from `/api/claude_cli/bootstrap`, which
+  goes to the OAuth host, never through `ANTHROPIC_BASE_URL`.
+- `modelPicker` in `~/.claude/settings.json` takes rows of `model`, `label`,
+  `description` and `behavesAs`, with no credential and no id filter. It is
+  honoured from user, managed and `--settings` sources only, never a project's
+  settings, so the Workhorse repo-root file cannot carry it. `behavesAs` names a
+  model this Claude Code knows, whose client-side handling applies; without it
+  a row for an unknown model is not offered.
+
+So toker writes `modelPicker` (`picker.rs`, `patchers::patch_model_picker`). The
+rows come from rules matched against openrouter's public listing, keeping each
+rule's newest matches, so a new model version replaces the old on the next sync.
+The service cannot write `~/.claude`, so `toker picker sync` runs as the user:
+setup runs it once through `toker-picker.service`, and `toker-picker.timer`
+repeats it daily, sandboxed to claude's settings dir and the state dir. A sync
+owns only rows whose model starts with `openrouter/`, rewrites the file only
+when the rows changed (Claude Code hot-reloads it into every session), and
+changes nothing when the listing cannot be fetched.
 
 ## Same-protocol routes forward the client's bytes
 

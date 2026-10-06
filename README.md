@@ -38,6 +38,23 @@ New models come out regularly, but harnesses don't always follow suit. Toker lea
 
 When using opencode, a custom sidebar and footer plugin augments the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and shows the provider breakdown when using a router.
 
+## OpenRouter models in Claude Code
+
+With an OpenRouter backend set up, `toker setup` adds OpenRouter models to Claude Code's `/model` picker, beside the models your Anthropic login gives you. Picking one routes that session through OpenRouter on your OpenRouter key; everything else stays on your subscription. A daily timer keeps the list current, so a new version of a model replaces the old one without you doing anything. Run `toker picker sync --dry-run` to see what it would offer.
+
+Which models appear is decided by rules matched against OpenRouter's model list. The built-in rules offer one flagship and one fast model from the well-known labs, plus OpenRouter's Auto Router (and Anthropic's own models, when you have no Anthropic backend). To choose your own, print the built-in rules with `toker picker defaults`, copy them into `~/.config/toker/toker.toml`, and edit:
+
+```toml
+[[providers.openrouter.picker]]
+match = ["moonshotai/kimi-k*"]        # OpenRouter model ids, as globs
+exclude = ["*-code", "*-thinking"]
+behaves_as = "sonnet"                 # opus, sonnet, haiku, fable, or a Claude model id
+variant = ":floor"                    # optional OpenRouter variant
+keep = 1                              # how many of the newest matches to offer
+```
+
+Your list replaces the built-in one; `picker = []` offers nothing. `behaves_as` tells Claude Code which of its own models to treat the row like (its prompting and effort settings); pick the closest in cost and capability. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
+
 ## TUI
 
 ```

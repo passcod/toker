@@ -23,8 +23,10 @@ reasons.
      (pass-through-when-present). The anthropic subscription only ever passes
      through; toker holds no subscription token for it. The anthropic API
      injects `x-api-key` only when the request carries neither `x-api-key` nor
-     `authorization`. On the openai path another provider's credential is
-     dropped before the stored one is injected, never forwarded.
+     `authorization`. On a route to openrouter another provider's credential is
+     dropped before the stored one is injected, never forwarded: on the openai
+     path, and on the anthropic path's `openrouter/` route, where every request
+     carries Claude's subscription bearer.
    - One request toker makes itself uses a passing credential: the anthropic
      models listing, which names each model's context window. With no API key
      stored, toker has no other way to read it. While that catalogue is stale,
