@@ -50,6 +50,11 @@ finish by hand:
   sudo systemctl disable --now toker-wake.timer toker-wake.service
   sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
   predecessor history: none to import
+installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
+installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
+systemctl --user daemon-reload — ok
+systemctl --user enable --now toker-picker.timer — ok
+systemctl --user start toker-picker.service — ok
 
 [6/6] done
   config    : wrote [ROOT]/.config/toker/toker.toml
@@ -61,4 +66,5 @@ finish by hand:
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
   timers    : none — NOT fully removed — finish by hand: sudo systemctl disable --now toker-wake.timer toker-wake.service && sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
+  picker    : openrouter rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

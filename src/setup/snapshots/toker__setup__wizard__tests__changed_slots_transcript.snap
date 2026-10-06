@@ -61,6 +61,11 @@ enabling the wake system timer — sudo will be asked (WakeSystem=true needs the
 sudo systemctl link [ROOT]/.config/systemd/user/toker-wake.service — ok
 sudo systemctl enable --now [ROOT]/.config/systemd/user/toker-wake.timer — ok
   predecessor history: none to import
+installed toker-picker.timer ([ROOT]/.config/systemd/user/toker-picker.timer)
+installed toker-picker.service ([ROOT]/.config/systemd/user/toker-picker.service)
+systemctl --user daemon-reload — ok
+systemctl --user enable --now toker-picker.timer — ok
+systemctl --user start toker-picker.service — ok
 
 [6/6] done
   config    : wrote [ROOT]/.config/toker/toker.toml
@@ -72,4 +77,5 @@ sudo systemctl enable --now [ROOT]/.config/systemd/user/toker-wake.timer — ok
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
   timers    : slots 07:20, 12:20 — hold+ping user timers installed and enabled; wake system timer enabled; removed toker-ping-0730.timer, toker-ping-0730.service
+  picker    : openrouter rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

@@ -1,0 +1,16 @@
+---
+source: src/setup/wizard.rs
+expression: unit
+---
+[Unit]
+Description=toker picker sync (Claude Code's openrouter /model rows)
+
+[Service]
+Type=oneshot
+ExecStart="/opt/toker/toker" picker sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/user/.claude
+ReadWritePaths=-/home/user/.local/share/toker

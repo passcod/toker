@@ -102,6 +102,15 @@ pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
 /// The hold USER service's name.
 pub const HOLD_SERVICE_UNIT: &str = "toker-hold.service";
 
+/// The picker USER timer: the daily `toker picker sync`, which keeps
+/// Claude Code's openrouter `/model` rows in step with openrouter's
+/// listing. The service cannot do it: it may not write outside the
+/// state dir.
+pub const PICKER_TIMER_UNIT: &str = "toker-picker.timer";
+
+/// The picker USER service, which the timer starts and setup runs once.
+pub const PICKER_SERVICE_UNIT: &str = "toker-picker.service";
+
 /// The slots offered when no earlier run left any: the predecessor's
 /// schedule. A slot is the wake and hold, and its ping fires
 /// [`PING_DELAY_MINUTES`] later: 07:20's ping at 07:31 anchors its
@@ -625,6 +634,47 @@ ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
     (timer, service)
 }
 
+/// `toker-picker.timer` + `toker-picker.service`: a daily oneshot of
+/// `toker picker sync`. Sandboxed like the service, with two writable
+/// paths: claude's settings dir (the sync renames a temp file over
+/// `settings.json`, so the directory, not the file) and, optionally,
+/// the state dir, where even a read-only ledger open needs its WAL
+/// shared-memory file. A missed day runs on the next boot
+/// (`Persistent=true`): unlike a ping, a late sync is still right.
+pub fn picker_user_units(exe: &Path, claude_dir: &Path, state_dir: &Path) -> (String, String) {
+    let timer = r#"[Unit]
+Description=toker picker timer (refreshes Claude Code's openrouter /model rows daily)
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"#
+    .to_owned();
+    let service = format!(
+        r#"[Unit]
+Description=toker picker sync (Claude Code's openrouter /model rows)
+
+[Service]
+Type=oneshot
+ExecStart="{exe}" picker sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={claude_dir}
+ReadWritePaths=-{state_dir}
+"#,
+        exe = exe.display(),
+        claude_dir = claude_dir.display(),
+        state_dir = state_dir.display(),
+    );
+    (timer, service)
+}
+
 /// One slot's ping pair — [`ping_user_units`] returns one per slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PingUnits {
@@ -1028,6 +1078,9 @@ pub struct RunReport {
     pub wake_enabled: bool,
     /// Manual commands for the wake timer when not enabled.
     pub wake_manual: Vec<String>,
+    /// What became of the openrouter `/model` picker sync, when claude
+    /// is a frontend and there was anything to do.
+    pub picker: Option<String>,
 }
 
 // ── the wizard ──────────────────────────────────────────────────────────
@@ -1113,6 +1166,9 @@ impl<'a> Wizard<'a> {
             self.verify_step(&current, &detected, &mut report).await?;
             self.frontends_step(&detected, &current, &mut report)?;
             self.toggles_step(&detected, &current, &mut report)?;
+            // Last, after the timers: it writes claude's settings, so it
+            // must follow verify like the frontend patches do.
+            self.picker_step(&detected, &current, &mut report)?;
         }
         self.finish(&report)?;
         Ok(report)
@@ -1984,6 +2040,120 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
+    /// The openrouter `/model` rows in claude's settings, after the
+    /// timers: it writes claude's settings, which the ordering rule only
+    /// allows once the service is verified. With an
+    /// openrouter backend, the picker units go in, the timer is
+    /// enabled, and the service runs once now, so setup exercises the
+    /// same sandboxed path the timer will. Without one, a previous
+    /// run's units run one last time (taking toker's rows back out of
+    /// the picker) and are removed. Never fatal: the proxy works without
+    /// the picker.
+    fn picker_step(
+        &mut self,
+        detected: &Detected,
+        config: &Config,
+        report: &mut RunReport,
+    ) -> Result<()> {
+        if !detected
+            .frontends
+            .iter()
+            .any(|fd| matches!(fd.frontend, Frontend::Claude { .. }))
+        {
+            return Ok(());
+        }
+        let installed = self.paths.units_dir.join(PICKER_TIMER_UNIT).exists();
+        if config.openrouter.is_none() {
+            if !installed {
+                return Ok(());
+            }
+            let cleared = self.run_picker_sync()?;
+            let retired = self.retire_user_timers(&[PICKER_TIMER_UNIT.to_owned()], report)?;
+            report.picker = Some(if cleared && retired {
+                "no openrouter backend: rows and timer removed".to_owned()
+            } else {
+                format!(
+                    "no openrouter backend: NOT fully removed — finish by hand: \
+                     systemctl --user start {PICKER_SERVICE_UNIT} && \
+                     systemctl --user disable --now {PICKER_TIMER_UNIT}"
+                )
+            });
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe().context("resolving the running binary's own path")?;
+        let claude_dir = self
+            .paths
+            .claude_settings
+            .parent()
+            .context("claude's settings path has no directory")?
+            .to_path_buf();
+        let (timer, service) = picker_user_units(&exe, &claude_dir, &self.paths.state_dir);
+        let mut ok = true;
+        for (name, contents) in [(PICKER_TIMER_UNIT, timer), (PICKER_SERVICE_UNIT, service)] {
+            match self.runner.install_unit(name, &contents) {
+                Ok(path) => self.say(&format!("installed {name} ({})", path.display()))?,
+                Err(error) => {
+                    ok = false;
+                    self.say(&format!("installing {name} failed: {error:#}"))?;
+                }
+            }
+        }
+        for args in [
+            &["daemon-reload"][..],
+            &["enable", "--now", PICKER_TIMER_UNIT][..],
+        ] {
+            if !ok {
+                break;
+            }
+            match self.runner.systemctl_user(args) {
+                Ok(output) if output.status.success() => {
+                    self.say(&format!("systemctl --user {} — ok", args.join(" ")))?
+                }
+                other => {
+                    ok = false;
+                    self.say(&format!(
+                        "systemctl --user {} failed: {}",
+                        args.join(" "),
+                        stderr_of(&other)
+                    ))?;
+                }
+            }
+        }
+        let synced = ok && self.run_picker_sync()?;
+        report.picker = Some(if synced {
+            format!("openrouter rows synced; {PICKER_TIMER_UNIT} refreshes them daily")
+        } else if ok {
+            format!(
+                "{PICKER_TIMER_UNIT} enabled, but the first sync failed — \
+                 see `journalctl --user -u {PICKER_SERVICE_UNIT}`"
+            )
+        } else {
+            "NOT up — re-run `toker setup`, or `toker picker sync` by hand".to_owned()
+        });
+        Ok(())
+    }
+
+    /// Run the picker service once and wait for it (a oneshot's start
+    /// returns when it has finished). Returns whether it succeeded.
+    fn run_picker_sync(&mut self) -> Result<bool> {
+        match self.runner.systemctl_user(&["start", PICKER_SERVICE_UNIT]) {
+            Ok(output) if output.status.success() => {
+                self.say(&format!(
+                    "systemctl --user start {PICKER_SERVICE_UNIT} — ok"
+                ))?;
+                Ok(true)
+            }
+            other => {
+                self.say(&format!(
+                    "systemctl --user start {PICKER_SERVICE_UNIT} failed: {}",
+                    stderr_of(&other)
+                ))?;
+                Ok(false)
+            }
+        }
+    }
+
     /// The opencode plugin offer (opt-out): rides the frontends step,
     /// offered only when opencode itself was detected. The bundled
     /// plugin is the repo's own `plugins/opencode/toker-cost/`,
@@ -2648,6 +2818,9 @@ impl<'a> Wizard<'a> {
             )
         };
         self.say(&format!("  timers    : {timers}"))?;
+        if let Some(picker) = &report.picker {
+            self.say(&format!("  picker    : {picker}"))?;
+        }
         self.say("re-run `toker setup` any time to change anything.")?;
         Ok(())
     }
@@ -3131,6 +3304,14 @@ mod tests {
         outcome(true, "", "")
     }
 
+    /// `outcomes` with the picker step's three after them (it runs
+    /// last): daemon-reload, enable --now toker-picker.timer, and the
+    /// first sync's start of toker-picker.service.
+    fn with_picker(mut outcomes: Vec<Result<Output>>) -> Vec<Result<Output>> {
+        outcomes.extend([ok_empty(), ok_empty(), ok_empty()]);
+        outcomes
+    }
+
     fn active() -> Result<Output> {
         outcome(true, "active\n", "")
     }
@@ -3560,6 +3741,16 @@ default_backend_anthropic = "codex_sub"
         unit_snapshot("hold_timer", &hold_timer);
         unit_snapshot("hold_service", &hold_service);
 
+        // The picker pair: a daily oneshot of `picker sync`, writable
+        // only in claude's settings dir and (optionally) the state dir.
+        let (picker_timer, picker_service) = picker_user_units(
+            exe,
+            Path::new("/home/user/.claude"),
+            Path::new("/home/user/.local/share/toker"),
+        );
+        unit_snapshot("picker_timer", &picker_timer);
+        unit_snapshot("picker_service", &picker_service);
+
         // The ping pairs: ONE per slot, the timer at slot+11 m — the
         // 23:55 slot wraps to 00:06, which a daily OnCalendar reads as
         // the next day, exactly 11 m later — and the service carrying
@@ -3591,11 +3782,11 @@ default_backend_anthropic = "codex_sub"
             // The socket query FAILS (no systemd reachable): non-fatal
             // by design, reported as "unknown" — the state summary
             // must say so, not stop.
-            vec![
+            with_picker(vec![
                 Err(anyhow::anyhow!("systemctl: command not found")),
                 ok_empty(),
                 ok_empty(),
-            ],
+            ]),
         );
         let unwired_claude = seed_claude(&rig.root);
         let unwired_opencode = seed_opencode(&rig.root);
@@ -3643,28 +3834,26 @@ default_backend_anthropic = "codex_sub"
         // binary and the scratch state dir; the systemctl calls in
         // the wizard's exact order.
         let exe = std::env::current_exe().expect("this test binary's path");
+        let mut units = vec![
+            (SOCKET_UNIT.to_owned(), socket_unit(port)),
+            (
+                SERVICE_UNIT.to_owned(),
+                service_unit(&exe, &rig.paths().state_dir, &[]),
+            ),
+        ];
+        units.extend(picker_installed(&rig, &exe));
         assert_eq!(
             rig.runner.installed(),
-            vec![
-                (SOCKET_UNIT.to_owned(), socket_unit(port)),
-                (
-                    SERVICE_UNIT.to_owned(),
-                    service_unit(&exe, &rig.paths().state_dir, &[])
-                ),
-            ],
+            units,
             "the units generated are functions of current_exe and the state dir"
         );
-        assert_eq!(
-            rig.runner.calls(),
-            vec![
-                vec!["is-active", SOCKET_UNIT],
-                vec!["daemon-reload"],
-                vec!["enable", "--now", SOCKET_UNIT],
-            ]
-            .into_iter()
-            .map(|call| call.into_iter().map(str::to_owned).collect::<Vec<_>>())
-            .collect::<Vec<_>>(),
-        );
+        let mut calls = strings(vec![
+            vec!["is-active", SOCKET_UNIT],
+            vec!["daemon-reload"],
+            vec!["enable", "--now", SOCKET_UNIT],
+        ]);
+        calls.extend(picker_calls());
+        assert_eq!(rig.runner.calls(), calls);
 
         // Verify passed with the upstream verdicts.
         assert_eq!(
@@ -3792,7 +3981,7 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::at(
             root.clone(),
             answers_fresh(port),
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
         seed_claude(&root);
         seed_opencode(&root);
@@ -3819,7 +4008,7 @@ default_backend_anthropic = "codex_sub"
                 confirm(true),  // the shell rc: already wired
                 confirm(false), // wake/hold/ping timers: no
             ],
-            vec![active(), ok_empty(), ok_empty()],
+            with_picker(vec![active(), ok_empty(), ok_empty()]),
         );
         let report = rerun
             .run(VERIFY_TIMEOUT)
@@ -3933,7 +4122,7 @@ default_backend_anthropic = "codex_sub"
                 confirm(true),  // the opencode plugin
                 confirm(false), // wake/hold/ping timers: no
             ],
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
         let before_claude = seed_claude(&rig.root);
         seed_opencode(&rig.root);
@@ -4109,9 +4298,9 @@ default_backend_anthropic = "codex_sub"
         );
         let mut with = Rig::at(
             with_dir.clone(),
-            // The fresh script up to the port, the workhorse confirm
+            // The fresh script up to the port, with_picker(the workhorse confirm
             // (the only frontend detected here — no user-level claude,
-            // no opencode, no shell rc, so no plugin offer), then no
+            // no opencode, no shell rc, so no plugin offer)), then no
             // slots.
             vec![
                 multi(&[0, 3]),          // backends: anthropic_sub + openrouter
@@ -4162,7 +4351,7 @@ default_backend_anthropic = "codex_sub"
         let mut without = Rig::new(
             "workhorse-without",
             answers_fresh(port),
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
         seed_claude(&without.root);
         seed_opencode(&without.root);
@@ -4607,7 +4796,7 @@ default_backend_anthropic = "codex_sub"
                 answers[8] = confirm(false); // the opt-out
                 answers
             },
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
         seed_claude(&declined.root);
         seed_opencode(&declined.root);
@@ -4646,7 +4835,7 @@ default_backend_anthropic = "codex_sub"
                 answers[8] = confirm(false); // the reinstall refusal
                 answers
             },
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
         seed_claude(&guarded.root);
         seed_opencode(&guarded.root);
@@ -4690,7 +4879,7 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("09:00, 12:30")]);
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(), // is-active
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
@@ -4698,7 +4887,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-hold.timer
                 ok_empty(), // enable --now toker-ping-0900.timer
                 ok_empty(), // enable --now toker-ping-1230.timer
-            ],
+            ]),
         )
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
@@ -4733,8 +4922,11 @@ default_backend_anthropic = "codex_sub"
                 (pings[1].service_name.clone(), pings[1].service.clone()),
                 (WAKE_SERVICE_UNIT.to_owned(), wake_system_service()),
                 (WAKE_TIMER_UNIT.to_owned(), wake_system_unit(&slots)),
-            ],
-            "socket, service, hold pair, one ping pair per slot, staged wake pair"
+            ]
+            .into_iter()
+            .chain(picker_installed(&rig, &exe))
+            .collect::<Vec<_>>(),
+            "socket, service, hold pair, one ping pair per slot, staged wake pair, picker pair"
         );
 
         // The user-manager calls, in the wizard's exact order.
@@ -4751,6 +4943,7 @@ default_backend_anthropic = "codex_sub"
             ]
             .into_iter()
             .map(|call| call.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            .chain(picker_calls())
             .collect::<Vec<_>>(),
         );
 
@@ -4814,14 +5007,14 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
                 ok_empty(), // daemon-reload (timers)
                 ok_empty(), // enable --now toker-hold.timer
                 ok_empty(), // enable --now toker-ping-0900.timer
-            ],
+            ]),
         )
         // sudo cannot run at all on this leg.
         .with_system(vec![Err(anyhow::anyhow!("sudo: command not found"))]);
@@ -4898,14 +5091,14 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
                 ok_empty(), // daemon-reload (timers)
                 ok_empty(), // enable --now toker-hold.timer
                 ok_empty(), // enable --now toker-ping-0900.timer
-            ],
+            ]),
         )
         .with_system(vec![
             ok_empty(),
@@ -4949,12 +5142,12 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(),     // daemon-reload (units)
                 ok_empty(),     // enable --now socket
                 reload_fails(), // daemon-reload (timers) — the user manager is gone
-            ],
+            ]),
         )
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
@@ -4967,13 +5160,15 @@ default_backend_anthropic = "codex_sub"
             .expect("a failed timers step is non-fatal");
 
         assert!(!report.timers_ok, "the user timers did not come up");
-        // The enables were never called after the reload failed
-        // (no further scripted user outcomes remain).
+        // The enables were never called after the reload failed: the
+        // next call is the picker step's own reload.
+        let calls = rig.runner.calls();
         assert_eq!(
-            rig.runner.calls().last().map(|call| call.join(" ")),
-            Some("daemon-reload".to_owned()),
+            calls[calls.len() - 4].join(" "),
+            "daemon-reload",
             "enable was never called after the reload failed"
         );
+        assert_eq!(calls[calls.len() - 3..], picker_calls());
         assert!(
             report
                 .timers_manual
@@ -4992,6 +5187,58 @@ default_backend_anthropic = "codex_sub"
         assert_eq!(rig.runner.system_calls().len(), 2);
     }
 
+    /// With no openrouter backend, picker units an earlier run left run
+    /// once more (taking toker's rows back out of claude's picker) and
+    /// are removed. With neither, the step does nothing at all.
+    #[tokio::test]
+    async fn without_openrouter_an_earlier_picker_runs_once_more_and_goes() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "picker-gone",
+            vec![
+                multi(&[0]),             // backends: anthropic_sub only
+                confirm(true),           // awake
+                text(&port.to_string()), // the listener port
+                confirm(true),           // claude
+                confirm(false),          // wake/hold/ping timers: no
+            ],
+            vec![
+                inactive(),
+                ok_empty(), // daemon-reload (units)
+                ok_empty(), // enable --now socket
+                ok_empty(), // start toker-picker.service: the last sync
+                ok_empty(), // disable --now toker-picker.timer
+            ],
+        );
+        seed_claude(&rig.root);
+        seed_units(&rig, &[PICKER_TIMER_UNIT, PICKER_SERVICE_UNIT]);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        let calls = rig.runner.calls();
+        assert_eq!(
+            calls[calls.len() - 2..],
+            strings(vec![
+                vec!["start", PICKER_SERVICE_UNIT],
+                vec!["disable", "--now", PICKER_TIMER_UNIT],
+            ])
+        );
+        assert_eq!(
+            rig.runner.removed(),
+            [PICKER_TIMER_UNIT, PICKER_SERVICE_UNIT]
+        );
+        assert!(
+            rig.runner
+                .installed()
+                .iter()
+                .all(|(name, _)| !name.starts_with("toker-picker."))
+        );
+        assert_eq!(
+            report.picker.as_deref(),
+            Some("no openrouter backend: rows and timer removed")
+        );
+    }
+
     /// Seed the scratch units dir with what an earlier run left there.
     fn seed_units(rig: &Rig, names: &[&str]) {
         let dir = rig.paths().units_dir;
@@ -5008,6 +5255,27 @@ default_backend_anthropic = "codex_sub"
             .collect()
     }
 
+    /// The picker step's user-manager calls, which end every run with
+    /// an openrouter backend and a claude frontend.
+    fn picker_calls() -> Vec<Vec<String>> {
+        strings(vec![
+            vec!["daemon-reload"],
+            vec!["enable", "--now", PICKER_TIMER_UNIT],
+            vec!["start", PICKER_SERVICE_UNIT],
+        ])
+    }
+
+    /// The picker step's two units, as the rig's paths generate them.
+    fn picker_installed(rig: &Rig, exe: &Path) -> Vec<(String, String)> {
+        let paths = rig.paths();
+        let claude_dir = paths.claude_settings.parent().expect("a settings dir");
+        let (timer, service) = picker_user_units(exe, claude_dir, &paths.state_dir);
+        vec![
+            (PICKER_TIMER_UNIT.to_owned(), timer),
+            (PICKER_SERVICE_UNIT.to_owned(), service),
+        ]
+    }
+
     /// A yes with an empty slot answer takes the default slots — the
     /// predecessor's schedule — rather than meaning none.
     #[tokio::test]
@@ -5020,7 +5288,7 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("")]);
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
@@ -5028,7 +5296,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-hold.timer
                 ok_empty(), // enable --now toker-ping-0720.timer
                 ok_empty(), // enable --now toker-ping-1220.timer
-            ],
+            ]),
         )
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_claude(&rig.root);
@@ -5055,12 +5323,13 @@ default_backend_anthropic = "codex_sub"
         );
         let calls = rig.runner.calls();
         assert_eq!(
-            calls[calls.len() - 2..],
+            calls[calls.len() - 5..calls.len() - 3],
             strings(vec![
                 vec!["enable", "--now", "toker-ping-0720.timer"],
                 vec!["enable", "--now", "toker-ping-1220.timer"],
             ])
         );
+        assert_eq!(calls[calls.len() - 3..], picker_calls());
         assert!(rig.runner.removed().is_empty());
     }
 
@@ -5074,14 +5343,14 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::new(
             "timers-decline-installed",
             answers_fresh(port),
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
                 ok_empty(), // disable --now toker-hold.timer
                 ok_empty(), // disable --now toker-ping-0730.timer
                 ok_empty(), // daemon-reload (removal)
-            ],
+            ]),
         )
         .with_system(vec![ok_empty()]);
         seed_units(
@@ -5107,14 +5376,16 @@ default_backend_anthropic = "codex_sub"
             "installed timers make yes the default"
         );
         assert!(report.timer_slots.is_empty());
+        let calls = rig.runner.calls();
         assert_eq!(
-            rig.runner.calls()[3..],
+            calls[3..calls.len() - 3],
             strings(vec![
                 vec!["disable", "--now", HOLD_TIMER_UNIT],
                 vec!["disable", "--now", "toker-ping-0730.timer"],
                 vec!["daemon-reload"],
             ])
         );
+        assert_eq!(calls[calls.len() - 3..], picker_calls());
         assert_eq!(
             rig.runner.system_calls(),
             strings(vec![vec!["disable", "--now", WAKE_TIMER_UNIT]])
@@ -5134,7 +5405,10 @@ default_backend_anthropic = "codex_sub"
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.starts_with("toker-") && name != SOCKET_UNIT && name != SERVICE_UNIT
+                name.starts_with("toker-")
+                    && name != SOCKET_UNIT
+                    && name != SERVICE_UNIT
+                    && !name.starts_with("toker-picker.")
             })
             .collect();
         assert!(left.is_empty(), "nothing of the timers is left: {left:?}");
@@ -5153,7 +5427,7 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::new(
             "timers-decline-sudo-fail",
             answers_fresh(port),
-            vec![inactive(), ok_empty(), ok_empty()],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         )
         .with_system(vec![Err(anyhow::anyhow!("sudo: a password is required"))]);
         seed_units(&rig, &[WAKE_TIMER_UNIT, WAKE_SERVICE_UNIT]);
@@ -5194,7 +5468,7 @@ default_backend_anthropic = "codex_sub"
                 answers.splice(9..10, [confirm(true), text("07:20, 12:20")]);
                 answers
             },
-            vec![
+            with_picker(vec![
                 inactive(),
                 ok_empty(), // daemon-reload (units)
                 ok_empty(), // enable --now socket
@@ -5203,7 +5477,7 @@ default_backend_anthropic = "codex_sub"
                 ok_empty(), // enable --now toker-hold.timer
                 ok_empty(), // enable --now toker-ping-0720.timer
                 ok_empty(), // enable --now toker-ping-1220.timer
-            ],
+            ]),
         )
         .with_system(vec![ok_empty(), ok_empty()]);
         seed_units(
