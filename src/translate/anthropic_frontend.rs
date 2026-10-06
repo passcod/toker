@@ -183,6 +183,7 @@ fn messages_of(body: &Value) -> Result<Vec<CanonMessage>, TranslateError> {
             out.push(CanonMessage {
                 role,
                 blocks: system_blocks_of(message, message_index)?,
+                extensions: message_extensions(message),
             });
             continue;
         }
@@ -206,9 +207,30 @@ fn messages_of(body: &Value) -> Result<Vec<CanonMessage>, TranslateError> {
                 });
             }
         };
-        out.push(CanonMessage { role, blocks });
+        out.push(CanonMessage {
+            role,
+            blocks,
+            extensions: message_extensions(message),
+        });
     }
     Ok(out)
+}
+
+fn message_extensions(message: &Value) -> Vec<CanonicalExtension> {
+    message
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| !["role", "content"].contains(&field.as_str()))
+        .map(|(field, value)| {
+            CanonicalExtension::node_field(
+                DialectId::AnthropicMessages,
+                format!("$.messages[].{field}"),
+                field,
+                value.clone(),
+            )
+        })
+        .collect()
 }
 
 /// One message's block array → the canonical blocks, in order. The
@@ -1368,6 +1390,7 @@ mod tests {
             CanonMessage {
                 role: CanonRole::System,
                 blocks: vec![CanonBlock::Text("reminder".to_owned())],
+                extensions: Vec::new(),
             }
         );
         assert_eq!(canonical.messages[0].role, CanonRole::User);

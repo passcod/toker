@@ -41,6 +41,11 @@ pub fn render_anthropic(
         .ok_or_else(|| TranslateError::Malformed {
             reason: "canonical request has no model".to_owned(),
         })?;
+    if canonical.tool_choice == CanonToolChoice::None {
+        return Err(TranslateError::Malformed {
+            reason: "tool_choice type \"none\" has no messages equivalent".to_owned(),
+        });
+    }
 
     let mut report = TranslationReport::default();
     let mut body = Map::new();
@@ -134,15 +139,32 @@ fn message_value(
         CanonRole::User => "user",
         CanonRole::Assistant => "assistant",
         CanonRole::System => "system",
+        CanonRole::Developer => "system",
     };
-    json!({
+    if message.role == CanonRole::Developer {
+        report.push(TranslationLoss::new(
+            "messages[].role.developer",
+            TranslationLossReason::NotRepresentable,
+            1,
+        ));
+    }
+    let mut value = json!({
         "role": role,
         "content": message
             .blocks
             .iter()
             .filter_map(|block| block_value(block, dialect, report))
             .collect::<Vec<_>>(),
-    })
+    });
+    replay_extensions(
+        value
+            .as_object_mut()
+            .expect("a rendered message is an object"),
+        &message.extensions,
+        dialect,
+        report,
+    );
+    value
 }
 
 fn block_value(
@@ -279,6 +301,7 @@ fn tool_choice_value(choice: &CanonToolChoice) -> Value {
     match choice {
         CanonToolChoice::Auto => json!({"type": "auto"}),
         CanonToolChoice::Any => json!({"type": "any"}),
+        CanonToolChoice::None => unreachable!("rejected before rendering"),
         CanonToolChoice::Tool { name } => {
             let mut object = Map::new();
             object.insert("type".to_owned(), Value::String("tool".to_owned()));
@@ -911,6 +934,7 @@ mod tests {
                         )],
                     ),
                 ],
+                extensions: Vec::new(),
             }],
             extensions: vec![CanonicalExtension::node_field(
                 DialectId::CodexResponses,

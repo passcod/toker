@@ -197,6 +197,10 @@ impl fmt::Debug for CanonicalExtension {
 pub struct CanonMessage {
     pub role: CanonRole,
     pub blocks: Vec<CanonBlock>,
+    /// Dialect-local fields attached to this message rather than one of its
+    /// content blocks. Keeping them node-local lets middleware move a whole
+    /// message without invalidating an indexed wire path.
+    pub extensions: Vec<CanonicalExtension>,
 }
 
 /// A message role. `System` is a ROLE here, not a policy: the
@@ -207,6 +211,10 @@ pub enum CanonRole {
     User,
     Assistant,
     System,
+    /// OpenAI Chat's higher-priority instruction role. It stays distinct
+    /// from `System`; any backend that lacks the distinction must make its
+    /// deterministic transformation explicit in its adapter.
+    Developer,
 }
 
 /// One content block, wire-agnostic.
@@ -401,6 +409,8 @@ pub enum CanonToolChoice {
     Auto,
     /// The model must call some tool (anthropic `any`).
     Any,
+    /// Tool use is forbidden (OpenAI Chat `"none"`).
+    None,
     /// The model must call the named tool (anthropic `{type:"tool"}`).
     /// The name when the wire carried a string one — a backend that
     /// cannot express a forced tool reports the shape; this IR never

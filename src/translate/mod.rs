@@ -47,6 +47,11 @@
 //!   OpenRouter Messages dialects and reports incompatible omissions. It is
 //!   not a live binding yet: response interpretation must land before routing
 //!   can cut over to it.
+//! - [`openai_chat_frontend::from_openai_chat`] and
+//!   [`openai_chat_backend::render_openai_chat`]: Chat Completions request
+//!   ingress and deterministic OpenRouter Chat egress. `developer` remains a
+//!   distinct canonical role, tool messages become structural tool results,
+//!   and node-local Chat extensions replay only to the compatible dialect.
 //! - [`to_codex`]: the composition of the two — the public entry
 //!   the server calls (unit C).
 //!
@@ -231,6 +236,8 @@
 pub mod anthropic_backend;
 pub mod anthropic_frontend;
 pub mod codex_backend;
+pub mod openai_chat_backend;
+pub mod openai_chat_frontend;
 pub mod to_anthropic;
 pub mod to_codex;
 
@@ -239,6 +246,8 @@ pub use anthropic_backend::{
 };
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
+pub use openai_chat_backend::render_openai_chat;
+pub use openai_chat_frontend::from_openai_chat;
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::{render_to_codex, to_codex};
 

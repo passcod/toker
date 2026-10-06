@@ -315,11 +315,12 @@ No endpoint, body, credential, catalogue, or ledger behavior changes.
 
 ### 2. Make canonical IR universal
 
-In progress. The Messages request ingress, deterministic Anthropic/OpenRouter
-Messages request egress, streaming response interpretation, and complete
-response interpretation are implemented. Their provider bindings now declare
-canonical readiness, but live handlers remain on the legacy path until phase 3
-cuts each route over. Chat and native Responses ingress remain pending.
+In progress. The Messages adapter is complete in both directions. OpenAI Chat
+request ingress and deterministic OpenRouter Chat request egress are
+implemented; streaming and complete response interpretation remain. The
+Messages provider bindings declare canonical readiness, but live handlers
+remain on the legacy path until phase 3 cuts each route over. Native Responses
+ingress also remains pending.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.

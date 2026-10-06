@@ -181,6 +181,29 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
         ));
     }
 
+    let developer_messages = canonical
+        .messages
+        .iter()
+        .filter(|message| message.role == CanonRole::Developer)
+        .count();
+    if developer_messages > 0 {
+        report.push(TranslationLoss::new(
+            "messages[].role.developer",
+            TranslationLossReason::NotRepresentable,
+            developer_messages,
+        ));
+    }
+
+    for message in &canonical.messages {
+        for extension in &message.extensions {
+            report.push(TranslationLoss::new(
+                extension.wire_path(),
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            ));
+        }
+    }
+
     let thinking_blocks = canonical
         .messages
         .iter()
@@ -291,7 +314,7 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
     let mut leading_system: Vec<String> = Vec::new();
     for message in &canonical.messages {
         match message.role {
-            CanonRole::System => {
+            CanonRole::System | CanonRole::Developer => {
                 for block in &message.blocks {
                     // The frontend's system parse yields text blocks
                     // only; the canonical is typed, so anything else
@@ -412,6 +435,7 @@ fn tool_choice_of(choice: &CanonToolChoice) -> Result<String, TranslateError> {
     match choice {
         CanonToolChoice::Auto => Ok("auto".to_owned()),
         CanonToolChoice::Any => Ok("required".to_owned()),
+        CanonToolChoice::None => Ok("none".to_owned()),
         CanonToolChoice::Tool { .. } => Err(TranslateError::Malformed {
             reason: format!("tool_choice type {:?} has no responses equivalent", "tool"),
         }),
@@ -448,6 +472,7 @@ fn wire_role(role: CanonRole) -> &'static str {
         CanonRole::User => "user",
         CanonRole::Assistant => "assistant",
         CanonRole::System => "system",
+        CanonRole::Developer => "developer",
     }
 }
 
@@ -713,7 +738,11 @@ mod tests {
     }
 
     fn message(role: CanonRole, blocks: Vec<CanonBlock>) -> CanonMessage {
-        CanonMessage { role, blocks }
+        CanonMessage {
+            role,
+            blocks,
+            extensions: Vec::new(),
+        }
     }
 
     // ── the drops are THIS backend's doing ──────────────────────
