@@ -5,12 +5,14 @@
 //! messages become addressed canonical tool results, and unmodelled fields
 //! stay attached to their nearest canonical node.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalExtension,
-    CanonicalRequest, SamplingSpec, ToolResultContent,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest, CanonicalUsage,
+    SamplingSpec, ToolResultContent,
 };
+use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
 use crate::translate::TranslateError;
 
@@ -449,11 +451,242 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
+// ── response rendering ─────────────────────────────────────────────
+
+/// Deterministic Chat Completions SSE rendering for one canonical turn.
+#[derive(Debug, Clone)]
+pub struct OpenAiChatRenderer {
+    model: String,
+    id: Option<String>,
+    started: bool,
+    tool_index: u64,
+    ended: bool,
+}
+
+impl OpenAiChatRenderer {
+    pub fn new(model: &str) -> OpenAiChatRenderer {
+        OpenAiChatRenderer {
+            model: model.to_owned(),
+            id: None,
+            started: false,
+            tool_index: 0,
+            ended: false,
+        }
+    }
+
+    pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        match event {
+            CanonEvent::TurnStarted { turn_id } => {
+                if self.started {
+                    return Vec::new();
+                }
+                self.started = true;
+                self.id.clone_from(turn_id);
+                vec![self.chunk(json!({"role": "assistant", "content": ""}), None, None)]
+            }
+            CanonEvent::TextDelta { delta } => {
+                vec![self.chunk(json!({"content": delta}), None, None)]
+            }
+            CanonEvent::ThinkingDelta { delta, .. } => {
+                vec![self.chunk(json!({"reasoning": delta}), None, None)]
+            }
+            CanonEvent::ThinkingSignature { signature, .. } => vec![self.chunk(
+                json!({"reasoning_details": [{"type": "reasoning.signature", "signature": signature}]}),
+                None,
+                None,
+            )],
+            CanonEvent::RedactedThinking { data } => vec![self.chunk(
+                json!({"reasoning_details": [{"type": "reasoning.encrypted", "data": data}]}),
+                None,
+                None,
+            )],
+            CanonEvent::ToolCall(call) => {
+                let index = self.tool_index;
+                self.tool_index += 1;
+                vec![self.chunk(
+                    json!({"tool_calls": [{
+                        "index": index,
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    }]}),
+                    None,
+                    None,
+                )]
+            }
+            CanonEvent::TextEnded | CanonEvent::ThinkingEnded => Vec::new(),
+            CanonEvent::TurnEnded { stop_reason, usage } => {
+                self.ended = true;
+                let mut out = vec![self.chunk(
+                    json!({}),
+                    Some(chat_finish_reason(stop_reason)),
+                    None,
+                )];
+                if let Some(usage) = usage {
+                    out.push(self.chunk(Value::Null, None, Some(chat_usage_value(usage))));
+                }
+                out.push(SseEvent {
+                    data_lines: vec!["[DONE]".to_owned()],
+                    event: None,
+                });
+                out
+            }
+            CanonEvent::TurnFailed { error } | CanonEvent::Error { error } => {
+                if matches!(event, CanonEvent::TurnFailed { .. }) {
+                    self.ended = true;
+                }
+                vec![SseEvent {
+                    data_lines: vec![serde_json::to_string(&chat_error_value(error))
+                        .expect("chat error serialises")],
+                    event: None,
+                }]
+            }
+        }
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> SseEvent {
+        let choices = if delta.is_null() {
+            Vec::new()
+        } else {
+            vec![json!({"index": 0, "delta": delta, "finish_reason": finish_reason})]
+        };
+        let mut value = json!({
+            "id": self.id.as_deref().unwrap_or("chatcmpl"),
+            "object": "chat.completion.chunk",
+            "model": self.model,
+            "choices": choices,
+        });
+        if let Some(usage) = usage {
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("usage".to_owned(), usage);
+        }
+        SseEvent {
+            data_lines: vec![serde_json::to_string(&value).expect("chat chunk serialises")],
+            event: None,
+        }
+    }
+}
+
+pub fn openai_chat_from_canonical(model: &str, turn: &CanonTurn) -> Value {
+    if let Some(error) = &turn.error {
+        return chat_error_value(error);
+    }
+    let mut content = String::new();
+    let mut calls = Vec::new();
+    if let Some(blocks) = &turn.blocks {
+        for block in blocks {
+            match block.semantic() {
+                CanonBlock::Text(text) => content.push_str(text),
+                CanonBlock::ToolUse { id, name, input } => calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": serde_json::to_string(input).expect("tool input serialises"),
+                    }
+                })),
+                _ => {}
+            }
+        }
+    } else {
+        content.clone_from(&turn.text);
+        calls.extend(turn.tool_calls.iter().map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            })
+        }));
+    }
+    let mut message = json!({"role": "assistant", "content": content});
+    if !calls.is_empty() {
+        message
+            .as_object_mut()
+            .unwrap()
+            .insert("tool_calls".to_owned(), Value::Array(calls));
+    }
+    let mut body = json!({
+        "id": turn.turn_id.as_deref().unwrap_or("chatcmpl"),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": chat_finish_reason(&turn.stop_reason)}],
+    });
+    if let Some(usage) = &turn.usage {
+        body.as_object_mut()
+            .unwrap()
+            .insert("usage".to_owned(), chat_usage_value(usage));
+    }
+    body
+}
+
+fn chat_finish_reason(reason: &CanonStopReason) -> &'static str {
+    match reason {
+        CanonStopReason::ToolUse => "tool_calls",
+        CanonStopReason::MaxTokens
+        | CanonStopReason::ContextWindowExceeded
+        | CanonStopReason::Incomplete(_) => "length",
+        CanonStopReason::Refusal => "content_filter",
+        CanonStopReason::EndTurn | CanonStopReason::StopSequence | CanonStopReason::PauseTurn => {
+            "stop"
+        }
+    }
+}
+
+fn chat_usage_value(usage: &CanonicalUsage) -> Value {
+    let mut value = json!({});
+    let object = value.as_object_mut().unwrap();
+    if let Some(input) = usage.input {
+        object.insert("prompt_tokens".to_owned(), json!(input));
+    }
+    if let Some(output) = usage.output {
+        object.insert("completion_tokens".to_owned(), json!(output));
+    }
+    if let (Some(input), Some(output)) = (usage.input, usage.output) {
+        object.insert("total_tokens".to_owned(), json!(input + output));
+    }
+    if let Some(cached) = usage.cache_read {
+        object.insert(
+            "prompt_tokens_details".to_owned(),
+            json!({"cached_tokens": cached}),
+        );
+    }
+    if let Some(reasoning) = usage.reasoning {
+        object.insert(
+            "completion_tokens_details".to_owned(),
+            json!({"reasoning_tokens": reasoning}),
+        );
+    }
+    value
+}
+
+fn chat_error_value(error: &CanonError) -> Value {
+    let kind = match error.kind {
+        CanonErrorKind::RateLimit => "rate_limit_error",
+        CanonErrorKind::InvalidRequest => "invalid_request_error",
+        CanonErrorKind::Authentication => "authentication_error",
+        CanonErrorKind::Permission => "permission_error",
+        CanonErrorKind::NotFound => "not_found_error",
+        CanonErrorKind::TooLarge => "request_too_large",
+        CanonErrorKind::Overloaded => "overloaded_error",
+        CanonErrorKind::Api => "api_error",
+    };
+    json!({"error": {"type": kind, "message": error.message}})
+}
+
 #[cfg(test)]
 mod tests {
-    use super::from_openai_chat;
-    use crate::ir::canonical::{CanonBlock, CanonRole, CanonToolChoice};
+    use super::{OpenAiChatRenderer, from_openai_chat, openai_chat_from_canonical};
+    use crate::ir::canonical::{
+        CanonBlock, CanonEvent, CanonRole, CanonStopReason, CanonToolCall, CanonToolChoice,
+        CanonTurn,
+    };
     use serde_json::Value;
+    use std::collections::BTreeMap;
 
     fn fixture(name: &str) -> Value {
         serde_json::from_str(include_str!(concat!(
@@ -520,5 +753,56 @@ mod tests {
                 .iter()
                 .any(|extension| extension.wire_name() == Some("cache_control"))
         );
+    }
+
+    #[test]
+    fn canonical_events_render_as_chat_sse_with_done() {
+        let mut renderer = OpenAiChatRenderer::new("visible-model");
+        let events = [
+            CanonEvent::TurnStarted {
+                turn_id: Some("turn-1".to_owned()),
+            },
+            CanonEvent::TextDelta {
+                delta: "hello".to_owned(),
+            },
+            CanonEvent::ToolCall(CanonToolCall {
+                id: "call-1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{\"id\":1}".to_owned(),
+            }),
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                usage: None,
+            },
+        ];
+        let rendered = events
+            .iter()
+            .flat_map(|event| renderer.feed(event))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.last().unwrap().data(), "[DONE]");
+        let tool: Value = serde_json::from_str(&rendered[2].data()).unwrap();
+        assert_eq!(
+            tool["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        let end: Value = serde_json::from_str(&rendered[3].data()).unwrap();
+        assert_eq!(end["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn canonical_turn_renders_as_complete_chat_response() {
+        let turn = CanonTurn {
+            turn_id: Some("turn-1".to_owned()),
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: None,
+            tool_calls: Vec::new(),
+            blocks: None,
+            text: "hello".to_owned(),
+            thinking: BTreeMap::new(),
+        };
+        let value = openai_chat_from_canonical("visible-model", &turn);
+        assert_eq!(value["choices"][0]["message"]["content"], "hello");
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
     }
 }
