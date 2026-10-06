@@ -104,9 +104,9 @@
 //!   thinking needs a signature this translation never mints).
 //! - **`stop_sequences`** — no Responses equivalent, so the codex
 //!   backend drops it; the canonical carries it with the sampling
-//!   specs for a backend that takes it. **`top_k`** and
-//!   **`metadata`** (incl. `user_id`) have no canonical form (and no
-//!   backend has asked for one — the pair module dropped them too).
+//!   specs for a backend that takes it. **`top_k`**, **`metadata`**, and
+//!   other unmodeled top-level fields ride as opaque extensions; the Codex
+//!   binding reports their omission without including their values.
 //!   The thinking **request** crosses as the codex reasoning effort
 //!   (see [`codex_backend`]).
 //! - **`tool_result.is_error` / `cache_control`** and other block

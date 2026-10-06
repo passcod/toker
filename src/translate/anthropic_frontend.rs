@@ -105,6 +105,7 @@ pub fn from_anthropic(body: &Value) -> Result<CanonicalRequest, TranslateError> 
     let stream = body.get("stream").and_then(Value::as_bool);
     let extensions = extensions_of(body);
     Ok(CanonicalRequest {
+        model: body.get("model").and_then(Value::as_str).map(str::to_owned),
         system,
         messages,
         tools,
@@ -281,22 +282,22 @@ fn content_blocks_of(
                     input: input.clone(),
                 });
             }
-            // THINKING STAYS IN THE CANONICAL — whether reasoning
-            // replays is backend policy (the capability a backend
-            // declares), never a parse decision. The text is read
-            // leniently (a block the pair module accepted and
-            // dropped still parses; a redacted block's `data` is the
-            // only content it has); the signature metadata is
-            // frontend-wire replay machinery this IR does not carry.
+            // THINKING STAYS IN THE CANONICAL — including the signature and
+            // the distinction between visible and redacted forms. Whether it
+            // replays is backend policy, never a parse decision.
             (CanonRole::Assistant, "thinking") => out.push(CanonBlock::Thinking {
                 text: block
                     .get("thinking")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned(),
+                signature: block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             }),
-            (CanonRole::Assistant, "redacted_thinking") => out.push(CanonBlock::Thinking {
-                text: block
+            (CanonRole::Assistant, "redacted_thinking") => out.push(CanonBlock::RedactedThinking {
+                data: block
                     .get("data")
                     .and_then(Value::as_str)
                     .unwrap_or("")
@@ -659,9 +660,13 @@ fn lenient_block_of(block: &Value) -> Option<CanonBlock> {
         }),
         "thinking" => Some(CanonBlock::Thinking {
             text: block.get("thinking")?.as_str()?.to_owned(),
+            signature: block
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         }),
-        "redacted_thinking" => Some(CanonBlock::Thinking {
-            text: block.get("data")?.as_str()?.to_owned(),
+        "redacted_thinking" => Some(CanonBlock::RedactedThinking {
+            data: block.get("data")?.as_str()?.to_owned(),
         }),
         _ => None,
     }
@@ -1171,6 +1176,7 @@ mod tests {
             "messages": [{"role": "system", "content": "Preamble."}],
         });
         let canonical = from_anthropic(&body).expect("parses");
+        assert_eq!(canonical.model.as_deref(), Some("m"));
         assert_eq!(
             canonical.system,
             vec!["One.".to_owned(), "Two.".to_owned()],
@@ -1196,14 +1202,16 @@ mod tests {
             ],
         });
         let canonical = from_anthropic(&body).expect("parses");
+        assert_eq!(canonical.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(
             canonical.messages[0].blocks,
             vec![
                 CanonBlock::Thinking {
                     text: "secret reasoning".to_owned(),
+                    signature: Some("sig-1".to_owned()),
                 },
-                CanonBlock::Thinking {
-                    text: "opaque-blob".to_owned(),
+                CanonBlock::RedactedThinking {
+                    data: "opaque-blob".to_owned(),
                 },
                 CanonBlock::Text("Answer.".to_owned()),
             ]

@@ -50,11 +50,15 @@ use crate::routing::DialectId;
 /// [`from_anthropic`](crate::translate::anthropic_frontend::from_anthropic)),
 /// rendered by a backend adapter (today:
 /// [`codex_from_canonical`](crate::translate::codex_from_canonical)).
-/// The model slug and prompt-cache key are CALLER-derived facts and
-/// stay out of the canonical: they are explicit parameters of the
-/// backend adapter (purity — see [`crate::translate`]).
+/// Prompt-cache identity remains an explicit adapter input because it comes
+/// from request headers. Model identity is request semantics and stays in the
+/// canonical so routing middleware can transform it before rendering.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CanonicalRequest {
+    /// The model named by the current canonical stage. Ingress records the
+    /// requested model; routing middleware later replaces it with the
+    /// effective backend model. Absence is preserved, never invented.
+    pub model: Option<String>,
     /// The top-level system prompt pieces, in order (the
     /// string-or-blocks system read: each block's `text`, each bare
     /// string element, `""` for a textless block). How they join is
@@ -173,14 +177,15 @@ pub enum CanonBlock {
         tool_use_id: String,
         content: ToolResultContent,
     },
-    /// The assistant's reasoning — THINKING STAYS IN THE CANONICAL:
-    /// whether reasoning replays is backend policy
-    /// ([`Capabilities::thinking_replay`]), never a parse decision.
-    /// `text` is the `thinking` field, or a `redacted_thinking`'s
-    /// `data` (the only content it has); the block's own signature
-    /// metadata is frontend-wire replay machinery this IR does not
-    /// carry.
-    Thinking { text: String },
+    /// The assistant's visible reasoning and its provider signature. Whether
+    /// it can replay is a binding capability, never a parse decision.
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    /// Provider-encrypted reasoning that must remain opaque and distinct from
+    /// visible thinking.
+    RedactedThinking { data: String },
 }
 
 impl CanonBlock {
@@ -206,7 +211,19 @@ impl CanonBlock {
                 json!({"type": "tool_result", "tool_use_id": tool_use_id,
                        "content": content.wire_value()})
             }
-            CanonBlock::Thinking { text } => json!({"type": "thinking", "thinking": text}),
+            CanonBlock::Thinking { text, signature } => {
+                let mut value = json!({"type": "thinking", "thinking": text});
+                if let Some(signature) = signature {
+                    value
+                        .as_object_mut()
+                        .expect("a built thinking block is an object")
+                        .insert("signature".to_owned(), json!(signature));
+                }
+                value
+            }
+            CanonBlock::RedactedThinking { data } => {
+                json!({"type": "redacted_thinking", "data": data})
+            }
         }
     }
 }
@@ -557,10 +574,18 @@ mod tests {
         );
         assert_eq!(
             CanonBlock::Thinking {
-                text: "why".to_owned()
+                text: "why".to_owned(),
+                signature: Some("sig".to_owned()),
             }
             .wire_value(),
-            json!({"type": "thinking", "thinking": "why"})
+            json!({"type": "thinking", "thinking": "why", "signature": "sig"})
+        );
+        assert_eq!(
+            CanonBlock::RedactedThinking {
+                data: "opaque".to_owned()
+            }
+            .wire_value(),
+            json!({"type": "redacted_thinking", "data": "opaque"})
         );
         // The tool_result string form: the text verbatim, or the JSON
         // of the blocks' wire values — the lossless string shape.

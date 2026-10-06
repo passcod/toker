@@ -101,7 +101,9 @@ pub fn codex_from_canonical(
     model: &str,
     prompt_cache_key: &str,
 ) -> Result<ResponsesRequest, TranslateError> {
-    Ok(render_codex(canonical, model, prompt_cache_key)?.value)
+    let mut routed = canonical.clone();
+    routed.model = Some(model.to_owned());
+    Ok(render_codex(&routed, prompt_cache_key)?.value)
 }
 
 /// Render one canonical request and report every semantic omission.
@@ -110,9 +112,14 @@ pub fn codex_from_canonical(
 /// while phase 2 moves callers onto this explicit result.
 pub fn render_codex(
     canonical: &CanonicalRequest,
-    model: &str,
     prompt_cache_key: &str,
 ) -> Result<Rendered<ResponsesRequest>, TranslateError> {
+    let model = canonical
+        .model
+        .as_deref()
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "canonical request has no model".to_owned(),
+        })?;
     let mut request = ResponsesRequest::new(model, prompt_cache_key);
     let (input, leading_system) = input_of(canonical);
     // The system prompt is the pieces joined on blank lines — THIS
@@ -172,7 +179,12 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
         .messages
         .iter()
         .flat_map(|message| &message.blocks)
-        .filter(|block| matches!(block, CanonBlock::Thinking { .. }))
+        .filter(|block| {
+            matches!(
+                block,
+                CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
+            )
+        })
         .count();
     if thinking_blocks > 0 {
         report.push(TranslationLoss::new(
@@ -268,7 +280,7 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                         // thinking_replay is false (cross-provider
                         // reasoning is opaque; see the module docs).
                         // The drop does not split the message's parts.
-                        CanonBlock::Thinking { .. } => {}
+                        CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. } => {}
                     }
                 }
                 items.extend(flush(&mut parts, role));
@@ -647,6 +659,7 @@ mod tests {
         let caps = Capabilities::CODEX;
         assert!(!caps.sampling);
         let canonical = CanonicalRequest {
+            model: Some(MODEL.to_owned()),
             sampling: SamplingSpec {
                 temperature: Some(0.3),
                 top_p: Some(0.95),
@@ -677,7 +690,7 @@ mod tests {
         assert!(!bytes.contains("budget_tokens"));
         assert!(!bytes.contains("4096"));
         assert_eq!(request.reasoning.effort.as_deref(), Some("low"));
-        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
         assert_eq!(
             rendered.report.losses(),
             &[
@@ -717,27 +730,44 @@ mod tests {
     }
 
     #[test]
+    fn the_backend_renders_the_model_owned_by_the_canonical() {
+        let canonical = CanonicalRequest {
+            model: Some("effective-model".to_owned()),
+            ..CanonicalRequest::default()
+        };
+        let rendered = render_codex(&canonical, KEY).expect("model is present");
+        assert_eq!(rendered.value.model, "effective-model");
+
+        assert!(matches!(
+            render_codex(&CanonicalRequest::default(), KEY),
+            Err(TranslateError::Malformed { reason }) if reason.contains("no model")
+        ));
+    }
+
+    #[test]
     fn canonical_thinking_blocks_do_not_replay_here() {
         // The capability declaration the drop enforces:
         // cross-provider reasoning is opaque — protocol-forced out.
         let caps = Capabilities::CODEX;
         assert!(!caps.thinking_replay);
         let canonical = CanonicalRequest {
+            model: Some(MODEL.to_owned()),
             messages: vec![message(
                 CanonRole::Assistant,
                 vec![
                     CanonBlock::Thinking {
                         text: "secret reasoning".to_owned(),
+                        signature: Some("sig-1".to_owned()),
                     },
-                    CanonBlock::Thinking {
-                        text: "opaque-blob".to_owned(),
+                    CanonBlock::RedactedThinking {
+                        data: "opaque-blob".to_owned(),
                     },
                     CanonBlock::Text("Answer.".to_owned()),
                 ],
             )],
             ..CanonicalRequest::default()
         };
-        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
         assert_eq!(
             rendered.report.losses(),
             &[TranslationLoss::new(
@@ -764,6 +794,7 @@ mod tests {
                 CanonRole::Assistant,
                 vec![CanonBlock::Thinking {
                     text: "only thoughts".to_owned(),
+                    signature: None,
                 }],
             )],
             ..CanonicalRequest::default()
@@ -779,6 +810,7 @@ mod tests {
     #[test]
     fn incompatible_opaque_extensions_are_reported_without_their_values() {
         let canonical = CanonicalRequest {
+            model: Some(MODEL.to_owned()),
             extensions: vec![CanonicalExtension::new(
                 DialectId::AnthropicMessages,
                 "$.metadata",
@@ -786,7 +818,7 @@ mod tests {
             )],
             ..CanonicalRequest::default()
         };
-        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
         assert_eq!(
             rendered.report.losses(),
             &[TranslationLoss::new(
