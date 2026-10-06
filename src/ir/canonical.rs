@@ -6,18 +6,14 @@
 //! are [`to_codex`](crate::translate::to_codex) and
 //! [`to_anthropic`](crate::translate::to_anthropic)).
 //!
-//! ## When canonical engages — and when it never does
+//! ## The universal pipeline
 //!
-//! **Same-protocol routes keep the byte-passthrough machinery**: the
-//! [`Value`-wrapped protocol IR](crate::ir), whose re-serialisation is
-//! byte-exact by construction, so an untransformed request forwards
-//! identical bytes. **Canonical engages ONLY for cross-protocol
-//! routes** — a body that must change shape changes it exactly once,
-//! into a model that is nobody's wire: no frontend's extensions, no
-//! backend's dialect, just what the request means. The drops and
-//! merges of a cross-protocol route are then BACKEND properties
-//! ([`Capabilities`]), declared per backend adapter — never parse
-//! decisions baked into a frontend.
+//! Every inference route parses into this model and renders from it,
+//! including routes whose frontend and backend name the same protocol.
+//! Protocol equality may reuse adapter code, but it never bypasses the
+//! canonical request or event model. Backend-specific drops and merges
+//! are binding capabilities ([`Capabilities`]), never parse decisions
+//! baked into a frontend.
 //!
 //! ## What parsing decides, and what it must not
 //!
@@ -41,10 +37,14 @@
 //! outranks typing, always.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde_json::{Value, json};
 
-/// A canonical request: one cross-protocol turn, wire-agnostic.
+pub use crate::routing::Capabilities;
+use crate::routing::DialectId;
+
+/// A canonical request: one inference turn, wire-agnostic.
 ///
 /// Built by a frontend adapter (today:
 /// [`from_anthropic`](crate::translate::anthropic_frontend::from_anthropic)),
@@ -81,6 +81,57 @@ pub struct CanonicalRequest {
     /// — the wire default). A backend that cannot express a shape
     /// reports it; the canonical never guesses one into expressibility.
     pub tool_choice: CanonToolChoice,
+    /// Wire fields that the ingress adapter does not yet model semantically.
+    /// A compatible backend dialect may replay them; every other backend must
+    /// report or reject their omission.
+    pub extensions: Vec<CanonicalExtension>,
+}
+
+/// One unmodeled wire value retained across the canonical boundary.
+#[derive(Clone, PartialEq)]
+pub struct CanonicalExtension {
+    source: DialectId,
+    wire_path: String,
+    value: Value,
+}
+
+impl CanonicalExtension {
+    pub fn new(
+        source: DialectId,
+        wire_path: impl Into<String>,
+        value: Value,
+    ) -> CanonicalExtension {
+        CanonicalExtension {
+            source,
+            wire_path: wire_path.into(),
+            value,
+        }
+    }
+
+    pub fn source(&self) -> DialectId {
+        self.source
+    }
+
+    pub fn wire_path(&self) -> &str {
+        &self.wire_path
+    }
+
+    /// The opaque value is available to adapters, but must never be logged or
+    /// copied into translation-loss metadata.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+impl fmt::Debug for CanonicalExtension {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalExtension")
+            .field("source", &self.source)
+            .field("wire_path", &self.wire_path)
+            .field("value", &"<opaque>")
+            .finish()
+    }
 }
 
 /// One canonical message: a role plus its content blocks, in order.
@@ -459,53 +510,6 @@ pub struct CanonTurn {
     /// codex summary indices are non-negative array positions, so
     /// the order is the arrival order.
     pub thinking: BTreeMap<u64, String>,
-}
-
-/// What a backend supports — the BACKEND property, declared per
-/// backend adapter. Every `false` is a live-verified fact about that
-/// upstream, not an assumption: the adapter's drops are the
-/// enforcement of these declarations, and a future backend that
-/// supports a thing simply declares `true` and carries the canonical
-/// across — no frontend ever changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Capabilities {
-    /// Sampling parameters (`temperature`, `top_p`, `max_tokens`,
-    /// `stop_sequences`).
-    pub sampling: bool,
-    /// System-role messages among the conversation's items.
-    pub system_in_messages: bool,
-    /// Replaying another provider's reasoning blocks.
-    pub thinking_replay: bool,
-    /// Image content blocks.
-    pub images: bool,
-}
-
-impl Capabilities {
-    /// The codex backend's declared capabilities — LIVE-VERIFIED:
-    ///
-    /// - `sampling: false` — the backend refuses the parameters
-    ///   outright ("Unsupported parameter: temperature"), and its
-    ///   own client never sends any; the `temperature`/`top_p` its
-    ///   responses echo are the backend's defaults, not knobs it
-    ///   accepts.
-    /// - `system_in_messages: false` — the backend refuses
-    ///   system-role input items ("System messages are not allowed");
-    ///   its system content rides `instructions` (leading) and the
-    ///   preceding-user merge (mid-conversation, the same merge the
-    ///   predecessor proxy used).
-    /// - `thinking_replay: false` — protocol-forced out:
-    ///   cross-provider reasoning is opaque (claude's thinking blocks
-    ///   carry no `encrypted_content` legible to the codex wire);
-    ///   the backend still reasons with its own effort, which
-    ///   [`ThinkingSpec`] maps onto.
-    /// - `images: true` — `input_image` parts, data-URL and wire-URL
-    ///   alike.
-    pub const CODEX: Capabilities = Capabilities {
-        sampling: false,
-        system_in_messages: false,
-        thinking_replay: false,
-        images: true,
-    };
 }
 
 #[cfg(test)]

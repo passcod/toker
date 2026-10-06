@@ -56,8 +56,8 @@ pub use anthropic::{
     SENTINEL, System, SystemBlockDigest,
 };
 pub use canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalRequest,
-    Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
+    CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalExtension,
+    CanonicalRequest, Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
 pub use fidelity::{Fidelity, compare};
 pub use openai_chat::{

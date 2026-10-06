@@ -34,9 +34,12 @@ use reqwest::Url;
 use serde_json::{Map, Value, json};
 
 use super::Provider;
-use crate::routing::{BackendBinding, ProtocolId};
+use crate::routing::{BackendBinding, DialectId, ProtocolId};
 
-const BINDINGS: &[BackendBinding] = &[BackendBinding::new(ProtocolId::AnthropicMessages)];
+const BINDINGS: &[BackendBinding] = &[BackendBinding::declared(
+    ProtocolId::AnthropicMessages,
+    DialectId::AnthropicMessages,
+)];
 
 /// The header carrying the API key (Anthropic's API auth is `x-api-key`,
 /// not a bearer).

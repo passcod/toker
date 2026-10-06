@@ -1,4 +1,4 @@
-//! Cross-protocol translation, layered, in BOTH directions:
+//! Canonical protocol translation, layered in both directions:
 //! **frontend adapters** speak a frontend's wire and the canonical
 //! IR; **backend adapters** speak a backend's wire and the canonical
 //! IR. Request side, the frontend adapter parses the wire body INTO
@@ -8,18 +8,17 @@
 //! and the frontend adapter renders the canonical OUT onto its
 //! wire. A pair is the composition of the two adapters — adding a
 //! frontend or a backend is one adapter, not a new pair, in either
-//! direction. Same-protocol routes never come through here at all:
-//! they keep the [`Value`-wrapped protocol IR](crate::ir) and its
-//! byte-exact passthrough; translation is the cross-protocol
-//! machinery only.
+//! direction. During phase 2 the live same-protocol handlers still use
+//! the [`Value`-wrapped protocol IR](crate::ir), but that is a migration
+//! boundary, not an architectural branch: every route moves through
+//! these canonical adapter roles.
 //!
 //! One rule over both directions: **pure**. A translation is a
 //! function of its explicit inputs only — no clock, no counters, no
 //! state beyond the event under translation. That is invariant 4
-//! applied cross-protocol, and it buys invariant 5 for free
-//! (docs/plans/toker-toolsuite.md:96): a translated request
-//! reproduces byte-identically wherever the conversation did not
-//! change, so the upstream's cacheable prefix stays stable even
+//! applied to every adapter, and it buys prefix stability: a rendered
+//! request reproduces byte-identically wherever the conversation did
+//! not change, so the upstream's cacheable prefix stays stable even
 //! though it never existed in the frontend's wire format. The model
 //! slug and the prompt cache key are CALLER-derived and passed in as
 //! explicit parameters for exactly that reason — translation never
@@ -224,9 +223,88 @@ pub mod to_anthropic;
 pub mod to_codex;
 
 pub use anthropic_frontend::from_anthropic;
-pub use codex_backend::codex_from_canonical;
+pub use codex_backend::{codex_from_canonical, render_codex};
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::to_codex;
+
+/// Why a canonical value could not be represented on one side of a binding.
+///
+/// Variants describe adapter behavior only. They deliberately carry no wire
+/// value, prompt text, tool input, or completion content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranslationLossReason {
+    /// Live verification showed that the target binding rejects this shape.
+    UnsupportedByBinding,
+    /// The target protocol has no semantically equivalent shape.
+    NotRepresentable,
+    /// An opaque extension belongs to a dialect the target cannot replay.
+    IncompatibleExtensionDialect,
+}
+
+/// A content-free description of semantics omitted during translation.
+///
+/// `path` names a canonical schema location, never the value found there.
+/// `count` coalesces repeated losses such as several reasoning blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationLoss {
+    path: String,
+    reason: TranslationLossReason,
+    count: usize,
+}
+
+impl TranslationLoss {
+    pub fn new(
+        path: impl Into<String>,
+        reason: TranslationLossReason,
+        count: usize,
+    ) -> TranslationLoss {
+        assert!(count > 0, "a loss must describe at least one value");
+        TranslationLoss {
+            path: path.into(),
+            reason,
+            count,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn reason(&self) -> TranslationLossReason {
+        self.reason
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// The content-free losses accumulated by one adapter rendering.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TranslationReport {
+    losses: Vec<TranslationLoss>,
+}
+
+impl TranslationReport {
+    pub fn push(&mut self, loss: TranslationLoss) {
+        self.losses.push(loss);
+    }
+
+    pub fn losses(&self) -> &[TranslationLoss] {
+        &self.losses
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.losses.is_empty()
+    }
+}
+
+/// An adapter's rendered value and its explicit, content-free loss report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered<T> {
+    pub value: T,
+    pub report: TranslationReport,
+}
 
 /// A translation failure, typed: the CALLER (unit C) decides policy —
 /// reject the request, or route it to a backend that speaks the body

@@ -26,8 +26,8 @@ use crate::routing::{BackendBinding, ProtocolId};
 
 /// A backend provider: identity, upstream endpoint mapping, credential
 /// injection, and (when the provider is a meter source) meter parsing.
-/// Same-protocol providers (openrouter, openai api, lunaroute) all satisfy
-/// this today; cross-protocol backends add their adapter in later phases.
+/// A binding separately declares its nominal protocol, concrete dialect, and
+/// whether its canonical egress adapter is ready.
 pub trait Provider: Send + Sync {
     /// The stable provider id — the ledger's `provider` column and the
     /// backend half of `frontend:backend` routes.

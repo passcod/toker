@@ -82,7 +82,9 @@ use crate::ir::canonical::{
 use crate::providers::codex::{
     Item, ResponseError, ResponseEvent, ResponsesRequest, Tool, TurnCapture, Usage,
 };
-use crate::translate::TranslateError;
+use crate::translate::{
+    Rendered, TranslateError, TranslationLoss, TranslationLossReason, TranslationReport,
+};
 
 /// Render one canonical request onto the codex wire.
 ///
@@ -99,6 +101,18 @@ pub fn codex_from_canonical(
     model: &str,
     prompt_cache_key: &str,
 ) -> Result<ResponsesRequest, TranslateError> {
+    Ok(render_codex(canonical, model, prompt_cache_key)?.value)
+}
+
+/// Render one canonical request and report every semantic omission.
+///
+/// [`codex_from_canonical`] remains as the live-handler compatibility seam
+/// while phase 2 moves callers onto this explicit result.
+pub fn render_codex(
+    canonical: &CanonicalRequest,
+    model: &str,
+    prompt_cache_key: &str,
+) -> Result<Rendered<ResponsesRequest>, TranslateError> {
     let mut request = ResponsesRequest::new(model, prompt_cache_key);
     let (input, leading_system) = input_of(canonical);
     // The system prompt is the pieces joined on blank lines — THIS
@@ -127,7 +141,56 @@ pub fn codex_from_canonical(
     // this backend's turns always stream (the wire constant), so it
     // is read for nothing here either.
     request.reasoning.effort = canonical.thinking.as_ref().map(effort_of);
-    Ok(request)
+    Ok(Rendered {
+        value: request,
+        report: loss_report(canonical),
+    })
+}
+
+fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
+    let mut report = TranslationReport::default();
+    let unsupported = TranslationLossReason::UnsupportedByBinding;
+
+    if canonical.sampling.temperature.is_some() {
+        report.push(TranslationLoss::new("sampling.temperature", unsupported, 1));
+    }
+    if canonical.sampling.top_p.is_some() {
+        report.push(TranslationLoss::new("sampling.top_p", unsupported, 1));
+    }
+    if canonical.sampling.max_tokens.is_some() {
+        report.push(TranslationLoss::new("sampling.max_tokens", unsupported, 1));
+    }
+    if canonical.sampling.stop_sequences.is_some() {
+        report.push(TranslationLoss::new(
+            "sampling.stop_sequences",
+            unsupported,
+            1,
+        ));
+    }
+
+    let thinking_blocks = canonical
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| matches!(block, CanonBlock::Thinking { .. }))
+        .count();
+    if thinking_blocks > 0 {
+        report.push(TranslationLoss::new(
+            "messages[].blocks[].thinking",
+            unsupported,
+            thinking_blocks,
+        ));
+    }
+
+    for extension in &canonical.extensions {
+        report.push(TranslationLoss::new(
+            extension.wire_path(),
+            TranslationLossReason::IncompatibleExtensionDialect,
+            1,
+        ));
+    }
+
+    report
 }
 
 // ── messages → input items ─────────────────────────────────────────
@@ -543,18 +606,20 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::super::TranslateError;
-    use super::super::codex_backend::codex_from_canonical;
+    use super::super::codex_backend::{codex_from_canonical, render_codex};
+    use super::super::{TranslateError, TranslationLoss, TranslationLossReason};
     use super::{CanonStream, canon_error_from_response, canonical_turn_from_capture};
     use crate::ir::canonical::{
         CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole,
-        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest,
-        CanonicalUsage, Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
+        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
+        CanonicalRequest, CanonicalUsage, Capabilities, SamplingSpec, ThinkingSpec,
+        ToolResultContent,
     };
     use crate::providers::codex::{
         CompletedResponse, ContentPart, Item, ResponseError, ResponseEvent, ResponsesSse,
         TurnCapture,
     };
+    use crate::routing::DialectId;
     use serde_json::{Value, json};
 
     const MODEL: &str = "gpt-5.2-codex";
@@ -612,6 +677,32 @@ mod tests {
         assert!(!bytes.contains("budget_tokens"));
         assert!(!bytes.contains("4096"));
         assert_eq!(request.reasoning.effort.as_deref(), Some("low"));
+        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        assert_eq!(
+            rendered.report.losses(),
+            &[
+                TranslationLoss::new(
+                    "sampling.temperature",
+                    TranslationLossReason::UnsupportedByBinding,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "sampling.top_p",
+                    TranslationLossReason::UnsupportedByBinding,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "sampling.max_tokens",
+                    TranslationLossReason::UnsupportedByBinding,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "sampling.stop_sequences",
+                    TranslationLossReason::UnsupportedByBinding,
+                    1,
+                ),
+            ]
+        );
         // And the stream flag is read for nothing: this backend's
         // turns always stream.
         let streamed = CanonicalRequest {
@@ -646,6 +737,15 @@ mod tests {
             )],
             ..CanonicalRequest::default()
         };
+        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        assert_eq!(
+            rendered.report.losses(),
+            &[TranslationLoss::new(
+                "messages[].blocks[].thinking",
+                TranslationLossReason::UnsupportedByBinding,
+                2,
+            )]
+        );
         let request = codex_from_canonical(&canonical, MODEL, KEY).expect("renders");
         assert_eq!(request.input.len(), 1, "only the text item survives");
         assert_eq!(
@@ -674,6 +774,29 @@ mod tests {
                 .input
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn incompatible_opaque_extensions_are_reported_without_their_values() {
+        let canonical = CanonicalRequest {
+            extensions: vec![CanonicalExtension::new(
+                DialectId::AnthropicMessages,
+                "$.metadata",
+                json!({"user_id": "secret-user"}),
+            )],
+            ..CanonicalRequest::default()
+        };
+        let rendered = render_codex(&canonical, MODEL, KEY).expect("renders with report");
+        assert_eq!(
+            rendered.report.losses(),
+            &[TranslationLoss::new(
+                "$.metadata",
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            )]
+        );
+        let report = format!("{:?}", rendered.report);
+        assert!(!report.contains("secret-user"));
     }
 
     #[test]

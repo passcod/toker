@@ -7,11 +7,11 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
-use crate::routing::{BackendBinding, ProtocolId};
+use crate::routing::{BackendBinding, DialectId, ProtocolId};
 
 const BINDINGS: &[BackendBinding] = &[
-    BackendBinding::new(ProtocolId::OpenAiChat),
-    BackendBinding::new(ProtocolId::AnthropicMessages),
+    BackendBinding::declared(ProtocolId::OpenAiChat, DialectId::OpenRouterChatCompletions),
+    BackendBinding::declared(ProtocolId::AnthropicMessages, DialectId::OpenRouterMessages),
 ];
 
 /// Anthropic's key header. Openrouter takes its key as a bearer only, so

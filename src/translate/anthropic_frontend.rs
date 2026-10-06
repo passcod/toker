@@ -75,10 +75,11 @@ use serde_json::{Map, Value, json};
 
 use crate::ir::canonical::{
     CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
-    CanonTool, CanonToolChoice, CanonTurn, CanonicalRequest, CanonicalUsage, SamplingSpec,
-    ThinkingSpec, ToolResultContent,
+    CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest, CanonicalUsage,
+    SamplingSpec, ThinkingSpec, ToolResultContent,
 };
 use crate::observe::sse::SseEvent;
+use crate::routing::DialectId;
 use crate::translate::TranslateError;
 
 /// Parse one Anthropic Messages request body into the canonical IR.
@@ -102,6 +103,7 @@ pub fn from_anthropic(body: &Value) -> Result<CanonicalRequest, TranslateError> 
     let sampling = sampling_of(body);
     let thinking = thinking_of(body)?;
     let stream = body.get("stream").and_then(Value::as_bool);
+    let extensions = extensions_of(body);
     Ok(CanonicalRequest {
         system,
         messages,
@@ -110,7 +112,37 @@ pub fn from_anthropic(body: &Value) -> Result<CanonicalRequest, TranslateError> 
         thinking,
         stream,
         tool_choice,
+        extensions,
     })
+}
+
+fn extensions_of(body: &Value) -> Vec<CanonicalExtension> {
+    const MODELED: &[&str] = &[
+        "max_tokens",
+        "messages",
+        "model",
+        "stop_sequences",
+        "stream",
+        "system",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "tools",
+        "top_p",
+    ];
+
+    body.as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| !MODELED.contains(&field.as_str()))
+        .map(|(field, value)| {
+            CanonicalExtension::new(
+                DialectId::AnthropicMessages,
+                format!("$.{field}"),
+                value.clone(),
+            )
+        })
+        .collect()
 }
 
 // ── messages ────────────────────────────────────────────────────────
@@ -1063,9 +1095,33 @@ mod tests {
         SamplingSpec, ThinkingSpec, ToolResultContent,
     };
     use crate::observe::sse::SseEvent;
+    use crate::routing::DialectId;
     use serde_json::{Value, json};
 
     // ── what the pair module used to decide early, now carried ────
+
+    #[test]
+    fn unmodeled_fields_become_opaque_extensions_without_debug_content() {
+        let body = json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "metadata": {"user_id": "secret-user"},
+            "top_k": 17,
+        });
+        let canonical = from_anthropic(&body).expect("parses");
+        assert_eq!(canonical.extensions.len(), 2);
+        assert_eq!(
+            canonical.extensions[0].source(),
+            DialectId::AnthropicMessages
+        );
+        assert_eq!(canonical.extensions[0].wire_path(), "$.metadata");
+        assert_eq!(canonical.extensions[0].value(), &body["metadata"]);
+        assert_eq!(canonical.extensions[1].wire_path(), "$.top_k");
+
+        let debug = format!("{:?}", canonical.extensions[0]);
+        assert!(debug.contains("<opaque>"));
+        assert!(!debug.contains("secret-user"));
+    }
 
     #[test]
     fn system_role_messages_stay_messages_in_the_canonical() {
