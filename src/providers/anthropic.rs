@@ -34,6 +34,9 @@ use reqwest::Url;
 use serde_json::{Map, Value, json};
 
 use super::Provider;
+use crate::routing::{BackendBinding, ProtocolId};
+
+const BINDINGS: &[BackendBinding] = &[BackendBinding::new(ProtocolId::AnthropicMessages)];
 
 /// The header carrying the API key (Anthropic's API auth is `x-api-key`,
 /// not a bearer).
@@ -109,6 +112,10 @@ impl Provider for AnthropicSub {
         "anthropic_sub"
     }
 
+    fn bindings(&self) -> &'static [BackendBinding] {
+        BINDINGS
+    }
+
     fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
         self.model_map.as_ref()
     }
@@ -140,6 +147,10 @@ impl Provider for AnthropicSub {
 impl Provider for AnthropicApi {
     fn id(&self) -> &str {
         "anthropic_api"
+    }
+
+    fn bindings(&self) -> &'static [BackendBinding] {
+        BINDINGS
     }
 
     fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
@@ -279,6 +290,7 @@ pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
 mod tests {
     use super::super::Provider;
     use super::{AnthropicApi, AnthropicSub, parse_rate_limits};
+    use crate::routing::ProtocolId;
     use axum::http::{HeaderMap, HeaderValue, header};
     use serde_json::json;
 
@@ -295,6 +307,15 @@ mod tests {
             Some("sk-ant-test-key".to_owned()),
             None,
         )
+    }
+
+    #[test]
+    fn both_anthropic_providers_bind_only_messages() {
+        for provider in [&sub() as &dyn Provider, &api() as &dyn Provider] {
+            assert!(provider.supports_protocol(ProtocolId::AnthropicMessages));
+            assert!(!provider.supports_protocol(ProtocolId::OpenAiChat));
+            assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
+        }
     }
 
     /// A realistic full meter set: one header per named field, plus an

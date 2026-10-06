@@ -487,6 +487,13 @@ impl Provider for CodexSub {
         "codex_sub"
     }
 
+    fn bindings(&self) -> &'static [crate::routing::BackendBinding] {
+        const BINDINGS: &[crate::routing::BackendBinding] = &[crate::routing::BackendBinding::new(
+            crate::routing::ProtocolId::OpenAiResponses,
+        )];
+        BINDINGS
+    }
+
     fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
         self.model_map.as_ref()
     }
@@ -530,6 +537,7 @@ mod tests {
         user_agent,
     };
     use crate::providers::codex::auth::tests::{auth_file, spawn_refresh_mock};
+    use crate::routing::ProtocolId;
     use axum::http::{HeaderMap, HeaderValue, header};
     use serde_json::json;
 
@@ -548,6 +556,14 @@ mod tests {
             false,
         )
         .expect("provider builds")
+    }
+
+    #[test]
+    fn binding_pins_codex_sub_to_responses() {
+        let provider = provider(std::path::Path::new("/nonexistent/auth.json"));
+        assert!(provider.supports_protocol(ProtocolId::OpenAiResponses));
+        assert!(!provider.supports_protocol(ProtocolId::OpenAiChat));
+        assert!(!provider.supports_protocol(ProtocolId::AnthropicMessages));
     }
 
     #[test]

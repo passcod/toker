@@ -29,6 +29,7 @@ pub mod picker;
 pub mod proto;
 pub mod providers;
 pub mod release;
+pub mod routing;
 pub mod secrets;
 pub mod server;
 pub mod setup;

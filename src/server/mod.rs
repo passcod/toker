@@ -29,8 +29,8 @@
 //!   everything but its control path.
 //!
 //! Every route above also answers under a `/f/<frontend>` prefix: the
-//! router strips it before matching and keeps the name
-//! ([`FrontendName`]), which picks the frontend's gate-notice style
+//! router strips it before matching and keeps the profile
+//! ([`FrontendProfile`]), which picks the frontend's gate-notice style
 //! (`[notices]`). Setup writes the prefix into the frontends it patches;
 //! an unprefixed request is an unknown frontend.
 //!
@@ -81,6 +81,7 @@ use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenRouter, Provider};
+use crate::routing::FrontendProfile;
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::Store;
 
@@ -455,7 +456,7 @@ impl Server {
 
     /// The full route table, behind the frontend-prefix strip: a request
     /// to `/f/<frontend>/<path>` is routed as `/<path>`, with the
-    /// frontend's name riding along as a [`FrontendName`] extension (see
+    /// frontend's profile riding along as a [`FrontendProfile`] extension (see
     /// [`strip_frontend_prefix`]).
     pub fn router(&self) -> Router {
         // The strip runs before routing because it wraps a router whose
@@ -901,20 +902,17 @@ impl Server {
     }
 }
 
-/// The frontend a request came through: the name in its base URL's
-/// `/f/<frontend>` prefix, which setup writes into each frontend it
-/// patches (`/f/claude`, `/f/workhorse`). Absent for an unprefixed
-/// request — an unknown frontend. It selects the gate notices' style
-/// ([`crate::config::NoticesConfig`]) and nothing else: routing ignores
-/// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FrontendName(pub(crate) String);
-
 /// The frontend name a request carries, if it came through a prefix.
 pub(crate) fn frontend_of(extensions: &axum::http::Extensions) -> Option<&str> {
     extensions
-        .get::<FrontendName>()
-        .map(|frontend| frontend.0.as_str())
+        .get::<FrontendProfile>()
+        .map(FrontendProfile::name)
+}
+
+/// The resolved frontend profile, for ambiguous frontend-owned surfaces such
+/// as `/v1/models`. Inference handlers continue to trust their matched path.
+pub(crate) fn frontend_profile_of(extensions: &axum::http::Extensions) -> Option<&FrontendProfile> {
+    extensions.get::<FrontendProfile>()
 }
 
 /// Split `/f/<frontend>/<rest>` into the frontend name and `/<rest>`
@@ -952,7 +950,9 @@ async fn strip_frontend_prefix(mut request: axum::extract::Request) -> axum::ext
         return request;
     };
     *request.uri_mut() = uri;
-    request.extensions_mut().insert(FrontendName(name));
+    request
+        .extensions_mut()
+        .insert(FrontendProfile::named(name));
     request
 }
 

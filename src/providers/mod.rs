@@ -22,6 +22,8 @@ use axum::http::{HeaderMap, header};
 use reqwest::Url;
 use serde_json::Value;
 
+use crate::routing::{BackendBinding, ProtocolId};
+
 /// A backend provider: identity, upstream endpoint mapping, credential
 /// injection, and (when the provider is a meter source) meter parsing.
 /// Same-protocol providers (openrouter, openai api, lunaroute) all satisfy
@@ -30,6 +32,18 @@ pub trait Provider: Send + Sync {
     /// The stable provider id — the ledger's `provider` column and the
     /// backend half of `frontend:backend` routes.
     fn id(&self) -> &str;
+
+    /// The native wires this provider is verified to accept. Translation
+    /// reaches one of these bindings; it does not turn the provider itself
+    /// into a second protocol.
+    fn bindings(&self) -> &'static [BackendBinding];
+
+    /// Whether [`Provider::bindings`] contains `protocol`.
+    fn supports_protocol(&self, protocol: ProtocolId) -> bool {
+        self.bindings()
+            .iter()
+            .any(|binding| binding.protocol() == protocol)
+    }
 
     /// The upstream URL for an incoming frontend path (query included when
     /// the request carries one). E.g. `/v1/chat/completions` →

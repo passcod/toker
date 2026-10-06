@@ -67,6 +67,7 @@ use crate::config::{
     DEFAULT_PORT,
 };
 use crate::import::{self, ImportOpts};
+use crate::routing::ProtocolId;
 use crate::secrets::SecretStore;
 use crate::setup::atomic::atomic_write_bytes;
 use crate::setup::config_writer::write_config;
@@ -841,11 +842,11 @@ fn loopback_of(url: &str) -> Option<Loopback> {
 }
 
 /// Whether the config has a backend for a frontend protocol.
-fn protocol_enabled(config: &Config, protocol: &str) -> bool {
+fn protocol_enabled(config: &Config, protocol: ProtocolId) -> bool {
     match protocol {
-        "openai_chat" => !config.enabled_openai_chat().is_empty(),
-        "openai_responses" => config.codex_sub.is_some(),
-        _ => !config.enabled_anthropic().is_empty(),
+        ProtocolId::OpenAiChat => !config.enabled_openai_chat().is_empty(),
+        ProtocolId::OpenAiResponses => config.codex_sub.is_some(),
+        ProtocolId::AnthropicMessages => !config.enabled_anthropic().is_empty(),
     }
 }
 
@@ -862,9 +863,9 @@ fn verify_checks(config: &Config, detected: &Detected) -> Vec<verify::Check> {
         }
     };
     for (protocol, bare) in [
-        ("anthropic", "/v1/messages"),
-        ("openai_chat", "/v1/chat/completions"),
-        ("openai_responses", "/v1/responses"),
+        (ProtocolId::AnthropicMessages, "/v1/messages"),
+        (ProtocolId::OpenAiChat, "/v1/chat/completions"),
+        (ProtocolId::OpenAiResponses, "/v1/responses"),
     ] {
         if !protocol_enabled(config, protocol) {
             continue;

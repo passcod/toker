@@ -7,6 +7,12 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
+use crate::routing::{BackendBinding, ProtocolId};
+
+const BINDINGS: &[BackendBinding] = &[
+    BackendBinding::new(ProtocolId::OpenAiChat),
+    BackendBinding::new(ProtocolId::AnthropicMessages),
+];
 
 /// Anthropic's key header. Openrouter takes its key as a bearer only, so
 /// this header on a request bound for openrouter is always another
@@ -53,6 +59,10 @@ impl OpenRouter {
 impl Provider for OpenRouter {
     fn id(&self) -> &str {
         "openrouter"
+    }
+
+    fn bindings(&self) -> &'static [BackendBinding] {
+        BINDINGS
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -122,6 +132,7 @@ impl Provider for OpenRouter {
 mod tests {
     use super::super::Provider;
     use super::OpenRouter;
+    use crate::routing::ProtocolId;
     use axum::http::header::AUTHORIZATION;
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -139,6 +150,14 @@ mod tests {
         let provider = provider();
         assert!(provider.accepts_message_effort("anthropic/claude-sonnet-5.5"));
         assert!(!provider.accepts_message_effort("z-ai/glm-5.3"));
+    }
+
+    #[test]
+    fn bindings_pin_the_two_live_openrouter_wires() {
+        let provider = provider();
+        assert!(provider.supports_protocol(ProtocolId::OpenAiChat));
+        assert!(provider.supports_protocol(ProtocolId::AnthropicMessages));
+        assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
     }
 
     #[test]

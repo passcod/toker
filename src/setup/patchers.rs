@@ -37,6 +37,8 @@ use anyhow::{Context, bail};
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::routing::ProtocolId;
+
 use crate::setup::atomic::{atomic_patch_json, atomic_patch_json_if_changed, atomic_write_bytes};
 
 /// The marker comment governing toker's block in a shell rc. One
@@ -430,11 +432,11 @@ impl Frontend {
     /// The frontend protocol this frontend speaks: `anthropic` or
     /// `openai_chat`. A frontend is offered only when its protocol has a
     /// backend enabled.
-    pub fn protocol(&self) -> &'static str {
+    pub fn protocol(&self) -> ProtocolId {
         match self {
-            Frontend::Opencode { .. } => "openai_chat",
-            Frontend::Codex { .. } => "openai_responses",
-            _ => "anthropic",
+            Frontend::Opencode { .. } => ProtocolId::OpenAiChat,
+            Frontend::Codex { .. } => ProtocolId::OpenAiResponses,
+            _ => ProtocolId::AnthropicMessages,
         }
     }
 
@@ -442,9 +444,9 @@ impl Frontend {
     /// included — the path the setup wizard probes before patching.
     pub fn usage_path(&self) -> String {
         let route = match self.protocol() {
-            "openai_chat" => "/v1/chat/completions",
-            "openai_responses" => "/v1/responses",
-            _ => "/v1/messages",
+            ProtocolId::OpenAiChat => "/v1/chat/completions",
+            ProtocolId::OpenAiResponses => "/v1/responses",
+            ProtocolId::AnthropicMessages => "/v1/messages",
         };
         match self.prefix() {
             Some(name) => format!("/f/{name}{route}"),
