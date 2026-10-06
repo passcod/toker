@@ -44,7 +44,15 @@ Plus a `/_toker/*` control and query endpoint on the same listener: localhost on
 
 ### Intermediate representation
 
-Every request is parsed into a canonical internal model: messages/turns, tools, system prompt, sampling params, cache directives, plus raw preservation of all unmodeled fields so provider-specific extensions survive the trip. Middleware transforms the IR; the backend adapter serialises to the backend's protocol. **There is no passthrough code path** — passthrough is what the IR produces when nothing transforms it (see invariant 4).
+Every request is parsed into a canonical internal model: messages/turns, tools,
+system prompt, sampling params, cache directives, plus opaque extensions for
+unmodeled fields. Middleware transforms the IR; the backend adapter renders the
+backend's protocol. **There is no passthrough code path**, including when the
+frontend and backend name the same protocol. Compatible adapters may replay an
+opaque extension; otherwise they report its content-free translation loss or
+reject the request when omission would invalidate it. See
+[`protocol-provider-mux.md`](protocol-provider-mux.md) for the route graph and
+migration plan.
 
 ### Middleware
 
@@ -91,19 +99,46 @@ Carried over from ctp where marked, new where noted:
 1. **No content stored.** Counts, lengths, digests, and whether fixed known-in-advance marker strings matched — never prompt/completion/system/tool text. Session labels come from frontend transcripts at view time, read-only. *(ctp)*
 2. **Credentials never logged, never in the ledger.** Stored only in config/keyring; request auth headers read by name only where needed; response headers (no secrets there) captured wholesale. *(ctp, adapted: ctp stored no credentials at all — see Credentials)*
 3. **Absence ≠ zero, and proxy-written rows are never API measurements.** Unknown/estimating/stale are explicit verdicts, never silent guesses; a withheld cold notice is logged (`cold-quiet`) so silence is distinguishable from breakage. *(ctp)*
-4. **Serialisation purity.** IR → bytes is a pure function of the parsed value (serde_json `preserve_order` + `arbitrary_precision`, deterministic minimal escaping, raw unmodeled fields). No serialisation decision ever depends on runtime state — meters, gates, clocks. The only byte changes are deliberate: a middleware transform or a config change, each a user-visible, once-per-change event. The release marker `$#$BURN$#$` is a frozen public API and its stripping rule stays byte-stable forever. *(new; ctp's measured hazard was state-varying transformation)*
-5. **Prefix stability, by construction and by testing.** For a conversation that only appends, the body sent upstream keeps the upstream's cacheable prefix stable — same-protocol or translated, transformed or not:
-   - **Untransformed requests are passthrough by construction, verified per request.** The server byte-compares the re-serialised body against the original buffer on every request (cheap memcmp). Bytes match — the normal case — the original buffer is forwarded, identical to a passthrough proxy. Bytes differ: forward the original (still safe), and record a **fidelity-drift row** (route, frontend, divergence digest). Drift is a visible, queryable metric, not a hoped-for absence.
-   - **Transformed/translated requests**: the transform is pure and deterministic, so turn N+1 reproduces turn N's bytes exactly wherever the conversation didn't change, in any protocol pair. The prefix the upstream sees is stable even though it never existed in the frontend's wire format.
-   - **Enforced by**: round-trip byte-equality corpus tests (`serialize(parse(body)) == body` against captured real traffic, seeded from ctp fixtures); prefix-stability property tests per frontend×backend pair (mutate only the conversation tail, assert the upstream body is unchanged up to the mutation point); the CACHE REBUILDS analytics as the end-to-end production signal (systematic serialisation rebuilds would localise to nowhere).
-   - **Honest caveat**: the *first* request of an existing conversation through a translated route rebuilds the upstream cache once — the upstream's prefix genuinely changes. Bounded, deliberate, visible in the ledger. *(new, replaces ctp's byte-splice precaution)*
-6. **Accounting must never break a session; only a gate may stop one.** Observational parsing runs around an already-forwarded byte stream; a parse failure loses a measurement, never a request. *(ctp; free in Rust via Result, but the design stance carries)*
+4. **Rendering purity.** Canonical IR to backend bytes is a pure function of
+   the canonical value, target binding, and explicit configuration. No
+   rendering decision depends on runtime state such as meters, gates, or
+   clocks. The only semantic changes are deliberate middleware transforms,
+   adapter policy, or configuration changes. The release marker `$#$BURN$#$`
+   is a frozen public API and its stripping rule stays byte-stable forever.
+   *(new; ctp's measured hazard was state-varying transformation)*
+5. **Prefix stability, by construction and by testing.** For a conversation
+   that only appends, turn N+1 reproduces turn N's backend-rendered cacheable
+   prefix byte-for-byte, regardless of whether the two adapters name the same
+   protocol:
+   - **Every request is rendered.** The frontend bytes are evidence for the
+     ingress adapter, not the buffer sent upstream. Deterministic backend
+     rendering defines the stable prefix.
+   - **Loss is explicit.** Unknown fields and events are replayed by a
+     compatible adapter, omitted with a content-free translation-loss report,
+     or rejected when omission would invalidate the request. Backend
+     acceptance alone is not proof of semantic preservation.
+   - **Enforced by:** canonical semantic fixtures; deterministic rendering and
+     prefix-stability tests per adapter and binding; explicit translation-loss
+     snapshots; representative frontend and backend acceptance tests; and the
+     CACHE REBUILDS analytics as the end-to-end production signal.
+   - **Honest caveat:** the first request of an existing conversation after
+     migration may rebuild the upstream cache once because its canonical
+     rendering can differ from the formerly forwarded body. The effect is
+     bounded, deliberate, and measured against a copied ledger before rollout.
+     *(new, replaces ctp's byte-splice precaution)*
+6. **Accounting must never break a session; only a gate may stop one.**
+   Observation runs under a crash-proof boundary around canonical response
+   interpretation; its failure loses a measurement, never a response. *(ctp;
+   free in Rust via Result, but the design stance carries)*
 7. **Reads pull only what their consumer reads.** Every per-tick read path fetches the narrowest row shape its aggregation needs — `MeterRow` (4 columns, one JSON parse) for the quota tick, the display row for the sessions/spend tick — never a full 59-column `RequestRow` materialization; SQL filters what Rust would only discard (`rate_limits IS NOT NULL OR gate_on IS NOT NULL`). Adding a field to a narrow row is a per-tick cost decision made in the open, in that row type's docs. The full `RequestRow` is for the ledger's writers and full-row readers (export), not for refresh paths. A path that over-reads is the 80%-CPU bug waiting to come back.
 
 ## Server core
 
 - Buffer request bodies for gating decisions (ctp behaviour; bodies are small relative to streams).
-- Response streams pass through with backpressure; an opportunistic, crash-proof SSE side-parser extracts usage/model/cost. Tolerant of `\r\n` dialects with end-of-stream flush; skips keep-alives and non-JSON events; per-response state latches id/model/provider from the final usage-bearing chunk with earlier-chunk fallback.
+- Backend response streams are interpreted into canonical events with
+  backpressure, then rendered for the frontend. Observational accounting reads
+  canonical events and provider metadata under the same crash-proof boundary:
+  its failure loses a measurement, never a response.
 - Force `accept-encoding: identity` on upstream requests we side-parse; pass unexpected compressed responses through unledgered (ledger-proxy lesson).
 - No idle timeout on streams (equivalent of `requestTimeout = 0`); 300 s read timeout; upstream abort wired to client hangup; a client that hangs up mid-stream produces no row.
 - Non-2xx on a usage path → `error` row (status, type, retry-after), never priced.
@@ -121,11 +156,17 @@ Carried over from ctp where marked, new where noted:
 
 SQLite, `$XDG_DATA_HOME/toker/toker.db`, WAL mode. Engine choice: plain **rusqlite** behind a std `Mutex<Connection>`, considered against Turso/libSQL (async SQLite) and rejected — toker's write rate is one row per request (minutes-scale, never throughput-bound, blocking calls are microseconds) and libSQL's advantages (async, remote/replicated modes) are irrelevant to a single-user loopback tool. The `Store` API is encapsulated, so the engine stays swappable if that ever changes.
 
-- **`requests`** — insert-only, one row per request, carrying the ctp row schema verbatim (token buckets, `rateLimits`, shape fields — toolsHash, system hashes/ladders/tail, compaction markers, `usagePresence` — gate provenance, adaptive-rewrite provenance) **plus**: provider/backend, frontend protocol, routing provenance (`requestedModel`/`effectiveModel`/batch `modelMappings`), the raw provider usage JSON verbatim (OpenRouter's `usage.cost`/`cost_details`, serving provider — ledger parity), fidelity-drift rows, and cost in three explicit kinds, never conflated:
+- **`requests`** — insert-only, one row per request, carrying the ctp row
+  schema verbatim plus provider/backend, frontend protocol, routing
+  provenance, raw provider usage, and content-free translation-loss metadata.
+  Legacy fidelity-drift rows remain readable through the canonical migration.
+  Cost has three explicit kinds, never conflated:
   - `billed` — provider-reported (openrouter today)
   - `estimated` — catalog-priced (API backends)
   - `plan_equivalent` — list-price on a subscription ("what is the plan worth?")
-- Proxy-written row kinds (`blocked`, `released`, `cold`, `cold-quiet`, `awake`, `error`, `fidelity-drift`) carry no `rateLimits` unless explicitly a stale-copy kind; all excluded from API measurements.
+- Proxy-written row kinds (`blocked`, `released`, `cold`, `cold-quiet`,
+  `awake`, `error`, and legacy `fidelity-drift`) carry no `rateLimits` unless
+  explicitly a stale-copy kind; all are excluded from API measurements.
 - **State as tables**: lanes (keyed `sessionId|toolsHash`, 30-day prune), learned models (days served, `maxPrompt`), allowances (keyed by reset value, self-expiring), pings, last-meters.
 - **`toker import`** ingests ctp's `usage.jsonl` (honoring ctp's `docs/internals/log-schema.md` field-era notes) so learned model state and 7-day forecasting stay continuous from day one.
 - **`toker export`** emits JSONL for greppability.
@@ -176,11 +217,20 @@ No config files written by hand unless wanted; `toker.toml` exists for hand-edit
 
 ## Phases
 
-Each phase usable standalone; dogfood-first ordering:
+These phases record the original dogfood-first delivery order. The universal
+canonical migration that follows them is specified and phased in
+[`protocol-provider-mux.md`](protocol-provider-mux.md).
 
 1. **Opencode + openrouter, today.** OpenAI-chat frontend + openrouter backend, IR core with the serialisation-purity and fidelity-monitor machinery, full recording (billed cost + serving provider verbatim), lanes, minimal TUI (sessions, context, spend). Same-protocol from day one, so this phase is the live test of IR re-serialisation against OpenRouter's real cache behaviour. Exit: ledger proxy retired.
 2. **Anthropic.** Frontend endpoint + api/sub backends, full middleware (meters → quota gate, release marker, cold gate, compaction retarget, force-newest), `toker import`, sleep lock, quota panels. Exit: ctp retired at work.
-3. **Codex.** Responses frontend endpoint + codex sub backend (auth reuse, usage-limit shape verified; possibly promoted to a meter source), cross-protocol translation as needed — now canonical-IR shaped: the canonical IR (`src/ir/canonical.rs` — request model, turn events, backend `Capabilities`) sits between frontend adapters (`anthropic_frontend.rs`: wire→canonical both directions) and backend adapters (`codex_backend.rs`: canonical→wire both directions). Adding a frontend or a backend is ONE adapter; "what a backend supports" is a backend property (`Capabilities`), never a pair property. Same-protocol routes keep the byte-passthrough machinery; canonical engages only when crossing. The composition seams (`to_codex`, `AnthropicStream`) are stable and byte-pinned by the corpus.
+3. **Codex.** Responses frontend endpoint + codex sub backend (auth reuse,
+   usage-limit shape verified; possibly promoted to a meter source), with the
+   first canonical request/event pipeline between frontend and backend
+   adapters. Adding a frontend or backend is one adapter; what a backend
+   supports belongs to its binding and dialect, never to a vendor pair. The
+   initial composition seams (`to_codex`, `AnthropicStream`) establish the
+   canonical semantics and are migration inputs, not a permanent
+   cross-protocol-only branch.
 4. **OpenAI api + lunaroute** backends (adapter exists; these are auth + costing semantics).
 5. **Grown TUI + `setup` wizard + wake/hold/ping units + attribution plugin fallback.**
 
@@ -196,7 +246,10 @@ Each phase usable standalone; dogfood-first ordering:
 - Codex sub's usage-limit reporting shape (headers vs response body).
 - Whether lunaroute exposes per-request cost or only dashboard usage reports.
 - ~~Codex sub's usage-limit reporting shape (headers vs response body)~~ **Resolved 2026-10-04, verified live**: `x-codex-{primary,secondary}-used-percent` headers on every /responses response (percent + window-minutes + reset-at, plus credits) — parsed and stored per-backend; a real meter source.
-- ~~Anthropic's cache granularity vs re-serialisation in practice~~ **Zero drift rows on live traffic so far**; the fidelity monitor keeps watching.
+- ~~Anthropic's cache granularity vs re-serialisation in practice~~ **Zero
+  drift rows were observed on the original byte-forwarding path**; canonical
+  migration replaces that monitor with deterministic rendering and prefix
+  stability tests.
 - ~~System-role messages on the codex wire~~ **Resolved live**: the backend refuses system-role input items ("System messages are not allowed") — leading text goes to `instructions`, mid-conversation merges into the preceding user turn (ctp's pattern).
 - ~~Sampling parameters~~ **Dropped as a translation cost**: the backend rejects them ("Unsupported parameter: temperature"); its client sends none.
 - The `version` header gates models (a 400 "requires a newer version of Codex") — toker identifies with the installed CLI's tracked version from `~/.codex/version.json`.

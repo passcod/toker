@@ -1,11 +1,12 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phase 1 complete.
+Status: guiding architecture; phase 1 complete, canonical migration pending.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
-any configured frontend protocol should be able to reach any backend protocol
-for which toker has either a compatible same-wire binding or a complete
-translation path.
+any configured frontend protocol should be able to reach any backend for which
+toker has a complete canonical adapter. A nominal protocol match is not a
+different execution path: Messages to Messages is a translation through the
+same canonical model as Messages to Responses.
 
 The initial implementation proved the individual routes, but still names many
 of them as vendor pairs. That makes `codex_sub` look like the Responses
@@ -14,15 +15,19 @@ are independent facts. OpenRouter already demonstrates the problem: one
 provider exposes both OpenAI Chat and Anthropic Messages, and may expose a
 Responses dialect as well.
 
-This document is the guide for separating those concerns without weakening the
-byte, credential, accounting, or absence invariants in `AGENTS.md`.
+This document is the guide for separating those concerns. During migration,
+`AGENTS.md` and `docs/internals/` continue to govern the running byte-forwarding
+implementation. The cutover to universal canonical rendering must update those
+current-code rules in the same commit that removes the old path; a plan cannot
+pretend already-running code has changed.
 
 ## The layers
 
 ```text
 frontend profile
     -> frontend protocol adapter
-    -> protocol-local IR or canonical IR
+    -> canonical request and events
+    -> shared middleware
     -> backend protocol adapter
     -> provider binding
 ```
@@ -56,8 +61,8 @@ to adapters rather than to the identity itself.
 
 A frontend adapter:
 
-- reads routing and observation metadata from a request;
-- converts a cross-protocol request into canonical IR;
+- parses every request into canonical IR;
+- interprets every frontend event or body into canonical events;
 - renders canonical response events, errors, and synthetic notices;
 - renders the frontend's model-catalogue shape.
 
@@ -68,8 +73,9 @@ A backend adapter:
 - declares live-verified capabilities and translation costs.
 
 One implementation may serve both sides of a protocol, but the roles stay
-separate. This matters when a provider implements a dialect rather than every
-feature of a nominal protocol.
+separate. There is no identity or passthrough adapter: even equal nominal
+protocols parse and render. This matters when a provider implements a dialect
+rather than every feature of a nominal protocol.
 
 ### Provider bindings
 
@@ -81,7 +87,7 @@ A provider is a vendor/account boundary. It owns:
 - its catalogue source and parser;
 - the protocol bindings that have been verified against it.
 
-A binding says that one configured provider can be reached using one protocol
+A binding says that one configured provider can be reached using one backend
 adapter. It is deliberately narrower than "the provider has an endpoint with
 this spelling". A Responses endpoint is a binding only after representative
 Codex requests, streaming events, tools, errors, and usage have been verified.
@@ -107,27 +113,93 @@ The requested model may carry an outer provider prefix. For example,
 leaves `anthropic/claude-sonnet-x` as the provider's model id. Provider ids and
 model ids are never conflated.
 
-The routing decision then chooses one of two paths.
+The routing decision always selects a backend adapter. The frontend adapter has
+already produced canonical IR; shared middleware changes that IR; the selected
+backend adapter renders it. The response always takes the reverse path through
+canonical events. A route exists only when both halves are implemented and
+tested.
 
-### Same-wire path
+```text
+frontend bytes
+    -> canonical request
+    -> middleware
+    -> model target
+    -> backend bytes
 
-When the frontend protocol and backend binding are compatible, the client's
-body remains the forwarded body. Toker parses only protocol-local, lossless
-views for routing, gates, and observation. With no licensed rewrite it forwards
-the original buffer. A provider-prefix strip serialises the protocol-local IR
-once, deterministically, under the existing body-rewrite licence.
+backend bytes/events
+    -> canonical events
+    -> observation
+    -> frontend bytes/events
+```
 
-Canonical IR never enters this path.
+There is no same-wire fast path. Protocol equality can let two bindings reuse
+adapter code, but it never bypasses canonical IR.
 
-### Cross-protocol path
+## Canonical fidelity and explicit loss
 
-When the protocols differ, the frontend adapter parses into canonical IR and
-the backend adapter renders from it. The response takes the reverse path.
-Translation is pure and its losses are declared by the target binding's
-capabilities.
+Toker is a semantic mux, not a transparent proxy. Its contract is that the
+selected backend can accept the rendered request and the frontend can accept
+the rendered response. Byte equality with either side's original wire is not a
+goal.
 
-A route exists only when both halves are implemented and tested. There is no
-best-effort translation that silently drops unknown content.
+Canonical IR carries all semantics toker understands plus opaque extensions:
+
+```text
+CanonicalRequest {
+    model,
+    system,
+    messages,
+    tools,
+    sampling,
+    thinking,
+    extensions,
+}
+
+CanonicalExtension {
+    source dialect,
+    wire path,
+    optional known semantic kind,
+    opaque value,
+}
+```
+
+An adapter may render a known extension, replay an opaque extension whose
+dialect it understands, omit it with an explicit loss, or reject when omission
+would make the request invalid. Unknown content blocks are never silently
+flattened or truncated. Unknown optional fields may be omitted, but their field
+paths and loss reason are observable without storing their values.
+
+This matters even where an upstream would accept the omission: cache controls,
+reasoning effort, tool choice, thinking signatures, and encrypted reasoning can
+change behavior without producing an error.
+
+Translation produces a content-free loss report beside the rendered request or
+response. It may record field paths, block kinds, counts, and digests, never
+prompt, completion, tool, or opaque extension values.
+
+## Determinism replaces byte round-tripping
+
+Prefix stability remains mandatory, but its reference is the backend rendering,
+not the frontend's bytes. For an append-only conversation, rendering turn N+1
+must reproduce turn N's backend prefix byte-for-byte. Backend adapters are pure
+functions of canonical input, target binding, and explicit configuration; they
+do not read clocks, meters, or mutable state.
+
+The migration causes one real cache rebuild per existing lane whose new
+canonical rendering differs from the old forwarded body. After that bounded
+cutover, deterministic rendering keeps the new backend prefix stable. The
+migration must measure this effect against a copied ledger and should not be
+deployed casually into many warm sessions.
+
+The old byte-round-trip corpus remains useful while migrating ingress parsers,
+but it stops being the acceptance criterion. The replacement suite pins:
+
+- canonical semantics extracted from captured requests;
+- deterministic request rendering and append-only prefix stability;
+- canonical event interpretation and frontend rendering;
+- explicit translation-loss reports;
+- representative backend and frontend acceptance;
+- unknown fields and events staying quiet unless they affect compatibility.
 
 ## The models endpoint is a frontend projection
 
@@ -195,14 +267,17 @@ struct FrontendProfile {
 
 struct BackendBinding {
     protocol: ProtocolId,
+    dialect: DialectId,
+    adapter: BackendAdapterId,
+    capabilities: Capabilities,
 }
 ```
 
-Adapters become traits when more than one composition needs their behavior.
-The first refactor must not introduce boxed async streams or erase the existing
-typed state machines merely to make the diagram look complete. The route
-registry can initially name the existing handlers and acquire adapter objects
-as translation seams are generalized.
+Adapters become traits when more than one binding needs runtime dispatch. The
+first refactor must not introduce boxed async streams or erase the existing
+typed state machines merely to make the diagram look complete. Stateful stream
+interpreters and renderers may remain concrete objects created by a small
+object-safe adapter factory.
 
 The provider trait grows binding declarations first. Endpoint, auth, meter,
 and cost behavior remain on the provider. Later, a binding can carry a typed
@@ -211,12 +286,15 @@ identity.
 
 ## Invariants through the refactor
 
-- Same-protocol requests retain the original-buffer fast path.
-- Cross-protocol serialisation remains pure and deterministic.
+- Every request and response goes through canonical IR or canonical events.
+- Every backend and frontend rendering is pure and deterministic.
 - A new binding does not imply support until live verification says it does.
 - Provider auth stays provider-owned; protocol code never handles credential
   values.
-- Observation failure loses accounting, never a request.
+- Translation losses are content-free and visible, never silently asserted as
+  support.
+- Accounting failure loses accounting, never a request; translation failure is
+  a compatibility error and reaches no backend.
 - The catalogue join never guesses missing facts.
 - Frontend profile names affect presentation and ambiguous discovery, never
   reinterpret a usage path's wire protocol.
@@ -235,33 +313,48 @@ identity.
 
 No endpoint, body, credential, catalogue, or ledger behavior changes.
 
-### 2. Resolve concrete model targets
+### 2. Make canonical IR universal
+
+- Extend canonical requests and events for every semantic shape the three
+  current frontend protocols carry.
+- Add opaque extensions and content-free translation-loss reports.
+- Implement ingress adapters for Messages, Chat, and Responses.
+- Implement deterministic egress adapters for the currently live provider
+  bindings.
+- Pin semantic fixtures, rendered bytes, event streams, and prefix stability.
+- Keep the old handlers live until both sides of a route are complete.
+
+### 3. Resolve concrete model targets and cut routes over
 
 - Replace per-handler provider selection with a route registry.
 - Add a `ModelTarget` carrying provider, binding, requested model, and effective
   model.
-- Generalize provider-prefix stripping across protocol-local IRs.
-- Keep existing defaults and error shapes byte-pinned.
+- Move routing, gates, rewrites, and shape extraction onto canonical middleware.
+- Cut one complete request-and-response route at a time onto the common
+  pipeline.
+- Remove the old route only after its canonical replacement passes acceptance
+  and quietness tests.
+- Once every usage route has moved, remove fidelity drift and atomically update
+  `AGENTS.md` plus `docs/internals/` to the universal-rendering invariant.
 
-### 3. Own model discovery
+### 4. Own model discovery
 
 - Normalize the existing fetched catalogues into `ModelOffer`s.
 - Join offers against the route graph per frontend profile.
 - Render `/v1/models` locally for OpenAI Chat and Codex Responses clients.
 - Move Claude's picker generation onto the same joined source.
 
-### 4. Add the OpenRouter Responses binding
+### 5. Add the OpenRouter Responses binding
 
 - Live-verify a representative Codex workload against OpenRouter Responses.
 - Declare the binding only for verified request and event shapes.
-- Route `openrouter/<model>` from the Responses frontend through the
-  same-wire path.
+- Route `openrouter/<model>` through the universal canonical pipeline.
 - Record only provider-attested billed cost and serving-provider fields.
 
-### 5. Complete the adapter matrix
+### 6. Complete the adapter matrix
 
-- Add a Responses frontend adapter and an Anthropic Messages backend adapter.
-- Compose Codex-to-Anthropic API traffic through canonical IR.
+- Finish any adapter capabilities the first live route did not exercise.
+- Compose Codex-to-Anthropic API traffic through the same canonical pipeline.
 - Add Anthropic subscription signing before exposing that route to frontends
   that do not bring Claude's bearer.
 - Add OpenAI Chat canonical adapters for the remaining opencode routes.
