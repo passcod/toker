@@ -30,6 +30,12 @@ Read out of the Claude Code 2.1.280 binary (2026-10-06):
 - A row's model passes `/model` validation without a probe request, because
   it is listed.
 
+## Status
+
+Steps 2, 3, 5, 6 and 7 are done. Left: step 1 (it needs an OpenRouter key),
+and with it the second half of step 4 and step 1's findings in `routing.md`
+(which already lists what is unchecked).
+
 ## Steps
 
 1. **Probe OpenRouter's Anthropic endpoint** with a real key (a cheap model,
@@ -59,18 +65,18 @@ Read out of the Claude Code 2.1.280 binary (2026-10-06):
 3. **Keep the Anthropic-catalogue rewrites off the OpenRouter route.** The
    compaction retarget and force-newest pick targets from the Anthropic model
    catalogue, and either would move an OpenRouter conversation onto a bare
-   `claude-*` id at a different provider. Gate both on the backend being
-   `anthropic_sub` or `anthropic_api` (one helper, used by both), with tests
+   `claude-*` id at a different provider. Gate both off the openrouter
+   backend (`picks_from_anthropic_catalogue`; codex keeps them, its model map
+   turns the targets into codex ids), with tests
    that an `openrouter/` compaction on a cold lane and a short `openrouter/`
    conversation forward their model untouched. The quota gate is already
    sub-only. The cold gate stays on: a re-read on OpenRouter is billed, and
    `is_meter_source` is already false, so the notice says so.
 
-4. **Record cost.** `cost_kind_of` in `record_anthropic.rs` gives `Estimated`
-   to every non-sub backend, priced from the Anthropic catalogue. For
-   `openrouter` use `Billed` from `usage.cost` when step 1 shows it is there,
-   and no cost at all otherwise (absence, never an estimate from a catalogue
-   that does not price these models). Tests for both.
+4. **Record cost.** Done: openrouter rows carry no cost rather than an
+   Anthropic-catalogue estimate. Left: when step 1 shows the Anthropic
+   endpoint reports `usage.cost` (and where in the stream), capture it in
+   `observe/anthropic.rs` and record it as `Billed`, with tests.
 
 5. **Picker rules.** The picker is a list of rules applied to OpenRouter's
    model listing (`GET <upstream>/models`, public, read without the key), so
@@ -153,13 +159,14 @@ Read out of the Claude Code 2.1.280 binary (2026-10-06):
    rows instead. Only `~/.claude/settings.json` is patched: Claude Code
    ignores `modelPicker` in a project's settings, which is what the Workhorse
    repo-root file is.
-   - `toker setup` runs the sync after patching the claude frontend (after
-     its existing `/f/claude` listener check).
    - Setup installs `toker-picker.timer` and `toker-picker.service` as user
-     units, beside the existing hold units: a daily `OnCalendar` oneshot
-     running `toker picker sync`, sandboxed `ProtectHome=read-only` with
-     `ReadWritePaths=%h/.claude`. They are installed only with an openrouter
-     block, and removed by setup when it goes.
+     units: a daily `OnCalendar` oneshot running `toker picker sync`,
+     sandboxed `ProtectHome=read-only`, writable in claude's settings dir and
+     the state dir (a read-only ledger open still needs the WAL's shared
+     memory). Installed only with an openrouter block and a claude frontend;
+     setup then runs the service once, as its last step, so the first sync
+     goes through the same sandbox. When the block goes, setup runs it one
+     last time (removing toker's rows) and removes the units.
    - Patcher tests pin each ownership case; a test drives the sync against a
      mock listing.
 
