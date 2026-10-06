@@ -848,6 +848,42 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     assert_no_more_rows(&store, 1).await;
 }
 
+/// A cold compaction routed to openrouter is not retargeted: the target
+/// comes from the Anthropic catalogue, and moving an openrouter
+/// conversation onto a bare `claude-*` id would leave the model the user
+/// picked. Only the routing prefix is stripped.
+#[tokio::test]
+async fn a_cold_openrouter_compaction_is_not_retargeted() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream)).await;
+
+    let mut ir = IrRequest::parse(&compaction_body()).expect("parse");
+    ir.anthropic_mut().set_model("openrouter/claude-opus-5");
+    let body = ir.serialise();
+    poison_cold_lane(&store, &body, 2 * 3_600_000);
+    seed_sonnet(&store);
+
+    let response = post_messages(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    ir.anthropic_mut().set_model("claude-opus-5");
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].as_ref(),
+        ir.serialise().as_slice(),
+        "the model kept, every breakpoint and system message in place"
+    );
+    let rows = wait_for_rows(&store, 1).await;
+    let row = rows
+        .iter()
+        .find(|row| row.kind.is_none())
+        .expect("the measurement row");
+    assert_eq!(row.provider.as_deref(), Some("openrouter"));
+    assert_eq!(row.downgraded_from, None);
+    assert_eq!(row.cache_stripped, None);
+}
+
 #[tokio::test]
 async fn a_warm_compaction_passes_through_untouched() {
     let (mock, upstream) = spawn_mock().await;

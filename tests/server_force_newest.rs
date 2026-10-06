@@ -499,6 +499,42 @@ async fn a_cold_lane_moves_to_the_learned_newest() {
     assert_eq!(lane.forced_to.as_deref(), Some("claude-opus-5"));
 }
 
+/// An openrouter-routed lane is never moved, however cold: the newest
+/// model comes from the Anthropic catalogue, and a bare `claude-*` id at
+/// openrouter is not the model the user picked.
+#[tokio::test]
+async fn an_openrouter_lane_is_never_moved() {
+    let (mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream);
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    seed_opus(&store, 200_000);
+
+    let body = tools_body("openrouter/claude-opus-4-8", 2);
+    store
+        .upsert_lane(&poisoned_lane(&body, now_ms() - 2 * 3_600_000, 174_000))
+        .expect("poison lane");
+    let addr = spawn_toker(config, store.clone()).await;
+
+    let response = post_messages(addr, "ccses-42", &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1, "the request reached upstream");
+    assert_eq!(
+        captured[0],
+        Bytes::from(with_model(
+            &body,
+            "openrouter/claude-opus-4-8",
+            "claude-opus-4-8"
+        )),
+        "only the routing prefix is stripped"
+    );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
+    assert_eq!(rows[0].forced_from, None);
+    assert_eq!(rows[0].forced_to, None);
+}
+
 /// A warm lane has a cache to lose: the request forwards byte-identical
 /// and records no provenance.
 #[tokio::test]

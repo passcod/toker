@@ -759,6 +759,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // above exempted it by the summarising flag, so nothing has
     // interrupted it: the gate exists to advise this.
     if path == "/v1/messages"
+        && picks_from_anthropic_catalogue(backend.as_ref())
         && let Some(ir) = parsed.as_mut()
         && gate_shape
             .as_ref()
@@ -854,6 +855,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // drift.
     if path == "/v1/messages"
         && server.config.gates.force_newest
+        && picks_from_anthropic_catalogue(backend.as_ref())
         && record
             .as_ref()
             .is_none_or(|ctx| ctx.downgraded_from.is_none())
@@ -1029,6 +1031,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             transport_failure(ErrorWire::Anthropic, &error)
         }
     }
+}
+
+/// Whether the rewrites that pick their target from the Anthropic model
+/// catalogue (the compaction retarget, force-newest) may run on this
+/// backend. Both write a bare `claude-*` id, which on openrouter would
+/// move a conversation off the model the user picked onto whatever
+/// openrouter makes of that id. Codex keeps them: its model map turns
+/// their `claude-*` targets into codex ids before the request leaves.
+fn picks_from_anthropic_catalogue(backend: &dyn Provider) -> bool {
+    backend.id() != "openrouter"
 }
 
 /// The session's stored allowances, or none for a sessionless request
