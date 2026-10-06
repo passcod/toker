@@ -7,11 +7,16 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
-use crate::routing::{BackendBinding, DialectId, ProtocolId};
+use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
 
 const BINDINGS: &[BackendBinding] = &[
     BackendBinding::declared(ProtocolId::OpenAiChat, DialectId::OpenRouterChatCompletions),
-    BackendBinding::declared(ProtocolId::AnthropicMessages, DialectId::OpenRouterMessages),
+    BackendBinding::canonical(
+        ProtocolId::AnthropicMessages,
+        DialectId::OpenRouterMessages,
+        BackendAdapterId::AnthropicMessages,
+        Capabilities::MESSAGES,
+    ),
 ];
 
 /// Anthropic's key header. Openrouter takes its key as a bearer only, so
@@ -132,7 +137,7 @@ impl Provider for OpenRouter {
 mod tests {
     use super::super::Provider;
     use super::OpenRouter;
-    use crate::routing::ProtocolId;
+    use crate::routing::{BackendAdapterId, Capabilities, ProtocolId};
     use axum::http::header::AUTHORIZATION;
     use axum::http::{HeaderMap, HeaderValue};
 
@@ -158,6 +163,16 @@ mod tests {
         assert!(provider.supports_protocol(ProtocolId::OpenAiChat));
         assert!(provider.supports_protocol(ProtocolId::AnthropicMessages));
         assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
+        let messages = provider
+            .bindings()
+            .iter()
+            .find(|binding| binding.protocol() == ProtocolId::AnthropicMessages)
+            .expect("Messages binding");
+        let canonical = messages
+            .canonical_backend()
+            .expect("Messages adapter is complete");
+        assert_eq!(canonical.adapter(), BackendAdapterId::AnthropicMessages);
+        assert_eq!(canonical.capabilities(), Capabilities::MESSAGES);
     }
 
     #[test]

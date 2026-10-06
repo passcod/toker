@@ -670,6 +670,7 @@ pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
                 arguments: call.arguments,
             })
             .collect(),
+        blocks: None,
         text: capture.text().to_owned(),
         thinking: capture
             .reasoning_summaries()
@@ -1923,6 +1924,7 @@ mod tests {
                     name: "read_file".to_owned(),
                     arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
                 }],
+                blocks: None,
                 text: "I'll read the files, then café.".to_owned(),
                 thinking: [(0, "Reading the thread files.".to_owned())].into(),
             }
@@ -1963,6 +1965,7 @@ mod tests {
                 usage: None,
                 error: None,
                 tool_calls: Vec::new(),
+                blocks: None,
                 text: String::new(),
                 thinking: [].into(),
             }

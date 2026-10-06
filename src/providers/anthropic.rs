@@ -34,11 +34,13 @@ use reqwest::Url;
 use serde_json::{Map, Value, json};
 
 use super::Provider;
-use crate::routing::{BackendBinding, DialectId, ProtocolId};
+use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
 
-const BINDINGS: &[BackendBinding] = &[BackendBinding::declared(
+const BINDINGS: &[BackendBinding] = &[BackendBinding::canonical(
     ProtocolId::AnthropicMessages,
     DialectId::AnthropicMessages,
+    BackendAdapterId::AnthropicMessages,
+    Capabilities::MESSAGES,
 )];
 
 /// The header carrying the API key (Anthropic's API auth is `x-api-key`,
@@ -293,7 +295,7 @@ pub fn parse_rate_limits(headers: &HeaderMap) -> Option<Value> {
 mod tests {
     use super::super::Provider;
     use super::{AnthropicApi, AnthropicSub, parse_rate_limits};
-    use crate::routing::ProtocolId;
+    use crate::routing::{BackendAdapterId, Capabilities, ProtocolId};
     use axum::http::{HeaderMap, HeaderValue, header};
     use serde_json::json;
 
@@ -318,6 +320,11 @@ mod tests {
             assert!(provider.supports_protocol(ProtocolId::AnthropicMessages));
             assert!(!provider.supports_protocol(ProtocolId::OpenAiChat));
             assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
+            let canonical = provider.bindings()[0]
+                .canonical_backend()
+                .expect("Messages adapter is complete");
+            assert_eq!(canonical.adapter(), BackendAdapterId::AnthropicMessages);
+            assert_eq!(canonical.capabilities(), Capabilities::MESSAGES);
         }
     }
 

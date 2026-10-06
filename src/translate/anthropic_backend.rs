@@ -6,13 +6,18 @@
 //! extension replay domain; extensions from unrelated dialects are omitted
 //! with content-free losses.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Number, Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonSystemPart, CanonTool, CanonToolChoice,
-    CanonicalExtension, CanonicalRequest, ToolResultContent,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
+    CanonicalRequest, CanonicalUsage, ToolResultContent,
 };
+use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
+use crate::translate::anthropic_frontend::content_blocks_of;
 use crate::translate::{
     Rendered, TranslateError, TranslationLoss, TranslationLossReason, TranslationReport,
 };
@@ -321,14 +326,519 @@ fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationR
     ));
 }
 
+// ── response interpretation ─────────────────────────────────────────
+
+/// Stateful interpretation of one Anthropic Messages SSE turn.
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicResponseStream {
+    blocks: BTreeMap<u64, IncomingBlock>,
+    start_usage: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Clone)]
+enum IncomingBlock {
+    Text,
+    Thinking,
+    Redacted,
+    ToolUse {
+        id: String,
+        name: String,
+        initial_input: Value,
+        arguments: String,
+    },
+    Unknown,
+}
+
+impl AnthropicResponseStream {
+    pub fn new() -> AnthropicResponseStream {
+        AnthropicResponseStream::default()
+    }
+
+    /// Interpret one already-split SSE event. Invalid JSON and unknown event
+    /// shapes stay quiet; response observation must never break the stream.
+    pub fn feed_sse(&mut self, event: &SseEvent) -> Vec<CanonEvent> {
+        serde_json::from_str::<Value>(&event.data())
+            .ok()
+            .map(|value| self.feed(&value))
+            .unwrap_or_default()
+    }
+
+    /// Interpret one Anthropic event data object.
+    pub fn feed(&mut self, event: &Value) -> Vec<CanonEvent> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => self.message_start(event),
+            Some("content_block_start") => self.block_start(event),
+            Some("content_block_delta") => self.block_delta(event),
+            Some("content_block_stop") => self.block_stop(event),
+            Some("message_delta") => self.message_delta(event),
+            Some("error") => vec![CanonEvent::TurnFailed {
+                error: canonical_error(event.get("error").unwrap_or(event)),
+            }],
+            Some("message_stop") | Some("ping") | None | Some(_) => Vec::new(),
+        }
+    }
+
+    fn message_start(&mut self, event: &Value) -> Vec<CanonEvent> {
+        let Some(message) = event.get("message") else {
+            return Vec::new();
+        };
+        self.start_usage = message.get("usage").and_then(Value::as_object).cloned();
+        vec![CanonEvent::TurnStarted {
+            turn_id: message.get("id").and_then(Value::as_str).map(str::to_owned),
+        }]
+    }
+
+    fn block_start(&mut self, event: &Value) -> Vec<CanonEvent> {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return Vec::new();
+        };
+        let Some(block) = event.get("content_block") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let incoming = match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    out.push(CanonEvent::TextDelta {
+                        delta: text.to_owned(),
+                    });
+                }
+                IncomingBlock::Text
+            }
+            Some("thinking") => {
+                if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
+                    && !thinking.is_empty()
+                {
+                    out.push(CanonEvent::ThinkingDelta {
+                        part: index,
+                        delta: thinking.to_owned(),
+                    });
+                }
+                IncomingBlock::Thinking
+            }
+            Some("redacted_thinking") => {
+                if let Some(data) = block.get("data").and_then(Value::as_str) {
+                    out.push(CanonEvent::RedactedThinking {
+                        data: data.to_owned(),
+                    });
+                }
+                IncomingBlock::Redacted
+            }
+            Some("tool_use") => match (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) {
+                (Some(id), Some(name)) => IncomingBlock::ToolUse {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    initial_input: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    arguments: String::new(),
+                },
+                _ => IncomingBlock::Unknown,
+            },
+            _ => IncomingBlock::Unknown,
+        };
+        self.blocks.insert(index, incoming);
+        out
+    }
+
+    fn block_delta(&mut self, event: &Value) -> Vec<CanonEvent> {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return Vec::new();
+        };
+        let Some(delta) = event.get("delta") else {
+            return Vec::new();
+        };
+        match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => delta
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| {
+                    vec![CanonEvent::TextDelta {
+                        delta: text.to_owned(),
+                    }]
+                })
+                .unwrap_or_default(),
+            Some("thinking_delta") => delta
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(|thinking| {
+                    vec![CanonEvent::ThinkingDelta {
+                        part: index,
+                        delta: thinking.to_owned(),
+                    }]
+                })
+                .unwrap_or_default(),
+            Some("signature_delta") => delta
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(|signature| {
+                    vec![CanonEvent::ThinkingSignature {
+                        part: index,
+                        signature: signature.to_owned(),
+                    }]
+                })
+                .unwrap_or_default(),
+            Some("input_json_delta") => {
+                if let Some(IncomingBlock::ToolUse { arguments, .. }) = self.blocks.get_mut(&index)
+                    && let Some(fragment) = delta.get("partial_json").and_then(Value::as_str)
+                {
+                    arguments.push_str(fragment);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn block_stop(&mut self, event: &Value) -> Vec<CanonEvent> {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return Vec::new();
+        };
+        match self.blocks.remove(&index) {
+            Some(IncomingBlock::Text) => vec![CanonEvent::TextEnded],
+            Some(IncomingBlock::Thinking) => vec![CanonEvent::ThinkingEnded],
+            Some(IncomingBlock::ToolUse {
+                id,
+                name,
+                initial_input,
+                arguments,
+            }) => vec![CanonEvent::ToolCall(CanonToolCall {
+                id,
+                name,
+                arguments: if arguments.is_empty() {
+                    serde_json::to_string(&initial_input)
+                        .expect("a parsed tool input always serialises")
+                } else {
+                    arguments
+                },
+            })],
+            Some(IncomingBlock::Redacted | IncomingBlock::Unknown) | None => Vec::new(),
+        }
+    }
+
+    fn message_delta(&mut self, event: &Value) -> Vec<CanonEvent> {
+        let reason = event
+            .get("delta")
+            .and_then(|delta| delta.get("stop_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let usage = merged_usage(self.start_usage.as_ref(), event.get("usage"));
+        vec![CanonEvent::TurnEnded {
+            stop_reason: stop_reason(reason),
+            usage,
+        }]
+    }
+}
+
+fn stop_reason(reason: &str) -> CanonStopReason {
+    match reason {
+        "end_turn" => CanonStopReason::EndTurn,
+        "stop_sequence" => CanonStopReason::StopSequence,
+        "pause_turn" => CanonStopReason::PauseTurn,
+        "tool_use" => CanonStopReason::ToolUse,
+        "max_tokens" => CanonStopReason::MaxTokens,
+        "model_context_window_exceeded" => CanonStopReason::ContextWindowExceeded,
+        "refusal" => CanonStopReason::Refusal,
+        other => CanonStopReason::Incomplete(other.to_owned()),
+    }
+}
+
+fn merged_usage(
+    start: Option<&Map<String, Value>>,
+    final_usage: Option<&Value>,
+) -> Option<CanonicalUsage> {
+    let mut merged = start.cloned().unwrap_or_default();
+    if let Some(final_usage) = final_usage.and_then(Value::as_object) {
+        for (field, value) in final_usage {
+            merged.insert(field.clone(), value.clone());
+        }
+    }
+    if merged.is_empty() {
+        return None;
+    }
+    let raw = Value::Object(merged.clone());
+    Some(CanonicalUsage {
+        input: u64_field(&merged, "input_tokens"),
+        cache_read: u64_field(&merged, "cache_read_input_tokens"),
+        cache_write: u64_field(&merged, "cache_creation_input_tokens"),
+        output: u64_field(&merged, "output_tokens"),
+        reasoning: merged
+            .get("output_tokens_details")
+            .and_then(|details| details.get("thinking_tokens"))
+            .and_then(Value::as_u64),
+        raw,
+    })
+}
+
+fn u64_field(object: &Map<String, Value>, field: &str) -> Option<u64> {
+    object.get(field).and_then(Value::as_u64)
+}
+
+fn canonical_error(error: &Value) -> CanonError {
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    CanonError {
+        kind: match kind {
+            "rate_limit_error" => CanonErrorKind::RateLimit,
+            "invalid_request_error" => CanonErrorKind::InvalidRequest,
+            "authentication_error" => CanonErrorKind::Authentication,
+            "permission_error" => CanonErrorKind::Permission,
+            "not_found_error" => CanonErrorKind::NotFound,
+            "request_too_large" => CanonErrorKind::TooLarge,
+            "overloaded_error" => CanonErrorKind::Overloaded,
+            _ => CanonErrorKind::Api,
+        },
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(kind)
+            .to_owned(),
+        resets_at: error.get("retry_after").and_then(Value::as_i64),
+    }
+}
+
+/// Interpret one complete non-streaming Anthropic Messages response.
+pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, TranslateError> {
+    if body.get("type").and_then(Value::as_str) == Some("error") {
+        return Ok(CanonTurn {
+            turn_id: None,
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: Some(canonical_error(body.get("error").unwrap_or(body))),
+            tool_calls: Vec::new(),
+            blocks: None,
+            text: String::new(),
+            thinking: BTreeMap::new(),
+        });
+    }
+
+    let content = body
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "anthropic response content is missing or not an array".to_owned(),
+        })?;
+    let blocks = content_blocks_of(CanonRole::Assistant, content, 0)?;
+    let mut text = String::new();
+    let mut thinking = BTreeMap::new();
+    let mut tool_calls = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        match block.semantic() {
+            CanonBlock::Text(part) => text.push_str(part),
+            CanonBlock::Thinking { text, .. } => {
+                thinking.insert(index as u64, text.clone());
+            }
+            CanonBlock::ToolUse { id, name, input } => tool_calls.push(CanonToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: serde_json::to_string(input)
+                    .expect("a parsed tool input always serialises"),
+            }),
+            CanonBlock::Image { .. }
+            | CanonBlock::ToolResult { .. }
+            | CanonBlock::RedactedThinking { .. } => {}
+            CanonBlock::Annotated { .. } => unreachable!("semantic() removes annotations"),
+        }
+    }
+
+    Ok(CanonTurn {
+        turn_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
+        stop_reason: body
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .map(stop_reason)
+            .unwrap_or(CanonStopReason::EndTurn),
+        usage: merged_usage(None, body.get("usage")),
+        error: None,
+        tool_calls,
+        blocks: Some(blocks),
+        text,
+        thinking,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_anthropic;
-    use crate::ir::canonical::{CanonBlock, CanonMessage, CanonRole, CanonicalExtension};
+    use super::{
+        AnthropicResponseStream, canonical_turn_from_anthropic, render_anthropic, stop_reason,
+    };
+    use crate::ir::canonical::{
+        CanonBlock, CanonEvent, CanonMessage, CanonRole, CanonStopReason, CanonicalExtension,
+    };
+    use crate::observe::sse::SseSplitter;
     use crate::routing::DialectId;
+    use crate::translate::anthropic_frontend::anthropic_from_canonical;
     use crate::translate::anthropic_frontend::from_anthropic;
     use crate::translate::{TranslateError, TranslationLoss, TranslationLossReason};
     use serde_json::json;
+
+    fn fixture_events(source: &str) -> Vec<CanonEvent> {
+        let mut splitter = SseSplitter::new();
+        let mut stream = AnthropicResponseStream::new();
+        let mut events: Vec<_> = splitter
+            .feed(source.as_bytes())
+            .into_iter()
+            .flat_map(|event| stream.feed_sse(&event))
+            .collect();
+        if let Some(event) = splitter.finish() {
+            events.extend(stream.feed_sse(&event));
+        }
+        events
+    }
+
+    #[test]
+    fn the_tool_use_fixture_interprets_complete_arguments_and_usage() {
+        let events = fixture_events(include_str!(
+            "../../tests/fixtures/anthropic_sse/02_tool_use.sse"
+        ));
+        assert_eq!(events.len(), 5, "message_stop is quiet");
+        assert!(matches!(
+            &events[0],
+            CanonEvent::TurnStarted { turn_id: Some(id) } if id == "msg_02T9kQ"
+        ));
+        assert!(matches!(
+            &events[1],
+            CanonEvent::TextDelta { delta } if delta == "Checking the weather."
+        ));
+        assert_eq!(events[2], CanonEvent::TextEnded);
+        assert!(matches!(
+            &events[3],
+            CanonEvent::ToolCall(call)
+                if call.id == "toolu_02Wx"
+                    && call.name == "get_weather"
+                    && call.arguments == r#"{"city":"Wellington","units":"celsius"}"#
+        ));
+        let CanonEvent::TurnEnded { stop_reason, usage } = &events[4] else {
+            panic!("fifth event is the turn end: {:?}", events[4]);
+        };
+        assert_eq!(stop_reason, &CanonStopReason::ToolUse);
+        let usage = usage.as_ref().expect("usage merges start and final");
+        assert_eq!(usage.input, Some(4));
+        assert_eq!(usage.output, Some(65));
+        assert_eq!(usage.reasoning, Some(22));
+        assert_eq!(usage.raw["service_tier"], json!("standard"));
+    }
+
+    #[test]
+    fn signed_and_redacted_reasoning_interpret_without_exposing_payloads() {
+        let mut stream = AnthropicResponseStream::new();
+        let values = [
+            json!({"type": "content_block_start", "index": 3,
+                   "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 3,
+                   "delta": {"type": "thinking_delta", "thinking": "reason"}}),
+            json!({"type": "content_block_delta", "index": 3,
+                   "delta": {"type": "signature_delta", "signature": "signature"}}),
+            json!({"type": "content_block_stop", "index": 3}),
+            json!({"type": "content_block_start", "index": 4,
+                   "content_block": {"type": "redacted_thinking", "data": "encrypted"}}),
+            json!({"type": "content_block_stop", "index": 4}),
+        ];
+        let events: Vec<_> = values.iter().flat_map(|value| stream.feed(value)).collect();
+        assert_eq!(
+            events,
+            vec![
+                CanonEvent::ThinkingDelta {
+                    part: 3,
+                    delta: "reason".to_owned(),
+                },
+                CanonEvent::ThinkingSignature {
+                    part: 3,
+                    signature: "signature".to_owned(),
+                },
+                CanonEvent::ThinkingEnded,
+                CanonEvent::RedactedThinking {
+                    data: "encrypted".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_anthropic_errors_map_to_the_canonical_taxonomy() {
+        let events = fixture_events(include_str!(
+            "../../tests/fixtures/anthropic_sse/06_error_event.sse"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(CanonEvent::TurnFailed { error })
+                if error.kind == crate::ir::canonical::CanonErrorKind::Overloaded
+                    && error.message == "Overloaded"
+        ));
+    }
+
+    #[test]
+    fn every_anthropic_stop_reason_keeps_its_distinction() {
+        assert_eq!(stop_reason("end_turn"), CanonStopReason::EndTurn);
+        assert_eq!(stop_reason("tool_use"), CanonStopReason::ToolUse);
+        assert_eq!(stop_reason("max_tokens"), CanonStopReason::MaxTokens);
+        assert_eq!(stop_reason("stop_sequence"), CanonStopReason::StopSequence);
+        assert_eq!(stop_reason("pause_turn"), CanonStopReason::PauseTurn);
+        assert_eq!(stop_reason("refusal"), CanonStopReason::Refusal);
+        assert_eq!(
+            stop_reason("model_context_window_exceeded"),
+            CanonStopReason::ContextWindowExceeded
+        );
+        assert_eq!(
+            stop_reason("future_reason"),
+            CanonStopReason::Incomplete("future_reason".to_owned())
+        );
+    }
+
+    #[test]
+    fn complete_messages_keep_order_signatures_redaction_and_metadata() {
+        let body = json!({
+            "id": "msg_complete",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "content": [
+                {"type": "thinking", "thinking": "reason", "signature": "signature"},
+                {"type": "redacted_thinking", "data": "encrypted"},
+                {"type": "text", "text": "Answer", "cache_control": {"type": "ephemeral"}},
+                {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "x"}}
+            ],
+            "stop_reason": "pause_turn",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 7, "output_tokens": 9,
+                      "output_tokens_details": {"thinking_tokens": 3}}
+        });
+        let turn = canonical_turn_from_anthropic(&body).expect("interprets");
+        assert_eq!(turn.stop_reason, CanonStopReason::PauseTurn);
+        assert_eq!(turn.text, "Answer");
+        assert_eq!(turn.thinking.get(&0).map(String::as_str), Some("reason"));
+        assert_eq!(turn.tool_calls[0].arguments, r#"{"path":"x"}"#);
+        assert_eq!(
+            turn.usage.as_ref().and_then(|usage| usage.reasoning),
+            Some(3)
+        );
+
+        let rendered = anthropic_from_canonical("claude-opus-5", &turn);
+        assert_eq!(rendered["content"], body["content"]);
+        assert_eq!(rendered["stop_reason"], json!("pause_turn"));
+    }
+
+    #[test]
+    fn complete_error_bodies_interpret_as_failed_turns() {
+        let turn = canonical_turn_from_anthropic(&json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "bad token"}
+        }))
+        .expect("interprets error");
+        assert!(matches!(
+            turn.error,
+            Some(crate::ir::canonical::CanonError {
+                kind: crate::ir::canonical::CanonErrorKind::Authentication,
+                ..
+            })
+        ));
+        assert!(turn.blocks.is_none());
+    }
 
     #[test]
     fn rich_anthropic_input_round_trips_through_the_canonical() {

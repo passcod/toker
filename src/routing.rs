@@ -77,6 +77,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// The Messages features verified on Anthropic and OpenRouter's Messages
+    /// binding. Signed reasoning replay is additionally enforced by the
+    /// adapter; an unsigned block is reported and omitted.
+    pub const MESSAGES: Capabilities = Capabilities {
+        sampling: true,
+        system_in_messages: true,
+        thinking_replay: true,
+        images: true,
+    };
+
     /// The Codex subscription Responses binding's live-verified capabilities.
     pub const CODEX: Capabilities = Capabilities {
         sampling: false,

@@ -218,7 +218,7 @@ fn messages_of(body: &Value) -> Result<Vec<CanonMessage>, TranslateError> {
 /// this table has never heard of, or a known kind in the wrong
 /// position — is [`TranslateError::UnsupportedBlock`]: content is
 /// never silently dropped, and the CALLER decides policy.
-fn content_blocks_of(
+pub(crate) fn content_blocks_of(
     role: CanonRole,
     blocks: &[Value],
     message_index: usize,
@@ -956,6 +956,35 @@ impl AnthropicRenderer {
                     }),
                 ));
             }
+            CanonEvent::ThinkingSignature { part, signature } => {
+                let block = BlockKind::Thinking { part: *part };
+                let index = self.ensure_open(block, &mut out);
+                out.push(sse_event(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "signature_delta", "signature": signature},
+                    }),
+                ));
+            }
+            CanonEvent::RedactedThinking { data } => {
+                self.close_open(&mut out);
+                let index = self.next_index;
+                self.next_index += 1;
+                out.push(sse_event(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "redacted_thinking", "data": data},
+                    }),
+                ));
+                out.push(sse_event(
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": index}),
+                ));
+            }
             // The complete tool call: the arguments arrive whole on
             // the canonical, so ONE input_json_delta carries them
             // all — a tool_use block opened, filled, and closed.
@@ -1100,27 +1129,32 @@ pub fn anthropic_from_canonical(model: &str, turn: &CanonTurn) -> Value {
         return anthropic_error_event_data(error);
     }
 
-    let mut content: Vec<Value> = Vec::new();
-    for summary in turn.thinking.values() {
-        content.push(json!({"type": "thinking", "thinking": summary}));
-    }
-    if !turn.text.is_empty() {
-        content.push(json!({"type": "text", "text": turn.text}));
-    }
-    for call in &turn.tool_calls {
-        // The arguments are a JSON string on the canonical (the
-        // backend's whole-arguments form); anthropic's tool_use.input
-        // is the object. A string that does not parse is a degraded
-        // upstream — the empty object keeps the shape valid rather
-        // than inventing content.
-        let input: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-        content.push(json!({
-            "type": "tool_use",
-            "id": call.id,
-            "name": call.name,
-            "input": input,
-        }));
-    }
+    let content: Vec<Value> = if let Some(blocks) = &turn.blocks {
+        blocks.iter().map(CanonBlock::wire_value).collect()
+    } else {
+        let mut content = Vec::new();
+        for summary in turn.thinking.values() {
+            content.push(json!({"type": "thinking", "thinking": summary}));
+        }
+        if !turn.text.is_empty() {
+            content.push(json!({"type": "text", "text": turn.text}));
+        }
+        for call in &turn.tool_calls {
+            // The arguments are a JSON string on the canonical (the
+            // backend's whole-arguments form); anthropic's tool_use.input
+            // is the object. A string that does not parse is a degraded
+            // upstream — the empty object keeps the shape valid rather
+            // than inventing content.
+            let input: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": input,
+            }));
+        }
+        content
+    };
 
     let mut message = Map::new();
     message.insert(
@@ -1153,6 +1187,9 @@ fn stop_reason_of(reason: &CanonStopReason) -> &'static str {
         CanonStopReason::EndTurn => "end_turn",
         CanonStopReason::ToolUse => "tool_use",
         CanonStopReason::MaxTokens => "max_tokens",
+        CanonStopReason::StopSequence => "stop_sequence",
+        CanonStopReason::PauseTurn => "pause_turn",
+        CanonStopReason::ContextWindowExceeded => "model_context_window_exceeded",
         CanonStopReason::Refusal => "refusal",
         CanonStopReason::Incomplete(_) => "max_tokens",
     }
@@ -2206,6 +2243,64 @@ mod tests {
     }
 
     #[test]
+    fn signed_and_redacted_reasoning_render_without_flattening() {
+        let events = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("msg_1".to_owned()),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 4,
+                delta: "Thought.".to_owned(),
+            },
+            CanonEvent::ThinkingSignature {
+                part: 4,
+                signature: "opaque-signature".to_owned(),
+            },
+            CanonEvent::ThinkingEnded,
+            CanonEvent::RedactedThinking {
+                data: "encrypted-reasoning".to_owned(),
+            },
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            },
+        ];
+        let expected = wire(&[
+            ("message_start", &message_start("msg_1", "claude-opus-5")),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Thought."}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque-signature"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"encrypted-reasoning"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        assert_eq!(stream_bytes("claude-opus-5", &events), expected);
+    }
+
+    #[test]
     fn summary_indexes_open_separate_thinking_blocks() {
         let events = vec![
             CanonEvent::TurnStarted {
@@ -2475,6 +2570,12 @@ mod tests {
             (CanonStopReason::EndTurn, "end_turn"),
             (CanonStopReason::ToolUse, "tool_use"),
             (CanonStopReason::MaxTokens, "max_tokens"),
+            (CanonStopReason::StopSequence, "stop_sequence"),
+            (CanonStopReason::PauseTurn, "pause_turn"),
+            (
+                CanonStopReason::ContextWindowExceeded,
+                "model_context_window_exceeded",
+            ),
             (CanonStopReason::Refusal, "refusal"),
             (CanonStopReason::Incomplete(String::new()), "max_tokens"),
             (
@@ -2631,6 +2732,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
             }],
+            blocks: None,
             text: "I'll read the files.".to_owned(),
             thinking: [
                 (0, "Reading the thread files.".to_owned()),
@@ -2666,6 +2768,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: "not json at all".to_owned(),
             }],
+            blocks: None,
             text: String::new(),
             thinking: BTreeMap::new(),
         };
@@ -2689,6 +2792,7 @@ mod tests {
                 resets_at: None,
             }),
             tool_calls: Vec::new(),
+            blocks: None,
             text: "partial".to_owned(),
             thinking: BTreeMap::new(),
         };
@@ -2711,6 +2815,7 @@ mod tests {
             usage: None,
             error: None,
             tool_calls: Vec::new(),
+            blocks: None,
             text: String::new(),
             thinking: BTreeMap::new(),
         };

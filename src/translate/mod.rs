@@ -143,6 +143,11 @@
 //!   ([`CanonTurn`](crate::ir::canonical::CanonTurn)) for the
 //!   non-streaming path, and the error table's interpretation half
 //!   (the upstream's `code`/`kind` → the canonical error).
+//! - [`anthropic_backend::AnthropicResponseStream`]: the Messages backend
+//!   interpretation half. It preserves content-block ordering, complete tool
+//!   arguments, thinking signatures, encrypted reasoning, distinct stop
+//!   reasons, split usage snapshots, and terminal errors. The complete-body
+//!   sibling is [`anthropic_backend::canonical_turn_from_anthropic`].
 //! - [`anthropic_frontend`]: the frontend adapter's rendering half —
 //!   canonical turn events → Anthropic SSE (the
 //!   [`AnthropicRenderer`](crate::translate::anthropic_frontend::AnthropicRenderer)
@@ -229,7 +234,9 @@ pub mod codex_backend;
 pub mod to_anthropic;
 pub mod to_codex;
 
-pub use anthropic_backend::render_anthropic;
+pub use anthropic_backend::{
+    AnthropicResponseStream, canonical_turn_from_anthropic, render_anthropic,
+};
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};

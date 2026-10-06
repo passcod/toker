@@ -473,6 +473,12 @@ pub enum CanonStopReason {
     ToolUse,
     /// The turn stopped at a token budget.
     MaxTokens,
+    /// A configured stop sequence matched.
+    StopSequence,
+    /// The provider paused a resumable turn.
+    PauseTurn,
+    /// The model's context window, rather than the output budget, was reached.
+    ContextWindowExceeded,
     /// The turn was refused (content filtering).
     Refusal,
     /// The turn stopped short, for the reason this carries — the
@@ -586,6 +592,13 @@ pub enum CanonEvent {
     /// Deltas of one part continue it; a different part is a new
     /// one.
     ThinkingDelta { part: u64, delta: String },
+    /// The provider signature completing one visible reasoning part. It stays
+    /// opaque: compatible frontends replay it so the block can be submitted
+    /// on a later turn; incompatible frontends report or omit it.
+    ThinkingSignature { part: u64, signature: String },
+    /// One complete provider-encrypted reasoning block. Unlike visible
+    /// reasoning it has no text deltas and must remain opaque end to end.
+    RedactedThinking { data: String },
     /// A COMPLETE tool call — the arguments whole (see
     /// [`CanonToolCall`]).
     ToolCall(CanonToolCall),
@@ -629,6 +642,10 @@ pub struct CanonTurn {
     pub error: Option<CanonError>,
     /// The complete tool calls, in completion order, arguments whole.
     pub tool_calls: Vec<CanonToolCall>,
+    /// Exact canonical response blocks when the backend supplied a complete
+    /// ordered message. Streaming-only backends and older aggregators leave
+    /// this absent and use the flattened fields below.
+    pub blocks: Option<Vec<CanonBlock>>,
     /// The assistant text, the deltas joined.
     pub text: String,
     /// The reasoning parts, keyed by the backend's part identity,
@@ -662,6 +679,15 @@ mod tests {
             "protocol-forced: cross-provider reasoning is opaque"
         );
         assert!(caps.images, "the backend takes input_image parts");
+    }
+
+    #[test]
+    fn messages_capabilities_pin_the_verified_shared_wire() {
+        let caps = Capabilities::MESSAGES;
+        assert!(caps.sampling);
+        assert!(caps.system_in_messages);
+        assert!(caps.thinking_replay);
+        assert!(caps.images);
     }
 
     /// The wire values are the parse's inverse: the exact shapes the
