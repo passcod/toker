@@ -1405,6 +1405,7 @@ api_key = "ak-literal-test"
             model_mappings: None,
             frontend: None,
             thinking_rewritten: false,
+            translation_report: None,
         };
         let mut observer = crate::observe::AnthropicObserver::new();
         observer.observe_json(

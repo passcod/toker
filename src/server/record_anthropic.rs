@@ -54,6 +54,7 @@ use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
+use crate::translate::TranslationReport;
 
 use super::Server;
 use super::record::{elapsed_ms, i64_of, now_ms, with_frontend};
@@ -115,6 +116,8 @@ pub(crate) struct AnthropicRecordCtx {
     /// row describes the second attempt. Recorded in `extra` as
     /// `thinkingRewrite`; the refused first attempt has no row of its own.
     pub(crate) thinking_rewritten: bool,
+    /// Content-free semantic omissions made by canonical rendering.
+    pub(crate) translation_report: Option<TranslationReport>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -1364,7 +1367,7 @@ pub(crate) fn record_codex_measurement(
         status: None,
         error_type: None,
         retry_after_ms: None,
-        extra: None,
+        extra: translation_extra(ctx.translation_report.as_ref()),
         betas: ctx.betas.clone().map(|betas| betas.to_string()),
         geo: None,
         fast: None,
@@ -1457,6 +1460,9 @@ pub(crate) fn record_codex_error(
     if let Some(resets_at) = resets_at {
         extra.insert("resets_at".to_owned(), json!(resets_at));
     }
+    if let Some(losses) = translation_losses(ctx.translation_report.as_ref()) {
+        extra.insert("translation_losses".to_owned(), losses);
+    }
     let row = RequestRow {
         id: None,
         ts_ms,
@@ -1527,6 +1533,27 @@ pub(crate) fn record_codex_error(
         ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
     );
+}
+
+fn translation_extra(report: Option<&TranslationReport>) -> Option<Value> {
+    translation_losses(report).map(|losses| json!({"translation_losses": losses}))
+}
+
+fn translation_losses(report: Option<&TranslationReport>) -> Option<Value> {
+    let report = report.filter(|report| !report.is_empty())?;
+    Some(Value::Array(
+        report
+            .losses()
+            .iter()
+            .map(|loss| {
+                json!({
+                    "path": loss.path(),
+                    "reason": loss.reason().as_str(),
+                    "count": loss.count(),
+                })
+            })
+            .collect(),
+    ))
 }
 
 #[cfg(test)]

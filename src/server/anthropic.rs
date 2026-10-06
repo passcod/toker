@@ -364,6 +364,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forced_to: None,
             model_mappings: None,
             thinking_rewritten: false,
+            translation_report: None,
         });
         gate_shape = Some(shape);
         parsed = Some(ir);

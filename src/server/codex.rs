@@ -177,6 +177,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         model_mappings: None,
         frontend,
         thinking_rewritten: false,
+        translation_report: None,
     });
 
     let auth = match codex.auth_for_turn(&server.http, now_ms() / 1000).await {
@@ -407,7 +408,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         backend,
         parsed,
         gate_shape,
-        record,
+        mut record,
         in_flight,
         session_id,
         served_model,
@@ -440,8 +441,8 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
 
     // The translation itself — pure; a typed failure never reaches the
     // upstream and answers with an anthropic error naming the cause.
-    let request = match translate::to_codex(ir.value(), &model, &prompt_cache_key) {
-        Ok(request) => request,
+    let rendered = match translate::render_to_codex(ir.value(), &model, &prompt_cache_key) {
+        Ok(rendered) => rendered,
         Err(error) => {
             let (status, message) = translate_failure(&error);
             if let Some(ctx) = record.as_ref() {
@@ -462,6 +463,12 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             );
         }
     };
+    if !rendered.report.is_empty()
+        && let Some(ctx) = record.as_mut()
+    {
+        ctx.translation_report = Some(rendered.report);
+    }
+    let request = rendered.value;
     let body = match serde_json::to_vec(&request) {
         Ok(body) => body,
         Err(error) => {

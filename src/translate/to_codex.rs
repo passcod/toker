@@ -26,9 +26,9 @@
 use serde_json::Value;
 
 use crate::providers::codex::ResponsesRequest;
-use crate::translate::TranslateError;
 use crate::translate::anthropic_frontend::from_anthropic;
-use crate::translate::codex_backend::codex_from_canonical;
+use crate::translate::codex_backend::{codex_from_canonical, render_codex};
+use crate::translate::{Rendered, TranslateError};
 
 /// Translate one Anthropic Messages request body into a codex
 /// [`ResponsesRequest`]: the frontend adapter
@@ -48,6 +48,18 @@ pub fn to_codex(
     prompt_cache_key: &str,
 ) -> Result<ResponsesRequest, TranslateError> {
     codex_from_canonical(&from_anthropic(body)?, model, prompt_cache_key)
+}
+
+/// Translate through the canonical request and retain the backend's explicit
+/// content-free loss report.
+pub fn render_to_codex(
+    body: &Value,
+    model: &str,
+    prompt_cache_key: &str,
+) -> Result<Rendered<ResponsesRequest>, TranslateError> {
+    let mut canonical = from_anthropic(body)?;
+    canonical.model = Some(model.to_owned());
+    render_codex(&canonical, prompt_cache_key)
 }
 
 #[cfg(test)]

@@ -225,7 +225,7 @@ pub mod to_codex;
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
-pub use to_codex::to_codex;
+pub use to_codex::{render_to_codex, to_codex};
 
 /// Why a canonical value could not be represented on one side of a binding.
 ///
@@ -239,6 +239,16 @@ pub enum TranslationLossReason {
     NotRepresentable,
     /// An opaque extension belongs to a dialect the target cannot replay.
     IncompatibleExtensionDialect,
+}
+
+impl TranslationLossReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TranslationLossReason::UnsupportedByBinding => "unsupported_by_binding",
+            TranslationLossReason::NotRepresentable => "not_representable",
+            TranslationLossReason::IncompatibleExtensionDialect => "incompatible_extension_dialect",
+        }
+    }
 }
 
 /// A content-free description of semantics omitted during translation.

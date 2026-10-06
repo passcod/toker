@@ -687,6 +687,17 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(row.reasoning, Some(96));
     assert_eq!(row.cost_usd, None, "no honest price for a codex slug");
     assert_eq!(row.cost_kind, None);
+    assert_eq!(
+        row.extra
+            .as_ref()
+            .and_then(|extra| extra.get("translation_losses")),
+        Some(&json!([{
+            "path": "sampling.max_tokens",
+            "reason": "unsupported_by_binding",
+            "count": 1,
+        }])),
+        "semantic omissions are visible without carrying their values"
+    );
     let usage_raw = row.usage_raw.as_deref().expect("usage verbatim");
     assert!(usage_raw.contains(r#""input_tokens":1234"#));
     assert!(usage_raw.contains(r#""cache_write_tokens":64"#));
