@@ -232,6 +232,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
             api_key: None,
+            picker: None,
         }),
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {

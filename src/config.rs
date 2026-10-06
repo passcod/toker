@@ -282,6 +282,10 @@ pub struct OpenRouterConfig {
     /// An optional literal key, used only when neither the env var nor
     /// the keyring yields one.
     pub api_key: Option<String>,
+    /// The `/model` picker rules (`[[providers.openrouter.picker]]`).
+    /// `None` is the built-in set ([`crate::picker::default_rules`]),
+    /// `Some(empty)` offers nothing; only `toker picker sync` reads it.
+    pub picker: Option<Vec<crate::picker::PickerRule>>,
 }
 
 impl OpenRouterConfig {
@@ -409,6 +413,7 @@ impl Default for OpenRouterConfig {
             api_key_env: DEFAULT_OPENROUTER_API_KEY_ENV.to_owned(),
             api_key_keyring: false,
             api_key: None,
+            picker: None,
         }
     }
 }
@@ -644,6 +649,7 @@ impl Config {
                     api_key_env: Some(openrouter.api_key_env.clone()),
                     api_key_keyring: openrouter.api_key_keyring.then_some(true),
                     api_key: openrouter.api_key.clone(),
+                    picker: openrouter.picker.clone(),
                 }),
                 anthropic_sub: self.anthropic_sub.as_ref().map(|sub| FileAnthropicSub {
                     upstream: Some(sub.upstream.to_string()),
@@ -713,6 +719,15 @@ impl Config {
                         .unwrap_or_else(|| DEFAULT_OPENROUTER_API_KEY_ENV.to_owned()),
                     api_key_keyring: block.api_key_keyring.unwrap_or(false),
                     api_key: block.api_key,
+                    picker: block
+                        .picker
+                        .map(|rules| {
+                            for rule in &rules {
+                                rule.validate().context("[providers.openrouter] picker")?;
+                            }
+                            anyhow::Ok(rules)
+                        })
+                        .transpose()?,
                 })
             })
             .transpose()?;
@@ -1122,6 +1137,10 @@ pub(crate) struct FileOpenRouter {
     api_key_keyring: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
+    /// The picker rules, an array of tables, so last: TOML ends a block
+    /// at its first table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picker: Option<Vec<crate::picker::PickerRule>>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -2265,6 +2284,7 @@ quota_enabled = false
             api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),
             api_key_keyring: true,
             api_key: Some("literal-key".to_owned()),
+            picker: None,
         };
         let keyring = || Some("from-keyring".to_owned());
         let no_entry = || None;

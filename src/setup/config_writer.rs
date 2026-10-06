@@ -359,4 +359,62 @@ auth_path = "~/.codex/auth.json"
             "the link is never replaced"
         );
     }
+
+    #[test]
+    fn picker_rules_round_trip_and_absent_stays_distinct_from_empty() {
+        let dir = test_dir("picker");
+        let rules = dir.join("rules.toml");
+        fs::write(
+            &rules,
+            "[providers.openrouter]\n\n\
+             [[providers.openrouter.picker]]\n\
+             match = [\"moonshotai/kimi-k*\"]\n\
+             exclude = [\"*-code\"]\n\
+             behaves_as = \"sonnet\"\n\
+             variant = \":floor\"\n\
+             keep = 2\n",
+        )
+        .expect("write fixture");
+        write_config(&rules, |_| Ok(())).expect("rewrite");
+        let picker = Config::load_from(&rules)
+            .expect("reload")
+            .openrouter
+            .expect("enabled")
+            .picker
+            .expect("rules kept");
+        assert_eq!(picker.len(), 1);
+        assert_eq!(picker[0].matches, ["moonshotai/kimi-k*"]);
+        assert_eq!(picker[0].exclude, ["*-code"]);
+        assert_eq!(picker[0].variant.as_deref(), Some(":floor"));
+        assert_eq!(picker[0].keep, 2);
+
+        // `[]` offers nothing; absent is the built-in set. A rewrite must
+        // never turn one into the other.
+        for (name, block, expected) in [("empty", "picker = []\n", Some(0)), ("absent", "", None)] {
+            let path = dir.join(format!("{name}.toml"));
+            fs::write(&path, format!("[providers.openrouter]\n{block}")).expect("write");
+            write_config(&path, |_| Ok(())).expect("rewrite");
+            let picker = Config::load_from(&path)
+                .expect("reload")
+                .openrouter
+                .expect("enabled")
+                .picker;
+            assert_eq!(picker.map(|rules| rules.len()), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_picker_rule_that_cannot_match_is_refused_at_load() {
+        let path = test_dir("picker-bad").join("toker.toml");
+        fs::write(
+            &path,
+            "[providers.openrouter]\n\
+             [[providers.openrouter.picker]]\n\
+             match = [\"lab/[\"]\n\
+             behaves_as = \"sonnet\"\n",
+        )
+        .expect("write fixture");
+        let error = Config::load_from(&path).expect_err("an unparseable glob");
+        assert!(format!("{error:#}").contains("picker"), "{error:#}");
+    }
 }

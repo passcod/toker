@@ -405,6 +405,13 @@ pub fn resolve_context_window(
     }
 }
 
+/// Every identity the hand-verified catalogue names: the models a hand
+/// has checked exist, for a caller that needs a known model id without a
+/// listing or a ledger to ask (the picker's `behaves_as` fallback).
+pub fn verified_ids() -> impl Iterator<Item = &'static str> {
+    CATALOG.iter().map(|(id, _)| *id)
+}
+
 fn catalog_entry(id: &str) -> Option<Entry> {
     CATALOG
         .iter()

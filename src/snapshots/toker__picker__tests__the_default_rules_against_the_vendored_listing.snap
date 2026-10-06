@@ -1,0 +1,19 @@
+---
+source: src/picker.rs
+expression: render(&rows)
+---
+openrouter/openai/gpt-6.1-sol | OpenAI: GPT-6.1 Sol | OpenRouter · 1.05M ctx · $2.00/$10.00 per Mtok | claude-opus-5-5
+openrouter/openai/gpt-6-luna | OpenAI: GPT-6 Luna | OpenRouter · 1.05M ctx · $0.10/$0.50 per Mtok | claude-haiku-4-5
+openrouter/google/gemini-3.8-flash | Google: Gemini 3.8 Flash | OpenRouter · 1.05M ctx · $0.75/$3.75 per Mtok | claude-sonnet-5
+openrouter/moonshotai/kimi-k3 | MoonshotAI: Kimi K3 | OpenRouter · 1.05M ctx · $1.19/$14.00 per Mtok | claude-sonnet-5
+openrouter/z-ai/glm-5.3 | Z.ai: GLM 5.3 | OpenRouter · 1.05M ctx · $0.07/$7.00 per Mtok | claude-sonnet-5
+openrouter/z-ai/glm-5.3-flash | Z.ai: GLM 5.3 Flash | OpenRouter · 1.05M ctx · $0.15/$0.50 per Mtok | claude-haiku-4-5
+openrouter/deepseek/deepseek-v4-pro-0813 | DeepSeek: DeepSeek V4 Pro 0813 | OpenRouter · 1.05M ctx · $0.66/$1.98 per Mtok | claude-sonnet-5
+openrouter/deepseek/deepseek-v4.1-flash | DeepSeek: DeepSeek V4.1 Flash | OpenRouter · 1.05M ctx · $0.30/$1.20 per Mtok | claude-haiku-4-5
+openrouter/qwen/qwen3.8-max-0902 | Qwen: Qwen3.8 Max (0902) | OpenRouter · 1M ctx · $2.00/$6.00 per Mtok | claude-sonnet-5
+openrouter/minimax/minimax-m3 | MiniMax: MiniMax M3 | OpenRouter · 1.05M ctx · $0.30/$1.20 per Mtok | claude-sonnet-5
+openrouter/openrouter/auto | Auto Router | OpenRouter · 2M ctx · variable price | claude-sonnet-5
+openrouter/anthropic/claude-opus-5.5 | Anthropic: Claude Opus 5.5 | OpenRouter · 1M ctx · $4.00/$20.00 per Mtok | claude-opus-5-5
+openrouter/anthropic/claude-sonnet-5.5 | Anthropic: Claude Sonnet 5.5 | OpenRouter · 1M ctx · $2.00/$10.00 per Mtok | claude-sonnet-5
+openrouter/anthropic/claude-haiku-4.5 | Anthropic: Claude Haiku 4.5 | OpenRouter · 200k ctx · $1.00/$5.00 per Mtok | claude-haiku-4-5
+openrouter/anthropic/claude-fable-5.1 | Anthropic: Claude Fable 5.1 | OpenRouter · 1M ctx · $10.00/$50.00 per Mtok | claude-fable-5-1

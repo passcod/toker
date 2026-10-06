@@ -320,6 +320,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             api_key_env: api_key_env.to_owned(),
             api_key_keyring: false,
             api_key,
+            picker: None,
         }),
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {

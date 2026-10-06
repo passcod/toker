@@ -509,6 +509,7 @@ fn test_config(
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
             api_key: None,
+            picker: None,
         }),
         default_backend_anthropic: Some(default_backend.to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {
@@ -954,6 +955,7 @@ fn openrouter_config(anthropic_upstream: reqwest::Url, openrouter: &reqwest::Url
         api_key_env: UNSET_KEY_ENV.to_owned(),
         api_key_keyring: false,
         api_key: Some("sk-or-literal-test".to_owned()),
+        picker: None,
     });
     config
 }

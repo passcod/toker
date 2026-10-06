@@ -288,6 +288,7 @@ fn test_config(
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
             api_key: None,
+            picker: None,
         }),
         default_backend_anthropic: Some("codex_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {

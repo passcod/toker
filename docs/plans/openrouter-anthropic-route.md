@@ -99,6 +99,8 @@ Read out of the Claude Code 2.1.280 binary (2026-10-06):
      `name` plus the variant, `description` `"OpenRouter · <ctx> ctx ·
      $<in>/$<out> per Mtok"` from the listing's own `context_length` and
      `pricing` (provider facts, shown as given, never toker's estimate).
+     A listed price of `-1` (a router's variable price) reads "variable
+     price", and `0`/`0` reads "free".
    - A rule matching nothing logs a warning and offers nothing.
 
    Globs via `globset` (added with `cargo add`). Parsed into
@@ -123,6 +125,7 @@ Read out of the Claude Code 2.1.280 binary (2026-10-06):
    | `deepseek/deepseek-v*-flash*` | `*-vision*` | haiku | `deepseek/deepseek-v4.1-flash` |
    | `qwen/qwen*-max*` | `*-prime` | sonnet | `qwen/qwen3.8-max-0902` |
    | `minimax/minimax-m*` | | sonnet | `minimax/minimax-m3` |
+   | `openrouter/auto` | | sonnet | `openrouter/auto` (the Auto Router) |
    | `anthropic/claude-opus-*` | | opus | `anthropic/claude-opus-5.5` |
    | `anthropic/claude-sonnet-*` | | sonnet | `anthropic/claude-sonnet-5.5` |
    | `anthropic/claude-haiku-*` | | haiku | `anthropic/claude-haiku-4.5` |
