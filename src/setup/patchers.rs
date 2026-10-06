@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde_json::{Map, Value};
 
-use crate::setup::atomic::{atomic_patch_json, atomic_write_bytes};
+use crate::setup::atomic::{atomic_patch_json, atomic_patch_json_if_changed, atomic_write_bytes};
 
 /// The marker comment governing toker's block in a shell rc. One
 /// export line, updated in place when the marker exists — re-running
@@ -93,6 +93,59 @@ pub fn patch_claude(path: &Path, base_url: &str) -> anyhow::Result<()> {
         Ok(())
     })
     .with_context(|| format!("patching claude settings at {}", path.display()))
+}
+
+/// Put toker's `/model` picker rows into claude's user settings: in
+/// `modelPicker.options`, the rows whose `model` starts with
+/// [`crate::picker::ROW_PREFIX`] are toker's and are replaced by `rows`
+/// (appended after the user's own); every other row, and every other
+/// `modelPicker` key (`replaceBuiltInOptions`), is left as it was. No
+/// rows removes toker's, and a `modelPicker` left with nothing in it is
+/// removed rather than kept empty. A present non-object `modelPicker`
+/// or non-array `options` is refused. Returns whether the file changed:
+/// an unchanged picker is never rewritten (see
+/// [`atomic_patch_json_if_changed`]).
+///
+/// User settings only: Claude Code honours `modelPicker` from user,
+/// managed and `--settings` sources, never from a project's settings,
+/// so the Workhorse repo-root file gets no picker.
+pub fn patch_model_picker(path: &Path, rows: &[Value]) -> anyhow::Result<bool> {
+    atomic_patch_json_if_changed(path, |settings| {
+        let Some(root) = settings.as_object_mut() else {
+            bail!("claude settings: the JSON at this level is not an object — refusing to patch");
+        };
+        let picker = match root.get_mut("modelPicker") {
+            Some(Value::Object(picker)) => picker,
+            Some(_) => bail!("claude settings: \"modelPicker\" is not an object — refusing to overwrite it"),
+            None if rows.is_empty() => return Ok(()),
+            None => root
+                .entry("modelPicker")
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("just inserted an object"),
+        };
+        let mut options = match picker.remove("options") {
+            Some(Value::Array(options)) => options,
+            Some(other) => {
+                picker.insert("options".to_owned(), other);
+                bail!("claude settings: \"modelPicker.options\" is not an array — refusing to overwrite it");
+            }
+            None => Vec::new(),
+        };
+        options.retain(|row| {
+            !row.get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model.starts_with(crate::picker::ROW_PREFIX))
+        });
+        options.extend(rows.iter().cloned());
+        if options.is_empty() && picker.is_empty() {
+            root.remove("modelPicker");
+        } else {
+            picker.insert("options".to_owned(), Value::Array(options));
+        }
+        Ok(())
+    })
+    .with_context(|| format!("patching the claude model picker at {}", path.display()))
 }
 
 /// The Workhorse variant of the same patch: the work machine's
@@ -884,5 +937,104 @@ mod tests {
             patch_shell_rc(&path, "http://127.0.0.1:18123").expect_err("non-utf8 must be refused");
         assert!(format!("{error:#}").contains("reading"));
         assert_eq!(fs::read(&path).expect("read back"), b"export A=\xff");
+    }
+
+    fn picker_row(model: &str) -> Value {
+        json!({"model": model, "label": model, "description": "d", "behavesAs": "claude-sonnet-5"})
+    }
+
+    #[test]
+    fn the_model_picker_replaces_toker_rows_and_keeps_the_user_s() {
+        let path = test_dir("picker").join("settings.json");
+        let mut original = claude_settings();
+        original["modelPicker"] = json!({
+            "options": [picker_row("openrouter/old/model"), picker_row("claude-opus-4-8")],
+            "replaceBuiltInOptions": false,
+        });
+        write_pretty(&path, &original);
+
+        let changed =
+            patch_model_picker(&path, &[picker_row("openrouter/new/model")]).expect("patch");
+        assert!(changed);
+        let mut expected = original.clone();
+        expected["modelPicker"] = json!({
+            "replaceBuiltInOptions": false,
+            "options": [picker_row("claude-opus-4-8"), picker_row("openrouter/new/model")],
+        });
+        assert_eq!(read_value(&path), expected);
+        let env_before = original["env"].clone();
+        assert_eq!(read_value(&path)["env"], env_before, "nothing else moves");
+    }
+
+    #[test]
+    fn an_unchanged_model_picker_is_not_rewritten() {
+        let path = test_dir("picker-same").join("settings.json");
+        let mut original = claude_settings();
+        original["modelPicker"] = json!({"options": [picker_row("openrouter/a/b")]});
+        write_pretty(&path, &original);
+        let before = fs::metadata(&path)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        let changed = patch_model_picker(&path, &[picker_row("openrouter/a/b")]).expect("patch");
+        assert!(!changed, "same rows, no write");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            before
+        );
+    }
+
+    #[test]
+    fn no_rows_removes_toker_s_and_an_emptied_picker_goes() {
+        let path = test_dir("picker-empty").join("settings.json");
+        let original = claude_settings();
+        let mut with_rows = original.clone();
+        with_rows["modelPicker"] = json!({"options": [picker_row("openrouter/a/b")]});
+        write_pretty(&path, &with_rows);
+
+        assert!(patch_model_picker(&path, &[]).expect("patch"));
+        assert_eq!(
+            read_value(&path),
+            original,
+            "the key is gone, not left empty"
+        );
+
+        // With no picker and no rows, nothing is created.
+        assert!(!patch_model_picker(&path, &[]).expect("patch"));
+        let fresh = test_dir("picker-absent").join("settings.json");
+        assert!(!patch_model_picker(&fresh, &[]).expect("patch"));
+        assert!(!fresh.exists(), "an absent file stays absent");
+
+        // A picker holding the user's own keys keeps them.
+        let mut kept = original.clone();
+        kept["modelPicker"] = json!({
+            "options": [picker_row("openrouter/a/b")],
+            "replaceBuiltInOptions": true,
+        });
+        write_pretty(&path, &kept);
+        patch_model_picker(&path, &[]).expect("patch");
+        assert_eq!(
+            read_value(&path)["modelPicker"],
+            json!({"replaceBuiltInOptions": true, "options": []})
+        );
+    }
+
+    #[test]
+    fn a_model_picker_of_the_wrong_shape_is_refused() {
+        for (name, picker) in [
+            ("string", json!("rows")),
+            ("options", json!({"options": {"model": "x"}})),
+        ] {
+            let path = test_dir(&format!("picker-{name}")).join("settings.json");
+            let mut original = claude_settings();
+            original["modelPicker"] = picker;
+            let bytes = write_pretty(&path, &original);
+            assert!(patch_model_picker(&path, &[picker_row("openrouter/a/b")]).is_err());
+            assert_eq!(fs::read(&path).expect("read"), bytes, "{name}: untouched");
+        }
     }
 }

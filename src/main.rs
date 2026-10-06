@@ -84,6 +84,11 @@ enum Command {
     Setup,
     /// Show configuration and backend status (plan: Credentials).
     Status,
+    /// Claude Code's `/model` rows for openrouter models.
+    Picker {
+        #[command(subcommand)]
+        command: PickerCommand,
+    },
     /// Ingest the predecessor proxy's usage.jsonl into the ledger (plan:
     /// Storage).
     Import {
@@ -176,6 +181,22 @@ enum Command {
     },
 }
 
+/// `toker picker` verbs.
+#[derive(Debug, Subcommand)]
+enum PickerCommand {
+    /// Fetch openrouter's models listing, apply the picker rules, and
+    /// write the rows into `~/.claude/settings.json` (setup and the daily
+    /// picker timer run this).
+    Sync {
+        /// Print the rows; change nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Print the built-in picker rules as toker.toml text, to copy and
+    /// edit.
+    Defaults,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -193,6 +214,13 @@ fn main() -> anyhow::Result<()> {
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Setup => cmds::setup(),
         Command::Status => cmds::status(),
+        Command::Picker { command } => match command {
+            PickerCommand::Sync { dry_run } => cmds::picker_sync(dry_run),
+            PickerCommand::Defaults => {
+                print!("{}", toker::picker::defaults_toml());
+                Ok(())
+            }
+        },
         Command::Import {
             from,
             db,

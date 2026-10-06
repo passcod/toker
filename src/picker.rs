@@ -10,10 +10,12 @@
 //!
 //! The rows are not a fixed list: each rule names globs over openrouter
 //! ids and keeps the newest matches, so a new version of a model replaces
-//! the old one on the next sync without anyone editing anything. This
-//! module is pure: the listing comes in as JSON, the rows go out as JSON,
-//! and the `behaves_as` resolution is the caller's closure. Writing the
-//! rows into the settings file is `setup::patchers::patch_model_picker`.
+//! the old one on the next sync without anyone editing anything. The
+//! rule matching is pure (listing in, rows out); [`sync`] wraps it with
+//! the fetch and the settings write
+//! (`setup::patchers::patch_model_picker`). The service never runs it:
+//! it may not write outside the state dir, so `toker picker sync` runs
+//! as the user, from setup and from the daily picker timer.
 
 use std::collections::HashSet;
 
@@ -376,6 +378,80 @@ pub fn resolve_behaves_as(value: &str, learned: &[ModelEntry]) -> Option<String>
             })
             .max()
             .map(|(_, id)| id.to_owned())
+    })
+}
+
+/// What one sync did.
+#[derive(Debug)]
+pub struct SyncReport {
+    pub rows: Vec<Row>,
+    pub warnings: Vec<String>,
+    /// Whether the settings file changed (always `false` on a dry run).
+    pub changed: bool,
+}
+
+/// Fetch openrouter's listing, apply the configured rules (or the
+/// built-in set), and put the rows into claude's settings at `settings`.
+/// With no openrouter block there is nothing to route the rows to, so
+/// toker's rows are removed and nothing is fetched. A failed fetch
+/// returns the error before the settings are touched: a listing that
+/// could not be read must not empty the picker.
+pub async fn sync(
+    config: &crate::config::Config,
+    settings: &std::path::Path,
+    http: &reqwest::Client,
+    dry_run: bool,
+) -> anyhow::Result<SyncReport> {
+    let (rows, warnings) = match &config.openrouter {
+        None => (Vec::new(), Vec::new()),
+        Some(openrouter) => {
+            let url = format!(
+                "{}/models",
+                openrouter.upstream.as_str().trim_end_matches('/')
+            );
+            let listing: Value = http
+                .get(&url)
+                .timeout(crate::catalog::fetched::FETCH_TIMEOUT)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .with_context(|| format!("fetching {url}"))?
+                .json()
+                .await
+                .with_context(|| format!("reading {url}"))?;
+            let with_anthropic = config.anthropic_sub.is_none() && config.anthropic_api.is_none();
+            let rules = openrouter
+                .picker
+                .clone()
+                .unwrap_or_else(|| default_rules(with_anthropic));
+            let mut warnings = Vec::new();
+            // Read-only, and only for the learned families: a ledger that
+            // cannot be read costs the learned answer, never the sync.
+            let learned = crate::store::Store::open_read_only(&config.db_path)
+                .and_then(|store| store.load_models())
+                .unwrap_or_else(|error| {
+                    warnings.push(format!(
+                        "learned models unavailable ({error}); families resolve from the verified catalogue"
+                    ));
+                    Vec::new()
+                });
+            let (rows, mut rule_warnings) = rows(&rules, &eligible(&listing)?, &|value| {
+                resolve_behaves_as(value, &learned)
+            })?;
+            warnings.append(&mut rule_warnings);
+            (rows, warnings)
+        }
+    };
+    let changed = if dry_run {
+        false
+    } else {
+        let json: Vec<Value> = rows.iter().map(Row::to_json).collect();
+        crate::setup::patchers::patch_model_picker(settings, &json)?
+    };
+    Ok(SyncReport {
+        rows,
+        warnings,
+        changed,
     })
 }
 

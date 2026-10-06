@@ -163,6 +163,46 @@ fn key_sources_line(env: &str, sources: crate::config::KeySources) -> String {
     )
 }
 
+/// `picker sync`: the openrouter rows of Claude Code's `/model` picker,
+/// rebuilt from openrouter's listing (see [`crate::picker`]). Warnings
+/// go to stderr; a dry run prints the rows instead of writing them.
+pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let config = Config::load()?;
+    let settings = crate::setup::wizard::Paths::real()?.claude_settings;
+    let report = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the picker sync's runtime")?
+        .block_on(crate::picker::sync(
+            &config,
+            &settings,
+            &reqwest::Client::new(),
+            dry_run,
+        ))?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if dry_run {
+        for row in &report.rows {
+            println!("{}  {}  (as {})", row.model, row.label, row.behaves_as);
+        }
+    } else {
+        println!(
+            "picker: {} openrouter rows in {} ({})",
+            report.rows.len(),
+            settings.display(),
+            if report.changed {
+                "updated"
+            } else {
+                "unchanged"
+            }
+        );
+    }
+    Ok(())
+}
+
 /// `tui`: the ratatui dashboard over the ledger (plan: TUI). `--db`
 /// overrides the path; otherwise `TOKER_DB` and the config default apply
 /// (Config::load already layered env over file).

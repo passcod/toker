@@ -85,6 +85,29 @@ where
     })
 }
 
+/// [`atomic_patch_json`] for a patch that is re-run on a schedule: when
+/// the patch leaves the value as it was, nothing is written and `false`
+/// comes back. Claude Code hot-reloads its settings into every running
+/// session, so a daily sync that found nothing new must not touch the
+/// file (an absent file a no-op patch leaves absent).
+pub fn atomic_patch_json_if_changed<F>(path: &Path, patch: F) -> anyhow::Result<bool>
+where
+    F: FnOnce(&mut Value) -> anyhow::Result<()>,
+{
+    let target = resolve_target(path)?;
+    let before = read_json_start(&target, path)?;
+    let mut value = before.clone();
+    patch(&mut value).with_context(|| format!("patching {}", path.display()))?;
+    if value == before {
+        return Ok(false);
+    }
+    let bytes = json_bytes(&value)?;
+    atomic_write_bytes(&target, &bytes, None, |_temp, written| {
+        verify_json(written, &value)
+    })?;
+    Ok(true)
+}
+
 /// The write primitive every setup module shares (JSON, TOML, and the
 /// shell-rc text alike): temp file beside `target`, `fresh_mode` on it
 /// when the target is being created, fsync, read back, hand the bytes
