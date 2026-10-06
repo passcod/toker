@@ -1001,6 +1001,8 @@ async fn the_openrouter_prefix_routes_anthropic_messages_to_openrouter() {
         Some("openrouter/moonshotai/kimi-k3")
     );
     assert_eq!(row.effective_model.as_deref(), Some("moonshotai/kimi-k3"));
+    assert_eq!(row.cost_usd, None, "never an anthropic-catalogue estimate");
+    assert_eq!(row.cost_kind, None);
 }
 
 #[tokio::test]

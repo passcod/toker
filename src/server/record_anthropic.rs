@@ -354,12 +354,15 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
 
 /// The cost kind the backend's semantics pick (plan: Storage): the same
 /// list-price arithmetic, different meaning — the API bills it, the
-/// subscription never does.
-fn cost_kind_of(backend_id: &str) -> CostKind {
-    if backend_id == "anthropic_sub" {
-        CostKind::PlanEquivalent
-    } else {
-        CostKind::Estimated
+/// subscription never does. `None` for openrouter: the catalogue prices
+/// Anthropic's own API, not openrouter's providers or the other labs'
+/// models it serves there, so an estimate from it would be a guessed
+/// price (invariant 5). Its rows carry no cost rather than a wrong one.
+fn cost_kind_of(backend_id: &str) -> Option<CostKind> {
+    match backend_id {
+        "anthropic_sub" => Some(CostKind::PlanEquivalent),
+        "openrouter" => None,
+        _ => Some(CostKind::Estimated),
     }
 }
 
@@ -429,7 +432,8 @@ fn measurement_row(
     // prompt changed; a row matching its predecessor drops them, as ctp's
     // `loggableShape` did.
     let ladders = shape_ladders(ctx.shape.as_ref(), system);
-    let (cost_usd, cost_kind) = cost_of(capture, cost_kind_of(ctx.backend.id()));
+    let (cost_usd, cost_kind) =
+        cost_kind_of(ctx.backend.id()).map_or((None, None), |kind| cost_of(capture, kind));
     let shape = ctx.shape.as_ref();
     RequestRow {
         id: None,
@@ -1482,8 +1486,16 @@ mod tests {
 
     #[test]
     fn cost_kinds_follow_the_backend_semantics() {
-        assert_eq!(cost_kind_of("anthropic_sub"), CostKind::PlanEquivalent);
-        assert_eq!(cost_kind_of("anthropic_api"), CostKind::Estimated);
+        assert_eq!(
+            cost_kind_of("anthropic_sub"),
+            Some(CostKind::PlanEquivalent)
+        );
+        assert_eq!(cost_kind_of("anthropic_api"), Some(CostKind::Estimated));
+        assert_eq!(
+            cost_kind_of("openrouter"),
+            None,
+            "the anthropic catalogue never prices an openrouter row"
+        );
     }
 
     #[test]
