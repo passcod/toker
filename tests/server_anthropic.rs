@@ -944,6 +944,82 @@ async fn the_generic_anthropic_prefix_routes_to_the_default_and_strips() {
     assert_eq!(row.cost_kind, Some(CostKind::PlanEquivalent));
 }
 
+/// [`test_config`] with the openrouter block pointed at `openrouter`
+/// (the mock, whose `/v1` the provider's base carries) and holding a
+/// literal key.
+fn openrouter_config(anthropic_upstream: reqwest::Url, openrouter: &reqwest::Url) -> Config {
+    let mut config = test_config(anthropic_upstream, None, "anthropic_sub");
+    config.openrouter = Some(OpenRouterConfig {
+        upstream: format!("{}v1", openrouter).parse().expect("openrouter url"),
+        api_key_env: UNSET_KEY_ENV.to_owned(),
+        api_key_keyring: false,
+        api_key: Some("sk-or-literal-test".to_owned()),
+    });
+    config
+}
+
+#[tokio::test]
+async fn the_openrouter_prefix_routes_anthropic_messages_to_openrouter() {
+    let (anthropic, anthropic_upstream) = spawn_mock().await;
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+
+    let body = messages_body("openrouter/moonshotai/kimi-k3", false);
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("authorization", "Bearer sk-ant-oat01-claude-oauth")],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(anthropic.captured().is_empty(), "nothing reaches anthropic");
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/messages");
+    let mut expected = IrRequest::parse(&body).expect("parse");
+    expected.anthropic_mut().set_model("moonshotai/kimi-k3");
+    assert_eq!(captured[0].body.as_ref(), expected.serialise().as_slice());
+    assert_eq!(
+        captured[0]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-or-literal-test"),
+        "the claude OAuth bearer is replaced by the stored openrouter key"
+    );
+    assert!(!captured[0].headers.contains_key("x-api-key"));
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.provider.as_deref(), Some("openrouter"));
+    assert_eq!(row.route.as_deref(), Some("anthropic:openrouter"));
+    assert_eq!(
+        row.requested_model.as_deref(),
+        Some("openrouter/moonshotai/kimi-k3")
+    );
+    assert_eq!(row.effective_model.as_deref(), Some("moonshotai/kimi-k3"));
+}
+
+#[tokio::test]
+async fn the_openrouter_prefix_without_its_block_is_answered_locally() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.openrouter = None;
+    config.default_backend_openai_chat = None;
+    let (addr, _store) = spawn_toker(config).await;
+
+    let body = messages_body("openrouter/moonshotai/kimi-k3", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert!(response.headers().contains_key("x-toker-not-configured"));
+    assert!(
+        mock.captured().is_empty(),
+        "never sent to the default with the prefix still on"
+    );
+}
+
 #[tokio::test]
 async fn auth_passes_through_when_present_and_injects_when_absent() {
     let (mock, upstream) = spawn_mock().await;

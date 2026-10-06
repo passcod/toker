@@ -1157,11 +1157,15 @@ async fn transparent(server: Server, request: Request) -> Response {
 /// backend; the generic `anthropic/` family prefix selects the protocol
 /// default (it names the protocol, not a provider — plan: "`provider/model`
 /// names override per request … `anthropic/claude-opus-5`"); both are
-/// stripped from the model. Anything else — bare names, other protocols'
-/// prefixes — goes to the configured default, untransformed: routing the
-/// anthropic frontend to an openai backend is cross-protocol translation,
-/// a later phase's work, not a model-string edit. The provider is `None`
-/// when the prefix names a backend whose block is absent.
+/// stripped from the model. `openrouter/` is the one non-anthropic
+/// provider here: openrouter serves the Anthropic Messages wire itself
+/// (its `…/api/v1/messages`), so the route is a byte-forward like the
+/// others, with openrouter's key in place of the client's anthropic
+/// credential (`OpenRouter::strip_foreign_credentials`). This is how a
+/// Claude Code `modelPicker` row reaches an openrouter model. Anything
+/// else — bare names, other prefixes — goes to the configured default,
+/// untransformed. The provider is `None` when the prefix names a backend
+/// whose block is absent.
 fn strip_anthropic_prefix<'a>(
     server: &'a Server,
     model: &'a str,
@@ -1170,6 +1174,8 @@ fn strip_anthropic_prefix<'a>(
         Some((server.anthropic_sub.as_ref(), rest))
     } else if let Some(rest) = model.strip_prefix("anthropic_api/") {
         Some((server.anthropic_api.as_ref(), rest))
+    } else if let Some(rest) = model.strip_prefix("openrouter/") {
+        Some((server.openrouter.as_ref(), rest))
     } else {
         model
             .strip_prefix("anthropic/")
