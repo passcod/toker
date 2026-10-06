@@ -277,6 +277,31 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             metered(&mut response, "0.4127");
             response
         }
+        // OpenRouter's Anthropic endpoint, in the shapes measured on
+        // 2026-10-06: the billed cost on the final usage (the delta, or
+        // the plain body's), the serving provider on the message.
+        "z-ai/glm-5.3-flash" if stream => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                b"event: message_start\n\
+                  data: {\"type\":\"message_start\",\"message\":{\"model\":\"z-ai/glm-5.3-flash\",\
+                  \"usage\":{\"input_tokens\":0,\"output_tokens\":0},\"provider\":\"Friendli\"}}\n\n\
+                  event: message_delta\n\
+                  data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\
+                  \"usage\":{\"input_tokens\":18,\"output_tokens\":34,\"cost\":0.0000197}}\n\n\
+                  event: message_stop\n\
+                  data: {\"type\":\"message_stop\"}\n\n",
+            ),
+        ),
+        "z-ai/glm-5.3-flash" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"message","model":"z-ai/glm-5.3-flash","stop_reason":"end_turn",
+                "usage":{"input_tokens":18,"output_tokens":32,"cost":1.87e-05},"provider":"Friendli"}"#,
+            ),
+        ),
         "stall-headers" => {
             // The upstream accepts the request and then says nothing at
             // all — not even the response headers.
@@ -1003,8 +1028,38 @@ async fn the_openrouter_prefix_routes_anthropic_messages_to_openrouter() {
         Some("openrouter/moonshotai/kimi-k3")
     );
     assert_eq!(row.effective_model.as_deref(), Some("moonshotai/kimi-k3"));
-    assert_eq!(row.cost_usd, None, "never an anthropic-catalogue estimate");
+    assert_eq!(
+        row.cost_usd, None,
+        "no reported cost, and never an anthropic-catalogue estimate"
+    );
     assert_eq!(row.cost_kind, None);
+}
+
+#[tokio::test]
+async fn an_openrouter_row_records_the_billed_cost_and_serving_provider() {
+    let (_anthropic, anthropic_upstream) = spawn_mock().await;
+    let (_openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_config(anthropic_upstream, &openrouter_upstream)).await;
+
+    for (stream, cost) in [(false, 1.87e-05), (true, 0.0000197)] {
+        let body = messages_body("openrouter/z-ai/glm-5.3-flash", stream);
+        let response = post_messages(addr, "/v1/messages", &[], &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.expect("drain the response");
+        let rows = wait_for_rows(&store, 1 + usize::from(stream)).await;
+        let row = rows.last().expect("the row");
+        assert_eq!(row.cost_usd, Some(cost), "stream: {stream}");
+        assert_eq!(row.cost_kind, Some(CostKind::Billed), "stream: {stream}");
+        assert_eq!(
+            row.extra
+                .as_ref()
+                .and_then(|extra| extra.get("serving_provider"))
+                .and_then(Value::as_str),
+            Some("Friendli"),
+            "stream: {stream}"
+        );
+    }
 }
 
 #[tokio::test]

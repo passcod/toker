@@ -357,7 +357,8 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
 /// subscription never does. `None` for openrouter: the catalogue prices
 /// Anthropic's own API, not openrouter's providers or the other labs'
 /// models it serves there, so an estimate from it would be a guessed
-/// price (invariant 5). Its rows carry no cost rather than a wrong one.
+/// price (invariant 5). Its rows carry the `usage.cost` openrouter
+/// bills, or no cost when it reports none.
 fn cost_kind_of(backend_id: &str) -> Option<CostKind> {
     match backend_id {
         "anthropic_sub" => Some(CostKind::PlanEquivalent),
@@ -432,8 +433,12 @@ fn measurement_row(
     // prompt changed; a row matching its predecessor drops them, as ctp's
     // `loggableShape` did.
     let ladders = shape_ladders(ctx.shape.as_ref(), system);
-    let (cost_usd, cost_kind) =
-        cost_kind_of(ctx.backend.id()).map_or((None, None), |kind| cost_of(capture, kind));
+    let (cost_usd, cost_kind) = match cost_kind_of(ctx.backend.id()) {
+        Some(kind) => cost_of(capture, kind),
+        // Billed when the provider reported a cost; absent cost is never
+        // filled in from a catalogue.
+        None => (capture.cost(), capture.cost().map(|_| CostKind::Billed)),
+    };
     let shape = ctx.shape.as_ref();
     RequestRow {
         id: None,
@@ -521,11 +526,25 @@ fn measurement_row(
         retry_after_ms: None,
         // Where a summarisation wording sat, when one was near the end:
         // the evidence the detector's position rules are checked against.
-        extra: shape.and_then(shape_extra),
+        extra: measurement_extra(shape, capture),
         betas: ctx.betas.as_ref().map(|betas| betas.to_string()),
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
     }
+}
+
+/// A measurement row's `extra`: the shape's diagnostics, plus the
+/// serving provider when the response names one (openrouter's, for
+/// cross-referencing its own logs, as the openai route records it).
+fn measurement_extra(shape: Option<&AnthropicShape>, capture: &AnthropicCapture) -> Option<Value> {
+    let mut extra = match shape.and_then(shape_extra) {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(provider) = capture.serving_provider() {
+        extra.insert("serving_provider".to_owned(), json!(provider));
+    }
+    (!extra.is_empty()).then_some(Value::Object(extra))
 }
 
 /// The shape's diagnostics for a measurement row's `extra`: where a

@@ -150,9 +150,24 @@ pub struct AnthropicCapture {
     iterations: u64,
     ttl_split_known: Option<bool>,
     presence: UsagePresence,
+    cost: Option<f64>,
+    serving_provider: Option<String>,
 }
 
 impl AnthropicCapture {
+    /// `usage.cost` from the authoritative usage, as a provider that bills
+    /// per request reports it (openrouter's Anthropic endpoint, in USD).
+    /// Anthropic itself reports none; absent stays absent.
+    pub fn cost(&self) -> Option<f64> {
+        self.cost
+    }
+
+    /// The response's top-level `provider`: the upstream openrouter
+    /// served the request through. Absent from Anthropic's own responses.
+    pub fn serving_provider(&self) -> Option<&str> {
+        self.serving_provider.as_deref()
+    }
+
     /// The served model, verbatim from the response (`message.model`, or
     /// the non-streaming body's top level) — pre-normalisation; the row
     /// stores this as `raw_model` and the catalog normalises it for
@@ -290,6 +305,9 @@ pub struct AnthropicObserver {
     geo: Option<String>,
     error: Option<(Option<String>, Option<String>)>,
     message_stop: bool,
+    /// The top-level `provider` (`message_start`'s message, or the
+    /// non-streaming body).
+    provider: Option<String>,
 }
 
 impl AnthropicObserver {
@@ -329,6 +347,9 @@ impl AnthropicObserver {
         }
         if let Some(stop_reason) = object.get("stop_reason").and_then(Value::as_str) {
             self.stop_reason = Some(stop_reason.to_owned());
+        }
+        if let Some(provider) = object.get("provider").and_then(Value::as_str) {
+            self.provider = Some(provider.to_owned());
         }
         if object.get("error").is_some() {
             self.observe_error(object);
@@ -376,6 +397,9 @@ impl AnthropicObserver {
         }
         if let Some(model) = message.get("model").and_then(Value::as_str) {
             self.model = Some(model.to_owned());
+        }
+        if let Some(provider) = message.get("provider").and_then(Value::as_str) {
+            self.provider = Some(provider.to_owned());
         }
         // The message-level speed is read beside the usage one.
         if self.speed.is_none()
@@ -603,6 +627,15 @@ impl AnthropicObserver {
             iterations: iterations_count,
             ttl_split_known,
             presence,
+            // The delta's (or the body's) alone: openrouter puts the cost
+            // on the final usage, and the start's provisional snapshot
+            // has none to report.
+            cost: self
+                .delta_usage
+                .as_ref()
+                .and_then(|usage| usage.get("cost"))
+                .and_then(Value::as_f64),
+            serving_provider: self.provider,
         }
     }
 }
@@ -871,6 +904,35 @@ mod tests {
         assert_eq!(capture.output(), Some(2), "provisional start output");
         assert_eq!(capture.iterations(), 1);
         assert!(!capture.message_stop_observed());
+    }
+
+    #[test]
+    fn a_billed_cost_comes_from_the_final_usage_and_absent_stays_absent() {
+        // OpenRouter's shape: the provider on the message, the cost on the
+        // delta. Anthropic's own responses carry neither.
+        let capture = stream(
+            r#"{"type":"message_start","message":{"model":"m","provider":"Friendli","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":18,"output_tokens":34,"cost":0.0000197}}"#,
+        )
+        .expect("usage-bearing");
+        assert_eq!(capture.cost(), Some(0.0000197));
+        assert_eq!(capture.serving_provider(), Some("Friendli"));
+
+        let capture = stream(
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":1,"output_tokens":2}}"#,
+        )
+        .expect("usage-bearing");
+        assert_eq!(capture.cost(), None, "no cost reported, none recorded");
+        assert_eq!(capture.serving_provider(), None);
+
+        let mut observer = AnthropicObserver::new();
+        observer.observe_json(
+            br#"{"model":"m","usage":{"input_tokens":18,"output_tokens":32,"cost":1.87e-05},"provider":"Friendli"}"#,
+        );
+        let capture = observer.finish().expect("usage-bearing");
+        assert_eq!(capture.cost(), Some(1.87e-05));
+        assert_eq!(capture.serving_provider(), Some("Friendli"));
     }
 
     #[test]
