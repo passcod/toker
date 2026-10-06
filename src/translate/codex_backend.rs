@@ -187,7 +187,7 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
         .flat_map(|message| &message.blocks)
         .filter(|block| {
             matches!(
-                block,
+                block.semantic(),
                 CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
             )
         })
@@ -198,6 +198,44 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
             unsupported,
             thinking_blocks,
         ));
+    }
+
+    for block in canonical
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+    {
+        if let CanonBlock::Annotated {
+            is_error,
+            extensions,
+            ..
+        } = block
+        {
+            if is_error.is_some() {
+                report.push(TranslationLoss::new(
+                    "messages[].blocks[].tool_result.is_error",
+                    unsupported,
+                    1,
+                ));
+            }
+            for extension in extensions {
+                report.push(TranslationLoss::new(
+                    extension.wire_path(),
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ));
+            }
+        }
+    }
+
+    for tool in &canonical.tools {
+        for extension in &tool.extensions {
+            report.push(TranslationLoss::new(
+                extension.wire_path(),
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            ));
+        }
     }
 
     for part in &canonical.system {
@@ -258,7 +296,7 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                     // The frontend's system parse yields text blocks
                     // only; the canonical is typed, so anything else
                     // cannot occur — and skipping keeps this total.
-                    let CanonBlock::Text(text) = block else {
+                    let CanonBlock::Text(text) = block.semantic() else {
                         continue;
                     };
                     if let Some(user_item) = last_user_item_mut(&mut items) {
@@ -277,7 +315,7 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                 let role = wire_role(role);
                 let mut parts: Vec<Value> = Vec::new();
                 for block in &message.blocks {
-                    match block {
+                    match block.semantic() {
                         CanonBlock::Text(text) => {
                             parts.push(text_part(text, role == "assistant"));
                         }
@@ -306,6 +344,9 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                         // reasoning is opaque; see the module docs).
                         // The drop does not split the message's parts.
                         CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. } => {}
+                        CanonBlock::Annotated { .. } => {
+                            unreachable!("semantic() removes annotations")
+                        }
                     }
                 }
                 items.extend(flush(&mut parts, role));
@@ -901,6 +942,84 @@ mod tests {
     }
 
     #[test]
+    fn message_block_metadata_is_reported_without_changing_semantic_rendering() {
+        let canonical = CanonicalRequest {
+            model: Some(MODEL.to_owned()),
+            tools: vec![CanonTool {
+                name: "cached_tool".to_owned(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+                extensions: vec![CanonicalExtension::node_field(
+                    DialectId::AnthropicMessages,
+                    "$.tools[].cache_control",
+                    "cache_control",
+                    json!({"type": "ephemeral", "secret": "tool-cache-value"}),
+                )],
+            }],
+            messages: vec![message(
+                CanonRole::User,
+                vec![
+                    CanonBlock::Text("cached prompt".to_owned()).annotated(
+                        None,
+                        vec![CanonicalExtension::node_field(
+                            DialectId::AnthropicMessages,
+                            "$.messages[].content[].cache_control",
+                            "cache_control",
+                            json!({"type": "ephemeral", "secret": "cache-value"}),
+                        )],
+                    ),
+                    CanonBlock::ToolResult {
+                        tool_use_id: "toolu_1".to_owned(),
+                        content: ToolResultContent::String("failed".to_owned()),
+                    }
+                    .annotated(
+                        Some(true),
+                        vec![CanonicalExtension::node_field(
+                            DialectId::AnthropicMessages,
+                            "$.messages[].content[].future_field",
+                            "future_field",
+                            json!({"secret": "future-value"}),
+                        )],
+                    ),
+                ],
+            )],
+            ..CanonicalRequest::default()
+        };
+
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
+        assert_eq!(rendered.value.input.len(), 2);
+        assert_eq!(
+            rendered.report.losses(),
+            &[
+                TranslationLoss::new(
+                    "$.messages[].content[].cache_control",
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "messages[].blocks[].tool_result.is_error",
+                    TranslationLossReason::UnsupportedByBinding,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "$.messages[].content[].future_field",
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "$.tools[].cache_control",
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ),
+            ]
+        );
+        let report = format!("{:?}", rendered.report);
+        assert!(!report.contains("cache-value"));
+        assert!(!report.contains("future-value"));
+        assert!(!report.contains("tool-cache-value"));
+    }
+
+    #[test]
     fn a_midstream_system_message_merges_into_the_preceding_user_turn() {
         // The capability declaration the merge enforces: the codex
         // backend refuses system-role input items (live-verified:
@@ -1168,11 +1287,13 @@ mod tests {
                     name: "read_file".to_owned(),
                     description: String::new(),
                     parameters: json!({"type": "object"}),
+                    extensions: Vec::new(),
                 },
                 CanonTool {
                     name: "list_dir".to_owned(),
                     description: "List a directory".to_owned(),
                     parameters: json!({"type": "object", "properties": {}}),
+                    extensions: Vec::new(),
                 },
             ],
             messages: vec![message(

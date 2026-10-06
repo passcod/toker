@@ -137,9 +137,10 @@ fn extensions_of(body: &Value) -> Vec<CanonicalExtension> {
         .flat_map(|object| object.iter())
         .filter(|(field, _)| !MODELED.contains(&field.as_str()))
         .map(|(field, value)| {
-            CanonicalExtension::new(
+            CanonicalExtension::node_field(
                 DialectId::AnthropicMessages,
                 format!("$.{field}"),
+                field,
                 value.clone(),
             )
         })
@@ -239,12 +240,22 @@ fn content_blocks_of(
                         reason: at("text is missing or not a string"),
                     }
                 })?;
-                out.push(CanonBlock::Text(text.to_owned()));
+                out.push(annotated_block(
+                    block,
+                    CanonBlock::Text(text.to_owned()),
+                    &["type", "text"],
+                    None,
+                ));
             }
             (CanonRole::User, "image") => {
-                out.push(CanonBlock::Image {
-                    url: image_url_of(block, &at)?,
-                });
+                out.push(annotated_block(
+                    block,
+                    CanonBlock::Image {
+                        url: image_url_of(block, &at)?,
+                    },
+                    &["type", "source"],
+                    None,
+                ));
             }
             (CanonRole::User, "tool_result") => {
                 let tool_use_id = block
@@ -254,10 +265,15 @@ fn content_blocks_of(
                         reason: at("tool_result has no tool_use_id"),
                     })?;
                 let content = tool_result_content_of(block.get("content"), &at)?;
-                out.push(CanonBlock::ToolResult {
-                    tool_use_id: tool_use_id.to_owned(),
-                    content,
-                });
+                out.push(annotated_block(
+                    block,
+                    CanonBlock::ToolResult {
+                        tool_use_id: tool_use_id.to_owned(),
+                        content,
+                    },
+                    &["type", "tool_use_id", "content"],
+                    block.get("is_error").and_then(Value::as_bool),
+                ));
             }
             (CanonRole::Assistant, "tool_use") => {
                 let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -276,33 +292,48 @@ fn content_blocks_of(
                     .ok_or_else(|| TranslateError::Malformed {
                         reason: at("tool_use input is missing or not an object"),
                     })?;
-                out.push(CanonBlock::ToolUse {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    input: input.clone(),
-                });
+                out.push(annotated_block(
+                    block,
+                    CanonBlock::ToolUse {
+                        id: id.to_owned(),
+                        name: name.to_owned(),
+                        input: input.clone(),
+                    },
+                    &["type", "id", "name", "input"],
+                    None,
+                ));
             }
             // THINKING STAYS IN THE CANONICAL — including the signature and
             // the distinction between visible and redacted forms. Whether it
             // replays is backend policy, never a parse decision.
-            (CanonRole::Assistant, "thinking") => out.push(CanonBlock::Thinking {
-                text: block
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-                signature: block
-                    .get("signature")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            }),
-            (CanonRole::Assistant, "redacted_thinking") => out.push(CanonBlock::RedactedThinking {
-                data: block
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-            }),
+            (CanonRole::Assistant, "thinking") => out.push(annotated_block(
+                block,
+                CanonBlock::Thinking {
+                    text: block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    signature: block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+                &["type", "thinking", "signature"],
+                None,
+            )),
+            (CanonRole::Assistant, "redacted_thinking") => out.push(annotated_block(
+                block,
+                CanonBlock::RedactedThinking {
+                    data: block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                },
+                &["type", "data"],
+                None,
+            )),
             (_, other) => {
                 return Err(TranslateError::UnsupportedBlock {
                     kind: other.to_owned(),
@@ -311,6 +342,32 @@ fn content_blocks_of(
         }
     }
     Ok(out)
+}
+
+fn annotated_block(
+    source: &Value,
+    block: CanonBlock,
+    semantic_fields: &[&str],
+    is_error: Option<bool>,
+) -> CanonBlock {
+    let extensions = source
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| {
+            !semantic_fields.contains(&field.as_str())
+                && !(field.as_str() == "is_error" && is_error.is_some())
+        })
+        .map(|(field, value)| {
+            CanonicalExtension::node_field(
+                DialectId::AnthropicMessages,
+                format!("$.messages[].content[].{field}"),
+                field,
+                value.clone(),
+            )
+        })
+        .collect();
+    block.annotated(is_error, extensions)
 }
 
 /// A system-role message's blocks: string content is one text block;
@@ -337,17 +394,19 @@ fn system_blocks_of(message: &Value, index: usize) -> Result<Vec<CanonBlock>, Tr
                         kind: kind.to_owned(),
                     });
                 }
-                out.push(CanonBlock::Text(
-                    block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| TranslateError::Malformed {
-                            reason: format!(
-                                "messages[{index}] block {block_index}: \
-                                     text is missing or not a string"
-                            ),
-                        })?
-                        .to_owned(),
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    TranslateError::Malformed {
+                        reason: format!(
+                            "messages[{index}] block {block_index}: \
+                             text is missing or not a string"
+                        ),
+                    }
+                })?;
+                out.push(annotated_block(
+                    block,
+                    CanonBlock::Text(text.to_owned()),
+                    &["type", "text"],
+                    None,
                 ));
             }
             Ok(out)
@@ -416,9 +475,10 @@ fn system_part_of(part: &Value) -> CanonSystemPart {
         .iter()
         .filter(|(field, _)| field.as_str() != "type" && field.as_str() != "text")
         .map(|(field, value)| {
-            CanonicalExtension::new(
+            CanonicalExtension::node_field(
                 DialectId::AnthropicMessages,
                 format!("$.system[].{field}"),
+                field,
                 value.clone(),
             )
         })
@@ -475,6 +535,22 @@ fn tools_of(body: &Value) -> Result<Vec<CanonTool>, TranslateError> {
             name: name.to_owned(),
             description: description.to_owned(),
             parameters: parameters.clone(),
+            extensions: tool
+                .as_object()
+                .into_iter()
+                .flat_map(|object| object.iter())
+                .filter(|(field, _)| {
+                    !["name", "description", "input_schema"].contains(&field.as_str())
+                })
+                .map(|(field, value)| {
+                    CanonicalExtension::node_field(
+                        DialectId::AnthropicMessages,
+                        format!("$.tools[].{field}"),
+                        field,
+                        value.clone(),
+                    )
+                })
+                .collect(),
         });
     }
     Ok(out)
@@ -670,40 +746,67 @@ fn tool_result_blocks_of(blocks: &[Value]) -> ToolResultContent {
 /// reject for base64 sources — the raw anthropic source shape is
 /// what the output string must reproduce.)
 fn lenient_block_of(block: &Value) -> Option<CanonBlock> {
-    match block.get("type").and_then(Value::as_str)? {
-        "text" => Some(CanonBlock::Text(block.get("text")?.as_str()?.to_owned())),
-        "image" => Some(CanonBlock::Image {
-            url: image_url_of(block, &|_| String::new()).ok()?,
-        }),
-        "tool_use" => Some(CanonBlock::ToolUse {
-            id: block.get("id")?.as_str()?.to_owned(),
-            name: block.get("name")?.as_str()?.to_owned(),
-            input: block
-                .get("input")
-                .filter(|input| input.is_object())?
-                .clone(),
-        }),
-        "tool_result" => Some(CanonBlock::ToolResult {
-            tool_use_id: block.get("tool_use_id")?.as_str()?.to_owned(),
-            content: match block.get("content") {
-                None | Some(Value::Null) => ToolResultContent::String(String::new()),
-                Some(Value::String(text)) => ToolResultContent::String(text.clone()),
-                Some(Value::Array(blocks)) => tool_result_blocks_of(blocks),
-                Some(_) => return None,
+    let kind = block.get("type").and_then(Value::as_str)?;
+    let (semantic, fields): (CanonBlock, &[&str]) = match kind {
+        "text" => (
+            CanonBlock::Text(block.get("text")?.as_str()?.to_owned()),
+            &["type", "text"],
+        ),
+        "image" => (
+            CanonBlock::Image {
+                url: image_url_of(block, &|_| String::new()).ok()?,
             },
-        }),
-        "thinking" => Some(CanonBlock::Thinking {
-            text: block.get("thinking")?.as_str()?.to_owned(),
-            signature: block
-                .get("signature")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        }),
-        "redacted_thinking" => Some(CanonBlock::RedactedThinking {
-            data: block.get("data")?.as_str()?.to_owned(),
-        }),
-        _ => None,
-    }
+            &["type", "source"],
+        ),
+        "tool_use" => (
+            CanonBlock::ToolUse {
+                id: block.get("id")?.as_str()?.to_owned(),
+                name: block.get("name")?.as_str()?.to_owned(),
+                input: block
+                    .get("input")
+                    .filter(|input| input.is_object())?
+                    .clone(),
+            },
+            &["type", "id", "name", "input"],
+        ),
+        "tool_result" => (
+            CanonBlock::ToolResult {
+                tool_use_id: block.get("tool_use_id")?.as_str()?.to_owned(),
+                content: match block.get("content") {
+                    None | Some(Value::Null) => ToolResultContent::String(String::new()),
+                    Some(Value::String(text)) => ToolResultContent::String(text.clone()),
+                    Some(Value::Array(blocks)) => tool_result_blocks_of(blocks),
+                    Some(_) => return None,
+                },
+            },
+            &["type", "tool_use_id", "content"],
+        ),
+        "thinking" => (
+            CanonBlock::Thinking {
+                text: block.get("thinking")?.as_str()?.to_owned(),
+                signature: block
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+            &["type", "thinking", "signature"],
+        ),
+        "redacted_thinking" => (
+            CanonBlock::RedactedThinking {
+                data: block.get("data")?.as_str()?.to_owned(),
+            },
+            &["type", "data"],
+        ),
+        _ => return None,
+    };
+    Some(annotated_block(
+        block,
+        semantic,
+        fields,
+        (kind == "tool_result")
+            .then(|| block.get("is_error").and_then(Value::as_bool))
+            .flatten(),
+    ))
 }
 
 // ── shared ──────────────────────────────────────────────────────────
@@ -1154,12 +1257,57 @@ mod tests {
             DialectId::AnthropicMessages
         );
         assert_eq!(canonical.extensions[0].wire_path(), "$.metadata");
+        assert_eq!(canonical.extensions[0].wire_name(), Some("metadata"));
         assert_eq!(canonical.extensions[0].value(), &body["metadata"]);
         assert_eq!(canonical.extensions[1].wire_path(), "$.top_k");
 
         let debug = format!("{:?}", canonical.extensions[0]);
         assert!(debug.contains("<opaque>"));
         assert!(!debug.contains("secret-user"));
+    }
+
+    #[test]
+    fn message_block_metadata_stays_attached_and_replays_exactly() {
+        let source = json!([
+            {
+                "type": "text",
+                "text": "cached prompt",
+                "cache_control": {"type": "ephemeral", "secret": "cache-value"}
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "failed",
+                "is_error": true,
+                "future_field": {"secret": "future-value"}
+            }
+        ]);
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": source.clone()}],
+        });
+        let canonical = from_anthropic(&body).expect("parses");
+
+        assert_eq!(
+            canonical.messages[0]
+                .blocks
+                .iter()
+                .map(CanonBlock::wire_value)
+                .collect::<Vec<_>>(),
+            source.as_array().expect("source is an array").clone()
+        );
+        assert!(matches!(
+            &canonical.messages[0].blocks[1],
+            CanonBlock::Annotated {
+                is_error: Some(true),
+                extensions,
+                ..
+            } if extensions.len() == 1
+                && extensions[0].wire_name() == Some("future_field")
+        ));
+        let debug = format!("{:?}", canonical.messages[0].blocks);
+        assert!(!debug.contains("cache-value"));
+        assert!(!debug.contains("future-value"));
     }
 
     #[test]
@@ -1361,9 +1509,10 @@ mod tests {
             vec![
                 CanonSystemPart::Text {
                     text: "One.".to_owned(),
-                    extensions: vec![CanonicalExtension::new(
+                    extensions: vec![CanonicalExtension::node_field(
                         DialectId::AnthropicMessages,
                         "$.system[].cache_control",
+                        "cache_control",
                         json!({"type": "ephemeral"}),
                     )],
                 },
@@ -1512,9 +1661,9 @@ mod tests {
             },
             "[{\"type\":\"text\",\"text\":\"src holds\"},{\"type\":\"text\",\"text\":\"two modules.\"}]",
         );
-        // Extra fields or unknown kinds: the typed path cannot
-        // reproduce the bytes, so the raw-JSON string rides — the
-        // only lossless form, exactly what the pair module emitted.
+        // Modeled block metadata stays node-local and the typed path can now
+        // reproduce it exactly. Unknown block kinds still take the raw-JSON
+        // string path.
         let extra = from_anthropic(&body(json!([{"type": "text", "text": "kept",
                          "cache_control": {"type": "ephemeral"}}])))
         .expect("parses");
@@ -1522,10 +1671,17 @@ mod tests {
             extra.messages[0].blocks[0],
             CanonBlock::ToolResult {
                 tool_use_id: "t1".to_owned(),
-                content: ToolResultContent::String(
-                    "[{\"type\":\"text\",\"text\":\"kept\",\"cache_control\":{\"type\":\"ephemeral\"}}]"
-                        .to_owned(),
-                ),
+                content: ToolResultContent::Blocks(vec![
+                    CanonBlock::Text("kept".to_owned()).annotated(
+                        None,
+                        vec![CanonicalExtension::node_field(
+                            DialectId::AnthropicMessages,
+                            "$.messages[].content[].cache_control",
+                            "cache_control",
+                            json!({"type": "ephemeral"}),
+                        )],
+                    )
+                ]),
             }
         );
         let unknown = from_anthropic(&body(json!([{"type": "banana"}]))).expect("parses");
@@ -1679,7 +1835,8 @@ mod tests {
         let body = json!({
             "model": "m",
             "tools": [
-                {"name": "read_file", "input_schema": {"type": "object"}},
+                {"name": "read_file", "input_schema": {"type": "object"},
+                 "cache_control": {"type": "ephemeral"}},
                 {"name": "list_dir", "description": "List a directory",
                  "input_schema": {"type": "object", "properties": {}}},
             ],
@@ -1692,11 +1849,18 @@ mod tests {
                     name: "read_file".to_owned(),
                     description: String::new(),
                     parameters: json!({"type": "object"}),
+                    extensions: vec![CanonicalExtension::node_field(
+                        DialectId::AnthropicMessages,
+                        "$.tools[].cache_control",
+                        "cache_control",
+                        json!({"type": "ephemeral"}),
+                    )],
                 },
                 CanonTool {
                     name: "list_dir".to_owned(),
                     description: "List a directory".to_owned(),
                     parameters: json!({"type": "object", "properties": {}}),
+                    extensions: Vec::new(),
                 },
             ],
             "absent description reads empty — parse-time normalisation"

@@ -127,6 +127,7 @@ impl CanonSystemPart {
 pub struct CanonicalExtension {
     source: DialectId,
     wire_path: String,
+    wire_name: Option<String>,
     value: Value,
 }
 
@@ -139,6 +140,23 @@ impl CanonicalExtension {
         CanonicalExtension {
             source,
             wire_path: wire_path.into(),
+            wire_name: None,
+            value,
+        }
+    }
+
+    /// Retain an unmodeled field attached to one canonical node. The explicit
+    /// wire name avoids reconstructing JSON keys from diagnostic paths.
+    pub fn node_field(
+        source: DialectId,
+        wire_path: impl Into<String>,
+        wire_name: impl Into<String>,
+        value: Value,
+    ) -> CanonicalExtension {
+        CanonicalExtension {
+            source,
+            wire_path: wire_path.into(),
+            wire_name: Some(wire_name.into()),
             value,
         }
     }
@@ -149,6 +167,10 @@ impl CanonicalExtension {
 
     pub fn wire_path(&self) -> &str {
         &self.wire_path
+    }
+
+    pub fn wire_name(&self) -> Option<&str> {
+        self.wire_name.as_deref()
     }
 
     /// The opaque value is available to adapters, but must never be logged or
@@ -164,6 +186,7 @@ impl fmt::Debug for CanonicalExtension {
             .debug_struct("CanonicalExtension")
             .field("source", &self.source)
             .field("wire_path", &self.wire_path)
+            .field("wire_name", &self.wire_name)
             .field("value", &"<opaque>")
             .finish()
     }
@@ -217,9 +240,42 @@ pub enum CanonBlock {
     /// Provider-encrypted reasoning that must remain opaque and distinct from
     /// visible thinking.
     RedactedThinking { data: String },
+    /// Node-local wire metadata decorating a semantic block. Structural
+    /// middleware moves this wrapper with the block, so no array index becomes
+    /// canonical identity. `is_error` is semantic tool-result state; all other
+    /// unmodeled fields remain dialect-local opaque extensions.
+    Annotated {
+        block: Box<CanonBlock>,
+        is_error: Option<bool>,
+        extensions: Vec<CanonicalExtension>,
+    },
 }
 
 impl CanonBlock {
+    pub fn annotated(
+        self,
+        is_error: Option<bool>,
+        extensions: Vec<CanonicalExtension>,
+    ) -> CanonBlock {
+        if is_error.is_none() && extensions.is_empty() {
+            self
+        } else {
+            CanonBlock::Annotated {
+                block: Box::new(self),
+                is_error,
+                extensions,
+            }
+        }
+    }
+
+    /// The semantic block beneath any node-local wire annotation.
+    pub fn semantic(&self) -> &CanonBlock {
+        match self {
+            CanonBlock::Annotated { block, .. } => block.semantic(),
+            block => block,
+        }
+    }
+
     /// The frontend-wire block JSON this canonical block renders as:
     /// the parse's inverse with its normalisations applied (a base64
     /// image is its data-URL form, a thinking block is the plain
@@ -254,6 +310,25 @@ impl CanonBlock {
             }
             CanonBlock::RedactedThinking { data } => {
                 json!({"type": "redacted_thinking", "data": data})
+            }
+            CanonBlock::Annotated {
+                block,
+                is_error,
+                extensions,
+            } => {
+                let mut value = block.wire_value();
+                let object = value
+                    .as_object_mut()
+                    .expect("a canonical content block renders as an object");
+                if let Some(is_error) = is_error {
+                    object.insert("is_error".to_owned(), json!(is_error));
+                }
+                for extension in extensions {
+                    if let Some(name) = extension.wire_name() {
+                        object.insert(name.to_owned(), extension.value().clone());
+                    }
+                }
+                value
             }
         }
     }
@@ -312,6 +387,9 @@ pub struct CanonTool {
     pub description: String,
     /// The input schema, the raw JSON object verbatim.
     pub parameters: Value,
+    /// Dialect-local fields attached to this tool, such as prompt cache
+    /// controls. Compatible backends can replay them; others report them.
+    pub extensions: Vec<CanonicalExtension>,
 }
 
 /// The tool-choice intent.

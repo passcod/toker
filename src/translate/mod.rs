@@ -112,12 +112,11 @@
 //! - Top-level system block metadata and unrecognized system elements remain
 //!   node-local opaque extensions. The Codex binding reports their omission;
 //!   an Anthropic-compatible binding can replay them.
-//! - **`tool_result.is_error` / message-block `cache_control`** and other
-//!   block metadata are phase-2 fidelity work still to be modeled.
-//! - Unmapped **top-level fields** are dropped: cross-protocol
-//!   translation maps the table above, not the raw-preservation rule
-//!   ([`crate::ir`] keeps unknown fields for same-protocol routes; a
-//!   foreign protocol has nowhere to put them).
+//! - **`tool_result.is_error`**, message-block metadata, and tool metadata
+//!   remain attached to their canonical node. The Codex binding reports what
+//!   it cannot express; an Anthropic-compatible binding can replay it.
+//! - Unmapped **top-level fields** remain opaque extensions. A compatible
+//!   binding may replay them; a foreign binding reports their omission.
 //! - The release marker `$#$BURN$#$` rides through untouched —
 //!   stripping is middleware's job
 //!   ([`crate::ir::AnthropicBodyMut::strip_release`]), which runs
