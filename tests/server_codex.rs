@@ -558,6 +558,87 @@ async fn native_responses_passes_bytes_through_and_records_as_codex() {
 }
 
 #[tokio::test]
+async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "chat-to-codex",
+        upstream,
+        login_dir("chat-to-codex").join("auth.json"),
+        false,
+    ))
+    .await;
+    let response = client()
+        .post(format!("http://{addr}/f/opencode/v1/chat/completions"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-toker-session", "chat-codex-session")
+        .body(
+            json!({
+                "model": "codex_sub/gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "private prompt"}],
+                "stream": true
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("chat SSE");
+    assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains("\"tool_calls\""));
+    assert!(body.contains("data: [DONE]"));
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let request: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(request["model"], "gpt-5.6-sol");
+    assert_eq!(request["input"][0]["role"], "user");
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(rows[0].route.as_deref(), Some("openai_chat:codex_sub"));
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[0].session_id.as_deref(), Some("chat-codex-session"));
+}
+
+#[tokio::test]
+async fn chat_can_use_codex_as_its_default_and_return_plain_json() {
+    let (upstream, _mock) = spawn_mock().await;
+    let mut config = test_config(
+        "chat-default-codex",
+        upstream,
+        login_dir("chat-default-codex").join("auth.json"),
+        false,
+    );
+    config.default_backend_openai_chat = Some("codex_sub".to_owned());
+    let (addr, store) = spawn_toker(config).await;
+    let response = client()
+        .post(format!("http://{addr}/f/opencode/v1/chat/completions"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-toker-session", "chat-default-session")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "private prompt"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("chat completion JSON");
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "gpt-5.6-sol");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "read_file"
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].route.as_deref(), Some("openai_chat:codex_sub"));
+}
+
+#[tokio::test]
 async fn an_invalid_native_body_is_forwarded_unchanged_and_not_ledgered() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(

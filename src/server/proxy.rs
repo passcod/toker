@@ -11,18 +11,17 @@
 //!    the original. Exact → forward the original, byte-identical by
 //!    construction. Drift → **still** forward the original (safe), with a
 //!    `fidelity-drift` row at completion — drift is a visible metric.
-//! 4. Routing: `openrouter/…` routes to openrouter with the prefix
-//!    stripped; bare models go to the protocol default (phase 1 hardcodes
-//!    both).
+//! 4. Routing: a known provider prefix selects that backend and is
+//!    stripped; bare models go to the protocol default.
 //! 5. A routed request forwards the *serialised* form — a transformed
 //!    request forwards what the IR produces, and purity (invariant 4)
 //!    makes that stable. Recorded as requested vs effective model.
 //! 6. **The cold-cache notice** (plan: Middleware — cold gate): the openai
 //!    path's own gate, on the lane the request itself keys (session ×
 //!    tools-hash) and the post-routing model. A summarising request is
-//!    exempt, as on the anthropic path. No quota outlook — this backend
-//!    has no meter source — and a per-model writes-free exemption: when
-//!    the fetched openrouter catalogue says the model's cache writes cost
+//!    exempt, as on the anthropic path. No quota outlook is applied on the
+//!    Chat path yet. A per-model writes-free exemption applies to
+//!    OpenRouter: when its fetched catalogue says the model's cache writes cost
 //!    nothing, the re-read the notice warns about is free, and the
 //!    withheld notice is a `cold-quiet` row. On fire: 200 with a
 //!    synthetic openai turn naming no compaction target (this path never
@@ -45,6 +44,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -69,6 +69,7 @@ use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
     record_openai_cold, record_openai_cold_quiet, retry_after_ms,
 };
+use super::record_anthropic::AnthropicRecordCtx;
 
 /// Request bodies are buffered for gating and the fidelity check; 64 MiB
 /// is far beyond any chat body, so hitting the cap is a client bug worth a
@@ -82,7 +83,7 @@ pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
-    let Some(openrouter) = server.openrouter.clone() else {
+    let Some(default_backend) = server.config.default_backend_openai_chat.clone() else {
         return super::openai_not_configured();
     };
     let (parts, body) = request.into_parts();
@@ -132,6 +133,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let mut gate_shape: Option<Shape> = None;
     let mut stream_requested = false;
     let mut gate_model: Option<String> = None;
+    let mut target_backend = default_backend;
+    let mut parsed_for_codex = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
         // 3. Invariant 5, verified per request: Exact is the normal case;
         // Drift forwards the original buffer either way, and lands a
@@ -144,11 +147,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         // prefix overrides the backend per request.
         let model = ir.openai_chat().model().map(str::to_owned);
         let mut effective_model = model.clone();
-        if let Some(rest) = model.as_deref().and_then(strip_provider_prefix) {
+        if let Some((provider, rest)) = model.as_deref().and_then(strip_chat_provider_prefix) {
             // 5. A deliberate transform: forward the serialised IR (pure
             // and deterministic, so the upstream prefix stays stable),
             // recorded as requested vs effective — nothing is "forced".
             effective_model = Some(rest.to_owned());
+            target_backend = provider.to_owned();
             ir.openai_chat_mut().set_model(rest);
             forward = Bytes::from(ir.serialise());
         }
@@ -177,7 +181,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             shape: Some(shape),
             system_messages,
         });
+        parsed_for_codex = Some(ir);
     }
+
+    let Some(backend) = server.openai_chat_backend(&target_backend).cloned() else {
+        return super::openai_not_configured();
+    };
 
     // 6. The cold-cache notice (see the module docs). Advisory like the
     // anthropic gate's: once per idle spell, re-armed by activity, and
@@ -229,14 +238,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // free, the warning buys nothing. Only a POSITIVE verdict
             // exempts; an unknown model never does (conservative: the
             // gate applies).
-            let writes_free = gate_model.as_deref().is_some_and(|model| {
-                server
-                    .catalogs
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .cache_writes_free(openrouter.id(), model)
-                    == Some(true)
-            });
+            let writes_free = backend.id() == "openrouter"
+                && gate_model.as_deref().is_some_and(|model| {
+                    server
+                        .catalogs
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .cache_writes_free(backend.id(), model)
+                        == Some(true)
+                });
             if writes_free {
                 // Withheld, and recorded as the anthropic path records it:
                 // a `cold-quiet` row saying why, so silence reads as a
@@ -321,10 +331,27 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     }
 
+    if backend.id() == "codex_sub" {
+        let record = record.map(|ctx| chat_codex_record(ctx, backend.clone()));
+        return super::codex::turn(super::codex::CodexTurn {
+            server,
+            backend,
+            parsed: parsed_for_codex,
+            gate_shape: None,
+            record,
+            in_flight,
+            session_id,
+            served_model: gate_model,
+            stream_explicitly_false: !stream_requested,
+            frontend_wire: super::codex::CodexFrontendWire::OpenAiChat,
+        })
+        .await;
+    }
+
     // 7. Upstream; 8.-10. in forward_upstream.
     match send_upstream(
         &server,
-        openrouter.as_ref(),
+        backend.as_ref(),
         &parts,
         forward,
         // Sticky routing: openrouter consumes the session headers as its
@@ -502,8 +529,69 @@ pub(crate) async fn forward_upstream(
 /// bare names, other providers' prefixes — goes to the protocol's
 /// configured default backend, untransformed. Generalising the prefix set
 /// is a later phase's work.
+#[cfg(test)]
 pub(crate) fn strip_provider_prefix(model: &str) -> Option<&str> {
     model.strip_prefix("openrouter/")
+}
+
+fn chat_codex_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
+    let shape = ctx.shape.map(|shape| crate::ir::AnthropicShape {
+        req_bytes: shape.req_bytes,
+        req_messages: shape.req_messages,
+        req_tools: shape.req_tools,
+        tools_hash: shape.tools_hash,
+        system_chars: shape.system_chars,
+        system_hash: shape.system_hash,
+        system_blocks: shape
+            .system_blocks
+            .into_iter()
+            .map(|block| crate::ir::SystemBlockDigest {
+                chars: block.chars,
+                hash: block.hash,
+            })
+            .collect(),
+        system_messages: ctx.system_messages,
+        compact_generations: None,
+        summarising: shape.summarising,
+        compact_marker: None,
+        recap: false,
+        system_ladder: Vec::new(),
+        system_tail: Vec::new(),
+    });
+    AnthropicRecordCtx {
+        server: ctx.server,
+        started: ctx.started,
+        path: "/v1/chat/completions",
+        session_id: ctx.session_id,
+        requested_model: ctx.requested_model,
+        effective_model: ctx.effective_model,
+        drift: ctx.drift,
+        backend,
+        betas: None,
+        shape,
+        ping: ctx.ping,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        forced_from: None,
+        forced_to: None,
+        model_mappings: None,
+        frontend: ctx.frontend,
+        thinking_rewritten: false,
+        translation_report: None,
+    }
+}
+
+fn strip_chat_provider_prefix(model: &str) -> Option<(&str, &str)> {
+    ["openrouter", "codex_sub"]
+        .into_iter()
+        .find_map(|provider| {
+            model
+                .strip_prefix(provider)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|rest| (provider, rest))
+        })
 }
 
 /// The session identity from the configured header names, in priority

@@ -393,6 +393,14 @@ impl Server {
         self.anthropic_backend(self.config.default_backend_anthropic.as_deref()?)
     }
 
+    pub(crate) fn openai_chat_backend(&self, name: &str) -> Option<&Arc<dyn Provider>> {
+        match name {
+            "openrouter" => self.openrouter.as_ref(),
+            "codex_sub" => self.codex_sub.as_ref(),
+            _ => None,
+        }
+    }
+
     // ── the idle-sleep lock ──────────────────────────────────────────
 
     /// Take or drop the sleep lock to match the lane table and the

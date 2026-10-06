@@ -1085,7 +1085,7 @@ async fn the_openrouter_prefix_without_its_block_is_answered_locally() {
     let (mock, upstream) = spawn_mock().await;
     let mut config = test_config(upstream, None, "anthropic_sub");
     config.openrouter = None;
-    config.default_backend_openai_chat = None;
+    config.default_backend_openai_chat = Some("codex_sub".to_owned());
     let (addr, _store) = spawn_toker(config).await;
 
     let body = messages_body("openrouter/moonshotai/kimi-k3", false);

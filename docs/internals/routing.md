@@ -12,14 +12,15 @@ serves them all, because the paths do not collide:
 | Protocol | Paths | Backends |
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
-| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter` |
+| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub` (translated) |
 | OpenAI Responses | `/v1/responses` | `codex_sub` |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
 `default_backend_openai_chat`), which bare model names go to. A model string can
 name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
-`anthropic/…` (the protocol default) and `openrouter/…` are stripped and routed
+`anthropic/…` (the protocol default), `openrouter/…`, and Chat's
+`codex_sub/…` are stripped and routed
 (`strip_anthropic_prefix` in `server/anthropic.rs`, `strip_provider_prefix` in
 `server/proxy.rs`; `openrouter/` on both protocols), and the row records both
 `requested_model` and `effective_model`. A prefix naming a backend whose block is absent is answered
@@ -36,6 +37,12 @@ The Responses route is native: Codex request and SSE response bytes pass through
 unchanged while the Responses observer records usage and meters. Toker always
 replaces the frontend credential with its shared Codex login before the request
 leaves loopback.
+
+The Chat route may select `codex_sub` as its configured default or with a
+`codex_sub/<model>` prefix. That route always parses Chat into canonical IR,
+renders a Responses request, and translates the Responses turn back to Chat
+SSE or complete JSON. Toker signs the upstream itself, records the route as
+`openai_chat:codex_sub`, and never forwards the frontend credential.
 
 ### What differs per backend
 

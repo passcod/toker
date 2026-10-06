@@ -1,10 +1,9 @@
 //! The codex translation branch (plan: Phases — "Codex").
 //!
 //! A request routed to the codex_sub backend never byte-forwards: the
-//! codex backend speaks the Responses dialect, so the anthropic-frontend
-//! body goes through [`crate::translate`] both ways —
-//! [`translate::to_codex`] for the request, [`translate::AnthropicStream`]
-//! for the response. The fidelity byte-compare is meaningless
+//! codex backend speaks the Responses dialect, so each supported frontend
+//! goes through [`crate::translate`] and canonical IR/events in both
+//! directions. The fidelity byte-compare is meaningless
 //! cross-protocol (the upstream bytes never existed on the frontend's
 //! wire), so translated routes skip it by construction.
 //!
@@ -50,7 +49,8 @@ use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_codex_measurement};
 use crate::translate::{self, TranslateError};
 
-/// Everything the branch needs from the anthropic pipeline, moved in.
+/// Everything the branch needs from a translated frontend pipeline,
+/// moved in.
 pub(crate) struct CodexTurn {
     pub(crate) server: Server,
     /// The routed backend (`codex_sub`), for endpoint + meter parsing.
@@ -71,6 +71,29 @@ pub(crate) struct CodexTurn {
     pub(crate) served_model: Option<String>,
     /// Whether the client explicitly asked for a plain JSON Message.
     pub(crate) stream_explicitly_false: bool,
+    pub(crate) frontend_wire: CodexFrontendWire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexFrontendWire {
+    Anthropic,
+    OpenAiChat,
+}
+
+impl CodexFrontendWire {
+    fn protocol(self) -> &'static str {
+        match self {
+            Self::Anthropic => ANTHROPIC_FRONTEND,
+            Self::OpenAiChat => "openai_chat",
+        }
+    }
+
+    fn error_wire(self) -> ErrorWire {
+        match self {
+            Self::Anthropic => ErrorWire::Anthropic,
+            Self::OpenAiChat => ErrorWire::Openai,
+        }
+    }
 }
 
 const ANTHROPIC_FRONTEND: &str = "anthropic";
@@ -413,6 +436,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         session_id,
         served_model,
         stream_explicitly_false,
+        frontend_wire,
     } = args;
 
     // A shape with no messages is untranslatable chat-wise (count_tokens
@@ -424,7 +448,8 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         // An untranslatable body on a translated route: the honest
         // answer names the problem; nothing reached the upstream, and
         // there is no row (no measurement, no provider response).
-        return anthropic_error_response(
+        return frontend_error_response(
+            frontend_wire,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "the request body could not be parsed for translation to this backend",
@@ -440,8 +465,19 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // The translation itself — pure; a typed failure never reaches the
-    // upstream and answers with an anthropic error naming the cause.
-    let rendered = match translate::render_to_codex(ir.value(), &model, &prompt_cache_key) {
+    // upstream and answers in the frontend's error shape.
+    let rendering = match frontend_wire {
+        CodexFrontendWire::Anthropic => {
+            translate::render_to_codex(ir.value(), &model, &prompt_cache_key)
+        }
+        CodexFrontendWire::OpenAiChat => {
+            translate::from_openai_chat(ir.value()).and_then(|mut canonical| {
+                canonical.model = Some(model.clone());
+                translate::render_codex(&canonical, &prompt_cache_key)
+            })
+        }
+    };
+    let rendered = match rendering {
         Ok(rendered) => rendered,
         Err(error) => {
             let (status, message) = translate_failure(&error);
@@ -452,10 +488,11 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                     "invalid_request_error",
                     &message,
                     None,
-                    ANTHROPIC_FRONTEND,
+                    frontend_wire.protocol(),
                 );
             }
-            return anthropic_error_response(
+            return frontend_error_response(
+                frontend_wire,
                 status,
                 "invalid_request_error",
                 &message,
@@ -484,7 +521,10 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     // Only the codex backend routes here, and it exists only when its
     // block does; the check keeps a broken invariant a typed answer.
     let Some(codex) = server.codex_turn.clone() else {
-        return super::anthropic_not_configured();
+        return match frontend_wire {
+            CodexFrontendWire::Anthropic => super::anthropic_not_configured(),
+            CodexFrontendWire::OpenAiChat => super::openai_not_configured(),
+        };
     };
     let auth = match codex.auth_for_turn(&server.http, now).await {
         Ok(auth) => auth,
@@ -493,7 +533,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             // A fixed message, not the error's: it names local paths, and
             // the log line above already has the detail.
             return upstream_failure(
-                ErrorWire::Anthropic,
+                frontend_wire.error_wire(),
                 "toker upstream error: the codex login could not be refreshed",
             );
         }
@@ -512,7 +552,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         Ok(upstream) => upstream,
         Err(error) => {
             tracing::warn!(%error, "codex upstream request failed");
-            return transport_failure(ErrorWire::Anthropic, &error);
+            return transport_failure(frontend_wire.error_wire(), &error);
         }
     };
 
@@ -530,11 +570,11 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     }
 
     if !status.is_success() {
-        // A provider error, translated: the client sees an anthropic
+        // A provider error, translated: the client sees its protocol's
         // error naming the mapped type; the row records the real
         // upstream status with the same mapping.
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
-            return truncated_body(ErrorWire::Anthropic);
+            return truncated_body(frontend_wire.error_wire());
         };
         let error = parse_upstream_error(&buffered.bytes);
         let kind = translate::anthropic_error_type(&error);
@@ -551,50 +591,51 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                 kind,
                 &message,
                 error.resets_at,
-                ANTHROPIC_FRONTEND,
+                frontend_wire.protocol(),
             );
         }
-        return anthropic_error_response(status, kind, &message, !stream_explicitly_false);
+        return frontend_error_response(
+            frontend_wire,
+            status,
+            kind,
+            &message,
+            !stream_explicitly_false,
+        );
     }
 
     if stream_explicitly_false {
         aggregated_turn(
-            server,
-            backend,
             record,
             in_flight,
             model,
             upstream,
             meter_snapshot,
+            frontend_wire,
         )
         .await
     } else {
         streamed_turn(
-            server,
-            backend,
             record,
             in_flight,
             model,
             upstream,
             meter_snapshot,
+            frontend_wire,
         )
         .await
     }
 }
 
 /// The `stream: false` shape: consume the whole turn, answer with the
-/// complete Message JSON (translate's aggregation), record once.
-/// The `stream: false` shape: consume the whole turn, answer with the
 /// complete Message JSON (translate's aggregation), record once. The
 /// guard drops at return — a JSON answer is over when it is sent.
 async fn aggregated_turn(
-    _server: Server,
-    _backend: Arc<dyn Provider>,
     record: Option<AnthropicRecordCtx>,
     _in_flight: Option<InFlightGuard>,
     model: String,
     upstream: reqwest::Response,
     meters: Option<Value>,
+    frontend_wire: CodexFrontendWire,
 ) -> Response {
     // The turn was recorded through the ctx (which carries the server);
     // the guard drops at return — a JSON answer is over when it is sent.
@@ -608,7 +649,7 @@ async fn aggregated_turn(
             Err(error) => {
                 tracing::warn!(%error, "codex stream failed mid-turn");
                 return upstream_failure(
-                    ErrorWire::Anthropic,
+                    frontend_wire.error_wire(),
                     "toker upstream error: the stream failed before the turn ended",
                 );
             }
@@ -636,24 +677,30 @@ async fn aggregated_turn(
                 kind,
                 &message,
                 error.resets_at,
-                ANTHROPIC_FRONTEND,
+                frontend_wire.protocol(),
             );
         }
-        return anthropic_error_response(StatusCode::OK, kind, &message, false);
+        return frontend_error_response(frontend_wire, StatusCode::OK, kind, &message, false);
     }
     if !capture.turn_ended() {
         // The stream closed before a terminator event (the codex client
         // treats this as an error; so does toker — never a partial row).
         tracing::warn!("codex stream closed before response.completed");
         return upstream_failure(
-            ErrorWire::Anthropic,
+            frontend_wire.error_wire(),
             "toker upstream error: the stream failed before the turn ended",
         );
     }
 
-    let message = translate::message_from_capture(&model, &capture);
+    let message = match frontend_wire {
+        CodexFrontendWire::Anthropic => translate::message_from_capture(&model, &capture),
+        CodexFrontendWire::OpenAiChat => translate::openai_chat_from_canonical(
+            &model,
+            &translate::codex_backend::canonical_turn_from_capture(&capture),
+        ),
+    };
     if let Some(ctx) = record.as_ref() {
-        record_codex_measurement(ctx, &capture, meters, 200, ANTHROPIC_FRONTEND);
+        record_codex_measurement(ctx, &capture, meters, 200, frontend_wire.protocol());
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -671,20 +718,18 @@ async fn aggregated_turn(
 /// client's response after the events already translated: the
 /// translation must not end cleanly on a turn the upstream never
 /// finished, or the client takes the truncated turn as complete.
-#[allow(clippy::too_many_arguments)]
 async fn streamed_turn(
-    _server: Server,
-    _backend: Arc<dyn Provider>,
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: String,
     upstream: reqwest::Response,
     meters: Option<Value>,
+    frontend_wire: CodexFrontendWire,
 ) -> Response {
     let state = StreamState {
         upstream,
         sse: ResponsesSse::new(),
-        anthropic: translate::AnthropicStream::new(&model),
+        frontend: FrontendStream::new(frontend_wire, &model),
         capture: TurnCapture::new(),
         pending: VecDeque::new(),
         done: false,
@@ -692,6 +737,7 @@ async fn streamed_turn(
         record,
         meters,
         in_flight,
+        frontend_wire,
     };
 
     let stream = futures::stream::unfold(state, |mut state| async move {
@@ -747,12 +793,12 @@ async fn streamed_turn(
 }
 
 /// The unfold state: one upstream connection, two observers (the
-/// anthropic stream for the client, the capture for the ledger), the
+/// frontend renderer for the client, the capture for the ledger), the
 /// bytes awaiting delivery, and the in-flight guard that dies with it.
 struct StreamState {
     upstream: reqwest::Response,
     sse: ResponsesSse,
-    anthropic: translate::AnthropicStream,
+    frontend: FrontendStream,
     capture: TurnCapture,
     pending: VecDeque<Bytes>,
     done: bool,
@@ -765,13 +811,50 @@ struct StreamState {
     /// or the upstream fails) is the point — the in-flight count must
     /// live exactly as long as the exchange does.
     in_flight: Option<InFlightGuard>,
+    frontend_wire: CodexFrontendWire,
+}
+
+enum FrontendStream {
+    Anthropic(translate::AnthropicStream),
+    OpenAiChat {
+        canonical: translate::codex_backend::CanonStream,
+        renderer: translate::OpenAiChatRenderer,
+    },
+}
+
+impl FrontendStream {
+    fn new(wire: CodexFrontendWire, model: &str) -> FrontendStream {
+        match wire {
+            CodexFrontendWire::Anthropic => {
+                FrontendStream::Anthropic(translate::AnthropicStream::new(model))
+            }
+            CodexFrontendWire::OpenAiChat => FrontendStream::OpenAiChat {
+                canonical: translate::codex_backend::CanonStream::new(),
+                renderer: translate::OpenAiChatRenderer::new(model),
+            },
+        }
+    }
+
+    fn feed(&mut self, event: &ResponseEvent) -> Vec<SseEvent> {
+        match self {
+            FrontendStream::Anthropic(stream) => stream.feed(event),
+            FrontendStream::OpenAiChat {
+                canonical,
+                renderer,
+            } => canonical
+                .feed(event)
+                .iter()
+                .flat_map(|event| renderer.feed(event))
+                .collect(),
+        }
+    }
 }
 
 impl StreamState {
-    /// One upstream event through both observers: the anthropic stream
+    /// One upstream event through both observers: the frontend renderer
     /// emits the client's events, the capture latches the ledger's.
     fn observe(&mut self, event: &ResponseEvent) {
-        for emitted in self.anthropic.feed(event) {
+        for emitted in self.frontend.feed(event) {
             self.pending.push_back(sse_bytes(&emitted));
         }
         self.capture.observe(event);
@@ -806,7 +889,7 @@ impl StreamState {
                 kind,
                 &message,
                 error.resets_at,
-                ANTHROPIC_FRONTEND,
+                self.frontend_wire.protocol(),
             );
         } else if self.capture.turn_ended() {
             record_codex_measurement(
@@ -814,7 +897,7 @@ impl StreamState {
                 &self.capture,
                 self.meters.clone(),
                 200,
-                ANTHROPIC_FRONTEND,
+                self.frontend_wire.protocol(),
             );
         }
         // A stream that died without a terminator never reaches here
@@ -822,8 +905,7 @@ impl StreamState {
     }
 }
 
-/// One emitted anthropic event → its wire bytes (the same framing the
-/// quota gate's synthetic turns use).
+/// One emitted frontend SSE event to its wire bytes.
 fn sse_bytes(event: &SseEvent) -> Bytes {
     let mut out = String::new();
     if let Some(name) = &event.event {
@@ -917,4 +999,30 @@ pub(crate) fn anthropic_error_response(
             .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
             .expect("a plain JSON body always builds")
     }
+}
+
+fn frontend_error_response(
+    wire: CodexFrontendWire,
+    status: StatusCode,
+    kind: &str,
+    message: &str,
+    stream: bool,
+) -> Response {
+    if wire == CodexFrontendWire::Anthropic {
+        return anthropic_error_response(status, kind, message, stream);
+    }
+    let value = serde_json::json!({
+        "error": {"type": kind, "message": message}
+    });
+    let json = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+    let (content_type, body) = if stream {
+        ("text/event-stream", format!("data: {json}\n\n"))
+    } else {
+        ("application/json", json)
+    };
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .expect("a plain error response builds")
 }

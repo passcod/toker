@@ -1013,6 +1013,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 session_id,
                 served_model,
                 stream_explicitly_false,
+                frontend_wire: codex::CodexFrontendWire::Anthropic,
             })
             .await;
         }

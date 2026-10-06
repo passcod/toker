@@ -55,6 +55,23 @@ keep = 1                              # how many of the newest matches to offer
 
 Your list replaces the built-in one; `picker = []` offers nothing. `behaves_as` tells Claude Code which of its own models to treat the row like (its prompting and effort settings); pick the closest in cost and capability. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
 
+## Codex subscription from OpenAI Chat clients
+
+An OpenAI Chat frontend such as opencode can use the Codex subscription
+backend through the canonical mux. Set it as that protocol's default:
+
+```toml
+default_backend_openai_chat = "codex_sub"
+
+[providers.codex_sub]
+```
+
+Bare Chat model names then route to the subscription. With several Chat
+backends enabled, a single request can instead select it with a
+`codex_sub/<model>` model id. Streaming, tools, usage, errors and plain JSON
+responses translate in both directions and are recorded under
+`openai_chat:codex_sub`.
+
 ## TUI
 
 ```

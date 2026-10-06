@@ -52,9 +52,8 @@ pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
 /// The env var holding the OpenRouter API key.
 pub const DEFAULT_OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
-/// The openai_chat protocol's backends, in preference order. Only
-/// openrouter exists.
-pub const OPENAI_CHAT_BACKENDS: &[&str] = &["openrouter"];
+/// The openai_chat protocol's backends, in historical-default order.
+pub const OPENAI_CHAT_BACKENDS: &[&str] = &["openrouter", "codex_sub"];
 
 /// Anthropic's upstream base — the API root, no `/v1` prefix: the
 /// frontend's `/v1/messages…` paths are already the upstream's paths.
@@ -807,11 +806,13 @@ impl Config {
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect();
-        let enabled_openai: Vec<&str> = openrouter
-            .is_some()
-            .then_some("openrouter")
-            .into_iter()
-            .collect();
+        let enabled_openai: Vec<&str> = [
+            ("openrouter", openrouter.is_some()),
+            ("codex_sub", codex_sub.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
 
         let config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
@@ -832,12 +833,14 @@ impl Config {
                 "default_backend_openai_chat",
                 file.default_backend_openai_chat,
                 &enabled_openai,
+                Some("openrouter"),
             )?,
             openrouter,
             default_backend_anthropic: default_backend(
                 "default_backend_anthropic",
                 file.default_backend_anthropic,
                 &enabled_anthropic,
+                Some("anthropic_sub"),
             )?,
             anthropic_sub,
             anthropic_api,
@@ -943,17 +946,23 @@ impl Config {
 
     /// The enabled openai_chat-protocol backends.
     pub fn enabled_openai_chat(&self) -> Vec<&'static str> {
-        self.openrouter
-            .is_some()
-            .then_some("openrouter")
-            .into_iter()
-            .collect()
+        [
+            self.openrouter.is_some().then_some("openrouter"),
+            self.codex_sub.is_some().then_some("codex_sub"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Every enabled backend, anthropic protocol first.
     pub fn enabled_backends(&self) -> Vec<&'static str> {
         let mut all = self.enabled_anthropic();
-        all.extend(self.enabled_openai_chat());
+        for backend in self.enabled_openai_chat() {
+            if !all.contains(&backend) {
+                all.push(backend);
+            }
+        }
         all
     }
 }
@@ -999,6 +1008,7 @@ fn default_backend(
     key: &str,
     named: Option<String>,
     enabled: &[&str],
+    historical: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     if named.is_some() {
         return Ok(named);
@@ -1006,8 +1016,8 @@ fn default_backend(
     match enabled {
         [] => Ok(None),
         [only] => Ok(Some((*only).to_owned())),
-        several if several.contains(&ANTHROPIC_BACKENDS[0]) => {
-            Ok(Some(ANTHROPIC_BACKENDS[0].to_owned()))
+        several if historical.is_some_and(|name| several.contains(&name)) => {
+            Ok(historical.map(str::to_owned))
         }
         several => bail!(
             "{key} is not set and several backends are enabled ({}): name one",
@@ -1466,7 +1476,10 @@ mod tests {
             config.default_backend_anthropic.as_deref(),
             Some("codex_sub")
         );
-        assert_eq!(config.default_backend_openai_chat, None);
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("codex_sub")
+        );
         // Two enabled, neither the historical default, none named: an
         // error rather than a guess.
         let error = load("[providers.anthropic_api]\n[providers.codex_sub]\n")

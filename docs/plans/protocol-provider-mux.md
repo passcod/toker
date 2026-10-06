@@ -1,6 +1,7 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phase 1 complete, canonical migration underway.
+Status: guiding architecture; phase 1 complete, canonical migration and first
+live cross-protocol cutover underway.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
 any configured frontend protocol should be able to reach any backend for which
@@ -333,6 +334,10 @@ Responses ingress remains pending.
 - Keep the old handlers live until both sides of a route are complete.
 
 ### 3. Resolve concrete model targets and cut routes over
+
+Underway: OpenAI Chat to `codex_sub` is the first live canonical route. It can
+be selected as the Chat default or per request with `codex_sub/<model>` and
+translates request, streaming response, complete response, errors and usage.
 
 - Replace per-handler provider selection with a route registry.
 - Add a `ModelTarget` carrying provider, binding, requested model, and effective

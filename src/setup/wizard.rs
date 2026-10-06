@@ -2962,7 +2962,13 @@ fn apply_choices(
     keep_or_create(&mut config.codex_sub, ticked("codex_sub"));
     keep_or_create(&mut config.openrouter, ticked("openrouter"));
     config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
-    config.default_backend_openai_chat = ticked("openrouter").then(|| "openrouter".to_owned());
+    config.default_backend_openai_chat = if ticked("openrouter") {
+        Some("openrouter".to_owned())
+    } else if ticked("codex_sub") {
+        Some("codex_sub".to_owned())
+    } else {
+        None
+    };
     if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
         apply_key(
             key,
@@ -4775,7 +4781,10 @@ default_backend_anthropic = "codex_sub"
             config.default_backend_anthropic.as_deref(),
             Some("codex_sub")
         );
-        assert_eq!(config.default_backend_openai_chat, None);
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("codex_sub")
+        );
         // codex_sub ticked without a login: said so.
         assert!(rig.out().contains("no codex login"), "{}", rig.out());
     }
