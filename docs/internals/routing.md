@@ -41,7 +41,7 @@ placeholder.
 | --- | --- | --- | --- |
 | `anthropic_sub` | the client's own OAuth bearer, passed through | `anthropic-ratelimit-*` headers, the quota gate's only source | `plan_equivalent` (list price on a subscription) |
 | `anthropic_api` | `x-api-key`, injected only when the request has none | none (its RPM headers are not quota meters and must never overwrite the gate's snapshot) | `estimated` |
-| `openrouter` | stored key, injected only when the request has none; an Anthropic credential is dropped first | none | `billed`, from `usage.cost`, on the OpenAI-chat route; none on the Anthropic route (see below) |
+| `openrouter` | stored key, injected only when the request has none; an Anthropic credential is dropped first | none | `billed`, from `usage.cost`, on both routes |
 | `codex_sub` | always toker-signed from `~/.codex/auth.json` | `x-codex-*` headers, stored per backend, not gated | NULL: no per-token price to verify |
 
 The three cost kinds are never conflated (`CostKind`).
@@ -97,15 +97,25 @@ into codex ones. The quota gate is subscription-only already; the cold gate
 runs, and since openrouter is no meter source its notice says the re-read is
 billed.
 
-Rows on this route carry no cost. The catalogue prices Anthropic's own API,
-not openrouter's providers or the other labs' models, so an estimate from it
-would be a guessed price. Whether OpenRouter's Anthropic endpoint reports
-`usage.cost` the way its chat endpoint does is not yet checked; until it is,
-absence is the truthful answer. Also unchecked: whether `count_tokens` is
-served there, and which of Claude Code's request fields (beta flags,
-`thinking`, `output_config.effort`, `context_management`) non-Anthropic models
-accept. A model that refuses one answers with openrouter's own error, passed
-through.
+What the endpoint does, measured through toker on 2026-10-06:
+
+- It reports the billed cost as `usage.cost`, in USD, beside a
+  `cost_details` breakdown: on the plain body's usage, and on the final
+  `message_delta`'s when streamed (`message_start` carries none). The figure
+  matched the listing's per-token prices exactly. Rows record it as `billed`;
+  a response without it records no cost, never an estimate from the
+  catalogue, which prices Anthropic's own API and not openrouter's providers.
+- The response names its upstream in a top-level `provider` (on
+  `message_start`'s message when streamed), recorded as
+  `extra.serving_provider`, as the chat route does.
+- `/v1/messages/count_tokens` is not served: openrouter answers 404, passed
+  through, and the row is an error row.
+- A request shaped like Claude Code's (its beta flags including the OAuth
+  one, `thinking` with a budget, `output_config.effort`, a
+  `context_management` edit, `cache_control` on the system prompt and the
+  last message, and a tool) succeeded with a `tool_use` stop on Z.ai's GLM
+  5.3 Flash, OpenAI's GPT-6 Luna and DeepSeek V4.1 Flash. A model that does
+  refuse a field answers with openrouter's own error, passed through.
 
 ### How the rows get into the picker
 
