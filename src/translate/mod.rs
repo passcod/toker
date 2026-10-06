@@ -42,6 +42,11 @@
 //!   What this backend refuses is its declared property
 //!   ([`Capabilities`](crate::ir::canonical::Capabilities)); its
 //!   live-verified cost table lives in its module docs.
+//! - [`anthropic_backend::render_anthropic`]: the deterministic Messages
+//!   backend request renderer. It replays extensions across the Anthropic and
+//!   OpenRouter Messages dialects and reports incompatible omissions. It is
+//!   not a live binding yet: response interpretation must land before routing
+//!   can cut over to it.
 //! - [`to_codex`]: the composition of the two — the public entry
 //!   the server calls (unit C).
 //!
@@ -218,11 +223,13 @@
 //! placeholder says nothing the upstream did not; the chain resolves
 //! backend-side, where the wire's own fields live).
 
+pub mod anthropic_backend;
 pub mod anthropic_frontend;
 pub mod codex_backend;
 pub mod to_anthropic;
 pub mod to_codex;
 
+pub use anthropic_backend::render_anthropic;
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};

@@ -1,6 +1,6 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phase 1 complete, canonical migration pending.
+Status: guiding architecture; phase 1 complete, canonical migration underway.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
 any configured frontend protocol should be able to reach any backend for which
