@@ -246,7 +246,9 @@ pub use anthropic_backend::{
 };
 pub use anthropic_frontend::from_anthropic;
 pub use codex_backend::{codex_from_canonical, render_codex};
-pub use openai_chat_backend::render_openai_chat;
+pub use openai_chat_backend::{
+    OpenAiChatResponseStream, canonical_turn_from_openai_chat, render_openai_chat,
+};
 pub use openai_chat_frontend::from_openai_chat;
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::{render_to_codex, to_codex};

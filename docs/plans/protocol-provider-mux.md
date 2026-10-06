@@ -316,11 +316,11 @@ No endpoint, body, credential, catalogue, or ledger behavior changes.
 ### 2. Make canonical IR universal
 
 In progress. The Messages adapter is complete in both directions. OpenAI Chat
-request ingress and deterministic OpenRouter Chat request egress are
-implemented; streaming and complete response interpretation remain. The
-Messages provider bindings declare canonical readiness, but live handlers
-remain on the legacy path until phase 3 cuts each route over. Native Responses
-ingress also remains pending.
+request ingress, deterministic OpenRouter Chat request egress, and streaming
+and complete OpenRouter response interpretation are implemented. The Messages
+and OpenRouter Chat provider bindings declare canonical readiness, but live
+handlers remain on the legacy path until phase 3 cuts each route over. Chat
+frontend response rendering and native Responses ingress remain pending.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.

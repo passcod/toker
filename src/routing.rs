@@ -87,6 +87,16 @@ impl Capabilities {
         images: true,
     };
 
+    /// OpenRouter's live Chat Completions binding. The request and response
+    /// corpus verifies sampling, in-band instruction roles, images, and tool
+    /// calls. Provider reasoning payloads have no portable replay shape.
+    pub const CHAT: Capabilities = Capabilities {
+        sampling: true,
+        system_in_messages: true,
+        thinking_replay: false,
+        images: true,
+    };
+
     /// The Codex subscription Responses binding's live-verified capabilities.
     pub const CODEX: Capabilities = Capabilities {
         sampling: false,

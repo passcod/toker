@@ -1,11 +1,15 @@
 //! Deterministic canonical request rendering for OpenAI Chat bindings.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Number, Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonSystemPart, CanonTool, CanonToolChoice,
-    CanonicalExtension, CanonicalRequest, ToolResultContent,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
+    CanonicalRequest, CanonicalUsage, ToolResultContent,
 };
+use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
 use crate::translate::{
     Rendered, TranslateError, TranslationLoss, TranslationLossReason, TranslationReport,
@@ -449,12 +453,321 @@ fn unsupported(block: &CanonBlock) -> TranslateError {
     }
 }
 
+// ── response interpretation ────────────────────────────────────────
+
+/// Stateful interpretation of one Chat Completions SSE turn.
+///
+/// Chat reports its finish reason before the optional usage-only chunk. The
+/// interpreter therefore holds the terminal event until that chunk or
+/// `[DONE]`, so canonical absence never masquerades as zero usage.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAiChatResponseStream {
+    started: bool,
+    text_open: bool,
+    calls: BTreeMap<u64, IncomingToolCall>,
+    usage: Option<CanonicalUsage>,
+    pending_stop: Option<CanonStopReason>,
+    ended: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IncomingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl OpenAiChatResponseStream {
+    pub fn new() -> OpenAiChatResponseStream {
+        OpenAiChatResponseStream::default()
+    }
+
+    pub fn feed_sse(&mut self, event: &SseEvent) -> Vec<CanonEvent> {
+        let data = event.data();
+        if data.trim() == "[DONE]" {
+            return self.finish_done();
+        }
+        serde_json::from_str::<Value>(&data)
+            .ok()
+            .map(|value| self.feed(&value))
+            .unwrap_or_default()
+    }
+
+    /// Finish an EOF-terminated stream. The shared SSE splitter deliberately
+    /// omits `[DONE]`, so the response pump calls this once after its final
+    /// event to flush a finish reason, usage, or truncated turn.
+    pub fn finish(&mut self) -> Vec<CanonEvent> {
+        self.finish_done()
+    }
+
+    pub fn feed(&mut self, chunk: &Value) -> Vec<CanonEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        if let Some(error) = chunk.get("error") {
+            self.ended = true;
+            return vec![CanonEvent::TurnFailed {
+                error: canonical_chat_error(error),
+            }];
+        }
+        let mut out = Vec::new();
+        if !self.started {
+            self.started = true;
+            out.push(CanonEvent::TurnStarted {
+                turn_id: chunk.get("id").and_then(Value::as_str).map(str::to_owned),
+            });
+        }
+        if let Some(usage) = chunk.get("usage").and_then(chat_usage) {
+            self.usage = Some(usage);
+        }
+        for choice in chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
+                continue;
+            }
+            if let Some(delta) = choice.get("delta") {
+                if let Some(text) = delta.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    self.text_open = true;
+                    out.push(CanonEvent::TextDelta {
+                        delta: text.to_owned(),
+                    });
+                }
+                self.collect_tool_deltas(delta);
+            }
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.pending_stop = Some(chat_stop_reason(reason));
+                out.extend(self.close_content());
+            }
+        }
+        if self.pending_stop.is_some() && chunk.get("usage").is_some() {
+            out.extend(self.finish_pending());
+        }
+        out
+    }
+
+    fn collect_tool_deltas(&mut self, delta: &Value) {
+        for call in delta
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(index) = call.get("index").and_then(Value::as_u64) else {
+                continue;
+            };
+            let incoming = self.calls.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                incoming.id.push_str(id);
+            }
+            if let Some(function) = call.get("function") {
+                if let Some(name) = function.get("name").and_then(Value::as_str) {
+                    incoming.name.push_str(name);
+                }
+                if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                    incoming.arguments.push_str(arguments);
+                }
+            }
+        }
+    }
+
+    fn close_content(&mut self) -> Vec<CanonEvent> {
+        let mut out = Vec::new();
+        if self.text_open {
+            self.text_open = false;
+            out.push(CanonEvent::TextEnded);
+        }
+        for (_, call) in std::mem::take(&mut self.calls) {
+            if !call.id.is_empty() && !call.name.is_empty() {
+                out.push(CanonEvent::ToolCall(CanonToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments: call.arguments,
+                }));
+            }
+        }
+        out
+    }
+
+    fn finish_pending(&mut self) -> Vec<CanonEvent> {
+        let Some(stop_reason) = self.pending_stop.take() else {
+            return Vec::new();
+        };
+        self.ended = true;
+        vec![CanonEvent::TurnEnded {
+            stop_reason,
+            usage: self.usage.take(),
+        }]
+    }
+
+    fn finish_done(&mut self) -> Vec<CanonEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        let mut out = self.close_content();
+        if self.pending_stop.is_none() {
+            self.pending_stop = Some(CanonStopReason::Incomplete("stream_ended".to_owned()));
+        }
+        out.extend(self.finish_pending());
+        out
+    }
+}
+
+/// Interpret one complete non-streaming Chat Completions response.
+pub fn canonical_turn_from_openai_chat(body: &Value) -> Result<CanonTurn, TranslateError> {
+    if let Some(error) = body.get("error") {
+        return Ok(CanonTurn {
+            turn_id: None,
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: Some(canonical_chat_error(error)),
+            tool_calls: Vec::new(),
+            blocks: None,
+            text: String::new(),
+            thinking: BTreeMap::new(),
+        });
+    }
+    let choice = body
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "chat response has no first choice".to_owned(),
+        })?;
+    let message = choice
+        .get("message")
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: "chat response choice has no message".to_owned(),
+        })?;
+    let parsed = crate::translate::openai_chat_frontend::from_openai_chat(&json!({
+        "messages": [message]
+    }))?;
+    let blocks = parsed
+        .messages
+        .into_iter()
+        .next()
+        .expect("one supplied message parses to one canonical message")
+        .blocks;
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for block in &blocks {
+        match block.semantic() {
+            CanonBlock::Text(part) => text.push_str(part),
+            CanonBlock::ToolUse { id, name, input } => tool_calls.push(CanonToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: serde_json::to_string(input)
+                    .expect("a parsed tool input always serialises"),
+            }),
+            _ => {}
+        }
+    }
+    Ok(CanonTurn {
+        turn_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
+        stop_reason: choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(chat_stop_reason)
+            .unwrap_or_else(|| CanonStopReason::Incomplete("missing_finish_reason".to_owned())),
+        usage: body.get("usage").and_then(chat_usage),
+        error: None,
+        tool_calls,
+        blocks: Some(blocks),
+        text,
+        thinking: BTreeMap::new(),
+    })
+}
+
+fn chat_stop_reason(reason: &str) -> CanonStopReason {
+    match reason {
+        "stop" => CanonStopReason::EndTurn,
+        "tool_calls" | "function_call" => CanonStopReason::ToolUse,
+        "length" => CanonStopReason::MaxTokens,
+        "content_filter" => CanonStopReason::Refusal,
+        other => CanonStopReason::Incomplete(other.to_owned()),
+    }
+}
+
+fn chat_usage(value: &Value) -> Option<CanonicalUsage> {
+    let object = value.as_object()?;
+    Some(CanonicalUsage {
+        input: object.get("prompt_tokens").and_then(Value::as_u64),
+        cache_read: object
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+        cache_write: None,
+        output: object.get("completion_tokens").and_then(Value::as_u64),
+        reasoning: object
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        raw: value.clone(),
+    })
+}
+
+fn canonical_chat_error(error: &Value) -> CanonError {
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let joined = format!("{code} {kind}").to_ascii_lowercase();
+    CanonError {
+        kind: if joined.contains("rate_limit") {
+            CanonErrorKind::RateLimit
+        } else if joined.contains("auth") || joined.contains("api_key") {
+            CanonErrorKind::Authentication
+        } else if joined.contains("permission") {
+            CanonErrorKind::Permission
+        } else if joined.contains("not_found") {
+            CanonErrorKind::NotFound
+        } else if joined.contains("too_large") || joined.contains("context_length") {
+            CanonErrorKind::TooLarge
+        } else if joined.contains("invalid") {
+            CanonErrorKind::InvalidRequest
+        } else {
+            CanonErrorKind::Api
+        },
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| (!code.is_empty()).then_some(code))
+            .or_else(|| (!kind.is_empty()).then_some(kind))
+            .unwrap_or("upstream error")
+            .to_owned(),
+        resets_at: error.get("resets_at").and_then(Value::as_i64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::render_openai_chat;
+    use super::{OpenAiChatResponseStream, canonical_turn_from_openai_chat, render_openai_chat};
+    use crate::ir::canonical::{CanonEvent, CanonStopReason};
+    use crate::observe::sse::SseSplitter;
     use crate::routing::DialectId;
     use crate::translate::openai_chat_frontend::from_openai_chat;
     use serde_json::Value;
+
+    fn stream_events(fixture: &str) -> Vec<CanonEvent> {
+        let mut splitter = SseSplitter::new();
+        let mut stream = OpenAiChatResponseStream::new();
+        let mut events = splitter
+            .feed(fixture.as_bytes())
+            .into_iter()
+            .flat_map(|event| stream.feed_sse(&event))
+            .collect::<Vec<_>>();
+        events.extend(stream.finish());
+        events
+    }
 
     #[test]
     fn rich_chat_request_round_trips_semantically() {
@@ -502,5 +815,110 @@ mod tests {
         assert!(rendered.report.is_empty());
         assert_eq!(rendered.value["messages"][0]["role"], "developer");
         assert_eq!(rendered.value["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn simple_stream_waits_for_the_usage_only_chunk() {
+        let events = stream_events(include_str!(
+            "../../tests/fixtures/openai_chat_sse/01_simple_content.sse"
+        ));
+        assert_eq!(
+            events,
+            vec![
+                CanonEvent::TurnStarted {
+                    turn_id: Some("gen-1760000000-3f2a".to_owned()),
+                },
+                CanonEvent::TextDelta {
+                    delta: "Hello".to_owned(),
+                },
+                CanonEvent::TextDelta {
+                    delta: "!".to_owned(),
+                },
+                CanonEvent::TextEnded,
+                CanonEvent::TurnEnded {
+                    stop_reason: CanonStopReason::EndTurn,
+                    usage: Some(crate::ir::canonical::CanonicalUsage {
+                        input: Some(128),
+                        cache_read: None,
+                        cache_write: None,
+                        output: Some(16),
+                        reasoning: None,
+                        raw: serde_json::json!({
+                            "prompt_tokens": 128,
+                            "completion_tokens": 16,
+                            "total_tokens": 144,
+                            "cost": 0.000192,
+                            "cost_details": {
+                                "upstream": 0.00016,
+                                "router": 0.000032
+                            }
+                        }),
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn fragmented_tool_calls_emit_once_with_complete_arguments() {
+        let events = stream_events(include_str!(
+            "../../tests/fixtures/openai_chat_sse/02_tool_calls.sse"
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CanonEvent::ToolCall(call)
+                if call.id == "call_kJ4n"
+                    && call.name == "get_weather"
+                    && call.arguments == "{\"city\":\"Wellington\",\"units\":\"metric\"}"
+        )));
+        let CanonEvent::TurnEnded { stop_reason, usage } = events.last().unwrap() else {
+            panic!("stream should terminate")
+        };
+        assert_eq!(*stop_reason, CanonStopReason::ToolUse);
+        let usage = usage.as_ref().unwrap();
+        assert_eq!(usage.cache_read, Some(384));
+        assert_eq!(usage.reasoning, Some(12));
+    }
+
+    #[test]
+    fn truncated_stream_finishes_incomplete_without_inventing_usage() {
+        let events = stream_events(include_str!(
+            "../../tests/fixtures/openai_chat_sse/05_no_usage.sse"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::Incomplete(reason),
+                usage: None,
+            }) if reason == "stream_ended"
+        ));
+    }
+
+    #[test]
+    fn complete_chat_response_preserves_order_tools_and_usage() {
+        let body = serde_json::json!({
+            "id": "gen-complete",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "checking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"id\":1}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 4}
+        });
+        let turn = canonical_turn_from_openai_chat(&body).unwrap();
+        assert_eq!(turn.turn_id.as_deref(), Some("gen-complete"));
+        assert_eq!(turn.stop_reason, CanonStopReason::ToolUse);
+        assert_eq!(turn.text, "checking");
+        assert_eq!(turn.tool_calls[0].arguments, "{\"id\":1}");
+        assert_eq!(turn.blocks.as_ref().unwrap().len(), 2);
+        assert_eq!(turn.usage.unwrap().input, Some(20));
     }
 }

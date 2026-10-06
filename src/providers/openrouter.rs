@@ -10,7 +10,12 @@ use super::Provider;
 use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
 
 const BINDINGS: &[BackendBinding] = &[
-    BackendBinding::declared(ProtocolId::OpenAiChat, DialectId::OpenRouterChatCompletions),
+    BackendBinding::canonical(
+        ProtocolId::OpenAiChat,
+        DialectId::OpenRouterChatCompletions,
+        BackendAdapterId::OpenAiChatCompletions,
+        Capabilities::CHAT,
+    ),
     BackendBinding::canonical(
         ProtocolId::AnthropicMessages,
         DialectId::OpenRouterMessages,
@@ -173,6 +178,14 @@ mod tests {
             .expect("Messages adapter is complete");
         assert_eq!(canonical.adapter(), BackendAdapterId::AnthropicMessages);
         assert_eq!(canonical.capabilities(), Capabilities::MESSAGES);
+        let chat = provider
+            .bindings()
+            .iter()
+            .find(|binding| binding.protocol() == ProtocolId::OpenAiChat)
+            .expect("Chat binding");
+        let canonical = chat.canonical_backend().expect("Chat adapter is complete");
+        assert_eq!(canonical.adapter(), BackendAdapterId::OpenAiChatCompletions);
+        assert_eq!(canonical.capabilities(), Capabilities::CHAT);
     }
 
     #[test]

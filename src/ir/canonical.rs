@@ -700,6 +700,15 @@ mod tests {
         assert!(caps.images);
     }
 
+    #[test]
+    fn chat_capabilities_pin_the_verified_openrouter_wire() {
+        let caps = Capabilities::CHAT;
+        assert!(caps.sampling);
+        assert!(caps.system_in_messages);
+        assert!(!caps.thinking_replay);
+        assert!(caps.images);
+    }
+
     /// The wire values are the parse's inverse: the exact shapes the
     /// frontend's byte-exactness guard compares against, and the
     /// tool_result string form a backend emits.
