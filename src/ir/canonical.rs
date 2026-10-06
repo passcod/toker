@@ -59,11 +59,11 @@ pub struct CanonicalRequest {
     /// requested model; routing middleware later replaces it with the
     /// effective backend model. Absence is preserved, never invented.
     pub model: Option<String>,
-    /// The top-level system prompt pieces, in order (the
-    /// string-or-blocks system read: each block's `text`, each bare
-    /// string element, `""` for a textless block). How they join is
-    /// backend policy.
-    pub system: Vec<String>,
+    /// The top-level system prompt pieces, in order. Text remains semantic;
+    /// block-local wire metadata and unrecognized elements remain attached
+    /// to their node so structural middleware cannot invalidate their paths.
+    /// How text pieces join, and which metadata can replay, is backend policy.
+    pub system: Vec<CanonSystemPart>,
     /// The conversation, in order. System-role messages STAY
     /// messages — merging them, or hoisting them into the system
     /// prompt, is backend policy ([`Capabilities::system_in_messages`]).
@@ -89,6 +89,37 @@ pub struct CanonicalRequest {
     /// A compatible backend dialect may replay them; every other backend must
     /// report or reject their omission.
     pub extensions: Vec<CanonicalExtension>,
+}
+
+/// One top-level system prompt part.
+///
+/// Anthropic permits either a string or an array of blocks here. A string and
+/// a text block have the same canonical meaning, while metadata on the block
+/// remains dialect-local and opaque. An array element without a semantic text
+/// reading is retained whole rather than invented into an empty string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonSystemPart {
+    Text {
+        text: String,
+        extensions: Vec<CanonicalExtension>,
+    },
+    Opaque(CanonicalExtension),
+}
+
+impl CanonSystemPart {
+    pub fn text(text: impl Into<String>) -> CanonSystemPart {
+        CanonSystemPart::Text {
+            text: text.into(),
+            extensions: Vec::new(),
+        }
+    }
+
+    pub fn semantic_text(&self) -> Option<&str> {
+        match self {
+            CanonSystemPart::Text { text, .. } => Some(text),
+            CanonSystemPart::Opaque(_) => None,
+        }
+    }
 }
 
 /// One unmodeled wire value retained across the canonical boundary.

@@ -141,12 +141,12 @@ fn minimal_translates_and_pins_the_full_request_bytes() {
 fn system_blocks_translate_to_joined_instructions() {
     let value = pinned("02_system_blocks.json");
     wire_constants_pinned(&value);
-    // Each block's text, the bare string element, and "" for the block
-    // without one — joined on blank lines, trailing separator and all
-    // (the join is mechanical; the corpus round-trips the body).
+    // Each semantic text block and the bare string element join on blank
+    // lines. The object without text remains an opaque canonical part and is
+    // reported by the loss-aware adapter rather than fabricating empty text.
     assert_eq!(
         value["instructions"],
-        json!("You are a careful assistant.\n\nSecond block.\n\nbare string element\n\n")
+        json!("You are a careful assistant.\n\nSecond block.\n\nbare string element")
     );
     assert_eq!(
         value["input"],

@@ -76,8 +76,9 @@
 use serde_json::{Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonRole, CanonStopReason, CanonTool,
-    CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest, CanonicalUsage, ThinkingSpec,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonRole, CanonStopReason,
+    CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest,
+    CanonicalUsage, ThinkingSpec,
 };
 use crate::providers::codex::{
     Item, ResponseError, ResponseEvent, ResponsesRequest, Tool, TurnCapture, Usage,
@@ -125,7 +126,12 @@ pub fn render_codex(
     // The system prompt is the pieces joined on blank lines — THIS
     // backend's `instructions` form — plus any system-role message
     // texts that had no user turn to merge into (below).
-    let mut instructions = canonical.system.join("\n\n");
+    let mut instructions = canonical
+        .system
+        .iter()
+        .filter_map(CanonSystemPart::semantic_text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
     for text in leading_system {
         if !instructions.is_empty() {
             instructions.push_str("\n\n");
@@ -192,6 +198,25 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
             unsupported,
             thinking_blocks,
         ));
+    }
+
+    for part in &canonical.system {
+        match part {
+            CanonSystemPart::Text { extensions, .. } => {
+                for extension in extensions {
+                    report.push(TranslationLoss::new(
+                        extension.wire_path(),
+                        TranslationLossReason::IncompatibleExtensionDialect,
+                        1,
+                    ));
+                }
+            }
+            CanonSystemPart::Opaque(extension) => report.push(TranslationLoss::new(
+                extension.wire_path(),
+                TranslationLossReason::IncompatibleExtensionDialect,
+                1,
+            )),
+        }
     }
 
     for extension in &canonical.extensions {
@@ -623,9 +648,9 @@ mod tests {
     use super::{CanonStream, canon_error_from_response, canonical_turn_from_capture};
     use crate::ir::canonical::{
         CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole,
-        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
-        CanonicalRequest, CanonicalUsage, Capabilities, SamplingSpec, ThinkingSpec,
-        ToolResultContent,
+        CanonStopReason, CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn,
+        CanonicalExtension, CanonicalRequest, CanonicalUsage, Capabilities, SamplingSpec,
+        ThinkingSpec, ToolResultContent,
     };
     use crate::providers::codex::{
         CompletedResponse, ContentPart, Item, ResponseError, ResponseEvent, ResponsesSse,
@@ -832,6 +857,50 @@ mod tests {
     }
 
     #[test]
+    fn system_metadata_and_opaque_parts_are_reported_but_not_rendered() {
+        let canonical = CanonicalRequest {
+            model: Some(MODEL.to_owned()),
+            system: vec![
+                CanonSystemPart::Text {
+                    text: "Keep this instruction.".to_owned(),
+                    extensions: vec![CanonicalExtension::new(
+                        DialectId::AnthropicMessages,
+                        "$.system[].cache_control",
+                        json!({"type": "ephemeral", "secret": "metadata-value"}),
+                    )],
+                },
+                CanonSystemPart::Opaque(CanonicalExtension::new(
+                    DialectId::AnthropicMessages,
+                    "$.system[]",
+                    json!({"future_prompt": "opaque-value"}),
+                )),
+            ],
+            ..CanonicalRequest::default()
+        };
+
+        let rendered = render_codex(&canonical, KEY).expect("renders with report");
+        assert_eq!(rendered.value.instructions, "Keep this instruction.");
+        assert_eq!(
+            rendered.report.losses(),
+            &[
+                TranslationLoss::new(
+                    "$.system[].cache_control",
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ),
+                TranslationLoss::new(
+                    "$.system[]",
+                    TranslationLossReason::IncompatibleExtensionDialect,
+                    1,
+                ),
+            ]
+        );
+        let report = format!("{:?}", rendered.report);
+        assert!(!report.contains("metadata-value"));
+        assert!(!report.contains("opaque-value"));
+    }
+
+    #[test]
     fn a_midstream_system_message_merges_into_the_preceding_user_turn() {
         // The capability declaration the merge enforces: the codex
         // backend refuses system-role input items (live-verified:
@@ -867,7 +936,7 @@ mod tests {
     #[test]
     fn leading_system_messages_ride_the_instructions() {
         let canonical = CanonicalRequest {
-            system: vec!["Base prompt.".to_owned()],
+            system: vec![CanonSystemPart::text("Base prompt.")],
             messages: vec![
                 message(
                     CanonRole::System,

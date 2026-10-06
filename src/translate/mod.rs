@@ -49,7 +49,7 @@
 //!
 //! | Anthropic | Responses |
 //! |---|---|
-//! | `system` (string or block array) | `instructions` — the text pieces (each block's `text`, each bare string element, `""` when a block carries none) joined on blank lines, then any LEADING system-role message texts appended the same way |
+//! | `system` (string or block array) | `instructions` — semantic text pieces joined on blank lines, then any LEADING system-role message texts appended the same way; block metadata and opaque elements are retained canonically and reported as incompatible with this binding |
 //! | user `text` (string content or text blocks) | `message{role:"user", content:[{type:"input_text", text}]}` |
 //! | user `image` (base64 source) | `message` content part `{type:"input_image", image_url:"data:<media_type>;base64,<data>"}` |
 //! | user `image` (url source) | `input_image` with the url verbatim |
@@ -109,9 +109,11 @@
 //!   binding reports their omission without including their values.
 //!   The thinking **request** crosses as the codex reasoning effort
 //!   (see [`codex_backend`]).
-//! - **`tool_result.is_error` / `cache_control`** and other block
-//!   metadata — metadata, not content; the output text carries what
-//!   the model needs.
+//! - Top-level system block metadata and unrecognized system elements remain
+//!   node-local opaque extensions. The Codex binding reports their omission;
+//!   an Anthropic-compatible binding can replay them.
+//! - **`tool_result.is_error` / message-block `cache_control`** and other
+//!   block metadata are phase-2 fidelity work still to be modeled.
 //! - Unmapped **top-level fields** are dropped: cross-protocol
 //!   translation maps the table above, not the raw-preservation rule
 //!   ([`crate::ir`] keeps unknown fields for same-protocol routes; a

@@ -75,8 +75,8 @@ use serde_json::{Map, Value, json};
 
 use crate::ir::canonical::{
     CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
-    CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest, CanonicalUsage,
-    SamplingSpec, ThinkingSpec, ToolResultContent,
+    CanonSystemPart, CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest,
+    CanonicalUsage, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
@@ -365,33 +365,67 @@ fn system_blocks_of(message: &Value, index: usize) -> Result<Vec<CanonBlock>, Tr
 
 // ── system, tools, tool choice, sampling, thinking ─────────────────
 
-/// `system` → the prompt pieces, in order (the IR's `system_pieces`
-/// reading): a string is itself; a block array contributes each
-/// block's `text`, each bare string element verbatim, `""` for a
-/// textless block. Absent or `null` reads as no pieces. How the
-/// pieces JOIN is backend policy — the codex backend joins them on
-/// blank lines into its `instructions`.
-fn system_of(body: &Value) -> Result<Vec<String>, TranslateError> {
+/// `system` → semantic text plus node-local opaque metadata, in order. A
+/// string is plain text. A text block retains every field other than `type`
+/// and `text` as a dialect extension attached to that part. Any other array
+/// element remains opaque as a whole instead of becoming invented empty text.
+/// Absent or `null` reads as no parts. How text joins, and which extensions
+/// replay, is backend policy.
+fn system_of(body: &Value) -> Result<Vec<CanonSystemPart>, TranslateError> {
     match body.get("system") {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::String(text)) => Ok(vec![text.clone()]),
-        Some(Value::Array(blocks)) => Ok(blocks
-            .iter()
-            .map(|block| match block {
-                Value::String(text) => text.clone(),
-                other => other
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-            })
-            .collect()),
+        Some(Value::String(text)) => Ok(vec![CanonSystemPart::text(text)]),
+        Some(Value::Array(blocks)) => Ok(blocks.iter().map(system_part_of).collect()),
         Some(other) => Err(TranslateError::Malformed {
             reason: format!(
                 "system is neither a string nor a block array ({})",
                 json_kind(other)
             ),
         }),
+    }
+}
+
+fn system_part_of(part: &Value) -> CanonSystemPart {
+    if let Value::String(text) = part {
+        return CanonSystemPart::text(text);
+    }
+
+    let Some(object) = part.as_object() else {
+        return CanonSystemPart::Opaque(CanonicalExtension::new(
+            DialectId::AnthropicMessages,
+            "$.system[]",
+            part.clone(),
+        ));
+    };
+    if object.get("type").is_some_and(|kind| kind != "text") {
+        return CanonSystemPart::Opaque(CanonicalExtension::new(
+            DialectId::AnthropicMessages,
+            "$.system[]",
+            part.clone(),
+        ));
+    }
+    let Some(text) = object.get("text").and_then(Value::as_str) else {
+        return CanonSystemPart::Opaque(CanonicalExtension::new(
+            DialectId::AnthropicMessages,
+            "$.system[]",
+            part.clone(),
+        ));
+    };
+
+    let extensions = object
+        .iter()
+        .filter(|(field, _)| field.as_str() != "type" && field.as_str() != "text")
+        .map(|(field, value)| {
+            CanonicalExtension::new(
+                DialectId::AnthropicMessages,
+                format!("$.system[].{field}"),
+                value.clone(),
+            )
+        })
+        .collect();
+    CanonSystemPart::Text {
+        text: text.to_owned(),
+        extensions,
     }
 }
 
@@ -1096,8 +1130,8 @@ mod tests {
     use super::{AnthropicRenderer, anthropic_error_event_data, anthropic_error_type};
     use crate::ir::canonical::{
         CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole,
-        CanonStopReason, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalUsage,
-        SamplingSpec, ThinkingSpec, ToolResultContent,
+        CanonStopReason, CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn,
+        CanonicalExtension, CanonicalUsage, SamplingSpec, ThinkingSpec, ToolResultContent,
     };
     use crate::observe::sse::SseEvent;
     use crate::routing::DialectId;
@@ -1179,7 +1213,7 @@ mod tests {
         assert_eq!(canonical.model.as_deref(), Some("m"));
         assert_eq!(
             canonical.system,
-            vec!["One.".to_owned(), "Two.".to_owned()],
+            vec![CanonSystemPart::text("One."), CanonSystemPart::text("Two.")],
             "pieces, not a joined instruction"
         );
     }
@@ -1319,37 +1353,47 @@ mod tests {
                        {"no_text": true}],
             "messages": [{"role": "user", "content": "Hi"}],
         });
-        // The pieces: each block's text (cache_control is metadata,
-        // not text), each bare string element, "" for the block
-        // without one — in order, NOT joined (the join is backend
-        // policy).
+        // Text remains semantic, cache metadata stays attached to its node,
+        // and an element with no text remains opaque rather than turning into
+        // invented empty text. The join is backend policy.
         assert_eq!(
             from_anthropic(&join).expect("parses").system,
             vec![
-                "One.".to_owned(),
-                "bare string element".to_owned(),
-                String::new()
+                CanonSystemPart::Text {
+                    text: "One.".to_owned(),
+                    extensions: vec![CanonicalExtension::new(
+                        DialectId::AnthropicMessages,
+                        "$.system[].cache_control",
+                        json!({"type": "ephemeral"}),
+                    )],
+                },
+                CanonSystemPart::text("bare string element"),
+                CanonSystemPart::Opaque(CanonicalExtension::new(
+                    DialectId::AnthropicMessages,
+                    "$.system[]",
+                    json!({"no_text": true}),
+                )),
             ]
         );
 
         let absent = json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]});
         assert_eq!(
             from_anthropic(&absent).expect("parses").system,
-            Vec::<String>::new()
+            Vec::<CanonSystemPart>::new()
         );
 
         let null = json!({"model": "m", "system": null,
                           "messages": [{"role": "user", "content": "Hi"}]});
         assert_eq!(
             from_anthropic(&null).expect("parses").system,
-            Vec::<String>::new()
+            Vec::<CanonSystemPart>::new()
         );
 
         let string = json!({"model": "m", "system": "One prompt.",
                             "messages": [{"role": "user", "content": "Hi"}]});
         assert_eq!(
             from_anthropic(&string).expect("parses").system,
-            vec!["One prompt.".to_owned()]
+            vec![CanonSystemPart::text("One prompt.")]
         );
 
         let malformed = json!({"model": "m", "system": 5,
