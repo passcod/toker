@@ -96,6 +96,13 @@ impl Provider for OpenRouter {
         }
     }
 
+    /// Only Anthropic's own models behind openrouter understand the field;
+    /// the rest (glm, deepseek, ...) answer `400 Mid-conversation reasoning
+    /// effort (configuration_update) is not supported`.
+    fn accepts_message_effort(&self, model: &str) -> bool {
+        model.starts_with("anthropic/")
+    }
+
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
         let Some(key) = &self.api_key else {
             // No key: forward unauthenticated; openrouter's 401 body passes
@@ -125,6 +132,13 @@ mod tests {
                 .expect("upstream url"),
             Some("sk-test-key".to_owned()),
         )
+    }
+
+    #[test]
+    fn only_anthropic_models_accept_message_effort() {
+        let provider = provider();
+        assert!(provider.accepts_message_effort("anthropic/claude-sonnet-5.5"));
+        assert!(!provider.accepts_message_effort("z-ai/glm-5.3"));
     }
 
     #[test]

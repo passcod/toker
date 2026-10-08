@@ -344,6 +344,49 @@ impl AnthropicBodyMut<'_> {
         }
     }
 
+    /// Remove mid-conversation effort changes: the `output_config` a
+    /// `role: "system"` message in `messages[]` carries to move the
+    /// reasoning effort partway through a session. A message left with no
+    /// content (the effort-only form) goes entirely; one that also carries
+    /// text keeps the text. Returns whether anything changed. System
+    /// messages sit outside the user/assistant alternation, so dropping
+    /// one cannot break it.
+    ///
+    /// Backends whose models reject the field (see
+    /// `Provider::accepts_message_effort`) would 400 the whole turn, and
+    /// the client replays the message on every later turn.
+    pub fn strip_message_effort(&mut self) -> bool {
+        let Some(messages) = self
+            .request
+            .value
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+        else {
+            return false;
+        };
+        let before = messages.len();
+        let mut changed = false;
+        messages.retain_mut(|message| {
+            if message.get("role").and_then(Value::as_str) != Some("system") {
+                return true;
+            }
+            let Some(map) = message.as_object_mut() else {
+                return true;
+            };
+            if map.shift_remove("output_config").is_none() {
+                return true;
+            }
+            changed = true;
+            match map.get("content") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(text)) => !text.trim().is_empty(),
+                Some(Value::Array(blocks)) => !blocks.is_empty(),
+                Some(_) => true,
+            }
+        });
+        changed || messages.len() != before
+    }
+
     /// [`Self::strip_release`] for one marker.
     fn strip_marker(&mut self, marker: &str) {
         // Phase 1 — the parsed decision, as mutation targets (message
@@ -1651,6 +1694,26 @@ mod tests {
         assert_eq!(parse(&body).anthropic().shape().system_messages, Some(2));
         let body = body_of(vec![user_text("hi")]);
         assert_eq!(parse(&body).anthropic().shape().system_messages, None);
+    }
+
+    #[test]
+    fn strip_message_effort_drops_effort_only_messages_and_keeps_text() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"system","content":[],"output_config":{"effort":"low"}},{"role":"system","content":[{"type":"text","text":"keep"}],"output_config":{"effort":"high"}},{"role":"user","content":"next"}]}"#;
+        let mut request = parse(body);
+        assert!(request.anthropic_mut().strip_message_effort());
+        let value: serde_json::Value = serde_json::from_slice(&request.serialise()).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[1].get("output_config").is_none());
+        assert_eq!(messages[1]["content"][0]["text"], "keep");
+    }
+
+    #[test]
+    fn strip_message_effort_is_quiet_without_an_effort_message() {
+        let body = body_of(vec![user_text("hi"), system_message("reminder")]);
+        let mut request = parse(&body);
+        assert!(!request.anthropic_mut().strip_message_effort());
+        assert_eq!(request.serialise(), body);
     }
 
     #[test]

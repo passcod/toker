@@ -81,6 +81,16 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Whether `model` on this backend accepts a mid-conversation effort
+    /// change (`output_config` on a `role: "system"` message). Where it does
+    /// not, the server strips the field (invariant 6) rather than let the
+    /// upstream 400 every turn of the session. `true` by default: the field
+    /// is Anthropic's own.
+    fn accepts_message_effort(&self, model: &str) -> bool {
+        let _ = model;
+        true
+    }
+
     /// Parse this provider's meter snapshot from one upstream response's
     /// headers, when this provider is a **meter source** (plan: quota
     /// gate — "Anthropic sub is the only meter source today. The meter

@@ -137,6 +137,12 @@ reasons.
      breakpoints, and mid-conversation system messages, together or not at all.
      That one is defensible because a compaction is a dead end: its body is
      never replayed and the client's transcript is untouched.
+   - `strip_message_effort` removes the `output_config` a mid-conversation
+     `system` message carries to change the reasoning effort, on a backend
+     whose model rejects it (`Provider::accepts_message_effort`, today any
+     non-Anthropic model on openrouter). The client replays that message every
+     turn, so leaving it would 400 the whole session. Text in the same message
+     stays; an effort-only message goes.
    - `model_map::rewrite_mapped_models` applies an explicit, configured routing
      map as the last stage and changes only model positions. An unmatched or
      disabled map returns the input bytes untouched.

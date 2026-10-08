@@ -962,6 +962,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
+    // ── mid-conversation effort, for models that reject it ──
+    //
+    // Claude Code moves the reasoning effort with an `output_config` on a
+    // system message and replays it every turn; a backend whose model does
+    // not know the field 400s the request. Strip it there, after the map so
+    // the check sees the model actually being sent.
+    if path == "/v1/messages"
+        && let Some(model) = served_model.as_deref()
+        && !backend.accepts_message_effort(model)
+        && let Ok(mut ir) = crate::ir::Request::parse(&forward)
+        && ir.anthropic_mut().strip_message_effort()
+    {
+        forward = Bytes::from(ir.serialise());
+        tracing::info!("stripped mid-conversation effort for {model}");
+    }
+
     // ── the served-model mark, BEFORE the request goes ──
     //
     // Not after: a lane deciding while this one is still in flight must see
