@@ -192,8 +192,10 @@ cache once, because the upstream's prefix genuinely changed.
 ## Restarting without cutting a stream
 
 `systemctl --user restart toker.service` stops the process with SIGTERM, and
-every response still streaming through it ends mid-turn. The client retries, but
-that turn is lost, in every session at once. `toker restart` replaces it:
+every response still streaming through it ends mid-turn. The socket unit keeps
+accepting meanwhile and harnesses retry a cut stream, so this is safe and was
+the way before `toker restart`, but each retry re-sends that turn, in every
+session at once. `toker restart` avoids the cut:
 
 1. It polls `/_toker/status` once a second until `in_flight` reads zero on
    `QUIET_POLLS` (3) polls in a row. `in_flight` counts only exchanges already
