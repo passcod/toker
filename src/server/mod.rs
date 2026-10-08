@@ -203,6 +203,11 @@ pub struct Server {
     /// `Notify` keeps the permit when nothing waits yet, so a request
     /// that lands before the listener awaits is not lost.
     pub(crate) shutdown: Arc<tokio::sync::Notify>,
+    /// Fired by a `POST /_toker/shutdown` that says `force`: the drain
+    /// stops waiting for connections. [`Server::serve_listener`] returns
+    /// at once and the process exits through its normal path, which
+    /// cancels what was still running (dropping it, so destructors run).
+    pub(crate) force: Arc<tokio::sync::Notify>,
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
@@ -327,6 +332,7 @@ impl Server {
             instance: Arc::from(uuid::Uuid::new_v4().simple().to_string()),
             started_ms: now_ms(),
             shutdown: Arc::default(),
+            force: Arc::default(),
             quota_events: Arc::default(),
         })
     }
@@ -525,7 +531,10 @@ impl Server {
     /// The drain has no deadline of its own, because the point of the
     /// shutdown is never to cut a stream. It is bounded anyway: a stalled
     /// upstream fails after [`UPSTREAM_IDLE_TIMEOUT`] like any other, and
-    /// a client that hangs up ends its exchange.
+    /// a client that hangs up ends its exchange. A shutdown request that
+    /// says `force` is the caller's deadline: this returns without
+    /// waiting, and what was still streaming is cut when the process
+    /// exits.
     ///
     /// Dropping the listener closes this process's descriptor only. Under
     /// socket activation systemd keeps its own, so connections that arrive
@@ -536,21 +545,40 @@ impl Server {
     /// they end with the runtime, when the process exits.
     pub async fn serve_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
         let shutdown = self.shutdown.clone();
-        axum::serve(listener, self.router())
-            .with_graceful_shutdown(async move { shutdown.notified().await })
-            .await?;
-        tracing::info!("drained; exiting");
+        let serving = axum::serve(listener, self.router())
+            .with_graceful_shutdown(async move { shutdown.notified().await });
+        tokio::select! {
+            result = serving => {
+                result?;
+                tracing::info!("drained; exiting");
+            }
+            // The serve future is dropped here, closing the listener.
+            // Connections already accepted are tasks of the runtime and
+            // go with it when the process exits; nothing is killed
+            // before that, so every destructor still runs.
+            () = self.force.notified() => {
+                tracing::warn!(
+                    in_flight = self.in_flight.load(Ordering::SeqCst),
+                    "forced shutdown; not waiting for connections"
+                );
+            }
+        }
         self.release_awake_for_exit();
         Ok(())
     }
 
-    /// Ask [`Server::serve_listener`] to drain and return.
-    pub(crate) fn begin_shutdown(&self) {
+    /// Ask [`Server::serve_listener`] to drain and return, or with
+    /// `force` to return without waiting for the connections under way.
+    pub(crate) fn begin_shutdown(&self, force: bool) {
         tracing::info!(
             in_flight = self.in_flight.load(Ordering::SeqCst),
+            force,
             "shutdown requested; draining"
         );
         self.shutdown.notify_one();
+        if force {
+            self.force.notify_one();
+        }
     }
 
     /// This instance's id, as `/_toker/status` reports it.

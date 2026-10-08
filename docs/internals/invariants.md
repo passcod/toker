@@ -101,10 +101,10 @@ reasons.
    `shutdown`, also a JSON body, so that a web page, which can reach loopback,
    cannot drive one without a preflight nothing here answers. `models/merge`
    can only add to the model store, for models already served. `shutdown`
-   (`toker restart`'s) names the instance `status` reported and only drains:
-   the listener closes, every response under way finishes, and the process
-   exits for systemd to start again, so the worst a caller can do is a
-   restart that cuts nothing. Keep any new control path to the same terms, or
+   (`toker restart`'s) names the instance `status` reported and only stops it:
+   the listener closes, every response under way finishes (or, with `force`,
+   is cut), and the process exits cleanly for systemd to start again, so the
+   worst a caller can do is a restart. Keep any new control path to the same terms, or
    better, do not add one.
 
 5. **Never guess prices.** Verify against the published pricing page and move

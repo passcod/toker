@@ -48,18 +48,22 @@ enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Restart the running service without cutting a response: wait for
-    /// a moment with nothing in flight, ask it to drain and exit, and wait
-    /// for systemd to start the new binary. Ctrl-C while waiting leaves it
-    /// untouched.
+    /// Restart the running service without cutting a response if it can
+    /// be helped: wait for a moment with nothing in flight, ask it to
+    /// drain and exit, and wait for systemd to start the new binary. If
+    /// that does not happen in time (no quiet moment, no answer, a drain
+    /// that does not end), tell it to stop without waiting for connections;
+    /// it still exits cleanly, and clients retry a cut stream. Ctrl-C
+    /// while waiting leaves it untouched.
     Restart {
-        /// Give up without restarting if no quiet moment comes within this
-        /// span: a whole number with a unit (90s, 10m, 1h).
+        /// Stop without waiting for connections if no quiet moment comes
+        /// within this span, a whole number with a unit (90s, 10m, 1h). Default 30s.
         #[arg(long = "max-wait", value_name = "SPAN", value_parser = cmds::wait_arg)]
         max_wait: Option<std::time::Duration>,
-        /// Do not wait for a quiet moment. The old instance still finishes
-        /// every response under way before it exits; new connections wait
-        /// for the next instance meanwhile.
+        /// Do not wait for a quiet moment. The old instance still gets 30s
+        /// to finish every response under way before it is told to stop
+        /// without waiting; new connections wait for the next instance
+        /// meanwhile.
         #[arg(long = "now", conflicts_with = "max_wait")]
         now: bool,
     },
@@ -200,10 +204,18 @@ enum PickerCommand {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(cmds::serve()),
+        Command::Serve => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let served = runtime.block_on(cmds::serve());
+            // A forced shutdown returns with connections still open:
+            // dropping the runtime cancels them, running their destructors,
+            // and waits on any blocking work. Bound that wait so a stuck
+            // one cannot hold a restart up.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+            served
+        }
         Command::Promote {
             model,
             days,

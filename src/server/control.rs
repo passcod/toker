@@ -28,8 +28,9 @@
 //! for a quiet moment on `status`, then asks this instance, by the id
 //! `status` gave it, to drain and exit; systemd starts the next one. It
 //! is gated exactly like `models/merge`. The worst a caller can do with
-//! it is what `systemctl --user restart` does, minus cutting streams:
-//! the drain lets every response under way finish.
+//! it is what `systemctl --user restart` does: by default the drain lets
+//! every response under way finish, and with `force` they are cut, but
+//! the exit is the normal one either way.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -383,7 +384,11 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
 
 /// `POST /_toker/shutdown` — drain and exit, for `toker restart`.
 ///
-/// Body: `{"instance": id}`, the id `/_toker/status` reported. The gate is
+/// Body: `{"instance": id}`, the id `/_toker/status` reported, and
+/// optionally `"force": true` to stop without waiting for connections
+/// under way (see [`Server::serve_listener`]): the restart's second
+/// request, once the drain it asked for first has had its time. Any other
+/// `force` is a 400. The gate is
 /// `models/merge`'s: a wrong verb, method, or content type is a 403. A body
 /// that is not that object is a 400; an id that is not this instance's is
 /// a 409 carrying the current one, so a restart that raced another never
@@ -418,8 +423,13 @@ pub(crate) async fn shutdown(State(server): State<Server>, request: Request) -> 
         reply["instance"] = json!(&*server.instance);
         return (StatusCode::CONFLICT, Json(reply)).into_response();
     }
+    let force = match incoming.get("force") {
+        None => false,
+        Some(Value::Bool(force)) => *force,
+        Some(_) => return shutdown_error(StatusCode::BAD_REQUEST, "unparseable request"),
+    };
     let in_flight = server.in_flight.load(std::sync::atomic::Ordering::SeqCst);
-    server.begin_shutdown();
+    server.begin_shutdown(force);
     (
         StatusCode::ACCEPTED,
         Json(json!({

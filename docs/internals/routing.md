@@ -201,15 +201,18 @@ session at once. `toker restart` avoids the cut:
    `QUIET_POLLS` (3) polls in a row. `in_flight` counts only exchanges already
    under way, and an agent's next request follows its tool calls after a short
    gap, so a single idle reading can fall between two requests of one busy
-   turn. Ctrl-C here changes nothing; `--max-wait` gives up the same way.
+   turn. Ctrl-C here changes nothing. After `--max-wait` (30 s unless given)
+   with no quiet moment, or with status not answering at all, it skips to
+   the forced stop in step 6 instead of giving up: a session that never idles
+   is not a reason to keep the old binary.
 2. It posts `/_toker/shutdown` with the `instance` id status reported. A
    mismatch is a 409, so a restart that raced another never stops an instance
    it did not see.
 3. The server drains (`Server::serve_listener`, axum's graceful shutdown): it
    stops accepting, lets every response under way finish, closes idle
    keep-alive connections, then exits 0. There is no drain deadline, because
-   the point is never to cut a stream; a stalled upstream still fails after the
-   upstream idle timeout, as it would at any time.
+   the point is never to cut a stream by itself; the forced stop in step 6 is
+   what bounds a drain that does not end.
 4. `Restart=always` in the service unit (`service_unit` in `setup/wizard.rs`)
    restarts it after any exit, a clean one included. The socket unit keeps the
    listening socket the whole time, so connections that arrive meanwhile queue
@@ -217,11 +220,24 @@ session at once. `toker restart` avoids the cut:
 5. The CLI polls status until a different `instance` answers, for up to 30
    seconds. Uptime cannot tell the two apart: an instance asked to stop a
    second after it started reads like its successor.
+6. If those 30 seconds pass with the old instance still draining, or the
+   shutdown request got no answer, it posts the shutdown again with `"force":
+   true`: the graceful attempt had its time, and a response that will not end
+   does not get to hold the new binary back. The server stops waiting for
+   connections and returns from `serve_listener` as it would after a drain, so
+   the sleep lock is released the same way and the process exits 0 through
+   `main`, which drops the runtime (bounded to 5 seconds) and so cancels the
+   responses still under way, running their destructors. They are cut; the
+   client retries them. `Restart=always` starts the next instance, and step 5's
+   poll runs once more for 30 seconds. After that failure it reports rather
+   than forcing again. The request names the last instance that answered, so a
+   daemon that never answered status at all has nothing to address, and the
+   command says to use `systemctl --user restart toker.service` instead.
 
 Waiting for a quiet moment is not what keeps streams whole; the drain does that
 on its own. It keeps new requests from queueing behind a long one: from the
 moment the listener closes until the old process exits, nothing accepts them.
-`--now` skips the wait and accepts that queue.
+`--now` skips the wait and accepts that queue, up to the same 30 seconds.
 
 A `toker serve` run by hand has no systemd behind it: the drain still works, but
 nothing starts the next instance, and the CLI says so when its wait runs out. A

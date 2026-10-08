@@ -1,0 +1,8 @@
+---
+source: src/cmds.rs
+expression: out
+---
+waiting for 1 response in flight to finish (Ctrl-C leaves toker untouched)
+toker is not answering its status request (Ctrl-C leaves toker untouched)
+toker did not answer within 1ms; stopping toker without waiting for connections, systemd starts the next one
+toker n3wn3wn3 is up: version 0.1.0, up 0s

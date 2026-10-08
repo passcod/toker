@@ -1,0 +1,7 @@
+---
+source: src/cmds.rs
+expression: "format!(\"{out}---\\n{error:#}\")"
+---
+toker is not answering its status request (Ctrl-C leaves toker untouched)
+---
+toker did not answer within 1ms, and toker never answered, so there is no instance to tell to stop. Nothing was restarted; `systemctl --user restart toker.service` restarts it.

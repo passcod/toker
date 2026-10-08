@@ -1,4 +1,5 @@
-//! `POST /_toker/shutdown` end to end: the gate, and the drain.
+//! `POST /_toker/shutdown` end to end: the gate, the drain, and the forced
+//! stop that does not wait for it.
 //!
 //! The drain is the point of the endpoint, so it is tested on the real
 //! listener path ([`Server::serve_listener`]), not a bare router: a
@@ -204,10 +205,14 @@ fn client() -> reqwest::Client {
 }
 
 async fn request_shutdown(addr: SocketAddr, instance: &str) -> reqwest::Response {
+    post_shutdown(addr, json!({ "instance": instance })).await
+}
+
+async fn post_shutdown(addr: SocketAddr, body: Value) -> reqwest::Response {
     client()
         .post(format!("http://{addr}/_toker/shutdown"))
         .header("x-toker-control", "shutdown")
-        .json(&json!({ "instance": instance }))
+        .json(&body)
         .send()
         .await
         .expect("shutdown request")
@@ -426,6 +431,84 @@ async fn a_stream_under_way_finishes_byte_for_byte_while_new_connections_are_ref
 
     // The lock: taken while the turn ran, killed at exit, and the only
     // awake row is the hold. The exit is not the sessions going quiet.
+    assert_eq!(toker.probe.spawns.load(Ordering::SeqCst), 1);
+    assert_eq!(toker.probe.kills.load(Ordering::SeqCst), 1);
+    assert_eq!(awake_rows(&toker.store), vec![true]);
+}
+
+#[tokio::test]
+async fn a_forced_shutdown_does_not_wait_for_a_stream_but_exits_cleanly() {
+    let (mock, upstream) = spawn_mock().await;
+    let toker = spawn_toker(test_config(upstream), 0).await;
+
+    // Same live lane as the drain test: the lock is held when the exit
+    // comes, and a clean exit kills it without a release row.
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "stream": true,
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        "messages": [{"role": "user", "content": "Hi"}],
+    }))
+    .expect("body");
+    let shape = toker::ir::Request::parse(&body)
+        .expect("parse")
+        .anthropic()
+        .shape();
+    let now = jiff::Timestamp::now().as_millisecond();
+    toker
+        .store
+        .upsert_lane(&Lane {
+            key: format!("ses-1|{}", shape.tools_hash),
+            session_id: Some("ses-1".to_owned()),
+            tools_hash: Some(shape.tools_hash.clone()),
+            updated_ms: now - 1_000,
+            prompt_tokens: Some(200_000),
+            ttl: Some(3_600_000),
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+        })
+        .expect("lane");
+
+    let mut response = client()
+        .post(format!("http://{}/v1/messages", toker.addr))
+        .header("x-claude-code-session-id", "ses-1")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(body)
+        .send()
+        .await
+        .expect("messages request");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.chunk().await.expect("chunk").expect("first half");
+
+    // A forced stop that is not a boolean is refused, and stops nothing.
+    let bad = post_shutdown(
+        toker.addr,
+        json!({ "instance": toker.instance, "force": "yes" }),
+    )
+    .await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert!(!toker.served.is_finished());
+
+    // The upstream gate is never released: the stream would hang for
+    // good. A plain drain would wait on it; the forced one does not.
+    let shutdown = post_shutdown(
+        toker.addr,
+        json!({ "instance": toker.instance, "force": true }),
+    )
+    .await;
+    assert_eq!(shutdown.status(), StatusCode::ACCEPTED);
+    let served = tokio::time::timeout(Duration::from_secs(5), toker.served)
+        .await
+        .expect("the server returns without the stream finishing")
+        .expect("the serve task did not panic");
+    served.expect("a forced exit is still a clean one");
+    drop(mock);
+
+    // The exit path ran: the lock was killed once, and the exit is not
+    // the sessions going quiet, so there is no release row.
     assert_eq!(toker.probe.spawns.load(Ordering::SeqCst), 1);
     assert_eq!(toker.probe.kills.load(Ordering::SeqCst), 1);
     assert_eq!(awake_rows(&toker.store), vec![true]);

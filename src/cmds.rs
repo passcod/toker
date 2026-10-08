@@ -711,13 +711,19 @@ impl Pacing {
     };
 }
 
+/// How long the graceful restart may look for a quiet moment before
+/// giving up on it and telling the service to stop without waiting.
+pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What `toker restart` was asked to do.
 #[derive(Debug, Clone, Default)]
 pub struct RestartOpts {
-    /// Give up, restarting nothing, if no quiet moment comes in this long.
+    /// How long to wait for a quiet moment before forcing the stop
+    /// ([`DEFAULT_MAX_WAIT`] when unset).
     pub max_wait: Option<std::time::Duration>,
     /// Skip the wait. The shutdown still drains: nothing is cut, but the
-    /// new instance starts only after the responses under way finish.
+    /// new instance starts only after the responses under way finish, or
+    /// until `up_timeout` runs out and the stop is forced.
     pub now: bool,
 }
 
@@ -745,8 +751,13 @@ pub struct ControlReply {
 pub trait Control {
     /// `GET /_toker/status`.
     fn status(&self) -> impl Future<Output = Result<ControlReply, ControlError>>;
-    /// `POST /_toker/shutdown` for the named instance.
-    fn shutdown(&self, instance: &str) -> impl Future<Output = Result<ControlReply, ControlError>>;
+    /// `POST /_toker/shutdown` for the named instance; with `force`, not
+    /// waiting for connections under way.
+    fn shutdown(
+        &self,
+        instance: &str,
+        force: bool,
+    ) -> impl Future<Output = Result<ControlReply, ControlError>>;
 }
 
 /// [`Control`] over HTTP to the toker on a loopback port.
@@ -796,12 +807,20 @@ impl Control for HttpControl {
         )
     }
 
-    fn shutdown(&self, instance: &str) -> impl Future<Output = Result<ControlReply, ControlError>> {
+    fn shutdown(
+        &self,
+        instance: &str,
+        force: bool,
+    ) -> impl Future<Output = Result<ControlReply, ControlError>> {
+        let mut body = serde_json::json!({ "instance": instance });
+        if force {
+            body["force"] = serde_json::json!(true);
+        }
         self.send(
             self.client
                 .post(format!("{}/_toker/shutdown", self.base))
                 .header("x-toker-control", "shutdown")
-                .json(&serde_json::json!({ "instance": instance })),
+                .json(&body),
         )
     }
 }
@@ -923,7 +942,10 @@ pub async fn restart_run(
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
     let address = format!("127.0.0.1:{port}");
-    let read = |result: Result<ControlReply, ControlError>| -> anyhow::Result<Reading> {
+    // `None` is a service that did not answer in time: busy, not gone.
+    // That is the case the forced stop is for, so it is not an error
+    // here the way a refused connection or another server is.
+    let read = |result: Result<ControlReply, ControlError>| -> anyhow::Result<Option<Reading>> {
         let reply = match result {
             Ok(reply) => reply,
             // With the socket unit active, the connection itself starts
@@ -933,16 +955,13 @@ pub async fn restart_run(
                 "nothing is listening on {address}: toker is not running. Nothing was \
                  restarted; `systemctl --user start toker.socket` starts it."
             ),
-            Err(ControlError::Timeout) => bail!(
-                "toker on {address} did not answer within {}. Nothing was restarted.",
-                span(pacing.request_timeout)
-            ),
+            Err(ControlError::Timeout) => return Ok(None),
             Err(ControlError::Failed(error)) => {
                 bail!("asking toker on {address} for its status failed: {error}")
             }
         };
         match reading(&reply) {
-            Ok(reading) => Ok(reading),
+            Ok(reading) => Ok(Some(reading)),
             Err(Unreadable::NotToker(status)) => bail!(
                 "something on {address} answered the status request with {status}, so it \
                  is not toker. Nothing was restarted."
@@ -955,13 +974,21 @@ pub async fn restart_run(
         }
     };
 
+    let max_wait = opts.max_wait.unwrap_or(DEFAULT_MAX_WAIT);
     let started = tokio::time::Instant::now();
     let mut current = read(control.status().await)?;
+    // The last instance that answered: what the next one is told apart from.
+    let mut old = current.as_ref().map(|reading| reading.instance.clone());
     let mut quiet = 0;
     let mut shown = None;
+    let mut silent = false;
+    // Why the graceful restart was given up on, once it is.
+    let mut hard: Option<String> = None;
     loop {
         if opts.now {
-            if current.in_flight > 0 {
+            if let Some(current) = &current
+                && current.in_flight > 0
+            {
                 writeln!(
                     out,
                     "not waiting (--now): {} in flight will finish before the old instance exits",
@@ -970,78 +997,148 @@ pub async fn restart_run(
             }
             break;
         }
-        if current.in_flight == 0 {
-            quiet += 1;
-            if quiet >= QUIET_POLLS {
-                break;
+        match &current {
+            Some(current) if current.in_flight == 0 => {
+                quiet += 1;
+                if quiet >= QUIET_POLLS {
+                    break;
+                }
             }
-        } else {
-            quiet = 0;
-            if shown.is_none() {
-                writeln!(
-                    out,
-                    "waiting for {} in flight to finish (Ctrl-C leaves toker untouched)",
-                    responses(current.in_flight)
-                )?;
-            } else if shown != Some(current.in_flight) {
-                writeln!(out, "  {} in flight", current.in_flight)?;
+            Some(current) => {
+                quiet = 0;
+                if shown.is_none() {
+                    writeln!(
+                        out,
+                        "waiting for {} in flight to finish (Ctrl-C leaves toker untouched)",
+                        responses(current.in_flight)
+                    )?;
+                } else if shown != Some(current.in_flight) {
+                    writeln!(out, "  {} in flight", current.in_flight)?;
+                }
+                shown = Some(current.in_flight);
             }
-            shown = Some(current.in_flight);
+            None => {
+                quiet = 0;
+                if !silent {
+                    writeln!(
+                        out,
+                        "toker is not answering its status request (Ctrl-C leaves toker untouched)"
+                    )?;
+                }
+                silent = true;
+            }
         }
-        if let Some(max_wait) = opts.max_wait
-            && started.elapsed() >= max_wait
-        {
-            bail!(
-                "no quiet moment within {} (--max-wait): {} in flight at the last look. \
-                 toker was not restarted.",
-                span(max_wait),
-                responses(current.in_flight)
-            );
+        if started.elapsed() >= max_wait {
+            hard = Some(match &current {
+                Some(current) => format!(
+                    "no quiet moment within {}: {} in flight at the last look",
+                    span(max_wait),
+                    responses(current.in_flight)
+                ),
+                None => format!("toker did not answer within {}", span(max_wait)),
+            });
+            break;
         }
         tokio::time::sleep(pacing.poll).await;
         current = read(control.status().await)?;
+        if let Some(current) = &current {
+            old = Some(current.instance.clone());
+        }
     }
 
-    let old = current.instance;
-    match control.shutdown(&old).await {
-        Ok(reply) if reply.status == 202 => {}
-        Ok(reply) if reply.status == 409 => bail!(
-            "toker on {address} is no longer the instance that was idle (another restart?). \
-             Nothing was restarted by this command; run it again."
-        ),
-        Ok(reply) => bail!(
-            "toker on {address} refused the shutdown request ({}). Nothing was restarted.",
-            reply.status
-        ),
-        Err(ControlError::Down) => bail!(
-            "toker on {address} went away before the shutdown request reached it; \
-             systemd may be restarting it already."
-        ),
-        Err(ControlError::Timeout) => bail!(
-            "the shutdown request to {address} got no answer within {}: the old instance \
-             may or may not be draining.",
-            span(pacing.request_timeout)
-        ),
-        Err(ControlError::Failed(error)) => bail!(
-            "the shutdown request to {address} failed ({error}): the old instance may or \
-             may not be draining."
-        ),
+    if hard.is_none() {
+        match &current {
+            None => hard = Some("toker did not answer its status request".to_owned()),
+            Some(current) => match control.shutdown(&current.instance, false).await {
+                Ok(reply) if reply.status == 202 => {
+                    writeln!(
+                        out,
+                        "toker {} is draining and will exit; waiting for systemd to start the next one",
+                        short(&current.instance)
+                    )?;
+                }
+                Ok(reply) if reply.status == 409 => bail!(
+                    "toker on {address} is no longer the instance that was idle (another restart?). \
+                     Nothing was restarted by this command; run it again."
+                ),
+                Ok(reply) => bail!(
+                    "toker on {address} refused the shutdown request ({}). Nothing was restarted.",
+                    reply.status
+                ),
+                Err(ControlError::Down) => bail!(
+                    "toker on {address} went away before the shutdown request reached it; \
+                     systemd may be restarting it already."
+                ),
+                Err(ControlError::Timeout) => {
+                    hard = Some(format!(
+                        "the shutdown request got no answer within {}",
+                        span(pacing.request_timeout)
+                    ));
+                }
+                Err(ControlError::Failed(error)) => bail!(
+                    "the shutdown request to {address} failed ({error}): the old instance may or \
+                     may not be draining."
+                ),
+            },
+        }
     }
-    writeln!(
-        out,
-        "toker {} is draining and will exit; waiting for systemd to start the next one",
-        short(&old)
-    )?;
+
+    // The forced stop: the same request again, saying not to wait for
+    // connections. The daemon still exits through its normal path, so
+    // destructors run and the ledger and sleep lock are tidied; only the
+    // responses under way are cut, and the harness retries those. It names
+    // the last instance that answered, so without one there is nothing to
+    // address, and a daemon that answers nothing is for systemd to deal
+    // with.
+    let force = async |reason: &str, out: &mut dyn std::io::Write| -> anyhow::Result<()> {
+        let Some(instance) = &old else {
+            bail!(
+                "{reason}, and toker never answered, so there is no instance to tell to stop. \
+                 Nothing was restarted; `systemctl --user restart toker.service` restarts it."
+            );
+        };
+        writeln!(
+            out,
+            "{reason}; stopping toker without waiting for connections, systemd starts the next one"
+        )?;
+        match control.shutdown(instance, true).await {
+            Ok(reply) if reply.status == 202 => Ok(()),
+            // Gone between the two requests: on its way out already.
+            Err(ControlError::Down) => Ok(()),
+            Ok(reply) if reply.status == 409 => bail!(
+                "toker on {address} is no longer the instance that was asked to stop (another \
+                 restart?). Run the command again."
+            ),
+            Ok(reply) => bail!(
+                "toker on {address} refused the forced shutdown ({}). Nothing more was done.",
+                reply.status
+            ),
+            Err(ControlError::Timeout) => bail!(
+                "the forced shutdown request to {address} got no answer within {}. \
+                 `systemctl --user restart toker.service` restarts it from outside.",
+                span(pacing.request_timeout)
+            ),
+            Err(ControlError::Failed(error)) => bail!(
+                "the forced shutdown request to {address} failed ({error}). \
+                 `systemctl --user restart toker.service` restarts it from outside."
+            ),
+        }
+    };
+    let mut forced = false;
+    if let Some(reason) = &hard {
+        force(reason, out).await?;
+        forced = true;
+    }
 
     // Until the deadline anything goes: refused while nothing listens,
     // a timeout while the connection queues, the old instance itself if
     // the drain has not closed its listener yet. Only a new id ends it.
-    let deadline = tokio::time::Instant::now() + pacing.up_timeout;
+    let mut deadline = tokio::time::Instant::now() + pacing.up_timeout;
     loop {
         tokio::time::sleep(pacing.poll).await;
         if let Ok(reply) = control.status().await
             && let Ok(reading) = reading(&reply)
-            && reading.instance != old
+            && old.as_deref() != Some(reading.instance.as_str())
         {
             writeln!(
                 out,
@@ -1055,13 +1152,27 @@ pub async fn restart_run(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "no new toker answered on {address} within {} of the shutdown. The old \
-                 instance may still be draining a long response; under systemd \
-                 `Restart=always` starts the next one once it exits (see `systemctl --user \
-                 status toker.service`). A hand-run `toker serve` is not restarted.",
-                span(pacing.up_timeout)
-            );
+            if forced {
+                bail!(
+                    "no new toker answered on {address} within {} of the forced shutdown. Under \
+                     systemd `Restart=always` starts the next one once the old one has exited \
+                     (see `systemctl --user status toker.service`). A hand-run `toker serve` is \
+                     not restarted.",
+                    span(pacing.up_timeout)
+                );
+            }
+            // The drain is not done: a response that will not end. That
+            // is the second timeout, and it ends the same way.
+            force(
+                &format!(
+                    "the old instance was still draining {} after the shutdown",
+                    span(pacing.up_timeout)
+                ),
+                out,
+            )
+            .await?;
+            forced = true;
+            deadline = tokio::time::Instant::now() + pacing.up_timeout;
         }
     }
 }
@@ -1350,6 +1461,10 @@ mod restart_tests {
         statuses: Mutex<VecDeque<Result<ControlReply, ControlError>>>,
         status_calls: Mutex<usize>,
         shutdowns: Mutex<Vec<String>>,
+        forced: Mutex<Vec<String>>,
+        /// Whether a forced shutdown brings the successor up: after it,
+        /// status answers as the new instance.
+        revives: bool,
     }
 
     impl Script {
@@ -1358,7 +1473,18 @@ mod restart_tests {
                 statuses: Mutex::new(statuses.into()),
                 status_calls: Mutex::new(0),
                 shutdowns: Mutex::new(Vec::new()),
+                forced: Mutex::new(Vec::new()),
+                revives: false,
             }
+        }
+
+        fn reviving(mut self) -> Script {
+            self.revives = true;
+            self
+        }
+
+        fn forced(&self) -> Vec<String> {
+            self.forced.lock().unwrap().clone()
         }
 
         fn shutdowns(&self) -> Vec<String> {
@@ -1377,8 +1503,19 @@ mod restart_tests {
             }
         }
 
-        async fn shutdown(&self, instance: &str) -> Result<ControlReply, ControlError> {
-            self.shutdowns.lock().unwrap().push(instance.to_owned());
+        async fn shutdown(
+            &self,
+            instance: &str,
+            force: bool,
+        ) -> Result<ControlReply, ControlError> {
+            if force {
+                self.forced.lock().unwrap().push(instance.to_owned());
+                if self.revives {
+                    *self.statuses.lock().unwrap() = VecDeque::from([status(0, NEW)]);
+                }
+            } else {
+                self.shutdowns.lock().unwrap().push(instance.to_owned());
+            }
             Ok(ControlReply {
                 status: 202,
                 body: Some(json!({"toker": "shutdown", "ok": true})),
@@ -1453,19 +1590,78 @@ mod restart_tests {
     }
 
     #[tokio::test]
-    async fn max_wait_expiring_restarts_nothing() {
-        let script = Script::new(vec![status(1, OLD)]);
+    async fn max_wait_expiring_forces_the_stop_instead_of_waiting_on() {
+        // Busy until the wait runs out; the successor answers once forced.
+        let script = Script::new(vec![status(1, OLD), status(1, OLD), status(0, NEW)]).reviving();
         let (result, out) = run(
             &script,
             RestartOpts {
-                max_wait: Some(Duration::from_millis(30)),
+                max_wait: Some(Duration::from_millis(1)),
                 now: false,
             },
         )
         .await;
-        let error = result.expect_err("gives up");
-        assert!(script.shutdowns().is_empty(), "no shutdown was sent");
+        result.expect("restarts, forced");
+        assert!(
+            script.shutdowns().is_empty(),
+            "no graceful drain was asked for"
+        );
+        assert_eq!(script.forced(), vec![OLD.to_owned()]);
+        insta::assert_snapshot!(out);
+    }
+
+    #[tokio::test]
+    async fn a_status_that_times_out_is_waited_on_then_forced_not_an_error() {
+        // The service answered once, then went quiet: the instance it
+        // gave is what the forced stop names.
+        let script = Script::new(vec![
+            status(1, OLD),
+            Err(ControlError::Timeout),
+            Err(ControlError::Timeout),
+        ])
+        .reviving();
+        let (result, out) = run(
+            &script,
+            RestartOpts {
+                max_wait: Some(Duration::from_millis(1)),
+                now: false,
+            },
+        )
+        .await;
+        result.expect("restarts, forced");
+        assert!(script.shutdowns().is_empty());
+        assert_eq!(script.forced(), vec![OLD.to_owned()]);
+        insta::assert_snapshot!(out);
+    }
+
+    #[tokio::test]
+    async fn a_toker_that_never_answers_has_no_instance_to_force_and_says_so() {
+        let script = Script::new(vec![Err(ControlError::Timeout)]);
+        let (result, out) = run(
+            &script,
+            RestartOpts {
+                max_wait: Some(Duration::from_millis(1)),
+                now: false,
+            },
+        )
+        .await;
+        let error = result.expect_err("nothing to address");
+        assert!(script.shutdowns().is_empty() && script.forced().is_empty());
         insta::assert_snapshot!(format!("{out}---\n{error:#}"));
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_never_ends_is_forced_after_the_up_timeout() {
+        let mut statuses: Vec<_> = (0..QUIET_POLLS).map(|_| status(0, OLD)).collect();
+        // The old instance keeps answering through the whole drain
+        // budget; only once forced does the successor show.
+        statuses.push(status(1, OLD));
+        let script = Script::new(statuses).reviving();
+        let (result, out) = run(&script, RestartOpts::default()).await;
+        result.expect("restarts, forced after the drain times out");
+        assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        assert_eq!(script.forced(), vec![OLD.to_owned()]);
+        insta::assert_snapshot!(out);
     }
 
     #[tokio::test]
@@ -1529,6 +1725,7 @@ mod restart_tests {
         let (result, out) = run(&script, RestartOpts::default()).await;
         let error = result.expect_err("never up");
         assert_eq!(script.shutdowns(), vec![OLD.to_owned()]);
+        assert_eq!(script.forced().len(), 1, "forced once, not in a loop");
         insta::assert_snapshot!(format!("{out}---\n{error:#}"));
     }
 

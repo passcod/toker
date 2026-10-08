@@ -65,14 +65,15 @@ cargo install --path . && toker restart
 ```
 
 The unit's `ExecStart` is whichever binary ran `toker setup`; if that was not
-the cargo-installed one, re-run setup. `systemctl --user restart toker.service`
-is also safe: it cuts every in-flight stream, but the socket unit keeps
-listening so new connections queue, and harnesses retry a cut stream, which is
-how restarts were done before `toker restart` existed. `toker restart` is the
-tidier choice: it waits until nothing is in flight, then has the service drain
-and exit for systemd to start the new binary, so no stream is cut. If it gives
-up waiting on busy sessions, restart with systemctl rather than holding the
-change back. See [routing.md](docs/internals/routing.md).
+the cargo-installed one, re-run setup. `toker restart` waits for a quiet moment,
+then has the service drain and exit for systemd to start the new binary, so no
+stream is cut. If that does not work out in time (no quiet moment within 30s, a
+drain that does not end) it asks the service again to stop without waiting for
+connections: still a clean exit, with destructors run, but whatever was
+streaming is cut. That is safe: the socket unit keeps listening so new
+connections queue, and harnesses retry a cut stream, which is how restarts were
+done with `systemctl --user restart toker.service` before `toker restart`
+existed, and that still works too. See [routing.md](docs/internals/routing.md).
 
 **Never point a frontend's `ANTHROPIC_BASE_URL` at a listener that is not up.**
 `settings.json` is hot-reloaded into running sessions, so pointing it at nothing
