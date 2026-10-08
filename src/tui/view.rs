@@ -415,7 +415,7 @@ fn strip_colour(frame: &mut Frame) {
 }
 
 /// The legend's rows: a glyph or marker, and what it means.
-const LEGEND: [(&str, &str); 18] = [
+const LEGEND: [(&str, &str); 19] = [
     (
         "↑",
         "served on a newer model: bright on the latest turn, dim earlier",
@@ -424,6 +424,10 @@ const LEGEND: [(&str, &str); 18] = [
     (
         "%",
         "released to the end of the plan, stopping before overage",
+    ),
+    (
+        "!",
+        "stopped: the last thing this session got was a gate notice",
     ),
     ("↺", "compactions so far; - for none"),
     ("-", "not reported, which is not zero"),
@@ -1240,7 +1244,7 @@ fn ctx_cell(ctx: ContextWindow) -> Line<'static> {
     }
 }
 
-/// The MODEL cell with its `↑`/`$`/`%` markers, coloured per marker. The
+/// The MODEL cell with its `↑`/`$`/`%`/`!` markers, coloured per marker. The
 /// `claude-` prefix goes: every anthropic model carries it, so it
 /// distinguishes nothing and costs seven cells a row.
 fn model_cell(session: &SessionAgg) -> Line<'static> {
@@ -1259,6 +1263,12 @@ fn model_cell(session: &SessionAgg) -> Line<'static> {
         Some(Release::Overage) => line.push(Span::styled(" $", Style::new().fg(Color::Yellow))),
         Some(Release::Plan) => line.push(Span::styled(" %", Style::new().fg(Color::Yellow))),
         None => {}
+    }
+    if session.stopped {
+        line.push(Span::styled(
+            " !",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
     }
     Line::from(line)
 }
@@ -3556,6 +3566,9 @@ mod tests {
         assert!(text(&session).ends_with(" %"), "{}", text(&session));
         session.released = None;
         assert!(!text(&session).contains('$') && !text(&session).contains('%'));
+        assert!(!text(&session).contains('!'));
+        session.stopped = true;
+        assert!(text(&session).ends_with(" !"), "{}", text(&session));
     }
 
     #[test]

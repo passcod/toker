@@ -10,24 +10,24 @@ last 30m · 4 sessions · 1 idle · 12 requests                             last
 │… 2 more │ ↑           served on a newer model: bright on the latest turn, dim earlier │          │
 └─────────│ $           released past the armed quota gate for this window              │──────────┘
 ┌CONTEXT──│ %           released to the end of the plan, stopping before overage        │──────────┐
-│ses-free │ ↺           compactions so far; - for none                                  │          │
-│ses-hot  │ -           not reported, which is not zero                                 │          │
-│… 2 more │ ?           unknown: model, context ceiling, or token count                 │          │
-└─────────│ ≥           a floor: some rows unknown, or the span predates the data       │──────────┘
-┌TOKENS───│ <1%         spent less than the meter's 1% step shows; 0% is none at all    │──────────┐
-│fresh inp│ ·           no requests in that slice of the window; red holds an error     │          │
-│cache rea│ on track    the meter resets before it runs out                             │          │
+│ses-free │ !           stopped: the last thing this session got was a gate notice      │          │
+│ses-hot  │ ↺           compactions so far; - for none                                  │          │
+│… 2 more │ -           not reported, which is not zero                                 │          │
+└─────────│ ?           unknown: model, context ceiling, or token count                 │──────────┘
+┌TOKENS───│ ≥           a floor: some rows unknown, or the span predates the data       │──────────┐
+│fresh inp│ <1%         spent less than the meter's 1% step shows; 0% is none at all    │          │
+│cache rea│ ·           no requests in that slice of the window; red holds an error     │          │
+│cache wri│ on track    the meter resets before it runs out                             │          │
 │cache wri│ estimating  too little data to separate burn from noise                     │          │
-│cache wri│ stops ~T    reaches the armed gate's threshold at T                         │          │
-│output   │ out ~T      runs out at T                                                   │          │
-│hit rate │ gated ·     past the gate; the countdown is to exhaustion                   │e prefix  │
-│missed   │ on track?   a trailing ?: the gate's state is assumed, not observed         │          │
-└─────────│ last req    green under 30s, yellow under 5m, red beyond                    │──────────┘
-┌CACHE REB│ ctx         green: native 1M; yellow: another known ceiling                 │──────────┐
-│2 of 9 re│ idle        dim once a session has been quiet 3m                            │          │
-│system pr│ ? or Esc closes                                                             │          │
-│new prefi└─────────────────────────────────────────────────────────────────────────────┘          │
-│· ses-hot — system prompt changed (43,696 → 43,801 chars; block 1, in the last 8 bytes)           │
+│output   │ stops ~T    reaches the armed gate's threshold at T                         │          │
+│hit rate │ out ~T      runs out at T                                                   │e prefix  │
+│missed   │ gated ·     past the gate; the countdown is to exhaustion                   │          │
+└─────────│ on track?   a trailing ?: the gate's state is assumed, not observed         │──────────┘
+┌CACHE REB│ last req    green under 30s, yellow under 5m, red beyond                    │──────────┐
+│2 of 9 re│ ctx         green: native 1M; yellow: another known ceiling                 │          │
+│system pr│ idle        dim once a session has been quiet 3m                            │          │
+│new prefi│ ? or Esc closes                                                             │          │
+│· ses-hot└─────────────────────────────────────────────────────────────────────────────┘          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌RATE & QUOTA──────────────────────────────────────────────────────────────────────────────────────┐
 │  requests ·················▄▄▄···▄▄▄███· 0.4/min                                                 │

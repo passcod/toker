@@ -159,6 +159,12 @@ pub(crate) struct SessionAgg {
     /// into overage). Decided by the caller from the allowances table
     /// against the current meter resets, and passed in as a map.
     pub released: Option<Release>,
+    /// A gate notice is the last thing the session heard: its newest
+    /// decision row (a measurement, a release, or a notice) is a quota
+    /// block, a cold notice or a cold recap, so the frontend is sitting
+    /// on the notice waiting for the operator. The `!` marker. A turn
+    /// that went through afterwards, by whatever means, clears it.
+    pub stopped: bool,
     /// The context ceiling of the main lane's model, resolved through the
     /// chain (see [`session_ctx`]): the hand-verified catalogue first
     /// ([`resolve_context_window`] of the model, as of that lane's latest row
@@ -429,7 +435,26 @@ pub(crate) fn aggregate(
     let mut drift = 0;
     let mut window_requests = 0;
 
+    // Per session, whether its newest decision row was a gate notice.
+    // Only measurements, releases and notices decide: an error, a
+    // sleep-lock transition or a withheld cold notice says nothing
+    // about whether the frontend is waiting on a notice. Rows come in
+    // ts order, so the last write wins.
+    let mut stopped: HashMap<String, bool> = HashMap::new();
+
     for row in sorted {
+        let decides = match row.kind {
+            None | Some(RowKind::Released) => Some(false),
+            Some(RowKind::Blocked | RowKind::Cold | RowKind::ColdRecap) => Some(true),
+            Some(_) => None,
+        };
+        if let Some(is_stop) = decides {
+            let key = row
+                .session_id
+                .clone()
+                .unwrap_or_else(|| NO_SESSION.to_owned());
+            stopped.insert(key, is_stop);
+        }
         // Error/drift metrics see every row kind — proxy-written rows are
         // their only source — and error rows mark their minute's bucket.
         match row.kind {
@@ -492,6 +517,7 @@ pub(crate) fn aggregate(
                 forced_latest: false,
                 forced_any: false,
                 released: released.get(&key).copied(),
+                stopped: false,
                 ctx: ContextWindow::Unknown,
                 label: labels.get(&key).cloned(),
                 latest_ts_ms: row.ts_ms,
@@ -550,6 +576,7 @@ pub(crate) fn aggregate(
     // capability resolves to the phase that applied, never to today's
     // against historical rows.
     for (session, lanes) in sessions.iter_mut().zip(lanes) {
+        session.stopped = stopped.get(&session.session).copied().unwrap_or(false);
         if let Some((_, main)) = lanes.into_iter().max_by(|(a_key, a), (b_key, b)| {
             a.held
                 .cmp(&b.held)
@@ -2265,6 +2292,69 @@ mod tests {
             Some(crate::ir::Release::Overage)
         );
         assert_eq!(session("ses-live").released, None);
+    }
+
+    /// A session is `stopped` while a gate notice is the newest thing
+    /// it heard, and any turn that follows (a measurement or a release)
+    /// clears it. Errors, sleep-lock transitions and a withheld cold
+    /// notice do not decide either way.
+    #[test]
+    fn a_session_is_stopped_while_a_notice_is_its_newest_decision() {
+        let row = |ts, session: &str, kind: Option<RowKind>| {
+            let mut row = display_bare(ts);
+            row.kind = kind;
+            row.session_id = Some(session.into());
+            row
+        };
+        let rows = [
+            // Blocked after its last turn: stopped.
+            row(mins_ago(9), "ses-block", None),
+            row(mins_ago(5), "ses-block", Some(RowKind::Blocked)),
+            // A cold notice, then a turn that went through: cleared.
+            row(mins_ago(9), "ses-cold", None),
+            row(mins_ago(6), "ses-cold", Some(RowKind::Cold)),
+            row(mins_ago(4), "ses-cold", None),
+            // A cold recap answered by the gate: stopped.
+            row(mins_ago(9), "ses-recap", None),
+            row(mins_ago(3), "ses-recap", Some(RowKind::ColdRecap)),
+            // Blocked, then released: cleared.
+            row(mins_ago(9), "ses-free", None),
+            row(mins_ago(6), "ses-free", Some(RowKind::Blocked)),
+            row(mins_ago(5), "ses-free", Some(RowKind::Released)),
+            // Noise after a turn does not stop it, and noise after a
+            // notice does not clear it.
+            row(mins_ago(9), "ses-quiet", None),
+            row(mins_ago(4), "ses-quiet", Some(RowKind::ColdQuiet)),
+            row(mins_ago(3), "ses-quiet", Some(RowKind::Error)),
+            row(mins_ago(9), "ses-still", None),
+            row(mins_ago(6), "ses-still", Some(RowKind::Blocked)),
+            row(mins_ago(2), "ses-still", Some(RowKind::Error)),
+            row(mins_ago(1), "ses-still", Some(RowKind::Awake)),
+        ];
+        let snap = super::aggregate(
+            &rows,
+            None,
+            &super::Released::new(),
+            &no_labels(),
+            &no_catalogs(),
+            None,
+            WINDOW,
+            NOW,
+            rows.len() as i64,
+        );
+        let stopped = |name: &str| {
+            snap.sessions
+                .iter()
+                .find(|s| s.session == name)
+                .unwrap_or_else(|| panic!("no session {name}"))
+                .stopped
+        };
+        assert!(stopped("ses-block"));
+        assert!(!stopped("ses-cold"), "a turn after the notice clears it");
+        assert!(stopped("ses-recap"));
+        assert!(!stopped("ses-free"), "a release after the block clears it");
+        assert!(!stopped("ses-quiet"));
+        assert!(stopped("ses-still"), "noise does not clear a stop");
     }
 
     /// A session row reads its main lane — the lane (`tools_hash`)

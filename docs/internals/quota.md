@@ -90,6 +90,12 @@ release for the same window only widens it: burn over over makes it overage,
 over over burn leaves it overage. The TUI marks a session `$` for overage and
 `%` for the plan only.
 
+A `!` marks a session stopped by a notice: its newest decision row is a block,
+a cold notice or a cold recap, with no measurement or release after it. Errors,
+sleep-lock transitions and a withheld cold notice are not decisions, so they
+neither set nor clear it. A session whose only rows are notices has no
+measurement row and so no table row to mark.
+
 ## Allowances outlive their window only as dead rows
 
 A release grants an allowance per exhausted meter, keyed by that meter's
