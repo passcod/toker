@@ -322,11 +322,13 @@ and complete OpenRouter response interpretation are implemented. OpenAI
 Responses request ingress now preserves messages, tools, named reasoning
 effort, extensions, and opaque provider reasoning items canonically. The Codex
 Responses backend replays compatible request extensions through that IR, with
-deterministic and append-prefix-stable rendering. Its frontend response
-renderer remains pending. The Messages and OpenRouter Chat provider bindings
-declare canonical readiness, and the Chat frontend renders canonical streaming
-and complete responses. Live handlers remain on the legacy path until phase 3
-cuts each route over.
+deterministic and append-prefix-stable rendering. Its frontend adapter now
+renders canonical streaming events and complete turns back to Responses,
+including provider-encrypted reasoning. The Messages and OpenRouter Chat
+provider bindings declare canonical readiness, and the Chat frontend renders
+canonical streaming and complete responses. The Codex Responses and Chat
+handlers now use those adapters live; the remaining handlers stay on the
+legacy path until phase 3 cuts each route over.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.
@@ -339,9 +341,11 @@ cuts each route over.
 
 ### 3. Resolve concrete model targets and cut routes over
 
-Underway: OpenAI Chat to `codex_sub` is the first live canonical route. It can
+Underway: OpenAI Chat to `codex_sub` was the first live canonical route. It can
 be selected as the Chat default or per request with `codex_sub/<model>` and
 translates request, streaming response, complete response, errors and usage.
+OpenAI Responses to `codex_sub` now takes the same path despite matching wire
+protocols, including compatible extension replay and encrypted reasoning.
 
 - Replace per-handler provider selection with a route registry.
 - Add a `ModelTarget` carrying provider, binding, requested model, and effective

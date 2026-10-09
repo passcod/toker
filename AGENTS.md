@@ -45,11 +45,12 @@ The full text and the incidents behind them are in
    one. Do not add one without the same gate.
 5. **Never guess prices.** Verify against the published page and move
    `catalog::pricing::VERIFIED_ON`. Store cache-read rates explicitly.
-6. **The forwarded body is the client's**, except the licensed rewrites:
+6. **A legacy passthrough body is the client's**, except the licensed rewrites:
    `strip_release`, the `provider/model` prefix strip, the force-newest
    `set_model`, `retarget_compaction`, `strip_message_effort`,
    `thinking_between_tools`, `rewrite_mapped_models`, and translation on a
-   cross-protocol route. Editing a body anywhere else is a bug.
+   a route migrated to the universal canonical pipeline. Editing a body
+   anywhere else is a bug.
 7. **Never pin a quota weight.** Weights are fitted from the ledger on every run
    and carry their spread; one the data cannot separate from zero is no weight.
 8. **Gate notices are model-visible and byte-stable.** A notice enters the

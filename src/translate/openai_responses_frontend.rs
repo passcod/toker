@@ -1,16 +1,23 @@
-//! OpenAI Responses request ingress: Responses JSON into canonical IR.
+//! OpenAI Responses frontend adapter: Responses JSON into canonical IR, and
+//! canonical response events/turns back onto the Responses wire.
 //!
 //! This adapter describes the frontend wire only. It preserves named
 //! reasoning effort without inventing an Anthropic token budget, keeps
 //! provider reasoning input items opaque and source-tagged, and retains
-//! unmodelled fields at their nearest canonical node.
+//! unmodelled fields at their nearest canonical node. Response rendering is
+//! deterministic: wire-required identities that canonical events do not carry
+//! use stable, position-derived placeholders rather than clocks or randomness.
 
-use serde_json::Value;
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonMessage, CanonRole, CanonSystemPart, CanonTool, CanonToolChoice,
-    CanonicalExtension, CanonicalRequest, SamplingSpec, ThinkingSpec, ToolResultContent,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonSystemPart, CanonTool, CanonToolChoice, CanonTurn, CanonicalExtension, CanonicalRequest,
+    CanonicalUsage, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
+use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
 use crate::translate::TranslateError;
 
@@ -416,10 +423,524 @@ fn extensions(source: &Value, path: &str, modeled: &[&str]) -> Vec<CanonicalExte
         .collect()
 }
 
+// ── response rendering ─────────────────────────────────────────────
+
+const UNNAMED_RESPONSE: &str = "resp";
+
+#[derive(Debug, Clone)]
+pub struct OpenAiResponsesRenderer {
+    model: String,
+    response_id: Option<String>,
+    sequence: u64,
+    next_output_index: u64,
+    next_message_id: u64,
+    text: Option<TextItem>,
+    reasoning: Option<ReasoningItem>,
+    started: bool,
+    ended: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TextItem {
+    output_index: u64,
+    id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReasoningItem {
+    output_index: u64,
+    id: String,
+    summaries: BTreeMap<u64, String>,
+    encrypted_content: Option<String>,
+}
+
+impl OpenAiResponsesRenderer {
+    pub fn new(model: &str) -> OpenAiResponsesRenderer {
+        OpenAiResponsesRenderer {
+            model: model.to_owned(),
+            response_id: None,
+            sequence: 0,
+            next_output_index: 0,
+            next_message_id: 0,
+            text: None,
+            reasoning: None,
+            started: false,
+            ended: false,
+        }
+    }
+
+    pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
+        if self.ended {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        match event {
+            CanonEvent::TurnStarted { turn_id } => {
+                if self.started {
+                    return out;
+                }
+                self.started = true;
+                self.response_id.clone_from(turn_id);
+                let response = json!({
+                    "id": self.response_id(),
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.model,
+                });
+                out.push(self.sse("response.created", json!({"response": response})));
+            }
+            CanonEvent::TextDelta { delta } => {
+                self.ensure_text(&mut out);
+                let item = self.text.as_mut().expect("text item opened");
+                item.text.push_str(delta);
+                let output_index = item.output_index;
+                let item_id = item.id.clone();
+                out.push(self.sse(
+                    "response.output_text.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": delta,
+                    }),
+                ));
+            }
+            CanonEvent::ThinkingDelta { part, delta } => {
+                self.ensure_reasoning(&mut out);
+                let item = self.reasoning.as_mut().expect("reasoning item opened");
+                item.summaries.entry(*part).or_default().push_str(delta);
+                let output_index = item.output_index;
+                let item_id = item.id.clone();
+                out.push(self.sse(
+                    "response.reasoning_summary_text.delta",
+                    json!({
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "summary_index": part,
+                        "delta": delta,
+                    }),
+                ));
+            }
+            CanonEvent::ThinkingSignature { .. } => {}
+            CanonEvent::RedactedThinking { data } => {
+                self.ensure_reasoning(&mut out);
+                self.reasoning
+                    .as_mut()
+                    .expect("reasoning item opened")
+                    .encrypted_content = Some(data.clone());
+            }
+            CanonEvent::ToolCall(call) => {
+                let output_index = self.take_output_index();
+                let id = format!("fc_{output_index}");
+                out.push(self.sse(
+                    "response.output_item.added",
+                    json!({
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": id,
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": "",
+                            "status": "in_progress",
+                        },
+                    }),
+                ));
+                out.push(self.sse(
+                    "response.output_item.done",
+                    json!({
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": id,
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                            "status": "completed",
+                        },
+                    }),
+                ));
+            }
+            CanonEvent::TextEnded => self.finish_text(&mut out),
+            CanonEvent::ThinkingEnded => self.finish_reasoning(&mut out),
+            CanonEvent::TurnEnded { stop_reason, usage } => {
+                self.finish_reasoning(&mut out);
+                self.finish_text(&mut out);
+                let response =
+                    terminal_response(self.response_id(), stop_reason, usage.as_ref(), &self.model);
+                let kind = if matches!(
+                    stop_reason,
+                    CanonStopReason::MaxTokens
+                        | CanonStopReason::ContextWindowExceeded
+                        | CanonStopReason::Refusal
+                        | CanonStopReason::Incomplete(_)
+                ) {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
+                out.push(self.sse(kind, json!({"response": response})));
+                self.ended = true;
+            }
+            CanonEvent::TurnFailed { error } => {
+                let response = json!({
+                    "id": self.response_id(),
+                    "object": "response",
+                    "status": "failed",
+                    "model": self.model,
+                    "error": responses_error(error),
+                });
+                out.push(self.sse("response.failed", json!({"response": response})));
+                self.ended = true;
+            }
+            CanonEvent::Error { error } => {
+                out.push(self.sse("error", json!({"error": responses_error(error)})));
+            }
+        }
+        out
+    }
+
+    fn ensure_text(&mut self, out: &mut Vec<SseEvent>) {
+        if self.text.is_some() {
+            return;
+        }
+        let output_index = self.take_output_index();
+        let id = format!("msg_{}", self.next_message_id);
+        self.next_message_id += 1;
+        out.push(self.sse(
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": {"type": "message", "id": id, "role": "assistant",
+                         "content": [], "status": "in_progress"},
+            }),
+        ));
+        self.text = Some(TextItem {
+            output_index,
+            id,
+            text: String::new(),
+        });
+    }
+
+    fn ensure_reasoning(&mut self, out: &mut Vec<SseEvent>) {
+        if self.reasoning.is_some() {
+            return;
+        }
+        let output_index = self.take_output_index();
+        let id = format!("rs_{output_index}");
+        out.push(self.sse(
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": {"type": "reasoning", "id": id, "summary": []},
+            }),
+        ));
+        self.reasoning = Some(ReasoningItem {
+            output_index,
+            id,
+            summaries: BTreeMap::new(),
+            encrypted_content: None,
+        });
+    }
+
+    fn finish_text(&mut self, out: &mut Vec<SseEvent>) {
+        let Some(item) = self.text.take() else {
+            return;
+        };
+        out.push(self.sse(
+            "response.output_item.done",
+            json!({
+                "output_index": item.output_index,
+                "item": {"type": "message", "id": item.id, "role": "assistant",
+                         "content": [{"type": "output_text", "text": item.text}],
+                         "status": "completed"},
+            }),
+        ));
+    }
+
+    fn finish_reasoning(&mut self, out: &mut Vec<SseEvent>) {
+        let Some(item) = self.reasoning.take() else {
+            return;
+        };
+        let summary = item
+            .summaries
+            .into_values()
+            .map(|text| json!({"type": "summary_text", "text": text}))
+            .collect::<Vec<_>>();
+        let mut reasoning = json!({"type": "reasoning", "id": item.id, "summary": summary});
+        if let Some(data) = item.encrypted_content {
+            reasoning
+                .as_object_mut()
+                .expect("reasoning item is an object")
+                .insert("encrypted_content".to_owned(), json!(data));
+        }
+        out.push(self.sse(
+            "response.output_item.done",
+            json!({"output_index": item.output_index, "item": reasoning}),
+        ));
+    }
+
+    fn take_output_index(&mut self) -> u64 {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn response_id(&self) -> &str {
+        self.response_id.as_deref().unwrap_or(UNNAMED_RESPONSE)
+    }
+
+    fn sse(&mut self, kind: &str, fields: Value) -> SseEvent {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        let mut value = fields.as_object().cloned().unwrap_or_default();
+        value.insert("type".to_owned(), json!(kind));
+        value.insert("sequence_number".to_owned(), json!(sequence));
+        SseEvent {
+            event: Some(kind.to_owned()),
+            data_lines: vec![
+                serde_json::to_string(&Value::Object(value)).expect("responses event serialises"),
+            ],
+        }
+    }
+}
+
+pub fn openai_responses_from_canonical(model: &str, turn: &CanonTurn) -> Value {
+    if let Some(error) = &turn.error {
+        return json!({
+            "id": turn.turn_id.as_deref().unwrap_or(UNNAMED_RESPONSE),
+            "object": "response",
+            "status": "failed",
+            "model": model,
+            "output": [],
+            "error": responses_error(error),
+        });
+    }
+
+    let output = response_output(turn);
+    let mut response = terminal_response(
+        turn.turn_id.as_deref().unwrap_or(UNNAMED_RESPONSE),
+        &turn.stop_reason,
+        turn.usage.as_ref(),
+        model,
+    );
+    response
+        .as_object_mut()
+        .expect("terminal response is an object")
+        .insert("output".to_owned(), Value::Array(output));
+    response
+}
+
+fn response_output(turn: &CanonTurn) -> Vec<Value> {
+    if let Some(blocks) = &turn.blocks {
+        let mut output = Vec::new();
+        let mut index = 0;
+        while index < blocks.len() {
+            if matches!(
+                blocks[index].semantic(),
+                CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
+            ) {
+                let output_index = output.len();
+                let mut summary = Vec::new();
+                let mut encrypted_content = None;
+                while index < blocks.len() {
+                    match blocks[index].semantic() {
+                        CanonBlock::Thinking { text, .. } => {
+                            summary.push(json!({"type": "summary_text", "text": text}));
+                        }
+                        CanonBlock::RedactedThinking { data } => {
+                            encrypted_content = Some(data);
+                        }
+                        _ => break,
+                    }
+                    index += 1;
+                }
+                let mut reasoning = json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{output_index}"),
+                    "summary": summary,
+                });
+                if let Some(data) = encrypted_content {
+                    reasoning
+                        .as_object_mut()
+                        .expect("reasoning output is an object")
+                        .insert("encrypted_content".to_owned(), json!(data));
+                }
+                output.push(reasoning);
+                continue;
+            }
+            if let Some(value) = output_of_block(blocks[index].semantic(), output.len()) {
+                output.push(value);
+            }
+            index += 1;
+        }
+        return output;
+    }
+    let mut output = Vec::new();
+    if !turn.thinking.is_empty() {
+        output.push(json!({
+            "type": "reasoning",
+            "id": "rs_0",
+            "summary": turn.thinking.values()
+                .map(|text| json!({"type": "summary_text", "text": text}))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    if !turn.text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": "msg_0",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": turn.text}],
+            "status": "completed",
+        }));
+    }
+    output.extend(turn.tool_calls.iter().enumerate().map(|(index, call)| {
+        json!({
+            "type": "function_call",
+            "id": format!("fc_{index}"),
+            "call_id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "status": "completed",
+        })
+    }));
+    output
+}
+
+fn output_of_block(block: &CanonBlock, index: usize) -> Option<Value> {
+    match block {
+        CanonBlock::Text(text) => Some(json!({
+            "type": "message", "id": format!("msg_{index}"), "role": "assistant",
+            "content": [{"type": "output_text", "text": text}], "status": "completed",
+        })),
+        CanonBlock::Thinking { text, .. } => Some(json!({
+            "type": "reasoning", "id": format!("rs_{index}"),
+            "summary": [{"type": "summary_text", "text": text}],
+        })),
+        CanonBlock::RedactedThinking { data } => Some(json!({
+            "type": "reasoning", "id": format!("rs_{index}"), "summary": [],
+            "encrypted_content": data,
+        })),
+        CanonBlock::ToolUse { id, name, input } => Some(json!({
+            "type": "function_call", "id": format!("fc_{index}"), "call_id": id,
+            "name": name, "arguments": serde_json::to_string(input)
+                .expect("tool input serialises"), "status": "completed",
+        })),
+        CanonBlock::Image { .. } | CanonBlock::ToolResult { .. } | CanonBlock::Annotated { .. } => {
+            None
+        }
+    }
+}
+
+fn terminal_response(
+    id: &str,
+    stop_reason: &CanonStopReason,
+    usage: Option<&CanonicalUsage>,
+    model: &str,
+) -> Value {
+    let incomplete = incomplete_reason(stop_reason);
+    let mut response = Map::new();
+    response.insert("id".to_owned(), json!(id));
+    response.insert("object".to_owned(), json!("response"));
+    response.insert(
+        "status".to_owned(),
+        json!(if incomplete.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        }),
+    );
+    response.insert("model".to_owned(), json!(model));
+    if let Some(reason) = incomplete {
+        response.insert("incomplete_details".to_owned(), json!({"reason": reason}));
+    } else {
+        response.insert(
+            "end_turn".to_owned(),
+            json!(!matches!(stop_reason, CanonStopReason::ToolUse)),
+        );
+    }
+    if let Some(usage) = usage {
+        response.insert("usage".to_owned(), responses_usage(usage));
+    }
+    Value::Object(response)
+}
+
+fn incomplete_reason(reason: &CanonStopReason) -> Option<&str> {
+    match reason {
+        CanonStopReason::MaxTokens => Some("max_output_tokens"),
+        CanonStopReason::ContextWindowExceeded => Some("context_window_exceeded"),
+        CanonStopReason::Refusal => Some("content_filter"),
+        CanonStopReason::Incomplete(reason) => Some(reason),
+        CanonStopReason::EndTurn
+        | CanonStopReason::ToolUse
+        | CanonStopReason::StopSequence
+        | CanonStopReason::PauseTurn => None,
+    }
+}
+
+fn responses_usage(usage: &CanonicalUsage) -> Value {
+    let mut value = Map::new();
+    if let Some(input) = usage.input {
+        value.insert("input_tokens".to_owned(), json!(input));
+    }
+    if usage.cache_read.is_some() || usage.cache_write.is_some() {
+        let mut details = Map::new();
+        if let Some(cached) = usage.cache_read {
+            details.insert("cached_tokens".to_owned(), json!(cached));
+        }
+        if let Some(written) = usage.cache_write {
+            details.insert("cache_write_tokens".to_owned(), json!(written));
+        }
+        value.insert("input_tokens_details".to_owned(), Value::Object(details));
+    }
+    if let Some(output) = usage.output {
+        value.insert("output_tokens".to_owned(), json!(output));
+    }
+    if let Some(reasoning) = usage.reasoning {
+        value.insert(
+            "output_tokens_details".to_owned(),
+            json!({"reasoning_tokens": reasoning}),
+        );
+    }
+    if let (Some(input), Some(output)) = (usage.input, usage.output) {
+        value.insert("total_tokens".to_owned(), json!(input + output));
+    }
+    Value::Object(value)
+}
+
+fn responses_error(error: &CanonError) -> Value {
+    let kind = match error.kind {
+        CanonErrorKind::RateLimit => "rate_limit_error",
+        CanonErrorKind::InvalidRequest => "invalid_request_error",
+        CanonErrorKind::Authentication => "authentication_error",
+        CanonErrorKind::Permission => "permission_error",
+        CanonErrorKind::NotFound => "not_found_error",
+        CanonErrorKind::TooLarge => "request_too_large",
+        CanonErrorKind::Overloaded => "overloaded_error",
+        CanonErrorKind::Api => "api_error",
+    };
+    let mut value = Map::new();
+    value.insert("type".to_owned(), json!(kind));
+    value.insert("code".to_owned(), json!(kind));
+    value.insert("message".to_owned(), json!(error.message));
+    if let Some(resets_at) = error.resets_at {
+        value.insert("resets_at".to_owned(), json!(resets_at));
+    }
+    Value::Object(value)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::from_openai_responses;
-    use crate::ir::canonical::{CanonBlock, CanonRole, CanonToolChoice, ThinkingSpec};
+    use std::collections::BTreeMap;
+
+    use super::{OpenAiResponsesRenderer, from_openai_responses, openai_responses_from_canonical};
+    use crate::ir::canonical::{
+        CanonBlock, CanonEvent, CanonRole, CanonStopReason, CanonToolCall, CanonToolChoice,
+        CanonTurn, CanonicalUsage, ThinkingSpec,
+    };
+    use crate::providers::codex::ResponsesSse;
     use crate::translate::{TranslateError, render_codex};
     use serde_json::json;
 
@@ -576,6 +1097,148 @@ mod tests {
                 1,
             )]
         );
+    }
+
+    #[test]
+    fn canonical_events_render_as_responses_sse_and_round_trip() {
+        let usage = CanonicalUsage {
+            input: Some(12),
+            cache_read: Some(4),
+            cache_write: None,
+            output: Some(7),
+            reasoning: Some(3),
+            raw: json!({
+                "input_tokens": 12,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens": 7,
+                "output_tokens_details": {"reasoning_tokens": 3},
+                "total_tokens": 19
+            }),
+        };
+        let canonical = vec![
+            CanonEvent::TurnStarted {
+                turn_id: Some("resp_1".to_owned()),
+            },
+            CanonEvent::ThinkingDelta {
+                part: 0,
+                delta: "consider".to_owned(),
+            },
+            CanonEvent::RedactedThinking {
+                data: "ciphertext".to_owned(),
+            },
+            CanonEvent::ThinkingEnded,
+            CanonEvent::TextDelta {
+                delta: "hello".to_owned(),
+            },
+            CanonEvent::TextEnded,
+            CanonEvent::ToolCall(CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{\"id\":1}".to_owned(),
+            }),
+            CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                usage: Some(usage),
+            },
+        ];
+        let mut renderer = OpenAiResponsesRenderer::new("visible-model");
+        let rendered = canonical
+            .iter()
+            .flat_map(|event| renderer.feed(event))
+            .collect::<Vec<_>>();
+        let kinds = rendered
+            .iter()
+            .map(|event| event.event.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_text.delta",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (sequence, event) in rendered.iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(&event.data()).expect("event JSON");
+            assert_eq!(value["sequence_number"], json!(sequence));
+        }
+        let reasoning_done: serde_json::Value =
+            serde_json::from_str(&rendered[3].data()).expect("reasoning done JSON");
+        assert_eq!(
+            reasoning_done["item"]["encrypted_content"],
+            json!("ciphertext")
+        );
+
+        let wire = rendered
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {}\n\n",
+                    event.event.as_deref().unwrap(),
+                    event.data()
+                )
+            })
+            .collect::<String>();
+        let mut parser = ResponsesSse::new();
+        let parsed = parser.feed(wire.as_bytes());
+        let mut interpreter = crate::translate::codex_backend::CanonStream::new();
+        let round_tripped = parsed
+            .iter()
+            .flat_map(|event| interpreter.feed(event))
+            .collect::<Vec<_>>();
+        assert_eq!(round_tripped, canonical);
+    }
+
+    #[test]
+    fn complete_canonical_turn_renders_as_a_responses_body() {
+        let turn = CanonTurn {
+            turn_id: Some("resp_1".to_owned()),
+            stop_reason: CanonStopReason::Incomplete("max_output_tokens".to_owned()),
+            usage: None,
+            error: None,
+            tool_calls: vec![CanonToolCall {
+                id: "call_1".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{\"id\":1}".to_owned(),
+            }],
+            blocks: Some(vec![
+                CanonBlock::Thinking {
+                    text: "consider".to_owned(),
+                    signature: None,
+                },
+                CanonBlock::RedactedThinking {
+                    data: "ciphertext".to_owned(),
+                },
+                CanonBlock::Text("partial".to_owned()),
+                CanonBlock::ToolUse {
+                    id: "call_1".to_owned(),
+                    name: "lookup".to_owned(),
+                    input: json!({"id": 1}),
+                },
+            ]),
+            text: "partial".to_owned(),
+            thinking: BTreeMap::from([(0, "consider".to_owned())]),
+        };
+        let response = openai_responses_from_canonical("visible-model", &turn);
+        assert_eq!(response["status"], json!("incomplete"));
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            json!("max_output_tokens")
+        );
+        assert_eq!(response["output"][0]["type"], json!("reasoning"));
+        assert_eq!(
+            response["output"][0]["encrypted_content"],
+            json!("ciphertext")
+        );
+        assert_eq!(response["output"][1]["type"], json!("message"));
+        assert_eq!(response["output"][2]["call_id"], json!("call_1"));
     }
 
     #[test]

@@ -52,10 +52,10 @@
 //!   ingress and deterministic OpenRouter Chat egress. `developer` remains a
 //!   distinct canonical role, tool messages become structural tool results,
 //!   and node-local Chat extensions replay only to the compatible dialect.
-//! - [`openai_responses_frontend::from_openai_responses`]: Responses request
-//!   ingress. Named effort remains named rather than being guessed into a
-//!   token budget, and provider reasoning input items stay opaque and
-//!   source-tagged for compatible replay.
+//! - [`openai_responses_frontend`]: Responses request ingress plus canonical
+//!   streaming and complete response rendering. Named effort remains named
+//!   rather than being guessed into a token budget, and provider reasoning
+//!   items stay opaque and source-tagged for compatible replay.
 //! - [`to_codex`]: the composition of the two — the public entry
 //!   the server calls (unit C).
 //!
@@ -255,7 +255,9 @@ pub use openai_chat_backend::{
     OpenAiChatResponseStream, canonical_turn_from_openai_chat, render_openai_chat,
 };
 pub use openai_chat_frontend::{OpenAiChatRenderer, from_openai_chat, openai_chat_from_canonical};
-pub use openai_responses_frontend::from_openai_responses;
+pub use openai_responses_frontend::{
+    OpenAiResponsesRenderer, from_openai_responses, openai_responses_from_canonical,
+};
 pub use to_anthropic::{AnthropicStream, anthropic_error_type, message_from_capture};
 pub use to_codex::{render_to_codex, to_codex};
 

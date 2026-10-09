@@ -116,10 +116,11 @@ reasons.
    NULL-costed for the same reason: there is no per-token price for its slugs to
    verify.
 
-6. **The forwarded body is the client's, with narrow exceptions.** A
-   same-protocol route forwards the client's own buffer whenever nothing
-   transformed it (see [routing.md](routing.md)), so every edit below is a
-   deliberate, once-per-change byte event:
+6. **A legacy passthrough body is the client's, with narrow exceptions.** A
+   route not yet migrated to universal canonical rendering forwards the
+   client's own buffer whenever nothing transformed it (see
+   [routing.md](routing.md)), so every edit below is a deliberate,
+   once-per-change byte event:
 
    - `AnthropicBodyMut::strip_release` removes the release markers
      (`$#$BURN$#$`, and the plan-only `$#$OVER$#$`), strings toker itself
@@ -152,9 +153,10 @@ reasons.
    - `model_map::rewrite_mapped_models` applies an explicit, configured routing
      map as the last stage and changes only model positions. An unmatched or
      disabled map returns the input bytes untouched.
-   - Translation on a cross-protocol route (`translate::to_codex`) builds a new
-     body, because the backend speaks a different wire. It is pure, so turn N+1
-     reproduces turn N's bytes wherever the conversation did not change.
+   - Translation on a route migrated to the universal canonical pipeline
+     builds a new body even when the protocols match. It is pure, so turn N+1
+     reproduces turn N's backend prefix wherever the conversation did not
+     change. The Responses to Codex route is the first same-protocol cutover.
 
    Dropping `cache_control` needs a second licence on top of a body rewrite, and
    there are exactly two: a **model change**, since caches are keyed per model

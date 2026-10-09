@@ -697,7 +697,15 @@ impl CanonStream {
     fn item_done(&mut self, item: &Item, out: &mut Vec<CanonEvent>) {
         match item.kind() {
             Some("message") => out.push(CanonEvent::TextEnded),
-            Some("reasoning") => out.push(CanonEvent::ThinkingEnded),
+            Some("reasoning") => {
+                if let Some(data) = item
+                    .as_reasoning()
+                    .and_then(|reasoning| reasoning.encrypted_content)
+                {
+                    out.push(CanonEvent::RedactedThinking { data });
+                }
+                out.push(CanonEvent::ThinkingEnded);
+            }
             Some("function_call") => {
                 if let Some(call) = item.as_function_call() {
                     self.function_calls = true;
@@ -811,7 +819,7 @@ pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
                 arguments: call.arguments,
             })
             .collect(),
-        blocks: None,
+        blocks: blocks_from_capture(capture),
         text: capture.text().to_owned(),
         thinking: capture
             .reasoning_summaries()
@@ -819,6 +827,60 @@ pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
             .map(|(part, text)| (*part as u64, text.clone()))
             .collect(),
     }
+}
+
+fn blocks_from_capture(capture: &TurnCapture) -> Option<Vec<CanonBlock>> {
+    if capture.items().is_empty() {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    let mut has_reasoning = false;
+    for item in capture.items() {
+        match item.kind()? {
+            "reasoning" => {
+                has_reasoning = true;
+                let reasoning = item.as_reasoning()?;
+                blocks.extend(
+                    reasoning
+                        .summary
+                        .into_iter()
+                        .map(|summary| CanonBlock::Thinking {
+                            text: summary.text,
+                            signature: None,
+                        }),
+                );
+                if let Some(data) = reasoning.encrypted_content {
+                    blocks.push(CanonBlock::RedactedThinking { data });
+                }
+            }
+            "message" => {
+                let message = item.as_message()?;
+                for part in message.content {
+                    if part.kind != "output_text" {
+                        return None;
+                    }
+                    blocks.push(CanonBlock::Text(part.text));
+                }
+            }
+            "function_call" => {
+                let call = item.as_function_call()?;
+                let input: Value = serde_json::from_str(&call.arguments).ok()?;
+                if !input.is_object() {
+                    return None;
+                }
+                blocks.push(CanonBlock::ToolUse {
+                    id: call.call_id,
+                    name: call.name,
+                    input,
+                });
+            }
+            _ => return None,
+        }
+    }
+    if !capture.reasoning_summaries().is_empty() && !has_reasoning {
+        return None;
+    }
+    Some(blocks)
 }
 
 #[cfg(test)]

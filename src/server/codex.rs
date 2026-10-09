@@ -21,7 +21,6 @@
 //! on EVERY response — the "not just accounted ones" rule.
 
 use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,16 +32,15 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use super::Server;
-use crate::ir::{AnthropicShape, Fidelity, Request as IrRequest, compare};
+use crate::ir::{AnthropicShape, Request as IrRequest};
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, buffered_body, build_response,
-    forward_upstream, is_compressed, plain_status, response_headers, session_id, transport_failure,
-    truncated_body, upstream_failure, upstream_request_headers,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, forward_upstream, plain_status,
+    session_id, transport_failure, truncated_body, upstream_failure, upstream_request_headers,
 };
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
@@ -67,6 +65,10 @@ pub(crate) struct CodexTurn {
     pub(crate) in_flight: Option<InFlightGuard>,
     /// Session identity — the prompt-cache key when present.
     pub(crate) session_id: Option<String>,
+    /// Provider-binding request identities. Native Responses clients supply
+    /// these; other frontends leave them absent and the binding derives them.
+    pub(crate) thread_id: Option<String>,
+    pub(crate) request_id: Option<String>,
     /// The final effective model (routing, retarget, force-newest, map).
     pub(crate) served_model: Option<String>,
     /// Whether the client explicitly asked for a plain JSON Message.
@@ -78,6 +80,7 @@ pub(crate) struct CodexTurn {
 pub(crate) enum CodexFrontendWire {
     Anthropic,
     OpenAiChat,
+    OpenAiResponses,
 }
 
 impl CodexFrontendWire {
@@ -85,13 +88,14 @@ impl CodexFrontendWire {
         match self {
             Self::Anthropic => ANTHROPIC_FRONTEND,
             Self::OpenAiChat => "openai_chat",
+            Self::OpenAiResponses => RESPONSES_FRONTEND,
         }
     }
 
     fn error_wire(self) -> ErrorWire {
         match self {
             Self::Anthropic => ErrorWire::Anthropic,
-            Self::OpenAiChat => ErrorWire::Openai,
+            Self::OpenAiChat | Self::OpenAiResponses => ErrorWire::Openai,
         }
     }
 }
@@ -133,16 +137,16 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
     }
 }
 
-/// Native Codex CLI usage path. The request and response bytes stay in the
-/// Responses dialect end-to-end; observation is side-band only.
+/// Codex CLI usage path. Even though both sides speak Responses, the request
+/// and response take the same canonical path as every cross-protocol route.
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
     let Some(backend) = server.codex_sub.clone() else {
         return super::responses_not_configured();
     };
-    let Some(codex) = server.codex_turn.clone() else {
+    if server.codex_turn.is_none() {
         return super::responses_not_configured();
-    };
+    }
     let (parts, body) = request.into_parts();
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
@@ -158,35 +162,38 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     let header_session = session_id(&server.config.session_header_names, &parts.headers);
     let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
     let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
+    let thread_id = parts
+        .headers
+        .get("thread-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let request_id = parts
+        .headers
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
 
     let parsed = IrRequest::parse(&original).ok();
     let body_session = parsed
         .as_ref()
         .and_then(|request| request.openai_responses().prompt_cache_key())
         .map(str::to_owned);
-    let cache_key = body_session
-        .clone()
-        .or_else(|| header_session.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let request_session = body_session.clone().or_else(|| header_session.clone());
     let model = parsed
         .as_ref()
         .and_then(|request| request.openai_responses().model())
         .map(str::to_owned);
-    let drift =
-        parsed
-            .as_ref()
-            .and_then(|request| match compare(&original, &request.serialise()) {
-                Fidelity::Exact => None,
-                Fidelity::Drift { digest, .. } => Some(digest),
-            });
+    let stream_explicitly_false = parsed.as_ref().is_some_and(|request| {
+        request.value().get("stream").and_then(Value::as_bool) == Some(false)
+    });
     let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
         server: server.clone(),
         started,
         path: "/v1/responses",
-        session_id: body_session.or(header_session),
+        session_id: request_session.clone(),
         requested_model: model.clone(),
         effective_model: model.clone(),
-        drift,
+        drift: None,
         backend: backend.clone(),
         betas: None,
         shape: Some(request.openai_responses().shape()),
@@ -203,225 +210,21 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         translation_report: None,
     });
 
-    let auth = match codex.auth_for_turn(&server.http, now_ms() / 1000).await {
-        Ok(auth) => auth,
-        Err(error) => {
-            tracing::warn!(%error, "codex auth refresh failed");
-            return upstream_failure(
-                ErrorWire::Openai,
-                "toker upstream error: the codex login could not be refreshed",
-            );
-        }
-    };
-    let thread_id = parts
-        .headers
-        .get("thread-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or(&cache_key);
-    let request_id = parts
-        .headers
-        .get("x-client-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let headers = codex.turn_headers(auth.as_ref(), &cache_key, thread_id, &request_id);
-    let suffix = parts
-        .uri
-        .path_and_query()
-        .map(|path| path.as_str())
-        .unwrap_or("/v1/responses")
-        .strip_prefix("/v1")
-        .unwrap_or("/responses");
-    let upstream = match server
-        .http
-        .post(backend.endpoint(suffix))
-        .headers(headers)
-        .body(original)
-        .send()
-        .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            tracing::warn!(%error, "codex upstream request failed");
-            return transport_failure(ErrorWire::Openai, &error);
-        }
-    };
-
-    native_response(server, backend, upstream, record, in_flight).await
-}
-
-async fn native_response(
-    server: Server,
-    backend: Arc<dyn Provider>,
-    upstream: reqwest::Response,
-    record: Option<AnthropicRecordCtx>,
-    in_flight: Option<InFlightGuard>,
-) -> Response {
-    let status = upstream.status();
-    let headers = upstream.headers().clone();
-    let meters = backend.meters(&headers);
-    if let Some(snapshot) = &meters {
-        server.note_quota(backend.id(), snapshot);
-        if let Err(error) = server.store.save_meters(
-            backend.id(),
-            &crate::store::MetersSnapshot {
-                updated_ms: now_ms(),
-                snapshot: snapshot.clone(),
-            },
-        ) {
-            tracing::error!(%error, "codex meter snapshot save failed");
-        }
-    }
-
-    if is_compressed(&headers) {
-        tracing::debug!("compressed codex response passed through unledgered");
-        return build_response(
-            status,
-            response_headers(&headers, true),
-            Body::from_stream(upstream.bytes_stream()),
-        );
-    }
-    if !status.is_success() {
-        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
-            return truncated_body(ErrorWire::Openai);
-        };
-        if buffered.rest.is_none()
-            && let Some(ctx) = record.as_ref()
-        {
-            let error = parse_upstream_error(&buffered.bytes);
-            let kind = error
-                .kind
-                .as_deref()
-                .or(error.code.as_deref())
-                .unwrap_or("api_error");
-            let message = error
-                .message
-                .as_deref()
-                .or(error.code.as_deref())
-                .unwrap_or("upstream error");
-            record_codex_error(
-                ctx,
-                status.as_u16(),
-                kind,
-                message,
-                error.resets_at,
-                RESPONSES_FRONTEND,
-            );
-        }
-        return build_response(
-            status,
-            response_headers(&headers, false),
-            buffered_body(buffered),
-        );
-    }
-
-    let state = NativeStreamState {
-        upstream,
-        parser: ResponsesSse::new(),
-        capture: TurnCapture::new(),
-        done: false,
-        failure: None,
+    turn(CodexTurn {
+        server,
+        backend,
+        parsed,
+        gate_shape: None,
         record,
-        meters,
         in_flight,
-    };
-    let stream = futures::stream::unfold(state, |mut state| async move {
-        if state.done {
-            return state.failure.take().map(|error| (Err(error), state));
-        }
-        match state.upstream.chunk().await {
-            Ok(Some(chunk)) => {
-                state.observe(&chunk);
-                if state.capture.turn_ended() {
-                    state.finish();
-                }
-                Some((Ok(chunk), state))
-            }
-            Ok(None) => {
-                if let Some(event) = state.parser.finish() {
-                    state.capture.observe(&event);
-                }
-                if state.capture.turn_ended() || state.capture.error().is_some() {
-                    state.finish();
-                    None
-                } else {
-                    tracing::warn!("codex stream closed before a final response event");
-                    state.record = None;
-                    state.done = true;
-                    drop(state.in_flight.take());
-                    Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "codex stream closed before a final response event",
-                        )),
-                        state,
-                    ))
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "codex stream failed mid-turn");
-                state.record = None;
-                state.done = true;
-                drop(state.in_flight.take());
-                Some((Err(std::io::Error::other(error)), state))
-            }
-        }
-    });
-    build_response(
-        status,
-        response_headers(&headers, false),
-        Body::from_stream(stream),
-    )
-}
-
-struct NativeStreamState {
-    upstream: reqwest::Response,
-    parser: ResponsesSse,
-    capture: TurnCapture,
-    done: bool,
-    failure: Option<std::io::Error>,
-    record: Option<AnthropicRecordCtx>,
-    meters: Option<Value>,
-    in_flight: Option<InFlightGuard>,
-}
-
-impl NativeStreamState {
-    fn observe(&mut self, bytes: &[u8]) {
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            for event in self.parser.feed(bytes) {
-                self.capture.observe(&event);
-            }
-        }));
-    }
-
-    fn finish(&mut self) {
-        self.done = true;
-        let Some(ctx) = self.record.as_ref() else {
-            return;
-        };
-        if let Some(error) = self.capture.error() {
-            let kind = error
-                .kind
-                .as_deref()
-                .or(error.code.as_deref())
-                .unwrap_or("api_error");
-            let message = error
-                .message
-                .as_deref()
-                .or(error.code.as_deref())
-                .unwrap_or("upstream error");
-            record_codex_error(ctx, 200, kind, message, error.resets_at, RESPONSES_FRONTEND);
-        } else {
-            record_codex_measurement(
-                ctx,
-                &self.capture,
-                self.meters.clone(),
-                200,
-                RESPONSES_FRONTEND,
-            );
-        }
-        drop(self.in_flight.take());
-    }
+        session_id: request_session,
+        thread_id,
+        request_id,
+        served_model: model,
+        stream_explicitly_false,
+        frontend_wire: CodexFrontendWire::OpenAiResponses,
+    })
+    .await
 }
 
 /// One turn: translate, send, translate back, record.
@@ -434,6 +237,8 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         mut record,
         in_flight,
         session_id,
+        thread_id,
+        request_id,
         served_model,
         stream_explicitly_false,
         frontend_wire,
@@ -461,8 +266,8 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     let prompt_cache_key = session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let thread_id = prompt_cache_key.clone();
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let thread_id = thread_id.unwrap_or_else(|| prompt_cache_key.clone());
+    let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // The translation itself — pure; a typed failure never reaches the
     // upstream and answers in the frontend's error shape.
@@ -476,6 +281,11 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                 translate::render_codex(&canonical, &prompt_cache_key)
             })
         }
+        CodexFrontendWire::OpenAiResponses => translate::from_openai_responses(ir.value())
+            .and_then(|mut canonical| {
+                canonical.model = Some(model.clone());
+                translate::render_codex(&canonical, &prompt_cache_key)
+            }),
     };
     let rendered = match rendering {
         Ok(rendered) => rendered,
@@ -524,6 +334,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         return match frontend_wire {
             CodexFrontendWire::Anthropic => super::anthropic_not_configured(),
             CodexFrontendWire::OpenAiChat => super::openai_not_configured(),
+            CodexFrontendWire::OpenAiResponses => super::responses_not_configured(),
         };
     };
     let auth = match codex.auth_for_turn(&server.http, now).await {
@@ -698,6 +509,10 @@ async fn aggregated_turn(
             &model,
             &translate::codex_backend::canonical_turn_from_capture(&capture),
         ),
+        CodexFrontendWire::OpenAiResponses => translate::openai_responses_from_canonical(
+            &model,
+            &translate::codex_backend::canonical_turn_from_capture(&capture),
+        ),
     };
     if let Some(ctx) = record.as_ref() {
         record_codex_measurement(ctx, &capture, meters, 200, frontend_wire.protocol());
@@ -820,6 +635,10 @@ enum FrontendStream {
         canonical: translate::codex_backend::CanonStream,
         renderer: translate::OpenAiChatRenderer,
     },
+    OpenAiResponses {
+        canonical: translate::codex_backend::CanonStream,
+        renderer: translate::OpenAiResponsesRenderer,
+    },
 }
 
 impl FrontendStream {
@@ -832,6 +651,10 @@ impl FrontendStream {
                 canonical: translate::codex_backend::CanonStream::new(),
                 renderer: translate::OpenAiChatRenderer::new(model),
             },
+            CodexFrontendWire::OpenAiResponses => FrontendStream::OpenAiResponses {
+                canonical: translate::codex_backend::CanonStream::new(),
+                renderer: translate::OpenAiResponsesRenderer::new(model),
+            },
         }
     }
 
@@ -839,6 +662,14 @@ impl FrontendStream {
         match self {
             FrontendStream::Anthropic(stream) => stream.feed(event),
             FrontendStream::OpenAiChat {
+                canonical,
+                renderer,
+            } => canonical
+                .feed(event)
+                .iter()
+                .flat_map(|event| renderer.feed(event))
+                .collect(),
+            FrontendStream::OpenAiResponses {
                 canonical,
                 renderer,
             } => canonical

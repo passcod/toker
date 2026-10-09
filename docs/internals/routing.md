@@ -33,10 +33,13 @@ Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
 `/_toker/` namespace, which never leaves the proxy.
 
-The Responses route is native: Codex request and SSE response bytes pass through
-unchanged while the Responses observer records usage and meters. Toker always
-replaces the frontend credential with its shared Codex login before the request
-leaves loopback.
+The Responses route is canonical even though both ends speak Responses. Toker
+parses the request into canonical IR, deterministically renders it for the
+Codex binding, interprets upstream events canonically, and renders Responses
+events back to the client. Compatible extensions and provider-encrypted
+reasoning replay through the canonical model. Toker always replaces the
+frontend credential with its shared Codex login before the request leaves
+loopback.
 
 The Chat route may select `codex_sub` as its configured default or with a
 `codex_sub/<model>` prefix. That route always parses Chat into canonical IR,
@@ -157,7 +160,7 @@ owns only rows whose model starts with `openrouter/`, rewrites the file only
 when the rows changed (Claude Code hot-reloads it into every session), and
 changes nothing when the listing cannot be fetched.
 
-## Same-protocol routes forward the client's bytes
+## Legacy same-protocol routes forward the client's bytes
 
 Every request is parsed into the IR, a `serde_json::Value` with `preserve_order`
 and `arbitrary_precision`, so re-serialising an untouched body reproduces it
@@ -170,10 +173,12 @@ forwards the serialised IR instead, and that serialisation is a pure function of
 the value, so the transform repeats identically on the next turn and the
 upstream's cached prefix holds.
 
-A body toker cannot parse is forwarded unchanged and unrecorded: the proxy never
-rejects what it does not understand. Setup's wiring check relies on that,
-posting an empty body and taking the upstream's own 401 as proof the chain is
-up.
+A body on one of those legacy routes that toker cannot parse is forwarded
+unchanged and unrecorded: the proxy never rejects what it does not understand.
+Setup's wiring check relies on that, posting an empty body and taking the
+upstream's own 401 as proof the chain is up. A route already cut over to the
+universal canonical path instead returns a typed compatibility error and never
+sends an unparsed body upstream.
 
 ## Thinking that cannot be turned off
 
@@ -200,7 +205,7 @@ row carries `extra.thinkingRewrite` (see
 This keys on the upstream's answer, not on the backend or the model, so it
 applies wherever an Anthropic-wire upstream asks for it.
 
-## Cross-protocol routes translate, purely
+## Canonical routes translate, purely
 
 An anthropic-frontend request routed to `codex_sub` never byte-forwards. It goes
 through `translate::to_codex` into the canonical IR (`ir/canonical.rs`) and out
@@ -209,6 +214,10 @@ onto the Responses wire, and the response comes back through
 first, so the codex request carries the final effective model. The fidelity
 check is skipped, because the upstream bytes never existed on the frontend's
 wire.
+
+The Responses frontend to Codex binding takes the same path despite matching
+protocol names. Protocol equality lets it replay compatible opaque extensions;
+it does not bypass canonical request or event handling.
 
 What a backend refuses is that backend's declared property (`Capabilities`),
 never a parse-time decision in the frontend: codex refuses system-role input

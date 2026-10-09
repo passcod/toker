@@ -341,6 +341,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             record,
             in_flight,
             session_id,
+            thread_id: None,
+            request_id: None,
             served_model: gate_model,
             stream_explicitly_false: !stream_requested,
             frontend_wire: super::codex::CodexFrontendWire::OpenAiChat,

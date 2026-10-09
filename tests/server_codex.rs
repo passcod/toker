@@ -474,7 +474,7 @@ async fn codex_models_uses_the_subscription_catalogue_and_exact_slug() {
 }
 
 #[tokio::test]
-async fn native_responses_passes_bytes_through_and_records_as_codex() {
+async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(
         "native",
@@ -488,7 +488,12 @@ async fn native_responses_passes_bytes_through_and_records_as_codex() {
         "prompt_cache_key": "codex-session-1",
         "instructions": "private instructions",
         "input": [{"role": "user", "content": "private prompt"}],
-        "tools": [{"type": "function", "name": "shell", "parameters": {}}],
+        "tools": [{"type": "function", "name": "shell", "parameters": {}, "strict": true}],
+        "reasoning": {"effort": "xhigh", "summary": "auto"},
+        "parallel_tool_calls": true,
+        "store": true,
+        "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
+        "service_tier": "flex",
         "stream": true,
     }))
     .expect("request body");
@@ -505,12 +510,31 @@ async fn native_responses_passes_bytes_through_and_records_as_codex() {
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::OK);
     let response_bytes = response.bytes().await.expect("response bytes");
-    assert_eq!(response_bytes, fixture("01_tool_call_turn.sse"));
+    let response_text = String::from_utf8(response_bytes.to_vec()).expect("Responses SSE is UTF-8");
+    assert!(response_text.contains("event: response.created"));
+    assert!(response_text.contains("event: response.output_text.delta"));
+    assert!(response_text.contains("event: response.completed"));
 
     let requests = mock.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].path, "/backend-api/codex/responses");
-    assert_eq!(requests[0].body, body, "the request was not re-rendered");
+    assert_ne!(
+        requests[0].body, body,
+        "the canonical request was re-rendered"
+    );
+    let rendered: Value = serde_json::from_slice(&requests[0].body).expect("rendered request JSON");
+    assert_eq!(rendered["model"], "gpt-5.6-sol");
+    assert_eq!(rendered["instructions"], "private instructions");
+    assert_eq!(rendered["input"][0]["content"][0]["text"], "private prompt");
+    assert_eq!(rendered["tools"][0]["name"], "shell");
+    assert_eq!(rendered["tools"][0]["strict"], true);
+    assert_eq!(rendered["reasoning"]["effort"], "xhigh");
+    assert_eq!(rendered["reasoning"]["summary"], "auto");
+    assert_eq!(rendered["parallel_tool_calls"], true);
+    assert_eq!(rendered["store"], true);
+    assert_eq!(rendered["include"][1], "message.output_text.logprobs");
+    assert_eq!(rendered["service_tier"], "flex");
+    assert_eq!(rendered["prompt_cache_key"], "codex-session-1");
     assert_eq!(
         requests[0].headers.get("session-id").unwrap(),
         "codex-session-1"
@@ -555,6 +579,51 @@ async fn native_responses_passes_bytes_through_and_records_as_codex() {
         row.extra.as_ref().and_then(|extra| extra.get("frontend")),
         Some(&json!("codex"))
     );
+}
+
+#[tokio::test]
+async fn non_streaming_responses_are_aggregated_from_canonical_turns() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(
+        "responses-json",
+        upstream,
+        login_dir("responses-json").join("auth.json"),
+        false,
+    ))
+    .await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-sol",
+                "prompt_cache_key": "responses-json-session",
+                "input": "private prompt",
+                "stream": false
+            }))
+            .expect("request body"),
+        )
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body: Value = response.json().await.expect("Responses JSON");
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][1]["type"], "message");
+    assert_eq!(body["output"][2]["type"], "function_call");
+    assert_eq!(body["usage"]["input_tokens"], 1234);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let upstream_body: Value = serde_json::from_slice(&requests[0].body).expect("upstream JSON");
+    assert_eq!(upstream_body["stream"], true, "the backend always streams");
+    assert_eq!(wait_for_rows(&store, 1).await[0].kind, None);
 }
 
 #[tokio::test]
@@ -639,7 +708,7 @@ async fn chat_can_use_codex_as_its_default_and_return_plain_json() {
 }
 
 #[tokio::test]
-async fn an_invalid_native_body_is_forwarded_unchanged_and_not_ledgered() {
+async fn an_invalid_responses_body_is_rejected_before_upstream_and_not_ledgered() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(
         "native-invalid",
@@ -657,9 +726,7 @@ async fn an_invalid_native_body_is_forwarded_unchanged_and_not_ledgered() {
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let _ = response.bytes().await.expect("body");
-    let requests = mock.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].body, body);
+    assert!(mock.requests.lock().unwrap().is_empty());
     assert!(wait_for_rows(&store, 0).await.is_empty());
 }
 

@@ -1011,6 +1011,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 record,
                 in_flight,
                 session_id,
+                thread_id: None,
+                request_id: None,
                 served_model,
                 stream_explicitly_false,
                 frontend_wire: codex::CodexFrontendWire::Anthropic,
