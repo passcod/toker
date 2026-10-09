@@ -222,15 +222,7 @@ mod tests {
             ),
             (
                 "content_block_start",
-                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
-            ),
-            (
-                "content_block_delta",
-                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I'll read the files, then "}}"#,
-            ),
-            (
-                "content_block_delta",
-                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"café."}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque-encrypted-reasoning"}}"#,
             ),
             (
                 "content_block_stop",
@@ -238,15 +230,31 @@ mod tests {
             ),
             (
                 "content_block_start",
-                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_read1","name":"read_file","input":{}}}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
             ),
             (
                 "content_block_delta",
-                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/main.rs\"}"}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"I'll read the files, then "}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"café."}}"#,
             ),
             (
                 "content_block_stop",
                 r#"{"type":"content_block_stop","index":2}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call_read1","name":"read_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src/main.rs\"}"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":3}"#,
             ),
             (
                 "message_delta",
@@ -505,6 +513,7 @@ mod tests {
             concat!(
                 r#"{"id":"resp_6f3c9a","type":"message","role":"assistant","model":"claude-opus-5","#,
                 r#""content":[{"type":"thinking","thinking":"Reading the thread files."},"#,
+                r#"{"type":"redacted_thinking","data":"opaque-encrypted-reasoning"},"#,
                 r#"{"type":"text","text":"I'll read the files, then café."},"#,
                 r#"{"type":"tool_use","id":"call_read1","name":"read_file","input":{"path":"src/main.rs"}}],"#,
                 r#""stop_reason":"tool_use","stop_sequence":null,"#,

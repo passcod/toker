@@ -428,6 +428,7 @@ mod tests {
                 "response.output_item.added",
                 "response.reasoning_summary_text.delta",
                 "response.reasoning_summary_text.delta",
+                "response.output_item.done",
                 "response.output_item.added",
                 "response.output_text.delta",
                 "response.output_text.delta",
@@ -482,9 +483,17 @@ mod tests {
             "the done item carries the whole arguments string"
         );
 
-        // The message item completed too.
-        assert_eq!(capture.items().len(), 2);
-        let message = capture.items()[0].as_message().expect("message item");
+        // The encrypted reasoning, message, and function-call items completed.
+        assert_eq!(capture.items().len(), 3);
+        let reasoning = capture.items()[0]
+            .as_reasoning()
+            .expect("reasoning item");
+        assert_eq!(reasoning.id.as_deref(), Some("rs_1"));
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("opaque-encrypted-reasoning")
+        );
+        let message = capture.items()[1].as_message().expect("message item");
         assert_eq!(message.role, "assistant");
         assert_eq!(message.content[0].kind, "output_text");
         assert_eq!(message.content[0].text, "I'll read the files, then café.");

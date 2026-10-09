@@ -2185,7 +2185,22 @@ mod tests {
                     name: "read_file".to_owned(),
                     arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
                 }],
-                blocks: None,
+                blocks: Some(vec![
+                    CanonBlock::Thinking {
+                        text: "Reading the thread files.".to_owned(),
+                        signature: None,
+                    },
+                    CanonBlock::RedactedThinking {
+                        data: "opaque-encrypted-reasoning".to_owned(),
+                        provider_id: Some("rs_1".to_owned()),
+                    },
+                    CanonBlock::Text("I'll read the files, then café.".to_owned()),
+                    CanonBlock::ToolUse {
+                        id: "call_read1".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({"path": "src/main.rs"}),
+                    },
+                ]),
                 text: "I'll read the files, then café.".to_owned(),
                 thinking: [(0, "Reading the thread files.".to_owned())].into(),
             }
