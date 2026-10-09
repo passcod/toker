@@ -20,8 +20,11 @@ reasons.
    see it:
 
    - A request that brings its own credential keeps it
-     (pass-through-when-present). The anthropic subscription only ever passes
-     through; toker holds no subscription token for it. The anthropic API
+     (pass-through-when-present) on its native wire. The anthropic
+     subscription passes Claude's bearer through on native Messages requests;
+     for foreign OpenAI frontends it replaces their bearer with a toker-held
+     OAuth token or an unexpired Claude local login, never forwarding the
+     foreign credential. The anthropic API
      injects `x-api-key` only when the request carries neither `x-api-key` nor
      `authorization`. On a route to openrouter another provider's credential is
      dropped before the stored one is injected, never forwarded: on the openai

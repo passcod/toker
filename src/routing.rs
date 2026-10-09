@@ -266,6 +266,16 @@ const ROUTES: &[RouteDeclaration] = &[
         backend: ProtocolId::OpenAiResponses,
     },
     RouteDeclaration {
+        frontend: ProtocolId::OpenAiChat,
+        provider: "anthropic_api",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiChat,
+        provider: "anthropic_sub",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
         provider: "codex_sub",
         backend: ProtocolId::OpenAiResponses,
@@ -273,6 +283,11 @@ const ROUTES: &[RouteDeclaration] = &[
     RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
         provider: "anthropic_api",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiResponses,
+        provider: "anthropic_sub",
         backend: ProtocolId::AnthropicMessages,
     },
 ];

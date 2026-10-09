@@ -67,9 +67,17 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
     let config = &server.config;
     let mut providers = serde_json::Map::new();
     if let Some(sub) = &config.anthropic_sub {
+        let sources = sub.oauth_sources();
         providers.insert(
             "anthropic_sub".to_owned(),
-            json!({ "upstream": sub.upstream.as_str() }),
+            json!({
+                "upstream": sub.upstream.as_str(),
+                "oauth_token_env": sub.oauth_token_env,
+                "oauth_token_env_set": sources.env_set,
+                "oauth_token_keyring_configured": sources.keyring_configured,
+                "oauth_token_literal_set": sources.literal_set,
+                "claude_login_configured": sub.claude_credentials_path.is_some(),
+            }),
         );
     }
     if let Some(api) = &config.anthropic_api {

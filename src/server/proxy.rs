@@ -81,9 +81,6 @@ pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
-    let Ok(mut target) = server.registry.resolve(ProtocolId::OpenAiChat, None) else {
-        return super::openai_not_configured();
-    };
     let (parts, body) = request.into_parts();
 
     // Session identity, read by name only — request headers are never
@@ -132,17 +129,18 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let mut gate_shape: Option<Shape> = None;
     let mut stream_requested = false;
     let mut gate_model: Option<String> = None;
-    let mut parsed_for_codex = None;
+    let mut parsed = None;
+    let mut target = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
         let model = ir.openai_chat().model().map(str::to_owned);
-        target = match server
+        let resolved = match server
             .registry
             .resolve(ProtocolId::OpenAiChat, model.as_deref())
         {
             Ok(target) => target,
             Err(_) => return super::openai_not_configured(),
         };
-        let effective_model = target.effective_model().map(str::to_owned);
+        let effective_model = resolved.effective_model().map(str::to_owned);
         if effective_model.as_deref() != model.as_deref()
             && let Some(effective) = effective_model.as_deref()
         {
@@ -172,8 +170,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             shape: Some(shape),
             system_messages,
         });
-        parsed_for_codex = Some(ir);
+        parsed = Some(ir);
+        target = Some(resolved);
     }
+
+    let Some(target) = target else {
+        return compatibility_error(
+            "the request body could not be parsed as an OpenAI Chat request",
+        );
+    };
 
     let backend = target.provider().clone();
 
@@ -182,7 +187,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
     {
-        let Some(ir) = parsed_for_codex.as_ref() else {
+        let Some(ir) = parsed.as_ref() else {
             return compatibility_error(
                 "the request body could not be parsed as an OpenAI Chat request",
             );
@@ -353,13 +358,36 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     if target
         .binding()
         .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
+    {
+        let Some(ir) = parsed else {
+            return compatibility_error(
+                "the request body could not be parsed as an OpenAI Chat request",
+            );
+        };
+        let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
+        return super::anthropic_target::turn(
+            server,
+            parts,
+            ir,
+            target,
+            record,
+            in_flight,
+            super::anthropic_target::FrontendWire::Chat,
+        )
+        .await;
+    }
+
+    if target
+        .binding()
+        .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
     {
-        let record = record.map(|ctx| chat_codex_record(ctx, backend.clone()));
+        let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
         return super::codex::turn(super::codex::CodexTurn {
             server,
             backend,
-            parsed: parsed_for_codex,
+            parsed,
             gate_shape: None,
             record,
             in_flight,
@@ -804,7 +832,7 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
     Bytes::from(out)
 }
 
-fn chat_codex_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
+fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
     let shape = ctx.shape.map(|shape| crate::ir::AnthropicShape {
         req_bytes: shape.req_bytes,
         req_messages: shape.req_messages,

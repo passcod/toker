@@ -53,7 +53,8 @@ pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
 /// The openai_chat protocol's backends, in historical-default order.
-pub const OPENAI_CHAT_BACKENDS: &[&str] = &["openrouter", "codex_sub"];
+pub const OPENAI_CHAT_BACKENDS: &[&str] =
+    &["openrouter", "codex_sub", "anthropic_api", "anthropic_sub"];
 
 /// Anthropic's upstream base — the API root, no `/v1` prefix: the
 /// frontend's `/v1/messages…` paths are already the upstream's paths.
@@ -61,6 +62,8 @@ pub const DEFAULT_ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com";
 
 /// The env var holding the Anthropic API key.
 pub const DEFAULT_ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+pub const DEFAULT_ANTHROPIC_SUB_TOKEN_ENV: &str = "TOKER_ANTHROPIC_SUB_TOKEN";
+pub const DEFAULT_CLAUDE_CREDENTIALS_PATH: &str = "~/.claude/.credentials.json";
 
 /// The anthropic protocol's backends. The first is the historical
 /// default: a config that enables it among others and names no default
@@ -311,10 +314,8 @@ impl OpenRouterConfig {
     }
 }
 
-/// The anthropic subscription provider block, resolved. No key sources:
-/// auth is pass-through-when-present and toker has no stored sub token yet
-/// (a later credentials unit adds signing).
-#[derive(Debug, Clone, PartialEq)]
+/// The anthropic subscription provider block, resolved.
+#[derive(Clone, PartialEq)]
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
@@ -323,6 +324,47 @@ pub struct AnthropicSubConfig {
     /// applied as the pipeline's final routing stage on this backend.
     /// `None` when the table is absent (the default — no mapping).
     pub model_map: Option<ModelMap>,
+    /// Toker-held OAuth token sources, preferred to Claude's local login
+    /// when both are available for a foreign frontend.
+    pub oauth_token_env: String,
+    pub oauth_token_keyring: bool,
+    pub oauth_token: Option<String>,
+    /// Claude Code's local login file. `None` disables that fallback (used
+    /// by isolated tests); file-loaded configs default to Claude's path.
+    pub claude_credentials_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for AnthropicSubConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnthropicSubConfig")
+            .field("upstream", &self.upstream)
+            .field("model_map", &self.model_map)
+            .field("oauth_token_env", &self.oauth_token_env)
+            .field("oauth_token_keyring", &self.oauth_token_keyring)
+            .field("oauth_token_set", &self.oauth_token.is_some())
+            .field("claude_credentials_path", &self.claude_credentials_path)
+            .finish()
+    }
+}
+
+impl AnthropicSubConfig {
+    pub fn oauth_token(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        resolve_api_key(
+            &self.oauth_token_env,
+            self.oauth_token_keyring,
+            keyring,
+            &self.oauth_token,
+        )
+    }
+
+    pub fn oauth_sources(&self) -> KeySources {
+        key_sources_of(
+            &self.oauth_token_env,
+            self.oauth_token_keyring,
+            &self.oauth_token,
+        )
+    }
 }
 
 /// The anthropic API provider block, resolved — the same KeySources
@@ -422,6 +464,10 @@ impl Default for AnthropicSubConfig {
         AnthropicSubConfig {
             upstream: default_url(DEFAULT_ANTHROPIC_UPSTREAM),
             model_map: None,
+            oauth_token_env: DEFAULT_ANTHROPIC_SUB_TOKEN_ENV.to_owned(),
+            oauth_token_keyring: false,
+            oauth_token: None,
+            claude_credentials_path: Some(default_claude_credentials_path()),
         }
     }
 }
@@ -652,6 +698,13 @@ impl Config {
                 }),
                 anthropic_sub: self.anthropic_sub.as_ref().map(|sub| FileAnthropicSub {
                     upstream: Some(sub.upstream.to_string()),
+                    oauth_token_env: Some(sub.oauth_token_env.clone()),
+                    oauth_token_keyring: sub.oauth_token_keyring.then_some(true),
+                    oauth_token: sub.oauth_token.clone(),
+                    claude_credentials_path: sub
+                        .claude_credentials_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
                     model_map: sub.model_map.as_ref().map(model_map_table),
                 }),
                 anthropic_api: self.anthropic_api.as_ref().map(|api| FileAnthropicApi {
@@ -743,6 +796,18 @@ impl Config {
                         Some(table) => parse_model_map_table("anthropic_sub", table)?,
                         None => None,
                     },
+                    oauth_token_env: block
+                        .oauth_token_env
+                        .unwrap_or_else(|| DEFAULT_ANTHROPIC_SUB_TOKEN_ENV.to_owned()),
+                    oauth_token_keyring: block.oauth_token_keyring.unwrap_or(false),
+                    oauth_token: block.oauth_token,
+                    claude_credentials_path: Some(
+                        block
+                            .claude_credentials_path
+                            .as_deref()
+                            .map(expand_tilde)
+                            .unwrap_or_else(default_claude_credentials_path),
+                    ),
                 })
             })
             .transpose()?;
@@ -806,13 +871,20 @@ impl Config {
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect();
-        let enabled_openai: Vec<&str> = [
+        let enabled_openai_legacy: Vec<&str> = [
             ("openrouter", openrouter.is_some()),
             ("codex_sub", codex_sub.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect();
+        let mut enabled_openai = enabled_openai_legacy.clone();
+        if anthropic_api.is_some() {
+            enabled_openai.push("anthropic_api");
+        }
+        if anthropic_sub.is_some() {
+            enabled_openai.push("anthropic_sub");
+        }
 
         let config = Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
@@ -831,8 +903,12 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_PING_HEADER.to_owned()),
             default_backend_openai_chat: default_backend(
                 "default_backend_openai_chat",
-                file.default_backend_openai_chat,
-                &enabled_openai,
+                file.default_backend_openai_chat.clone(),
+                if file.default_backend_openai_chat.is_some() {
+                    &enabled_openai
+                } else {
+                    &enabled_openai_legacy
+                },
                 Some("openrouter"),
             )?,
             openrouter,
@@ -910,10 +986,20 @@ impl Config {
             &self.enabled_anthropic(),
             ANTHROPIC_BACKENDS,
         )?;
+        let chat_enabled = self.enabled_openai_chat();
+        let legacy_chat_enabled: Vec<&str> = chat_enabled
+            .iter()
+            .copied()
+            .filter(|provider| matches!(*provider, "openrouter" | "codex_sub"))
+            .collect();
         check_default(
             "default_backend_openai_chat",
             self.default_backend_openai_chat.as_deref(),
-            &self.enabled_openai_chat(),
+            if self.default_backend_openai_chat.is_some() {
+                &chat_enabled
+            } else {
+                &legacy_chat_enabled
+            },
             OPENAI_CHAT_BACKENDS,
         )?;
         // The codex originator rides on every request header: an
@@ -949,6 +1035,8 @@ impl Config {
         [
             self.openrouter.is_some().then_some("openrouter"),
             self.codex_sub.is_some().then_some("codex_sub"),
+            self.anthropic_api.is_some().then_some("anthropic_api"),
+            self.anthropic_sub.is_some().then_some("anthropic_sub"),
         ]
         .into_iter()
         .flatten()
@@ -1158,6 +1246,14 @@ pub(crate) struct FileOpenRouter {
 pub(crate) struct FileAnthropicSub {
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_token_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_token_keyring: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_credentials_path: Option<String>,
     /// The model routing map: selector keys → target model ids, parsed by
     /// [`parse_model_map_table`] into the committed [`ModelMap`]. Written
     /// back by [`model_map_table`]; the table goes last because a TOML
@@ -1245,6 +1341,14 @@ fn expand_tilde(path: &str) -> PathBuf {
         Some(home) => PathBuf::from(home).join(rest),
         None => PathBuf::from(path),
     }
+}
+
+fn default_claude_credentials_path() -> PathBuf {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_tilde("~/.claude"))
+        .join(".credentials.json")
 }
 
 #[cfg(test)]
@@ -1383,7 +1487,8 @@ mod tests {
             config.default_backend_anthropic.as_deref(),
             Some("anthropic_sub")
         );
-        // The only openai backend is the openai default.
+        // The historical OpenAI Chat default stays OpenRouter even though
+        // cross-protocol Anthropic routes are now available.
         assert_eq!(
             config.default_backend_openai_chat.as_deref(),
             Some("openrouter")
@@ -1427,6 +1532,24 @@ mod tests {
         assert_eq!(*sub, super::AnthropicSubConfig::default());
         assert_eq!(*api, super::AnthropicApiConfig::default());
         assert_eq!(*openrouter, super::OpenRouterConfig::default());
+    }
+
+    #[test]
+    fn anthropic_chat_binding_can_be_explicit_default_without_changing_legacy_inference() {
+        let dir = test_dir("anthropic-chat-default");
+        fs::write(
+            dir.join("toker.toml"),
+            "default_backend_openai_chat = \"anthropic_api\"\n[providers.anthropic_api]\n",
+        )
+        .expect("write config");
+        let explicit = load_from(&dir);
+        assert_eq!(
+            explicit.default_backend_openai_chat.as_deref(),
+            Some("anthropic_api")
+        );
+        fs::write(dir.join("toker.toml"), "[providers.anthropic_api]\n").expect("rewrite config");
+        let legacy = load_from(&dir);
+        assert_eq!(legacy.default_backend_openai_chat, None);
     }
 
     #[test]

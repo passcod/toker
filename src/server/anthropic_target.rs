@@ -1,9 +1,9 @@
-//! Responses frontend to the Anthropic API's Messages binding.
+//! OpenAI frontends to an Anthropic Messages binding.
 //!
 //! Request and response both cross canonical adapters. The API key and
 //! version header remain provider-owned; a foreign frontend bearer is removed
 //! by the provider before its key is injected. Observation sees provider
-//! bytes before the Responses renderer sees canonical events.
+//! bytes before either frontend renderer sees canonical events.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -19,7 +19,9 @@ use crate::ir::Request as IrRequest;
 use crate::ir::canonical::CanonEvent;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
 use crate::routing::{ModelTarget, ProtocolId};
-use crate::translate::{self, AnthropicResponseStream, OpenAiResponsesRenderer};
+use crate::translate::{
+    self, AnthropicResponseStream, OpenAiChatRenderer, OpenAiResponsesRenderer,
+};
 
 use super::InFlightGuard;
 use super::Server;
@@ -32,6 +34,35 @@ use super::record_anthropic::{
     AnthropicRecordCtx, record_anthropic_error, record_anthropic_measurement,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) enum FrontendWire {
+    Chat,
+    Responses,
+}
+
+impl FrontendWire {
+    fn protocol(self) -> ProtocolId {
+        match self {
+            Self::Chat => ProtocolId::OpenAiChat,
+            Self::Responses => ProtocolId::OpenAiResponses,
+        }
+    }
+
+    fn codex_wire(self) -> CodexFrontendWire {
+        match self {
+            Self::Chat => CodexFrontendWire::OpenAiChat,
+            Self::Responses => CodexFrontendWire::OpenAiResponses,
+        }
+    }
+
+    fn render_complete(self, model: &str, turn: &crate::ir::canonical::CanonTurn) -> Value {
+        match self {
+            Self::Chat => translate::openai_chat_from_canonical(model, turn),
+            Self::Responses => translate::openai_responses_from_canonical(model, turn),
+        }
+    }
+}
+
 pub(crate) async fn turn(
     server: Server,
     parts: Parts,
@@ -39,12 +70,22 @@ pub(crate) async fn turn(
     target: ModelTarget,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
+    frontend: FrontendWire,
 ) -> Response {
     let model = target.effective_model().unwrap_or_default().to_owned();
-    let stream = parsed.value().get("stream").and_then(Value::as_bool) != Some(false);
-    let mut canonical = match translate::from_openai_responses(parsed.value()) {
+    let stream = match frontend {
+        FrontendWire::Chat => parsed.value().get("stream").and_then(Value::as_bool) == Some(true),
+        FrontendWire::Responses => {
+            parsed.value().get("stream").and_then(Value::as_bool) != Some(false)
+        }
+    };
+    let canonical_result = match frontend {
+        FrontendWire::Chat => translate::from_openai_chat(parsed.value()),
+        FrontendWire::Responses => translate::from_openai_responses(parsed.value()),
+    };
+    let mut canonical = match canonical_result {
         Ok(canonical) => canonical,
-        Err(error) => return invalid_request(&error.to_string(), stream),
+        Err(error) => return invalid_request(&error.to_string(), stream, frontend),
     };
     canonical.model = Some(model.clone());
     canonical.stream = Some(stream);
@@ -52,16 +93,24 @@ pub(crate) async fn turn(
     // Responses makes this limit optional; Messages requires one. Prefer
     // the caller's positive bound. Otherwise use the model's own declared
     // maximum from the fetched Anthropic catalogue, never a guessed limit.
-    let requested_limit = parsed.value().get("max_output_tokens");
-    let limit = match requested_limit {
+    let limit_field = match frontend {
+        FrontendWire::Chat => parsed
+            .value()
+            .get("max_completion_tokens")
+            .filter(|value| !value.is_null())
+            .or_else(|| parsed.value().get("max_tokens")),
+        FrontendWire::Responses => parsed.value().get("max_output_tokens"),
+    };
+    let limit = match limit_field {
         Some(Value::Number(number)) => number.as_u64().filter(|limit| *limit > 0),
         None | Some(Value::Null) => declared_output_limit(&server, &model),
         Some(_) => None,
     };
     let Some(limit) = limit else {
         return invalid_request(
-            "max_output_tokens must be a positive integer, or the Anthropic model catalogue must declare max_tokens",
+            "an output token limit is required: supply a positive max_output_tokens/max_tokens or fetch an Anthropic catalogue with max_tokens",
             stream,
+            frontend,
         );
     };
     canonical.sampling.max_tokens = Some(limit);
@@ -71,7 +120,7 @@ pub(crate) async fn turn(
 
     let rendered = match translate::render_anthropic(&canonical, target.binding().dialect()) {
         Ok(rendered) => rendered,
-        Err(error) => return invalid_request(&error.to_string(), stream),
+        Err(error) => return invalid_request(&error.to_string(), stream, frontend),
     };
     if !rendered.report.is_empty()
         && let Some(ctx) = record.as_mut()
@@ -86,13 +135,22 @@ pub(crate) async fn turn(
         }
     };
     let backend = target.provider();
+    if !backend.foreign_auth_available() {
+        return frontend_error_response(
+            frontend.codex_wire(),
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "the selected backend has no usable subscription credential",
+            stream,
+        );
+    }
     let upstream = match send_upstream_to(
         &server,
         backend.as_ref(),
         &parts,
         body,
         &server.config.session_header_names,
-        ProtocolId::OpenAiResponses,
+        frontend.protocol(),
         "/v1/messages",
     )
     .await
@@ -100,7 +158,7 @@ pub(crate) async fn turn(
         Ok(upstream) => upstream,
         Err(error) => return transport_failure(ErrorWire::Openai, &error),
     };
-    forward(upstream, record, in_flight, &model).await
+    forward(upstream, record, in_flight, &model, frontend, stream).await
 }
 
 fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
@@ -119,9 +177,9 @@ fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
         .filter(|limit| *limit > 0)
 }
 
-fn invalid_request(message: &str, stream: bool) -> Response {
+fn invalid_request(message: &str, stream: bool, frontend: FrontendWire) -> Response {
     frontend_error_response(
-        CodexFrontendWire::OpenAiResponses,
+        frontend.codex_wire(),
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
         message,
@@ -134,6 +192,8 @@ async fn forward(
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: &str,
+    frontend: FrontendWire,
+    expected_stream: bool,
 ) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
@@ -161,19 +221,27 @@ async fn forward(
             let (kind, message) = error_pair(parsed.as_ref());
             record_anthropic_error(ctx, status.as_u16(), kind, message, None, None);
         }
-        return json_response(
-            status,
-            &headers,
-            &translate::openai_responses_from_canonical(model, &turn),
+        return json_response(status, &headers, &frontend.render_complete(model, &turn));
+    }
+    if is_event_stream(&headers) != expected_stream {
+        return upstream_failure(
+            ErrorWire::Openai,
+            "upstream Messages response used the wrong streaming mode",
         );
     }
-    if is_event_stream(&headers) {
+    if expected_stream {
         let mut response_headers = response_headers(&headers, false);
         response_headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
-        let body = Body::from_stream(stream_events(upstream, record, in_flight, model.to_owned()));
+        let body = Body::from_stream(stream_events(
+            upstream,
+            record,
+            in_flight,
+            model.to_owned(),
+            frontend,
+        ));
         return Response::builder()
             .status(status)
             .body(body)
@@ -202,11 +270,7 @@ async fn forward(
         let capture = observer.finish();
         record_anthropic_measurement(ctx, capture.as_ref(), None, status.as_u16());
     }
-    json_response(
-        status,
-        &headers,
-        &translate::openai_responses_from_canonical(model, &turn),
-    )
+    json_response(status, &headers, &frontend.render_complete(model, &turn))
 }
 
 fn error_pair(body: Option<&Value>) -> (Option<String>, Option<String>) {
@@ -239,7 +303,7 @@ struct StreamState {
     upstream: reqwest::Response,
     splitter: SseSplitter,
     backend: AnthropicResponseStream,
-    frontend: OpenAiResponsesRenderer,
+    frontend: FrontendRenderer,
     observer: AnthropicObserver,
     pending: VecDeque<Bytes>,
     record: Option<AnthropicRecordCtx>,
@@ -248,17 +312,46 @@ struct StreamState {
     succeeded: bool,
 }
 
+enum FrontendRenderer {
+    Chat(OpenAiChatRenderer),
+    Responses(OpenAiResponsesRenderer),
+}
+
+impl FrontendRenderer {
+    fn new(model: &str, wire: FrontendWire) -> Self {
+        match wire {
+            FrontendWire::Chat => Self::Chat(OpenAiChatRenderer::new(model)),
+            FrontendWire::Responses => Self::Responses(OpenAiResponsesRenderer::new(model)),
+        }
+    }
+
+    fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
+        match self {
+            Self::Chat(renderer) => renderer.feed(event),
+            Self::Responses(renderer) => renderer.feed(event),
+        }
+    }
+
+    fn turn_ended(&self) -> bool {
+        match self {
+            Self::Chat(renderer) => renderer.turn_ended(),
+            Self::Responses(renderer) => renderer.turn_ended(),
+        }
+    }
+}
+
 fn stream_events(
     upstream: reqwest::Response,
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: String,
+    frontend: FrontendWire,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     let state = StreamState {
         upstream,
         splitter: SseSplitter::new(),
         backend: AnthropicResponseStream::new(),
-        frontend: OpenAiResponsesRenderer::new(&model),
+        frontend: FrontendRenderer::new(&model, frontend),
         observer: AnthropicObserver::new(),
         pending: VecDeque::new(),
         record,

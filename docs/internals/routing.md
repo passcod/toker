@@ -12,8 +12,8 @@ serves them all, because the paths do not collide:
 | Protocol | Paths | Backends |
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
-| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub` (translated) |
-| OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub` |
+| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub`, `anthropic_api`, `anthropic_sub` (translated) |
+| OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `anthropic_api`, `anthropic_sub` (translated) |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
@@ -37,6 +37,9 @@ alias. A model without a complete route is absent. Chat receives the OpenAI
 list shape, built from known fields rather than copying a foreign provider's
 entry; Codex receives its native `models` shape with routed slugs and its
 provider metadata retained. Catalogue age stays with each internal offer.
+Codex's model parser requires a full `ModelInfo` entry, so foreign providers
+remain explicitly routable but are not advertised in its models response until
+their metadata projection is verified.
 When no usable catalogue has arrived, the endpoint returns 503, not a false
 empty list. Unknown and unprefixed profiles keep path-driven forwarding.
 The service loads cached catalogues before serving, then refreshes in the
@@ -47,7 +50,7 @@ Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
 `/_toker/` namespace, which never leaves the proxy.
 
-The Responses route is canonical even though both ends speak Responses. Toker
+The Codex Responses route is canonical even though both ends speak Responses. Toker
 parses the request into canonical IR, deterministically renders it for the
 Codex binding, interprets upstream events canonically, and renders Responses
 events back to the client. Compatible extensions, provider-owned input items
@@ -65,17 +68,34 @@ intact. Chat may also select `codex_sub` as its configured default or with a
 translates the Responses turn back to Chat SSE or complete JSON. Toker signs
 the Codex upstream itself, records the route as `openai_chat:codex_sub`, and
 never forwards the frontend credential.
+The Anthropic Messages bindings accept Chat and Responses requests after
+canonical rendering. A foreign OpenAI bearer is removed before provider-owned
+authentication is added. Responses and Chat output limits are optional on
+their own wires but required by Messages: a positive caller limit wins, then
+the fetched model's declared `max_tokens`; absent evidence is a local 400,
+not a guessed limit. The reverse path interprets Messages events or JSON and
+renders the client's OpenAI wire, while Anthropic usage is observed before
+translation.
 
 ### What differs per backend
 
 | Backend | Auth | Meters | Cost |
 | --- | --- | --- | --- |
-| `anthropic_sub` | the client's own OAuth bearer, passed through | `anthropic-ratelimit-*` headers, the quota gate's only source | `plan_equivalent` (list price on a subscription) |
+| `anthropic_sub` | native Claude bearer passed through; foreign frontend bearer replaced by a toker-held OAuth token or Claude's local login (in that order) | `anthropic-ratelimit-*` headers, the quota gate's only source | `plan_equivalent` (list price on a subscription) |
 | `anthropic_api` | `x-api-key`, injected only when the request has none | none (its RPM headers are not quota meters and must never overwrite the gate's snapshot) | `estimated` |
 | `openrouter` | stored key, injected only when the request has none; an Anthropic credential is dropped first | none | `billed`, from `usage.cost`, on both routes |
 | `codex_sub` | always toker-signed from `~/.codex/auth.json` | `x-codex-*` headers, stored per backend, not gated | NULL: no per-token price to verify |
 
 The three cost kinds are never conflated (`CostKind`).
+
+For a foreign frontend, `anthropic_sub` resolves its own token from
+`oauth_token_env`, the `anthropic_sub` keyring entry when configured, then a
+literal `oauth_token` in the 0600 config. If none exists, it reads Claude
+Code's `.credentials.json` at the configured `claude_credentials_path` (by
+default under `$CLAUDE_CONFIG_DIR`, else `~/.claude`). That login is read for
+each turn so Claude's refresh or logout takes effect without restarting toker;
+an expired token is not sent. The provider adds the OAuth beta and version
+headers when it signs. No credential value is logged or stored in the ledger.
 
 Meters are fed from **every** response of a meter-source backend, not only the
 accounted ones: a 429 or a background call still reports them, and a gate fed
@@ -198,14 +218,14 @@ creation retain their legacy buffer, routing rewrites, observation, and
 error-row behavior; batch reads, cancellation, and unmatched administrative
 paths stream without inference observation.
 
-OpenAI Chat is fully canonical for both current backends. The frontend adapter
-parses every request, then either the OpenRouter Chat or Codex Responses backend
-adapter renders it. Responses take the reverse path through canonical events or
-a complete canonical turn. OpenRouter's original response bytes still feed the
-ledger observer before translation, so `usage_raw`, billed cost and the serving
-provider remain provider-attested evidence. An invalid Chat body is a local 400
-and a compressed or malformed upstream response is a local 502; neither is
-forwarded as though it had crossed the canonical boundary.
+OpenAI Chat is canonical for every declared route. The frontend adapter parses
+each request, then the OpenRouter Chat, Codex Responses, or Anthropic Messages
+backend adapter renders it. Responses take the reverse path through canonical
+events or a complete canonical turn. OpenRouter's original response bytes still
+feed the ledger observer before translation, so `usage_raw`, billed cost and
+the serving provider remain provider-attested evidence. An invalid Chat body
+is a local 400 and a compressed or malformed upstream response is a local
+502; neither is forwarded as though it had crossed the canonical boundary.
 
 ## Thinking that cannot be turned off
 

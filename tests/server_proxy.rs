@@ -316,6 +316,8 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: anthropic_upstream.clone(),
+            claude_credentials_path: None,
+            ..AnthropicSubConfig::default()
         }),
         anthropic_api: Some(AnthropicApiConfig {
             model_map: None,

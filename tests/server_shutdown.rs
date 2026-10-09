@@ -144,6 +144,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream,
+            claude_credentials_path: None,
+            ..AnthropicSubConfig::default()
         }),
         anthropic_api: None,
         codex_sub: None,

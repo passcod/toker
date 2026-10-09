@@ -192,8 +192,16 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 !stream_explicitly_false,
             );
         };
-        return super::responses_anthropic::turn(server, parts, parsed, target, record, in_flight)
-            .await;
+        return super::anthropic_target::turn(
+            server,
+            parts,
+            parsed,
+            target,
+            record,
+            in_flight,
+            super::anthropic_target::FrontendWire::Responses,
+        )
+        .await;
     }
 
     turn(CodexTurn {

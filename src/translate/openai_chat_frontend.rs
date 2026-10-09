@@ -465,6 +465,10 @@ pub struct OpenAiChatRenderer {
 }
 
 impl OpenAiChatRenderer {
+    pub fn turn_ended(&self) -> bool {
+        self.ended
+    }
+
     pub fn new(model: &str) -> OpenAiChatRenderer {
         OpenAiChatRenderer {
             model: model.to_owned(),

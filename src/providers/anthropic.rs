@@ -1,10 +1,9 @@
 //! The anthropic backends (plan: "Backend providers") — two providers, one
 //! upstream, one protocol ([crate::ir::anthropic]).
 //!
-//! - [`AnthropicSub`]: the subscription. Auth is pass-through-when-present:
-//!   claude brings its own OAuth bearer, and toker has no stored sub token
-//!   yet (a later credentials unit adds signing), so nothing is ever
-//!   injected. The sub is also today's only **meter source** (plan: quota
+//! - [`AnthropicSub`]: the subscription. Native Claude brings its own OAuth
+//!   bearer; foreign frontends use a toker-held token or Claude's local
+//!   login, in that order. The sub is also today's only **meter source** (plan: quota
 //!   gate — "Anthropic sub is the only meter source today"): the
 //!   `anthropic-ratelimit-*` response headers parse into the quota
 //!   snapshot the gate will read.
@@ -32,6 +31,7 @@ use axum::http::HeaderMap;
 use axum::http::{HeaderValue, header};
 use reqwest::Url;
 use serde_json::{Map, Value, json};
+use std::path::PathBuf;
 
 use super::Provider;
 use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
@@ -52,6 +52,8 @@ const X_API_KEY: header::HeaderName = header::HeaderName::from_static("x-api-key
 /// response headers.
 pub struct AnthropicSub {
     upstream: Url,
+    oauth_token: Option<String>,
+    claude_credentials_path: Option<PathBuf>,
     /// The operator's model routing map, when one is configured
     /// (`[providers.anthropic_sub.model_map]`) — the routing map this
     /// backend applies, ported from the predecessor's env-typed knob.
@@ -64,12 +66,51 @@ impl AnthropicSub {
     pub fn new(
         upstream: Url,
         model_map: Option<crate::middleware::model_map::ModelMap>,
+        oauth_token: Option<String>,
+        claude_credentials_path: Option<PathBuf>,
     ) -> AnthropicSub {
         AnthropicSub {
             upstream,
             model_map,
+            oauth_token,
+            claude_credentials_path,
         }
     }
+
+    fn token_for_turn(&self) -> Option<String> {
+        self.oauth_token
+            .as_ref()
+            .filter(|token| usable_oauth_token(token))
+            .cloned()
+            .or_else(|| {
+                self.claude_credentials_path
+                    .as_deref()
+                    .and_then(claude_login_token)
+                    .filter(|token| usable_oauth_token(token))
+            })
+    }
+}
+
+/// Claude owns and refreshes its login. Read it for each foreign turn so a
+/// refresh or logout takes effect without restarting toker. Never log the
+/// file or token; a broken/missing login simply cannot sign that turn.
+fn claude_login_token(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let login: Value = serde_json::from_str(&raw).ok()?;
+    let oauth = login.get("claudeAiOauth")?;
+    let expires_at = oauth.get("expiresAt").and_then(Value::as_i64);
+    if expires_at.is_some_and(|expiry| expiry <= jiff::Timestamp::now().as_millisecond()) {
+        return None;
+    }
+    oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+fn usable_oauth_token(token: &str) -> bool {
+    !token.is_empty() && HeaderValue::from_str(&format!("Bearer {token}")).is_ok()
 }
 
 /// The anthropic API backend: same upstream, `x-api-key` auth, list-price
@@ -132,11 +173,28 @@ impl Provider for AnthropicSub {
     // credential_present: the default — the sub's credential is the OAuth
     // bearer, so `authorization` present means pass-through.
 
-    /// Nothing to inject: toker holds no sub token yet, so a request
-    /// without its own bearer goes up unauthenticated and anthropic's 401
-    /// body passes through — visibly verifying the wiring (the
-    /// keyring/signing unit replaces this).
-    fn inject_auth(&self, _outgoing: &mut HeaderMap) {}
+    fn inject_auth(&self, outgoing: &mut HeaderMap) {
+        let token = self.token_for_turn();
+        let Some(token) = token else { return };
+        let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) else {
+            return;
+        };
+        outgoing.insert(header::AUTHORIZATION, value);
+        outgoing
+            .entry("anthropic-beta")
+            .or_insert(HeaderValue::from_static("oauth-2025-04-20"));
+    }
+
+    fn foreign_auth_available(&self) -> bool {
+        self.token_for_turn().is_some()
+    }
+
+    fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
+        if frontend != ProtocolId::AnthropicMessages {
+            outgoing.remove(header::AUTHORIZATION);
+            outgoing.remove(&X_API_KEY);
+        }
+    }
 
     fn prepare_protocol_headers(&self, outgoing: &mut HeaderMap) {
         outgoing
@@ -322,6 +380,8 @@ mod tests {
         AnthropicSub::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
             None,
+            None,
+            None,
         )
     }
 
@@ -394,7 +454,12 @@ mod tests {
                 "https://api.anthropic.com/v1/messages/batches?limit=10&after=3"
             );
         }
-        let slashed = AnthropicSub::new("http://localhost:9/".parse().expect("upstream url"), None);
+        let slashed = AnthropicSub::new(
+            "http://localhost:9/".parse().expect("upstream url"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             slashed.endpoint("/v1/messages").as_str(),
             "http://localhost:9/v1/messages",
@@ -403,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sub_passes_credentials_through_and_injects_nothing() {
+    fn the_sub_passes_native_credentials_through_and_injects_nothing_without_a_login() {
         let provider = sub();
         assert_eq!(provider.id(), "anthropic_sub");
 
@@ -422,7 +487,7 @@ mod tests {
         provider.inject_auth(&mut outgoing);
         assert!(
             outgoing.is_empty(),
-            "no stored sub token yet — nothing injected"
+            "no configured or local token means nothing injected"
         );
     }
 

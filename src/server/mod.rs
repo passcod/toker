@@ -60,13 +60,13 @@
 //! decisions never consult runtime state.
 
 pub(crate) mod anthropic;
+pub(crate) mod anthropic_target;
 pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod proxy;
 pub(crate) mod quota_events;
 mod record;
 mod record_anthropic;
-pub(crate) mod responses_anthropic;
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -254,6 +254,10 @@ impl Server {
             Arc::new(AnthropicSub::new(
                 sub.upstream.clone(),
                 sub.model_map.clone(),
+                sub.oauth_token(|| {
+                    secrets::read_key(secrets.clone(), "anthropic_sub", KEYRING_READ_TIMEOUT)
+                }),
+                sub.claude_credentials_path.clone(),
             )) as Arc<dyn Provider>
         });
         let anthropic_api = config.anthropic_api.as_ref().map(|api| {

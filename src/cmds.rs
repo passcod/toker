@@ -110,6 +110,15 @@ pub fn status() -> anyhow::Result<()> {
     }
     if let Some(sub) = &config.anthropic_sub {
         println!("anthropic_sub: {}", sub.upstream);
+        println!(
+            "anthropic_sub OAuth token: {}; Claude login: {}",
+            key_sources_line(&sub.oauth_token_env, sub.oauth_sources()),
+            if sub.claude_credentials_path.is_some() {
+                "configured"
+            } else {
+                "disabled"
+            },
+        );
     }
     if let Some(api) = &config.anthropic_api {
         println!("anthropic_api: {}", api.upstream);

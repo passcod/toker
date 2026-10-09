@@ -98,6 +98,14 @@ pub trait Provider: Send + Sync {
         let _ = outgoing;
     }
 
+    /// A foreign frontend may reach a subscription binding only when the
+    /// provider can supply its own credential. Native pass-through remains
+    /// independent of this check. Providers without that restriction keep
+    /// their existing upstream-401 behavior.
+    fn foreign_auth_available(&self) -> bool {
+        true
+    }
+
     /// The operator's model routing map for this backend, when one is
     /// configured (`[providers.<id>.model_map]`, the same
     /// env-typed pattern the predecessor used):
