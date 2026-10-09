@@ -752,6 +752,7 @@ fn canonical_usage(usage: &Usage) -> CanonicalUsage {
             .output_tokens_details
             .as_ref()
             .and_then(|details| details.reasoning_tokens),
+        serving_provider: None,
         raw: serde_json::to_value(usage).expect("a parsed Usage always serialises"),
     }
 }
@@ -1746,6 +1747,7 @@ mod tests {
                         cache_write: Some(64),
                         output: Some(210),
                         reasoning: Some(96),
+                        serving_provider: None,
                         raw: json!({
                             "input_tokens": 1234,
                             "input_tokens_details": {"cached_tokens": 512, "cache_write_tokens": 64},
@@ -1959,6 +1961,7 @@ mod tests {
                     cache_write: None,
                     output: Some(5),
                     reasoning: None,
+                    serving_provider: None,
                     raw: json!({
                         "input_tokens": 10,
                         "input_tokens_details": {"cached_tokens": 4},
@@ -2143,6 +2146,7 @@ mod tests {
                     cache_write: Some(64),
                     output: Some(210),
                     reasoning: Some(96),
+                    serving_provider: None,
                     raw: json!({
                         "input_tokens": 1234,
                         "input_tokens_details": {"cached_tokens": 512, "cache_write_tokens": 64},

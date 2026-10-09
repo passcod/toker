@@ -601,6 +601,7 @@ fn merged_usage(
             .get("output_tokens_details")
             .and_then(|details| details.get("thinking_tokens"))
             .and_then(Value::as_u64),
+        serving_provider: None,
         raw,
     })
 }

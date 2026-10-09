@@ -526,7 +526,7 @@ impl OpenAiChatRenderer {
                     None,
                 )];
                 if let Some(usage) = usage {
-                    out.push(self.chunk(Value::Null, None, Some(chat_usage_value(usage))));
+                    out.push(self.usage_chunk(usage));
                 }
                 out.push(SseEvent {
                     data_lines: vec!["[DONE]".to_owned()],
@@ -569,6 +569,21 @@ impl OpenAiChatRenderer {
             data_lines: vec![serde_json::to_string(&value).expect("chat chunk serialises")],
             event: None,
         }
+    }
+
+    fn usage_chunk(&self, usage: &CanonicalUsage) -> SseEvent {
+        let mut chunk = self.chunk(Value::Null, None, Some(chat_usage_value(usage)));
+        if let Some(provider) = &usage.serving_provider {
+            let mut value: Value = serde_json::from_str(&chunk.data_lines[0])
+                .expect("the renderer's own chat chunk parses");
+            value
+                .as_object_mut()
+                .expect("a chat chunk is an object")
+                .insert("provider".to_owned(), Value::String(provider.clone()));
+            chunk.data_lines[0] =
+                serde_json::to_string(&value).expect("chat usage chunk serialises");
+        }
+        chunk
     }
 }
 
@@ -617,9 +632,11 @@ pub fn openai_chat_from_canonical(model: &str, turn: &CanonTurn) -> Value {
         "choices": [{"index": 0, "message": message, "finish_reason": chat_finish_reason(&turn.stop_reason)}],
     });
     if let Some(usage) = &turn.usage {
-        body.as_object_mut()
-            .unwrap()
-            .insert("usage".to_owned(), chat_usage_value(usage));
+        let object = body.as_object_mut().unwrap();
+        object.insert("usage".to_owned(), chat_usage_value(usage));
+        if let Some(provider) = &usage.serving_provider {
+            object.insert("provider".to_owned(), Value::String(provider.clone()));
+        }
     }
     body
 }
@@ -640,6 +657,14 @@ fn chat_finish_reason(reason: &CanonStopReason) -> &'static str {
 fn chat_usage_value(usage: &CanonicalUsage) -> Value {
     let mut value = json!({});
     let object = value.as_object_mut().unwrap();
+    // Cost is provider-attested usage metadata rather than a token bucket.
+    // Preserve it across compatible and cross-protocol routes without
+    // copying arbitrary backend-only usage fields into the Chat shape.
+    for field in ["cost", "cost_details"] {
+        if let Some(value) = usage.raw.get(field) {
+            object.insert(field.to_owned(), value.clone());
+        }
+    }
     if let Some(input) = usage.input {
         object.insert("prompt_tokens".to_owned(), json!(input));
     }
@@ -683,9 +708,9 @@ mod tests {
     use super::{OpenAiChatRenderer, from_openai_chat, openai_chat_from_canonical};
     use crate::ir::canonical::{
         CanonBlock, CanonEvent, CanonRole, CanonStopReason, CanonToolCall, CanonToolChoice,
-        CanonTurn,
+        CanonTurn, CanonicalUsage,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
     fn fixture(name: &str) -> Value {
@@ -804,5 +829,50 @@ mod tests {
         let value = openai_chat_from_canonical("visible-model", &turn);
         assert_eq!(value["choices"][0]["message"]["content"], "hello");
         assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn chat_rendering_preserves_provider_attested_billing_metadata() {
+        let usage = CanonicalUsage {
+            input: Some(12),
+            cache_read: Some(4),
+            cache_write: None,
+            output: Some(7),
+            reasoning: None,
+            serving_provider: Some("Example Compute".to_owned()),
+            raw: json!({
+                "prompt_tokens": 12,
+                "completion_tokens": 7,
+                "cost": 0.00042,
+                "cost_details": {"upstream": 0.0004},
+            }),
+        };
+        let turn = CanonTurn {
+            turn_id: Some("turn-billing".to_owned()),
+            stop_reason: CanonStopReason::EndTurn,
+            usage: Some(usage.clone()),
+            error: None,
+            tool_calls: Vec::new(),
+            blocks: None,
+            text: "done".to_owned(),
+            thinking: BTreeMap::new(),
+        };
+        let complete = openai_chat_from_canonical("visible-model", &turn);
+        assert_eq!(complete["provider"], "Example Compute");
+        assert_eq!(complete["usage"]["cost"], 0.00042);
+        assert_eq!(complete["usage"]["cost_details"]["upstream"], 0.0004);
+
+        let mut renderer = OpenAiChatRenderer::new("visible-model");
+        let event = renderer
+            .feed(&CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: Some(usage),
+            })
+            .into_iter()
+            .find(|event| event.data().contains("\"usage\""))
+            .expect("usage chunk");
+        let streamed: Value = serde_json::from_str(&event.data()).unwrap();
+        assert_eq!(streamed["provider"], "Example Compute");
+        assert_eq!(streamed["usage"]["cost"], 0.00042);
     }
 }

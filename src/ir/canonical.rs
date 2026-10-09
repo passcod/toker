@@ -521,6 +521,11 @@ pub struct CanonicalUsage {
     pub cache_write: Option<u64>,
     pub output: Option<u64>,
     pub reasoning: Option<u64>,
+    /// The provider that actually served the turn, when the backend attests
+    /// one separately from its own provider identity (OpenRouter's
+    /// top-level `provider`). This is routing/accounting metadata, never
+    /// inferred from the model id.
+    pub serving_provider: Option<String>,
     /// The backend's own usage object, re-serialised verbatim (every
     /// member the wire carried, modelled and unmodelled alike).
     pub raw: Value,

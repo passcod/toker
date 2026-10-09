@@ -2629,6 +2629,7 @@ mod tests {
             cache_write: Some(64),
             output: Some(210),
             reasoning: Some(96),
+            serving_provider: None,
             raw: json!({"input_tokens": 1234}),
         };
         let rendered = stream_bytes(
@@ -2649,6 +2650,7 @@ mod tests {
             cache_write: None,
             output: Some(5),
             reasoning: None,
+            serving_provider: None,
             raw: json!({}),
         };
         let rendered = stream_bytes(
@@ -2745,6 +2747,7 @@ mod tests {
                 cache_write: Some(64),
                 output: Some(210),
                 reasoning: Some(96),
+                serving_provider: None,
                 raw: json!({}),
             }),
             error: None,
@@ -2880,6 +2883,7 @@ mod tests {
                     cache_write: None,
                     output: Some(2),
                     reasoning: None,
+                    serving_provider: None,
                     raw: json!({}),
                 }),
             },

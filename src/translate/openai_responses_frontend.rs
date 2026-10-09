@@ -1119,6 +1119,7 @@ mod tests {
             cache_write: None,
             output: Some(7),
             reasoning: Some(3),
+            serving_provider: None,
             raw: json!({
                 "input_tokens": 12,
                 "input_tokens_details": {"cached_tokens": 4},

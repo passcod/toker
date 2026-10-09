@@ -467,6 +467,7 @@ pub struct OpenAiChatResponseStream {
     calls: BTreeMap<u64, IncomingToolCall>,
     usage: Option<CanonicalUsage>,
     pending_stop: Option<CanonStopReason>,
+    serving_provider: Option<String>,
     ended: bool,
 }
 
@@ -511,6 +512,9 @@ impl OpenAiChatResponseStream {
             }];
         }
         let mut out = Vec::new();
+        if let Some(provider) = chunk.get("provider").and_then(Value::as_str) {
+            self.serving_provider = Some(provider.to_owned());
+        }
         if !self.started {
             self.started = true;
             out.push(CanonEvent::TurnStarted {
@@ -599,6 +603,9 @@ impl OpenAiChatResponseStream {
             return Vec::new();
         };
         self.ended = true;
+        if let Some(usage) = self.usage.as_mut() {
+            usage.serving_provider.clone_from(&self.serving_provider);
+        }
         vec![CanonEvent::TurnEnded {
             stop_reason,
             usage: self.usage.take(),
@@ -667,6 +674,13 @@ pub fn canonical_turn_from_openai_chat(body: &Value) -> Result<CanonTurn, Transl
             _ => {}
         }
     }
+    let mut usage = body.get("usage").and_then(chat_usage);
+    if let Some(usage) = usage.as_mut() {
+        usage.serving_provider = body
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
     Ok(CanonTurn {
         turn_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
         stop_reason: choice
@@ -674,7 +688,7 @@ pub fn canonical_turn_from_openai_chat(body: &Value) -> Result<CanonTurn, Transl
             .and_then(Value::as_str)
             .map(chat_stop_reason)
             .unwrap_or_else(|| CanonStopReason::Incomplete("missing_finish_reason".to_owned())),
-        usage: body.get("usage").and_then(chat_usage),
+        usage,
         error: None,
         tool_calls,
         blocks: Some(blocks),
@@ -707,6 +721,7 @@ fn chat_usage(value: &Value) -> Option<CanonicalUsage> {
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64),
+        serving_provider: None,
         raw: value.clone(),
     })
 }
@@ -843,6 +858,7 @@ mod tests {
                         cache_write: None,
                         output: Some(16),
                         reasoning: None,
+                        serving_provider: Some("z-ai".to_owned()),
                         raw: serde_json::json!({
                             "prompt_tokens": 128,
                             "completion_tokens": 16,
