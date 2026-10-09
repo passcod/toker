@@ -365,6 +365,7 @@ fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationR
 pub struct AnthropicResponseStream {
     blocks: BTreeMap<u64, IncomingBlock>,
     start_usage: Option<Map<String, Value>>,
+    serving_provider: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +416,10 @@ impl AnthropicResponseStream {
             return Vec::new();
         };
         self.start_usage = message.get("usage").and_then(Value::as_object).cloned();
+        self.serving_provider = message
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         vec![CanonEvent::TurnStarted {
             turn_id: message.get("id").and_then(Value::as_str).map(str::to_owned),
         }]
@@ -557,7 +562,11 @@ impl AnthropicResponseStream {
             .and_then(|delta| delta.get("stop_reason"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let usage = merged_usage(self.start_usage.as_ref(), event.get("usage"));
+        let usage = merged_usage(
+            self.start_usage.as_ref(),
+            event.get("usage"),
+            self.serving_provider.as_deref(),
+        );
         vec![CanonEvent::TurnEnded {
             stop_reason: stop_reason(reason),
             usage,
@@ -581,6 +590,7 @@ fn stop_reason(reason: &str) -> CanonStopReason {
 fn merged_usage(
     start: Option<&Map<String, Value>>,
     final_usage: Option<&Value>,
+    serving_provider: Option<&str>,
 ) -> Option<CanonicalUsage> {
     let mut merged = start.cloned().unwrap_or_default();
     if let Some(final_usage) = final_usage.and_then(Value::as_object) {
@@ -601,7 +611,7 @@ fn merged_usage(
             .get("output_tokens_details")
             .and_then(|details| details.get("thinking_tokens"))
             .and_then(Value::as_u64),
-        serving_provider: None,
+        serving_provider: serving_provider.map(str::to_owned),
         raw,
     })
 }
@@ -686,7 +696,11 @@ pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, Translat
             .and_then(Value::as_str)
             .map(stop_reason)
             .unwrap_or(CanonStopReason::EndTurn),
-        usage: merged_usage(None, body.get("usage")),
+        usage: merged_usage(
+            None,
+            body.get("usage"),
+            body.get("provider").and_then(Value::as_str),
+        ),
         error: None,
         tool_calls,
         blocks: Some(blocks),
@@ -755,6 +769,31 @@ mod tests {
         assert_eq!(usage.output, Some(65));
         assert_eq!(usage.reasoning, Some(22));
         assert_eq!(usage.raw["service_tier"], json!("standard"));
+    }
+
+    #[test]
+    fn openrouter_stream_usage_keeps_billing_and_serving_provider() {
+        let events = fixture_events(
+            r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","provider":"Example Compute","usage":{"input_tokens":7}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"cost":0.0007,"cost_details":{"upstream":0.0006}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#,
+        );
+        let Some(CanonEvent::TurnEnded {
+            usage: Some(usage), ..
+        }) = events.last()
+        else {
+            panic!("stream ends with canonical usage: {events:?}");
+        };
+        assert_eq!(usage.serving_provider.as_deref(), Some("Example Compute"));
+        assert_eq!(usage.raw["cost"], json!(0.0007));
+        assert_eq!(usage.raw["cost_details"]["upstream"], json!(0.0006));
     }
 
     #[test]
@@ -838,7 +877,9 @@ mod tests {
             ],
             "stop_reason": "pause_turn",
             "stop_sequence": null,
-            "usage": {"input_tokens": 7, "output_tokens": 9,
+            "provider": "Example Compute",
+            "usage": {"input_tokens": 7, "output_tokens": 9, "cost": 0.0007,
+                      "cost_details": {"upstream": 0.0006},
                       "output_tokens_details": {"thinking_tokens": 3}}
         });
         let turn = canonical_turn_from_anthropic(&body).expect("interprets");
@@ -850,10 +891,22 @@ mod tests {
             turn.usage.as_ref().and_then(|usage| usage.reasoning),
             Some(3)
         );
+        assert_eq!(
+            turn.usage
+                .as_ref()
+                .and_then(|usage| usage.serving_provider.as_deref()),
+            Some("Example Compute")
+        );
 
         let rendered = anthropic_from_canonical("claude-opus-5", &turn);
         assert_eq!(rendered["content"], body["content"]);
         assert_eq!(rendered["stop_reason"], json!("pause_turn"));
+        assert_eq!(rendered["provider"], body["provider"]);
+        assert_eq!(rendered["usage"]["cost"], body["usage"]["cost"]);
+        assert_eq!(
+            rendered["usage"]["cost_details"],
+            body["usage"]["cost_details"]
+        );
     }
 
     #[test]

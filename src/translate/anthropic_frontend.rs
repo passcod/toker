@@ -1065,6 +1065,9 @@ impl AnthropicRenderer {
                 );
                 if let Some(usage) = usage {
                     data.insert("usage".to_owned(), usage_json(usage));
+                    if let Some(provider) = &usage.serving_provider {
+                        data.insert("provider".to_owned(), Value::String(provider.clone()));
+                    }
                 }
                 out.push(sse_event("message_delta", Value::Object(data)));
                 out.push(sse_event("message_stop", json!({"type": "message_stop"})));
@@ -1194,6 +1197,9 @@ pub fn anthropic_from_canonical(model: &str, turn: &CanonTurn) -> Value {
     message.insert("stop_sequence".to_owned(), Value::Null);
     if let Some(usage) = &turn.usage {
         message.insert("usage".to_owned(), usage_json(usage));
+        if let Some(provider) = &usage.serving_provider {
+            message.insert("provider".to_owned(), Value::String(provider.clone()));
+        }
     }
     Value::Object(message)
 }
@@ -1223,6 +1229,14 @@ fn stop_reason_of(reason: &CanonStopReason) -> &'static str {
 /// (the pair module's translation note).
 fn usage_json(usage: &CanonicalUsage) -> Value {
     let mut map = Map::new();
+    // Cost is provider-attested usage metadata rather than a token bucket.
+    // Preserve the OpenRouter Messages fields without copying arbitrary
+    // backend-only usage values into the frontend shape.
+    for field in ["cost", "cost_details"] {
+        if let Some(value) = usage.raw.get(field) {
+            map.insert(field.to_owned(), value.clone());
+        }
+    }
     if let Some(input) = usage.input {
         map.insert("input_tokens".to_owned(), json!(input));
     }
@@ -2629,8 +2643,12 @@ mod tests {
             cache_write: Some(64),
             output: Some(210),
             reasoning: Some(96),
-            serving_provider: None,
-            raw: json!({"input_tokens": 1234}),
+            serving_provider: Some("Example Compute".to_owned()),
+            raw: json!({
+                "input_tokens": 1234,
+                "cost": 0.0007,
+                "cost_details": {"upstream": 0.0006}
+            }),
         };
         let rendered = stream_bytes(
             "claude-opus-5",
@@ -2640,8 +2658,9 @@ mod tests {
             }],
         );
         assert!(rendered.contains(
-            r#""usage":{"input_tokens":1234,"cache_creation_input_tokens":64,"cache_read_input_tokens":512,"output_tokens":210}"#
+            r#""usage":{"cost":0.0007,"cost_details":{"upstream":0.0006},"input_tokens":1234,"cache_creation_input_tokens":64,"cache_read_input_tokens":512,"output_tokens":210}"#
         ));
+        assert!(rendered.contains(r#""provider":"Example Compute""#));
 
         // A usage without the details omits the cache keys entirely.
         let partial = CanonicalUsage {
