@@ -55,6 +55,7 @@ pub fn from_openai_responses(body: &Value) -> Result<CanonicalRequest, Translate
             ],
         )
         .into_iter()
+        .chain(tool_extensions(body))
         .chain(reasoning_extensions(body))
         .collect(),
     })
@@ -122,33 +123,30 @@ fn input_of(body: &Value) -> Result<Vec<CanonMessage>, TranslateError> {
 
 fn input_item_of(item: &Value, index: usize) -> Result<CanonMessage, TranslateError> {
     let kind = item.get("type").and_then(Value::as_str);
-    if kind == Some("reasoning") {
-        // Reasoning items contain provider-encrypted state whose semantics
-        // cannot be flattened into portable thinking text. Keep the whole
-        // item opaque at its exact conversation position; the Codex dialect
-        // renderer can replay it, while every foreign binding reports it.
-        return Ok(CanonMessage {
-            role: CanonRole::Assistant,
-            blocks: Vec::new(),
-            extensions: vec![CanonicalExtension::new(
-                DIALECT,
-                "$.input[].reasoning",
-                item.clone(),
-            )],
-        });
+    match kind {
+        Some("function_call") => function_call_of(item, index),
+        Some("function_call_output") => function_output_of(item, index),
+        None | Some("message") => message_of(item, index),
+        Some(kind) => {
+            // Responses grows provider-owned conversation item kinds (for
+            // example encrypted reasoning, custom tool calls, and Codex's
+            // incremental `additional_tools` declaration). Their semantics
+            // are not portable, but rejecting a newly introduced item breaks
+            // even a Responses-to-Responses route. Keep the complete item at
+            // its exact position so a compatible binding can replay it and a
+            // foreign binding can report the opaque loss without inspecting
+            // or storing its value.
+            Ok(CanonMessage {
+                role: CanonRole::Assistant,
+                blocks: Vec::new(),
+                extensions: vec![CanonicalExtension::new(
+                    DIALECT,
+                    format!("$.input[].{kind}"),
+                    item.clone(),
+                )],
+            })
+        }
     }
-    if kind == Some("function_call") {
-        return function_call_of(item, index);
-    }
-    if kind == Some("function_call_output") {
-        return function_output_of(item, index);
-    }
-    if kind.is_none() || kind == Some("message") {
-        return message_of(item, index);
-    }
-    Err(TranslateError::UnsupportedBlock {
-        kind: kind.unwrap_or("input_item").to_owned(),
-    })
 }
 
 fn message_of(item: &Value, index: usize) -> Result<CanonMessage, TranslateError> {
@@ -308,16 +306,8 @@ fn tools_of(body: &Value) -> Result<Vec<CanonTool>, TranslateError> {
     tools
         .iter()
         .enumerate()
+        .filter(|(_, tool)| tool.get("type").and_then(Value::as_str) == Some("function"))
         .map(|(index, tool)| {
-            if tool.get("type").and_then(Value::as_str) != Some("function") {
-                return Err(TranslateError::UnsupportedBlock {
-                    kind: tool
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_owned(),
-                });
-            }
             let name = tool.get("name").and_then(Value::as_str).ok_or_else(|| {
                 TranslateError::Malformed {
                     reason: format!("tools[{index}].name is missing or not a string"),
@@ -350,6 +340,28 @@ fn tools_of(body: &Value) -> Result<Vec<CanonTool>, TranslateError> {
             })
         })
         .collect()
+}
+
+fn tool_extensions(body: &Value) -> Vec<CanonicalExtension> {
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    if tools
+        .iter()
+        .all(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+    {
+        return Vec::new();
+    }
+    // Preserve the complete collection when it contains a provider-owned
+    // tool kind. The semantic function subset remains canonical for foreign
+    // bindings; a compatible Responses binding replaces its rendered subset
+    // with this exact ordered array.
+    vec![CanonicalExtension::node_field(
+        DIALECT,
+        "$.tools",
+        "tools",
+        Value::Array(tools.clone()),
+    )]
 }
 
 fn tool_choice_of(body: &Value) -> Result<CanonToolChoice, TranslateError> {
@@ -1254,14 +1266,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_input_kinds_and_malformed_arguments_are_typed_failures() {
-        let unknown = from_openai_responses(&json!({
-            "input": [{"type": "computer_call"}]
-        }));
-        assert!(matches!(
-            unknown,
-            Err(TranslateError::UnsupportedBlock { kind }) if kind == "computer_call"
-        ));
+    fn provider_input_items_replay_opaquely_and_malformed_arguments_still_fail() {
+        let body = json!({
+            "model": "gpt-example",
+            "tools": [
+                {"type": "function", "name": "lookup", "description": "Lookup",
+                 "parameters": {"type": "object"}},
+                {"type": "custom", "name": "exec", "format": {"type": "grammar"}}
+            ],
+            "input": [
+                {"type": "additional_tools", "id": "at_1", "role": "developer",
+                 "tools": [{"type": "custom", "name": "exec"}]},
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec",
+                 "input": "opaque input"}
+            ]
+        });
+        let canonical = from_openai_responses(&body).expect("opaque items parse");
+        assert_eq!(canonical.messages.len(), 2);
+        assert_eq!(canonical.tools.len(), 1);
+        assert!(
+            canonical
+                .messages
+                .iter()
+                .all(|message| message.blocks.is_empty())
+        );
+        let rendered = render_codex(&canonical, "cache-key").expect("opaque items render");
+        assert!(rendered.report.is_empty(), "{:?}", rendered.report);
+        let value = serde_json::to_value(rendered.value).expect("wire value");
+        assert_eq!(value["input"], body["input"]);
+        assert_eq!(value["tools"], body["tools"]);
+
         let malformed = from_openai_responses(&json!({
             "input": [{"type": "function_call", "name": "f", "call_id": "c",
                        "arguments": "[]"}]

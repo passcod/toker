@@ -36,10 +36,12 @@ backend (`anthropic::unmatched`), as ctp forwarded everything, except the
 The Responses route is canonical even though both ends speak Responses. Toker
 parses the request into canonical IR, deterministically renders it for the
 Codex binding, interprets upstream events canonically, and renders Responses
-events back to the client. Compatible extensions and provider-encrypted
-reasoning replay through the canonical model. Toker always replaces the
-frontend credential with its shared Codex login before the request leaves
-loopback.
+events back to the client. Compatible extensions, provider-owned input items
+(including encrypted reasoning and incremental tool declarations), and
+provider-owned tool kinds replay opaquely through the canonical model. This
+lets a newer frontend shape reach a compatible backend without requiring toker
+to understand its contents. Toker always replaces the frontend credential
+with its shared Codex login before the request leaves loopback.
 
 The Chat route may select `codex_sub` as its configured default or with a
 `codex_sub/<model>` prefix. That route always parses Chat into canonical IR,

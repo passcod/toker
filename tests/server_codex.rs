@@ -487,7 +487,12 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         "model": "gpt-5.6-sol",
         "prompt_cache_key": "codex-session-1",
         "instructions": "private instructions",
-        "input": [{"role": "user", "content": "private prompt"}],
+        "input": [
+            {"role": "user", "content": "private prompt"},
+            {"type": "additional_tools", "id": "at_1", "role": "developer",
+             "tools": [{"type": "custom", "name": "exec"}]},
+            {"type": "future_provider_item", "opaque": true}
+        ],
         "tools": [{"type": "function", "name": "shell", "parameters": {}, "strict": true}],
         "reasoning": {"effort": "xhigh", "summary": "auto"},
         "parallel_tool_calls": true,
@@ -526,6 +531,17 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(rendered["model"], "gpt-5.6-sol");
     assert_eq!(rendered["instructions"], "private instructions");
     assert_eq!(rendered["input"][0]["content"][0]["text"], "private prompt");
+    assert_eq!(
+        rendered["input"][1],
+        json!({
+            "type": "additional_tools", "id": "at_1", "role": "developer",
+            "tools": [{"type": "custom", "name": "exec"}]
+        })
+    );
+    assert_eq!(
+        rendered["input"][2],
+        json!({"type": "future_provider_item", "opaque": true})
+    );
     assert_eq!(rendered["tools"][0]["name"], "shell");
     assert_eq!(rendered["tools"][0]["strict"], true);
     assert_eq!(rendered["reasoning"]["effort"], "xhigh");
@@ -559,7 +575,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
     assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
     assert_eq!(row.requested_model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(row.req_messages, Some(1));
+    assert_eq!(row.req_messages, Some(3));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
     assert_eq!(row.input, Some(658));

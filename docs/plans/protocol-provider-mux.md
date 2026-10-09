@@ -324,11 +324,13 @@ effort, extensions, and opaque provider reasoning items canonically. The Codex
 Responses backend replays compatible request extensions through that IR, with
 deterministic and append-prefix-stable rendering. Its frontend adapter now
 renders canonical streaming events and complete turns back to Responses,
-including provider-encrypted reasoning. The Messages and OpenRouter Chat
-provider bindings declare canonical readiness, and the Chat frontend renders
-canonical streaming and complete responses. The Codex Responses and Chat
-handlers now use those adapters live; the remaining handlers stay on the
-legacy path until phase 3 cuts each route over.
+including provider-encrypted reasoning. Provider-owned Responses input items
+also cross the canonical boundary opaquely and replay to compatible bindings,
+so protocol evolution does not make same-dialect routes brittle. The Messages
+and OpenRouter Chat provider bindings declare canonical readiness, and the
+Chat frontend renders canonical streaming and complete responses. The Codex
+Responses and Chat handlers now use those adapters live; the remaining
+handlers stay on the legacy path until phase 3 cuts each route over.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.

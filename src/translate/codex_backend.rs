@@ -276,6 +276,12 @@ fn replay_request_extensions(
                 Ok(value) => request.include = value,
                 Err(_) => report_not_representable(extension, report),
             },
+            "tools" => match extension.value().as_array() {
+                Some(tools) => {
+                    request.tools = tools.iter().cloned().map(Tool).collect();
+                }
+                None => report_not_representable(extension, report),
+            },
             _ => {
                 request
                     .extra
@@ -345,8 +351,8 @@ fn input_of(
     let mut items: Vec<Item> = Vec::with_capacity(canonical.messages.len());
     let mut leading_system: Vec<String> = Vec::new();
     for message in &canonical.messages {
-        if let Some(reasoning) = opaque_reasoning_item(message, report) {
-            items.push(reasoning);
+        if let Some(item) = opaque_codex_input_item(message, report) {
+            items.push(item);
             continue;
         }
         match message.role {
@@ -439,19 +445,26 @@ fn input_of(
     (items, leading_system)
 }
 
-fn opaque_reasoning_item(message: &CanonMessage, report: &mut TranslationReport) -> Option<Item> {
+fn opaque_codex_input_item(message: &CanonMessage, report: &mut TranslationReport) -> Option<Item> {
     if !message.blocks.is_empty() {
         return None;
     }
-    let reasoning_index = message.extensions.iter().position(|extension| {
+    let item_index = message.extensions.iter().position(|extension| {
+        let Some(kind) = extension
+            .value()
+            .as_object()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
         extension.source() == DialectId::CodexResponses
             && extension.wire_name().is_none()
-            && extension.wire_path() == "$.input[].reasoning"
-            && extension.value().is_object()
+            && extension.wire_path().strip_prefix("$.input[].") == Some(kind)
     })?;
-    let reasoning = Item(message.extensions[reasoning_index].value().clone());
+    let item = Item(message.extensions[item_index].value().clone());
     for (index, extension) in message.extensions.iter().enumerate() {
-        if index == reasoning_index {
+        if index == item_index {
             continue;
         }
         if extension.source() == DialectId::CodexResponses {
@@ -460,7 +473,7 @@ fn opaque_reasoning_item(message: &CanonMessage, report: &mut TranslationReport)
             report_incompatible(extension, report);
         }
     }
-    Some(reasoning)
+    Some(item)
 }
 
 fn report_unrepresentable_or_incompatible(
