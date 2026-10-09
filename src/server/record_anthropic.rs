@@ -110,6 +110,11 @@ pub(crate) struct AnthropicRecordCtx {
     /// The frontend's name from its `/f/<frontend>` prefix, recorded in
     /// `extra` ([`with_frontend`]).
     pub(crate) frontend: Option<String>,
+    /// The upstream refused this request's `thinking: disabled` and it was
+    /// sent again as `between_tools` (the server's thinking retry), so the
+    /// row describes the second attempt. Recorded in `extra` as
+    /// `thinkingRewrite`; the refused first attempt has no row of its own.
+    pub(crate) thinking_rewritten: bool,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -253,7 +258,10 @@ fn drift_note(ctx: &AnthropicRecordCtx) -> String {
 /// served, which a host-side alias or an upstream substitution can make
 /// differ from what was sent — and recency must follow the served
 /// identity. In-memory and infallible, so it cannot cost the row.
-fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
+fn insert(ctx: &AnthropicRecordCtx, mut row: RequestRow) {
+    if ctx.thinking_rewritten {
+        mark_thinking_rewrite(&mut row);
+    }
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
@@ -261,6 +269,19 @@ fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     ctx.server
         .models
         .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
+}
+
+/// Mark a row whose request went out the second time with `thinking`
+/// rewritten to `between_tools`, the same way [`with_frontend`] adds its
+/// key: into an object `extra`, or as a new one.
+fn mark_thinking_rewrite(row: &mut RequestRow) {
+    match &mut row.extra {
+        Some(Value::Object(extra)) => {
+            extra.insert("thinkingRewrite".to_owned(), json!("between_tools"));
+        }
+        Some(_) => {}
+        None => row.extra = Some(json!({ "thinkingRewrite": "between_tools" })),
+    }
 }
 
 /// Whether the capture carries any usage metric at all. Only responses

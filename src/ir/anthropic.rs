@@ -387,6 +387,25 @@ impl AnthropicBodyMut<'_> {
         changed || messages.len() != before
     }
 
+    /// Turn `"thinking": {"type": "disabled"}` into
+    /// `{"type": "between_tools"}`, the form a model that cannot switch
+    /// thinking off names in its 400. Any other `thinking` (absent,
+    /// enabled, adaptive) is left alone. Returns whether anything changed.
+    ///
+    /// The key keeps its position, so only the value's bytes move. Extra
+    /// keys beside `type` go too: the upstream rejects them on a disabled
+    /// block already, and `between_tools` takes none.
+    pub fn thinking_between_tools(&mut self) -> bool {
+        let Some(thinking) = self.request.value.get_mut("thinking") else {
+            return false;
+        };
+        if thinking.get("type").and_then(Value::as_str) != Some("disabled") {
+            return false;
+        }
+        *thinking = serde_json::json!({ "type": "between_tools" });
+        true
+    }
+
     /// [`Self::strip_release`] for one marker.
     fn strip_marker(&mut self, marker: &str) {
         // Phase 1 — the parsed decision, as mutation targets (message
@@ -1714,6 +1733,32 @@ mod tests {
         let mut request = parse(&body);
         assert!(!request.anthropic_mut().strip_message_effort());
         assert_eq!(request.serialise(), body);
+    }
+
+    #[test]
+    fn thinking_between_tools_replaces_only_a_disabled_block_in_place() {
+        let mut request = parse(
+            br#"{"model":"m","thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        assert!(request.anthropic_mut().thinking_between_tools());
+        assert_eq!(
+            request.serialise(),
+            br#"{"model":"m","thinking":{"type":"between_tools"},"messages":[{"role":"user","content":"hi"}]}"#
+        );
+    }
+
+    #[test]
+    fn thinking_between_tools_is_quiet_unless_thinking_is_disabled() {
+        for body in [
+            &br#"{"model":"m","messages":[]}"#[..],
+            br#"{"model":"m","thinking":{"type":"enabled","budget_tokens":2048},"messages":[]}"#,
+            br#"{"model":"m","thinking":{"type":"adaptive"},"messages":[]}"#,
+            br#"{"model":"m","thinking":{"type":"between_tools"},"messages":[]}"#,
+        ] {
+            let mut request = parse(body);
+            assert!(!request.anthropic_mut().thinking_between_tools());
+            assert_eq!(request.serialise(), body);
+        }
     }
 
     #[test]

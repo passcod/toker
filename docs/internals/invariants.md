@@ -143,6 +143,12 @@ reasons.
      non-Anthropic model on openrouter). The client replays that message every
      turn, so leaving it would 400 the whole session. Text in the same message
      stays; an effort-only message goes.
+   - `thinking_between_tools` turns `"thinking": {"type": "disabled"}` into
+     `{"type": "between_tools"}` on the one retry that follows an upstream 400
+     asking for exactly that (`retry_thinking_off` in `server/anthropic.rs`).
+     It waits for the refusal because the refusal is the only evidence a model
+     wants it. Only the value's bytes change, and the client's transcript is
+     untouched: the next turn sends `disabled` again and is judged afresh.
    - `model_map::rewrite_mapped_models` applies an explicit, configured routing
      map as the last stage and changes only model positions. An unmatched or
      disabled map returns the input bytes untouched.

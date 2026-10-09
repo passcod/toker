@@ -60,6 +60,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::Stream;
 
@@ -362,6 +363,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forced_from: None,
             forced_to: None,
             model_mappings: None,
+            thinking_rewritten: false,
         });
         gate_shape = Some(shape);
         parsed = Some(ir);
@@ -1035,8 +1037,28 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // 6. Upstream; 7.-9. in forward_response. Session headers pass
     // through (see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.
+    let sent = forward.clone();
     match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
-        Ok(upstream) => forward_response(server, backend, upstream, record, in_flight).await,
+        Ok(upstream) => {
+            let upstream = if path == "/v1/messages" {
+                match retry_thinking_off(
+                    &server,
+                    backend.as_ref(),
+                    &parts,
+                    sent,
+                    upstream,
+                    &mut record,
+                )
+                .await
+                {
+                    Ok(upstream) => upstream,
+                    Err(response) => return *response,
+                }
+            } else {
+                upstream
+            };
+            forward_response(server, backend, upstream, record, in_flight).await
+        }
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
             // provider-response-shaped (status/type/retry-after), so this
@@ -1047,6 +1069,115 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             transport_failure(ErrorWire::Anthropic, &error)
         }
     }
+}
+
+/// Feed the meters from EVERY response, not just accounted ones: a 429, a
+/// count_tokens, a background batch poll, a 400 the thinking retry
+/// swallowed still report the meters, and the gate must not go stale. Only
+/// a meter-source backend has meters to report (the sub; the API's RPM
+/// headers are not quota meters and must not overwrite the gate's
+/// snapshot).
+fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
+    let Some(meters) = backend.meters(headers) else {
+        return;
+    };
+    server.note_quota(backend.id(), &meters);
+    let snapshot = MetersSnapshot {
+        updated_ms: now_ms(),
+        snapshot: meters,
+    };
+    if let Err(error) = server.store.save_meters(backend.id(), &snapshot) {
+        tracing::error!(%error, "meter snapshot save failed");
+    }
+}
+
+/// Send the request once more with `thinking: disabled` rewritten to
+/// `between_tools`, when the upstream refused the first with a 400 that
+/// names that form. Any other response comes back as it arrived.
+///
+/// Claude Code turns thinking off on its side calls (the auto-mode
+/// classifier among them) and decides per model whether `disabled` is
+/// allowed from a list built into the client. From 2026-10-08 Anthropic
+/// started refusing it on `claude-sonnet-5` in bursts, with "To turn
+/// thinking off on this model, send `between_tools`", while the same call
+/// succeeded between bursts; a client built before that keeps sending
+/// `disabled`, and every Bash permission check in auto mode fails. The
+/// rewrite waits for the refusal rather than running up front, because
+/// whether `between_tools` is accepted where `disabled` still is was never
+/// observed, and the refusal is the only evidence a model wants it.
+///
+/// Once only: a second refusal is forwarded and recorded like any error.
+/// The refused response's meters still feed the gate.
+async fn retry_thinking_off(
+    server: &Server,
+    backend: &dyn Provider,
+    parts: &axum::http::request::Parts,
+    sent: Bytes,
+    upstream: reqwest::Response,
+    record: &mut Option<AnthropicRecordCtx>,
+) -> Result<reqwest::Response, Box<Response>> {
+    if upstream.status() != StatusCode::BAD_REQUEST {
+        return Ok(upstream);
+    }
+    let Some(retry) = between_tools_body(&sent) else {
+        return Ok(upstream);
+    };
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+        return Err(Box::new(truncated_body(ErrorWire::Anthropic)));
+    };
+    let wants_between_tools = buffered.rest.is_none()
+        && error_pair(&buffered.bytes)
+            .1
+            .is_some_and(|message| message.contains("between_tools"));
+    if !wants_between_tools {
+        return Ok(rebuilt_response(status, headers, buffered));
+    }
+    note_meters(server, backend, &headers);
+    tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
+    if let Some(ctx) = record {
+        ctx.thinking_rewritten = true;
+    }
+    send_upstream(server, backend, parts, retry, &[])
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "upstream request failed");
+            Box::new(transport_failure(ErrorWire::Anthropic, &error))
+        })
+}
+
+/// The sent body with `thinking: disabled` made `between_tools`
+/// ([`crate::ir::AnthropicBodyMut::thinking_between_tools`]), or `None`
+/// when it did not turn thinking off (or does not parse), so there is
+/// nothing to retry.
+fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
+    let mut ir = IrRequest::parse(sent).ok()?;
+    ir.anthropic_mut()
+        .thinking_between_tools()
+        .then(|| Bytes::from(ir.serialise()))
+}
+
+/// A response put back together from what [`retry_thinking_off`] buffered
+/// to read its error, so [`forward_response`] handles it as if it had
+/// never been read: the same status, headers, and bytes, with any
+/// unbuffered remainder chained on.
+fn rebuilt_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    buffered: super::proxy::Buffered,
+) -> reqwest::Response {
+    let body = match buffered.rest {
+        None => reqwest::Body::from(buffered.bytes),
+        Some(rest) => reqwest::Body::wrap_stream(
+            futures::stream::iter([Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes))])
+                .chain(rest.bytes_stream()),
+        ),
+    };
+    let mut response = axum::http::Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    reqwest::Response::from(response)
 }
 
 /// Whether the rewrites that pick their target from the Anthropic model
@@ -1251,21 +1382,7 @@ async fn forward_response(
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
 
-    // Feed the meters from EVERY response, not just accounted
-    // ones — a 429, a count_tokens, a background batch poll still report
-    // the meters, and the gate must not go stale. Only a meter-source
-    // backend has meters to report (the sub; the API's RPM headers are
-    // not quota meters and must not overwrite the gate's snapshot).
-    if let Some(meters) = backend.meters(&upstream_headers) {
-        server.note_quota(backend.id(), &meters);
-        let snapshot = MetersSnapshot {
-            updated_ms: now_ms(),
-            snapshot: meters,
-        };
-        if let Err(error) = server.store.save_meters(backend.id(), &snapshot) {
-            tracing::error!(%error, "meter snapshot save failed");
-        }
-    }
+    note_meters(&server, backend.as_ref(), &upstream_headers);
     // The row's own copy — this response's headers, parsed, for the
     // measurement row and the error row alike (a failure's meters are the
     // only evidence of throttling); the meters_state table took the

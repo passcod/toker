@@ -168,6 +168,31 @@ rejects what it does not understand. Setup's wiring check relies on that,
 posting an empty body and taking the upstream's own 401 as proof the chain is
 up.
 
+## Thinking that cannot be turned off
+
+Claude Code turns thinking off on its side calls, the auto-mode classifier
+among them, with `"thinking": {"type": "disabled"}`. Which models accept that
+is a list built into the client: 2.1.292 (read 2026-10-09) lists
+`claude-sonnet-5` as one that does. From 2026-10-08 Anthropic refused it on
+that model in bursts, answering 400 with "To turn thinking off on this model,
+send `"thinking": {"type": "between_tools"}`", while the same call succeeded
+between bursts. In a burst every classifier call failed, and with it every Bash
+permission check in auto mode, in sessions on any main model.
+
+So when a `/v1/messages` request that sent `disabled` comes back 400 with an
+error message naming `between_tools`, toker sends it once more with that value
+in its place (`retry_thinking_off` in `server/anthropic.rs`) and forwards
+whatever the second attempt gets. It never rewrites up front: nobody observed
+whether `between_tools` is accepted where `disabled` still is, and the refusal
+is the only evidence. The cost is one extra round trip per call during a
+burst; the 400 arrives before any stream begins, so the client sees only the
+retry's answer. The refusal's meters still feed the gate, and the retried
+row carries `extra.thinkingRewrite` (see
+[ledger-schema.md](ledger-schema.md)).
+
+This keys on the upstream's answer, not on the backend or the model, so it
+applies wherever an Anthropic-wire upstream asks for it.
+
 ## Cross-protocol routes translate, purely
 
 An anthropic-frontend request routed to `codex_sub` never byte-forwards. It goes

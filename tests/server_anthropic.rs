@@ -185,6 +185,8 @@ fn non_stream_body(model: &str) -> Vec<u8> {
 const ERROR_BODY: &str =
     r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
 
+const BETWEEN_TOOLS_ERROR: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"To turn thinking off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks."}}"#;
+
 async fn read_and_capture(mock: &MockState, request: Request) -> (String, HeaderMap, Value, bool) {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
@@ -216,6 +218,22 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
             metered(&mut response, "0.77");
+            response
+        }
+        // A model that cannot turn thinking off, in Anthropic's words of
+        // 2026-10-08: `disabled` is refused with the form it wants instead.
+        // `thinking-always-400` refuses whatever it is sent, so the retry
+        // must stop at one.
+        "thinking-strict" | "thinking-always-400"
+            if model == "thinking-always-400"
+                || json.pointer("/thinking/type") == Some(&json!("disabled")) =>
+        {
+            let mut response = raw_response(
+                StatusCode::BAD_REQUEST,
+                "application/json",
+                Bytes::from_static(BETWEEN_TOOLS_ERROR.as_bytes()),
+            );
+            metered(&mut response, "0.31");
             response
         }
         "gzip-me" => {
@@ -1228,6 +1246,126 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
         .expect("meters")
         .expect("fed from the 401");
     assert_eq!(meters.snapshot, expected_rate_limits("0.77"));
+}
+
+/// A side call shaped like Claude Code's auto-mode classifier: no tools,
+/// thinking turned off.
+fn thinking_off_body(model: &str, stream: bool) -> Vec<u8> {
+    format!(
+        r#"{{"model":"{model}","thinking":{{"type":"disabled"}},"messages":[{{"role":"user","content":"Hi"}}],"stream":{stream}}}"#
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
+    for stream in [false, true] {
+        let (mock, upstream) = spawn_mock().await;
+        let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+        let body = thinking_off_body("thinking-strict", stream);
+        let response = post_messages(addr, "/v1/messages", &[], &body).await;
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        response.bytes().await.expect("body");
+
+        let captured = mock.captured();
+        assert_eq!(captured.len(), 2, "one refusal, one retry");
+        assert_eq!(captured[0].body.as_ref(), body.as_slice());
+        let expected = String::from_utf8(body.clone())
+            .unwrap()
+            .replace(r#"{"type":"disabled"}"#, r#"{"type":"between_tools"}"#);
+        assert_eq!(
+            captured[1].body.as_ref(),
+            expected.as_bytes(),
+            "only the thinking value's bytes move"
+        );
+        // The retry carries the client's own credential and headers.
+        assert_eq!(
+            captured[1].headers.get("x-claude-code-session-id"),
+            captured[0].headers.get("x-claude-code-session-id"),
+        );
+
+        // One row, for the attempt that answered, marked as rewritten.
+        let rows = wait_for_rows(&store, 1).await;
+        let row = &rows[0];
+        assert_eq!(row.status, None, "a measurement row");
+        assert_eq!(
+            row.extra
+                .as_ref()
+                .and_then(|extra| extra.get("thinkingRewrite"))
+                .and_then(Value::as_str),
+            Some("between_tools")
+        );
+        assert_no_more_rows(&store, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn the_thinking_retry_happens_once() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let body = thinking_off_body("thinking-always-400", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        BETWEEN_TOOLS_ERROR.as_bytes(),
+        "the second refusal passes through unchanged"
+    );
+    assert_eq!(mock.captured().len(), 2, "never a third attempt");
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].status, Some(400));
+    assert_eq!(
+        rows[0]
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("thinkingRewrite"))
+            .and_then(Value::as_str),
+        Some("between_tools")
+    );
+}
+
+#[tokio::test]
+async fn other_refusals_and_thinking_left_on_are_not_retried() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    // A 400 naming between_tools, but the request did not turn thinking
+    // off: there is nothing to rewrite, so it is forwarded as it came.
+    let body = messages_body("thinking-always-400", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        BETWEEN_TOOLS_ERROR.as_bytes()
+    );
+    // Thinking off, but an error about something else.
+    let body = thinking_off_body("err-401", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        ERROR_BODY.as_bytes()
+    );
+
+    assert_eq!(mock.captured().len(), 2, "one attempt each");
+    let rows = wait_for_rows(&store, 2).await;
+    for row in &rows {
+        assert!(
+            row.extra
+                .as_ref()
+                .is_none_or(|extra| extra.get("thinkingRewrite").is_none()),
+            "{row:?}"
+        );
+    }
+}
+
+/// [`assert_no_rows`] for a ledger that already holds `count`.
+async fn assert_no_more_rows(store: &Store, count: usize) {
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(store.count_requests().expect("count"), count as i64);
 }
 
 #[tokio::test]

@@ -176,6 +176,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         forced_to: None,
         model_mappings: None,
         frontend,
+        thinking_rewritten: false,
     });
 
     let auth = match codex.auth_for_turn(&server.http, now_ms() / 1000).await {
