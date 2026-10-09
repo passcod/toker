@@ -427,10 +427,28 @@ pub struct CompletedResponse {
 pub struct ResponseError {
     #[serde(rename = "type")]
     pub kind: Option<String>,
+    #[serde(default, deserialize_with = "string_or_number")]
     pub code: Option<String>,
     pub message: Option<String>,
     /// When the error is a rate limit: unix seconds.
     pub resets_at: Option<i64>,
+}
+
+// OpenRouter sends numeric HTTP error codes, whereas Responses events may use
+// symbolic strings. A numeric code must not discard the accompanying message.
+fn string_or_number<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(serde_json::Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(serde::de::Error::custom(
+            "error code must be a string or number",
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -285,6 +285,9 @@ content requests, cache keys and other opaque fields with content-free loss
 reports, rejects unknown tool collections and unsupported input items, and
 records only the provider's reported cost. This binding does not claim images
 or reasoning replay.
+An invalid-model live probe on 2026-10-09 returned HTTP 400 with numeric
+`error.code: 400`; the shared error parser accepts both numeric and symbolic
+codes so the accompanying message survives HTTP and SSE error handling.
 
 What a backend refuses is that backend's declared property (`Capabilities`),
 never a parse-time decision in the frontend: codex refuses system-role input

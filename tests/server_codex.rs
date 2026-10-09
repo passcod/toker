@@ -329,6 +329,22 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
             ),
         );
     }
+    if value["model"] == "numeric-error" {
+        return raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(br#"{"error":{"code":400,"message":"invalid model"}}"#),
+        );
+    }
+    if value["model"] == "numeric-failed" {
+        return raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(br#"data: {"type":"response.failed","response":{"error":{"code":400,"message":"invalid streamed model"}}}
+
+"#),
+        );
+    }
     if value["model"] == "failed" {
         return raw_response(
             StatusCode::OK,
@@ -1116,6 +1132,18 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
     assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(mock.requests.lock().unwrap().len(), 2);
     assert_eq!(wait_for_rows(&store, 2).await[1].kind, Some(RowKind::Error));
+
+    let numeric = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/numeric-error","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(numeric.status(), StatusCode::BAD_REQUEST);
+    let body: Value = numeric.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "invalid model");
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows[2].kind, Some(RowKind::Error));
 }
 
 #[tokio::test]
@@ -1133,6 +1161,16 @@ async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet
     assert!(failed_body.contains("response.failed"), "{failed_body}");
     assert_eq!(wait_for_rows(&store, 1).await[0].kind, Some(RowKind::Error));
 
+    let numeric = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/numeric-failed","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    let numeric_body: Value = numeric.json().await.unwrap();
+    assert_eq!(numeric_body["error"]["message"], "invalid streamed model");
+    assert_eq!(wait_for_rows(&store, 2).await[1].kind, Some(RowKind::Error));
+
     let cut = client()
         .post(format!("http://{addr}/v1/responses"))
         .json(&json!({"model":"openrouter/cut","input":"hello","stream":false}))
@@ -1140,8 +1178,8 @@ async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet
         .await
         .unwrap();
     assert_eq!(cut.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(mock.requests.lock().unwrap().len(), 2);
-    assert_eq!(wait_for_rows(&store, 1).await.len(), 1);
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    assert_eq!(wait_for_rows(&store, 2).await.len(), 2);
 }
 
 #[tokio::test]

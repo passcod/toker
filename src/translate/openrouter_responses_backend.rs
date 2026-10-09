@@ -27,9 +27,9 @@ pub fn render_openrouter_responses(
     for extension in std::mem::take(&mut safe.extensions) {
         match (extension.wire_path(), extension.wire_name()) {
             ("$.max_output_tokens", Some("max_output_tokens")) => {
-                let Some(limit) = extension.value().as_u64().filter(|limit| *limit >= 16) else {
+                let Some(limit) = extension.value().as_u64().filter(|limit| *limit > 0) else {
                     return Err(TranslateError::Malformed {
-                        reason: "max_output_tokens must be an integer of at least 16".to_owned(),
+                        reason: "max_output_tokens must be a positive integer".to_owned(),
                     });
                 };
                 max_output_tokens = Some(limit);
@@ -195,6 +195,14 @@ mod tests {
             let canonical = from_openai_responses(&value).expect("opaque input stays canonical");
             assert!(render_openrouter_responses(&canonical, false).is_err());
         }
+    }
+
+    #[test]
+    fn accepts_positive_output_limit_without_an_unverified_minimum() {
+        assert_eq!(
+            render(json!({"model":"x", "input":"hi", "max_output_tokens":1})).value["max_output_tokens"],
+            1
+        );
     }
 
     #[test]

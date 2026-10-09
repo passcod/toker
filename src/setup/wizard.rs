@@ -1048,7 +1048,7 @@ struct Choices {
 const BACKENDS: &[(&str, &str)] = &[
     (
         "anthropic_sub",
-        "anthropic_sub — the Claude subscription (claude's own login, nothing to store)",
+        "anthropic_sub — the Claude subscription (Claude login or configured OAuth token)",
     ),
     (
         "anthropic_api",
