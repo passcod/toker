@@ -15,7 +15,9 @@
 //!   ORIGINAL body, then stripped unconditionally (the frozen marker rule
 //!   runs on this path for every backend and regardless of the gate's
 //!   toggle — a toggled strip would change the cached prefix of every
-//!   conversation carrying a marker).
+//!   conversation carrying a marker). After middleware finishes, the final
+//!   body parses into canonical IR and the selected Messages binding renders
+//!   it. Provider bytes feed observation before canonical response rendering.
 //! - `POST /v1/messages/count_tokens`, `POST /v1/messages/batches` — the
 //!   same pipeline end to end (buffer → IR parse → fidelity check →
 //!   routing → forward → tee → record), but they are **never gated**
@@ -50,6 +52,7 @@
 //! A client hangup aborts the upstream and records no row, exactly like
 //! the openai path; a hung-up stream is half a measurement, not a row.
 
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -57,7 +60,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -75,7 +78,9 @@ use crate::middleware::quota::{
 };
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
+use crate::routing::ProtocolId;
 use crate::store::{Allowance, MetersSnapshot};
+use crate::translate;
 
 use super::InFlightGuard;
 use super::Server;
@@ -1038,7 +1043,54 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // own bearer when toker holds no key (spawned; never waited on).
     server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
 
-    // 6. Upstream; 7.-9. in forward_response. Session headers pass
+    // Native Messages bindings still traverse the universal canonical
+    // request path. Parse the FINAL middleware output, not `parsed`: the
+    // licensed body rewrites above may have reserialised it since ingress.
+    if path == "/v1/messages" {
+        let dialect = backend
+            .bindings()
+            .iter()
+            .find(|binding| binding.protocol() == ProtocolId::AnthropicMessages)
+            .map(|binding| binding.dialect());
+        let rendered = serde_json::from_slice::<serde_json::Value>(&forward)
+            .map_err(|error| translate::TranslateError::Malformed {
+                reason: error.to_string(),
+            })
+            .and_then(|body| translate::from_anthropic(&body))
+            .and_then(|mut canonical| {
+                canonical.model.clone_from(&served_model);
+                let Some(dialect) = dialect else {
+                    return Err(translate::TranslateError::Malformed {
+                        reason: format!("{} has no Messages binding", backend.id()),
+                    });
+                };
+                translate::render_anthropic(&canonical, dialect)
+            });
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                let stream = serde_json::from_slice::<serde_json::Value>(&forward)
+                    .ok()
+                    .and_then(|body| body.get("stream").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+                return codex::anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("the request could not be translated: {error}"),
+                    stream,
+                );
+            }
+        };
+        forward = match serde_json::to_vec(&rendered.value) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                tracing::error!(%error, "canonical Messages request serialisation failed");
+                return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
+            }
+        };
+    }
+
+    // 6. Upstream; 7.-9. in the response paths. Session headers pass
     // through (see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.
     let sent = forward.clone();
@@ -1061,7 +1113,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             } else {
                 upstream
             };
-            forward_response(server, backend, upstream, record, in_flight).await
+            if path == "/v1/messages" {
+                forward_canonical_messages(
+                    server,
+                    backend,
+                    upstream,
+                    record,
+                    in_flight,
+                    served_model.as_deref().unwrap_or_default(),
+                )
+                .await
+            } else {
+                forward_legacy_response(server, backend, upstream, record, in_flight).await
+            }
         }
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
@@ -1163,7 +1227,7 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
 }
 
 /// A response put back together from what [`retry_thinking_off`] buffered
-/// to read its error, so [`forward_response`] handles it as if it had
+/// to read its error, so [`forward_legacy_response`] handles it as if it had
 /// never been read: the same status, headers, and bytes, with any
 /// unbuffered remainder chained on.
 fn rebuilt_response(
@@ -1308,7 +1372,7 @@ async fn transparent(server: Server, request: Request) -> Response {
         }
     };
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
-        Ok(upstream) => forward_response(server, backend, upstream, None, None).await,
+        Ok(upstream) => forward_legacy_response(server, backend, upstream, None, None).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
             transport_failure(ErrorWire::Anthropic, &error)
@@ -1322,13 +1386,13 @@ async fn transparent(server: Server, request: Request) -> Response {
 /// names override per request … `anthropic/claude-opus-5`"); both are
 /// stripped from the model. `openrouter/` is the one non-anthropic
 /// provider here: openrouter serves the Anthropic Messages wire itself
-/// (its `…/api/v1/messages`), so the route is a byte-forward like the
-/// others, with openrouter's key in place of the client's anthropic
-/// credential (`OpenRouter::strip_foreign_credentials`). This is how a
-/// Claude Code `modelPicker` row reaches an openrouter model. Anything
-/// else — bare names, other prefixes — goes to the configured default,
-/// untransformed. The provider is `None` when the prefix names a backend
-/// whose block is absent.
+/// (its `…/api/v1/messages`), so the route uses the Messages canonical
+/// adapter with openrouter's key in place of the client's anthropic credential
+/// (`OpenRouter::strip_foreign_credentials`). This is how a Claude Code
+/// `modelPicker` row reaches an openrouter model. Anything else — bare names,
+/// other prefixes — goes to the configured default, with no routing rewrite.
+/// The provider is `None` when the prefix names a backend whose block is
+/// absent.
 fn strip_anthropic_prefix<'a>(
     server: &'a Server,
     model: &'a str,
@@ -1368,15 +1432,286 @@ fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
     Some(serde_json::Value::Array(flags))
 }
 
+/// A native Messages binding's universal-canonical response path. The
+/// provider bytes feed accounting before interpretation; only the client wire
+/// is rendered from canonical events or a canonical complete turn.
+async fn forward_canonical_messages(
+    server: Server,
+    backend: Arc<dyn Provider>,
+    upstream: reqwest::Response,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    model: &str,
+) -> Response {
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+
+    note_meters(&server, backend.as_ref(), &upstream_headers);
+    let rate_limits = parse_rate_limits(&upstream_headers);
+
+    if is_compressed(&upstream_headers) {
+        tracing::warn!("compressed canonical Messages response could not be interpreted");
+        return super::proxy::upstream_failure(
+            ErrorWire::Anthropic,
+            "toker could not interpret a compressed upstream response",
+        );
+    }
+
+    if !status.is_success() {
+        let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            return truncated_body(ErrorWire::Anthropic);
+        };
+        if buffered.rest.is_some() {
+            return super::proxy::upstream_failure(
+                ErrorWire::Anthropic,
+                "toker could not interpret an oversized upstream error",
+            );
+        }
+        if let Some(ctx) = record.as_ref() {
+            let (error_type, error_message) = error_pair(&buffered.bytes);
+            record_anthropic_error(
+                ctx,
+                status.as_u16(),
+                error_type,
+                error_message,
+                retry_after_ms(&upstream_headers),
+                rate_limits.as_ref(),
+            );
+        }
+        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+            .ok()
+            .and_then(|body| translate::canonical_turn_from_anthropic(&body).ok())
+            .map(|turn| translate::anthropic_frontend::anthropic_from_canonical(model, &turn));
+        let Some(rendered) = rendered else {
+            return super::proxy::upstream_failure(
+                ErrorWire::Anthropic,
+                "toker could not interpret the upstream error response",
+            );
+        };
+        return anthropic_json_response(status, &upstream_headers, &rendered);
+    }
+
+    if is_event_stream(&upstream_headers) {
+        let stream = CanonicalMessagesStream::new(
+            upstream,
+            status.as_u16(),
+            record,
+            rate_limits,
+            in_flight,
+            model,
+        );
+        let mut headers = response_headers(&upstream_headers, false);
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return build_response(status, headers, Body::from_stream(stream));
+    }
+
+    let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        return truncated_body(ErrorWire::Anthropic);
+    };
+    if buffered.rest.is_some() {
+        return super::proxy::upstream_failure(
+            ErrorWire::Anthropic,
+            "toker could not interpret an oversized upstream response",
+        );
+    }
+    let turn = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+        .map_err(|error| error.to_string())
+        .and_then(|body| {
+            translate::canonical_turn_from_anthropic(&body).map_err(|error| error.to_string())
+        }) {
+        Ok(turn) => turn,
+        Err(error) => {
+            tracing::warn!(%error, "canonical Messages response interpretation failed");
+            return super::proxy::upstream_failure(
+                ErrorWire::Anthropic,
+                "toker could not interpret the upstream response",
+            );
+        }
+    };
+    if let Some(ctx) = record.as_ref() {
+        let mut observer = AnthropicObserver::new();
+        observer.observe_json(&buffered.bytes);
+        let capture = observer.finish();
+        record_anthropic_measurement(ctx, capture.as_ref(), rate_limits.as_ref(), status.as_u16());
+    }
+    let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
+    anthropic_json_response(status, &upstream_headers, &body)
+}
+
+fn anthropic_json_response(
+    status: StatusCode,
+    upstream_headers: &HeaderMap,
+    value: &serde_json::Value,
+) -> Response {
+    let mut headers = response_headers(upstream_headers, false);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    build_response(
+        status,
+        headers,
+        Body::from(serde_json::to_vec(value).unwrap_or_default()),
+    )
+}
+
+struct CanonicalMessagesStream {
+    inner: Pin<Box<Abortable<UpstreamBody>>>,
+    abort: AbortHandle,
+    splitter: SseSplitter,
+    backend: translate::AnthropicResponseStream,
+    frontend: translate::anthropic_frontend::AnthropicRenderer,
+    observer: AnthropicObserver,
+    pending: VecDeque<Bytes>,
+    failure: Option<std::io::Error>,
+    upstream_done: bool,
+    ctx: Option<AnthropicRecordCtx>,
+    rate_limits: Option<serde_json::Value>,
+    in_flight: Option<InFlightGuard>,
+    status: u16,
+}
+
+impl CanonicalMessagesStream {
+    fn new(
+        response: reqwest::Response,
+        status: u16,
+        ctx: Option<AnthropicRecordCtx>,
+        rate_limits: Option<serde_json::Value>,
+        in_flight: Option<InFlightGuard>,
+        model: &str,
+    ) -> CanonicalMessagesStream {
+        let (abort, registration) = AbortHandle::new_pair();
+        let stream: UpstreamBody = Box::pin(response.bytes_stream());
+        CanonicalMessagesStream {
+            inner: Box::pin(Abortable::new(stream, registration)),
+            abort,
+            splitter: SseSplitter::new(),
+            backend: translate::AnthropicResponseStream::new(),
+            frontend: translate::anthropic_frontend::AnthropicRenderer::new(model),
+            observer: AnthropicObserver::new(),
+            pending: VecDeque::new(),
+            failure: None,
+            upstream_done: false,
+            ctx,
+            rate_limits,
+            in_flight,
+            status,
+        }
+    }
+
+    fn translate_event(&mut self, event: crate::observe::sse::SseEvent) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.observer.observe_event(&event);
+        }));
+        let canonical = self.backend.feed_sse(&event);
+        for emitted in canonical.iter().flat_map(|event| self.frontend.feed(event)) {
+            self.pending.push_back(anthropic_sse_bytes(&emitted));
+        }
+    }
+
+    fn finish_translation(&mut self) {
+        if let Some(event) = self.splitter.finish() {
+            self.translate_event(event);
+        }
+        if !self.frontend.turn_ended() {
+            self.ctx.take();
+            self.failure = Some(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upstream Messages stream closed before the turn ended",
+            ));
+        }
+        self.upstream_done = true;
+    }
+
+    fn finish_recording(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            let capture = std::mem::take(&mut self.observer).finish();
+            record_anthropic_measurement(
+                &ctx,
+                capture.as_ref(),
+                self.rate_limits.as_ref(),
+                self.status,
+            );
+        }
+        drop(self.in_flight.take());
+    }
+}
+
+impl Stream for CanonicalMessagesStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(bytes) = this.pending.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(bytes)));
+            }
+            if let Some(error) = this.failure.take() {
+                drop(this.in_flight.take());
+                return std::task::Poll::Ready(Some(Err(error)));
+            }
+            if this.upstream_done {
+                this.finish_recording();
+                return std::task::Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    for event in this.splitter.feed(&chunk) {
+                        this.translate_event(event);
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    tracing::warn!(%error, "upstream canonical Messages stream failed");
+                    this.ctx.take();
+                    drop(this.in_flight.take());
+                    this.upstream_done = true;
+                    return std::task::Poll::Ready(Some(Err(std::io::Error::other(error))));
+                }
+                std::task::Poll::Ready(None) => this.finish_translation(),
+            }
+        }
+    }
+}
+
+impl Drop for CanonicalMessagesStream {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+fn anthropic_sse_bytes(event: &crate::observe::sse::SseEvent) -> Bytes {
+    let mut out = String::new();
+    if let Some(name) = &event.event {
+        out.push_str("event: ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    for line in &event.data_lines {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    Bytes::from(out)
+}
+
 /// Forward one upstream response to the client, branching on compression /
 /// status / content-type — the anthropic mirror of the openai
-/// `forward_upstream`, plus the meter feed. `record` is the usage-path
-/// completion context; `None` means transparent forwarding. `in_flight` is
+/// `forward_upstream`, plus the meter feed. This remains for non-inference
+/// Messages surfaces. `record` is their optional completion context; `None`
+/// means transparent forwarding. `in_flight` is
 /// the request's sleep-lock hold: it rides the SSE stream (dropping when
 /// axum drops the body — the close semantics, "however the exchange ends") and
 /// drops at the end of this function on every other branch, after
 /// whatever row was owed has landed.
-async fn forward_response(
+async fn forward_legacy_response(
     server: Server,
     backend: Arc<dyn Provider>,
     upstream: reqwest::Response,

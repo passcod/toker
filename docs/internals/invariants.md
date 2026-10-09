@@ -116,11 +116,12 @@ reasons.
    NULL-costed for the same reason: there is no per-token price for its slugs to
    verify.
 
-6. **A legacy passthrough body is the client's, with narrow exceptions.** A
-   route not yet migrated to universal canonical rendering forwards the
-   client's own buffer whenever nothing transformed it (see
-   [routing.md](routing.md)), so every edit below is a deliberate,
-   once-per-change byte event:
+6. **Inference bodies cross canonical IR; legacy administrative bodies are the
+   client's.** Every inference binding deterministically renders its backend
+   wire from canonical semantics. Messages middleware still runs before that
+   boundary, and only these deliberate transformations may change what the
+   canonical parser sees. Count-token, batch, and unmatched administrative
+   paths retain the client's buffer except for the applicable routing map:
 
    - `AnthropicBodyMut::strip_release` removes the release markers
      (`$#$BURN$#$`, and the plan-only `$#$OVER$#$`), strings toker itself
@@ -148,15 +149,15 @@ reasons.
      `{"type": "between_tools"}` on the one retry that follows an upstream 400
      asking for exactly that (`retry_thinking_off` in `server/anthropic.rs`).
      It waits for the refusal because the refusal is the only evidence a model
-     wants it. Only the value's bytes change, and the client's transcript is
-     untouched: the next turn sends `disabled` again and is judged afresh.
+     wants it. Only the rendered request's thinking mode changes, and the
+     client's transcript is untouched: the next turn sends `disabled` again
+     and is judged afresh.
    - `model_map::rewrite_mapped_models` applies an explicit, configured routing
      map as the last stage and changes only model positions. An unmatched or
      disabled map returns the input bytes untouched.
-   - Translation on a route migrated to the universal canonical pipeline
-     builds a new body even when the protocols match. It is pure, so turn N+1
-     reproduces turn N's backend prefix wherever the conversation did not
-     change. The Responses to Codex route is the first same-protocol cutover.
+   - Canonical rendering builds a new body even when the protocols match. It
+     is pure, so turn N+1 reproduces turn N's backend prefix wherever the
+     conversation did not change.
 
    Dropping `cache_control` needs a second licence on top of a body rewrite, and
    there are exactly two: a **model change**, since caches are keyed per model

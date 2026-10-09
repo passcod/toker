@@ -106,6 +106,12 @@ pub fn render_anthropic(
                     json!({"type": "enabled", "budget_tokens": budget_tokens}),
                 );
             }
+            ThinkingSpec::Disabled => {
+                body.insert("thinking".to_owned(), json!({"type": "disabled"}));
+            }
+            ThinkingSpec::BetweenTools => {
+                body.insert("thinking".to_owned(), json!({"type": "between_tools"}));
+            }
             ThinkingSpec::Effort(_) => report.push(TranslationLoss::new(
                 "thinking.effort",
                 TranslationLossReason::NotRepresentable,

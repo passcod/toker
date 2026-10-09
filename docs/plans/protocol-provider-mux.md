@@ -1,7 +1,7 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phase 1 complete, canonical migration and first
-live cross-protocol cutover underway.
+Status: guiding architecture; phase 1 complete, every current inference route
+canonical, routing and discovery convergence still underway.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
 any configured frontend protocol should be able to reach any backend for which
@@ -329,9 +329,9 @@ also cross the canonical boundary opaquely and replay to compatible bindings,
 so protocol evolution does not make same-dialect routes brittle. The Messages
 and OpenRouter Chat provider bindings declare canonical readiness, and the
 Chat frontend renders canonical streaming and complete responses. The Codex
-Responses handler and every Chat route now use those adapters live; the
-remaining Messages provider routes stay on the legacy path until phase 3 cuts
-each one over.
+Responses handler, every Chat route, and every `/v1/messages` provider route
+now use those adapters live. Count-token, batch, and unmatched administrative
+paths remain transparent because they are not canonical inference turns.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.
@@ -351,7 +351,11 @@ OpenAI Responses to `codex_sub` now takes the same path despite matching wire
 protocols, including compatible extension replay and encrypted reasoning.
 OpenAI Chat to OpenRouter has also moved: requests and streaming, complete, and
 error responses cross canonical IR while accounting observes OpenRouter's
-provider bytes before translation.
+provider bytes before translation. Native Messages to `anthropic_sub`,
+`anthropic_api`, and OpenRouter have moved as well: final middleware output is
+rendered for the binding, provider responses are observed before canonical
+interpretation, and billed cost plus serving-provider evidence survive the
+round trip.
 
 - Replace per-handler provider selection with a route registry.
 - Add a `ModelTarget` carrying provider, binding, requested model, and effective

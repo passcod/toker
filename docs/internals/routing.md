@@ -102,10 +102,11 @@ strips it can answer.
 OpenRouter serves the Anthropic Messages wire itself, at `…/api/v1/messages`,
 which the openrouter provider's `endpoint` already maps `/v1/messages` onto. So
 an `openrouter/<id>` model on the anthropic frontend is a same-protocol
-byte-forward with the prefix stripped. The client's own credential is Claude's
-OAuth bearer, meant for Anthropic: `OpenRouter::strip_foreign_credentials` drops
-any `sk-ant-` bearer and `x-api-key`, and the stored openrouter key goes in its
-place. Nothing of the subscription's reaches openrouter.ai.
+canonical route with the prefix stripped before deterministic rendering. The
+client's own credential is Claude's OAuth bearer, meant for Anthropic:
+`OpenRouter::strip_foreign_credentials` drops any `sk-ant-` bearer and
+`x-api-key`, and the stored openrouter key goes in its place. Nothing of the
+subscription's reaches openrouter.ai.
 
 Two rewrites stay off this route (`picks_from_anthropic_catalogue`): the
 compaction retarget and force-newest both pick a bare `claude-*` id from the
@@ -132,8 +133,9 @@ What the endpoint does, measured through toker on 2026-10-06:
   one, `thinking` with a budget, `output_config.effort`, a
   `context_management` edit, `cache_control` on the system prompt and the
   last message, and a tool) succeeded with a `tool_use` stop on Z.ai's GLM
-  5.3 Flash, OpenAI's GPT-6 Luna and DeepSeek V4.1 Flash. A model that does
-  refuse a field answers with openrouter's own error, passed through.
+  5.3 Flash, OpenAI's GPT-6 Luna and DeepSeek V4.1 Flash. A model that refuses
+  a field answers with an error interpreted and rendered through the Messages
+  adapters.
 
 ### How the rows get into the picker
 
@@ -165,26 +167,22 @@ owns only rows whose model starts with `openrouter/`, rewrites the file only
 when the rows changed (Claude Code hot-reloads it into every session), and
 changes nothing when the listing cannot be fetched.
 
-## Legacy Messages routes forward the client's bytes
+## Inference routes are canonical
 
-Every request on a Messages route not yet cut over is parsed into the IR, a
-`serde_json::Value` with `preserve_order`
-and `arbitrary_precision`, so re-serialising an untouched body reproduces it
-byte for byte. The server checks that on every request (`ir/fidelity.rs`): when
-the bytes match, the client's original buffer is forwarded; when they differ,
-the original is *still* forwarded and a `fidelity-drift` row records the
-divergence. Drift is a visible metric, not a hoped-for absence. Only a
-deliberate transform (the licensed rewrites in [invariants.md](invariants.md))
-forwards the serialised IR instead, and that serialisation is a pure function of
-the value, so the transform repeats identically on the next turn and the
-upstream's cached prefix holds.
+Every `/v1/messages` request is parsed after the Messages middleware has made
+its gate and licensed-rewrite decisions. The selected provider binding then
+renders the canonical request even when both ends speak Messages. The reverse
+path observes provider bytes first, interprets SSE events or a complete body
+canonically, and renders Messages for the client. This applies to
+`anthropic_sub`, `anthropic_api`, OpenRouter Messages, and the translated Codex
+binding. An invalid request is a local typed 400; a compressed, oversized, or
+malformed provider response that cannot cross the canonical boundary is a
+local typed 502. Neither reaches the other side as an unverified wire shape.
 
-A body on one of those legacy routes that toker cannot parse is forwarded
-unchanged and unrecorded: the proxy never rejects what it does not understand.
-Setup's wiring check relies on that, posting an empty body and taking the
-upstream's own 401 as proof the chain is up. A route already cut over to the
-universal canonical path instead returns a typed compatibility error and never
-sends an unparsed body upstream.
+The non-inference Messages surfaces remain transparent. Count-token and batch
+creation retain their legacy buffer, routing rewrites, observation, and
+error-row behavior; batch reads, cancellation, and unmatched administrative
+paths stream without inference observation.
 
 OpenAI Chat is fully canonical for both current backends. The frontend adapter
 parses every request, then either the OpenRouter Chat or Codex Responses backend
@@ -213,7 +211,9 @@ whatever the second attempt gets. It never rewrites up front: nobody observed
 whether `between_tools` is accepted where `disabled` still is, and the refusal
 is the only evidence. The cost is one extra round trip per call during a
 burst; the 400 arrives before any stream begins, so the client sees only the
-retry's answer. The refusal's meters still feed the gate, and the retried
+retry's answer. The canonical request renderer preserves both explicit modes;
+the retry changes only that semantic value in the already-rendered Messages
+body. The refusal's meters still feed the gate, and the retried
 row carries `extra.thinkingRewrite` (see
 [ledger-schema.md](ledger-schema.md)).
 

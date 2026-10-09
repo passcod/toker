@@ -12,11 +12,11 @@
 //! - a would-fire notice the quota outlook can absorb is withheld: a
 //!   `cold-quiet` row lands and the request forwards;
 //! - a summarising request (a real compaction among them) is exempt from
-//!   the notice, and a COLD compaction is retargeted — the upstream body
-//!   is the transformed bytes (model swapped, no cache_control anywhere,
-//!   the mid-conversation system message merged), asserted byte for
-//!   byte, with the downgrade provenance on the row;
-//! - a WARM compaction passes through untouched;
+//!   the notice, and a COLD compaction is retargeted before canonical
+//!   rendering (model swapped, no cache_control anywhere, the
+//!   mid-conversation system message merged), with the downgrade
+//!   provenance on the row;
+//! - a WARM compaction keeps its semantics and cache controls;
 //! - a model whose listing entry prices its cache writes at nothing is
 //!   exempt from the notice: the request forwards and a `cold-quiet`
 //!   row with `writesFree` records the withholding (the
@@ -43,6 +43,7 @@ use toker::config::{
 use toker::ir::Request as IrRequest;
 use toker::server::Server;
 use toker::store::{Lane, ModelEntry, RequestRow, RowKind, Store};
+use toker::translate::from_anthropic;
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_COLD_7A";
@@ -97,6 +98,23 @@ fn non_stream_body(model: &str) -> Vec<u8> {
         },
     }))
     .expect("serialise non-stream body")
+}
+
+fn assert_response_model(bytes: &[u8], model: &str) {
+    let body: Value = serde_json::from_slice(bytes).expect("canonical response JSON");
+    assert_eq!(body["model"], json!(model));
+    assert_eq!(body["content"][0]["text"], json!("Done."));
+}
+
+fn assert_canonical_request(source: &[u8], actual: &[u8], model: &str) {
+    let source: Value = serde_json::from_slice(source).expect("source request JSON");
+    let mut expected = from_anthropic(&source).expect("source request canonicalizes");
+    expected.model = Some(model.to_owned());
+    let actual: Value = serde_json::from_slice(actual).expect("rendered request JSON");
+    assert_eq!(
+        from_anthropic(&actual).expect("rendered request reparses"),
+        expected
+    );
 }
 
 async fn mock_messages(State(mock): State<MockState>, request: Request) -> Response {
@@ -585,11 +603,7 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-opus-5").as_slice(),
-        "the resend is served by the upstream, not the gate"
-    );
+    assert_response_model(&bytes, "claude-opus-5");
 
     let rows = wait_for_rows(&store, 2).await;
     assert_eq!(
@@ -685,10 +699,7 @@ async fn a_recap_on_a_cold_lane_is_held_without_spending_the_notice() {
 
     // And the user's resend forwards as before.
     let response = post_messages(addr, &prompt).await;
-    assert_eq!(
-        response.bytes().await.expect("body").as_ref(),
-        non_stream_body("claude-opus-5").as_slice()
-    );
+    assert_response_model(&response.bytes().await.expect("body"), "claude-opus-5");
     wait_for_rows(&store, 4).await;
     assert_no_more_rows(&store, 4).await;
 }
@@ -725,11 +736,7 @@ async fn an_on_track_outlook_withholds_the_notice_and_records_cold_quiet() {
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-opus-5").as_slice(),
-        "the request forwards — the notice was withheld"
-    );
+    assert_response_model(&bytes, "claude-opus-5");
     assert_eq!(mock.captured().len(), 1, "it really went upstream");
 
     // 86 seeded rows + the cold-quiet row + the measurement.
@@ -783,11 +790,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-sonnet-5").as_slice(),
-        "the upstream served the RETARGETED request — it echoes the swapped model"
-    );
+    assert_response_model(&bytes, "claude-sonnet-5");
 
     // The upstream body is the transform's bytes, asserted exactly: the
     // model changed, every cache_control went, and the mid-conversation
@@ -795,9 +798,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     // [system]-prefixed block.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].as_ref(),
-        serde_json::to_vec(&json!({
+    let expected = serde_json::to_vec(&json!({
             "model": "claude-sonnet-5",
             "stream": false,
             "system": [
@@ -817,10 +818,8 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
                 ]},
             ],
         }))
-        .expect("serialise expected upstream body")
-        .as_slice(),
-        "the retargeted body reaches upstream byte for byte"
-    );
+        .expect("serialise expected upstream body");
+    assert_canonical_request(&expected, &captured[0], "claude-sonnet-5");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = rows
@@ -870,11 +869,7 @@ async fn a_cold_openrouter_compaction_is_not_retargeted() {
     ir.anthropic_mut().set_model("claude-opus-5");
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].as_ref(),
-        ir.serialise().as_slice(),
-        "the model kept, every breakpoint and system message in place"
-    );
+    assert_canonical_request(&ir.serialise(), &captured[0], "claude-opus-5");
     let rows = wait_for_rows(&store, 1).await;
     let row = rows
         .iter()
@@ -901,19 +896,11 @@ async fn a_warm_compaction_passes_through_untouched() {
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-opus-5").as_slice(),
-        "the upstream served the request on the model it asked for"
-    );
+    assert_response_model(&bytes, "claude-opus-5");
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].as_ref(),
-        body.as_slice(),
-        "the body is untouched"
-    );
+    assert_canonical_request(&body, &captured[0], "claude-opus-5");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = rows
@@ -969,11 +956,7 @@ async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet()
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("free/claude-sonnet").as_slice(),
-        "the request forwarded on the MAPPED model — no interruption"
-    );
+    assert_response_model(&bytes, "free/claude-sonnet");
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     let sent: Value = serde_json::from_slice(&captured[0]).expect("the forwarded body");

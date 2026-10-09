@@ -5,12 +5,10 @@
 //!
 //! Asserts the unit's contract end to end:
 //!
-//! - a COLD lane is moved onto its family's learned newest: the upstream
-//!   body is the request with the model value swapped and nothing else
-//!   (byte-asserted — every cache_control survives, the prefix-stability
-//!   property of the transform), and the forced provenance lands on the
+//! - a COLD lane is moved onto its family's learned newest before canonical
+//!   rendering: every cache_control survives, and the forced provenance lands on the
 //!   row (`forcedFrom`/`forcedTo`) and in the lane record;
-//! - a WARM lane with cache to lose is left byte-identical, no
+//! - a WARM lane with cache to lose keeps its request semantics, no
 //!   provenance;
 //! - a lane whose conversation exceeds the target's OBSERVED maxPrompt
 //!   is not moved — the guard is empirical, never a declared ceiling;
@@ -42,6 +40,7 @@ use toker::config::{
 use toker::ir::Request as IrRequest;
 use toker::server::Server;
 use toker::store::{Lane, ModelEntry, RequestRow, Store};
+use toker::translate::from_anthropic;
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_FORCE_7A";
@@ -51,6 +50,17 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_millis() as i64
+}
+
+fn assert_canonical_request(source: &[u8], actual: &[u8], model: &str) {
+    let source: Value = serde_json::from_slice(source).expect("source request JSON");
+    let mut expected = from_anthropic(&source).expect("source request canonicalizes");
+    expected.model = Some(model.to_owned());
+    let actual: Value = serde_json::from_slice(actual).expect("rendered request JSON");
+    assert_eq!(
+        from_anthropic(&actual).expect("rendered request reparses"),
+        expected
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -465,16 +475,12 @@ async fn a_cold_lane_moves_to_the_learned_newest() {
     let response = post_messages(addr, "ccses-42", &body).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // The transform's prefix stability: only the model token's bytes
-    // changed, cache_control and all else byte-identical.
+    // The middleware changed only the model semantics; canonical rendering
+    // keeps every cache-control extension.
     let expected = with_model(&body, "claude-opus-4-8", "claude-opus-5");
     let captured = mock.captured();
     assert_eq!(captured.len(), 1, "the request reached upstream");
-    assert_eq!(
-        captured[0],
-        Bytes::from(expected),
-        "upstream body: the model swapped, everything else byte-identical"
-    );
+    assert_canonical_request(&expected, &captured[0], "claude-opus-5");
 
     // The row: the three identities stay distinct, and the forced
     // provenance records the move.
@@ -521,23 +527,16 @@ async fn an_openrouter_lane_is_never_moved() {
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1, "the request reached upstream");
-    assert_eq!(
-        captured[0],
-        Bytes::from(with_model(
-            &body,
-            "openrouter/claude-opus-4-8",
-            "claude-opus-4-8"
-        )),
-        "only the routing prefix is stripped"
-    );
+    let expected = with_model(&body, "openrouter/claude-opus-4-8", "claude-opus-4-8");
+    assert_canonical_request(&expected, &captured[0], "claude-opus-4-8");
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
     assert_eq!(rows[0].forced_from, None);
     assert_eq!(rows[0].forced_to, None);
 }
 
-/// A warm lane has a cache to lose: the request forwards byte-identical
-/// and records no provenance.
+/// A warm lane has a cache to lose: its model stays put and no provenance
+/// is recorded.
 #[tokio::test]
 async fn a_warm_lane_with_cache_to_lose_is_left_alone() {
     let (mock, upstream) = spawn_mock().await;
@@ -556,11 +555,7 @@ async fn a_warm_lane_with_cache_to_lose_is_left_alone() {
     assert_eq!(response.status(), StatusCode::OK);
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0],
-        Bytes::from(body.clone()),
-        "a warm lane forwards byte-identical"
-    );
+    assert_canonical_request(&body, &captured[0], "claude-opus-4-8");
 
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows.len(), 1);
@@ -588,11 +583,7 @@ async fn a_conversation_the_target_has_not_held_is_not_moved() {
     assert_eq!(response.status(), StatusCode::OK);
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0],
-        Bytes::from(body.clone()),
-        "the target has never held 174k: no move"
-    );
+    assert_canonical_request(&body, &captured[0], "claude-opus-4-8");
 
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows.len(), 1);
@@ -627,11 +618,7 @@ async fn a_sticky_lane_moves_to_its_recorded_target() {
     let expected = with_model(&body, "claude-opus-4-8", "claude-opus-5");
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0],
-        Bytes::from(expected),
-        "the lane's recorded target, not the election's newer opus-5-5"
-    );
+    assert_canonical_request(&expected, &captured[0], "claude-opus-5");
 
     // The lane kept its record from the response; the next request in the
     // same conversation moves the same way.
@@ -680,16 +667,9 @@ async fn an_unknown_lane_with_a_short_conversation_moves() {
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 2);
-    assert_eq!(
-        captured[0],
-        Bytes::from(with_model(&short, "claude-opus-4-8", "claude-opus-5")),
-        "the short conversation moved"
-    );
-    assert_eq!(
-        captured[1],
-        Bytes::from(long.clone()),
-        "the real history forwarded byte-identical"
-    );
+    let expected_short = with_model(&short, "claude-opus-4-8", "claude-opus-5");
+    assert_canonical_request(&expected_short, &captured[0], "claude-opus-5");
+    assert_canonical_request(&long, &captured[1], "claude-opus-4-8");
 
     // Three rows: the served-row seed plus the two requests.
     let rows = wait_for_rows(&store, 3).await;

@@ -2,11 +2,11 @@
 //! every request byte-for-byte) behind the real toker router, driven as a
 //! client.
 //!
-//! Asserts the unit's contract: request bodies arrive upstream
-//! byte-identical (echo capture) with the header discipline intact
+//! Asserts the unit's contract: inference requests and responses traverse
+//! canonical Messages adapters with the header discipline intact
 //! (identity forced, credentials passed through or injected per backend,
-//! claude's session header forwarded), responses pass through
-//! byte-identically, rows carry the right buckets/betas/rate_limits and
+//! claude's session header forwarded), rows carry the right
+//! buckets/betas/rate_limits and
 //! the right cost kind per backend (plan_equivalent on the sub, estimated
 //! on the api), error rows keep their meters but are never priced, the
 //! meters_state table feeds from every response on the meter-source
@@ -40,6 +40,7 @@ use toker::middleware::notice::NoticeStyle;
 use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering, decide};
 use toker::server::Server;
 use toker::store::{Allowance, CostKind, MetersSnapshot, RequestRow, RowKind, Store};
+use toker::translate::from_anthropic;
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_ANTH_5C";
@@ -250,6 +251,11 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             metered(&mut response, "0.4127");
             response
         }
+        "malformed-response" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"unexpected":true}"#),
+        ),
         "hang" if stream => {
             // First event, then nothing — the client hangs up mid-stream
             // and the abort must propagate (the Drop flag proves it).
@@ -316,7 +322,7 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             StatusCode::OK,
             "application/json",
             Bytes::from_static(
-                br#"{"type":"message","model":"z-ai/glm-5.3-flash","stop_reason":"end_turn",
+                br#"{"type":"message","model":"z-ai/glm-5.3-flash","content":[],"stop_reason":"end_turn",
                 "usage":{"input_tokens":18,"output_tokens":32,"cost":1.87e-05},"provider":"Friendli"}"#,
             ),
         ),
@@ -677,6 +683,17 @@ fn messages_body(model: &str, stream: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+fn assert_canonical_request(source: &[u8], actual: &[u8], model: &str) {
+    let source: Value = serde_json::from_slice(source).expect("source request JSON");
+    let mut expected = from_anthropic(&source).expect("source request is canonicalizable");
+    expected.model = Some(model.to_owned());
+    let actual: Value = serde_json::from_slice(actual).expect("rendered request JSON");
+    assert_eq!(
+        from_anthropic(&actual).expect("rendered request reparses"),
+        expected
+    );
+}
+
 /// A body whose tool set gives the request a tools-hash — without tools
 /// there is no lane, just a session (the lane rule: a session is not a
 /// cache entry).
@@ -698,7 +715,7 @@ fn tools_body(model: &str, stream: bool) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn sse_messages_pass_through_byte_identically_and_ledger() {
+async fn sse_messages_cross_canonical_adapters_and_ledger() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -726,17 +743,19 @@ async fn sse_messages_pass_through_byte_identically_and_ledger() {
         "SSE content type passes through"
     );
 
-    // Response passthrough is byte-identical to the fixture (CRLF dialect).
     let bytes = response.bytes().await.expect("sse bytes");
-    let expected = fixture("03_1h_write_crlf.sse");
-    assert_eq!(bytes, expected, "SSE stream passes through verbatim");
+    let rendered = String::from_utf8(bytes.to_vec()).expect("rendered SSE is UTF-8");
+    assert!(rendered.contains("Kia ora — tēnā koe 🌿"));
+    assert!(rendered.contains(r#""stop_reason":"end_turn""#));
+    assert!(rendered.contains(r#""input_tokens":2"#));
+    assert!(rendered.contains(r#""output_tokens":13"#));
 
-    // Request bytes arrive upstream byte-identical, with the header
-    // discipline intact.
+    // The canonical request arrives upstream with its header discipline
+    // intact.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].path, "/v1/messages");
-    assert_eq!(captured[0].body.as_ref(), body.as_slice());
+    assert_canonical_request(&body, &captured[0].body, "claude-opus-5");
     assert_eq!(
         captured[0]
             .headers
@@ -865,22 +884,18 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body bytes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("canonical response JSON");
     assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-sonnet-5").as_slice(),
-        "non-SSE body passes through unchanged"
+        rendered["content"],
+        json!([{"type": "text", "text": "Done."}])
     );
+    assert_eq!(rendered["usage"]["input_tokens"], json!(9));
+    assert_eq!(rendered["usage"]["output_tokens"], json!(40));
 
     // A routed request forwards the serialised rewrite.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    let mut expected = IrRequest::parse(&body).expect("parse");
-    expected.anthropic_mut().set_model("claude-sonnet-5");
-    assert_eq!(
-        captured[0].body.as_ref(),
-        expected.serialise().as_slice(),
-        "the routed request is the serialised rewrite"
-    );
+    assert_canonical_request(&body, &captured[0].body, "claude-sonnet-5");
     assert_ne!(captured[0].body.as_ref(), body.as_slice());
     assert_eq!(
         captured[0]
@@ -944,9 +959,8 @@ async fn bare_models_go_to_the_configured_default_backend() {
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Untransformed: the original buffer is forwarded byte-identical.
     let captured = mock.captured();
-    assert_eq!(captured[0].body.as_ref(), body.as_slice());
+    assert_canonical_request(&body, &captured[0].body, "claude-sonnet-5");
     assert_eq!(
         captured[0]
             .headers
@@ -973,9 +987,7 @@ async fn the_generic_anthropic_prefix_routes_to_the_default_and_strips() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let captured = mock.captured();
-    let mut expected = IrRequest::parse(&body).expect("parse");
-    expected.anthropic_mut().set_model("claude-opus-5");
-    assert_eq!(captured[0].body.as_ref(), expected.serialise().as_slice());
+    assert_canonical_request(&body, &captured[0].body, "claude-opus-5");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -1024,9 +1036,7 @@ async fn the_openrouter_prefix_routes_anthropic_messages_to_openrouter() {
     let captured = openrouter.captured();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].path, "/v1/messages");
-    let mut expected = IrRequest::parse(&body).expect("parse");
-    expected.anthropic_mut().set_model("moonshotai/kimi-k3");
-    assert_eq!(captured[0].body.as_ref(), expected.serialise().as_slice());
+    assert_canonical_request(&body, &captured[0].body, "moonshotai/kimi-k3");
     assert_eq!(
         captured[0]
             .headers
@@ -1204,7 +1214,7 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
         ERROR_BODY.as_bytes(),
         "the error body passes through unchanged"
     );
-    assert_eq!(mock.captured()[0].body.as_ref(), body.as_slice());
+    assert_canonical_request(&body, &mock.captured()[0].body, "err-401");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -1270,14 +1280,11 @@ async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
 
         let captured = mock.captured();
         assert_eq!(captured.len(), 2, "one refusal, one retry");
-        assert_eq!(captured[0].body.as_ref(), body.as_slice());
-        let expected = String::from_utf8(body.clone())
-            .unwrap()
-            .replace(r#"{"type":"disabled"}"#, r#"{"type":"between_tools"}"#);
+        assert_canonical_request(&body, &captured[0].body, "thinking-strict");
+        let retry: Value = serde_json::from_slice(&captured[1].body).expect("retry JSON");
         assert_eq!(
-            captured[1].body.as_ref(),
-            expected.as_bytes(),
-            "only the thinking value's bytes move"
+            retry.pointer("/thinking/type"),
+            Some(&json!("between_tools"))
         );
         // The retry carries the client's own credential and headers.
         assert_eq!(
@@ -1575,25 +1582,21 @@ async fn unmatched_toker_paths_stay_local() {
 }
 
 #[tokio::test]
-async fn fidelity_drift_forwards_the_original_bytes_and_is_recorded_visibly() {
+async fn fidelity_drift_is_recorded_before_canonical_rendering() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
     // `\/` is legal JSON that serde_json's canonical form never emits: the
     // IR re-serialises to "/", so the monitor must report drift — and the
-    // upstream still receives the ORIGINAL bytes (invariant 5: drift never
-    // changes what is forwarded).
+    // canonical request rendering then normalises the equivalent spelling.
     let body = br#"{"model":"claude-opus-5","messages":[{"role":"user","content":"a\/b"}]}"#;
     let response = post_messages(addr, "/v1/messages", &[], body).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].body.as_ref(),
-        body.as_slice(),
-        "the original, non-canonical buffer is forwarded"
-    );
+    assert_canonical_request(body, &captured[0].body, "claude-opus-5");
+    assert_ne!(captured[0].body.as_ref(), body.as_slice());
 
     let rows = wait_for_rows(&store, 2).await;
     let mut drift_rows = rows
@@ -1677,48 +1680,56 @@ async fn row_model_is_normalised_and_raw_model_is_verbatim() {
 }
 
 #[tokio::test]
-async fn non_json_bodies_forward_unchanged_with_no_row_but_the_meters_feed() {
+async fn non_json_messages_are_rejected_locally_without_a_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
     let response = post_messages(addr, "/v1/messages", &[], b"not json at all").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        mock.captured()[0].body.as_ref(),
-        b"not json at all",
-        "unparseable bodies forward unchanged (invariant 6 spirit)"
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("typed compatibility error");
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(mock.captured().is_empty(), "invalid JSON stays local");
 
     assert_no_rows(&store).await;
-    let meters = store
-        .load_meters("anthropic_sub")
-        .expect("meters")
-        .expect("even the unparseable request's response fed the meters");
-    assert_eq!(meters.snapshot, expected_rate_limits("0.4127"));
+    assert_eq!(store.load_meters("anthropic_sub").expect("meters"), None);
 }
 
 #[tokio::test]
-async fn compressed_responses_pass_through_untouched_and_unledgered() {
+async fn compressed_messages_responses_are_rejected_and_unledgered() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
     let response = post_messages(addr, "/v1/messages", &[], &messages_body("gzip-me", false)).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-        Some("gzip"),
-        "the encoding header passes through with the bytes"
-    );
-    let bytes = response.bytes().await.expect("bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        b"\x1f\x8b-not-really-gzip",
-        "bytes untouched"
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let error: Value = response.json().await.expect("typed upstream error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("compressed upstream response"))
     );
 
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn malformed_complete_messages_responses_are_rejected_and_unledgered() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body("malformed-response", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let error: Value = response.json().await.expect("typed upstream error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not interpret"))
+    );
     assert_no_rows(&store).await;
 }
 
@@ -1902,11 +1913,9 @@ async fn the_idle_timeout_leaves_a_slow_but_live_stream_alone() {
     let body = read_to_end(response)
         .await
         .expect("a live stream completes");
-    assert_eq!(
-        body,
-        fixture("03_1h_write_crlf.sse").to_vec(),
-        "every byte arrives"
-    );
+    let body = String::from_utf8(body).expect("canonical SSE is UTF-8");
+    assert!(body.contains("Kia ora — tēnā koe 🌿"));
+    assert!(body.contains(r#""stop_reason":"end_turn""#));
 
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows.len(), 1, "a completed slow stream still records");
@@ -2258,11 +2267,9 @@ async fn an_expired_spent_reading_fails_open_and_forwards() {
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        non_stream_body("claude-opus-5").as_slice(),
-        "forwarded, and the response passes through"
-    );
+    let rendered: Value = serde_json::from_slice(&bytes).expect("canonical response JSON");
+    assert_eq!(rendered["content"][0]["text"], json!("Done."));
+    assert_eq!(rendered["usage"]["input_tokens"], json!(9));
     assert_eq!(mock.captured().len(), 1, "the request forwarded");
 
     // A real measurement, not a blocked row.
@@ -2292,11 +2299,10 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
         !contains_marker(&captured[0].body),
         "the marker never reaches the model"
     );
-    // The strip is byte-exact: what went upstream is the IR round-trip
-    // with the marker spliced out.
+    // The marker is stripped before the canonical request is rendered.
     let mut expected = IrRequest::parse(&body).expect("parse");
     expected.anthropic_mut().strip_release();
-    assert_eq!(captured[0].body.as_ref(), expected.serialise().as_slice());
+    assert_canonical_request(&expected.serialise(), &captured[0].body, "claude-opus-5");
 
     // The released row (the trace of "this session may spend overage this
     // window"), plus the normal measurement for the forwarded request.

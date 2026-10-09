@@ -3,7 +3,7 @@
 //!
 //! The drain is the point of the endpoint, so it is tested on the real
 //! listener path ([`Server::serve_listener`]), not a bare router: a
-//! response under way when the shutdown lands finishes byte for byte, new
+//! response under way when the shutdown lands finishes canonically, new
 //! connections are no longer accepted, and the serve call returns once
 //! the stream is done. The sleep lock is on over a fake spawner (never a
 //! real inhibitor), to show the exit kills it without writing a row.
@@ -334,7 +334,7 @@ async fn status_names_the_instance() {
 }
 
 #[tokio::test]
-async fn a_stream_under_way_finishes_byte_for_byte_while_new_connections_are_refused() {
+async fn a_stream_under_way_finishes_while_new_connections_are_refused() {
     let (mock, upstream) = spawn_mock().await;
     let toker = spawn_toker(test_config(upstream), 0).await;
 
@@ -380,7 +380,9 @@ async fn a_stream_under_way_finishes_byte_for_byte_while_new_connections_are_ref
     assert_eq!(response.status(), StatusCode::OK);
     let mut received = Vec::new();
     received.extend_from_slice(&response.chunk().await.expect("chunk").expect("first half"));
-    assert_eq!(received, first_half());
+    let opening = String::from_utf8(received.clone()).expect("canonical SSE");
+    assert!(opening.contains("event: message_start"));
+    assert!(opening.contains(r#""model":"claude-opus-5""#));
 
     let shutdown = request_shutdown(toker.addr, &toker.instance).await;
     assert_eq!(shutdown.status(), StatusCode::ACCEPTED);
@@ -404,14 +406,16 @@ async fn a_stream_under_way_finishes_byte_for_byte_while_new_connections_are_ref
         "the server waits for the stream under way"
     );
 
-    // The rest of the turn arrives as the upstream sent it.
+    // The rest of the canonical turn arrives without the drain cutting it.
     mock.gate.notify_one();
     while let Some(chunk) = response.chunk().await.expect("the stream is not cut") {
         received.extend_from_slice(&chunk);
     }
-    let mut expected = first_half().to_vec();
-    expected.extend_from_slice(&second_half());
-    assert_eq!(received, expected, "byte for byte");
+    let received = String::from_utf8(received).expect("canonical SSE");
+    assert!(received.contains("event: message_delta"));
+    assert!(received.contains(r#""stop_reason":"end_turn""#));
+    assert!(received.contains(r#""output_tokens":40"#));
+    assert!(received.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
 
     let served = tokio::time::timeout(Duration::from_secs(5), toker.served)
         .await

@@ -641,10 +641,9 @@ fn sampling_of(body: &Value) -> SamplingSpec {
     }
 }
 
-/// `thinking` → the request-side intent, parse `enabled` only:
-/// absent, `null`, or any other shape means "the client did not ask"
-/// (`None`) — the model's own default then governs, never guessed
-/// here. A malformed budget is reported, never coerced.
+/// `thinking` → the request-side intent. The Messages-native modes remain
+/// distinct so a same-protocol canonical route can replay them exactly; a
+/// malformed or unknown mode is reported, never guessed.
 fn thinking_of(body: &Value) -> Result<Option<ThinkingSpec>, TranslateError> {
     let Some(thinking) = body.get("thinking").filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -654,16 +653,26 @@ fn thinking_of(body: &Value) -> Result<Option<ThinkingSpec>, TranslateError> {
         .ok_or_else(|| TranslateError::Malformed {
             reason: "thinking is not an object".to_owned(),
         })?;
-    if object.get("type").and_then(Value::as_str) != Some("enabled") {
-        return Ok(None);
+    match object.get("type").and_then(Value::as_str) {
+        Some("enabled") => {
+            let budget_tokens = object
+                .get("budget_tokens")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| TranslateError::Malformed {
+                    reason: "thinking.budget_tokens is missing or not a non-negative integer"
+                        .to_owned(),
+                })?;
+            Ok(Some(ThinkingSpec::BudgetTokens(budget_tokens)))
+        }
+        Some("disabled") => Ok(Some(ThinkingSpec::Disabled)),
+        Some("between_tools") => Ok(Some(ThinkingSpec::BetweenTools)),
+        Some(kind) => Err(TranslateError::Malformed {
+            reason: format!("thinking type {kind:?} is unsupported"),
+        }),
+        None => Err(TranslateError::Malformed {
+            reason: "thinking.type is missing or not a string".to_owned(),
+        }),
     }
-    let budget_tokens = object
-        .get("budget_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| TranslateError::Malformed {
-            reason: "thinking.budget_tokens is missing or not a non-negative integer".to_owned(),
-        })?;
-    Ok(Some(ThinkingSpec::BudgetTokens(budget_tokens)))
 }
 
 // ── block content helpers ──────────────────────────────────────────
@@ -2044,8 +2053,6 @@ mod tests {
 
     #[test]
     fn thinking_requests_parse_to_the_spec() {
-        // `enabled` with a budget carries the intent — the only
-        // request-side shape that does.
         assert_eq!(
             from_anthropic(&json!({"model": "m",
                                    "thinking": {"type": "enabled", "budget_tokens": 20_000},
@@ -2054,15 +2061,22 @@ mod tests {
             .thinking,
             Some(ThinkingSpec::BudgetTokens(20_000))
         );
-        // Absent and disabled both mean "the client did not ask" —
-        // never guessed here.
+        for (kind, expected) in [
+            ("disabled", ThinkingSpec::Disabled),
+            ("between_tools", ThinkingSpec::BetweenTools),
+        ] {
+            assert_eq!(
+                from_anthropic(&json!({"model": "m", "thinking": {"type": kind},
+                                       "messages": [{"role": "user", "content": "Hi"}]}))
+                .expect("parses")
+                .thinking,
+                Some(expected)
+            );
+        }
+        // Absent and null mean "the client did not ask".
         for body in [
             json!({"model": "m", "messages": [{"role": "user", "content": "Hi"}]}),
-            json!({"model": "m", "thinking": {"type": "disabled"},
-                   "messages": [{"role": "user", "content": "Hi"}]}),
             json!({"model": "m", "thinking": null,
-                   "messages": [{"role": "user", "content": "Hi"}]}),
-            json!({"model": "m", "thinking": {},
                    "messages": [{"role": "user", "content": "Hi"}]}),
         ] {
             assert_eq!(
@@ -2071,13 +2085,17 @@ mod tests {
                 "case reads as not asked: {body}"
             );
         }
-        // Malformed budgets are reported, never coerced.
+        // Malformed budgets and unknown modes are reported, never coerced.
         for body in [
             json!({"model": "m", "thinking": {"type": "enabled"},
                    "messages": [{"role": "user", "content": "Hi"}]}),
             json!({"model": "m", "thinking": {"type": "enabled", "budget_tokens": "4096"},
                    "messages": [{"role": "user", "content": "Hi"}]}),
             json!({"model": "m", "thinking": 5,
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+            json!({"model": "m", "thinking": {},
+                   "messages": [{"role": "user", "content": "Hi"}]}),
+            json!({"model": "m", "thinking": {"type": "future"},
                    "messages": [{"role": "user", "content": "Hi"}]}),
         ] {
             assert!(matches!(

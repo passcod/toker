@@ -159,7 +159,7 @@ pub fn render_codex(
     // `stream` rides the canonical for backends that distinguish;
     // this backend's turns always stream (the wire constant), so it
     // is read for nothing here either.
-    request.reasoning.effort = canonical.thinking.as_ref().map(effort_of);
+    request.reasoning.effort = canonical.thinking.as_ref().and_then(effort_of);
     replay_request_extensions(&mut request, &canonical.extensions, &mut report);
     Ok(Rendered {
         value: request,
@@ -584,12 +584,13 @@ fn tool_choice_of(choice: &CanonToolChoice) -> Result<String, TranslateError> {
 /// model's own default effort then governs (the codex catalog's
 /// `default_reasoning_level`), which is exactly what "the client did
 /// not ask" means.
-fn effort_of(thinking: &ThinkingSpec) -> String {
+fn effort_of(thinking: &ThinkingSpec) -> Option<String> {
     match thinking {
-        ThinkingSpec::Effort(effort) => effort.clone(),
-        ThinkingSpec::BudgetTokens(0..=16_383) => "low".to_owned(),
-        ThinkingSpec::BudgetTokens(16_384..=32_767) => "medium".to_owned(),
-        ThinkingSpec::BudgetTokens(_) => "high".to_owned(),
+        ThinkingSpec::Effort(effort) => Some(effort.clone()),
+        ThinkingSpec::BudgetTokens(0..=16_383) => Some("low".to_owned()),
+        ThinkingSpec::BudgetTokens(16_384..=32_767) => Some("medium".to_owned()),
+        ThinkingSpec::BudgetTokens(_) => Some("high".to_owned()),
+        ThinkingSpec::Disabled | ThinkingSpec::BetweenTools => None,
     }
 }
 

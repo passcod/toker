@@ -440,6 +440,10 @@ pub struct SamplingSpec {
 pub enum ThinkingSpec {
     /// Anthropic Messages' explicit reasoning-token budget.
     BudgetTokens(u64),
+    /// Anthropic Messages' explicit request to disable reasoning.
+    Disabled,
+    /// Anthropic Messages' provider-requested reasoning between tool calls.
+    BetweenTools,
     /// OpenAI Responses' named reasoning-effort tier.
     Effort(String),
 }
