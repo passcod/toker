@@ -121,12 +121,13 @@ reasons.
 
 6. **Inference bodies cross canonical IR; legacy administrative bodies are the
    client's.** Every inference binding deterministically renders its backend
-   wire from canonical semantics. Messages middleware still runs before that
-   boundary, and only these deliberate transformations may change what the
-   canonical parser sees. Count-token, batch, and unmatched administrative
+   wire from canonical semantics. Messages inference middleware keeps the
+   parsed canonical request across its gate and rewrite stages. Only these
+   deliberate transformations may change its semantics. Count-token, batch,
+   and unmatched administrative
    paths retain the client's buffer except for the applicable routing map:
 
-   - `AnthropicBodyMut::strip_release` removes the release markers
+   - `canonical::strip_release` removes the release markers
      (`$#$BURN$#$`, and the plan-only `$#$OVER$#$`), strings toker itself
      defined. It runs on every `/v1/messages` request, for every backend and
      whatever the gate's toggle: the marker rule is a frozen public API, and a
@@ -155,9 +156,9 @@ reasons.
      wants it. Only the rendered request's thinking mode changes, and the
      client's transcript is untouched: the next turn sends `disabled` again
      and is judged afresh.
-   - `model_map::rewrite_mapped_models` applies an explicit, configured routing
-     map as the last stage and changes only model positions. An unmatched or
-     disabled map returns the input bytes untouched.
+   - `canonical::map_model` applies an explicit, configured routing map to
+     inference as the last model stage. Administrative bodies use the lexical
+     `model_map::rewrite_mapped_models`. An unmatched map changes neither.
    - Canonical rendering builds a new body even when the protocols match. It
      is pure, so turn N+1 reproduces turn N's backend prefix wherever the
      conversation did not change.

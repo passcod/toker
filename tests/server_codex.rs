@@ -1506,6 +1506,10 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
     assert_eq!(rows[0].kind, Some(RowKind::Error));
     assert_eq!(rows[0].status, Some(400));
     assert_eq!(rows[0].error_type.as_deref(), Some("invalid_request_error"));
+    assert_eq!(
+        rows[0].req_messages, None,
+        "unsupported input has no canonical shape"
+    );
 }
 
 #[tokio::test]

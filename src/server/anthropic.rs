@@ -69,6 +69,7 @@ use futures::stream::Stream;
 use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
 use crate::ir::Request as IrRequest;
+use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
@@ -221,11 +222,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Parse and route before applying the Messages middleware.
     let mut forward = original.clone();
     let mut record = None;
-    // The parsed IR outlives the block below: the compaction retarget —
-    // the only middleware transform that changes model-visible prompt
-    // structure — runs after the gates and rewrites it (the body is
-    // re-serialised for the same reason).
-    let mut parsed: Option<IrRequest> = None;
+    // Inference middleware keeps one canonical request across the gates and
+    // rewrites. Administrative bodies continue through the lexical IR.
+    let mut canonical: Option<CanonicalRequest> = None;
+    let mut canonical_error: Option<translate::TranslateError> = None;
     // The request's own shape, kept past the record context (which takes
     // a clone): the cold gate and the retarget read it, and the row's
     // shape fields stay the PRE-transform shape's, in the same order.
@@ -281,7 +281,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             });
             if let Some(routed) = routed_ir {
                 ir = routed;
-            } else {
+            } else if path != "/v1/messages" {
                 ir.anthropic_mut().set_model(effective);
             }
             transformed = true;
@@ -308,7 +308,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 });
         }
         if path == "/v1/messages" {
-            let mut canonical = translate::from_anthropic(ir.value()).ok();
+            match translate::from_anthropic(ir.value()) {
+                Ok(request) => canonical = Some(request),
+                Err(error) => canonical_error = Some(error),
+            }
             // A release: grant/refresh an allowance for the
             // currently-exhausted meters only, and record it. The gate
             // fires on the marker + the session id + the toggle
@@ -319,7 +322,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 && let Some(release) = canonical
                     .as_ref()
                     .and_then(crate::middleware::canonical::release_marker)
-                    .or_else(|| ir.anthropic().release_marker())
             {
                 let meters = meters_snapshot.as_ref().map(Meters::over);
                 let now = now_ms();
@@ -361,11 +363,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             if let Some(stripped) = canonical_strip {
                 ir = stripped;
                 transformed = true;
-            } else {
-                // A body not representable by the canonical adapter still
-                // gets the established strip before its eventual local error.
-                ir.anthropic_mut().strip_release();
-                transformed |= ir.serialise() != pre_strip;
             }
         }
         if transformed {
@@ -373,13 +370,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // marker never reaches the model.
             forward = Bytes::from(ir.serialise());
         }
-        let shape = serde_json::from_slice::<serde_json::Value>(&original)
-            .ok()
-            .and_then(|body| translate::from_anthropic(&body).ok())
-            .map(|canonical| {
-                AnthropicShape::from_canonical_messages(&canonical, original.len() as u64)
-            })
-            .unwrap_or_else(|| ir.anthropic().shape());
+        let shape = if path == "/v1/messages" {
+            serde_json::from_slice::<serde_json::Value>(&original)
+                .ok()
+                .and_then(|body| translate::from_anthropic(&body).ok())
+                .map(|request| {
+                    AnthropicShape::from_canonical_messages(&request, original.len() as u64)
+                })
+        } else {
+            Some(ir.anthropic().shape())
+        };
         // The model this request is about to be sent on — the note-served
         // mark below needs it after `effective_model` moves into the
         // record context.
@@ -396,7 +396,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             effective_model,
             backend: backend.clone(),
             betas,
-            shape: Some(shape.clone()),
+            shape: shape.clone(),
             ping,
             downgraded_from: None,
             downgraded_to: None,
@@ -408,8 +408,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             thinking_rewritten: false,
             translation_report: None,
         });
-        gate_shape = Some(shape);
-        parsed = Some(ir);
+        gate_shape = shape;
     }
 
     // ── the gate decision (after the strip) ──
@@ -836,31 +835,26 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()
                 .flatten();
-            let retargeted = serde_json::from_slice::<serde_json::Value>(&forward)
-                .ok()
-                .and_then(|body| translate::from_anthropic(&body).ok())
-                .and_then(|mut canonical| {
-                    let outcome = crate::middleware::canonical::retarget_compaction(
-                        &mut canonical,
-                        target.as_deref(),
-                        true,
-                        backend.model_map(),
-                    )?;
-                    let rendered = translate::render_anthropic(
-                        &canonical,
-                        crate::routing::DialectId::AnthropicMessages,
-                    )
-                    .ok()?;
-                    let bytes = serde_json::to_vec(&rendered.value).ok()?;
-                    let ir = IrRequest::parse(&bytes).ok()?;
-                    Some((outcome, bytes, ir))
-                });
-            if let Some((outcome, bytes, ir)) = retargeted {
+            let retargeted = canonical.as_mut().and_then(|canonical| {
+                let outcome = crate::middleware::canonical::retarget_compaction(
+                    canonical,
+                    target.as_deref(),
+                    true,
+                    backend.model_map(),
+                )?;
+                let rendered = translate::render_anthropic(
+                    canonical,
+                    crate::routing::DialectId::AnthropicMessages,
+                )
+                .ok()?;
+                let bytes = serde_json::to_vec(&rendered.value).ok()?;
+                Some((outcome, bytes))
+            });
+            if let Some((outcome, bytes)) = retargeted {
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.
                 forward = Bytes::from(bytes);
-                parsed = Some(ir);
                 // A same-model strip is not a downgrade, and recording one
                 // would put a model in `downgradedFrom` that also served
                 // the request — only `cacheStripped` says it happened.
@@ -917,7 +911,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         && record
             .as_ref()
             .is_none_or(|ctx| ctx.downgraded_from.is_none())
-        && let Some(ir) = parsed.as_mut()
+        && canonical.is_some()
     {
         // The asked model: the model the body names as it
         // stands at this point — after routing, after any retarget —
@@ -950,23 +944,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             &server.models,
         );
         if let ForceDecision::Move(forced) = decision {
-            let canonical_rewrite = serde_json::from_slice::<serde_json::Value>(&forward)
-                .ok()
-                .and_then(|body| translate::from_anthropic(&body).ok())
-                .and_then(|mut canonical| {
-                    canonical.model = Some(forced.to.clone());
-                    translate::render_anthropic(
-                        &canonical,
-                        crate::routing::DialectId::AnthropicMessages,
-                    )
+            let canonical_rewrite = canonical.as_mut().and_then(|canonical| {
+                canonical.model = Some(forced.to.clone());
+                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
                     .ok()
                     .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
-                });
+            });
             if let Some(body) = canonical_rewrite {
                 forward = Bytes::from(body);
-            } else {
-                ir.anthropic_mut().set_model(&forced.to);
-                forward = Bytes::from(ir.serialise());
             }
             if let Some(ctx) = record.as_mut() {
                 ctx.forced_from = Some(forced.from.clone());
@@ -992,14 +977,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // the served-model mark — the mark must see what is actually sent.
     if let Some(map) = backend.model_map() {
         let canonical_rewrite = (path == "/v1/messages")
-            .then(|| serde_json::from_slice::<serde_json::Value>(&forward).ok())
+            .then_some(canonical.as_mut())
             .flatten()
-            .and_then(|body| translate::from_anthropic(&body).ok())
-            .and_then(|mut canonical| {
+            .and_then(|canonical| {
                 let before = canonical.model.clone()?;
-                let matched = crate::middleware::canonical::map_model(&mut canonical, Some(map))?;
+                let matched = crate::middleware::canonical::map_model(canonical, Some(map))?;
                 let rendered = translate::render_anthropic(
-                    &canonical,
+                    canonical,
                     crate::routing::DialectId::AnthropicMessages,
                 )
                 .ok()?;
@@ -1020,13 +1004,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     }],
                 })
             });
-        let rewrite = canonical_rewrite.unwrap_or_else(|| {
-            // Count-token and batch bodies are administrative and keep the
-            // lexical mapper; invalid inference bodies cannot be rendered
-            // canonically and will receive the local compatibility error.
-            model_map::rewrite_mapped_models(Some(map), &forward, "POST", path)
-        });
-        if rewrite.mapped {
+        let rewrite = if path == "/v1/messages" {
+            canonical_rewrite
+        } else {
+            // Count-token and batch bodies are administrative and keep their
+            // lexical mapper. Invalid inference bodies get a local error.
+            Some(model_map::rewrite_mapped_models(
+                Some(map),
+                &forward,
+                "POST",
+                path,
+            ))
+        };
+        if let Some(rewrite) = rewrite.filter(|rewrite| rewrite.mapped) {
             forward = Bytes::from(rewrite.body);
             if let Some(effective) = rewrite.effective_model.clone() {
                 // Provenance (requested/effective pair): the
@@ -1082,27 +1072,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let canonical_stripped = serde_json::from_slice::<serde_json::Value>(&forward)
             .ok()
             .and_then(|body| {
-                let mut canonical = translate::from_anthropic(&body).ok()?;
-                if !crate::middleware::canonical::strip_message_effort(&mut canonical, &body) {
+                let canonical = canonical.as_mut()?;
+                if !crate::middleware::canonical::strip_message_effort(canonical, &body) {
                     return None;
                 }
-                translate::render_anthropic(
-                    &canonical,
-                    crate::routing::DialectId::AnthropicMessages,
-                )
-                .ok()
-                .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
-                .map(Bytes::from)
+                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
+                    .ok()
+                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
+                    .map(Bytes::from)
             });
         if let Some(stripped) = canonical_stripped {
             forward = stripped;
-            tracing::info!("stripped mid-conversation effort for {model}");
-        } else if let Ok(mut ir) = crate::ir::Request::parse(&forward)
-            && ir.anthropic_mut().strip_message_effort()
-        {
-            // A malformed body may not parse canonically, but the previous
-            // stripper can still make its eventual error deterministic.
-            forward = Bytes::from(ir.serialise());
             tracing::info!("stripped mid-conversation effort for {model}");
         }
     }
@@ -1133,13 +1113,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
     {
         if path == "/v1/messages" {
-            let canonical = serde_json::from_slice::<serde_json::Value>(&forward)
-                .ok()
-                .map(|body| translate::from_anthropic(&body));
             return codex::turn(codex::CodexTurn {
                 server,
                 backend: backend.clone(),
-                canonical,
+                canonical: canonical
+                    .take()
+                    .map(Ok)
+                    .or_else(|| canonical_error.take().map(Err)),
                 gate_shape,
                 record,
                 in_flight,
@@ -1171,16 +1151,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // own bearer when toker holds no key (spawned; never waited on).
     server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
 
-    // Native Messages bindings still traverse the universal canonical
-    // request path. Parse the FINAL middleware output, not `parsed`: the
-    // licensed body rewrites above may have reserialised it since ingress.
+    // Native Messages bindings render the same canonical request that all
+    // inference middleware mutated. Administrative paths keep their wire.
     if path == "/v1/messages" {
         let dialect = Some(target.binding().dialect());
-        let rendered = serde_json::from_slice::<serde_json::Value>(&forward)
-            .map_err(|error| translate::TranslateError::Malformed {
-                reason: error.to_string(),
+        let rendered = canonical
+            .take()
+            .ok_or_else(|| {
+                canonical_error
+                    .take()
+                    .unwrap_or_else(|| translate::TranslateError::Malformed {
+                        reason: "Messages inference body is not canonical".to_owned(),
+                    })
             })
-            .and_then(|body| translate::from_anthropic(&body))
             .and_then(|mut canonical| {
                 canonical.model.clone_from(&served_model);
                 let Some(dialect) = dialect else {

@@ -2354,6 +2354,29 @@ async fn a_release_marker_grants_an_allowance_records_a_released_row_and_strips(
     );
 }
 
+#[tokio::test]
+async fn an_untranslatable_marker_does_not_grant_or_emit_a_notice() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "stream": false,
+        "messages": [
+            {"role": "user", "content": format!("{SENTINEL} continue")},
+            {"role": "assistant", "content": [{"type":"image", "source": {
+                "type":"base64", "media_type":"image/png", "data":"AAAA"
+            }}]}
+        ]
+    }))
+    .expect("request body");
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(mock.captured().is_empty());
+    assert!(store.load_allowances().expect("allowances").is_empty());
+    assert_no_rows(&store).await;
+}
+
 /// The over marker through the real router: offered while the plan has
 /// room, it forwards past the gate until the plan is spent, then the gate
 /// stops the session again and offers only the burn marker, which widens

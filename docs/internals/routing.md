@@ -203,19 +203,18 @@ changes nothing when the listing cannot be fetched.
 
 ## Inference routes are canonical
 
-Every `/v1/messages` request is parsed after the Messages middleware has made
-its gate and licensed-rewrite decisions. The selected provider binding then
-renders the canonical request even when both ends speak Messages. The reverse
+Every valid `/v1/messages` request is parsed into one canonical request that
+the Messages gate and licensed rewrites use. The selected provider binding
+then renders it even when both ends speak Messages. The reverse
 path observes provider bytes first, interprets SSE events or a complete body
 canonically, and renders Messages for the client. This applies to
 `anthropic_sub`, `anthropic_api`, OpenRouter Messages, and the translated Codex
 binding. An invalid request is a local typed 400; a compressed, oversized, or
 malformed provider response that cannot cross the canonical boundary is a
 local typed 502. Neither reaches the other side as an unverified wire shape.
-The live Messages rewrite operations work on canonical nodes; malformed and
-administrative bodies retain a wire-shaped staging view so quota decisions
-and their established path-specific behavior do not depend on inference
-translation succeeding.
+Malformed bodies retain a wire-shaped view only for the quota decision and
+error presentation, not inference mutation or shape extraction. Administrative
+bodies keep their legacy path-specific behavior.
 
 The non-inference Messages surfaces remain transparent. Count-token and batch
 creation retain their legacy buffer, routing rewrites, observation, and

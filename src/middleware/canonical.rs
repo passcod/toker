@@ -349,6 +349,7 @@ mod tests {
             let mut canonical = from_anthropic(&value).unwrap();
             let legacy_outcome =
                 crate::middleware::cold::retarget_compaction(&mut legacy, None, true, None);
+            let before = canonical.clone();
             let canonical_outcome = retarget_compaction(&mut canonical, None, true, None);
             assert_eq!(canonical_outcome, legacy_outcome);
             if legacy_outcome.is_some() {
@@ -358,6 +359,11 @@ mod tests {
                 assert_eq!(
                     from_anthropic(&rendered).unwrap(),
                     from_anthropic(legacy.value()).unwrap(),
+                );
+            } else {
+                assert_eq!(
+                    canonical, before,
+                    "a refused retarget leaves the input untouched"
                 );
             }
         }
