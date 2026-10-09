@@ -746,6 +746,120 @@ pub struct AnthropicShape {
 }
 
 impl AnthropicShape {
+    /// Extract the Messages frontend's ledger/gate shape from canonical IR.
+    /// The original wire size is explicit metadata; every other observation
+    /// follows the canonical nodes before middleware mutates them.
+    pub fn from_canonical_messages(
+        request: &super::canonical::CanonicalRequest,
+        req_bytes: u64,
+    ) -> AnthropicShape {
+        use super::canonical::{CanonBlock, CanonRole, CanonSystemPart};
+
+        let pieces = request.system.iter().map(|part| match part {
+            CanonSystemPart::Text { text, .. } => text.as_str(),
+            CanonSystemPart::Opaque(extension) => extension
+                .value()
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        });
+        let mut system_blocks = Vec::new();
+        let mut system_units = Vec::new();
+        let mut system_bytes = Vec::new();
+        for piece in pieces {
+            system_blocks.push(SystemBlockDigest {
+                chars: piece.encode_utf16().count() as u64,
+                hash: short_hash(piece.as_bytes()),
+            });
+            system_units.extend(piece.encode_utf16());
+            system_bytes.extend_from_slice(piece.as_bytes());
+        }
+        let message_text = |message: &super::canonical::CanonMessage| {
+            message
+                .blocks
+                .iter()
+                .map(|block| match block.semantic() {
+                    CanonBlock::Text(text) => text.as_str(),
+                    _ => "",
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let has_tool_result = |message: &super::canonical::CanonMessage| {
+            message
+                .blocks
+                .iter()
+                .any(|block| matches!(block.semantic(), CanonBlock::ToolResult { .. }))
+        };
+        let role_name = |role: CanonRole| match role {
+            CanonRole::User => "user",
+            CanonRole::Assistant => "assistant",
+            CanonRole::System => "system",
+            CanonRole::Developer => "developer",
+        };
+        let last_turn = request
+            .messages
+            .iter()
+            .rfind(|message| message.role != CanonRole::System);
+        let last_begins = |markers: &[&str]| {
+            last_turn.is_some_and(|message| {
+                !has_tool_result(message) && begins_line_any(&message_text(message), markers)
+            })
+        };
+        let compact_generations = request.messages.first().and_then(|first| {
+            let count = count_of(&message_text(first), COMPACT_RESUMED);
+            (count > 0).then_some(count)
+        });
+        let compact_marker = request
+            .messages
+            .iter()
+            .enumerate()
+            .skip(request.messages.len().saturating_sub(MARKER_SCAN))
+            .rev()
+            .find(|(_, message)| {
+                let text = message_text(message);
+                COMPACT_PERFORMING
+                    .iter()
+                    .any(|marker| text.contains(marker))
+            })
+            .map(|(at, message)| CompactMarker {
+                from_end: (request.messages.len() - 1 - at) as u64,
+                role: Some(role_name(message.role).to_owned()),
+                trailing: request.messages[at + 1..]
+                    .iter()
+                    .map(|message| role_name(message.role).to_owned())
+                    .collect(),
+                line_start: begins_line_any(&message_text(message), COMPACT_PERFORMING),
+                tool_result: has_tool_result(message),
+            });
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let system_messages = request
+            .messages
+            .iter()
+            .filter(|message| message.role == CanonRole::System)
+            .count() as u64;
+        AnthropicShape {
+            req_bytes,
+            req_messages: Some(request.messages.len() as u64),
+            req_tools: names.len() as u64,
+            tools_hash: short_hash(names.join("\0").as_bytes()),
+            system_chars: system_units.len() as u64,
+            system_hash: short_hash(&system_bytes),
+            system_blocks,
+            system_messages: (system_messages > 0).then_some(system_messages),
+            compact_generations,
+            summarising: last_begins(COMPACT_PERFORMING),
+            compact_marker,
+            recap: last_begins(&[RECAP_PROMPT]),
+            system_ladder: prefix_ladder(&system_units),
+            system_tail: suffix_ladder(&system_units),
+        }
+    }
+
     /// Whether this request is a real compaction.
     ///
     /// The separator between a compaction and the routine summariser is
@@ -1024,6 +1138,35 @@ mod tests {
     use super::super::short_hash;
     use super::{MARKER_SCAN, PLAN_SENTINEL, Release, SENTINEL, System};
     use crate::ir::Request;
+    use crate::translate::from_anthropic;
+
+    #[test]
+    fn canonical_shape_matches_the_wire_shape_for_messages_and_compaction() {
+        for value in [
+            serde_json::json!({
+                "model":"m", "max_tokens":64,
+                "system":[{"type":"text","text":"A😊"},{"type":"other","text":"B"}],
+                "tools":[{"name":"echo","input_schema":{"type":"object"}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"hello"}]},
+                            {"role":"assistant","content":[{"type":"text","text":"answer"}]}]
+            }),
+            serde_json::json!({
+                "model":"m", "max_tokens":64,
+                "tools":[{"name":"echo","input_schema":{"type":"object"}}],
+                "messages":[{"role":"user","content":format!("{}\nhello", super::COMPACT_RESUMED)},
+                            {"role":"user","content":super::COMPACT_PERFORMING[0]},
+                            {"role":"system","content":"trailing hook"}]
+            }),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let ir = Request::parse(&bytes).unwrap();
+            let canonical = from_anthropic(&value).unwrap();
+            assert_eq!(
+                super::AnthropicShape::from_canonical_messages(&canonical, bytes.len() as u64),
+                ir.anthropic().shape(),
+            );
+        }
+    }
 
     fn parse(body: &[u8]) -> Request {
         Request::parse(body).expect("test body parses")

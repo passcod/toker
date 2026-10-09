@@ -2128,7 +2128,7 @@ impl ColdBlocking {
 /// predecessor's `[system]`, which says what the block was. A port once
 /// wrote `[PROMPT_INJECTION]` here, labelling the client's own
 /// instructions as an injection for the model to distrust.
-const MERGED_SYSTEM: &str = "[system]";
+pub(crate) const MERGED_SYSTEM: &str = "[system]";
 
 /// What one retarget did. `to == from` is a same-model strip: a real
 /// transform (the breakpoints went) but not a downgrade — recording one
@@ -2156,7 +2156,11 @@ pub struct RetargetOutcome {
 /// be called cheaper because of its own name. An identity that cannot be
 /// priced cannot be judged. Never sideways, never upward: that would buy
 /// nothing and cost the quality difference.
-fn cheaper_of(from: Option<&str>, target: Option<&str>, map: Option<&ModelMap>) -> Option<String> {
+pub(crate) fn cheaper_of(
+    from: Option<&str>,
+    target: Option<&str>,
+    map: Option<&ModelMap>,
+) -> Option<String> {
     let target = target?;
     let from = from?;
     let target_input = price(preview_mapped_model(map, target)?, false, None)?

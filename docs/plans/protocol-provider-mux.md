@@ -360,13 +360,18 @@ round trip. All inference handlers now resolve through the shared route
 registry to a `ModelTarget` carrying the provider, verified backend binding,
 requested model, and effective model.
 Chat and Responses now pass their parsed canonical requests directly to
-cross-protocol backend handlers; Messages still runs its licensed gate and
-rewrite sequence over wire-shaped IR before canonical parsing.
+cross-protocol backend handlers. Messages' live inference rewrites and shape
+extraction use canonical IR, while its handler still keeps a wire-shaped
+staging view for malformed and administrative bodies.
 Chat also resolves its model and extracts its ledger/cold-gate shape from
 canonical IR, with parity tests against the previous wire-shaped view.
 Responses resolves through its canonical model and derives ledger shape from
 canonical IR too; wire-only `input` array length and request byte count remain
 explicit metadata so absence and wire size keep their original meanings.
+Messages canonical middleware now handles the release marker, cold-compaction
+retarget, force-newest model mutation, model map, effort strip, and
+response-triggered thinking retry, with semantic parity coverage against the
+previous helpers.
 
 - Move routing, gates, rewrites, and shape extraction onto canonical middleware.
 - Cut one complete request-and-response route at a time onto the common

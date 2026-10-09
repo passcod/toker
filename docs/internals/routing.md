@@ -212,6 +212,10 @@ canonically, and renders Messages for the client. This applies to
 binding. An invalid request is a local typed 400; a compressed, oversized, or
 malformed provider response that cannot cross the canonical boundary is a
 local typed 502. Neither reaches the other side as an unverified wire shape.
+The live Messages rewrite operations work on canonical nodes; malformed and
+administrative bodies retain a wire-shaped staging view so quota decisions
+and their established path-specific behavior do not depend on inference
+translation succeeding.
 
 The non-inference Messages surfaces remain transparent. Count-token and batch
 creation retain their legacy buffer, routing rewrites, observation, and

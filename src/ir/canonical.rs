@@ -176,6 +176,10 @@ impl CanonicalExtension {
     pub fn value(&self) -> &Value {
         &self.value
     }
+
+    pub(crate) fn value_mut(&mut self) -> &mut Value {
+        &mut self.value
+    }
 }
 
 impl fmt::Debug for CanonicalExtension {

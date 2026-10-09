@@ -243,10 +243,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // even reading meters).
     let mut meters_snapshot: Option<serde_json::Value> = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
-        client_model = ir.anthropic().model().map(str::to_owned);
-        stream_explicitly_false = ir.anthropic().stream_explicitly_false();
-        // 4. Routing: read the model through the typed view; a provider
-        // prefix overrides the backend per request.
+        let mut ingress_canonical = (path == "/v1/messages")
+            .then(|| translate::from_anthropic(ir.value()).ok())
+            .flatten();
+        client_model = ingress_canonical
+            .as_ref()
+            .and_then(|request| request.model.clone())
+            .or_else(|| ir.anthropic().model().map(str::to_owned));
+        stream_explicitly_false = ingress_canonical.as_ref().map_or_else(
+            || ir.anthropic().stream_explicitly_false(),
+            |request| request.stream == Some(false),
+        );
+        // Inference routing reads the canonical model; administrative
+        // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
         target = match server
             .registry
@@ -263,7 +272,18 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         {
             // A deliberate routing transform: the registry removed only
             // toker's outer provider/protocol prefix.
-            ir.anthropic_mut().set_model(effective);
+            let routed_ir = ingress_canonical.as_mut().and_then(|canonical| {
+                canonical.model = Some(effective.to_owned());
+                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
+                    .ok()
+                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
+                    .and_then(|bytes| IrRequest::parse(&bytes).ok())
+            });
+            if let Some(routed) = routed_ir {
+                ir = routed;
+            } else {
+                ir.anthropic_mut().set_model(effective);
+            }
             transformed = true;
         }
 
@@ -288,6 +308,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 });
         }
         if path == "/v1/messages" {
+            let mut canonical = translate::from_anthropic(ir.value()).ok();
             // A release: grant/refresh an allowance for the
             // currently-exhausted meters only, and record it. The gate
             // fires on the marker + the session id + the toggle
@@ -295,7 +316,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // allowance.
             if gate_armed
                 && let Some(session) = session_id.as_deref()
-                && let Some(release) = ir.anthropic().release_marker()
+                && let Some(release) = canonical
+                    .as_ref()
+                    .and_then(crate::middleware::canonical::release_marker)
+                    .or_else(|| ir.anthropic().release_marker())
             {
                 let meters = meters_snapshot.as_ref().map(Meters::over);
                 let now = now_ms();
@@ -325,9 +349,23 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // nothing for the strip itself: the released row is the
             // user-visible event, and the strip is the API's own rule.
             let pre_strip = ir.serialise();
-            ir.anthropic_mut().strip_release();
-            if ir.serialise() != pre_strip {
+            let canonical_strip = canonical.as_mut().and_then(|canonical| {
+                if !crate::middleware::canonical::strip_release(canonical, &pre_strip) {
+                    return None;
+                }
+                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
+                    .ok()
+                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
+                    .and_then(|bytes| IrRequest::parse(&bytes).ok())
+            });
+            if let Some(stripped) = canonical_strip {
+                ir = stripped;
                 transformed = true;
+            } else {
+                // A body not representable by the canonical adapter still
+                // gets the established strip before its eventual local error.
+                ir.anthropic_mut().strip_release();
+                transformed |= ir.serialise() != pre_strip;
             }
         }
         if transformed {
@@ -335,7 +373,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // marker never reaches the model.
             forward = Bytes::from(ir.serialise());
         }
-        let shape = ir.anthropic().shape();
+        let shape = serde_json::from_slice::<serde_json::Value>(&original)
+            .ok()
+            .and_then(|body| translate::from_anthropic(&body).ok())
+            .map(|canonical| {
+                AnthropicShape::from_canonical_messages(&canonical, original.len() as u64)
+            })
+            .unwrap_or_else(|| ir.anthropic().shape());
         // The model this request is about to be sent on — the note-served
         // mark below needs it after `effective_model` moves into the
         // record context.
@@ -761,7 +805,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // interrupted it: the gate exists to advise this.
     if path == "/v1/messages"
         && picks_from_anthropic_catalogue(backend.as_ref())
-        && let Some(ir) = parsed.as_mut()
         && gate_shape
             .as_ref()
             .is_some_and(AnthropicShape::is_compaction)
@@ -793,13 +836,31 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()
                 .flatten();
-            if let Some(outcome) =
-                cold::retarget_compaction(ir, target.as_deref(), true, backend.model_map())
-            {
+            let retargeted = serde_json::from_slice::<serde_json::Value>(&forward)
+                .ok()
+                .and_then(|body| translate::from_anthropic(&body).ok())
+                .and_then(|mut canonical| {
+                    let outcome = crate::middleware::canonical::retarget_compaction(
+                        &mut canonical,
+                        target.as_deref(),
+                        true,
+                        backend.model_map(),
+                    )?;
+                    let rendered = translate::render_anthropic(
+                        &canonical,
+                        crate::routing::DialectId::AnthropicMessages,
+                    )
+                    .ok()?;
+                    let bytes = serde_json::to_vec(&rendered.value).ok()?;
+                    let ir = IrRequest::parse(&bytes).ok()?;
+                    Some((outcome, bytes, ir))
+                });
+            if let Some((outcome, bytes, ir)) = retargeted {
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.
-                forward = Bytes::from(ir.serialise());
+                forward = Bytes::from(bytes);
+                parsed = Some(ir);
                 // A same-model strip is not a downgrade, and recording one
                 // would put a model in `downgradedFrom` that also served
                 // the request — only `cacheStripped` says it happened.
@@ -889,8 +950,24 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             &server.models,
         );
         if let ForceDecision::Move(forced) = decision {
-            ir.anthropic_mut().set_model(&forced.to);
-            forward = Bytes::from(ir.serialise());
+            let canonical_rewrite = serde_json::from_slice::<serde_json::Value>(&forward)
+                .ok()
+                .and_then(|body| translate::from_anthropic(&body).ok())
+                .and_then(|mut canonical| {
+                    canonical.model = Some(forced.to.clone());
+                    translate::render_anthropic(
+                        &canonical,
+                        crate::routing::DialectId::AnthropicMessages,
+                    )
+                    .ok()
+                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
+                });
+            if let Some(body) = canonical_rewrite {
+                forward = Bytes::from(body);
+            } else {
+                ir.anthropic_mut().set_model(&forced.to);
+                forward = Bytes::from(ir.serialise());
+            }
             if let Some(ctx) = record.as_mut() {
                 ctx.forced_from = Some(forced.from.clone());
                 ctx.forced_to = Some(forced.to.clone());
@@ -914,7 +991,41 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // force-newest (which previewed through the map above), and BEFORE
     // the served-model mark — the mark must see what is actually sent.
     if let Some(map) = backend.model_map() {
-        let rewrite = model_map::rewrite_mapped_models(Some(map), &forward, "POST", path);
+        let canonical_rewrite = (path == "/v1/messages")
+            .then(|| serde_json::from_slice::<serde_json::Value>(&forward).ok())
+            .flatten()
+            .and_then(|body| translate::from_anthropic(&body).ok())
+            .and_then(|mut canonical| {
+                let before = canonical.model.clone()?;
+                let matched = crate::middleware::canonical::map_model(&mut canonical, Some(map))?;
+                let rendered = translate::render_anthropic(
+                    &canonical,
+                    crate::routing::DialectId::AnthropicMessages,
+                )
+                .ok()?;
+                let body = serde_json::to_vec(&rendered.value).ok()?;
+                let effective = matched.target;
+                Some(model_map::MappedRewrite {
+                    changed: body != forward,
+                    body,
+                    mapped: true,
+                    pre_map_model: Some(before.clone()),
+                    effective_model: Some(effective.clone()),
+                    models: vec![model_map::MappedPosition {
+                        request_index: None,
+                        pre_map_model: before,
+                        effective_model: effective,
+                        matched: true,
+                        selector: Some(matched.selector),
+                    }],
+                })
+            });
+        let rewrite = canonical_rewrite.unwrap_or_else(|| {
+            // Count-token and batch bodies are administrative and keep the
+            // lexical mapper; invalid inference bodies cannot be rendered
+            // canonically and will receive the local compatibility error.
+            model_map::rewrite_mapped_models(Some(map), &forward, "POST", path)
+        });
         if rewrite.mapped {
             forward = Bytes::from(rewrite.body);
             if let Some(effective) = rewrite.effective_model.clone() {
@@ -967,11 +1078,33 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     if path == "/v1/messages"
         && let Some(model) = served_model.as_deref()
         && !backend.accepts_message_effort(model)
-        && let Ok(mut ir) = crate::ir::Request::parse(&forward)
-        && ir.anthropic_mut().strip_message_effort()
     {
-        forward = Bytes::from(ir.serialise());
-        tracing::info!("stripped mid-conversation effort for {model}");
+        let canonical_stripped = serde_json::from_slice::<serde_json::Value>(&forward)
+            .ok()
+            .and_then(|body| {
+                let mut canonical = translate::from_anthropic(&body).ok()?;
+                if !crate::middleware::canonical::strip_message_effort(&mut canonical, &body) {
+                    return None;
+                }
+                translate::render_anthropic(
+                    &canonical,
+                    crate::routing::DialectId::AnthropicMessages,
+                )
+                .ok()
+                .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
+                .map(Bytes::from)
+            });
+        if let Some(stripped) = canonical_stripped {
+            forward = stripped;
+            tracing::info!("stripped mid-conversation effort for {model}");
+        } else if let Ok(mut ir) = crate::ir::Request::parse(&forward)
+            && ir.anthropic_mut().strip_message_effort()
+        {
+            // A malformed body may not parse canonically, but the previous
+            // stripper can still make its eventual error deterministic.
+            forward = Bytes::from(ir.serialise());
+            tracing::info!("stripped mid-conversation effort for {model}");
+        }
     }
 
     // ── the served-model mark, BEFORE the request goes ──
@@ -1206,15 +1339,19 @@ async fn retry_thinking_off(
         })
 }
 
-/// The sent body with `thinking: disabled` made `between_tools`
-/// ([`crate::ir::AnthropicBodyMut::thinking_between_tools`]), or `None`
-/// when it did not turn thinking off (or does not parse), so there is
-/// nothing to retry.
+/// The sent canonical body with `thinking: disabled` made `between_tools`,
+/// or `None` when no such retry is possible.
 fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
-    let mut ir = IrRequest::parse(sent).ok()?;
-    ir.anthropic_mut()
-        .thinking_between_tools()
-        .then(|| Bytes::from(ir.serialise()))
+    let value = serde_json::from_slice::<serde_json::Value>(sent).ok()?;
+    let mut canonical = translate::from_anthropic(&value).ok()?;
+    if canonical.thinking != Some(crate::ir::canonical::ThinkingSpec::Disabled) {
+        return None;
+    }
+    canonical.thinking = Some(crate::ir::canonical::ThinkingSpec::BetweenTools);
+    let rendered =
+        translate::render_anthropic(&canonical, crate::routing::DialectId::AnthropicMessages)
+            .ok()?;
+    serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
 }
 
 /// A response put back together from what [`retry_thinking_off`] buffered
