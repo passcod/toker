@@ -1,5 +1,5 @@
 //! The proxy routes: chat completions (the usage path, fully recorded) and
-//! models (transparent forwarding).
+//! locally projected model discovery.
 //!
 //! Chat completions, in order (plan: Server core):
 //!
@@ -45,11 +45,13 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::response::Response;
 use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::{Stream, StreamExt};
 
+use crate::catalog::offers;
 use crate::ir::{Request as IrRequest, Shape};
 use crate::middleware::cold;
 use crate::middleware::force_newest;
@@ -405,21 +407,42 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     }
 }
 
-/// `GET /v1/models` — transparent forwarding. The model list is not a
-/// usage path: no recording, no observation (plan: the frontend fetches
-/// it through the base URL; the simplest correct dogfooding behavior).
-/// Every frontend lands here, claude included, so the openrouter
-/// provider strips any Anthropic credential the request carries before
-/// it leaves (see [`Provider::strip_foreign_credentials`]).
-///
-/// With no openrouter block the path is the default anthropic backend's,
-/// like any other path the routes do not claim: claude asks for it too,
-/// and only the openai backend makes it an openai route.
+/// `GET /v1/models` is a local route-graph projection for known OpenAI
+/// profiles. An unknown or Anthropic profile retains path-driven legacy
+/// forwarding. No model catalogue request is a usage path or ledger row.
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
-    if super::frontend_profile_of(request.extensions()).and_then(|profile| profile.protocol())
-        == Some(crate::routing::ProtocolId::OpenAiResponses)
-    {
-        return super::codex::models(State(server), request).await;
+    let profile = super::frontend_profile_of(request.extensions()).and_then(|p| p.protocol());
+    if let Some(frontend @ (ProtocolId::OpenAiChat | ProtocolId::OpenAiResponses)) = profile {
+        if server.registry.resolve(frontend, None).is_err() {
+            return match frontend {
+                ProtocolId::OpenAiChat => super::openai_not_configured(),
+                ProtocolId::OpenAiResponses => super::responses_not_configured(),
+                ProtocolId::AnthropicMessages => unreachable!(),
+            };
+        }
+        let catalogs = server
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let models = offers::for_frontend(&server.registry, &catalogs, frontend);
+        if models.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "type": "catalog_unavailable",
+                        "message": "No provider model catalogue is available yet"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        let body = match frontend {
+            ProtocolId::OpenAiChat => offers::render_chat(&models),
+            ProtocolId::OpenAiResponses => offers::render_responses(&models),
+            ProtocolId::AnthropicMessages => unreachable!(),
+        };
+        return axum::Json(body).into_response();
     }
     let Some(openrouter) = server.registry.provider("openrouter").cloned() else {
         return super::anthropic::unmatched(State(server), request).await;

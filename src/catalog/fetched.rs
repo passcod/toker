@@ -226,7 +226,7 @@ impl FetchedCatalogs {
     /// both anthropic backends share anthropic's listing,
     /// openrouter and codex_sub are their own. A provider with no
     /// source has no fetched catalogue at all.
-    fn source_of(provider: &str) -> Option<&'static str> {
+    pub fn source_of(provider: &str) -> Option<&'static str> {
         match provider {
             "openrouter" => Some("openrouter"),
             "codex_sub" => Some("codex_sub"),

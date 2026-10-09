@@ -829,6 +829,68 @@ async fn models_passthrough_is_byte_identical_and_unledgered() {
 }
 
 #[tokio::test]
+async fn known_chat_profile_projects_routable_models_locally() {
+    let (mock, upstream) = spawn_mock().await;
+    let config = test_config(upstream, UNSET_KEY_ENV, None);
+    let listing = serde_json::json!({
+        "data": [
+            {"id": "invented/one", "created": 123, "context_length": 64000,
+             "pricing": {"prompt": "0.000001"}},
+            {"id": "invented/two"}
+        ]
+    });
+    let catalog = toker::catalog::fetched::parse_openrouter(&listing, 1).expect("catalog");
+    let (addr, store) = spawn_toker_cataloged(config, "openrouter", catalog).await;
+
+    let response = client()
+        .get(toker_url(addr, "/f/opencode/v1/models"))
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("models JSON");
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "invented/one",
+            "invented/two",
+            "openrouter/invented/one",
+            "openrouter/invented/two"
+        ]
+    );
+    assert_eq!(body["data"][0]["object"], "model");
+    assert_eq!(body["data"][0]["owned_by"], "openrouter");
+    assert!(body["data"][0].get("pricing").is_none());
+    assert!(
+        mock.captured().is_empty(),
+        "discovery never reaches upstream"
+    );
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn missing_local_catalogue_is_unavailable_not_an_empty_model_list() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let response = client()
+        .get(toker_url(addr, "/f/opencode/v1/models"))
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.expect("error JSON");
+    assert_eq!(body["error"]["type"], "catalog_unavailable");
+    assert!(mock.captured().is_empty());
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+#[tokio::test]
 async fn models_never_carries_an_anthropic_credential_to_openrouter() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, _store) = spawn_toker(test_config(

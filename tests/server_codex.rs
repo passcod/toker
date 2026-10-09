@@ -399,6 +399,33 @@ async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     (addr, store)
 }
 
+async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::new(config, store.clone()).expect("build server");
+    let raw = json!({
+        "models": [{
+            "slug": "gpt-5.6-sol",
+            "context_window": 272000,
+            "max_context_window": 872000
+        }]
+    });
+    server.install_catalog(
+        "codex_sub",
+        toker::catalog::fetched::parse_codex(&raw, 1).expect("catalog"),
+    );
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        let _dir = dir;
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    (addr, store)
+}
+
 /// A claude-shaped streaming Messages request for `model`, with a system
 /// prompt, tools, and one user turn.
 fn messages_body(model: &str, stream: bool) -> Vec<u8> {
@@ -437,45 +464,22 @@ fn client() -> reqwest::Client {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn codex_models_uses_the_subscription_catalogue_and_exact_slug() {
+async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, _store) = spawn_toker(test_config("models", upstream, false)).await;
+    let (addr, _store) = spawn_toker_cataloged(test_config("models", upstream, false)).await;
 
     let response = client()
         .get(format!("http://{addr}/f/codex/v1/models"))
         .header(header::AUTHORIZATION, "Bearer frontend-must-not-pass")
-        .header(header::IF_NONE_MATCH, "\"catalog-v0\"")
         .send()
         .await
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(header::ETAG).unwrap(),
-        "\"catalog-v1\""
-    );
     let body: Value = response.json().await.expect("catalogue JSON");
-    assert_eq!(body["models"][0]["slug"], "gpt-5.6-sol");
-
-    let requests = mock.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].path,
-        "/backend-api/codex/models?client_version=0.154.0"
-    );
-    assert_eq!(requests[0].headers.get("version").unwrap(), "0.154.0");
-    assert_eq!(
-        requests[0].headers.get("originator").unwrap(),
-        "codex_cli_rs"
-    );
-    assert_eq!(
-        requests[0].headers.get(header::IF_NONE_MATCH).unwrap(),
-        "\"catalog-v0\""
-    );
-    assert_ne!(
-        requests[0].headers.get(header::AUTHORIZATION).unwrap(),
-        "Bearer frontend-must-not-pass"
-    );
-    assert!(requests[0].body.is_empty());
+    assert_eq!(body["models"][0]["slug"], "codex_sub/gpt-5.6-sol");
+    assert_eq!(body["models"][1]["slug"], "gpt-5.6-sol");
+    assert_eq!(body["models"][0]["max_context_window"], 872000);
+    assert!(mock.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -1,8 +1,8 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phases 1 and 2 complete, every current inference
-route canonical, the shared route registry complete, and middleware and
-discovery convergence still underway.
+Status: guiding architecture; phases 1, 2, and 4 complete, every current
+inference route canonical, the shared route registry complete, and middleware
+convergence still underway.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
 any configured frontend protocol should be able to reach any backend for which
@@ -371,6 +371,11 @@ requested model, and effective model.
   readable.
 
 ### 4. Own model discovery
+
+Implemented: fetched catalogues become route-checked `ModelOffer`s retaining
+raw entries and fetch age. Known Chat and Responses profiles render their
+catalogues locally; unknown profiles retain path-driven forwarding. Claude's
+picker filters the same joined OpenRouter Messages offers.
 
 - Normalize the existing fetched catalogues into `ModelOffer`s.
 - Join offers against the route graph per frontend profile.

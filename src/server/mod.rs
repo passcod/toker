@@ -11,14 +11,15 @@
 //! - OpenAI-chat frontend (→ OpenRouter Chat or Codex Responses binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
 //!     the IR, routed, recorded ([`proxy`]).
-//!   - `GET /v1/models` — transparent forwarding, no recording.
+//!   - `GET /v1/models` — local route-graph projection for a known Chat
+//!     profile, no recording.
 //! - Anthropic frontend (→ any registered Messages/Codex binding):
 //!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
 //!     `count_tokens` and `batches` run the same pipeline (they are not
 //!     gated — gates arrive with the quota-gate unit) but carry no usage,
 //!     so they record nothing in practice ([`anthropic`]).
 //!   - The batch-result GETs (and cancel) — transparent forwarding like
-//!     `/v1/models`.
+//!     `/v1/models` (a local projection for a known Responses profile).
 //! - `GET /_toker/status`, `POST /_toker/models/merge`,
 //!   `GET /_toker/session`, `POST /_toker/shutdown` — the control
 //!   endpoints, gated by a custom header ([`control`]); `session` is the
@@ -39,8 +40,8 @@
 //! not-configured error in that protocol's own error shape
 //! ([`anthropic_not_configured`], [`openai_not_configured`]) and reaches
 //! no upstream; that includes the unmatched-path fallback, which is the
-//! anthropic default's. `GET /v1/models` is the openai backend's when
-//! there is one and the anthropic default's otherwise.
+//! anthropic default's. Unprefixed or unknown-profile `GET /v1/models`
+//! retains path-driven forwarding; known OpenAI profiles use local discovery.
 //!
 //! Timeouts: axum applies no default request or idle timeout on the
 //! client side, so streams run as long as both ends keep the connection
@@ -142,7 +143,8 @@ pub struct Server {
     pub(crate) models: Arc<ModelStore>,
     /// The fetched models catalogues (one per source: openrouter's
     /// public listing, anthropic's presence list, the codex backend's
-    /// own models endpoint — see [`crate::catalog::fetched`]),
+    /// own models endpoint — see [`crate::catalog::fetched`]), projected
+    /// into frontend catalogues by [`crate::catalog::offers`], and
     /// refreshed by the background task
     /// [`Server::spawn_catalog_refresh`] spawns at startup and every
     /// [`fetched::CACHE_TTL_MS`]. Held so the record paths and a
@@ -785,6 +787,10 @@ impl Server {
     fn spawn_catalog_refresh(&self) {
         match fetched::cache_dir() {
             Ok(dir) => {
+                *self
+                    .catalogs
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fetched::load_cached(&dir);
                 let _ = self.catalog_dir.set(dir);
             }
             Err(_) => {

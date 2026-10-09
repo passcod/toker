@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::catalog::windows::verified_ids;
+use crate::catalog::{fetched, offers};
 use crate::middleware::models::{family_of, newest_in_family};
+use crate::providers::{OpenRouter, Provider};
+use crate::routing::{ProtocolId, RouteRegistry};
 use crate::store::ModelEntry;
 
 /// The prefix that routes a model to openrouter on the Anthropic wire,
@@ -205,42 +208,53 @@ pub fn eligible(listing: &Value) -> anyhow::Result<Vec<Listed>> {
         .get("data")
         .and_then(Value::as_array)
         .context("openrouter models listing has no `data` array")?;
-    Ok(data
+    Ok(data.iter().filter_map(listed_from_raw).collect())
+}
+
+/// Picker candidates are the OpenRouter Messages offers from the same
+/// catalogue/route join used by `/v1/models`. Bare aliases and models with
+/// no verified Messages route never enter the Claude picker.
+pub fn eligible_offers(offers: &[offers::ModelOffer]) -> Vec<Listed> {
+    offers
         .iter()
-        .filter(|model| {
-            let has = |field: &str, item: &str| {
-                model
-                    .pointer(field)
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| items.iter().any(|value| value.as_str() == Some(item)))
-            };
-            has("/supported_parameters", "tools") && has("/architecture/input_modalities", "text")
-        })
-        .filter_map(|model| {
-            let id = model.get("id")?.as_str()?;
-            if id.contains(':') {
-                return None;
-            }
-            let price = |field: &str| {
-                model
-                    .pointer(field)
-                    .and_then(Value::as_str)
-                    .and_then(|price| price.parse::<f64>().ok())
-            };
-            Some(Listed {
-                id: id.to_owned(),
-                name: model
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_owned(),
-                created: model.get("created").and_then(Value::as_i64).unwrap_or(0),
-                context_length: model.get("context_length").and_then(Value::as_u64),
-                prompt_price: price("/pricing/prompt"),
-                completion_price: price("/pricing/completion"),
-            })
-        })
-        .collect())
+        .filter(|offer| offer.provider == "openrouter")
+        .filter(|offer| offer.routed_model_id.starts_with(ROW_PREFIX))
+        .filter_map(|offer| listed_from_raw(&offer.raw))
+        .collect()
+}
+
+fn listed_from_raw(model: &Value) -> Option<Listed> {
+    let has = |field: &str, item: &str| {
+        model
+            .pointer(field)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|value| value.as_str() == Some(item)))
+    };
+    if !has("/supported_parameters", "tools") || !has("/architecture/input_modalities", "text") {
+        return None;
+    }
+    let id = model.get("id")?.as_str()?;
+    if id.contains(':') {
+        return None;
+    }
+    let price = |field: &str| {
+        model
+            .pointer(field)
+            .and_then(Value::as_str)
+            .and_then(|price| price.parse::<f64>().ok())
+    };
+    Some(Listed {
+        id: id.to_owned(),
+        name: model
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_owned(),
+        created: model.get("created").and_then(Value::as_i64).unwrap_or(0),
+        context_length: model.get("context_length").and_then(Value::as_u64),
+        prompt_price: price("/pricing/prompt"),
+        completion_price: price("/pricing/completion"),
+    })
 }
 
 /// One `modelPicker.options` row.
@@ -435,7 +449,14 @@ pub async fn sync(
                     ));
                     Vec::new()
                 });
-            let (rows, mut rule_warnings) = rows(&rules, &eligible(&listing)?, &|value| {
+            let catalog = fetched::parse_openrouter(&listing, 0)?;
+            let mut catalogs = fetched::FetchedCatalogs::default();
+            catalogs.set("openrouter", catalog);
+            let provider: std::sync::Arc<dyn Provider> =
+                std::sync::Arc::new(OpenRouter::new(openrouter.upstream.clone(), None));
+            let registry = RouteRegistry::new([provider], []);
+            let joined = offers::for_frontend(&registry, &catalogs, ProtocolId::AnthropicMessages);
+            let (rows, mut rule_warnings) = rows(&rules, &eligible_offers(&joined), &|value| {
                 resolve_behaves_as(value, &learned)
             })?;
             warnings.append(&mut rule_warnings);
@@ -489,6 +510,27 @@ mod tests {
         let (rows, warnings) = rows(&default_rules(true), &models, &verified_only).expect("rows");
         assert_eq!(warnings, Vec::<String>::new());
         insta::assert_snapshot!(render(&rows));
+    }
+
+    #[test]
+    fn picker_candidates_are_the_joined_messages_offers() {
+        let listing = listing();
+        let mut catalogs = fetched::FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            fetched::parse_openrouter(&listing, 42).expect("catalog"),
+        );
+        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(OpenRouter::new(
+            "https://openrouter.ai/api/v1".parse().expect("url"),
+            None,
+        ));
+        let registry = RouteRegistry::new([provider], []);
+        let offers = offers::for_frontend(&registry, &catalogs, ProtocolId::AnthropicMessages);
+        assert_eq!(
+            eligible_offers(&offers),
+            eligible(&listing).expect("eligible")
+        );
+        assert!(offers.iter().all(|offer| offer.fetched_at_ms == 42));
     }
 
     #[test]

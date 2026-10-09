@@ -37,6 +37,7 @@
 //! number.
 
 pub mod fetched;
+pub mod offers;
 pub mod pricing;
 pub mod windows;
 

@@ -13,7 +13,7 @@ serves them all, because the paths do not collide:
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
 | OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub` (translated) |
-| OpenAI Responses | `/v1/responses` | `codex_sub` |
+| OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub` |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
@@ -29,6 +29,19 @@ An unknown prefix belongs to the provider's model id and stays intact. A
 protocol with no enabled backend answers its routes with a not-configured error
 in that protocol's own shape, carrying the `x-toker-not-configured` header, and
 reaches no upstream.
+
+For a known OpenAI frontend profile, `/v1/models` is projected locally from
+the fetched provider catalogues through this same route registry. Each listed
+model has a provider-qualified id; the configured default also gets a bare
+alias. A model without a complete route is absent. Chat receives the OpenAI
+list shape, built from known fields rather than copying a foreign provider's
+entry; Codex receives its native `models` shape with routed slugs and its
+provider metadata retained. Catalogue age stays with each internal offer.
+When no usable catalogue has arrived, the endpoint returns 503, not a false
+empty list. Unknown and unprefixed profiles keep path-driven forwarding.
+The service loads cached catalogues before serving, then refreshes in the
+background. Claude's picker filters the OpenRouter Messages offers from the
+same join, subject to its own tool/text and user-rule constraints.
 
 Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
