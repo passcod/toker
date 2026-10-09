@@ -76,13 +76,14 @@
 use serde_json::{Value, json};
 
 use crate::ir::canonical::{
-    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonRole, CanonStopReason,
-    CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalRequest,
-    CanonicalUsage, ThinkingSpec,
+    CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
+    CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
+    CanonicalRequest, CanonicalUsage, ThinkingSpec,
 };
 use crate::providers::codex::{
     Item, ResponseError, ResponseEvent, ResponsesRequest, Tool, TurnCapture, Usage,
 };
+use crate::routing::DialectId;
 use crate::translate::{
     Rendered, TranslateError, TranslationLoss, TranslationLossReason, TranslationReport,
 };
@@ -122,7 +123,8 @@ pub fn render_codex(
             reason: "canonical request has no model".to_owned(),
         })?;
     let mut request = ResponsesRequest::new(model, prompt_cache_key);
-    let (input, leading_system) = input_of(canonical);
+    let mut report = loss_report(canonical);
+    let (input, leading_system) = input_of(canonical, &mut report);
     // The system prompt is the pieces joined on blank lines — THIS
     // backend's `instructions` form — plus any system-role message
     // texts that had no user turn to merge into (below).
@@ -140,7 +142,11 @@ pub fn render_codex(
     }
     request.instructions = instructions;
     request.input = input;
-    request.tools = canonical.tools.iter().map(tool_of).collect();
+    request.tools = canonical
+        .tools
+        .iter()
+        .map(|tool| tool_of(tool, &mut report))
+        .collect();
     request.tool_choice = tool_choice_of(&canonical.tool_choice)?;
     // Sampling does not cross: [`Capabilities::CODEX`].sampling is
     // false — the backend refuses the parameters outright
@@ -154,9 +160,10 @@ pub fn render_codex(
     // this backend's turns always stream (the wire constant), so it
     // is read for nothing here either.
     request.reasoning.effort = canonical.thinking.as_ref().map(effort_of);
+    replay_request_extensions(&mut request, &canonical.extensions, &mut report);
     Ok(Rendered {
         value: request,
-        report: loss_report(canonical),
+        report,
     })
 }
 
@@ -194,16 +201,6 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
         ));
     }
 
-    for message in &canonical.messages {
-        for extension in &message.extensions {
-            report.push(TranslationLoss::new(
-                extension.wire_path(),
-                TranslationLossReason::IncompatibleExtensionDialect,
-                1,
-            ));
-        }
-    }
-
     let thinking_blocks = canonical
         .messages
         .iter()
@@ -221,44 +218,6 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
             unsupported,
             thinking_blocks,
         ));
-    }
-
-    for block in canonical
-        .messages
-        .iter()
-        .flat_map(|message| &message.blocks)
-    {
-        if let CanonBlock::Annotated {
-            is_error,
-            extensions,
-            ..
-        } = block
-        {
-            if is_error.is_some() {
-                report.push(TranslationLoss::new(
-                    "messages[].blocks[].tool_result.is_error",
-                    unsupported,
-                    1,
-                ));
-            }
-            for extension in extensions {
-                report.push(TranslationLoss::new(
-                    extension.wire_path(),
-                    TranslationLossReason::IncompatibleExtensionDialect,
-                    1,
-                ));
-            }
-        }
-    }
-
-    for tool in &canonical.tools {
-        for extension in &tool.extensions {
-            report.push(TranslationLoss::new(
-                extension.wire_path(),
-                TranslationLossReason::IncompatibleExtensionDialect,
-                1,
-            ));
-        }
     }
 
     for part in &canonical.system {
@@ -280,15 +239,85 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
         }
     }
 
-    for extension in &canonical.extensions {
-        report.push(TranslationLoss::new(
-            extension.wire_path(),
-            TranslationLossReason::IncompatibleExtensionDialect,
-            1,
-        ));
-    }
-
     report
+}
+
+fn replay_request_extensions(
+    request: &mut ResponsesRequest,
+    extensions: &[CanonicalExtension],
+    report: &mut TranslationReport,
+) {
+    for extension in extensions {
+        if extension.source() != DialectId::CodexResponses {
+            report_incompatible(extension, report);
+            continue;
+        }
+        let Some(name) = extension.wire_name() else {
+            report_not_representable(extension, report);
+            continue;
+        };
+        if extension.wire_path().starts_with("$.reasoning.") {
+            request
+                .reasoning
+                .extra
+                .insert(name.to_owned(), extension.value().clone());
+            continue;
+        }
+        match name {
+            "store" => match extension.value().as_bool() {
+                Some(value) => request.store = value,
+                None => report_not_representable(extension, report),
+            },
+            "parallel_tool_calls" => match extension.value().as_bool() {
+                Some(value) => request.parallel_tool_calls = value,
+                None => report_not_representable(extension, report),
+            },
+            "include" => match serde_json::from_value(extension.value().clone()) {
+                Ok(value) => request.include = value,
+                Err(_) => report_not_representable(extension, report),
+            },
+            _ => {
+                request
+                    .extra
+                    .insert(name.to_owned(), extension.value().clone());
+            }
+        }
+    }
+}
+
+fn report_incompatible(extension: &CanonicalExtension, report: &mut TranslationReport) {
+    report.push(TranslationLoss::new(
+        extension.wire_path(),
+        TranslationLossReason::IncompatibleExtensionDialect,
+        1,
+    ));
+}
+
+fn report_not_representable(extension: &CanonicalExtension, report: &mut TranslationReport) {
+    report.push(TranslationLoss::new(
+        extension.wire_path(),
+        TranslationLossReason::NotRepresentable,
+        1,
+    ));
+}
+
+fn replay_node_extensions(
+    value: &mut Value,
+    extensions: &[CanonicalExtension],
+    report: &mut TranslationReport,
+) {
+    let object = value
+        .as_object_mut()
+        .expect("a Responses node renders as an object");
+    for extension in extensions {
+        if extension.source() != DialectId::CodexResponses {
+            report_incompatible(extension, report);
+        } else if let Some(name) = extension.wire_name() {
+            object.insert(name.to_owned(), extension.value().clone());
+        } else {
+            report_not_representable(extension, report);
+        }
+    }
 }
 
 // ── messages → input items ─────────────────────────────────────────
@@ -309,12 +338,22 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
 /// allowed", the `system_in_messages: false` capability). With no
 /// preceding user item, the text falls back to the leading set
 /// (instructions) — never dropped, never a system item.
-fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
+fn input_of(
+    canonical: &CanonicalRequest,
+    report: &mut TranslationReport,
+) -> (Vec<Item>, Vec<String>) {
     let mut items: Vec<Item> = Vec::with_capacity(canonical.messages.len());
     let mut leading_system: Vec<String> = Vec::new();
     for message in &canonical.messages {
+        if let Some(reasoning) = opaque_reasoning_item(message, report) {
+            items.push(reasoning);
+            continue;
+        }
         match message.role {
             CanonRole::System | CanonRole::Developer => {
+                for extension in &message.extensions {
+                    report_unrepresentable_or_incompatible(extension, report);
+                }
                 for block in &message.blocks {
                     // The frontend's system parse yields text blocks
                     // only; the canonical is typed, so anything else
@@ -335,31 +374,38 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                 }
             }
             role => {
+                let first_item = items.len();
                 let role = wire_role(role);
                 let mut parts: Vec<Value> = Vec::new();
                 for block in &message.blocks {
                     match block.semantic() {
                         CanonBlock::Text(text) => {
-                            parts.push(text_part(text, role == "assistant"));
+                            let mut part = text_part(text, role == "assistant");
+                            replay_block_extensions(&mut part, block, report);
+                            parts.push(part);
                         }
                         CanonBlock::Image { url } => {
-                            parts.push(json!({"type": "input_image", "image_url": url}));
+                            let mut part = json!({"type": "input_image", "image_url": url});
+                            replay_block_extensions(&mut part, block, report);
+                            parts.push(part);
                         }
                         CanonBlock::ToolUse { id, name, input } => {
                             let arguments = serde_json::to_string(input)
                                 .expect("a parsed Value always serialises");
                             items.extend(flush(&mut parts, role));
-                            items.push(Item::function_call(name, &arguments, id));
+                            let mut item = Item::function_call(name, &arguments, id);
+                            replay_block_extensions(&mut item.0, block, report);
+                            items.push(item);
                         }
                         CanonBlock::ToolResult {
                             tool_use_id,
                             content,
                         } => {
                             items.extend(flush(&mut parts, role));
-                            items.push(Item::function_call_output(
-                                tool_use_id,
-                                &content.output_text(),
-                            ));
+                            let mut item =
+                                Item::function_call_output(tool_use_id, &content.output_text());
+                            replay_block_extensions(&mut item.0, block, report);
+                            items.push(item);
                         }
                         // DROPPED, loudly — this backend's declared
                         // cost: [`Capabilities::CODEX`].
@@ -373,10 +419,78 @@ fn input_of(canonical: &CanonicalRequest) -> (Vec<Item>, Vec<String>) {
                     }
                 }
                 items.extend(flush(&mut parts, role));
+                if let Some(item) = items[first_item..]
+                    .iter_mut()
+                    .find(|item| item.kind() == Some("message"))
+                {
+                    replay_node_extensions(&mut item.0, &message.extensions, report);
+                } else {
+                    for extension in &message.extensions {
+                        if extension.source() == DialectId::CodexResponses {
+                            report_not_representable(extension, report);
+                        } else {
+                            report_incompatible(extension, report);
+                        }
+                    }
+                }
             }
         }
     }
     (items, leading_system)
+}
+
+fn opaque_reasoning_item(message: &CanonMessage, report: &mut TranslationReport) -> Option<Item> {
+    if !message.blocks.is_empty() {
+        return None;
+    }
+    let reasoning_index = message.extensions.iter().position(|extension| {
+        extension.source() == DialectId::CodexResponses
+            && extension.wire_name().is_none()
+            && extension.wire_path() == "$.input[].reasoning"
+            && extension.value().is_object()
+    })?;
+    let reasoning = Item(message.extensions[reasoning_index].value().clone());
+    for (index, extension) in message.extensions.iter().enumerate() {
+        if index == reasoning_index {
+            continue;
+        }
+        if extension.source() == DialectId::CodexResponses {
+            report_not_representable(extension, report);
+        } else {
+            report_incompatible(extension, report);
+        }
+    }
+    Some(reasoning)
+}
+
+fn report_unrepresentable_or_incompatible(
+    extension: &CanonicalExtension,
+    report: &mut TranslationReport,
+) {
+    if extension.source() == DialectId::CodexResponses {
+        report_not_representable(extension, report);
+    } else {
+        report_incompatible(extension, report);
+    }
+}
+
+fn replay_block_extensions(value: &mut Value, block: &CanonBlock, report: &mut TranslationReport) {
+    let CanonBlock::Annotated {
+        is_error,
+        extensions,
+        ..
+    } = block
+    else {
+        return;
+    };
+    if is_error.is_some() {
+        report.push(TranslationLoss::new(
+            "messages[].blocks[].tool_result.is_error",
+            TranslationLossReason::UnsupportedByBinding,
+            1,
+        ));
+    }
+    replay_node_extensions(value, extensions, report);
 }
 
 /// The most recent user message item, mutably — the merge target for a
@@ -416,13 +530,15 @@ fn text_part(text: &str, output: bool) -> Value {
 /// One canonical tool → the flat Responses function shape
 /// (`strict: false` — the codex client's own setting; the schema
 /// crosses verbatim).
-fn tool_of(tool: &CanonTool) -> Tool {
-    Tool::function(
+fn tool_of(tool: &CanonTool, report: &mut TranslationReport) -> Tool {
+    let mut rendered = Tool::function(
         &tool.name,
         &tool.description,
         false,
         tool.parameters.clone(),
-    )
+    );
+    replay_node_extensions(&mut rendered.0, &tool.extensions, report);
+    rendered
 }
 
 /// The canonical tool-choice intent → the wire's string form:

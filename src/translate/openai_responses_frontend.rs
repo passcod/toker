@@ -18,6 +18,7 @@ const DIALECT: DialectId = DialectId::CodexResponses;
 
 /// Parse one OpenAI Responses request body into canonical IR.
 pub fn from_openai_responses(body: &Value) -> Result<CanonicalRequest, TranslateError> {
+    validate_backend_controls(body)?;
     let system = instructions_of(body)?;
     let messages = input_of(body)?;
     let tools = tools_of(body)?;
@@ -50,6 +51,32 @@ pub fn from_openai_responses(body: &Value) -> Result<CanonicalRequest, Translate
         .chain(reasoning_extensions(body))
         .collect(),
     })
+}
+
+fn validate_backend_controls(body: &Value) -> Result<(), TranslateError> {
+    for field in ["store", "parallel_tool_calls"] {
+        if body
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            return Err(TranslateError::Malformed {
+                reason: format!("{field} is not a boolean"),
+            });
+        }
+    }
+    if let Some(include) = body.get("include").filter(|value| !value.is_null()) {
+        let Some(include) = include.as_array() else {
+            return Err(TranslateError::Malformed {
+                reason: "include is not an array".to_owned(),
+            });
+        };
+        if include.iter().any(|value| !value.is_string()) {
+            return Err(TranslateError::Malformed {
+                reason: "include contains a non-string value".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn instructions_of(body: &Value) -> Result<Vec<CanonSystemPart>, TranslateError> {
@@ -393,7 +420,7 @@ fn extensions(source: &Value, path: &str, modeled: &[&str]) -> Vec<CanonicalExte
 mod tests {
     use super::from_openai_responses;
     use crate::ir::canonical::{CanonBlock, CanonRole, CanonToolChoice, ThinkingSpec};
-    use crate::translate::TranslateError;
+    use crate::translate::{TranslateError, render_codex};
     use serde_json::json;
 
     #[test]
@@ -451,6 +478,103 @@ mod tests {
                 .extensions
                 .iter()
                 .any(|extension| extension.wire_path() == "$.store")
+        );
+    }
+
+    #[test]
+    fn compatible_codex_rendering_replays_responses_extensions_and_reasoning() {
+        let body = json!({
+            "model": "gpt-example",
+            "stream": true,
+            "instructions": "Be concise.",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Look", "cache_control": {"type": "ephemeral"}}
+                ], "item_meta": 1},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "opaque"}],
+                 "encrypted_content": "ciphertext"}
+            ],
+            "tools": [{"type": "function", "name": "lookup", "description": "Lookup",
+                       "parameters": {"type": "object"}, "strict": true}],
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+            "parallel_tool_calls": true,
+            "store": true,
+            "include": ["reasoning.encrypted_content", "message.output_text.logprobs"],
+            "service_tier": "flex"
+        });
+        let canonical = from_openai_responses(&body).expect("parse");
+        let rendered = render_codex(&canonical, "cache-key").expect("render");
+        assert!(rendered.report.is_empty(), "{:?}", rendered.report);
+        let value = serde_json::to_value(rendered.value).expect("wire value");
+        assert_eq!(value["input"][0]["item_meta"], json!(1));
+        assert_eq!(
+            value["input"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(value["input"][1], body["input"][1]);
+        assert_eq!(value["tools"][0]["strict"], json!(true));
+        assert_eq!(value["reasoning"], body["reasoning"]);
+        assert_eq!(value["parallel_tool_calls"], json!(true));
+        assert_eq!(value["store"], json!(true));
+        assert_eq!(value["include"], body["include"]);
+        assert_eq!(value["service_tier"], json!("flex"));
+    }
+
+    #[test]
+    fn compatible_codex_rendering_is_deterministic_and_append_prefix_stable() {
+        let first_body = json!({
+            "model": "gpt-example",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Look", "cache_control": {"type": "ephemeral"}}
+                ], "item_meta": 1},
+                {"type": "reasoning", "encrypted_content": "ciphertext"}
+            ],
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+            "store": true
+        });
+        let first = from_openai_responses(&first_body).expect("parse first turn");
+        let first_render = render_codex(&first, "cache-key").expect("render first turn");
+        let repeated = render_codex(&first, "cache-key").expect("render first turn again");
+        assert_eq!(first_render, repeated);
+
+        let mut appended_body = first_body;
+        appended_body["input"]
+            .as_array_mut()
+            .expect("input array")
+            .push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Again"}]
+            }));
+        let appended = from_openai_responses(&appended_body).expect("parse appended turn");
+        let appended_render = render_codex(&appended, "cache-key").expect("render appended turn");
+        assert_eq!(
+            first_render.value.input,
+            appended_render.value.input[..first_render.value.input.len()]
+        );
+    }
+
+    #[test]
+    fn merged_same_dialect_message_metadata_is_not_mislabeled_foreign() {
+        let canonical = from_openai_responses(&json!({
+            "model": "gpt-example",
+            "input": [{
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "Stay concise."}],
+                "item_meta": "cannot survive the merge"
+            }]
+        }))
+        .expect("parse");
+        let rendered = render_codex(&canonical, "cache-key").expect("render");
+        assert_eq!(
+            rendered.report.losses(),
+            &[crate::translate::TranslationLoss::new(
+                "$.input[].item_meta",
+                crate::translate::TranslationLossReason::NotRepresentable,
+                1,
+            )]
         );
     }
 

@@ -82,7 +82,7 @@ impl ResponsesRequest {
             store: false,
             include: vec!["reasoning.encrypted_content".to_owned()],
             prompt_cache_key: Some(prompt_cache_key.to_owned()),
-            extra: Map::new(),
+            extra: Default::default(),
         }
     }
 }
@@ -94,6 +94,9 @@ pub struct Reasoning {
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Future Responses reasoning fields, retained for compatible replay.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 // ── input items ──────────────────────────────────────────────────────
@@ -452,6 +455,7 @@ mod tests {
         request.reasoning = Reasoning {
             effort: Some("high".to_owned()),
             summary: Some("auto".to_owned()),
+            extra: Default::default(),
         };
 
         let text = serde_json::to_string(&request).expect("serialise");
