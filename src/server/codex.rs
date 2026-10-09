@@ -44,7 +44,7 @@ use crate::server::proxy::{
 };
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
-use crate::server::record_anthropic::{record_codex_error, record_codex_measurement};
+use crate::server::record_anthropic::{record_codex_error, record_responses_measurement};
 use crate::translate::{self, TranslateError};
 
 /// Everything the branch needs from a translated frontend pipeline,
@@ -200,6 +200,32 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             record,
             in_flight,
             super::anthropic_target::FrontendWire::Responses,
+        )
+        .await;
+    }
+
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenRouterResponses)
+    {
+        let Some(parsed) = parsed else {
+            return frontend_error_response(
+                CodexFrontendWire::OpenAiResponses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "the request body could not be parsed for translation to this backend",
+                !stream_explicitly_false,
+            );
+        };
+        return super::openrouter_responses::turn(
+            server,
+            parts,
+            parsed,
+            target,
+            record,
+            in_flight,
+            request_session,
         )
         .await;
     }
@@ -509,7 +535,7 @@ async fn aggregated_turn(
         ),
     };
     if let Some(ctx) = record.as_ref() {
-        record_codex_measurement(ctx, &capture, meters, 200, frontend_wire.protocol());
+        record_responses_measurement(ctx, &capture, meters, 200, frontend_wire.protocol(), None);
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -717,12 +743,13 @@ impl StreamState {
                 self.frontend_wire.protocol(),
             );
         } else if self.capture.turn_ended() {
-            record_codex_measurement(
+            record_responses_measurement(
                 ctx,
                 &self.capture,
                 self.meters.clone(),
                 200,
                 self.frontend_wire.protocol(),
+                None,
             );
         }
         // A stream that died without a terminator never reaches here

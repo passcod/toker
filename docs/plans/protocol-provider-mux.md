@@ -384,6 +384,13 @@ picker filters the same joined OpenRouter Messages offers.
 
 ### 5. Add the OpenRouter Responses binding
 
+Implemented for the live-verified streamed tool/usage subset. A completed
+`openai/gpt-4.1-mini` probe returned a function call and provider-attested
+usage and cost. The `openai/gpt-5-nano` reasoning probe ended incomplete, so
+reasoning replay and other unverified request fields are not claimed. JSON
+frontend turns aggregate the verified streaming wire. The binding reports
+opaque omissions and rejects unknown tools or provider-owned input items.
+
 - Live-verify a representative Codex workload against OpenRouter Responses.
 - Declare the binding only for verified request and event shapes.
 - Route `openrouter/<model>` through the universal canonical pipeline.

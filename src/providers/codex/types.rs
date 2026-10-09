@@ -367,7 +367,10 @@ pub enum ResponseEvent {
     Completed { response: CompletedResponse },
     /// `response.incomplete` — the other terminal event: why the turn
     /// stopped short (`incomplete_details.reason`), when said.
-    Incomplete { reason: Option<String> },
+    Incomplete {
+        reason: Option<String>,
+        usage: Option<Usage>,
+    },
     /// `response.failed` — `response.error`.
     Failed { error: ResponseError },
     /// A top-level `error` event — `error`.
@@ -768,7 +771,13 @@ mod tests {
         };
         assert_eq!(completed.kind(), "response.completed");
         assert!(completed.ends_turn());
-        assert!(ResponseEvent::Incomplete { reason: None }.ends_turn());
+        assert!(
+            ResponseEvent::Incomplete {
+                reason: None,
+                usage: None
+            }
+            .ends_turn()
+        );
         assert!(
             ResponseEvent::Failed {
                 error: ResponseError::default()

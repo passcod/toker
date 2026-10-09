@@ -13,7 +13,7 @@ serves them all, because the paths do not collide:
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
 | OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub`, `anthropic_api`, `anthropic_sub` (translated) |
-| OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `anthropic_api`, `anthropic_sub` (translated) |
+| OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `openrouter`, `anthropic_api`, `anthropic_sub` (translated) |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
@@ -266,6 +266,18 @@ rendering is canonical, so a frontend-byte fidelity check does not apply.
 The Responses frontend to Codex binding takes the same path despite matching
 protocol names. Protocol equality lets it replay compatible opaque extensions;
 it does not bypass canonical request or event handling.
+
+The OpenRouter Responses binding is a narrower dialect. A completed live
+streamed function-call probe on `openai/gpt-4.1-mini` verified a required tool,
+`max_output_tokens`, terminal usage, and provider-reported billed cost. An
+earlier `openai/gpt-5-nano` probe ended incomplete at its output cap, so it
+does not establish reasoning replay. Toker streams upstream even for a JSON
+frontend turn, aggregating that turn locally; it removes Codex's bearer and
+signs with OpenRouter's key. It omits unverified reasoning controls, encrypted
+content requests, cache keys and other opaque fields with content-free loss
+reports, rejects unknown tool collections and unsupported input items, and
+records only the provider's reported cost. This binding does not claim images
+or reasoning replay.
 
 What a backend refuses is that backend's declared property (`Capabilities`),
 never a parse-time decision in the frontend: codex refuses system-role input

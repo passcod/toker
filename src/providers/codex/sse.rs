@@ -143,6 +143,9 @@ fn event_of(raw: SseEvent) -> Option<ResponseEvent> {
                 .pointer("/response/incomplete_details/reason")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            usage: value
+                .pointer("/response/usage")
+                .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
         }),
         "response.failed" => {
             error_of(&value, "/response/error").map(|error| ResponseEvent::Failed { error })
@@ -257,7 +260,10 @@ impl TurnCapture {
                 self.usage.clone_from(&response.usage);
                 self.end_turn = response.end_turn;
             }
-            ResponseEvent::Incomplete { reason } => self.incomplete_reason = reason.clone(),
+            ResponseEvent::Incomplete { reason, usage } => {
+                self.incomplete_reason = reason.clone();
+                self.usage.clone_from(usage);
+            }
             ResponseEvent::Failed { error } | ResponseEvent::Error { error } => {
                 if self.error.is_none() {
                     self.error = Some(error.clone());

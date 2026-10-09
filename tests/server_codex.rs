@@ -311,6 +311,62 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
     }
 }
 
+async fn mock_openrouter_responses(State(mock): State<MockState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    mock.requests.lock().unwrap().push(CapturedRequest {
+        path: parts.uri.path().to_owned(),
+        headers: parts.headers,
+        body,
+    });
+    if value["model"] == "bad" {
+        return raw_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            Bytes::from_static(
+                br#"{"error":{"code":"rate_limit_exceeded","message":"retry later"}}"#,
+            ),
+        );
+    }
+    if value["model"] == "failed" {
+        return raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(br#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"upstream failed"}}}
+
+"#),
+        );
+    }
+    if value["model"] == "cut" {
+        return raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                br#"data: {"type":"response.created","response":{"id":"gen_cut"}}
+
+"#,
+            ),
+        );
+    }
+    let mut body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"text\\\":\\\"hello\\\"}\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n",
+    ).to_owned();
+    let terminal = if value["model"] == "short" {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    body.push_str(&format!(
+        "data: {{\"type\":\"{terminal}\",\"response\":{{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"provider\":\"Example Router\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"input_tokens\":60,\"output_tokens\":6,\"total_tokens\":66,\"cost\":0.0000336}}}}}}\n\n"
+    ));
+    body.push_str("data: [DONE]\n\n");
+    raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body))
+}
+
 // ---------------------------------------------------------------------------
 // The auth fixture: a login whose access token never needs a refresh
 // during a test (exp far in the future), so no test ever hits the
@@ -436,6 +492,7 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
         .route("/backend-api/codex/responses", post(mock_responses))
         .route("/backend-api/codex/models", get(mock_models))
         .route("/v1/messages", post(mock_anthropic_messages))
+        .route("/v1/responses", post(mock_openrouter_responses))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -480,6 +537,16 @@ fn subscription_responses_config(
     sub.oauth_token_env = UNSET_KEY_ENV.to_owned();
     sub.oauth_token = held_token.map(str::to_owned);
     sub.claude_credentials_path = Some(login_path);
+    fixture
+}
+
+fn openrouter_responses_config(tag: &str, upstream: reqwest::Url) -> TestConfig {
+    let mut fixture = test_config(tag, upstream.clone(), false);
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
     fixture
 }
 
@@ -973,6 +1040,108 @@ async fn explicit_anthropic_chat_route_needs_no_chat_default() {
         .expect("chat answers");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn openrouter_responses_streams_tools_and_records_attested_cost() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) =
+        spawn_toker(openrouter_responses_config("router-responses", upstream)).await;
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header(header::AUTHORIZATION, "Bearer foreign-codex-token")
+        .json(&json!({
+            "model":"openrouter/openai/gpt-4.1-mini",
+            "instructions":"Use the provided tool.",
+            "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Call echo."}]}],
+            "tools":[{"type":"function","name":"echo","description":"Echo text","parameters":{"type":"object"},"strict":true}],
+            "tool_choice":"required",
+            "max_output_tokens":64,
+            "stream":true,
+            "store":false,
+        }))
+        .send().await.expect("router answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let sse = response.text().await.unwrap();
+    assert!(sse.contains("response.output_item.done"), "{sse}");
+    assert!(sse.contains("response.completed"), "{sse}");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(
+        requests[0].headers.get(header::AUTHORIZATION).unwrap(),
+        "Bearer sk-or-test"
+    );
+    let rendered: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(rendered["model"], "openai/gpt-4.1-mini");
+    assert_eq!(rendered["max_output_tokens"], 64);
+    assert_eq!(rendered["tools"][0]["strict"], true);
+    assert_eq!(rendered["store"], false);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows[0].route.as_deref(),
+        Some("openai_responses:openrouter")
+    );
+    assert_eq!(rows[0].cost_usd, Some(0.0000336));
+    assert_eq!(rows[0].cost_kind, Some(toker::store::CostKind::Billed));
+    assert_eq!(
+        rows[0].extra.as_ref().unwrap()["serving_provider"],
+        "Example Router"
+    );
+}
+
+#[tokio::test]
+async fn openrouter_responses_incomplete_usage_and_errors() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(openrouter_responses_config("router-short", upstream)).await;
+    let complete = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/short","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    let status = complete.status();
+    let body: Value = complete.json().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(wait_for_rows(&store, 1).await[0].cost_usd, Some(0.0000336));
+
+    let error = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/bad","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    assert_eq!(wait_for_rows(&store, 2).await[1].kind, Some(RowKind::Error));
+}
+
+#[tokio::test]
+async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(openrouter_responses_config("router-failures", upstream)).await;
+    let failed = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/failed","input":"hello","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::OK);
+    let failed_body = failed.text().await.unwrap();
+    assert!(failed_body.contains("response.failed"), "{failed_body}");
+    assert_eq!(wait_for_rows(&store, 1).await[0].kind, Some(RowKind::Error));
+
+    let cut = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/cut","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cut.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    assert_eq!(wait_for_rows(&store, 1).await.len(), 1);
 }
 
 #[tokio::test]

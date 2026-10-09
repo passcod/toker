@@ -46,6 +46,7 @@ pub enum DialectId {
     AnthropicMessages,
     OpenRouterMessages,
     OpenRouterChatCompletions,
+    OpenRouterResponses,
     CodexResponses,
 }
 
@@ -55,6 +56,7 @@ impl DialectId {
             DialectId::AnthropicMessages => "anthropic_messages",
             DialectId::OpenRouterMessages => "openrouter_messages",
             DialectId::OpenRouterChatCompletions => "openrouter_chat_completions",
+            DialectId::OpenRouterResponses => "openrouter_responses",
             DialectId::CodexResponses => "codex_responses",
         }
     }
@@ -107,6 +109,16 @@ impl Capabilities {
         thinking_replay: false,
         images: true,
     };
+
+    /// The streamed Responses subset verified against OpenRouter: tools,
+    /// usage, and caller output bounds. Other sampling knobs and replay of
+    /// provider-owned reasoning remain unverified and are not claimed here.
+    pub const OPENROUTER_RESPONSES: Capabilities = Capabilities {
+        sampling: false,
+        system_in_messages: false,
+        thinking_replay: false,
+        images: false,
+    };
 }
 
 /// A canonical backend adapter implementation.
@@ -119,6 +131,7 @@ pub enum BackendAdapterId {
     AnthropicMessages,
     OpenAiChatCompletions,
     CodexResponses,
+    OpenRouterResponses,
 }
 
 /// A configured client identity carried by `/f/<name>`.
@@ -289,6 +302,11 @@ const ROUTES: &[RouteDeclaration] = &[
         frontend: ProtocolId::OpenAiResponses,
         provider: "anthropic_sub",
         backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiResponses,
+        provider: "openrouter",
+        backend: ProtocolId::OpenAiResponses,
     },
 ];
 

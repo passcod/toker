@@ -22,6 +22,12 @@ const BINDINGS: &[BackendBinding] = &[
         BackendAdapterId::AnthropicMessages,
         Capabilities::MESSAGES,
     ),
+    BackendBinding::canonical(
+        ProtocolId::OpenAiResponses,
+        DialectId::OpenRouterResponses,
+        BackendAdapterId::OpenRouterResponses,
+        Capabilities::OPENROUTER_RESPONSES,
+    ),
 ];
 
 /// Anthropic's key header. Openrouter takes its key as a bearer only, so
@@ -116,6 +122,15 @@ impl Provider for OpenRouter {
         }
     }
 
+    fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
+        self.strip_foreign_credentials(outgoing);
+        if frontend == ProtocolId::OpenAiResponses {
+            // Codex's bearer authenticates the client to toker, not to
+            // OpenRouter. The provider's stored key signs this binding.
+            outgoing.remove(AUTHORIZATION);
+        }
+    }
+
     /// Only Anthropic's own models behind openrouter understand the field;
     /// the rest (glm, deepseek, ...) answer `400 Mid-conversation reasoning
     /// effort (configuration_update) is not supported`.
@@ -163,11 +178,11 @@ mod tests {
     }
 
     #[test]
-    fn bindings_pin_the_two_live_openrouter_wires() {
+    fn bindings_pin_the_live_openrouter_wires() {
         let provider = provider();
         assert!(provider.supports_protocol(ProtocolId::OpenAiChat));
         assert!(provider.supports_protocol(ProtocolId::AnthropicMessages));
-        assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
+        assert!(provider.supports_protocol(ProtocolId::OpenAiResponses));
         let messages = provider
             .bindings()
             .iter()
@@ -186,6 +201,16 @@ mod tests {
         let canonical = chat.canonical_backend().expect("Chat adapter is complete");
         assert_eq!(canonical.adapter(), BackendAdapterId::OpenAiChatCompletions);
         assert_eq!(canonical.capabilities(), Capabilities::CHAT);
+        let responses = provider
+            .bindings()
+            .iter()
+            .find(|binding| binding.protocol() == ProtocolId::OpenAiResponses)
+            .expect("Responses binding");
+        let canonical = responses
+            .canonical_backend()
+            .expect("Responses adapter is complete");
+        assert_eq!(canonical.adapter(), BackendAdapterId::OpenRouterResponses);
+        assert_eq!(canonical.capabilities(), Capabilities::OPENROUTER_RESPONSES);
     }
 
     #[test]

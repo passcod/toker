@@ -584,6 +584,7 @@ mod tests {
             },
             ResponseEvent::Incomplete {
                 reason: Some("content_filter".to_owned()),
+                usage: None,
             },
         ] {
             for emitted in stream.feed(&event) {
@@ -595,9 +596,13 @@ mod tests {
 
         // An unknown reason stops at the budget — max_tokens.
         let mut stream = AnthropicStream::new("claude-opus-5");
-        stream.feed(&ResponseEvent::Incomplete { reason: None });
+        stream.feed(&ResponseEvent::Incomplete {
+            reason: None,
+            usage: None,
+        });
         stream.feed(&ResponseEvent::Incomplete {
             reason: Some("something_new".to_owned()),
+            usage: None,
         });
         // (only the first incomplete matters; the stream has ended)
         assert!(stream.turn_ended());

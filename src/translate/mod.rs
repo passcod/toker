@@ -243,6 +243,7 @@ pub mod codex_backend;
 pub mod openai_chat_backend;
 pub mod openai_chat_frontend;
 pub mod openai_responses_frontend;
+pub mod openrouter_responses_backend;
 pub mod to_anthropic;
 pub mod to_codex;
 

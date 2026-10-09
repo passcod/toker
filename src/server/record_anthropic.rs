@@ -1167,12 +1167,13 @@ pub(crate) fn error_pair(body: &[u8]) -> (Option<String>, Option<String>) {
 /// with no kind: there is no honest per-token price for codex slugs —
 /// the subscription insight lives in the meter snapshot, not a
 /// fabricated number.
-pub(crate) fn record_codex_measurement(
+pub(crate) fn record_responses_measurement(
     ctx: &AnthropicRecordCtx,
     capture: &crate::providers::codex::TurnCapture,
     meters: Option<Value>,
     _status: u16,
     frontend_protocol: &'static str,
+    serving_provider: Option<&str>,
 ) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
@@ -1214,6 +1215,23 @@ pub(crate) fn record_codex_measurement(
     }
 
     let held_input = input;
+    let billed_cost = (ctx.backend.id() == "openrouter")
+        .then(|| {
+            usage
+                .and_then(|usage| usage.extra.get("cost"))
+                .and_then(Value::as_f64)
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        })
+        .flatten();
+    let mut extra = translation_extra(ctx.translation_report.as_ref());
+    if let Some(provider) = serving_provider {
+        match extra {
+            Some(Value::Object(ref mut map)) => {
+                map.insert("serving_provider".to_owned(), json!(provider));
+            }
+            _ => extra = Some(json!({"serving_provider": provider})),
+        }
+    }
     let row = RequestRow {
         id: None,
         ts_ms,
@@ -1247,9 +1265,10 @@ pub(crate) fn record_codex_measurement(
         ttl_split_known: cache_write_total.is_some().then_some(false),
         usage_presence: (!presence.is_empty()).then(|| Value::Object(presence)),
         usage_raw: usage.and_then(|usage| serde_json::to_string(usage).ok()),
-        // No honest price for a codex slug — never guessed (invariant 3).
-        cost_usd: None,
-        cost_kind: None,
+        // Only OpenRouter's own reported cost is billed evidence. Codex
+        // subscription usage has no per-turn price and remains NULL.
+        cost_usd: billed_cost,
+        cost_kind: billed_cost.map(|_| CostKind::Billed),
         // This response's own meter snapshot, parsed from its headers.
         rate_limits: meters,
         req_bytes: shape.map(|s| i64_of(s.req_bytes)),
@@ -1285,7 +1304,7 @@ pub(crate) fn record_codex_measurement(
         status: None,
         error_type: None,
         retry_after_ms: None,
-        extra: translation_extra(ctx.translation_report.as_ref()),
+        extra,
         betas: ctx.betas.clone().map(|betas| betas.to_string()),
         geo: None,
         fast: None,
