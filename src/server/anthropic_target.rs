@@ -15,8 +15,8 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::ir::Request as IrRequest;
 use crate::ir::canonical::CanonEvent;
+use crate::ir::canonical::CanonicalRequest;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
 use crate::routing::{ModelTarget, ProtocolId};
 use crate::translate::{
@@ -63,29 +63,28 @@ impl FrontendWire {
     }
 }
 
+pub(crate) struct AnthropicInput {
+    pub(crate) canonical: CanonicalRequest,
+    pub(crate) limit_field: Option<Value>,
+}
+
 pub(crate) async fn turn(
     server: Server,
     parts: Parts,
-    parsed: IrRequest,
+    input: AnthropicInput,
     target: ModelTarget,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     frontend: FrontendWire,
 ) -> Response {
+    let AnthropicInput {
+        mut canonical,
+        limit_field,
+    } = input;
     let model = target.effective_model().unwrap_or_default().to_owned();
     let stream = match frontend {
-        FrontendWire::Chat => parsed.value().get("stream").and_then(Value::as_bool) == Some(true),
-        FrontendWire::Responses => {
-            parsed.value().get("stream").and_then(Value::as_bool) != Some(false)
-        }
-    };
-    let canonical_result = match frontend {
-        FrontendWire::Chat => translate::from_openai_chat(parsed.value()),
-        FrontendWire::Responses => translate::from_openai_responses(parsed.value()),
-    };
-    let mut canonical = match canonical_result {
-        Ok(canonical) => canonical,
-        Err(error) => return invalid_request(&error.to_string(), stream, frontend),
+        FrontendWire::Chat => canonical.stream == Some(true),
+        FrontendWire::Responses => canonical.stream != Some(false),
     };
     canonical.model = Some(model.clone());
     canonical.stream = Some(stream);
@@ -93,15 +92,7 @@ pub(crate) async fn turn(
     // Responses makes this limit optional; Messages requires one. Prefer
     // the caller's positive bound. Otherwise use the model's own declared
     // maximum from the fetched Anthropic catalogue, never a guessed limit.
-    let limit_field = match frontend {
-        FrontendWire::Chat => parsed
-            .value()
-            .get("max_completion_tokens")
-            .filter(|value| !value.is_null())
-            .or_else(|| parsed.value().get("max_tokens")),
-        FrontendWire::Responses => parsed.value().get("max_output_tokens"),
-    };
-    let limit = match limit_field {
+    let limit = match limit_field.as_ref() {
         Some(Value::Number(number)) => number.as_u64().filter(|limit| *limit > 0),
         None | Some(Value::Null) => declared_output_limit(&server, &model),
         Some(_) => None,

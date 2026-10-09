@@ -31,6 +31,7 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use super::Server;
+use crate::ir::canonical::CanonicalRequest;
 use crate::ir::{AnthropicShape, Request as IrRequest};
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
@@ -54,7 +55,7 @@ pub(crate) struct CodexTurn {
     /// The routed backend (`codex_sub`), for endpoint + meter parsing.
     pub(crate) backend: Arc<dyn Provider>,
     /// The parsed, middleware-transformed request.
-    pub(crate) parsed: Option<IrRequest>,
+    pub(crate) canonical: Option<Result<CanonicalRequest, TranslateError>>,
     /// The request's own shape, pre-transform (the row's shape fields).
     pub(crate) gate_shape: Option<AnthropicShape>,
     /// The record context, when the pipeline built one.
@@ -134,6 +135,9 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .map(str::to_owned);
 
     let parsed = IrRequest::parse(&original).ok();
+    let canonical = parsed
+        .as_ref()
+        .map(|request| translate::from_openai_responses(request.value()));
     let body_session = parsed
         .as_ref()
         .and_then(|request| request.openai_responses().prompt_cache_key())
@@ -183,7 +187,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
     {
-        let Some(parsed) = parsed else {
+        let Some(Ok(canonical)) = canonical else {
             return frontend_error_response(
                 CodexFrontendWire::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
@@ -195,7 +199,12 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         return super::anthropic_target::turn(
             server,
             parts,
-            parsed,
+            super::anthropic_target::AnthropicInput {
+                canonical,
+                limit_field: parsed
+                    .as_ref()
+                    .and_then(|request| request.value().get("max_output_tokens").cloned()),
+            },
             target,
             record,
             in_flight,
@@ -209,7 +218,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenRouterResponses)
     {
-        let Some(parsed) = parsed else {
+        let Some(Ok(canonical)) = canonical else {
             return frontend_error_response(
                 CodexFrontendWire::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
@@ -221,11 +230,13 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         return super::openrouter_responses::turn(
             server,
             parts,
-            parsed,
+            canonical,
+            parsed
+                .as_ref()
+                .is_some_and(|request| request.value().get("prompt_cache_key").is_some()),
             target,
             record,
             in_flight,
-            request_session,
         )
         .await;
     }
@@ -233,7 +244,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     turn(CodexTurn {
         server,
         backend,
-        parsed,
+        canonical,
         gate_shape: None,
         record,
         in_flight,
@@ -252,7 +263,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     let CodexTurn {
         server,
         backend,
-        parsed,
+        canonical,
         gate_shape,
         mut record,
         in_flight,
@@ -269,7 +280,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     // them with a typed error before here).
     let _ = gate_shape;
 
-    let Some(ir) = parsed else {
+    let Some(canonical) = canonical else {
         // An untranslatable body on a translated route: the honest
         // answer names the problem; nothing reached the upstream, and
         // there is no row (no measurement, no provider response).
@@ -291,22 +302,10 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
 
     // The translation itself — pure; a typed failure never reaches the
     // upstream and answers in the frontend's error shape.
-    let rendering = match frontend_wire {
-        CodexFrontendWire::Anthropic => {
-            translate::render_to_codex(ir.value(), &model, &prompt_cache_key)
-        }
-        CodexFrontendWire::OpenAiChat => {
-            translate::from_openai_chat(ir.value()).and_then(|mut canonical| {
-                canonical.model = Some(model.clone());
-                translate::render_codex(&canonical, &prompt_cache_key)
-            })
-        }
-        CodexFrontendWire::OpenAiResponses => translate::from_openai_responses(ir.value())
-            .and_then(|mut canonical| {
-                canonical.model = Some(model.clone());
-                translate::render_codex(&canonical, &prompt_cache_key)
-            }),
-    };
+    let rendering = canonical.and_then(|mut canonical| {
+        canonical.model = Some(model.clone());
+        translate::render_codex(&canonical, &prompt_cache_key)
+    });
     let rendered = match rendering {
         Ok(rendered) => rendered,
         Err(error) => {

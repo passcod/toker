@@ -359,6 +359,9 @@ interpretation, and billed cost plus serving-provider evidence survive the
 round trip. All inference handlers now resolve through the shared route
 registry to a `ModelTarget` carrying the provider, verified backend binding,
 requested model, and effective model.
+Chat and Responses now pass their parsed canonical requests directly to
+cross-protocol backend handlers; Messages still runs its licensed gate and
+rewrite sequence over wire-shaped IR before canonical parsing.
 
 - Move routing, gates, rewrites, and shape extraction onto canonical middleware.
 - Cut one complete request-and-response route at a time onto the common

@@ -130,8 +130,13 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let mut stream_requested = false;
     let mut gate_model: Option<String> = None;
     let mut parsed = None;
+    let mut canonical = None;
     let mut target = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
+        let parsed_canonical = match translate::from_openai_chat(ir.value()) {
+            Ok(canonical) => canonical,
+            Err(error) => return compatibility_error(&error.to_string()),
+        };
         let model = ir.openai_chat().model().map(str::to_owned);
         let resolved = match server
             .registry
@@ -171,6 +176,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             system_messages,
         });
         parsed = Some(ir);
+        canonical = Some(parsed_canonical);
         target = Some(resolved);
     }
 
@@ -187,18 +193,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
     {
-        let Some(ir) = parsed.as_ref() else {
-            return compatibility_error(
-                "the request body could not be parsed as an OpenAI Chat request",
-            );
-        };
-        let rendered = translate::from_openai_chat(ir.value()).and_then(|mut canonical| {
-            canonical.model.clone_from(&gate_model);
-            translate::openai_chat_backend::render_openai_chat(
-                &canonical,
-                target.binding().dialect(),
-            )
-        });
+        let mut canonical = canonical.clone().expect("validated Chat request");
+        canonical.model.clone_from(&gate_model);
+        let rendered = translate::openai_chat_backend::render_openai_chat(
+            &canonical,
+            target.binding().dialect(),
+        );
         let rendered = match rendered {
             Ok(rendered) => rendered,
             Err(error) => return compatibility_error(&error.to_string()),
@@ -360,7 +360,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
     {
-        let Some(ir) = parsed else {
+        let Some(canonical) = canonical else {
             return compatibility_error(
                 "the request body could not be parsed as an OpenAI Chat request",
             );
@@ -369,7 +369,17 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         return super::anthropic_target::turn(
             server,
             parts,
-            ir,
+            super::anthropic_target::AnthropicInput {
+                canonical,
+                limit_field: parsed.as_ref().and_then(|request| {
+                    request
+                        .value()
+                        .get("max_completion_tokens")
+                        .filter(|value| !value.is_null())
+                        .or_else(|| request.value().get("max_tokens"))
+                        .cloned()
+                }),
+            },
             target,
             record,
             in_flight,
@@ -387,7 +397,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         return super::codex::turn(super::codex::CodexTurn {
             server,
             backend,
-            parsed,
+            canonical: canonical.map(Ok),
             gate_shape: None,
             record,
             in_flight,

@@ -11,7 +11,7 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::ir::Request as IrRequest;
+use crate::ir::canonical::CanonicalRequest;
 use crate::observe::{SseEvent, SseSplitter};
 use crate::providers::codex::{ResponseError, ResponsesSse, TurnCapture};
 use crate::routing::{ModelTarget, ProtocolId};
@@ -31,24 +31,18 @@ use super::record_anthropic::{
 pub(crate) async fn turn(
     server: Server,
     parts: Parts,
-    parsed: IrRequest,
+    mut canonical: CanonicalRequest,
+    had_prompt_cache_key: bool,
     target: ModelTarget,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
-    _session_id: Option<String>,
 ) -> Response {
     let model = target.effective_model().unwrap_or_default().to_owned();
-    let wants_stream = parsed.value().get("stream").and_then(Value::as_bool) != Some(false);
-    let canonical = match translate::from_openai_responses(parsed.value()) {
-        Ok(mut canonical) => {
-            canonical.model = Some(model.clone());
-            canonical
-        }
-        Err(error) => return invalid_request(&error.to_string(), wants_stream),
-    };
+    let wants_stream = canonical.stream != Some(false);
+    canonical.model = Some(model.clone());
     let rendered = match translate::openrouter_responses_backend::render_openrouter_responses(
         &canonical,
-        parsed.value().get("prompt_cache_key").is_some(),
+        had_prompt_cache_key,
     ) {
         Ok(rendered) => rendered,
         Err(error) => return invalid_request(&error.to_string(), wants_stream),

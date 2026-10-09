@@ -1000,10 +1000,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
     {
         if path == "/v1/messages" {
+            let canonical = serde_json::from_slice::<serde_json::Value>(&forward)
+                .ok()
+                .map(|body| translate::from_anthropic(&body));
             return codex::turn(codex::CodexTurn {
                 server,
                 backend: backend.clone(),
-                parsed,
+                canonical,
                 gate_shape,
                 record,
                 in_flight,
