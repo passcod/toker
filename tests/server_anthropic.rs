@@ -14,10 +14,12 @@
 //! unaccounted paths (count_tokens, batches, compression, non-JSON)
 //! record nothing.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -524,17 +526,6 @@ async fn spawn_mock() -> (MockState, reqwest::Url) {
 // The toker server
 // ---------------------------------------------------------------------------
 
-fn test_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from("/tmp/opencode").join(format!(
-        "server-anthropic-{name}-{}-{n}",
-        std::process::id()
-    ));
-    std::fs::remove_dir_all(&dir).ok();
-    dir
-}
-
 /// The anthropic test config: both anthropic backends point at the mock;
 /// the openai fields exist only to compile and are never routed to.
 fn test_config(
@@ -545,7 +536,7 @@ fn test_config(
     let unused_openrouter: reqwest::Url = "http://127.0.0.1:9/v1".parse().expect("upstream url");
     Config {
         port: 0,
-        db_path: test_dir("db").join("toker.db"),
+        db_path: PathBuf::from(":memory:"),
         session_header_names: vec![
             "x-toker-session".to_owned(),
             "x-claude-code-session-id".to_owned(),
@@ -584,7 +575,7 @@ fn test_config(
                 .parse()
                 .expect("codex upstream url"),
             originator: "codex_cli_rs".to_owned(),
-            auth_path: test_dir("codex-absent").join("auth.json"),
+            auth_path: PathBuf::from("/nonexistent/toker-test-auth.json"),
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),
@@ -2963,7 +2954,9 @@ async fn ping_tagged_requests_record_the_lane_but_flag_it() {
 #[tokio::test]
 async fn lanes_reseed_on_restart_from_the_requests_table() {
     let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream, None, "anthropic_sub");
+    let dir = common::tempdir("server-anthropic-reseed-");
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.db_path = dir.join("toker.db");
     let (addr, store) = spawn_toker(config.clone()).await;
 
     // Two responses in one lane: a 1h-tier write, then a 5m-tier one.
@@ -3212,7 +3205,9 @@ async fn models_merge_endpoint_gates_and_validates_the_body() {
 #[tokio::test]
 async fn promote_hands_the_grant_to_a_running_server() {
     let (_mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream, None, "anthropic_sub");
+    let dir = common::tempdir("server-anthropic-promote-");
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.db_path = dir.join("toker.db");
     let db = config.db_path.clone();
     let (addr, store) = spawn_toker(config).await;
     let incumbent_days: Vec<String> = (0..9).map(|i| format!("2026-09-2{i}")).collect();
@@ -3336,7 +3331,9 @@ async fn capture_localises_a_system_change_and_keeps_ladders_only_where_it_matte
 #[tokio::test]
 async fn a_restarted_server_finds_the_lanes_baseline_in_the_ledger() {
     let (_mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream, None, "anthropic_sub");
+    let dir = common::tempdir("server-anthropic-restart-");
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.db_path = dir.join("toker.db");
     let (addr, store) = spawn_toker(config.clone()).await;
     send_system(addr, &store, "A", 1).await;
     send_system(addr, &store, "A", 2).await;

@@ -24,7 +24,6 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -152,15 +151,6 @@ async fn spawn_mock() -> (MockState, reqwest::Url) {
 // The toker server
 // ---------------------------------------------------------------------------
 
-fn test_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from("/tmp/opencode")
-        .join(format!("server-cold-{name}-{}-{n}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    dir
-}
-
 fn test_config(upstream: reqwest::Url) -> Config {
     // The openai-chat backend's base includes the /v1 prefix (the
     // openrouter convention); the anthropic backends' base is the API
@@ -169,7 +159,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
     let openrouter_upstream: reqwest::Url = format!("{base}/v1").parse().expect("url");
     Config {
         port: 0,
-        db_path: test_dir("db").join("toker.db"),
+        db_path: PathBuf::from(":memory:"),
         session_header_names: vec![
             "x-toker-session".to_owned(),
             "x-claude-code-session-id".to_owned(),
@@ -208,7 +198,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
                 .parse()
                 .expect("codex upstream url"),
             originator: "codex_cli_rs".to_owned(),
-            auth_path: test_dir("codex-absent").join("auth.json"),
+            auth_path: PathBuf::from("/nonexistent/toker-test-auth.json"),
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),

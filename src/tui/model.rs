@@ -1734,9 +1734,7 @@ mod tests {
 
         // A scratch ledger under /tmp/opencode — a file DB, WAL on disk,
         // the shape the loop actually reads. Never the live one.
-        let dir = std::path::PathBuf::from("/tmp/opencode")
-            .join(format!("toker-display-bench-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::tempdir("toker-display-bench-");
         let store = Store::open(dir.join("bench.db")).expect("open the scratch ledger");
 
         // Production shape: billed openrouter rows carrying

@@ -529,8 +529,6 @@ mod tests {
     use crate::ir::Release;
     use rusqlite::Connection;
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A fresh private in-memory store per test.
     fn mem_store() -> Store {
@@ -540,13 +538,8 @@ mod tests {
     /// A fresh scratch directory under /tmp/opencode (pre-created and
     /// approved for external access), unique per call so parallel tests
     /// never collide.
-    fn test_dir(name: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            PathBuf::from("/tmp/opencode").join(format!("{}-{}-{}", std::process::id(), name, n));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+    fn test_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::tempdir(&format!("store-{name}-"))
     }
 
     fn user_version(store: &Store) -> i64 {
@@ -731,12 +724,7 @@ mod tests {
     /// shape), and does not move for this connection's own writes.
     #[test]
     fn data_version_moves_only_for_another_connections_commits() {
-        let dir = std::env::temp_dir().join(format!(
-            "toker-data-version-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::tempdir("toker-data-version-");
         let path = dir.join("toker.db");
         let reader = Store::open(&path).expect("open the reader");
         let writer = Store::open(&path).expect("open the writer");

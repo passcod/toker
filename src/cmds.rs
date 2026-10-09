@@ -1260,15 +1260,14 @@ mod tests {
 
     /// A fresh ledger in a directory of its own, holding the given
     /// learned entries.
-    fn ledger(name: &str, entries: &[ModelEntry]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("toker-promote-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn ledger(name: &str, entries: &[ModelEntry]) -> (crate::test_support::TestDir, PathBuf) {
+        let dir = crate::test_support::tempdir(&format!("toker-promote-{name}-"));
         let db = dir.join("toker.db");
         let store = Store::open(&db).expect("open ledger");
         for entry in entries {
             store.upsert_model(entry).expect("upsert");
         }
-        db
+        (dir, db)
     }
 
     /// A loopback port nothing listens on: bound, then released.
@@ -1295,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_nothing_listening_the_grant_is_written_to_the_ledger() {
-        let db = ledger("offline", &promoting_entries());
+        let (_dir, db) = ledger("offline", &promoting_entries());
         let mut out = Vec::new();
         promote_run(
             &db,
@@ -1363,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dry_run_reports_the_plan_and_touches_nothing() {
-        let db = ledger("dry-run", &promoting_entries());
+        let (_dir, db) = ledger("dry-run", &promoting_entries());
         // A listener that would see any attempt to reach the server.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         listener.set_nonblocking(true).expect("nonblocking");
@@ -1392,7 +1391,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_listener_that_is_not_toker_gets_nothing_written() {
-        let db = ledger("not-toker", &promoting_entries());
+        let (_dir, db) = ledger("not-toker", &promoting_entries());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1424,9 +1423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_ledger_is_never_created() {
-        let dir =
-            std::env::temp_dir().join(format!("toker-promote-{}-missing", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::test_support::tempdir("toker-promote-missing-");
         let db = dir.join("toker.db");
         let error = promote_run(
             &db,

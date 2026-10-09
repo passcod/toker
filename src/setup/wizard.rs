@@ -3452,6 +3452,7 @@ mod tests {
     /// The wizard rig: a scratch root, a scripted prompt, a recording
     /// runner, and the captured output.
     struct Rig {
+        _temp: Option<crate::test_support::TestDir>,
         root: PathBuf,
         prompt: ScriptedPrompt,
         runner: FakeRunner,
@@ -3463,12 +3464,17 @@ mod tests {
 
     impl Rig {
         fn new(name: &str, answers: Vec<Answer>, systemctl: Vec<Result<Output>>) -> Rig {
-            Rig::at(test_dir(name), answers, systemctl)
+            let temp = test_dir(name);
+            let root = temp.to_path_buf();
+            let mut rig = Rig::at(root, answers, systemctl);
+            rig._temp = Some(temp);
+            rig
         }
 
         fn at(root: PathBuf, answers: Vec<Answer>, systemctl: Vec<Result<Output>>) -> Rig {
             let units_dir = Paths::scratch(&root).units_dir;
             Rig {
+                _temp: None,
                 root,
                 prompt: ScriptedPrompt::new(answers),
                 runner: FakeRunner::new(units_dir, systemctl),
@@ -4106,7 +4112,7 @@ default_backend_anthropic = "codex_sub"
         // Run one: the full fresh script.
         let root = test_dir("rerun");
         let mut rig = Rig::at(
-            root.clone(),
+            root.to_path_buf(),
             answers_fresh(port),
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
@@ -4127,7 +4133,7 @@ default_backend_anthropic = "codex_sub"
         // Run two, same root: keep the config, leave every frontend,
         // and no slots (the silent default).
         let mut rerun = Rig::at(
-            root.clone(),
+            root.to_path_buf(),
             vec![
                 select(0),      // keep the config
                 confirm(true),  // claude: already wired
@@ -4440,7 +4446,7 @@ default_backend_anthropic = "codex_sub"
             &claude_fixture(),
         );
         let mut with = Rig::at(
-            with_dir.clone(),
+            with_dir.to_path_buf(),
             // The fresh script up to the port, with_picker(the workhorse confirm
             // (the only frontend detected here — no user-level claude,
             // no opencode, no shell rc, so no plugin offer)), then no

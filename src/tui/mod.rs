@@ -1456,7 +1456,7 @@ mod tests {
     #[test]
     fn model_caches_reload_only_when_the_mtime_moves() {
         let dir = crate::setup::test_dir("model-caches");
-        let mut caches = super::ModelCaches::new(dir.clone());
+        let mut caches = super::ModelCaches::new(dir.to_path_buf());
         // The stamp the rewritten caches carry: any constant later than
         // the first write's.
         const REWRITTEN_AT: i64 = 1_800_000_000_000;

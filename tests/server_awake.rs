@@ -201,15 +201,6 @@ async fn spawn_mock() -> (MockState, reqwest::Url) {
     (state, upstream)
 }
 
-fn test_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from("/tmp/opencode")
-        .join(format!("server-awake-{name}-{}-{n}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    dir
-}
-
 /// The config both servers build on. `awake` is the caller's choice —
 /// this suite is the one that exercises it on.
 fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
@@ -220,7 +211,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
     let openrouter_upstream: reqwest::Url = format!("{base}/v1").parse().expect("url");
     Config {
         port: 0,
-        db_path: test_dir("db").join("toker.db"),
+        db_path: PathBuf::from(":memory:"),
         session_header_names: vec![
             "x-toker-session".to_owned(),
             "x-claude-code-session-id".to_owned(),
@@ -258,7 +249,7 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
                 .parse()
                 .expect("codex upstream url"),
             originator: "codex_cli_rs".to_owned(),
-            auth_path: test_dir("codex-absent").join("auth.json"),
+            auth_path: PathBuf::from("/nonexistent/toker-test-auth.json"),
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("codex refresh url"),

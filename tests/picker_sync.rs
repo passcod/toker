@@ -2,9 +2,9 @@
 //! settings file out. No network, no real settings: every path is a
 //! temp directory.
 
+mod common;
+
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -12,15 +12,8 @@ use axum::routing::get;
 use serde_json::{Value, json};
 use toker::config::Config;
 
-fn test_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "toker-picker-sync-{name}-{}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("test dir");
-    dir
+fn test_dir(name: &str) -> common::TestDir {
+    common::tempdir(&format!("toker-picker-sync-{name}-"))
 }
 
 async fn spawn_listing(status: StatusCode) -> SocketAddr {

@@ -132,19 +132,10 @@ impl InhibitLock for ProbeLock {
 // The toker server
 // ---------------------------------------------------------------------------
 
-fn test_dir(name: &str) -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = PathBuf::from("/tmp/opencode")
-        .join(format!("server-shutdown-{name}-{}-{n}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    dir
-}
-
 fn test_config(upstream: reqwest::Url) -> Config {
     Config {
         port: 0,
-        db_path: test_dir("db").join("toker.db"),
+        db_path: PathBuf::from(":memory:"),
         session_header_names: vec!["x-claude-code-session-id".to_owned()],
         ping_header_name: "x-toker-ping".to_owned(),
         default_backend_openai_chat: None,

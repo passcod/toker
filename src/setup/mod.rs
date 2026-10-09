@@ -117,18 +117,8 @@ pub fn plan() -> &'static [Step] {
 /// home (the machine's live configs are already correctly wired and
 /// stay untouched).
 #[cfg(test)]
-pub(crate) fn test_dir(name: &str) -> std::path::PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::path::PathBuf::from("/tmp/opencode").join(format!(
-        "setup-{}-{}-{}",
-        std::process::id(),
-        name,
-        n
-    ));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    dir
+pub(crate) fn test_dir(name: &str) -> crate::test_support::TestDir {
+    crate::test_support::tempdir(&format!("setup-{name}-"))
 }
 
 #[cfg(test)]

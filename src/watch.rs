@@ -510,9 +510,7 @@ mod tests {
 
     #[test]
     fn the_state_file_round_trips_and_keeps_the_newest_keys() {
-        let dir = std::env::temp_dir().join(format!("toker-watch-state-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_support::tempdir("toker-watch-state-");
         let path = dir.join(super::STATE_FILE);
         assert_eq!(
             WatchState::load(&path).expect("absent"),

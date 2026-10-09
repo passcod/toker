@@ -266,7 +266,8 @@ mod tests {
 
     #[test]
     fn fresh_file_write_creates_it() {
-        let path = test_dir("write-fresh").join("settings.json");
+        let dir = test_dir("write-fresh");
+        let path = dir.join("settings.json");
         let value = json!({"a": 1, "nested": {"b": [true, null, "x"]}});
         atomic_write_json(&path, &value).expect("write");
         let bytes = fs::read(&path).expect("read back");
@@ -280,7 +281,8 @@ mod tests {
 
     #[test]
     fn fresh_file_in_a_missing_directory_is_created() {
-        let path = test_dir("write-mkdir").join("deep/er/settings.json");
+        let dir = test_dir("write-mkdir");
+        let path = dir.join("deep/er/settings.json");
         atomic_write_json(&path, &json!({"a": 1})).expect("write");
         let read: Value =
             serde_json::from_slice(&fs::read(&path).expect("read back")).expect("parse");
@@ -289,7 +291,8 @@ mod tests {
 
     #[test]
     fn patch_starts_from_an_empty_object_when_the_file_is_absent() {
-        let path = test_dir("patch-fresh").join("settings.json");
+        let dir = test_dir("patch-fresh");
+        let path = dir.join("settings.json");
         atomic_patch_json(&path, |value| {
             let map = value.as_object_mut().expect("starts as an object");
             map.insert("k".to_owned(), json!(42));
@@ -505,7 +508,8 @@ mod tests {
     #[test]
     fn a_fresh_file_in_a_symlinked_directory_lands_in_the_real_directory() {
         let real_dir = test_dir("symlink-dir-real");
-        let link_dir = test_dir("symlink-dir-link").join("config");
+        let link_root = test_dir("symlink-dir-link");
+        let link_dir = link_root.join("config");
         std::os::unix::fs::symlink(&real_dir, &link_dir).expect("symlink the directory");
         let via_link = link_dir.join("settings.json");
 

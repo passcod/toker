@@ -792,7 +792,6 @@ fn count_or_bool(field: &'static str, value: &Option<Value>) -> Result<Option<bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
     /// The checkpoint a source's import has written, parsed.
@@ -807,17 +806,8 @@ mod tests {
 
     /// A fresh scratch directory under /tmp/opencode, unique per call so
     /// parallel tests never collide.
-    fn test_dir(name: &str) -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = PathBuf::from("/tmp/opencode").join(format!(
-            "{}-import-{}-{}",
-            std::process::id(),
-            name,
-            n
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        dir
+    fn test_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::tempdir(&format!("import-{name}-"))
     }
 
     /// Write a JSONL fixture (each slice one line, trailing newline).

@@ -361,12 +361,7 @@ mod tests {
 
     #[test]
     fn a_reopened_ledger_still_holds_the_baseline() {
-        let dir = std::env::temp_dir().join(format!(
-            "toker-system-change-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::tempdir("toker-system-change-");
         let path = dir.join("toker.db");
         {
             let store = Store::open(&path).expect("store");

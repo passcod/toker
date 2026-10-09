@@ -689,18 +689,8 @@ mod tests {
     use serde_json::json;
 
     /// A fresh scratch directory under /tmp/opencode, unique per call.
-    fn scratch(name: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = PathBuf::from("/tmp/opencode").join(format!(
-            "toker-labels-{}-{}-{}",
-            std::process::id(),
-            name,
-            n
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    fn scratch(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::tempdir(&format!("toker-labels-{name}-"))
     }
 
     /// A checked-in transcript fixture's text.
@@ -947,9 +937,9 @@ mod tests {
         let config_dir = scratch("fixtures-cfg");
         let extra = scratch("fixtures-extra");
         let roots = roots_from(
-            Some(home.clone()),
-            Some(config_dir.clone()),
-            std::slice::from_ref(&extra),
+            Some(home.to_path_buf()),
+            Some(config_dir.to_path_buf()),
+            std::slice::from_ref(&extra.to_path_buf()),
         );
         // Each config dir's own projects/ tree, the level Claude Code
         // keeps its transcripts under.
@@ -1132,7 +1122,8 @@ mod tests {
             "the fixture must be past the byte budget for the test to mean anything"
         );
 
-        let label = session_label(sid, std::slice::from_ref(&root), TAIL_BYTES).expect("a label");
+        let label = session_label(sid, std::slice::from_ref(&root.to_path_buf()), TAIL_BYTES)
+            .expect("a label");
         assert_eq!(
             label.cwd.as_deref(),
             Some("/home/u/code/toker"),
@@ -1185,13 +1176,15 @@ mod tests {
         // sits before its start (and the torn first line it lands mid-
         // way into is dropped with it).
         let small = real.len() as u64 + 40;
-        let label = session_label(sid, std::slice::from_ref(&root), small).expect("a label");
+        let label =
+            session_label(sid, std::slice::from_ref(&root.to_path_buf()), small).expect("a label");
         assert_eq!(label.cwd.as_deref(), Some("/home/u/code/toker"));
         assert_eq!(label.title.as_deref(), Some("the real title"));
 
         // The whole file reads the canary too — the agent name beats
         // the generated title wherever it sits.
-        let label = session_label(sid, std::slice::from_ref(&root), TAIL_BYTES).expect("a label");
+        let label = session_label(sid, std::slice::from_ref(&root.to_path_buf()), TAIL_BYTES)
+            .expect("a label");
         assert_eq!(label.title.as_deref(), Some("canary"));
         assert_eq!(label.cwd.as_deref(), Some("/home/u/code/toker"));
     }
@@ -1238,13 +1231,15 @@ mod tests {
 
         let near = "018f2b7c-9999-4a55-9a99-000000000009";
         write(near, 4 * 1024);
-        let label = session_label(near, std::slice::from_ref(&root), small).expect("a label");
+        let label =
+            session_label(near, std::slice::from_ref(&root.to_path_buf()), small).expect("a label");
         assert_eq!(label.title.as_deref(), Some("C1 the card"));
         assert_eq!(label.cwd.as_deref(), Some("/home/u/code/toker"));
 
         let far = "018f2b7c-aaaa-4a55-9aaa-00000000000a";
         write(far, HEAD_BYTES as usize + 8 * 1024);
-        let label = session_label(far, std::slice::from_ref(&root), small).expect("a label");
+        let label =
+            session_label(far, std::slice::from_ref(&root.to_path_buf()), small).expect("a label");
         assert_eq!(label.title.as_deref(), Some("generated"));
     }
 
@@ -1261,7 +1256,7 @@ mod tests {
         )
         .expect("write the transcript");
 
-        let mut labels = Labels::new(vec![root.clone()]);
+        let mut labels = Labels::new(vec![root.to_path_buf()]);
         assert_eq!(
             labels.resolve(sid).and_then(|label| label.title),
             Some("first title".to_owned())
@@ -1420,7 +1415,7 @@ mod tests {
         assert_eq!(label.cwd.as_deref(), Some("/home/user/code/rust/toker"));
         assert_eq!(label.prompt, None);
 
-        let mut labels = Labels::with_codex_home(Vec::new(), home.clone());
+        let mut labels = Labels::with_codex_home(Vec::new(), home.to_path_buf());
         assert_eq!(labels.resolve(sid), Some(label.clone()));
         std::fs::write(
             home.join("session_index.jsonl"),

@@ -634,7 +634,8 @@ mod tests {
              the upstream 401 passes through visibly"
         );
 
-        let with_login = provider(&auth_file("signed", None));
+        let login_file = auth_file("signed", None);
+        let with_login = provider(&login_file);
         let login = with_login.auth().expect("login loaded");
         let mut outgoing = HeaderMap::new();
         outgoing.insert(
@@ -659,7 +660,8 @@ mod tests {
 
     #[test]
     fn turn_headers_carry_the_full_codex_block() {
-        let signed = provider(&auth_file("headers", None));
+        let login_file = auth_file("headers", None);
+        let signed = provider(&login_file);
         let auth = signed.auth().expect("login loaded");
         let headers = signed.turn_headers(
             Some(&auth),
@@ -783,7 +785,8 @@ mod tests {
     #[tokio::test]
     async fn a_turn_reuses_the_cached_login_until_it_needs_refresh() {
         let now = 1_800_000_000;
-        let fresh = provider(&auth_file("cache-fresh", None));
+        let fresh_file = auth_file("cache-fresh", None);
+        let fresh = provider(&fresh_file);
         let http = reqwest::Client::new();
         // Fresh exp → no refresh, and no server to even ask.
         let auth = fresh
@@ -808,7 +811,7 @@ mod tests {
                 .parse()
                 .expect("url"),
             "codex_cli_rs".to_owned(),
-            dir.clone(),
+            dir.to_path_buf(),
             url,
             None,
             None,

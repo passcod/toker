@@ -289,8 +289,7 @@ mod tests {
         // A file ledger, so a second connection can ask SQLite for the
         // columns: a later migration's column fails here until the full
         // fixture sets it.
-        let dir = std::env::temp_dir().join(format!("toker-export-cols-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = crate::test_support::tempdir("toker-export-cols-");
         let path = dir.join("toker.db");
         let store = Store::open(&path).expect("open");
         store.record_request(&full(T0)).expect("full");

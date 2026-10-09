@@ -118,7 +118,8 @@ default_backend_anthropic = "codex_sub"
 
     #[test]
     fn round_trips_the_real_file_with_a_change_and_the_documented_trades() {
-        let path = test_dir("roundtrip").join("toker.toml");
+        let dir = test_dir("roundtrip");
+        let path = dir.join("toker.toml");
         fs::write(&path, REAL_MACHINE_TOML).expect("write fixture");
 
         write_config(&path, |config| {
@@ -191,7 +192,8 @@ default_backend_anthropic = "codex_sub"
 
     #[test]
     fn understood_keys_are_not_lost_even_when_the_wizard_did_not_ask_about_them() {
-        let path = test_dir("preserve").join("toker.toml");
+        let dir = test_dir("preserve");
+        let path = dir.join("toker.toml");
         fs::write(
             &path,
             r#"
@@ -253,7 +255,8 @@ auth_path = "~/.codex/auth.json"
         // The read side is deny_unknown_fields, so "unknown-key loss"
         // cannot happen: a key this toker does not understand is a load
         // error, and the rewrite refuses rather than running over it.
-        let path = test_dir("unknown").join("toker.toml");
+        let dir = test_dir("unknown");
+        let path = dir.join("toker.toml");
         fs::write(&path, "prot = 1\n").expect("write fixture");
         let error = write_config(&path, |_config| Ok(())).expect_err("must refuse");
         let chain = format!("{error:#}");
@@ -266,7 +269,8 @@ auth_path = "~/.codex/auth.json"
 
     #[test]
     fn a_change_that_does_not_validate_refuses_and_never_clobbers() {
-        let path = test_dir("invalid").join("toker.toml");
+        let dir = test_dir("invalid");
+        let path = dir.join("toker.toml");
         fs::write(&path, "port = 19999\n").expect("write fixture");
         let error = write_config(&path, |config| {
             config.default_backend_anthropic = Some("not-a-backend".to_owned());
@@ -283,7 +287,8 @@ auth_path = "~/.codex/auth.json"
 
     #[test]
     fn a_broken_existing_file_refuses_and_never_clobbers() {
-        let path = test_dir("broken").join("toker.toml");
+        let dir = test_dir("broken");
+        let path = dir.join("toker.toml");
         fs::write(&path, "port = not-a-number\n").expect("write broken fixture");
         let error = write_config(&path, |_config| Ok(())).expect_err("must refuse");
         assert!(format!("{error:#}").contains("reading the existing"));
@@ -318,7 +323,8 @@ auth_path = "~/.codex/auth.json"
 
     #[test]
     fn an_existing_files_mode_is_preserved() {
-        let path = test_dir("mode").join("toker.toml");
+        let dir = test_dir("mode");
+        let path = dir.join("toker.toml");
         fs::write(&path, "port = 19999\n").expect("write fixture");
         fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
         write_config(&path, |config| {
@@ -405,7 +411,8 @@ auth_path = "~/.codex/auth.json"
 
     #[test]
     fn a_picker_rule_that_cannot_match_is_refused_at_load() {
-        let path = test_dir("picker-bad").join("toker.toml");
+        let dir = test_dir("picker-bad");
+        let path = dir.join("toker.toml");
         fs::write(
             &path,
             "[providers.openrouter]\n\

@@ -1278,18 +1278,8 @@ mod tests {
     }
 
     /// A fresh scratch directory under /tmp/opencode, unique per call.
-    fn test_dir(name: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = PathBuf::from("/tmp/opencode").join(format!(
-            "config-{}-{}-{}",
-            std::process::id(),
-            name,
-            n
-        ));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).expect("create test dir");
-        dir
+    fn test_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::tempdir(&format!("config-{name}-"))
     }
 
     /// A config pointing at a scratch db, loadable without touching the

@@ -13,7 +13,8 @@
 //! Needs `/proc` and util-linux `script` (the pty); run deliberately:
 //! `cargo test --test tui_pty -- --ignored --nocapture`.
 
-use std::path::PathBuf;
+mod common;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -232,9 +233,7 @@ fn tui_steady_state_cpu_over_the_2s_tick_at_display_scale() {
 
     // A scratch ledger under /tmp/opencode — never the live one, whose
     // daemon is proxying the session supervising this very test run.
-    let dir =
-        PathBuf::from("/tmp/opencode").join(format!("toker-pty-probe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = common::tempdir("toker-pty-probe-");
     let db = dir.join("bench.db");
     let store = Store::open(&db).expect("open the scratch ledger");
     seed_display_window(&store, now_ms);

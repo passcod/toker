@@ -38,3 +38,6 @@ pub mod timers;
 pub mod translate;
 pub mod tui;
 pub mod watch;
+
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -1,13 +1,34 @@
-//! Shared helpers for the IR integration tests: a deterministic PRNG and a
-//! canonical-body generator. Seeded, not random — the corpus and the
-//! prefix-stability property reproduce byte-for-byte on every run, without
-//! a proptest dependency.
-//!
-//! This module is compiled into every integration-test binary, and each binary
-//! uses a different subset of the helpers — hence the module-level dead_code
-//! allow below.
+//! Shared helpers for integration tests: deterministic generated bodies and
+//! automatically cleaned temporary directories.
 
 #![allow(dead_code)]
+
+pub struct TestDir(tempfile::TempDir);
+
+impl std::ops::Deref for TestDir {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.path()
+    }
+}
+
+impl AsRef<std::path::Path> for TestDir {
+    fn as_ref(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+pub fn tempdir(prefix: &str) -> TestDir {
+    let root = std::path::Path::new("/tmp/opencode");
+    std::fs::create_dir_all(root).expect("create test scratch root");
+    TestDir(
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .expect("create temporary test directory"),
+    )
+}
 
 /// splitmix64: small, deterministic, plenty to vary generated bodies.
 pub struct Rng(u64);
@@ -25,7 +46,6 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// A value in `0..n`.
     pub fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
@@ -61,9 +81,6 @@ const MODELS: &[&str] = &[
 ];
 const TOOL_NAMES: &[&str] = &["read_file", "list_dir", "run_command"];
 
-/// A canonical OpenAI-chat body with `messages` as the last key — the shape
-/// the prefix-stability property splices at. `message_count` messages of
-/// alternating roles, plus a seeded-random spread of the surrounding keys.
 pub fn conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u8> {
     let mut map = serde_json::Map::new();
     map.insert("model".to_owned(), serde_json::json!(rng.pick(MODELS)));
@@ -88,7 +105,7 @@ pub fn conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u8> {
     for i in 0..message_count {
         let role = if i % 2 == 0 { "user" } else { "assistant" };
         let words = 1 + rng.below(5) as usize;
-        let content: String = (0..words)
+        let content = (0..words)
             .map(|_| rng.pick(WORDS))
             .collect::<Vec<_>>()
             .join(" ");
@@ -105,10 +122,6 @@ const ANTHROPIC_SYSTEMS: &[&str] = &[
     "Prefer canonical JSON output.",
 ];
 
-/// A canonical Anthropic Messages body with `messages` as the last key —
-/// the shape the anthropic prefix-stability property splices at. Uses the
-/// same seeded spread of surrounding keys as the OpenAI-chat generator,
-/// with Anthropic's top-level `system` and `tools` fields.
 pub fn anthropic_conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u8> {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -142,7 +155,7 @@ pub fn anthropic_conversation_body(rng: &mut Rng, message_count: usize) -> Vec<u
     for i in 0..message_count {
         let role = if i % 2 == 0 { "user" } else { "assistant" };
         let words = 1 + rng.below(5) as usize;
-        let content: String = (0..words)
+        let content = (0..words)
             .map(|_| rng.pick(WORDS))
             .collect::<Vec<_>>()
             .join(" ");

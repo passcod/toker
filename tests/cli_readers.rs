@@ -4,17 +4,15 @@
 //! state dir, each proof once, and a first pass without `--since` that
 //! replays nothing.
 
+mod common;
+
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use toker::store::{RequestRow, Store};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("toker-cli-readers-{}-{name}", std::process::id()));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+fn scratch(name: &str) -> common::TestDir {
+    common::tempdir(&format!("toker-cli-readers-{name}-"))
 }
 
 fn toker() -> Command {

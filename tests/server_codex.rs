@@ -14,6 +14,8 @@
 //! without reaching the upstream, and HTTP/in-band errors map through
 //! the translate error table.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -254,8 +256,7 @@ fn b64url(payload: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
 }
 
-fn login_dir(tag: &str) -> PathBuf {
-    let dir = test_dir(tag);
+fn write_login(dir: &std::path::Path) {
     let claims = json!({
         "exp": 4102444800u64,
         "https://api.openai.com/auth": {
@@ -280,31 +281,38 @@ fn login_dir(tag: &str) -> PathBuf {
         "last_refresh": "2026-10-03T00:00:00Z",
     });
     std::fs::write(dir.join("auth.json"), auth.to_string()).expect("write auth fixture");
-    dir
 }
 
-fn test_dir(tag: &str) -> PathBuf {
-    let dir = PathBuf::from("/tmp/opencode")
-        .join("server-codex")
-        .join(format!("{}-{}", std::process::id(), tag));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+struct TestConfig {
+    config: Config,
+    dir: common::TestDir,
+}
+
+impl std::ops::Deref for TestConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for TestConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
 }
 
 // ---------------------------------------------------------------------------
 // toker + config
 // ---------------------------------------------------------------------------
 
-fn test_config(
-    tag: &str,
-    codex_upstream: reqwest::Url,
-    auth_path: PathBuf,
-    family_map: bool,
-) -> Config {
+fn test_config(tag: &str, codex_upstream: reqwest::Url, family_map: bool) -> TestConfig {
+    let dir = common::tempdir(&format!("server-codex-{tag}-"));
+    write_login(&dir);
     let unused: reqwest::Url = "http://127.0.0.1:9".parse().expect("upstream url");
-    Config {
+    let config = Config {
         port: 0,
-        db_path: test_dir(tag).join("toker.db"),
+        db_path: dir.join("toker.db"),
         session_header_names: vec![
             "x-toker-session".to_owned(),
             "x-claude-code-session-id".to_owned(),
@@ -341,7 +349,7 @@ fn test_config(
             }),
             upstream: codex_upstream,
             originator: "codex_cli_rs".to_owned(),
-            auth_path,
+            auth_path: dir.join("auth.json"),
             refresh_url: "https://auth.openai.com/oauth/token"
                 .parse()
                 .expect("refresh url"),
@@ -350,7 +358,8 @@ fn test_config(
         notices: toker::config::NoticesConfig::default(),
         awake: false,
         transcript_roots: Vec::new(),
-    }
+    };
+    TestConfig { config, dir }
 }
 
 async fn spawn_mock() -> (reqwest::Url, MockState) {
@@ -374,7 +383,8 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
     )
 }
 
-async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
+async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     let server = Server::new(config, store.clone()).expect("build server");
     let app = server.router();
@@ -383,6 +393,7 @@ async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
         .expect("toker binds");
     let addr = listener.local_addr().expect("toker addr");
     tokio::spawn(async move {
+        let _dir = dir;
         axum::serve(listener, app).await.expect("toker serves");
     });
     (addr, store)
@@ -428,13 +439,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn codex_models_uses_the_subscription_catalogue_and_exact_slug() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, _store) = spawn_toker(test_config(
-        "models",
-        upstream,
-        login_dir("models").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, _store) = spawn_toker(test_config("models", upstream, false)).await;
 
     let response = client()
         .get(format!("http://{addr}/f/codex/v1/models"))
@@ -476,13 +481,7 @@ async fn codex_models_uses_the_subscription_catalogue_and_exact_slug() {
 #[tokio::test]
 async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "native",
-        upstream,
-        login_dir("native").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("native", upstream, false)).await;
     let body = serde_json::to_vec(&json!({
         "model": "gpt-5.6-sol",
         "prompt_cache_key": "codex-session-1",
@@ -600,13 +599,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
 #[tokio::test]
 async fn non_streaming_responses_are_aggregated_from_canonical_turns() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "responses-json",
-        upstream,
-        login_dir("responses-json").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("responses-json", upstream, false)).await;
     let response = client()
         .post(format!("http://{addr}/v1/responses"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -645,13 +638,7 @@ async fn non_streaming_responses_are_aggregated_from_canonical_turns() {
 #[tokio::test]
 async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "chat-to-codex",
-        upstream,
-        login_dir("chat-to-codex").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("chat-to-codex", upstream, false)).await;
     let response = client()
         .post(format!("http://{addr}/f/opencode/v1/chat/completions"))
         .header(header::CONTENT_TYPE, "application/json")
@@ -689,12 +676,7 @@ async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
 #[tokio::test]
 async fn chat_can_use_codex_as_its_default_and_return_plain_json() {
     let (upstream, _mock) = spawn_mock().await;
-    let mut config = test_config(
-        "chat-default-codex",
-        upstream,
-        login_dir("chat-default-codex").join("auth.json"),
-        false,
-    );
+    let mut config = test_config("chat-default-codex", upstream, false);
     config.default_backend_openai_chat = Some("codex_sub".to_owned());
     let (addr, store) = spawn_toker(config).await;
     let response = client()
@@ -726,13 +708,7 @@ async fn chat_can_use_codex_as_its_default_and_return_plain_json() {
 #[tokio::test]
 async fn an_invalid_responses_body_is_rejected_before_upstream_and_not_ledgered() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "native-invalid",
-        upstream,
-        login_dir("native-invalid").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("native-invalid", upstream, false)).await;
     let body = Bytes::from_static(b"not json at all");
     let response = client()
         .post(format!("http://{addr}/v1/responses"))
@@ -749,13 +725,7 @@ async fn an_invalid_responses_body_is_rejected_before_upstream_and_not_ledgered(
 #[tokio::test]
 async fn a_streaming_turn_translates_both_ways_and_records() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "live",
-        upstream,
-        login_dir("live").join("auth.json"),
-        true,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("live", upstream, true)).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/messages"))
@@ -877,13 +847,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
 #[tokio::test]
 async fn a_non_streaming_request_gets_an_aggregated_message() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "ns",
-        upstream,
-        login_dir("ns").join("auth.json"),
-        true,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("ns", upstream, true)).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/messages"))
@@ -913,13 +877,7 @@ async fn a_non_streaming_request_gets_an_aggregated_message() {
 #[tokio::test]
 async fn an_untranslatable_body_never_reaches_the_upstream() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "ut",
-        upstream,
-        login_dir("ut").join("auth.json"),
-        true,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("ut", upstream, true)).await;
 
     // An assistant-side image block: translate fails as UnsupportedBlock.
     let body = serde_json::to_vec(&json!({
@@ -964,13 +922,7 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
 #[tokio::test]
 async fn an_http_error_maps_through_the_error_table() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "e401",
-        upstream,
-        login_dir("401").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("e401", upstream, false)).await;
 
     // No family map: the bare model rides through untouched, and the
     // mock's err-401 arm answers the request for it.
@@ -1005,13 +957,7 @@ async fn an_in_band_failure_maps_and_records_status_200() {
     // outlive the turn); its captured requests are not read here —
     // the row assertions are the point.
     let (upstream, _mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "fail",
-        upstream,
-        login_dir("fail").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("fail", upstream, false)).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/messages"))
@@ -1045,13 +991,7 @@ async fn an_in_band_failure_maps_and_records_status_200() {
 #[tokio::test]
 async fn count_tokens_on_a_codex_route_answers_a_typed_error() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "ct",
-        upstream,
-        login_dir("ct").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("ct", upstream, false)).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/messages/count_tokens"))
@@ -1079,13 +1019,7 @@ async fn count_tokens_on_a_codex_route_answers_a_typed_error() {
 #[tokio::test]
 async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "unmatched",
-        upstream,
-        login_dir("unmatched").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("unmatched", upstream, false)).await;
 
     // An unmatched path: the codex backend serves no anthropic paths, so
     // the answer is anthropic's own 404 shape, not a forward.
@@ -1132,13 +1066,7 @@ async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest
 #[tokio::test]
 async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_no_row() {
     let (upstream, _mock) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(
-        "drop-mid",
-        upstream,
-        login_dir("drop-mid").join("auth.json"),
-        false,
-    ))
-    .await;
+    let (addr, store) = spawn_toker(test_config("drop-mid", upstream, false)).await;
 
     // A reset mid-turn, and a clean close before the terminator: the
     // translation once ended cleanly on both, handing claude a turn the

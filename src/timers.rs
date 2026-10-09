@@ -1741,11 +1741,12 @@ mod tests {
         // 08:59 is before today's 09:00, so the most recent occurrence
         // is yesterday's — a fire time ~24 h past, far beyond the guard.
         let now = utc_ms(8, 59);
+        let dir = test_dir("ping-early");
         let mut out = Vec::new();
         let mut sleep = no_sleep();
         let error = super::ping_window(
             &mut out,
-            &ping_config(&test_dir("ping-early").join("toker.db"), "x-toker-ping"),
+            &ping_config(&dir.join("toker.db"), "x-toker-ping"),
             "09:00",
             now,
             &utc(),
@@ -2091,12 +2092,13 @@ mod tests {
 
     #[test]
     fn a_bad_slot_argument_is_refused_before_anything_runs() {
+        let dir = test_dir("ping-bad-slot");
         let mut out = Vec::new();
         let mut sleep = no_sleep();
         let client = ScriptedClient::new(0);
         let error = super::ping_window(
             &mut out,
-            &ping_config(&test_dir("ping-bad-slot").join("toker.db"), "x-toker-ping"),
+            &ping_config(&dir.join("toker.db"), "x-toker-ping"),
             "9:30",
             utc_ms(9, 12),
             &utc(),

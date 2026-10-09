@@ -563,7 +563,8 @@ mod tests {
 
     #[test]
     fn claude_settings_patch_changes_exactly_the_base_url() {
-        let path = test_dir("claude").join("settings.json");
+        let dir = test_dir("claude");
+        let path = dir.join("settings.json");
         let original = claude_settings();
         write_pretty(&path, &original);
 
@@ -593,7 +594,8 @@ mod tests {
 
     #[test]
     fn claude_settings_without_env_gains_it_at_the_end() {
-        let path = test_dir("claude-no-env").join("settings.json");
+        let dir = test_dir("claude-no-env");
+        let path = dir.join("settings.json");
         let original = json!({"model": "opus[1m]", "theme": "dark"});
         write_pretty(&path, &original);
         patch_claude(&path, "http://127.0.0.1:18123").expect("patch");
@@ -618,7 +620,8 @@ mod tests {
 
     #[test]
     fn claude_settings_with_a_non_object_env_is_refused() {
-        let path = test_dir("claude-bad-env").join("settings.json");
+        let dir = test_dir("claude-bad-env");
+        let path = dir.join("settings.json");
         write_pretty(&path, &json!({"env": "not an object", "model": "opus[1m]"}));
         let error = patch_claude(&path, "http://127.0.0.1:18123")
             .expect_err("a non-object env must be refused");
@@ -646,7 +649,8 @@ mod tests {
                 patch_opencode as fn(&Path, &str) -> anyhow::Result<()>,
             ),
         ] {
-            let path = test_dir("root-array").join(format!("{name}.json"));
+            let dir = test_dir("root-array");
+            let path = dir.join(format!("{name}.json"));
             fs::write(&path, b"[1, 2, 3]\n").expect("write fixture");
             let error = patch(&path, "http://127.0.0.1:18123")
                 .expect_err("a JSON array root must be refused");
@@ -696,7 +700,8 @@ mod tests {
 
     #[test]
     fn opencode_patch_changes_exactly_the_base_url() {
-        let path = test_dir("opencode").join("opencode.json");
+        let dir = test_dir("opencode");
+        let path = dir.join("opencode.json");
         let original = opencode_config();
         write_pretty(&path, &original);
 
@@ -716,7 +721,8 @@ mod tests {
 
     #[test]
     fn opencode_patch_builds_the_provider_chain_when_absent() {
-        let path = test_dir("opencode-empty").join("opencode.json");
+        let dir = test_dir("opencode-empty");
+        let path = dir.join("opencode.json");
         let original = json!({"$schema": "https://opencode.ai/config.json"});
         write_pretty(&path, &original);
         patch_opencode(&path, "http://127.0.0.1:18123/v1").expect("patch");
@@ -730,7 +736,8 @@ mod tests {
 
     #[test]
     fn a_fresh_opencode_config_starts_from_scratch() {
-        let path = test_dir("opencode-fresh").join("opencode.json");
+        let dir = test_dir("opencode-fresh");
+        let path = dir.join("opencode.json");
         patch_opencode(&path, "http://127.0.0.1:18123/v1").expect("patch");
         assert_eq!(
             read_value(&path),
@@ -740,7 +747,8 @@ mod tests {
 
     #[test]
     fn opencode_with_a_non_object_provider_is_refused() {
-        let path = test_dir("opencode-bad").join("opencode.json");
+        let dir = test_dir("opencode-bad");
+        let path = dir.join("opencode.json");
         write_pretty(&path, &json!({"provider": "openrouter", "agents": {}}));
         let error = patch_opencode(&path, "http://127.0.0.1:18123/v1")
             .expect_err("a non-object provider must be refused");
@@ -870,7 +878,8 @@ mod tests {
 
     #[test]
     fn a_fresh_rc_gets_the_block() {
-        let path = test_dir("rc-fresh").join("bashrc");
+        let dir = test_dir("rc-fresh");
+        let path = dir.join("bashrc");
         patch_shell_rc(&path, "http://127.0.0.1:18123").expect("patch");
         assert_eq!(
             fs::read_to_string(&path).expect("read"),
@@ -880,7 +889,8 @@ mod tests {
 
     #[test]
     fn an_empty_existing_rc_gets_the_block_without_a_stray_blank_line() {
-        let path = test_dir("rc-empty").join("bashrc");
+        let dir = test_dir("rc-empty");
+        let path = dir.join("bashrc");
         fs::write(&path, "").expect("write empty");
         patch_shell_rc(&path, "http://127.0.0.1:18123").expect("patch");
         assert_eq!(
@@ -891,7 +901,8 @@ mod tests {
 
     #[test]
     fn repatching_the_same_url_is_a_byte_identical_no_op() {
-        let path = test_dir("rc-idempotent").join("bashrc");
+        let dir = test_dir("rc-idempotent");
+        let path = dir.join("bashrc");
         fs::write(&path, "export PATH=$HOME/bin:$PATH\n").expect("write rc");
         patch_shell_rc(&path, "http://127.0.0.1:18123").expect("patch");
         let once = fs::read_to_string(&path).expect("read");
@@ -906,7 +917,8 @@ mod tests {
 
     #[test]
     fn repatching_a_new_url_updates_the_line_in_place() {
-        let path = test_dir("rc-update").join("bashrc");
+        let dir = test_dir("rc-update");
+        let path = dir.join("bashrc");
         fs::write(
             &path,
             "alias x=y\n# toker\nexport ANTHROPIC_BASE_URL=\"http://old\"\nalias z=w\n",
@@ -922,7 +934,8 @@ mod tests {
 
     #[test]
     fn a_block_is_appended_after_ensuring_the_file_ends_with_a_newline() {
-        let path = test_dir("rc-append").join("bashrc");
+        let dir = test_dir("rc-append");
+        let path = dir.join("bashrc");
         fs::write(&path, "export PATH=$HOME/bin:$PATH").expect("write rc, no trailing newline");
         patch_shell_rc(&path, "http://127.0.0.1:18123").expect("patch");
         assert_eq!(
@@ -936,7 +949,8 @@ mod tests {
         // The marker with the export moved (or duplicated) below it:
         // toker's governed exports collapse into one, where the first
         // one sat.
-        let path = test_dir("rc-mangled").join("bashrc");
+        let dir = test_dir("rc-mangled");
+        let path = dir.join("bashrc");
         fs::write(
             &path,
             "# toker\necho hello\nexport ANTHROPIC_BASE_URL=\"http://a\"\nexport ANTHROPIC_BASE_URL=\"http://b\"\n",
@@ -952,7 +966,8 @@ mod tests {
 
     #[test]
     fn a_marker_without_its_export_gets_it_re_seated() {
-        let path = test_dir("rc-reseat").join("bashrc");
+        let dir = test_dir("rc-reseat");
+        let path = dir.join("bashrc");
         fs::write(&path, "# toker\nalias x=y\n").expect("write rc");
         patch_shell_rc(&path, "http://127.0.0.1:18123").expect("patch");
         assert_eq!(
@@ -966,7 +981,8 @@ mod tests {
         // An ANTHROPIC_BASE_URL export with no marker is not toker's;
         // it stays byte-for-byte (and toker's block, later in the file,
         // is the assignment a sourced shell actually applies last).
-        let path = test_dir("rc-foreign").join("bashrc");
+        let dir = test_dir("rc-foreign");
+        let path = dir.join("bashrc");
         fs::write(
             &path,
             "export ANTHROPIC_BASE_URL=\"https://my-own.example\"\nexport OTHER=1\n",
@@ -994,7 +1010,8 @@ mod tests {
 
     #[test]
     fn a_non_utf8_rc_is_an_error_not_a_clobber() {
-        let path = test_dir("rc-utf8").join("bashrc");
+        let dir = test_dir("rc-utf8");
+        let path = dir.join("bashrc");
         fs::write(&path, b"export A=\xff").expect("write non-utf8 rc");
         let error =
             patch_shell_rc(&path, "http://127.0.0.1:18123").expect_err("non-utf8 must be refused");
@@ -1007,7 +1024,8 @@ mod tests {
 
     #[test]
     fn the_model_picker_replaces_toker_rows_and_keeps_the_user_s() {
-        let path = test_dir("picker").join("settings.json");
+        let dir = test_dir("picker");
+        let path = dir.join("settings.json");
         let mut original = claude_settings();
         original["modelPicker"] = json!({
             "options": [picker_row("openrouter/old/model"), picker_row("claude-opus-4-8")],
@@ -1030,7 +1048,8 @@ mod tests {
 
     #[test]
     fn an_unchanged_model_picker_is_not_rewritten() {
-        let path = test_dir("picker-same").join("settings.json");
+        let dir = test_dir("picker-same");
+        let path = dir.join("settings.json");
         let mut original = claude_settings();
         original["modelPicker"] = json!({"options": [picker_row("openrouter/a/b")]});
         write_pretty(&path, &original);
@@ -1052,7 +1071,8 @@ mod tests {
 
     #[test]
     fn no_rows_removes_toker_s_and_an_emptied_picker_goes() {
-        let path = test_dir("picker-empty").join("settings.json");
+        let dir = test_dir("picker-empty");
+        let path = dir.join("settings.json");
         let original = claude_settings();
         let mut with_rows = original.clone();
         with_rows["modelPicker"] = json!({"options": [picker_row("openrouter/a/b")]});
@@ -1067,7 +1087,8 @@ mod tests {
 
         // With no picker and no rows, nothing is created.
         assert!(!patch_model_picker(&path, &[]).expect("patch"));
-        let fresh = test_dir("picker-absent").join("settings.json");
+        let dir = test_dir("picker-absent");
+        let fresh = dir.join("settings.json");
         assert!(!patch_model_picker(&fresh, &[]).expect("patch"));
         assert!(!fresh.exists(), "an absent file stays absent");
 
@@ -1091,7 +1112,8 @@ mod tests {
             ("string", json!("rows")),
             ("options", json!({"options": {"model": "x"}})),
         ] {
-            let path = test_dir(&format!("picker-{name}")).join("settings.json");
+            let dir = test_dir(&format!("picker-{name}"));
+            let path = dir.join("settings.json");
             let mut original = claude_settings();
             original["modelPicker"] = picker;
             let bytes = write_pretty(&path, &original);
@@ -1102,7 +1124,8 @@ mod tests {
 
     #[test]
     fn codex_patch_preserves_unrelated_toml_and_is_idempotent() {
-        let path = test_dir("codex").join("config.toml");
+        let dir = test_dir("codex");
+        let path = dir.join("config.toml");
         fs::write(
             &path,
             "# keep this comment\nmodel = \"gpt-5\"\nmodel_provider = \"openai\"\n\n[projects.\"/work\"]\ntrust_level = \"trusted\"\n",
@@ -1133,7 +1156,8 @@ mod tests {
 
     #[test]
     fn codex_patch_refuses_a_non_table_provider_without_clobbering() {
-        let path = test_dir("codex-refuse").join("config.toml");
+        let dir = test_dir("codex-refuse");
+        let path = dir.join("config.toml");
         let before = "model_providers = \"not a table\"\n";
         fs::write(&path, before).expect("write codex config");
         let error = patch_codex(&path, "http://127.0.0.1:18123/f/codex/v1")

@@ -837,8 +837,7 @@ mod tests {
 
     #[test]
     fn path_probe_finds_executables_and_skips_the_rest() {
-        let dir = std::env::temp_dir().join(format!("toker-awake-{}-path", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create probe dir");
+        let dir = crate::test_support::tempdir("toker-awake-path-");
         let exe = dir.join("fake-inhibitor");
         std::fs::write(&exe, b"#!/bin/sh\n").expect("write probe");
         set_mode(&exe, 0o755);

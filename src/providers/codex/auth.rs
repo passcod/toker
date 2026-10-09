@@ -494,20 +494,14 @@ pub(crate) mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use serde_json::{Value, json};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     /// A fresh scratch directory under /tmp/opencode, unique per call
     /// (the tests/server_* pattern). NEVER the real `~/.codex` — these
     /// tests build fixture logins, never touch a real one.
-    pub(crate) fn test_dir(name: &str) -> PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = PathBuf::from("/tmp/opencode")
-            .join(format!("codex-auth-{name}-{}-{n}", std::process::id()));
-        fs::remove_dir_all(&dir).ok();
-        fs::create_dir_all(&dir).expect("create test dir");
-        dir
+    pub(crate) fn test_dir(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::tempdir(&format!("codex-auth-{name}-"))
     }
 
     /// Encode one JWT part: base64url, no padding.
@@ -537,7 +531,26 @@ pub(crate) mod tests {
     /// `exp.unwrap_or(FRESH_EXP)`; refresh token `codex-refresh-token`;
     /// an id token carrying the fedramp claim; `last_refresh`
     /// 2026-09-26 (under 8 days old at the tests' `now`).
-    pub(crate) fn auth_file(name: &str, exp: Option<i64>) -> PathBuf {
+    pub(crate) struct AuthFixture {
+        _dir: crate::test_support::TestDir,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for AuthFixture {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for AuthFixture {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    pub(crate) fn auth_file(name: &str, exp: Option<i64>) -> AuthFixture {
         let exp = exp.unwrap_or(FRESH_EXP);
         let claims = |fedramp: bool| {
             json!({
@@ -557,10 +570,11 @@ pub(crate) mod tests {
             },
             "last_refresh": "2026-09-26T00:00:00Z",
         });
-        let path = test_dir(name).join("auth.json");
+        let dir = test_dir(name);
+        let path = dir.join("auth.json");
         fs::write(&path, serde_json::to_string_pretty(&body).expect("fixture"))
             .expect("write fixture auth.json");
-        path
+        AuthFixture { _dir: dir, path }
     }
 
     /// Rewrite `path`'s auth.json to the given tokens and last_refresh
@@ -689,7 +703,7 @@ pub(crate) mod tests {
     fn load_reads_the_schema_and_missing_means_none() {
         let path = auth_file("schema", None);
         let auth = CodexAuth::load(&path).expect("parse").expect("present");
-        assert_eq!(auth.path(), path);
+        assert_eq!(auth.path(), path.as_path());
         assert!(auth.access_token().is_some());
         assert_eq!(auth.refresh_token(), Some("codex-refresh-token"));
         // No explicit tokens.account_id → the claims' account id.
@@ -720,7 +734,8 @@ pub(crate) mod tests {
         assert_eq!(auth.account_id(), Some("explicit-acct"));
 
         // Missing file: no login.
-        let missing = test_dir("missing").join("auth.json");
+        let missing_dir = test_dir("missing");
+        let missing = missing_dir.join("auth.json");
         assert!(CodexAuth::load(&missing).expect("load").is_none());
 
         // Present-but-corrupt is an error, never "no login".
