@@ -243,6 +243,8 @@ pub fn run(
         // frame: hold the offset at what the frame could show.
         ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
         ui.scroll.context = ui.scroll.context.min(drawn.context.max_offset);
+        ui.scroll.rebuilds = ui.scroll.rebuilds.min(drawn.rebuilds.max_offset);
+        ui.scroll.spend = ui.scroll.spend.min(drawn.spend.max_offset);
 
         // Block until the next tick or an input event. The deadline was
         // set after the tick's work, so it is in the future unless the
@@ -299,6 +301,8 @@ pub fn run(
             for (list, offset) in [
                 (&drawn.sessions, &mut ui.scroll.sessions),
                 (&drawn.context, &mut ui.scroll.context),
+                (&drawn.rebuilds, &mut ui.scroll.rebuilds),
+                (&drawn.spend, &mut ui.scroll.spend),
             ] {
                 if delta != 0 && list.area.contains(at) {
                     *offset = offset.saturating_add_signed(delta).min(list.max_offset);

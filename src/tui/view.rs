@@ -61,8 +61,9 @@ use crate::ir::Release;
 use crate::middleware::cold::Verdict;
 
 /// The most lines SPEND claims beside CACHE REBUILDS: the total line,
-/// the never-dropped "no cost data" line, and a few breakdown lines.
-/// The rebuild causes can grow the row past it (see [`spend_lines`]).
+/// the never-dropped "no cost data" line, and a few breakdown lines;
+/// a longer breakdown scrolls. The rebuild causes can grow the row
+/// past it (see [`spend_lines`]).
 const SPEND_LINES: u16 = 7;
 
 /// The fewest lines SPEND renders in: the total and the "no cost data"
@@ -124,9 +125,10 @@ const CONTEXT_NAME_W: usize = 24;
 /// cap must not touch the bar.
 const CONTEXT_NAME_GAP: usize = 2;
 
-/// The rebuild panel's localised detail lines: the newest
-/// system-prompt changes, so a change is diagnosable at a glance
-/// without leaving the dashboard for `toker report`.
+/// The rebuild panel's localised detail lines in its natural height:
+/// the newest system-prompt changes, so a change is diagnosable at a
+/// glance without leaving the dashboard for `toker report`. Older ones
+/// are a scroll away.
 const REBUILD_DETAIL_LINES: usize = 3;
 
 /// The tokens panel's label and amount column widths
@@ -285,6 +287,10 @@ pub(crate) struct Popup {
 pub(crate) struct Scroll {
     pub sessions: usize,
     pub context: usize,
+    /// CACHE REBUILDS' causes and details, under its pinned summary.
+    pub rebuilds: usize,
+    /// SPEND's breakdown, under its pinned total and counter.
+    pub spend: usize,
 }
 
 /// What a frame drew that the loop needs back: where each list landed,
@@ -293,6 +299,11 @@ pub(crate) struct Scroll {
 pub(crate) struct Drawn {
     pub sessions: DrawnList,
     pub context: DrawnList,
+    /// CACHE REBUILDS' causes and details; not clickable either.
+    pub rebuilds: DrawnList,
+    /// SPEND's breakdown; its rows are not clickable, so none are
+    /// recorded. Zero-sized while SPEND does not render.
+    pub spend: DrawnList,
     /// Where the detail popup and its controls landed, when it showed.
     pub popup: Option<super::detail::DrawnPopup>,
 }
@@ -376,6 +387,8 @@ pub(crate) fn render(
             max_offset: context_offset,
             rows: context_rows,
         },
+        rebuilds: DrawnList::default(),
+        spend: DrawnList::default(),
         popup: None,
     };
     render_tokens(frame, layout.tokens, chrome, snap, fmt);
@@ -384,10 +397,21 @@ pub(crate) fn render(
         // as the breakdown lines do.
         let [rebuilds, spend] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(layout.rebuilds);
-        render_rebuilds(frame, rebuilds, chrome, snap, fmt);
-        render_spend(frame, spend, chrome, snap);
+        drawn.rebuilds = rebuilds_drawn(frame, rebuilds, chrome, snap, fmt, ui.scroll.rebuilds);
+        drawn.spend = DrawnList {
+            area: spend,
+            max_offset: render_spend(frame, spend, chrome, snap, ui.scroll.spend),
+            rows: Vec::new(),
+        };
     } else {
-        render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
+        drawn.rebuilds = rebuilds_drawn(
+            frame,
+            layout.rebuilds,
+            chrome,
+            snap,
+            fmt,
+            ui.scroll.rebuilds,
+        );
     }
     render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
     // The overlays are exclusive (the loop opens one by closing the
@@ -1457,24 +1481,7 @@ fn render_context(
             session,
         })
         .collect();
-    let dim = Style::new().dim();
-    let lines: Vec<Line<'static>> = window
-        .above
-        .map(|above| Line::styled(format!("… {above} above"), dim))
-        .into_iter()
-        .chain(
-            lines
-                .into_iter()
-                .skip(window.shown.start)
-                .take(window.shown.len()),
-        )
-        .chain(
-            window
-                .below
-                .map(|hidden| Line::styled(format!("… {hidden} more"), dim)),
-        )
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(scrolled(lines, &window)), inner);
     (window.max_offset, hits)
 }
 
@@ -1822,20 +1829,31 @@ impl TokensRow {
 /// localised system-prompt changes. The panel never vanishes: no
 /// rebuilds is a verdict ("none — every prefix held"), not an absence
 /// of data, and unknown rewrites are counted, never guessed.
-fn render_rebuilds(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot, fmt: &Fmt) {
+///
+/// The summary (and the none-verdict) is pinned; the cause rows and the
+/// detail lines under it scroll from `offset` ([`list_window`]).
+/// Returns the furthest it can scroll.
+fn render_rebuilds(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    fmt: &Fmt,
+    offset: usize,
+) -> usize {
     if area.height == 0 {
-        return;
+        return 0;
     }
     let inner = panel(frame, area, "CACHE REBUILDS", chrome);
     let Some(rebuilds) = snap.rebuilds.as_ref() else {
         // The loop computes the section before the first draw; this is
         // the pre-refresh placeholder's shape, and it says so.
         frame.render_widget(Paragraph::new("no rebuild data yet").dim(), inner);
-        return;
+        return 0;
     };
     if snap.window_empty {
         frame.render_widget(Paragraph::new("no data in window").dim(), inner);
-        return;
+        return 0;
     }
 
     let mut lines = Vec::new();
@@ -1868,15 +1886,12 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
             Style::new().dim(),
         )));
     }
-    // A short panel sheds the detail lines first, then the cause rows
-    // from the bottom; the summary is the panel's answer and stays.
-    let room = (inner.height as usize).max(1);
-    for (cause, count) in rebuilds
-        .causes
-        .iter()
-        .take(room.saturating_sub(lines.len()))
-    {
-        lines.push(Line::from(vec![
+    // The summary is the panel's answer and stays; under it the cause
+    // rows, then the detail lines, scroll, a short panel counting what
+    // it cannot show rather than shedding it.
+    let mut list = Vec::new();
+    for (cause, count) in &rebuilds.causes {
+        list.push(Line::from(vec![
             Span::raw(format!("{:<24}{:>4}  ", cause.label(), count)),
             Span::styled("▬".repeat((*count).min(30)), Style::new().dim()),
         ]));
@@ -1887,7 +1902,6 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
         .events
         .iter()
         .filter(|event| event.cause == super::rebuilds::Cause::SystemPrompt)
-        .take(REBUILD_DETAIL_LINES.min(room.saturating_sub(lines.len())))
     {
         // The session's NAME, shared with the other panels (label or
         // id) — correlation everywhere a session is named, the same
@@ -1904,12 +1918,53 @@ fn render_rebuilds(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapsho
             .collect::<Vec<_>>()
             .join("");
         let detail = event.detail.as_deref().unwrap_or("");
-        lines.push(Line::from(Span::styled(
+        list.push(Line::from(Span::styled(
             format!("· {name_text} — system prompt changed ({detail})"),
             Style::new().dim(),
         )));
     }
+    let room = (inner.height as usize).saturating_sub(lines.len());
+    let window = list_window(list.len(), room, offset);
+    lines.extend(scrolled(list, &window));
     frame.render_widget(Paragraph::new(lines), inner);
+    window.max_offset
+}
+
+/// [`render_rebuilds`] with what the loop needs back for the wheel.
+fn rebuilds_drawn(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    fmt: &Fmt,
+    offset: usize,
+) -> DrawnList {
+    DrawnList {
+        area,
+        max_offset: render_rebuilds(frame, area, chrome, snap, fmt, offset),
+        rows: Vec::new(),
+    }
+}
+
+/// A list's lines as its [`ListWindow`] shows them: the "above" count,
+/// the entries in view, the "more" count.
+fn scrolled(list: Vec<Line<'static>>, window: &ListWindow) -> Vec<Line<'static>> {
+    let dim = Style::new().dim();
+    window
+        .above
+        .map(|above| Line::styled(format!("… {above} above"), dim))
+        .into_iter()
+        .chain(
+            list.into_iter()
+                .skip(window.shown.start)
+                .take(window.shown.len()),
+        )
+        .chain(
+            window
+                .below
+                .map(|hidden| Line::styled(format!("… {hidden} more"), dim)),
+        )
+        .collect()
 }
 
 /// Short tokens: round thousands and millions
@@ -1951,9 +2006,20 @@ fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
 /// never reported is visible, not folded into the total). Rendered only
 /// when [`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost),
 /// so never over an empty window.
-fn render_spend(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot) {
+///
+/// The total and the counter are pinned; the breakdown under them
+/// scrolls from `offset` like the lists do ([`list_window`]), since a
+/// router window can name more provider·model pairs than the row has
+/// lines. Returns the furthest it can scroll.
+fn render_spend(
+    frame: &mut Frame,
+    area: Rect,
+    chrome: Chrome,
+    snap: &Snapshot,
+    offset: usize,
+) -> usize {
     if area.height == 0 {
-        return;
+        return 0;
     }
     let inner = panel(frame, area, "SPEND", chrome);
     let spend = &snap.spend;
@@ -1966,28 +2032,38 @@ fn render_spend(frame: &mut Frame, area: Rect, chrome: Chrome, snap: &Snapshot) 
         ))),
         None => lines.push(Line::from("billed: no billed cost data")),
     }
-    // Positioned third-from-last at worst and second here: this line is
+    // Second, and pinned above the scrolling breakdown: this line is
     // the invariant-3 counter, so it must never scroll out of view.
     lines.push(Line::from(format!(
         "no cost data: {}",
         reqs(spend.no_cost_data)
     )));
-    for entry in &spend.breakdown {
-        lines.push(Line::from(format!(
-            "{} · {}  {} · {}",
-            entry.provider.as_deref().unwrap_or(NO_SESSION),
-            entry.model.as_deref().unwrap_or(NO_SESSION),
-            usd(entry.billed),
-            reqs(entry.requests)
-        )));
-    }
+    let mut list: Vec<Line<'static>> = spend
+        .breakdown
+        .iter()
+        .map(|entry| {
+            Line::from(format!(
+                "{} · {}  {} · {}",
+                entry.provider.as_deref().unwrap_or(NO_SESSION),
+                entry.model.as_deref().unwrap_or(NO_SESSION),
+                usd(entry.billed),
+                reqs(entry.requests)
+            ))
+        })
+        .collect();
+    // The last entry, so it scrolls with the rest: the "… N more" line
+    // says it is there when it does not show.
     if spend.other_cost_kinds > 0 {
-        lines.push(Line::from(format!(
+        list.push(Line::from(format!(
             "{} with non-billed cost",
             reqs(spend.other_cost_kinds)
         )));
     }
+    let room = (inner.height as usize).saturating_sub(lines.len());
+    let window = list_window(list.len(), room, offset);
+    lines.extend(scrolled(list, &window));
     frame.render_widget(Paragraph::new(lines), inner);
+    window.max_offset
 }
 
 /// RATE & QUOTA: the requests line (see [`requests_line`]) — and, when the
@@ -3414,6 +3490,107 @@ mod tests {
     }
 
     #[test]
+    fn a_long_spend_breakdown_scrolls_under_its_pinned_counter() {
+        // A router window naming more provider·model pairs than the row
+        // has lines: the overflow is counted, not clipped, and scrolling
+        // to the end moves the count to the top while the total and the
+        // "no cost data" counter stay put.
+        let mut snap = snapshot();
+        snap.spend.breakdown = (0..10)
+            .map(|n| model::ProviderModelSpend {
+                provider: Some("openrouter".into()),
+                model: Some(format!("vendor/model-{n}")),
+                billed: 0.01,
+                requests: 1,
+            })
+            .collect();
+        let draw = |spend: usize| {
+            draw_scrolled(
+                &snap,
+                super::Scroll {
+                    spend,
+                    ..Default::default()
+                },
+            )
+        };
+        let (top, drawn) = draw(0);
+        assert!(top.contains("vendor/model-0"), "{top}");
+        assert!(!top.contains("vendor/model-9"), "{top}");
+        assert!(top.contains("more"), "{top}");
+        assert!(drawn.spend.max_offset > 0, "{drawn:?}");
+        assert!(drawn.spend.area.height > 0, "{drawn:?}");
+
+        let (end, _) = draw(usize::MAX);
+        assert!(end.contains("vendor/model-9"), "{end}");
+        assert!(!end.contains("vendor/model-0 "), "{end}");
+        assert!(end.contains("above"), "{end}");
+        for text in [&top, &end] {
+            assert!(text.contains("billed: "), "{text}");
+            assert!(text.contains("no cost data"), "{text}");
+        }
+    }
+
+    /// The frame at 100x40 with the lists at `scroll`, and what it drew.
+    fn draw_scrolled(snap: &model::Snapshot, scroll: super::Scroll) -> (String, super::Drawn) {
+        let ui = super::Ui { scroll, ..plain() };
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        let mut drawn = super::Drawn::default();
+        terminal
+            .draw(|frame| {
+                drawn = super::render(frame, snap, "12:34:56", &utc(), &ui);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        (text, drawn)
+    }
+
+    #[test]
+    fn rebuild_details_past_the_budget_scroll_under_the_summary() {
+        // Eight system-prompt changes against a three-line detail
+        // budget: the older ones were dropped once; now they are
+        // counted, and scrolling to the end reaches the oldest while
+        // the summary stays on top.
+        let mut snap = full_snapshot();
+        let rebuilds = snap.rebuilds.as_mut().expect("the fixture has rebuilds");
+        let template = rebuilds.events[0].clone();
+        rebuilds.events = (0..8)
+            .map(|n| crate::tui::rebuilds::RebuildEvent {
+                detail: Some(format!("change {n}")),
+                ..template.clone()
+            })
+            .collect();
+        let draw = |rebuilds: usize| {
+            draw_scrolled(
+                &snap,
+                super::Scroll {
+                    rebuilds,
+                    ..Default::default()
+                },
+            )
+        };
+        let (top, drawn) = draw(0);
+        assert!(top.contains("(change 0)"), "{top}");
+        assert!(!top.contains("(change 7)"), "{top}");
+        assert!(top.contains("more"), "{top}");
+        assert!(drawn.rebuilds.max_offset > 0, "{drawn:?}");
+
+        let (end, _) = draw(usize::MAX);
+        assert!(end.contains("(change 7)"), "{end}");
+        assert!(!end.contains("(change 0)"), "{end}");
+        assert!(end.contains("above"), "{end}");
+        for text in [&top, &end] {
+            assert!(text.contains("2 of 9 requests rewrote"), "{text}");
+        }
+    }
+
+    #[test]
     fn a_short_page_keeps_spends_counter_or_drops_the_row_whole() {
         // SPEND moved off the pinned strip into the middle, which sheds:
         // at every height its "no cost data" counter (invariant 3)
@@ -4331,6 +4508,7 @@ mod tests {
         let (end, _) = draw(super::Scroll {
             sessions: usize::MAX,
             context: usize::MAX,
+            ..Default::default()
         });
         frame_snapshot("full_frame_100x30_scrolled", &end);
         assert!(end.contains("… 2 sessions above"), "{end}");
@@ -4351,6 +4529,7 @@ mod tests {
             super::Scroll {
                 sessions: usize::MAX,
                 context: usize::MAX,
+                ..Default::default()
             },
         ] {
             let ui = super::Ui { scroll, ..plain() };
