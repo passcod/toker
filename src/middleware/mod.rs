@@ -42,6 +42,7 @@
 //!   ladders only where the prompt changed or the lane began.
 
 pub mod awake;
+pub mod canonical;
 pub mod cold;
 pub mod force_newest;
 pub mod lanes;
