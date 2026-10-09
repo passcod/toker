@@ -485,9 +485,7 @@ mod tests {
 
         // The encrypted reasoning, message, and function-call items completed.
         assert_eq!(capture.items().len(), 3);
-        let reasoning = capture.items()[0]
-            .as_reasoning()
-            .expect("reasoning item");
+        let reasoning = capture.items()[0].as_reasoning().expect("reasoning item");
         assert_eq!(reasoning.id.as_deref(), Some("rs_1"));
         assert_eq!(
             reasoning.encrypted_content.as_deref(),

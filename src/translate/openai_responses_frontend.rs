@@ -1277,10 +1277,7 @@ mod tests {
             response["output"][0]["encrypted_content"],
             json!("ciphertext")
         );
-        assert_eq!(
-            response["output"][0]["id"],
-            json!("rs_provider_bound")
-        );
+        assert_eq!(response["output"][0]["id"], json!("rs_provider_bound"));
         assert_eq!(response["output"][1]["type"], json!("message"));
         assert_eq!(response["output"][2]["call_id"], json!("call_1"));
     }
