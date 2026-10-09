@@ -468,6 +468,10 @@ struct ReasoningItem {
 }
 
 impl OpenAiResponsesRenderer {
+    pub fn turn_ended(&self) -> bool {
+        self.ended
+    }
+
     pub fn new(model: &str) -> OpenAiResponsesRenderer {
         OpenAiResponsesRenderer {
             model: model.to_owned(),

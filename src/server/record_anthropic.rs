@@ -227,7 +227,15 @@ pub(crate) fn record_anthropic_error(
 
 /// The route column, `frontend:backend`.
 fn route_of(ctx: &AnthropicRecordCtx) -> String {
-    format!("anthropic:{}", ctx.backend.id())
+    format!("{}:{}", frontend_protocol_of(ctx), ctx.backend.id())
+}
+
+fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
+    match ctx.path {
+        "/v1/responses" => "openai_responses",
+        "/v1/chat/completions" => "openai_chat",
+        _ => "anthropic",
+    }
 }
 
 /// Insert one row; a store failure loses the row, never the request
@@ -448,7 +456,7 @@ fn measurement_row(
         ts_ms,
         duration_ms: Some(duration_ms),
         kind: None,
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol_of(ctx).to_owned()),
         provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
@@ -595,7 +603,7 @@ fn error_row(
         ts_ms,
         duration_ms: Some(duration_ms),
         kind: Some(RowKind::Error),
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol_of(ctx).to_owned()),
         provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),

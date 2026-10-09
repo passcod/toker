@@ -270,6 +270,11 @@ const ROUTES: &[RouteDeclaration] = &[
         provider: "codex_sub",
         backend: ProtocolId::OpenAiResponses,
     },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiResponses,
+        provider: "anthropic_api",
+        backend: ProtocolId::AnthropicMessages,
+    },
 ];
 
 /// A fully resolved inference destination.

@@ -84,6 +84,20 @@ pub trait Provider: Send + Sync {
         let _ = outgoing;
     }
 
+    /// The frontend wire may identify credentials that are foreign to this
+    /// provider even when a native frontend's same header is valid. Keep
+    /// that distinction provider-owned; the default retains the existing
+    /// protocol-independent strip rule.
+    fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
+        let _ = frontend;
+        self.strip_foreign_credentials(outgoing);
+    }
+
+    /// Required provider protocol headers not supplied by another frontend.
+    fn prepare_protocol_headers(&self, outgoing: &mut HeaderMap) {
+        let _ = outgoing;
+    }
+
     /// The operator's model routing map for this backend, when one is
     /// configured (`[providers.<id>.model_map]`, the same
     /// env-typed pattern the predecessor used):

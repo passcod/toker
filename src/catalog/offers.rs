@@ -68,6 +68,12 @@ fn offered(
     provider: &str,
     routed_model_id: String,
 ) -> Option<ModelOffer> {
+    // Codex's catalogue parser requires a full ModelInfo shape, not just a
+    // slug. A foreign provider is routable explicitly, but not advertised
+    // until a verified frontend metadata projection exists for it.
+    if frontend == ProtocolId::OpenAiResponses && provider != "codex_sub" {
+        return None;
+    }
     let target = registry.resolve(frontend, Some(&routed_model_id)).ok()?;
     if target.provider().id() != provider || target.effective_model() != Some(model.id.as_str()) {
         return None;

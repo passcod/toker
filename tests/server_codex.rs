@@ -245,6 +245,49 @@ async fn mock_models(State(mock): State<MockState>, request: Request) -> Respons
     response
 }
 
+async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
+        .await
+        .expect("mock reads Messages body");
+    let value: Value = serde_json::from_slice(&body).expect("Messages JSON");
+    mock.requests.lock().unwrap().push(CapturedRequest {
+        path: parts.uri.path().to_owned(),
+        headers: parts.headers,
+        body,
+    });
+    match value["model"].as_str().unwrap_or_default() {
+        "error" => raw_response(
+            StatusCode::UNAUTHORIZED,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"authentication_error","message":"bad upstream key"}}"#,
+            ),
+        ),
+        "stream" | "failed" | "eof" => {
+            let mut body = concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_api\",\"usage\":{\"input_tokens\":7}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"shell\",\"input\":{}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )
+            .to_owned();
+            if value["model"] == "failed" {
+                body.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n");
+            } else if value["model"] == "stream" {
+                body.push_str("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n");
+                body.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            }
+            raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body))
+        }
+        _ => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"id":"msg_api","type":"message","model":"claude-sonnet-5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":3}}"#),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The auth fixture: a login whose access token never needs a refresh
 // during a test (exp far in the future), so no test ever hits the
@@ -367,6 +410,7 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(mock_responses))
         .route("/backend-api/codex/models", get(mock_models))
+        .route("/v1/messages", post(mock_anthropic_messages))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -381,6 +425,17 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
             .expect("url"),
         mock,
     )
+}
+
+fn anthropic_responses_config(tag: &str, upstream: reqwest::Url) -> TestConfig {
+    let mut fixture = test_config(tag, upstream.clone(), false);
+    fixture.config.anthropic_api.as_mut().unwrap().upstream = upstream
+        .origin()
+        .ascii_serialization()
+        .parse()
+        .expect("Anthropic mock URL");
+    fixture.config.anthropic_api.as_mut().unwrap().api_key = Some("sk-ant-test".to_owned());
+    fixture
 }
 
 async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
@@ -602,6 +657,96 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         row.extra.as_ref().and_then(|extra| extra.get("frontend")),
         Some(&json!("codex"))
     );
+}
+
+#[tokio::test]
+async fn responses_to_anthropic_api_render_json_and_replace_foreign_auth() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-json", upstream)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header(header::AUTHORIZATION, "Bearer codex-foreign-token")
+        .json(&json!({
+            "model": "anthropic_api/claude-sonnet-5",
+            "input": [{"role": "user", "content": "hello"}],
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("Responses JSON");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["usage"]["input_tokens"], 7);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/messages");
+    assert!(requests[0].headers.get(header::AUTHORIZATION).is_none());
+    assert_eq!(requests[0].headers.get("x-api-key").unwrap(), "sk-ant-test");
+    assert_eq!(
+        requests[0].headers.get("anthropic-version").unwrap(),
+        "2023-06-01"
+    );
+    let rendered: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(rendered["model"], "claude-sonnet-5");
+    assert_eq!(rendered["max_tokens"], 128);
+    assert_eq!(rendered["messages"][0]["content"][0]["text"], "hello");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(
+        rows[0].route.as_deref(),
+        Some("openai_responses:anthropic_api")
+    );
+    assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
+}
+
+#[tokio::test]
+async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-stream", upstream)).await;
+    for (model, expected) in [
+        ("stream", "event: response.completed"),
+        ("failed", "event: response.failed"),
+    ] {
+        let response = client()
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "model": format!("anthropic_api/{model}"),
+                "input": "hello",
+                "max_output_tokens": 128,
+                "stream": true,
+            }))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.expect("Responses SSE");
+        assert!(body.contains(expected), "{body}");
+        assert!(body.contains("response.output_item.done"), "{body}");
+    }
+    assert_eq!(
+        wait_for_rows(&store, 1).await.len(),
+        1,
+        "failed stream unledgered"
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn responses_to_anthropic_api_reject_missing_limit_without_upstream() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-limit", upstream)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"anthropic_api/claude-sonnet-5", "input":"hello", "stream":false}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("max_output_tokens"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(wait_for_rows(&store, 0).await.is_empty());
 }
 
 #[tokio::test]

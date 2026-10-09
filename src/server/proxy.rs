@@ -486,6 +486,30 @@ pub(crate) async fn send_upstream(
         .path_and_query()
         .map(|path| path.as_str())
         .unwrap_or_else(|| parts.uri.path());
+    send_upstream_to(
+        server,
+        provider,
+        parts,
+        body,
+        session_header_names,
+        ProtocolId::AnthropicMessages,
+        path,
+    )
+    .await
+}
+
+/// The same provider-owned auth and transport path for a cross-protocol
+/// binding. `frontend` lets a provider distinguish a native credential from
+/// a different client's bearer; `path` is the selected backend endpoint.
+pub(crate) async fn send_upstream_to(
+    server: &Server,
+    provider: &dyn Provider,
+    parts: &Parts,
+    body: Bytes,
+    session_header_names: &[String],
+    frontend: ProtocolId,
+    path: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
     let url = provider.endpoint(path);
     // Pass-through-when-present (plan: Credentials): a frontend that
     // brings its own credential keeps it verbatim; the stored credential
@@ -495,10 +519,11 @@ pub(crate) async fn send_upstream(
     let mut headers = upstream_request_headers(&parts.headers, session_header_names);
     // Before injection, so a dropped foreign credential leaves room for
     // the provider's own.
-    provider.strip_foreign_credentials(&mut headers);
-    if !provider.credential_present(&parts.headers) {
+    provider.strip_foreign_credentials_for(&mut headers, frontend);
+    if !provider.credential_present(&headers) {
         provider.inject_auth(&mut headers);
     }
+    provider.prepare_protocol_headers(&mut headers);
     server
         .http
         .request(parts.method.clone(), url)

@@ -138,6 +138,12 @@ impl Provider for AnthropicSub {
     /// keyring/signing unit replaces this).
     fn inject_auth(&self, _outgoing: &mut HeaderMap) {}
 
+    fn prepare_protocol_headers(&self, outgoing: &mut HeaderMap) {
+        outgoing
+            .entry("anthropic-version")
+            .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+
     /// The sub is the meter source: its quota snapshot is the parsed
     /// `anthropic-ratelimit-*` headers.
     fn meters(&self, headers: &HeaderMap) -> Option<Value> {
@@ -172,6 +178,19 @@ impl Provider for AnthropicApi {
     /// keeps it either way).
     fn credential_present(&self, incoming: &HeaderMap) -> bool {
         incoming.contains_key(&X_API_KEY) || incoming.contains_key(header::AUTHORIZATION)
+    }
+
+    fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
+        if frontend != ProtocolId::AnthropicMessages {
+            outgoing.remove(header::AUTHORIZATION);
+            outgoing.remove(&X_API_KEY);
+        }
+    }
+
+    fn prepare_protocol_headers(&self, outgoing: &mut HeaderMap) {
+        outgoing
+            .entry("anthropic-version")
+            .or_insert(HeaderValue::from_static("2023-06-01"));
     }
 
     fn inject_auth(&self, outgoing: &mut HeaderMap) {

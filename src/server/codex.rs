@@ -36,7 +36,7 @@ use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
-use crate::routing::ProtocolId;
+use crate::routing::{BackendAdapterId, ProtocolId};
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, plain_status, session_id,
@@ -107,12 +107,6 @@ const RESPONSES_FRONTEND: &str = "openai_responses";
 /// and response take the same canonical path as every cross-protocol route.
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
-    let Ok(mut target) = server.registry.resolve(ProtocolId::OpenAiResponses, None) else {
-        return super::responses_not_configured();
-    };
-    if server.codex_turn.is_none() {
-        return super::responses_not_configured();
-    }
     let (parts, body) = request.into_parts();
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
@@ -149,15 +143,13 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .as_ref()
         .and_then(|request| request.openai_responses().model())
         .map(str::to_owned);
-    if parsed.is_some() {
-        target = match server
-            .registry
-            .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
-        {
-            Ok(target) => target,
-            Err(_) => return super::responses_not_configured(),
-        };
-    }
+    let target = match server
+        .registry
+        .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
+    {
+        Ok(target) => target,
+        Err(_) => return super::responses_not_configured(),
+    };
     let backend = target.provider().clone();
     let effective_model = target.effective_model().map(str::to_owned);
     let stream_explicitly_false = parsed.as_ref().is_some_and(|request| {
@@ -185,6 +177,24 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         thinking_rewritten: false,
         translation_report: None,
     });
+
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
+    {
+        let Some(parsed) = parsed else {
+            return frontend_error_response(
+                CodexFrontendWire::OpenAiResponses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "the request body could not be parsed for translation to this backend",
+                !stream_explicitly_false,
+            );
+        };
+        return super::responses_anthropic::turn(server, parts, parsed, target, record, in_flight)
+            .await;
+    }
 
     turn(CodexTurn {
         server,
@@ -808,7 +818,7 @@ pub(crate) fn anthropic_error_response(
     }
 }
 
-fn frontend_error_response(
+pub(crate) fn frontend_error_response(
     wire: CodexFrontendWire,
     status: StatusCode,
     kind: &str,

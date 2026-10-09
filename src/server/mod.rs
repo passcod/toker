@@ -66,6 +66,7 @@ pub(crate) mod proxy;
 pub(crate) mod quota_events;
 mod record;
 mod record_anthropic;
+pub(crate) mod responses_anthropic;
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
