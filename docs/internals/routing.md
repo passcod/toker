@@ -19,15 +19,16 @@ A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
 `default_backend_openai_chat`), which bare model names go to. A model string can
 name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
-`anthropic/…` (the protocol default), `openrouter/…`, and Chat's
-`codex_sub/…` are stripped and routed
-(`strip_anthropic_prefix` in `server/anthropic.rs`, `strip_provider_prefix` in
-`server/proxy.rs`; `openrouter/` on both protocols), and the row records both
-`requested_model` and `effective_model`. A prefix naming a backend whose block is absent is answered
-locally, never sent to the default with the prefix still on. A protocol with no
-enabled backend answers its routes with a not-configured error in that
-protocol's own shape, carrying the `x-toker-not-configured` header, and reaches
-no upstream.
+`anthropic/…` (the Messages protocol default), `openrouter/…`, and
+`codex_sub/…` are stripped and routed where the shared route registry declares
+that frontend-to-binding path. The resolved `ModelTarget` keeps the provider,
+verified backend binding, requested model, and effective model distinct; the
+row records both model spellings. A prefix naming a backend whose block is
+absent is answered locally, never sent to the default with the prefix still on.
+An unknown prefix belongs to the provider's model id and stays intact. A
+protocol with no enabled backend answers its routes with a not-configured error
+in that protocol's own shape, carrying the `x-toker-not-configured` header, and
+reaches no upstream.
 
 Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the

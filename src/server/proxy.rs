@@ -56,7 +56,7 @@ use crate::middleware::force_newest;
 use crate::middleware::lanes;
 use crate::observe::{SseEvent, SseSplitter, UsageObserver};
 use crate::providers::Provider;
-use crate::routing::DialectId;
+use crate::routing::{BackendAdapterId, ProtocolId};
 use crate::translate::{self, OpenAiChatRenderer};
 
 use super::InFlightGuard;
@@ -79,7 +79,7 @@ pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
-    let Some(default_backend) = server.config.default_backend_openai_chat.clone() else {
+    let Ok(mut target) = server.registry.resolve(ProtocolId::OpenAiChat, None) else {
         return super::openai_not_configured();
     };
     let (parts, body) = request.into_parts();
@@ -130,17 +130,21 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let mut gate_shape: Option<Shape> = None;
     let mut stream_requested = false;
     let mut gate_model: Option<String> = None;
-    let mut target_backend = default_backend;
     let mut parsed_for_codex = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
-        // Routing: read the model through the typed view; a provider
-        // prefix overrides the backend per request.
         let model = ir.openai_chat().model().map(str::to_owned);
-        let mut effective_model = model.clone();
-        if let Some((provider, rest)) = model.as_deref().and_then(strip_chat_provider_prefix) {
-            effective_model = Some(rest.to_owned());
-            target_backend = provider.to_owned();
-            ir.openai_chat_mut().set_model(rest);
+        target = match server
+            .registry
+            .resolve(ProtocolId::OpenAiChat, model.as_deref())
+        {
+            Ok(target) => target,
+            Err(_) => return super::openai_not_configured(),
+        };
+        let effective_model = target.effective_model().map(str::to_owned);
+        if effective_model.as_deref() != model.as_deref()
+            && let Some(effective) = effective_model.as_deref()
+        {
+            ir.openai_chat_mut().set_model(effective);
         }
         let shape = ir.openai_chat().shape();
         let system_messages = shape.req_messages.map(|_| {
@@ -170,11 +174,13 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         parsed_for_codex = Some(ir);
     }
 
-    let Some(backend) = server.openai_chat_backend(&target_backend).cloned() else {
-        return super::openai_not_configured();
-    };
+    let backend = target.provider().clone();
 
-    if backend.id() == "openrouter" {
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
+    {
         let Some(ir) = parsed_for_codex.as_ref() else {
             return compatibility_error(
                 "the request body could not be parsed as an OpenAI Chat request",
@@ -184,7 +190,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             canonical.model.clone_from(&gate_model);
             translate::openai_chat_backend::render_openai_chat(
                 &canonical,
-                DialectId::OpenRouterChatCompletions,
+                target.binding().dialect(),
             )
         });
         let rendered = match rendered {
@@ -343,7 +349,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     }
 
-    if backend.id() == "codex_sub" {
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
+    {
         let record = record.map(|ctx| chat_codex_record(ctx, backend.clone()));
         return super::codex::turn(super::codex::CodexTurn {
             server,
@@ -412,7 +422,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
     {
         return super::codex::models(State(server), request).await;
     }
-    let Some(openrouter) = server.openrouter.clone() else {
+    let Some(openrouter) = server.registry.provider("openrouter").cloned() else {
         return super::anthropic::unmatched(State(server), request).await;
     };
     let (parts, body) = request.into_parts();
@@ -747,16 +757,6 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
     Bytes::from(out)
 }
 
-/// Phase-1 routing (plan: Routing): an `openrouter/` prefix overrides the
-/// backend per request and is stripped from the model. Anything else —
-/// bare names, other providers' prefixes — goes to the protocol's
-/// configured default backend, untransformed. Generalising the prefix set
-/// is a later phase's work.
-#[cfg(test)]
-pub(crate) fn strip_provider_prefix(model: &str) -> Option<&str> {
-    model.strip_prefix("openrouter/")
-}
-
 fn chat_codex_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
     let shape = ctx.shape.map(|shape| crate::ir::AnthropicShape {
         req_bytes: shape.req_bytes,
@@ -804,17 +804,6 @@ fn chat_codex_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRec
         thinking_rewritten: false,
         translation_report: None,
     }
-}
-
-fn strip_chat_provider_prefix(model: &str) -> Option<(&str, &str)> {
-    ["openrouter", "codex_sub"]
-        .into_iter()
-        .find_map(|provider| {
-            model
-                .strip_prefix(provider)
-                .and_then(|rest| rest.strip_prefix('/'))
-                .map(|rest| (provider, rest))
-        })
 }
 
 /// The session identity from the configured header names, in priority
@@ -1086,29 +1075,8 @@ pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorWire, strip_provider_prefix, transport_failure};
+    use super::{ErrorWire, transport_failure};
     use axum::http::{StatusCode, header};
-
-    #[test]
-    fn the_openrouter_prefix_strips_and_everything_else_goes_to_the_default() {
-        assert_eq!(
-            strip_provider_prefix("openrouter/z-ai/glm-5.3"),
-            Some("z-ai/glm-5.3"),
-            "the provider prefix routes and strips"
-        );
-        // Nested provider models survive intact — only toker's own prefix
-        // is toker's to strip.
-        assert_eq!(
-            strip_provider_prefix("openrouter/openai/gpt-5.2"),
-            Some("openai/gpt-5.2")
-        );
-        assert_eq!(strip_provider_prefix("openrouter/"), Some(""));
-        // Bare models route to the protocol default, untransformed.
-        assert_eq!(strip_provider_prefix("z-ai/glm-5.3"), None);
-        // Other providers' prefixes are not toker's to intercept in
-        // phase 1: they go to the default backend unchanged.
-        assert_eq!(strip_provider_prefix("anthropic/claude-opus-5"), None);
-    }
 
     async fn error_of(response: axum::response::Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

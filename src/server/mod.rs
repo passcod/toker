@@ -8,11 +8,11 @@
 //!
 //! Routes:
 //!
-//! - OpenAI-chat frontend (phase 1, → openrouter):
+//! - OpenAI-chat frontend (→ OpenRouter Chat or Codex Responses binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
 //!     the IR, fidelity-checked, routed, recorded ([`proxy`]).
 //!   - `GET /v1/models` — transparent forwarding, no recording.
-//! - Anthropic frontend (phase 2, → anthropic sub/api backends):
+//! - Anthropic frontend (→ any registered Messages/Codex binding):
 //!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
 //!     `count_tokens` and `batches` run the same pipeline (they are not
 //!     gated — gates arrive with the quota-gate unit) but carry no usage,
@@ -81,7 +81,7 @@ use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenRouter, Provider};
-use crate::routing::FrontendProfile;
+use crate::routing::{FrontendProfile, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::Store;
 
@@ -162,19 +162,9 @@ pub struct Server {
     /// timeouts only — no overall deadline, so a stream lives as long as
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
-    /// The one openai-chat backend; a trait object because routing
-    /// selects by `provider/model` prefix and later phases add providers
-    /// to exactly this slot. Every backend slot is `None` when its
-    /// `[providers.X]` block is absent from the config: the routes that
-    /// would reach it answer a not-configured error instead.
-    pub(crate) openrouter: Option<Arc<dyn Provider>>,
-    /// The anthropic subscription backend.
-    pub(crate) anthropic_sub: Option<Arc<dyn Provider>>,
-    /// The anthropic API backend.
-    pub(crate) anthropic_api: Option<Arc<dyn Provider>>,
-    /// The codex subscription backend, as routing sees it (the trait
-    /// object: prefix routing and the protocol default resolve by id).
-    pub(crate) codex_sub: Option<Arc<dyn Provider>>,
+    /// The enabled provider bindings and implemented frontend-to-backend
+    /// routes. Every inference handler resolves a concrete model target here.
+    pub(crate) registry: RouteRegistry,
     /// The codex subscription backend, concretely — the translation
     /// branch needs [`crate::providers::codex::CodexSub`]'s own methods
     /// (auth-for-turn, the codex header block) that the trait does not
@@ -245,8 +235,8 @@ impl Server {
         secrets: Arc<dyn SecretStore>,
     ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
-        // tests, any embedder) must not reach routing with a default that
-        // names a disabled backend — `default_anthropic` relies on it.
+        // tests, any embedder) must not reach the registry with a default
+        // that names a disabled backend.
         config.validate()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
@@ -285,6 +275,28 @@ impl Server {
             None => None,
         };
         let codex_sub = codex_turn.clone().map(|codex| codex as Arc<dyn Provider>);
+        let providers = [
+            openrouter.clone(),
+            anthropic_sub.clone(),
+            anthropic_api.clone(),
+            codex_sub.clone(),
+        ]
+        .into_iter()
+        .flatten();
+        let defaults = [
+            config
+                .default_backend_anthropic
+                .clone()
+                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
+            config
+                .default_backend_openai_chat
+                .clone()
+                .map(|provider| (ProtocolId::OpenAiChat, provider)),
+            Some((ProtocolId::OpenAiResponses, "codex_sub".to_owned())),
+        ]
+        .into_iter()
+        .flatten();
+        let registry = RouteRegistry::new(providers, defaults);
 
         // The lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
@@ -318,10 +330,7 @@ impl Server {
             store,
             config: Arc::new(config),
             http,
-            openrouter,
-            anthropic_sub,
-            anthropic_api,
-            codex_sub,
+            registry,
             codex_turn,
             models,
             catalogs: Arc::new(std::sync::RwLock::new(FetchedCatalogs::default())),
@@ -370,35 +379,6 @@ impl Server {
     pub fn set_upstream_idle_timeout(&mut self, idle: Duration) -> anyhow::Result<()> {
         self.http = upstream_client(idle)?;
         Ok(())
-    }
-
-    /// Resolve an anthropic backend by provider name — routing and the
-    /// configured protocol default both resolve here (plan: Routing).
-    /// `None` for an unknown name and for a known backend whose block is
-    /// absent from the config.
-    pub(crate) fn anthropic_backend(&self, name: &str) -> Option<&Arc<dyn Provider>> {
-        match name {
-            "anthropic_sub" => self.anthropic_sub.as_ref(),
-            "anthropic_api" => self.anthropic_api.as_ref(),
-            "codex_sub" => self.codex_sub.as_ref(),
-            _ => None,
-        }
-    }
-
-    /// The configured default anthropic backend; `None` exactly when no
-    /// anthropic backend is enabled (validated at startup: a default
-    /// always names an enabled backend, and one is inferred whenever any
-    /// is enabled).
-    pub(crate) fn default_anthropic(&self) -> Option<&Arc<dyn Provider>> {
-        self.anthropic_backend(self.config.default_backend_anthropic.as_deref()?)
-    }
-
-    pub(crate) fn openai_chat_backend(&self, name: &str) -> Option<&Arc<dyn Provider>> {
-        match name {
-            "openrouter" => self.openrouter.as_ref(),
-            "codex_sub" => self.codex_sub.as_ref(),
-            _ => None,
-        }
     }
 
     // ── the idle-sleep lock ──────────────────────────────────────────
@@ -705,7 +685,7 @@ impl Server {
     /// did not hand to toker).
     fn catalog_sources(&self) -> Vec<fetched::CatalogSource> {
         let mut sources = Vec::new();
-        if let Some(openrouter) = &self.openrouter {
+        if let Some(openrouter) = self.registry.provider("openrouter") {
             sources.push(fetched::CatalogSource {
                 provider: "openrouter",
                 // The upstream base already includes `/v1`, so the
@@ -716,7 +696,11 @@ impl Server {
                 fetch: true,
             });
         }
-        if let Some(anthropic) = self.anthropic_sub.as_ref().or(self.anthropic_api.as_ref()) {
+        if let Some(anthropic) = self
+            .registry
+            .provider("anthropic_sub")
+            .or_else(|| self.registry.provider("anthropic_api"))
+        {
             // The stored API key when there is one. Without it toker
             // holds no anthropic credential, and the source reads the
             // cache only: the borrowed fetch fills it.
@@ -822,7 +806,7 @@ impl Server {
     /// The `anthropic_api` backend's stored key as the listing's
     /// headers, marked sensitive; `None` without that backend or a key.
     fn stored_anthropic_key(&self) -> Option<HeaderMap> {
-        let api = self.anthropic_api.as_ref()?;
+        let api = self.registry.provider("anthropic_api")?;
         let mut headers = HeaderMap::new();
         api.inject_auth(&mut headers);
         if headers.is_empty() {
@@ -1058,6 +1042,7 @@ fn anthropic_catalog_source(
 mod tests {
     use super::Server;
     use crate::config::Config;
+    use crate::routing::ProtocolId;
     use crate::store::Store;
     use axum::http::{HeaderMap, HeaderValue, header};
     use std::sync::Arc;
@@ -1270,7 +1255,11 @@ api_key = "ak-literal-test"
         let server = server_with(&dir, &upstream, "");
         let cache = dir.join("models-cache");
         server.catalog_dir.set(cache.clone()).expect("unset");
-        let sub = server.anthropic_sub.clone().expect("sub");
+        let sub = server
+            .registry
+            .provider("anthropic_sub")
+            .cloned()
+            .expect("sub");
 
         server.borrow_catalog_credential(sub.as_ref(), &bearer("sk-ant-oat01-test"));
         settle(&server, &seen, 1).await;
@@ -1316,7 +1305,11 @@ api_key = "ak-literal-test"
             .catalog_dir
             .set(dir.join("models-cache"))
             .expect("unset");
-        let sub = server.anthropic_sub.clone().expect("sub");
+        let sub = server
+            .registry
+            .provider("anthropic_sub")
+            .cloned()
+            .expect("sub");
 
         for _ in 0..5 {
             server.borrow_catalog_credential(sub.as_ref(), &bearer("t"));
@@ -1343,7 +1336,11 @@ api_key = "ak-literal-test"
         let dir = crate::setup::test_dir("catalog-borrow-quiet");
         let (seen, upstream) = models_upstream(axum::http::StatusCode::OK).await;
         let server = server_with(&dir, &upstream, "");
-        let sub = server.anthropic_sub.clone().expect("sub");
+        let sub = server
+            .registry
+            .provider("anthropic_sub")
+            .cloned()
+            .expect("sub");
 
         server.borrow_catalog_credential(sub.as_ref(), &bearer("t"));
         server
@@ -1369,9 +1366,17 @@ api_key = "ak-literal-test"
             .catalog_dir
             .set(keyed_dir.join("models-cache"))
             .expect("unset");
-        let api = keyed.anthropic_api.clone().expect("api");
+        let api = keyed
+            .registry
+            .provider("anthropic_api")
+            .cloned()
+            .expect("api");
         keyed.borrow_catalog_credential(api.as_ref(), &bearer("t"));
-        let keyed_sub = keyed.anthropic_sub.clone().expect("sub");
+        let keyed_sub = keyed
+            .registry
+            .provider("anthropic_sub")
+            .cloned()
+            .expect("sub");
         keyed.borrow_catalog_credential(keyed_sub.as_ref(), &bearer("t"));
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1400,7 +1405,12 @@ api_key = "ak-literal-test"
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
             drift: None,
-            backend: server.default_anthropic().expect("enabled").clone(),
+            backend: server
+                .registry
+                .resolve(ProtocolId::AnthropicMessages, None)
+                .expect("enabled")
+                .provider()
+                .clone(),
             betas: None,
             shape: None,
             ping: false,

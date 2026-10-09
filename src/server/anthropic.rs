@@ -78,7 +78,7 @@ use crate::middleware::quota::{
 };
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
-use crate::routing::ProtocolId;
+use crate::routing::{BackendAdapterId, ProtocolId};
 use crate::store::{Allowance, MetersSnapshot};
 use crate::translate;
 
@@ -156,10 +156,15 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     if path == "/_toker" || path.starts_with("/_toker/") {
         return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
     }
-    let Some(default) = server.default_anthropic() else {
+    let Ok(default) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
         return super::anthropic_not_configured();
     };
-    if default.id() == "codex_sub" {
+    if default
+        .binding()
+        .canonical_backend()
+        .map(|binding| binding.adapter())
+        == Some(BackendAdapterId::CodexResponses)
+    {
         return codex::anthropic_error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -175,9 +180,10 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
 /// exact-path rule: only `"/v1/messages"` gates.
 async fn usage_path(server: Server, request: Request, path: &'static str) -> Response {
     let started = Instant::now();
-    let Some(default_backend) = server.default_anthropic().cloned() else {
+    let Ok(mut target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
         return super::anthropic_not_configured();
     };
+    let mut backend = target.provider().clone();
     let (parts, body) = request.into_parts();
 
     // Session identity and betas, read by name only — request headers are
@@ -225,7 +231,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // a clone): the cold gate and the retarget read it, and the row's
     // shape fields stay the PRE-transform shape's, in the same order.
     let mut gate_shape: Option<AnthropicShape> = None;
-    let mut backend = default_backend;
     // The client's own wants: the client's own model and
     // whether it explicitly asked for a plain JSON Message — both read
     // BEFORE any transform, because the blocked answer renders the model
@@ -251,23 +256,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // 4. Routing: read the model through the typed view; a provider
         // prefix overrides the backend per request.
         let model = client_model.clone();
-        let mut effective_model = model.clone();
-        let mut transformed = false;
-        if let Some((provider, rest)) = model
-            .as_deref()
-            .and_then(|model| strip_anthropic_prefix(&server, model))
+        target = match server
+            .registry
+            .resolve(ProtocolId::AnthropicMessages, model.as_deref())
         {
-            // A prefix naming a backend whose block is absent: answered
-            // here, never sent to the default with the prefix still on.
-            let Some(provider) = provider else {
-                return super::anthropic_not_configured();
-            };
-            // 5. A deliberate transform: forward the serialised IR (pure
-            // and deterministic, so the upstream prefix stays stable),
-            // recorded as requested vs effective — nothing is "forced".
-            backend = provider.clone();
-            effective_model = Some(rest.to_owned());
-            ir.anthropic_mut().set_model(rest);
+            Ok(target) => target,
+            Err(_) => return super::anthropic_not_configured(),
+        };
+        backend = target.provider().clone();
+        let effective_model = target.effective_model().map(str::to_owned);
+        let mut transformed = false;
+        if effective_model.as_deref() != model.as_deref()
+            && let Some(effective) = effective_model.as_deref()
+        {
+            // A deliberate routing transform: the registry removed only
+            // toker's outer provider/protocol prefix.
+            ir.anthropic_mut().set_model(effective);
             transformed = true;
         }
 
@@ -1006,7 +1010,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // no codex equivalent (the CLI defines none) — those paths answer
     // with a typed anthropic error instead of forwarding JSON the
     // backend would only reject.
-    if backend.id() == "codex_sub" {
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
+    {
         if path == "/v1/messages" {
             return codex::turn(codex::CodexTurn {
                 server,
@@ -1047,11 +1055,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // request path. Parse the FINAL middleware output, not `parsed`: the
     // licensed body rewrites above may have reserialised it since ingress.
     if path == "/v1/messages" {
-        let dialect = backend
-            .bindings()
-            .iter()
-            .find(|binding| binding.protocol() == ProtocolId::AnthropicMessages)
-            .map(|binding| binding.dialect());
+        let dialect = Some(target.binding().dialect());
         let rendered = serde_json::from_slice::<serde_json::Value>(&forward)
             .map_err(|error| translate::TranslateError::Malformed {
                 reason: error.to_string(),
@@ -1346,13 +1350,18 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
 async fn transparent(server: Server, request: Request) -> Response {
-    let Some(backend) = server.default_anthropic().cloned() else {
+    let Ok(target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
         return super::anthropic_not_configured();
     };
+    let backend = target.provider().clone();
     // The batch paths have no codex equivalent: the same typed error the
     // usage path answers for count_tokens and batch creation, rather
     // than an anthropic request sent to the codex upstream.
-    if backend.id() == "codex_sub" {
+    if target
+        .binding()
+        .canonical_backend()
+        .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
+    {
         return codex::anthropic_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -1377,36 +1386,6 @@ async fn transparent(server: Server, request: Request) -> Response {
             tracing::warn!(%error, "upstream request failed");
             transport_failure(ErrorWire::Anthropic, &error)
         }
-    }
-}
-
-/// Anthropic routing (plan: Routing). A provider's own name selects that
-/// backend; the generic `anthropic/` family prefix selects the protocol
-/// default (it names the protocol, not a provider — plan: "`provider/model`
-/// names override per request … `anthropic/claude-opus-5`"); both are
-/// stripped from the model. `openrouter/` is the one non-anthropic
-/// provider here: openrouter serves the Anthropic Messages wire itself
-/// (its `…/api/v1/messages`), so the route uses the Messages canonical
-/// adapter with openrouter's key in place of the client's anthropic credential
-/// (`OpenRouter::strip_foreign_credentials`). This is how a Claude Code
-/// `modelPicker` row reaches an openrouter model. Anything else — bare names,
-/// other prefixes — goes to the configured default, with no routing rewrite.
-/// The provider is `None` when the prefix names a backend whose block is
-/// absent.
-fn strip_anthropic_prefix<'a>(
-    server: &'a Server,
-    model: &'a str,
-) -> Option<(Option<&'a Arc<dyn Provider>>, &'a str)> {
-    if let Some(rest) = model.strip_prefix("anthropic_sub/") {
-        Some((server.anthropic_sub.as_ref(), rest))
-    } else if let Some(rest) = model.strip_prefix("anthropic_api/") {
-        Some((server.anthropic_api.as_ref(), rest))
-    } else if let Some(rest) = model.strip_prefix("openrouter/") {
-        Some((server.openrouter.as_ref(), rest))
-    } else {
-        model
-            .strip_prefix("anthropic/")
-            .map(|rest| (server.default_anthropic(), rest))
     }
 }
 
@@ -1931,7 +1910,6 @@ fn observe_chunk(splitter: &mut SseSplitter, observer: &mut AnthropicObserver, c
 
 #[cfg(test)]
 mod tests {
-    use super::super::proxy::strip_provider_prefix;
     use super::request_betas;
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
@@ -1958,16 +1936,5 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-beta", HeaderValue::from_static(""));
         assert_eq!(request_betas(&headers), Some(json!([])));
-    }
-
-    #[test]
-    fn the_openai_prefix_stripping_is_untouched_by_the_anthropic_unit() {
-        // The openai path's router keeps its phase-1 shape: `anthropic/…`
-        // is NOT an openai path route.
-        assert_eq!(strip_provider_prefix("anthropic/claude-opus-5"), None);
-        assert_eq!(
-            strip_provider_prefix("openrouter/z-ai/glm-5.3"),
-            Some("z-ai/glm-5.3")
-        );
     }
 }

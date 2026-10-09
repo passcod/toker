@@ -1,7 +1,8 @@
 # Protocol and provider mux
 
-Status: guiding architecture; phase 1 complete, every current inference route
-canonical, routing and discovery convergence still underway.
+Status: guiding architecture; phases 1 and 2 complete, every current inference
+route canonical, the shared route registry complete, and middleware and
+discovery convergence still underway.
 
 Toker's purpose is not a fixed set of frontend-to-backend pairs. It is a mux:
 any configured frontend protocol should be able to reach any backend for which
@@ -355,11 +356,10 @@ provider bytes before translation. Native Messages to `anthropic_sub`,
 `anthropic_api`, and OpenRouter have moved as well: final middleware output is
 rendered for the binding, provider responses are observed before canonical
 interpretation, and billed cost plus serving-provider evidence survive the
-round trip.
+round trip. All inference handlers now resolve through the shared route
+registry to a `ModelTarget` carrying the provider, verified backend binding,
+requested model, and effective model.
 
-- Replace per-handler provider selection with a route registry.
-- Add a `ModelTarget` carrying provider, binding, requested model, and effective
-  model.
 - Move routing, gates, rewrites, and shape extraction onto canonical middleware.
 - Cut one complete request-and-response route at a time onto the common
   pipeline.

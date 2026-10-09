@@ -483,7 +483,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("native", upstream, false)).await;
     let body = serde_json::to_vec(&json!({
-        "model": "gpt-5.6-sol",
+        "model": "codex_sub/gpt-5.6-sol",
         "prompt_cache_key": "codex-session-1",
         "instructions": "private instructions",
         "input": [
@@ -573,7 +573,11 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(row.route.as_deref(), Some("openai_responses:codex_sub"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
     assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
-    assert_eq!(row.requested_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(
+        row.requested_model.as_deref(),
+        Some("codex_sub/gpt-5.6-sol")
+    );
+    assert_eq!(row.effective_model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(row.req_messages, Some(3));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
@@ -735,7 +739,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
         // The frontend's own (dummy) credential: must NEVER reach the
         // codex backend (pass-through-when-present's explicit opt-out).
         .header(header::AUTHORIZATION, "Bearer frontend-dummy")
-        .body(messages_body("claude-opus-5", true))
+        .body(messages_body("codex_sub/claude-opus-5", true))
         .send()
         .await
         .expect("toker answers");
@@ -806,7 +810,10 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(row.frontend.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
     assert_eq!(row.model.as_deref(), Some("gpt-5.2-codex"));
-    assert_eq!(row.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(
+        row.requested_model.as_deref(),
+        Some("codex_sub/claude-opus-5")
+    );
     assert_eq!(row.effective_model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(row.input, Some(1234 - 512 - 64));
     assert_eq!(row.cache_read, Some(512));

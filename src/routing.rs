@@ -1,11 +1,14 @@
 //! The identities in toker's protocol/provider route graph.
 //!
-//! This is phase 1 of `docs/plans/protocol-provider-mux.md`: it names the
-//! graph the existing handlers already implement without changing dispatch.
-//! Protocol identities are data; frontend and backend adapter behavior stays
-//! in its existing typed modules until more than one composition needs it.
+//! Protocol identities, implemented adapter paths, and the shared model-target
+//! resolver from `docs/plans/protocol-provider-mux.md`. Protocol identities are
+//! data; frontend and backend adapter behavior remains in typed modules.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+
+use crate::providers::Provider;
 
 /// One inference wire protocol understood by a frontend or backend binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -223,10 +226,226 @@ impl CanonicalBackend {
     }
 }
 
+/// One implemented path through the canonical adapter graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteDeclaration {
+    frontend: ProtocolId,
+    provider: &'static str,
+    backend: ProtocolId,
+}
+
+const ROUTES: &[RouteDeclaration] = &[
+    RouteDeclaration {
+        frontend: ProtocolId::AnthropicMessages,
+        provider: "anthropic_sub",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::AnthropicMessages,
+        provider: "anthropic_api",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::AnthropicMessages,
+        provider: "openrouter",
+        backend: ProtocolId::AnthropicMessages,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::AnthropicMessages,
+        provider: "codex_sub",
+        backend: ProtocolId::OpenAiResponses,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiChat,
+        provider: "openrouter",
+        backend: ProtocolId::OpenAiChat,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiChat,
+        provider: "codex_sub",
+        backend: ProtocolId::OpenAiResponses,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiResponses,
+        provider: "codex_sub",
+        backend: ProtocolId::OpenAiResponses,
+    },
+];
+
+/// A fully resolved inference destination.
+///
+/// The provider owns endpoint, credential, meter, and cost behavior. The
+/// binding chooses the backend wire adapter. Model identities remain separate:
+/// `requested_model` is the frontend spelling, while `effective_model` has
+/// only toker's outer routing prefix removed.
+#[derive(Clone)]
+pub struct ModelTarget {
+    provider: Arc<dyn Provider>,
+    binding: BackendBinding,
+    requested_model: Option<String>,
+    effective_model: Option<String>,
+}
+
+impl ModelTarget {
+    pub fn provider(&self) -> &Arc<dyn Provider> {
+        &self.provider
+    }
+
+    pub const fn binding(&self) -> BackendBinding {
+        self.binding
+    }
+
+    pub fn requested_model(&self) -> Option<&str> {
+        self.requested_model.as_deref()
+    }
+
+    pub fn effective_model(&self) -> Option<&str> {
+        self.effective_model.as_deref()
+    }
+}
+
+/// Failure to resolve an implemented route because its configured provider is
+/// absent. Handlers render this in the frontend protocol's own error shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteNotConfigured;
+
+/// The enabled providers and defaults projected onto the implemented route
+/// graph. Handlers resolve through this registry instead of maintaining their
+/// own provider-prefix tables.
+#[derive(Clone)]
+pub struct RouteRegistry {
+    providers: HashMap<String, Arc<dyn Provider>>,
+    defaults: HashMap<ProtocolId, String>,
+}
+
+impl RouteRegistry {
+    pub fn new(
+        providers: impl IntoIterator<Item = Arc<dyn Provider>>,
+        defaults: impl IntoIterator<Item = (ProtocolId, String)>,
+    ) -> RouteRegistry {
+        RouteRegistry {
+            providers: providers
+                .into_iter()
+                .map(|provider| (provider.id().to_owned(), provider))
+                .collect(),
+            defaults: defaults.into_iter().collect(),
+        }
+    }
+
+    pub fn provider(&self, id: &str) -> Option<&Arc<dyn Provider>> {
+        self.providers.get(id)
+    }
+
+    /// Resolve a frontend model spelling to its provider, backend binding, and
+    /// two model identities. Unknown prefixes are provider-owned model ids and
+    /// therefore remain intact on the protocol default.
+    pub fn resolve(
+        &self,
+        frontend: ProtocolId,
+        requested_model: Option<&str>,
+    ) -> Result<ModelTarget, RouteNotConfigured> {
+        let explicit = requested_model.and_then(|model| {
+            ROUTES
+                .iter()
+                .filter(|route| route.frontend == frontend)
+                .find_map(|route| {
+                    model
+                        .strip_prefix(route.provider)
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .map(|rest| (*route, rest))
+                })
+        });
+        let protocol_alias = (frontend == ProtocolId::AnthropicMessages)
+            .then_some(requested_model)
+            .flatten()
+            .and_then(|model| model.strip_prefix("anthropic/"));
+
+        let (provider_id, effective_model) = if let Some((route, rest)) = explicit {
+            (route.provider, Some(rest))
+        } else {
+            let provider = self.defaults.get(&frontend).ok_or(RouteNotConfigured)?;
+            (provider.as_str(), protocol_alias.or(requested_model))
+        };
+        let declaration = ROUTES
+            .iter()
+            .find(|route| route.frontend == frontend && route.provider == provider_id)
+            .ok_or(RouteNotConfigured)?;
+        let provider = self
+            .providers
+            .get(declaration.provider)
+            .cloned()
+            .ok_or(RouteNotConfigured)?;
+        let binding = provider
+            .bindings()
+            .iter()
+            .copied()
+            .find(|binding| {
+                binding.protocol() == declaration.backend && binding.canonical_backend().is_some()
+            })
+            .ok_or(RouteNotConfigured)?;
+        Ok(ModelTarget {
+            provider,
+            binding,
+            requested_model: requested_model.map(str::to_owned),
+            effective_model: effective_model.map(str::to_owned),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::HeaderMap;
+    use reqwest::Url;
+
     use super::Capabilities;
-    use super::{BackendAdapterId, BackendBinding, DialectId, FrontendProfile, ProtocolId};
+    use super::{
+        BackendAdapterId, BackendBinding, DialectId, FrontendProfile, ProtocolId, RouteRegistry,
+    };
+    use crate::providers::Provider;
+
+    struct FakeProvider {
+        id: &'static str,
+        bindings: &'static [BackendBinding],
+    }
+
+    impl Provider for FakeProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn bindings(&self) -> &'static [BackendBinding] {
+            self.bindings
+        }
+
+        fn endpoint(&self, _path: &str) -> Url {
+            "http://127.0.0.1:9".parse().expect("fixture URL")
+        }
+
+        fn inject_auth(&self, _outgoing: &mut HeaderMap) {}
+    }
+
+    const MESSAGES: &[BackendBinding] = &[BackendBinding::canonical(
+        ProtocolId::AnthropicMessages,
+        DialectId::AnthropicMessages,
+        BackendAdapterId::AnthropicMessages,
+        Capabilities::MESSAGES,
+    )];
+    const OPENROUTER: &[BackendBinding] = &[
+        BackendBinding::canonical(
+            ProtocolId::OpenAiChat,
+            DialectId::OpenRouterChatCompletions,
+            BackendAdapterId::OpenAiChatCompletions,
+            Capabilities::CHAT,
+        ),
+        BackendBinding::canonical(
+            ProtocolId::AnthropicMessages,
+            DialectId::OpenRouterMessages,
+            BackendAdapterId::AnthropicMessages,
+            Capabilities::MESSAGES,
+        ),
+    ];
 
     #[test]
     fn known_frontend_profiles_name_their_ambiguous_protocol() {
@@ -272,5 +491,74 @@ mod tests {
         let canonical = ready.canonical_backend().expect("adapter is verified");
         assert_eq!(canonical.adapter(), BackendAdapterId::CodexResponses);
         assert_eq!(canonical.capabilities(), Capabilities::CODEX);
+    }
+
+    #[test]
+    fn the_registry_resolves_provider_binding_and_both_model_identities() {
+        let registry = RouteRegistry::new(
+            [
+                Arc::new(FakeProvider {
+                    id: "anthropic_sub",
+                    bindings: MESSAGES,
+                }) as Arc<dyn Provider>,
+                Arc::new(FakeProvider {
+                    id: "openrouter",
+                    bindings: OPENROUTER,
+                }),
+            ],
+            [
+                (ProtocolId::AnthropicMessages, "anthropic_sub".to_owned()),
+                (ProtocolId::OpenAiChat, "openrouter".to_owned()),
+            ],
+        );
+
+        let target = registry
+            .resolve(
+                ProtocolId::AnthropicMessages,
+                Some("openrouter/openai/gpt-5.2"),
+            )
+            .expect("implemented route");
+        assert_eq!(target.provider().id(), "openrouter");
+        assert_eq!(target.binding().dialect(), DialectId::OpenRouterMessages);
+        assert_eq!(target.requested_model(), Some("openrouter/openai/gpt-5.2"));
+        assert_eq!(target.effective_model(), Some("openai/gpt-5.2"));
+
+        let alias = registry
+            .resolve(
+                ProtocolId::AnthropicMessages,
+                Some("anthropic/claude-opus-5"),
+            )
+            .expect("protocol alias");
+        assert_eq!(alias.provider().id(), "anthropic_sub");
+        assert_eq!(alias.effective_model(), Some("claude-opus-5"));
+
+        let provider_owned = registry
+            .resolve(ProtocolId::OpenAiChat, Some("anthropic/claude-opus-5"))
+            .expect("unknown prefix belongs to the model id");
+        assert_eq!(provider_owned.provider().id(), "openrouter");
+        assert_eq!(
+            provider_owned.effective_model(),
+            Some("anthropic/claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn an_explicit_but_disabled_provider_is_not_sent_to_the_default() {
+        let registry = RouteRegistry::new(
+            [Arc::new(FakeProvider {
+                id: "anthropic_sub",
+                bindings: MESSAGES,
+            }) as Arc<dyn Provider>],
+            [(ProtocolId::AnthropicMessages, "anthropic_sub".to_owned())],
+        );
+
+        assert!(
+            registry
+                .resolve(
+                    ProtocolId::AnthropicMessages,
+                    Some("openrouter/z-ai/glm-5.3")
+                )
+                .is_err()
+        );
     }
 }

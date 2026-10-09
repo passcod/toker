@@ -37,6 +37,7 @@ use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
+use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, forward_upstream, plain_status,
@@ -141,7 +142,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
 /// and response take the same canonical path as every cross-protocol route.
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
-    let Some(backend) = server.codex_sub.clone() else {
+    let Ok(mut target) = server.registry.resolve(ProtocolId::OpenAiResponses, None) else {
         return super::responses_not_configured();
     };
     if server.codex_turn.is_none() {
@@ -179,10 +180,21 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .and_then(|request| request.openai_responses().prompt_cache_key())
         .map(str::to_owned);
     let request_session = body_session.clone().or_else(|| header_session.clone());
-    let model = parsed
+    let requested_model = parsed
         .as_ref()
         .and_then(|request| request.openai_responses().model())
         .map(str::to_owned);
+    if parsed.is_some() {
+        target = match server
+            .registry
+            .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
+        {
+            Ok(target) => target,
+            Err(_) => return super::responses_not_configured(),
+        };
+    }
+    let backend = target.provider().clone();
+    let effective_model = target.effective_model().map(str::to_owned);
     let stream_explicitly_false = parsed.as_ref().is_some_and(|request| {
         request.value().get("stream").and_then(Value::as_bool) == Some(false)
     });
@@ -191,8 +203,8 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         started,
         path: "/v1/responses",
         session_id: request_session.clone(),
-        requested_model: model.clone(),
-        effective_model: model.clone(),
+        requested_model: requested_model.clone(),
+        effective_model: effective_model.clone(),
         drift: None,
         backend: backend.clone(),
         betas: None,
@@ -220,7 +232,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         session_id: request_session,
         thread_id,
         request_id,
-        served_model: model,
+        served_model: effective_model,
         stream_explicitly_false,
         frontend_wire: CodexFrontendWire::OpenAiResponses,
     })
