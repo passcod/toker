@@ -318,11 +318,13 @@ No endpoint, body, credential, catalogue, or ledger behavior changes.
 
 In progress. The Messages adapter is complete in both directions. OpenAI Chat
 request ingress, deterministic OpenRouter Chat request egress, and streaming
-and complete OpenRouter response interpretation are implemented. The Messages
-and OpenRouter Chat provider bindings declare canonical readiness, and the
-Chat frontend renders canonical streaming and complete responses. Live
-handlers remain on the legacy path until phase 3 cuts each route over. Native
-Responses ingress remains pending.
+and complete OpenRouter response interpretation are implemented. OpenAI
+Responses request ingress now preserves messages, tools, named reasoning
+effort, extensions, and opaque provider reasoning items canonically; its
+frontend response renderer remains pending. The Messages and OpenRouter Chat
+provider bindings declare canonical readiness, and the Chat frontend renders
+canonical streaming and complete responses. Live handlers remain on the
+legacy path until phase 3 cuts each route over.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.

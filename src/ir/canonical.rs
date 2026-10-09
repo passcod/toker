@@ -46,10 +46,8 @@ use crate::routing::DialectId;
 
 /// A canonical request: one inference turn, wire-agnostic.
 ///
-/// Built by a frontend adapter (today:
-/// [`from_anthropic`](crate::translate::anthropic_frontend::from_anthropic)),
-/// rendered by a backend adapter (today:
-/// [`codex_from_canonical`](crate::translate::codex_from_canonical)).
+/// Built by a frontend adapter (Messages, Chat Completions, or Responses),
+/// and rendered by a backend adapter.
 /// Prompt-cache identity remains an explicit adapter input because it comes
 /// from request headers. Model identity is request semantics and stays in the
 /// canonical so routing middleware can transform it before rendering.
@@ -432,15 +430,18 @@ pub struct SamplingSpec {
     pub stop_sequences: Option<Vec<String>>,
 }
 
-/// The request-side thinking intent: parse `enabled` only (absent,
-/// `null`, or any other shape means "the client did not ask", and
-/// the model's own default governs).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ThinkingSpec {
-    /// The requested reasoning budget, the wire's own knob-speak —
-    /// how a backend maps it (the codex effort ladder) is backend
-    /// policy.
-    pub budget_tokens: u64,
+/// The request-side reasoning intent, in the frontend wire's own units.
+///
+/// Keeping the forms distinct is deliberate: a Responses effort tier has no
+/// evidence-backed inverse token budget, so ingress never invents one. A
+/// backend either accepts the same form, translates it by documented policy,
+/// or reports that it cannot represent it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThinkingSpec {
+    /// Anthropic Messages' explicit reasoning-token budget.
+    BudgetTokens(u64),
+    /// OpenAI Responses' named reasoning-effort tier.
+    Effort(String),
 }
 
 // ── the turn model (the response direction) ─────────────────────────

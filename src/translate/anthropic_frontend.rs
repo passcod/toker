@@ -663,7 +663,7 @@ fn thinking_of(body: &Value) -> Result<Option<ThinkingSpec>, TranslateError> {
         .ok_or_else(|| TranslateError::Malformed {
             reason: "thinking.budget_tokens is missing or not a non-negative integer".to_owned(),
         })?;
-    Ok(Some(ThinkingSpec { budget_tokens }))
+    Ok(Some(ThinkingSpec::BudgetTokens(budget_tokens)))
 }
 
 // ── block content helpers ──────────────────────────────────────────
@@ -2038,9 +2038,7 @@ mod tests {
                                    "messages": [{"role": "user", "content": "Hi"}]}))
             .expect("parses")
             .thinking,
-            Some(ThinkingSpec {
-                budget_tokens: 20_000
-            })
+            Some(ThinkingSpec::BudgetTokens(20_000))
         );
         // Absent and disabled both mean "the client did not ask" —
         // never guessed here.

@@ -13,7 +13,7 @@ use serde_json::{Map, Number, Value, json};
 use crate::ir::canonical::{
     CanonBlock, CanonError, CanonErrorKind, CanonEvent, CanonMessage, CanonRole, CanonStopReason,
     CanonSystemPart, CanonTool, CanonToolCall, CanonToolChoice, CanonTurn, CanonicalExtension,
-    CanonicalRequest, CanonicalUsage, ToolResultContent,
+    CanonicalRequest, CanonicalUsage, ThinkingSpec, ToolResultContent,
 };
 use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
@@ -99,10 +99,19 @@ pub fn render_anthropic(
         body.insert("stop_sequences".to_owned(), json!(stops));
     }
     if let Some(thinking) = &canonical.thinking {
-        body.insert(
-            "thinking".to_owned(),
-            json!({"type": "enabled", "budget_tokens": thinking.budget_tokens}),
-        );
+        match thinking {
+            ThinkingSpec::BudgetTokens(budget_tokens) => {
+                body.insert(
+                    "thinking".to_owned(),
+                    json!({"type": "enabled", "budget_tokens": budget_tokens}),
+                );
+            }
+            ThinkingSpec::Effort(_) => report.push(TranslationLoss::new(
+                "thinking.effort",
+                TranslationLossReason::NotRepresentable,
+                1,
+            )),
+        }
     }
     if let Some(stream) = canonical.stream {
         body.insert("stream".to_owned(), Value::Bool(stream));
@@ -972,6 +981,28 @@ mod tests {
         assert!(!report.contains("must not leak"));
         assert!(!report.contains("reasoning-cache-value"));
         assert!(!report.contains("opaque-value"));
+    }
+
+    #[test]
+    fn responses_effort_is_reported_instead_of_inventing_a_token_budget() {
+        let canonical = crate::ir::canonical::CanonicalRequest {
+            model: Some("claude-example".to_owned()),
+            thinking: Some(crate::ir::canonical::ThinkingSpec::Effort(
+                "xhigh".to_owned(),
+            )),
+            ..Default::default()
+        };
+        let rendered = render_anthropic(&canonical, DialectId::AnthropicMessages)
+            .expect("renders with a loss");
+        assert!(rendered.value.get("thinking").is_none());
+        assert_eq!(
+            rendered.report.losses(),
+            &[TranslationLoss::new(
+                "thinking.effort",
+                TranslationLossReason::NotRepresentable,
+                1,
+            )]
+        );
     }
 
     #[test]

@@ -456,12 +456,12 @@ fn tool_choice_of(choice: &CanonToolChoice) -> Result<String, TranslateError> {
 /// `default_reasoning_level`), which is exactly what "the client did
 /// not ask" means.
 fn effort_of(thinking: &ThinkingSpec) -> String {
-    match thinking.budget_tokens {
-        0..=16_383 => "low",
-        16_384..=32_767 => "medium",
-        _ => "high",
+    match thinking {
+        ThinkingSpec::Effort(effort) => effort.clone(),
+        ThinkingSpec::BudgetTokens(0..=16_383) => "low".to_owned(),
+        ThinkingSpec::BudgetTokens(16_384..=32_767) => "medium".to_owned(),
+        ThinkingSpec::BudgetTokens(_) => "high".to_owned(),
     }
-    .to_owned()
 }
 
 // ── shared ──────────────────────────────────────────────────────────
@@ -762,9 +762,7 @@ mod tests {
                 max_tokens: Some(4096),
                 stop_sequences: Some(vec!["\n\nHuman:".to_owned()]),
             },
-            thinking: Some(ThinkingSpec {
-                budget_tokens: 2048,
-            }),
+            thinking: Some(ThinkingSpec::BudgetTokens(2048)),
             messages: vec![message(
                 CanonRole::User,
                 vec![CanonBlock::Text("Hi".to_owned())],
@@ -1421,9 +1419,7 @@ mod tests {
             (64_000, "high"),
         ] {
             let canonical = CanonicalRequest {
-                thinking: Some(ThinkingSpec {
-                    budget_tokens: budget,
-                }),
+                thinking: Some(ThinkingSpec::BudgetTokens(budget)),
                 messages: vec![message(
                     CanonRole::User,
                     vec![CanonBlock::Text("Hi".to_owned())],
@@ -1455,9 +1451,7 @@ mod tests {
         );
         // Purity: same budget, same effort bytes, every time.
         let canonical = CanonicalRequest {
-            thinking: Some(ThinkingSpec {
-                budget_tokens: 20_000,
-            }),
+            thinking: Some(ThinkingSpec::BudgetTokens(20_000)),
             messages: vec![message(
                 CanonRole::User,
                 vec![CanonBlock::Text("Hi".to_owned())],
@@ -1474,6 +1468,25 @@ mod tests {
             .expect("serialise");
             assert_eq!(first, again);
         }
+
+        // Responses ingress already speaks in effort tiers. They cross this
+        // same-dialect boundary verbatim, including a future tier this
+        // adapter has not learned; converting it through a token budget would
+        // be an unsupported guess.
+        let native = CanonicalRequest {
+            thinking: Some(ThinkingSpec::Effort("xhigh".to_owned())),
+            model: Some(MODEL.to_owned()),
+            ..CanonicalRequest::default()
+        };
+        assert_eq!(
+            render_codex(&native, KEY)
+                .expect("native effort renders")
+                .value
+                .reasoning
+                .effort
+                .as_deref(),
+            Some("xhigh")
+        );
     }
 
     // ── the response direction: interpretation ────────────────────
