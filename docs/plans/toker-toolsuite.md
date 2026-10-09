@@ -51,8 +51,7 @@ backend's protocol. **There is no passthrough code path**, including when the
 frontend and backend name the same protocol. Compatible adapters may replay an
 opaque extension; otherwise they report its content-free translation loss or
 reject the request when omission would invalidate it. See
-[`protocol-provider-mux.md`](protocol-provider-mux.md) for the route graph and
-migration plan.
+[`routing.md`](../internals/routing.md) for the route graph.
 
 ### Middleware
 
@@ -218,8 +217,7 @@ No config files written by hand unless wanted; `toker.toml` exists for hand-edit
 ## Phases
 
 These phases record the original dogfood-first delivery order. The universal
-canonical migration that follows them is specified and phased in
-[`protocol-provider-mux.md`](protocol-provider-mux.md).
+canonical route graph is described in [`routing.md`](../internals/routing.md).
 
 1. **Opencode + openrouter, today.** OpenAI-chat frontend + openrouter backend, IR core with the serialisation-purity and fidelity-monitor machinery, full recording (billed cost + serving provider verbatim), lanes, minimal TUI (sessions, context, spend). Same-protocol from day one, so this phase is the live test of IR re-serialisation against OpenRouter's real cache behaviour. Exit: ledger proxy retired.
 2. **Anthropic.** Frontend endpoint + api/sub backends, full middleware (meters → quota gate, release marker, cold gate, compaction retarget, force-newest), `toker import`, sleep lock, quota panels. Exit: ctp retired at work.

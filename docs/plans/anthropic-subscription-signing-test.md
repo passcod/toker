@@ -1,8 +1,8 @@
 # Anthropic subscription signing: on-host test
 
 This is a manual verification script for a machine with a Claude Code login.
-It is separate from the mux implementation plan because that plan records
-implementation work, not verification. Run it only when a small real
+It remains after the mux implementation plan because it records on-host
+verification, not unfinished implementation. Run it only when a small real
 subscription request is acceptable and no live session will be disrupted by
 installing or restarting toker.
 

@@ -1,7 +1,7 @@
 //! The identities in toker's protocol/provider route graph.
 //!
 //! Protocol identities, implemented adapter paths, and the shared model-target
-//! resolver from `docs/plans/protocol-provider-mux.md`. Protocol identities are
+//! resolver described in `docs/internals/routing.md`. Protocol identities are
 //! data; frontend and backend adapter behavior remains in typed modules.
 
 use std::collections::HashMap;
