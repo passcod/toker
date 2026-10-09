@@ -14,16 +14,21 @@
 //! ┌ SESSIONS ────────────────────────────────────────────────────────┐
 //! │ table sized to its data; sheds columns before the label narrows  │
 //! └────────────────────────────────────────────────────────────────────┘
-//! ┌ SPEND ─────────────┐ ┌ RATE & QUOTA ──────────────────────────────┐
-//! │ billed             │ │ requests ▁▂··▃█ 0.6/min  1 error           │
-//! │ breakdown          │ │ 5-hour   ██░░░░  12%  resets 14:53 · on track
-//! │ no cost data: N    │ │ 7-day    ██████░  74%  resets Mon 05:00 · stops ~Thu 08:49
-//! └─────────────────────┘ │ overage  ██████░  64%  resets 1 Oct · estimating
-//!                         │ spent    today +3%  ·  30m <1%            │
-//!                         │ binding  five_hour                         │
-//!                         └────────────────────────────────────────────┘
+//! ┌ CACHE REBUILDS ──────────────────┐┌ SPEND ──────────────────────────┐
+//! │ 2 of 17 requests rewrote ≥2,048  ││ billed: $1.20 (3 requests)      │
+//! │ system prompt changed      2 ▬▬  ││ no cost data: N                 │
+//! └──────────────────────────────────┘└─────────────────────────────────┘
+//! ┌ RATE & QUOTA ──────────────────────────────────────────────────────┐
+//! │ requests ▁▂··▃█ 0.6/min  1 error                                   │
+//! │ 5-hour   ██░░░░  12%  resets 14:53 · on track                      │
+//! │ 7-day    ██████░  74%  resets Mon 05:00 · stops ~Thu 08:49         │
+//! │ overage  ██████░  64%  resets 1 Oct · estimating                   │
+//! │ spent    today +3%  ·  30m <1%                                     │
+//! │ binding  five_hour                                                 │
+//! └────────────────────────────────────────────────────────────────────┘
 //! ```
-//! (the bottom strip holds SPEND and RATE & QUOTA side by side, and the
+//! (SPEND shares CACHE REBUILDS' row, half each, when the window carries
+//! a cost; RATE & QUOTA has the bottom strip to itself, and the
 //! quota lines render only when the snapshot carries a quota section —
 //! absence renders nothing, never zeros). The panels are boxed while the
 //! page has room and ruled (`SESSIONS ────`, a row cheaper each) when it
@@ -55,10 +60,14 @@ use crate::catalog::windows::ContextWindow;
 use crate::ir::Release;
 use crate::middleware::cold::Verdict;
 
-/// The most lines SPEND claims in the bottom strip: the total line, the
-/// never-dropped "no cost data" line, and a few breakdown lines. The
-/// quota section can grow the strip past it (see [`bottom_height`]).
+/// The most lines SPEND claims beside CACHE REBUILDS: the total line,
+/// the never-dropped "no cost data" line, and a few breakdown lines.
+/// The rebuild causes can grow the row past it (see [`spend_lines`]).
 const SPEND_LINES: u16 = 7;
+
+/// The fewest lines SPEND renders in: the total and the "no cost data"
+/// counter, which invariant 3 keeps in view.
+const SPEND_FLOOR: u16 = 2;
 
 /// The meter bar's width (22 cells), the widest
 /// it ever renders — it shrinks as the panel narrows rather than
@@ -328,11 +337,11 @@ pub(crate) fn no_color(value: Option<std::ffi::OsString>) -> bool {
 /// stay deterministic.
 ///
 /// The panels stack in the reference dashboard's order — SESSIONS /
-/// CONTEXT / TOKENS / CACHE REBUILDS, then the bottom strip holding
-/// RATE & QUOTA, with the toker-only SPEND beside it when the window
-/// carries a cost
-/// ([`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost))
-/// — into the height plan [`plan_layout`] computes from the snapshot.
+/// CONTEXT / TOKENS / CACHE REBUILDS, with the toker-only SPEND beside
+/// the rebuilds when the window carries a cost
+/// ([`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost)),
+/// then the bottom strip holding RATE & QUOTA — into the height plan
+/// [`plan_layout`] computes from the snapshot.
 /// The lists start at the [`Ui::scroll`] offsets.
 pub(crate) fn render(
     frame: &mut Frame,
@@ -370,17 +379,17 @@ pub(crate) fn render(
         popup: None,
     };
     render_tokens(frame, layout.tokens, chrome, snap, fmt);
-    render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
     if snap.spend.carries_cost() {
-        // Even halves: the meters' reset clocks need the width as much
+        // Even halves: the rebuild detail lines need the width as much
         // as the breakdown lines do.
-        let [spend, rate] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(layout.bottom);
+        let [rebuilds, spend] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(layout.rebuilds);
+        render_rebuilds(frame, rebuilds, chrome, snap, fmt);
         render_spend(frame, spend, chrome, snap);
-        render_rate(frame, rate, chrome, snap, tz, fmt);
     } else {
-        render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
+        render_rebuilds(frame, layout.rebuilds, chrome, snap, fmt);
     }
+    render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
     // The overlays are exclusive (the loop opens one by closing the
     // other); the legend wins if both are ever set.
     if ui.legend {
@@ -578,7 +587,11 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
     let context_need = context_rows(snap).max(1) as u16;
     let tokens_full = tokens_lines(snap) as u16;
     let tokens_min = tokens_min_lines(snap) as u16;
-    let rebuilds_full = rebuilds_lines(snap) as u16;
+    // SPEND shares the rebuild row, so the row is the taller of the two
+    // and never shrinks under SPEND's floor while SPEND renders.
+    let spend = spend_lines(snap);
+    let rebuilds_full = (rebuilds_lines(snap) as u16).max(spend);
+    let rebuilds_min = spend.clamp(1, SPEND_FLOOR);
 
     // Natural heights first, boxed then ruled; then the fixed sections
     // shrink, TOKENS before CACHE REBUILDS (the panel to watch).
@@ -592,7 +605,7 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
             .map(|t| (Chrome::Ruled, t, rebuilds_full)),
     );
     attempts.extend(
-        (1..rebuilds_full)
+        (rebuilds_min..rebuilds_full)
             .rev()
             .map(|r| (Chrome::Ruled, tokens_min, r)),
     );
@@ -632,7 +645,7 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
         sessions_head + 1 + 1,
         1 + 1,
         tokens_min + 1,
-        1 + 1, // the rebuild summary under its rule
+        rebuilds_min + 1, // the rebuild summary (and SPEND's floor) under its rule
     ];
     let room = area.height - bottom - header;
     let mut over = middle.iter().sum::<u16>().saturating_sub(room);
@@ -646,6 +659,12 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
     // REBUILDS below it, which renders a cause row in each.
     if (1..tokens_min + 1).contains(&middle[2]) {
         middle[3] += std::mem::take(&mut middle[2]);
+    }
+    // Nor does SPEND clip its "no cost data" counter (invariant 3): a
+    // cut that would leave the row short of SPEND's floor takes it
+    // whole, and the rows go back to SESSIONS, cut last.
+    if spend > 0 && (1..rebuilds_min + 1).contains(&middle[3]) {
+        middle[0] += std::mem::take(&mut middle[3]);
     }
     stack(area, chrome, header, bottom, middle)
 }
@@ -820,12 +839,22 @@ fn rebuilds_lines(snap: &Snapshot) -> usize {
     lines
 }
 
-/// The bottom strip's height: the taller of RATE & QUOTA's lines and,
-/// while SPEND renders beside it, SPEND's — its breakdown capped at
-/// [`SPEND_LINES`], since it has no line budget of its own — plus the
-/// frame. Sized to the content rather than floored: a padded strip is
-/// rows a short terminal's lists never get. Pinned: the middle sheds
-/// before the strip does ([`plan_layout`]).
+/// SPEND's content lines while it renders, else zero: the total, the
+/// "no cost data" counter, the breakdown and the non-billed count,
+/// capped at [`SPEND_LINES`], since it has no line budget of its own.
+fn spend_lines(snap: &Snapshot) -> u16 {
+    if !snap.spend.carries_cost() {
+        return 0;
+    }
+    let spend = &snap.spend;
+    let lines = 2 + spend.breakdown.len() + usize::from(spend.other_cost_kinds > 0);
+    (lines as u16).min(SPEND_LINES)
+}
+
+/// The bottom strip's height: RATE & QUOTA's lines plus the frame.
+/// Sized to the content rather than floored: a padded strip is rows a
+/// short terminal's lists never get. Pinned: the middle sheds before
+/// the strip does ([`plan_layout`]).
 fn bottom_height(snap: &Snapshot, chrome: Chrome) -> u16 {
     let mut lines = 1; // the requests line
     if let Some(quota) = &snap.quota {
@@ -837,14 +866,7 @@ fn bottom_height(snap: &Snapshot, chrome: Chrome) -> u16 {
             lines += 1;
         }
     }
-    let lines = lines as u16;
-    let lines = if snap.spend.carries_cost() {
-        let spend = 2 + snap.spend.breakdown.len() + usize::from(snap.spend.other_cost_kinds > 0);
-        lines.max((spend as u16).min(SPEND_LINES))
-    } else {
-        lines
-    };
-    lines + chrome.cost()
+    lines as u16 + chrome.cost()
 }
 
 /// Header line: the window summary on the left, the freshness and the
@@ -3292,28 +3314,22 @@ mod tests {
         assert!(text.contains("today +6%  ·  30m <1%"), "spent stays");
     }
 
-    /// The row index of the bottom strip's top border: the first row
-    /// holding the RATE & QUOTA title.
-    fn strip_top(text: &str) -> usize {
-        text.lines()
-            .position(|line| line.contains("RATE & QUOTA"))
-            .expect("the rate panel renders")
-    }
-
     #[test]
-    fn an_unbilled_window_hides_spend_and_gives_quota_the_strip() {
+    fn an_unbilled_window_hides_spend_and_gives_rebuilds_the_row() {
         // The quota fixture is subscription-shaped: no row is billed,
-        // so SPEND could only restate counts. RATE & QUOTA takes the
-        // whole width, and the strip is its natural height — the
-        // requests line, three meters, spent, binding, and borders — not
-        // the nine-row floor SPEND's breakdown needs.
+        // so SPEND could only restate counts. CACHE REBUILDS takes the
+        // whole width, and the strip is RATE & QUOTA's natural height:
+        // the requests line, three meters, spent, binding, and borders.
         let snap = quota_snapshot();
         assert!(!snap.spend.carries_cost());
         let text = rendered(&snap, 100, 30);
         assert!(!text.contains("SPEND"), "{text}");
         assert!(!text.contains("no cost data"), "{text}");
-        let top = text.lines().nth(strip_top(&text)).expect("the top row");
-        assert!(top.starts_with("┌RATE & QUOTA"), "{top}");
+        let top = text
+            .lines()
+            .nth(row_of(&text, "CACHE REBUILDS"))
+            .expect("the top row");
+        assert!(top.starts_with("┌CACHE REBUILDS"), "{top}");
         assert!(top.ends_with('┐'), "{top}");
         assert_eq!(strip_height(&text), 8, "{text}");
 
@@ -3340,6 +3356,14 @@ mod tests {
         assert_eq!(strip_height(&text), 3, "{text}");
     }
 
+    /// The row index of the first row holding `title`: a panel's top
+    /// border.
+    fn row_of(text: &str, title: &str) -> usize {
+        text.lines()
+            .position(|line| line.contains(title))
+            .unwrap_or_else(|| panic!("{title} renders: {text}"))
+    }
+
     /// The bottom strip's rows: its top border to the last bottom
     /// border.
     fn strip_height(text: &str) -> usize {
@@ -3349,35 +3373,58 @@ mod tests {
             .iter()
             .rposition(|line| line.starts_with('└'))
             .expect("the strip closes");
-        last + 1 - strip_top(text)
+        last + 1 - row_of(text, "RATE & QUOTA")
     }
 
     #[test]
-    fn a_billed_window_splits_the_strip_evenly() {
-        // The shared fixture carries one billed request: SPEND renders
-        // on the left half and RATE & QUOTA on the right, at SPEND's
-        // three lines (total, no cost data, one breakdown) — the strip
-        // sized to its content, not padded.
+    fn a_billed_window_splits_the_rebuild_row_evenly() {
+        // The shared fixture carries one billed request: CACHE REBUILDS
+        // renders on the left half and SPEND on the right, and RATE &
+        // QUOTA keeps the whole strip below them.
         let snap = snapshot();
         assert!(snap.spend.carries_cost());
         let text = rendered(&snap, 100, 30);
+        let row = row_of(&text, "CACHE REBUILDS");
         let top: Vec<char> = text
             .lines()
-            .nth(strip_top(&text))
+            .nth(row)
             .expect("the top row")
             .chars()
             .collect();
         assert_eq!(top.len(), 100);
-        assert!(top[..50].iter().collect::<String>().starts_with("┌SPEND"));
-        assert_eq!(top[49], '┐');
         assert!(
-            top[50..]
+            top[..50]
                 .iter()
                 .collect::<String>()
-                .starts_with("┌RATE & QUOTA"),
+                .starts_with("┌CACHE REBUILDS"),
             "{text}"
         );
-        assert_eq!(strip_height(&text), 5, "{text}");
+        assert_eq!(top[49], '┐');
+        assert!(
+            top[50..].iter().collect::<String>().starts_with("┌SPEND"),
+            "{text}"
+        );
+        let strip = text
+            .lines()
+            .nth(row_of(&text, "RATE & QUOTA"))
+            .expect("the strip");
+        assert!(strip.starts_with("┌RATE & QUOTA"), "{strip}");
+        assert!(strip.ends_with('┐'), "{strip}");
+        assert!(text.contains("no cost data"), "{text}");
+    }
+
+    #[test]
+    fn a_short_page_keeps_spends_counter_or_drops_the_row_whole() {
+        // SPEND moved off the pinned strip into the middle, which sheds:
+        // at every height its "no cost data" counter (invariant 3)
+        // either shows or the panel is gone, never a bare total.
+        let snap = snapshot();
+        for height in 4..=30u16 {
+            let text = rendered(&snap, 100, height);
+            if text.contains("SPEND") {
+                assert!(text.contains("no cost data"), "at {height}:\n{text}");
+            }
+        }
     }
 
     /// One meter line's text at `width`, from the quota fixture's
