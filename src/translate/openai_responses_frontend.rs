@@ -523,7 +523,7 @@ impl OpenAiResponsesRenderer {
                 ));
             }
             CanonEvent::ThinkingDelta { part, delta } => {
-                self.ensure_reasoning(&mut out);
+                self.ensure_reasoning(&mut out, None);
                 let item = self.reasoning.as_mut().expect("reasoning item opened");
                 item.summaries.entry(*part).or_default().push_str(delta);
                 let output_index = item.output_index;
@@ -539,8 +539,11 @@ impl OpenAiResponsesRenderer {
                 ));
             }
             CanonEvent::ThinkingSignature { .. } => {}
-            CanonEvent::RedactedThinking { data } => {
-                self.ensure_reasoning(&mut out);
+            CanonEvent::ReasoningStarted { provider_id } => {
+                self.ensure_reasoning(&mut out, provider_id.as_deref());
+            }
+            CanonEvent::RedactedThinking { data, provider_id } => {
+                self.ensure_reasoning(&mut out, provider_id.as_deref());
                 self.reasoning
                     .as_mut()
                     .expect("reasoning item opened")
@@ -639,12 +642,14 @@ impl OpenAiResponsesRenderer {
         });
     }
 
-    fn ensure_reasoning(&mut self, out: &mut Vec<SseEvent>) {
+    fn ensure_reasoning(&mut self, out: &mut Vec<SseEvent>, provider_id: Option<&str>) {
         if self.reasoning.is_some() {
             return;
         }
         let output_index = self.take_output_index();
-        let id = format!("rs_{output_index}");
+        let id = provider_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("rs_{output_index}"));
         out.push(self.sse(
             "response.output_item.added",
             json!({
@@ -760,13 +765,18 @@ fn response_output(turn: &CanonTurn) -> Vec<Value> {
                 let output_index = output.len();
                 let mut summary = Vec::new();
                 let mut encrypted_content = None;
+                let mut provider_id = None;
                 while index < blocks.len() {
                     match blocks[index].semantic() {
                         CanonBlock::Thinking { text, .. } => {
                             summary.push(json!({"type": "summary_text", "text": text}));
                         }
-                        CanonBlock::RedactedThinking { data } => {
+                        CanonBlock::RedactedThinking {
+                            data,
+                            provider_id: id,
+                        } => {
                             encrypted_content = Some(data);
+                            provider_id = id.as_deref();
                         }
                         _ => break,
                     }
@@ -774,7 +784,9 @@ fn response_output(turn: &CanonTurn) -> Vec<Value> {
                 }
                 let mut reasoning = json!({
                     "type": "reasoning",
-                    "id": format!("rs_{output_index}"),
+                    "id": provider_id
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("rs_{output_index}")),
                     "summary": summary,
                 });
                 if let Some(data) = encrypted_content {
@@ -835,8 +847,9 @@ fn output_of_block(block: &CanonBlock, index: usize) -> Option<Value> {
             "type": "reasoning", "id": format!("rs_{index}"),
             "summary": [{"type": "summary_text", "text": text}],
         })),
-        CanonBlock::RedactedThinking { data } => Some(json!({
-            "type": "reasoning", "id": format!("rs_{index}"), "summary": [],
+        CanonBlock::RedactedThinking { data, provider_id } => Some(json!({
+            "type": "reasoning", "id": provider_id.clone()
+                .unwrap_or_else(|| format!("rs_{index}")), "summary": [],
             "encrypted_content": data,
         })),
         CanonBlock::ToolUse { id, name, input } => Some(json!({
@@ -1136,12 +1149,16 @@ mod tests {
             CanonEvent::TurnStarted {
                 turn_id: Some("resp_1".to_owned()),
             },
+            CanonEvent::ReasoningStarted {
+                provider_id: Some("rs_provider_bound".to_owned()),
+            },
             CanonEvent::ThinkingDelta {
                 part: 0,
                 delta: "consider".to_owned(),
             },
             CanonEvent::RedactedThinking {
                 data: "ciphertext".to_owned(),
+                provider_id: Some("rs_provider_bound".to_owned()),
             },
             CanonEvent::ThinkingEnded,
             CanonEvent::TextDelta {
@@ -1192,6 +1209,11 @@ mod tests {
             reasoning_done["item"]["encrypted_content"],
             json!("ciphertext")
         );
+        assert_eq!(
+            reasoning_done["item"]["id"],
+            json!("rs_provider_bound"),
+            "encrypted reasoning must retain the item id its ciphertext binds to"
+        );
 
         let wire = rendered
             .iter()
@@ -1232,6 +1254,7 @@ mod tests {
                 },
                 CanonBlock::RedactedThinking {
                     data: "ciphertext".to_owned(),
+                    provider_id: Some("rs_provider_bound".to_owned()),
                 },
                 CanonBlock::Text("partial".to_owned()),
                 CanonBlock::ToolUse {
@@ -1253,6 +1276,10 @@ mod tests {
         assert_eq!(
             response["output"][0]["encrypted_content"],
             json!("ciphertext")
+        );
+        assert_eq!(
+            response["output"][0]["id"],
+            json!("rs_provider_bound")
         );
         assert_eq!(response["output"][1]["type"], json!("message"));
         assert_eq!(response["output"][2]["call_id"], json!("call_1"));

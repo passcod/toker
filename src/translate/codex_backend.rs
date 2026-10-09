@@ -664,6 +664,11 @@ impl CanonStream {
                     delta: delta.clone(),
                 });
             }
+            ResponseEvent::OutputItemAdded { item } if item.kind() == Some("reasoning") => {
+                out.push(CanonEvent::ReasoningStarted {
+                    provider_id: item.id().map(str::to_owned),
+                });
+            }
             ResponseEvent::OutputItemDone { item } => self.item_done(item, &mut out),
             ResponseEvent::Completed { response } => {
                 out.push(CanonEvent::TurnEnded {
@@ -716,7 +721,10 @@ impl CanonStream {
                     .as_reasoning()
                     .and_then(|reasoning| reasoning.encrypted_content)
                 {
-                    out.push(CanonEvent::RedactedThinking { data });
+                    out.push(CanonEvent::RedactedThinking {
+                        data,
+                        provider_id: item.id().map(str::to_owned),
+                    });
                 }
                 out.push(CanonEvent::ThinkingEnded);
             }
@@ -865,7 +873,10 @@ fn blocks_from_capture(capture: &TurnCapture) -> Option<Vec<CanonBlock>> {
                         }),
                 );
                 if let Some(data) = reasoning.encrypted_content {
-                    blocks.push(CanonBlock::RedactedThinking { data });
+                    blocks.push(CanonBlock::RedactedThinking {
+                        data,
+                        provider_id: item.id().map(str::to_owned),
+                    });
                 }
             }
             "message" => {
@@ -1048,6 +1059,7 @@ mod tests {
                     },
                     CanonBlock::RedactedThinking {
                         data: "opaque-blob".to_owned(),
+                        provider_id: None,
                     },
                     CanonBlock::Text("Answer.".to_owned()),
                 ],
@@ -1711,14 +1723,18 @@ mod tests {
 
     #[test]
     fn the_tool_call_fixture_interprets_to_the_canon_event_sequence() {
-        // The ignorable kinds (output_item.added, the function_call
-        // argument deltas) produce nothing; the message's done is
-        // the text part's end; the call arrives complete.
+        // The reasoning item's added event carries its replay identity;
+        // other added items and the function-call argument deltas produce
+        // nothing. The message's done is the text part's end; the call
+        // arrives complete.
         assert_eq!(
             canon_of(&fixture("01_tool_call_turn.sse")),
             vec![
                 CanonEvent::TurnStarted {
                     turn_id: Some("resp_6f3c9a".to_owned()),
+                },
+                CanonEvent::ReasoningStarted {
+                    provider_id: Some("rs_1".to_owned()),
                 },
                 CanonEvent::ThinkingDelta {
                     part: 0,
@@ -1728,6 +1744,11 @@ mod tests {
                     part: 0,
                     delta: "thread files.".to_owned(),
                 },
+                CanonEvent::RedactedThinking {
+                    data: "opaque-encrypted-reasoning".to_owned(),
+                    provider_id: Some("rs_1".to_owned()),
+                },
+                CanonEvent::ThinkingEnded,
                 CanonEvent::TextDelta {
                     delta: "I'll read the files, then ".to_owned(),
                 },

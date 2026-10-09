@@ -254,7 +254,7 @@ fn block_value(
             ));
             return None;
         }
-        CanonBlock::RedactedThinking { data } => {
+        CanonBlock::RedactedThinking { data, .. } => {
             json!({"type": "redacted_thinking", "data": data})
         }
         CanonBlock::Annotated { .. } => unreachable!("annotations handled above"),
@@ -465,6 +465,7 @@ impl AnthropicResponseStream {
                 if let Some(data) = block.get("data").and_then(Value::as_str) {
                     out.push(CanonEvent::RedactedThinking {
                         data: data.to_owned(),
+                        provider_id: None,
                     });
                 }
                 IncomingBlock::Redacted
@@ -832,6 +833,7 @@ data: {"type":"message_stop"}
                 CanonEvent::ThinkingEnded,
                 CanonEvent::RedactedThinking {
                     data: "encrypted".to_owned(),
+                    provider_id: None,
                 },
             ]
         );

@@ -249,7 +249,12 @@ pub enum CanonBlock {
     },
     /// Provider-encrypted reasoning that must remain opaque and distinct from
     /// visible thinking.
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+        /// The provider's reasoning-item identity, when its encryption binds
+        /// the payload to that identity. Compatible renderers must preserve it.
+        provider_id: Option<String>,
+    },
     /// Node-local wire metadata decorating a semantic block. Structural
     /// middleware moves this wrapper with the block, so no array index becomes
     /// canonical identity. `is_error` is semantic tool-result state; all other
@@ -318,7 +323,7 @@ impl CanonBlock {
                 }
                 value
             }
-            CanonBlock::RedactedThinking { data } => {
+            CanonBlock::RedactedThinking { data, .. } => {
                 json!({"type": "redacted_thinking", "data": data})
             }
             CanonBlock::Annotated {
@@ -620,9 +625,16 @@ pub enum CanonEvent {
     /// opaque: compatible frontends replay it so the block can be submitted
     /// on a later turn; incompatible frontends report or omit it.
     ThinkingSignature { part: u64, signature: String },
+    /// A provider reasoning item opened. Its identity is opaque provider
+    /// metadata, but encrypted reasoning can be replayed only under this same
+    /// identity, so compatible frontends preserve it exactly.
+    ReasoningStarted { provider_id: Option<String> },
     /// One complete provider-encrypted reasoning block. Unlike visible
     /// reasoning it has no text deltas and must remain opaque end to end.
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+        provider_id: Option<String>,
+    },
     /// A COMPLETE tool call — the arguments whole (see
     /// [`CanonToolCall`]).
     ToolCall(CanonToolCall),
@@ -750,7 +762,8 @@ mod tests {
         );
         assert_eq!(
             CanonBlock::RedactedThinking {
-                data: "opaque".to_owned()
+                data: "opaque".to_owned(),
+                provider_id: None,
             }
             .wire_value(),
             json!({"type": "redacted_thinking", "data": "opaque"})

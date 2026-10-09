@@ -352,6 +352,7 @@ pub(crate) fn content_blocks_of(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned(),
+                    provider_id: None,
                 },
                 &["type", "data"],
                 None,
@@ -825,6 +826,7 @@ fn lenient_block_of(block: &Value) -> Option<CanonBlock> {
         "redacted_thinking" => (
             CanonBlock::RedactedThinking {
                 data: block.get("data")?.as_str()?.to_owned(),
+                provider_id: None,
             },
             &["type", "data"],
         ),
@@ -999,7 +1001,8 @@ impl AnthropicRenderer {
                     }),
                 ));
             }
-            CanonEvent::RedactedThinking { data } => {
+            CanonEvent::ReasoningStarted { .. } => {}
+            CanonEvent::RedactedThinking { data, .. } => {
                 self.close_open(&mut out);
                 let index = self.next_index;
                 self.next_index += 1;
@@ -1477,6 +1480,7 @@ mod tests {
                 },
                 CanonBlock::RedactedThinking {
                     data: "opaque-blob".to_owned(),
+                    provider_id: None,
                 },
                 CanonBlock::Text("Answer.".to_owned()),
             ]
@@ -2312,6 +2316,7 @@ mod tests {
             CanonEvent::ThinkingEnded,
             CanonEvent::RedactedThinking {
                 data: "encrypted-reasoning".to_owned(),
+                provider_id: None,
             },
             CanonEvent::TurnEnded {
                 stop_reason: CanonStopReason::EndTurn,

@@ -705,6 +705,10 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert!(response_text.contains("event: response.created"));
     assert!(response_text.contains("event: response.output_text.delta"));
     assert!(response_text.contains("event: response.completed"));
+    assert!(response_text.contains(r#""id":"rs_1""#));
+    assert!(response_text.contains(
+        r#""encrypted_content":"opaque-encrypted-reasoning""#
+    ));
 
     let requests = mock.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
@@ -1210,6 +1214,11 @@ async fn non_streaming_responses_are_aggregated_from_canonical_turns() {
     assert_eq!(body["object"], "response");
     assert_eq!(body["status"], "completed");
     assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][0]["id"], "rs_1");
+    assert_eq!(
+        body["output"][0]["encrypted_content"],
+        "opaque-encrypted-reasoning"
+    );
     assert_eq!(body["output"][1]["type"], "message");
     assert_eq!(body["output"][2]["type"], "function_call");
     assert_eq!(body["usage"]["input_tokens"], 1234);

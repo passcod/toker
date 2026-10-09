@@ -503,7 +503,8 @@ impl OpenAiChatRenderer {
                 None,
                 None,
             )],
-            CanonEvent::RedactedThinking { data } => vec![self.chunk(
+            CanonEvent::ReasoningStarted { .. } => Vec::new(),
+            CanonEvent::RedactedThinking { data, .. } => vec![self.chunk(
                 json!({"reasoning_details": [{"type": "reasoning.encrypted", "data": data}]}),
                 None,
                 None,

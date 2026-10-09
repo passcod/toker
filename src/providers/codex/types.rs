@@ -163,6 +163,11 @@ impl Item {
         self.0.get("type").and_then(Value::as_str)
     }
 
+    /// The provider-owned item identity, when the item carries one.
+    pub fn id(&self) -> Option<&str> {
+        self.0.get("id").and_then(Value::as_str)
+    }
+
     /// The typed view, when this is a `function_call` item (see
     /// [`FunctionCall`] — `arguments` stays the raw JSON string).
     pub fn as_function_call(&self) -> Option<FunctionCall> {
@@ -247,6 +252,7 @@ impl ContentPart {
 /// opaque encrypted content when present.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ReasoningItem {
+    pub id: Option<String>,
     pub summary: Vec<ReasoningSummary>,
     pub encrypted_content: Option<String>,
 }
