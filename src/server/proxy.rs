@@ -52,7 +52,8 @@ use futures::future::{AbortHandle, Abortable};
 use futures::stream::{Stream, StreamExt};
 
 use crate::catalog::offers;
-use crate::ir::{Request as IrRequest, Shape};
+use crate::ir::Shape;
+use crate::ir::canonical::CanonRole;
 use crate::middleware::cold;
 use crate::middleware::force_newest;
 use crate::middleware::lanes;
@@ -121,70 +122,49 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // 2.-5. Parse and route. Every supported Chat backend renders from
     // canonical IR, including the same-protocol OpenRouter binding.
     let mut forward = original.clone();
-    let mut record = None;
     // The request's own shape and ask, kept past the record context: the
     // cold gate keys the lane on the session × tools-hash the request
     // itself carries, answers in the wire form the request asked for,
     // and exempts by the post-routing model.
-    let mut gate_shape: Option<Shape> = None;
-    let mut stream_requested = false;
-    let mut gate_model: Option<String> = None;
-    let mut parsed = None;
-    let mut canonical = None;
-    let mut target = None;
-    if let Ok(mut ir) = IrRequest::parse(&original) {
-        let parsed_canonical = match translate::from_openai_chat(ir.value()) {
-            Ok(canonical) => canonical,
-            Err(error) => return compatibility_error(&error.to_string()),
-        };
-        let model = ir.openai_chat().model().map(str::to_owned);
-        let resolved = match server
-            .registry
-            .resolve(ProtocolId::OpenAiChat, model.as_deref())
-        {
-            Ok(target) => target,
-            Err(_) => return super::openai_not_configured(),
-        };
-        let effective_model = resolved.effective_model().map(str::to_owned);
-        if effective_model.as_deref() != model.as_deref()
-            && let Some(effective) = effective_model.as_deref()
-        {
-            ir.openai_chat_mut().set_model(effective);
-        }
-        let shape = ir.openai_chat().shape();
-        let system_messages = shape.req_messages.map(|_| {
-            ir.openai_chat()
-                .messages()
-                .iter()
-                .filter(|m| m.is_system())
-                .count() as u64
-        });
-        stream_requested = ir.openai_chat().stream();
-        gate_model = effective_model.clone();
-        gate_shape = Some(shape.clone());
-        record = Some(RecordCtx {
-            frontend: frontend.clone(),
-            server: server.clone(),
-            started,
-            // Cloned, not moved: the cold gate below still keys the lane
-            // on the session.
-            session_id: session_id.clone(),
-            ping,
-            requested_model: model,
-            effective_model,
-            shape: Some(shape),
-            system_messages,
-        });
-        parsed = Some(ir);
-        canonical = Some(parsed_canonical);
-        target = Some(resolved);
-    }
-
-    let Some(target) = target else {
-        return compatibility_error(
-            "the request body could not be parsed as an OpenAI Chat request",
-        );
+    let value: serde_json::Value = match serde_json::from_slice(&original) {
+        Ok(value) => value,
+        Err(_) => return compatibility_error("the request body is not valid JSON"),
     };
+    let mut canonical = match translate::from_openai_chat(&value) {
+        Ok(canonical) => canonical,
+        Err(error) => return compatibility_error(&error.to_string()),
+    };
+    let model = canonical.model.clone();
+    let target = match server
+        .registry
+        .resolve(ProtocolId::OpenAiChat, model.as_deref())
+    {
+        Ok(target) => target,
+        Err(_) => return super::openai_not_configured(),
+    };
+    let gate_model = target.effective_model().map(str::to_owned);
+    let shape = Shape::from_canonical(&canonical, original.len() as u64);
+    let system_messages = Some(
+        canonical
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, CanonRole::System | CanonRole::Developer))
+            .count() as u64,
+    );
+    let stream_requested = canonical.stream == Some(true);
+    let gate_shape = Some(shape.clone());
+    let record = Some(RecordCtx {
+        frontend: frontend.clone(),
+        server: server.clone(),
+        started,
+        session_id: session_id.clone(),
+        ping,
+        requested_model: model,
+        effective_model: gate_model.clone(),
+        shape: Some(shape),
+        system_messages,
+    });
+    canonical.model.clone_from(&gate_model);
 
     let backend = target.provider().clone();
 
@@ -193,8 +173,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
     {
-        let mut canonical = canonical.clone().expect("validated Chat request");
-        canonical.model.clone_from(&gate_model);
         let rendered = translate::openai_chat_backend::render_openai_chat(
             &canonical,
             target.binding().dialect(),
@@ -360,25 +338,17 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
     {
-        let Some(canonical) = canonical else {
-            return compatibility_error(
-                "the request body could not be parsed as an OpenAI Chat request",
-            );
-        };
         let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
         return super::anthropic_target::turn(
             server,
             parts,
             super::anthropic_target::AnthropicInput {
                 canonical,
-                limit_field: parsed.as_ref().and_then(|request| {
-                    request
-                        .value()
-                        .get("max_completion_tokens")
-                        .filter(|value| !value.is_null())
-                        .or_else(|| request.value().get("max_tokens"))
-                        .cloned()
-                }),
+                limit_field: value
+                    .get("max_completion_tokens")
+                    .filter(|value| !value.is_null())
+                    .or_else(|| value.get("max_tokens"))
+                    .cloned(),
             },
             target,
             record,
@@ -397,7 +367,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         return super::codex::turn(super::codex::CodexTurn {
             server,
             backend,
-            canonical: canonical.map(Ok),
+            canonical: Some(Ok(canonical)),
             gate_shape: None,
             record,
             in_flight,

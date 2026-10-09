@@ -219,7 +219,8 @@ error-row behavior; batch reads, cancellation, and unmatched administrative
 paths stream without inference observation.
 
 OpenAI Chat is canonical for every declared route. The frontend adapter parses
-each request, then the OpenRouter Chat, Codex Responses, or Anthropic Messages
+each request; routing and cold-gate shape extraction read that canonical
+request. Then the OpenRouter Chat, Codex Responses, or Anthropic Messages
 backend adapter renders it. Responses take the reverse path through canonical
 events or a complete canonical turn. OpenRouter's original response bytes still
 feed the ledger observer before translation, so `usage_raw`, billed cost and
@@ -265,7 +266,9 @@ rendering is canonical, so a frontend-byte fidelity check does not apply.
 
 The Responses frontend to Codex binding takes the same path despite matching
 protocol names. Protocol equality lets it replay compatible opaque extensions;
-it does not bypass canonical request or event handling.
+it does not bypass canonical request or event handling. Responses routing and
+ledger shape extraction also read canonical IR, with the original byte length
+and `input` array presence carried separately rather than inferred.
 
 The OpenRouter Responses binding is a narrower dialect. A completed live
 streamed function-call probe on `openai/gpt-4.1-mini` verified a required tool,

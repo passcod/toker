@@ -31,8 +31,8 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use super::Server;
+use crate::ir::AnthropicShape;
 use crate::ir::canonical::CanonicalRequest;
-use crate::ir::{AnthropicShape, Request as IrRequest};
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
@@ -134,19 +134,25 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let parsed = IrRequest::parse(&original).ok();
-    let canonical = parsed
-        .as_ref()
-        .map(|request| translate::from_openai_responses(request.value()));
+    let parsed = serde_json::from_slice::<Value>(&original).ok();
+    let canonical = parsed.as_ref().map(translate::from_openai_responses);
     let body_session = parsed
         .as_ref()
-        .and_then(|request| request.openai_responses().prompt_cache_key())
+        .and_then(|request| request.get("prompt_cache_key"))
+        .and_then(Value::as_str)
         .map(str::to_owned);
     let request_session = body_session.clone().or_else(|| header_session.clone());
-    let requested_model = parsed
+    let requested_model = canonical
         .as_ref()
-        .and_then(|request| request.openai_responses().model())
-        .map(str::to_owned);
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|request| request.model.clone())
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|request| request.get("model"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     let target = match server
         .registry
         .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
@@ -156,9 +162,9 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     };
     let backend = target.provider().clone();
     let effective_model = target.effective_model().map(str::to_owned);
-    let stream_explicitly_false = parsed.as_ref().is_some_and(|request| {
-        request.value().get("stream").and_then(Value::as_bool) == Some(false)
-    });
+    let stream_explicitly_false = parsed
+        .as_ref()
+        .is_some_and(|request| request.get("stream").and_then(Value::as_bool) == Some(false));
     let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
         server: server.clone(),
         started,
@@ -168,7 +174,19 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         effective_model: effective_model.clone(),
         backend: backend.clone(),
         betas: None,
-        shape: Some(request.openai_responses().shape()),
+        shape: canonical
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|canonical| {
+                AnthropicShape::from_canonical_responses(
+                    canonical,
+                    original.len() as u64,
+                    request
+                        .get("input")
+                        .and_then(Value::as_array)
+                        .map(|input| input.len() as u64),
+                )
+            }),
         ping,
         downgraded_from: None,
         downgraded_to: None,
@@ -203,7 +221,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 canonical,
                 limit_field: parsed
                     .as_ref()
-                    .and_then(|request| request.value().get("max_output_tokens").cloned()),
+                    .and_then(|request| request.get("max_output_tokens").cloned()),
             },
             target,
             record,
@@ -233,7 +251,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             canonical,
             parsed
                 .as_ref()
-                .is_some_and(|request| request.value().get("prompt_cache_key").is_some()),
+                .is_some_and(|request| request.get("prompt_cache_key").is_some()),
             target,
             record,
             in_flight,

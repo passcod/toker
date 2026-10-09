@@ -351,6 +351,68 @@ pub struct Shape {
     pub summarising: bool,
 }
 
+impl Shape {
+    /// Measure the frontend's parsed canonical request. `req_bytes` remains
+    /// the original wire length: canonical rendering deliberately changes
+    /// bytes, while the ledger's request-size field measures what arrived.
+    pub fn from_canonical(request: &super::canonical::CanonicalRequest, req_bytes: u64) -> Shape {
+        use super::canonical::{CanonBlock, CanonRole};
+
+        let mut system = String::new();
+        let mut system_blocks = Vec::new();
+        for message in &request.messages {
+            if !matches!(message.role, CanonRole::System | CanonRole::Developer) {
+                continue;
+            }
+            for block in &message.blocks {
+                if let CanonBlock::Text(piece) = block.semantic() {
+                    system_blocks.push(BlockDigest {
+                        chars: piece.chars().count() as u64,
+                        hash: short_hash(piece.as_bytes()),
+                    });
+                    system.push_str(piece);
+                }
+            }
+        }
+        let names = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        let summarising = request.messages.last().is_some_and(|last| {
+            if last
+                .blocks
+                .iter()
+                .any(|block| matches!(block.semantic(), CanonBlock::ToolResult { .. }))
+            {
+                return false;
+            }
+            let text = last
+                .blocks
+                .iter()
+                .filter_map(|block| match block.semantic() {
+                    CanonBlock::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            COMPACT_PERFORMING
+                .iter()
+                .any(|marker| begins_line(&text, marker))
+        });
+        Shape {
+            req_bytes,
+            req_messages: Some(request.messages.len() as u64),
+            req_tools: names.len() as u64,
+            tools_hash: short_hash(names.join("\0").as_bytes()),
+            system_chars: system.chars().count() as u64,
+            system_hash: short_hash(system.as_bytes()),
+            system_blocks,
+            summarising,
+        }
+    }
+}
+
 /// One system block's digest and length (no content — invariant 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockDigest {
@@ -363,11 +425,29 @@ pub struct BlockDigest {
 #[cfg(test)]
 mod tests {
     use super::super::short_hash;
-    use super::{BlockDigest, Content};
+    use super::{BlockDigest, Content, Shape};
     use crate::ir::Request;
+    use crate::translate::from_openai_chat;
 
     fn parse(body: &[u8]) -> Request {
         Request::parse(body).expect("test body parses")
+    }
+
+    #[test]
+    fn canonical_shape_matches_the_wire_shape_for_valid_chat_requests() {
+        for body in [
+            r#"{"messages":[{"role":"system","content":"A😊"},{"role":"developer","content":[{"type":"text","text":"B"}]},{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"alpha","parameters":{"type":"object"}}}]}"#,
+            r#"{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"alpha","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"done"}]}"#,
+            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"Please summarize the conversation."}]}]}"#,
+        ] {
+            let ir = parse(body.as_bytes());
+            let canonical = from_openai_chat(ir.value()).expect("valid Chat request");
+            assert_eq!(
+                Shape::from_canonical(&canonical, body.len() as u64),
+                ir.openai_chat().shape(),
+                "shape drift for {body}"
+            );
+        }
     }
 
     #[test]
