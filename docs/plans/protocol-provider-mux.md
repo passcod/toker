@@ -329,8 +329,9 @@ also cross the canonical boundary opaquely and replay to compatible bindings,
 so protocol evolution does not make same-dialect routes brittle. The Messages
 and OpenRouter Chat provider bindings declare canonical readiness, and the
 Chat frontend renders canonical streaming and complete responses. The Codex
-Responses and Chat handlers now use those adapters live; the remaining
-handlers stay on the legacy path until phase 3 cuts each route over.
+Responses handler and every Chat route now use those adapters live; the
+remaining Messages provider routes stay on the legacy path until phase 3 cuts
+each one over.
 
 - Extend canonical requests and events for every semantic shape the three
   current frontend protocols carry.
@@ -348,6 +349,9 @@ be selected as the Chat default or per request with `codex_sub/<model>` and
 translates request, streaming response, complete response, errors and usage.
 OpenAI Responses to `codex_sub` now takes the same path despite matching wire
 protocols, including compatible extension replay and encrypted reasoning.
+OpenAI Chat to OpenRouter has also moved: requests and streaming, complete, and
+error responses cross canonical IR while accounting observes OpenRouter's
+provider bytes before translation.
 
 - Replace per-handler provider selection with a route registry.
 - Add a `ModelTarget` carrying provider, binding, requested model, and effective

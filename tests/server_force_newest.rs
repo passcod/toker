@@ -19,7 +19,7 @@
 //! - an unknown lane with a barely-started conversation moves (the
 //!   message-count condition), and one with a real history does not;
 //! - the openai path never meets the machinery: a poisoned store and
-//!   openai traffic forwards byte-identical.
+//!   openai traffic keeps its model through canonical rendering.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -706,8 +706,8 @@ async fn an_unknown_lane_with_a_short_conversation_moves() {
     assert_eq!(unmoved.forced_from, None);
 }
 
-/// The openai path never meets the force machinery: a poisoned store and
-/// openai traffic forwards byte-identical, its rows carry no provenance.
+/// The openai path never meets the force machinery: a poisoned store cannot
+/// change its routed model, and its rows carry no force provenance.
 #[tokio::test]
 async fn the_openai_path_never_meets_the_force_machinery() {
     let (mock, upstream) = spawn_mock().await;
@@ -728,11 +728,10 @@ async fn the_openai_path_never_meets_the_force_machinery() {
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0],
-        Bytes::from(body.clone()),
-        "openai traffic forwards byte-identical over a poisoned store"
-    );
+    let sent: serde_json::Value =
+        serde_json::from_slice(&captured[0]).expect("canonical Chat request");
+    assert_eq!(sent["model"], "claude-opus-4-8");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "Hi");
 
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows.len(), 1);

@@ -1,11 +1,10 @@
 //! End-to-end proxy tests: a mock openrouter upstream (capturing every
 //! request byte-for-byte) behind the real toker router, driven as a client.
 //!
-//! Asserts the unit's contract: request bodies arrive upstream
-//! byte-identical (echo capture), responses pass through byte-identical,
-//! ledger rows carry the right buckets/cost kinds, error rows are never
-//! priced, fidelity drift is visible, hangups abort the upstream and
-//! record nothing, and the control endpoint stays gated and secret-free.
+//! Asserts the unit's contract: usage requests and responses cross the
+//! canonical Chat adapters, ledger rows carry the right buckets/cost kinds,
+//! error rows are never priced, hangups abort the upstream and record nothing,
+//! and the control endpoint stays gated and secret-free.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -440,6 +439,14 @@ fn chat_body(model: &str, stream: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+fn assert_complete_chat(body: &[u8], model: &str) {
+    let value: Value = serde_json::from_slice(body).expect("canonical Chat response JSON");
+    assert_eq!(value["model"], model);
+    assert_eq!(value["provider"], "z-ai");
+    assert_eq!(value["choices"][0]["message"]["content"], "Done");
+    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+}
+
 // ---------------------------------------------------------------------------
 // The cold gate on the openai path
 // ---------------------------------------------------------------------------
@@ -523,7 +530,7 @@ async fn seed_cold_lane(addr: SocketAddr, store: &Store, body: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn sse_completions_pass_through_byte_identically_and_ledger() {
+async fn sse_completions_cross_canonical_adapters_and_ledger() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
@@ -539,17 +546,20 @@ async fn sse_completions_pass_through_byte_identically_and_ledger() {
         "SSE content type passes through"
     );
 
-    // Response passthrough is byte-identical to the fixture.
     let bytes = response.bytes().await.expect("sse bytes");
-    let expected = fixture("01_simple_content.sse");
-    assert_eq!(bytes, expected, "SSE stream passes through verbatim");
+    let rendered = std::str::from_utf8(&bytes).expect("rendered SSE is UTF-8");
+    assert!(rendered.contains("Hello"));
+    assert!(rendered.contains("data: [DONE]"));
+    assert!(rendered.contains(r#""provider":"z-ai""#));
+    assert!(rendered.contains(r#""cost":0.000192"#));
 
-    // Request bytes arrive upstream byte-identical (Exact fidelity → the
-    // original buffer is forwarded).
+    // The request is rendered deterministically through canonical IR.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].path, "/v1/chat/completions");
-    assert_eq!(captured[0].body.as_ref(), body.as_slice());
+    let sent: Value = serde_json::from_slice(&captured[0].body).expect("rendered request");
+    assert_eq!(sent["model"], "z-ai/glm-5.3");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "Hi");
     assert_eq!(
         captured[0]
             .headers
@@ -621,7 +631,7 @@ async fn sse_completions_pass_through_byte_identically_and_ledger() {
     assert_eq!(row.req_tools, Some(0));
     assert!(row.duration_ms.is_some());
     assert_eq!(row.status, None);
-    assert_eq!(row.drift_digest, None, "no drift for a canonical body");
+    assert_eq!(row.drift_digest, None);
 }
 
 #[tokio::test]
@@ -633,13 +643,9 @@ async fn non_streaming_completions_buffer_observe_and_ledger() {
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        NON_STREAM_BODY.as_bytes(),
-        "non-SSE body passes through unchanged"
-    );
-
-    assert_eq!(mock.captured()[0].body.as_ref(), body.as_slice());
+    assert_complete_chat(&bytes, "z-ai/glm-5.3");
+    let sent: Value = serde_json::from_slice(&mock.captured()[0].body).expect("rendered request");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "Hi");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -656,7 +662,7 @@ async fn non_streaming_completions_buffer_observe_and_ledger() {
 }
 
 #[tokio::test]
-async fn the_openrouter_prefix_routes_strips_and_rewrites_the_bytes() {
+async fn the_openrouter_prefix_routes_and_the_canonical_request_strips_it() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
@@ -664,18 +670,11 @@ async fn the_openrouter_prefix_routes_strips_and_rewrites_the_bytes() {
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // A transformed request forwards the serialised (rewritten) form: the
-    // model the upstream sees is the stripped one, in the IR's canonical
-    // bytes.
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    let mut expected = IrRequest::parse(&body).expect("parse");
-    expected.openai_chat_mut().set_model("z-ai/glm-5.3");
-    assert_eq!(
-        captured[0].body.as_ref(),
-        expected.serialise().as_slice(),
-        "the routed request is the serialised rewrite"
-    );
+    let sent: Value = serde_json::from_slice(&captured[0].body).expect("rendered request");
+    assert_eq!(sent["model"], "z-ai/glm-5.3");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "Hi");
     assert_ne!(captured[0].body.as_ref(), body.as_slice());
 
     let rows = wait_for_rows(&store, 1).await;
@@ -757,7 +756,7 @@ async fn the_env_key_source_wins_over_the_literal() {
 }
 
 #[tokio::test]
-async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row() {
+async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
@@ -765,12 +764,12 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row() {
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let bytes = response.bytes().await.expect("error bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        ERROR_BODY.as_bytes(),
-        "the error body passes through unchanged"
-    );
-    assert_eq!(mock.captured()[0].body.as_ref(), body.as_slice());
+    let error: Value = serde_json::from_slice(&bytes).expect("rendered error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["message"], "No auth credentials found.");
+    assert!(error["error"].get("code").is_none());
+    let sent: Value = serde_json::from_slice(&mock.captured()[0].body).expect("rendered request");
+    assert_eq!(sent["model"], "err-401");
 
     let rows = wait_for_rows(&store, 1).await;
     let row = &rows[0];
@@ -788,41 +787,27 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row() {
 }
 
 #[tokio::test]
-async fn fidelity_drift_forwards_the_original_bytes_and_is_recorded_visibly() {
+async fn noncanonical_json_is_normalised_without_a_legacy_drift_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
-    // `\/` is legal JSON that serde_json's canonical form never emits: the
-    // IR re-serialises to "/", so the monitor must report drift — and the
-    // upstream still receives the ORIGINAL bytes (invariant 5: drift never
-    // changes what is forwarded).
+    // `\/` is legal JSON that deterministic canonical rendering normalises.
     let body = br#"{"model":"z-ai/glm-5.3","messages":[{"role":"user","content":"a\/b"}]}"#;
     let response = post_chat(addr, body).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].body.as_ref(),
-        body.as_slice(),
-        "the original, non-canonical buffer is forwarded"
+    let sent: Value = serde_json::from_slice(&captured[0].body).expect("rendered request");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "a/b");
+    assert_ne!(captured[0].body.as_ref(), body.as_slice());
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert!(
+        rows.iter()
+            .all(|row| row.kind != Some(RowKind::FidelityDrift))
     );
-
-    let rows = wait_for_rows(&store, 2).await;
-    let mut drift_rows = rows
-        .iter()
-        .filter(|row| row.kind == Some(RowKind::FidelityDrift));
-    let drift = drift_rows.next().expect("a fidelity-drift row is recorded");
-    assert_eq!(drift.frontend.as_deref(), Some("openai_chat"));
-    assert_eq!(drift.route.as_deref(), Some("openai_chat:openrouter"));
-    let digest = drift.drift_digest.as_deref().expect("drift digest set");
-    assert_eq!(digest.len(), 12, "the sha256/12 short digest");
-    assert!(drift_rows.next().is_none(), "exactly one drift row");
-
-    let measurement = rows
-        .iter()
-        .find(|row| row.kind.is_none())
-        .expect("the measurement row is recorded too");
+    let measurement = &rows[0];
     assert_eq!(
         measurement.input,
         Some(48),
@@ -905,17 +890,13 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
 }
 
 #[tokio::test]
-async fn non_json_bodies_forward_unchanged_with_no_row() {
+async fn non_json_bodies_are_rejected_before_the_backend() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
     let response = post_chat(addr, b"not json at all").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        mock.captured()[0].body.as_ref(),
-        b"not json at all",
-        "unparseable bodies forward unchanged (invariant 6 spirit)"
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(mock.captured().is_empty(), "the malformed body stays local");
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
@@ -926,26 +907,13 @@ async fn non_json_bodies_forward_unchanged_with_no_row() {
 }
 
 #[tokio::test]
-async fn unexpected_compression_passes_through_untouched_and_unledgered() {
+async fn unexpected_compression_is_rejected_and_unledgered() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
     let response = post_chat(addr, &chat_body("gzip-me", false)).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok()),
-        Some("gzip"),
-        "the encoding header passes through with the bytes"
-    );
-    let bytes = response.bytes().await.expect("bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        b"\x1f\x8b-not-really-gzip",
-        "bytes untouched"
-    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
@@ -1179,17 +1147,10 @@ async fn poisoned_meters_state_never_blocks_the_openai_path() {
         "the gate never fires for the openai path"
     );
     let bytes = response.bytes().await.expect("body bytes");
-    assert_eq!(
-        bytes.as_ref(),
-        NON_STREAM_BODY.as_bytes(),
-        "the response passes through untouched"
-    );
+    assert_complete_chat(&bytes, "z-ai/glm-5.3");
     assert_eq!(mock.captured().len(), 1, "the request forwarded");
-    assert_eq!(
-        mock.captured()[0].body.as_ref(),
-        body.as_slice(),
-        "the request body forwards byte-identical"
-    );
+    let sent: Value = serde_json::from_slice(&mock.captured()[0].body).expect("rendered request");
+    assert_eq!(sent["model"], "z-ai/glm-5.3");
 
     // A normal measurement row, not a blocked one.
     let rows = wait_for_rows(&store, 1).await;
@@ -1377,11 +1338,7 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        big_non_stream_body("big/charged-model").as_slice(),
-        "the resend is served by the upstream, not the gate"
-    );
+    assert_complete_chat(&bytes, "big/charged-model");
     assert_eq!(mock.captured().len(), 2);
 
     let rows = wait_for_rows(&store, 3).await;
@@ -1432,11 +1389,7 @@ async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_cold_quiet(
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        big_non_stream_body("big/free-model").as_slice(),
-        "the upstream answered, not the gate"
-    );
+    assert_complete_chat(&bytes, "big/free-model");
     assert_eq!(mock.captured().len(), 2, "the request really went upstream");
 
     let rows = wait_for_rows(&store, 3).await;
@@ -1501,11 +1454,7 @@ async fn a_summarising_request_on_a_cold_lane_forwards_without_a_notice() {
     let response = post_chat(addr, &compaction).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        big_non_stream_body("big/charged-model").as_slice(),
-        "the upstream answered, not the gate"
-    );
+    assert_complete_chat(&bytes, "big/charged-model");
     assert_eq!(mock.captured().len(), 2);
     let rows = wait_for_rows(&store, 2).await;
     assert!(
@@ -1577,11 +1526,7 @@ async fn a_warm_openai_lane_forwards_without_a_notice() {
     let response = post_chat(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_eq!(
-        bytes.as_ref(),
-        big_non_stream_body("big/charged-model").as_slice(),
-        "a warm lane forwards, charged writes or not"
-    );
+    assert_complete_chat(&bytes, "big/charged-model");
     assert_eq!(mock.captured().len(), 2);
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;

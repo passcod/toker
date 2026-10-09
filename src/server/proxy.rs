@@ -4,19 +4,12 @@
 //! Chat completions, in order (plan: Server core):
 //!
 //! 1. Buffer the request body fully.
-//! 2. Parse the IR. A non-JSON body is forwarded unchanged with no
-//!    recording — the proxy never rejects what it cannot understand
-//!    (invariant 6 spirit).
-//! 3. Fidelity check (invariant 5): byte-compare the re-serialised IR with
-//!    the original. Exact → forward the original, byte-identical by
-//!    construction. Drift → **still** forward the original (safe), with a
-//!    `fidelity-drift` row at completion — drift is a visible metric.
-//! 4. Routing: a known provider prefix selects that backend and is
+//! 2. Parse the frontend wire into canonical IR. An invalid Chat body gets a
+//!    typed local compatibility error and never reaches a backend.
+//! 3. Routing: a known provider prefix selects that backend and is
 //!    stripped; bare models go to the protocol default.
-//! 5. A routed request forwards the *serialised* form — a transformed
-//!    request forwards what the IR produces, and purity (invariant 4)
-//!    makes that stable. Recorded as requested vs effective model.
-//! 6. **The cold-cache notice** (plan: Middleware — cold gate): the openai
+//! 4. The selected backend adapter renders the request deterministically.
+//! 5. **The cold-cache notice** (plan: Middleware — cold gate): the openai
 //!    path's own gate, on the lane the request itself keys (session ×
 //!    tools-hash) and the post-routing model. A summarising request is
 //!    exempt, as on the anthropic path. No quota outlook is applied on the
@@ -28,20 +21,21 @@
 //!    retargets one), a `cold` row, the lane marked noticed — never an
 //!    error status; the resend IS the release (there is no marker on this
 //!    wire).
-//! 7. Upstream request with hop-by-hop headers stripped,
+//! 6. Upstream request with hop-by-hop headers stripped,
 //!    `accept-encoding: identity` forced (SSE observation needs plaintext),
 //!    and the stored credential injected only when the incoming request
 //!    carries no Authorization of its own (pass-through-when-present).
 //!    Another provider's credential is dropped first, never forwarded.
-//! 8. A client hangup aborts the upstream (the body stream's Drop fires
+//! 7. A client hangup aborts the upstream (the body stream's Drop fires
 //!    an [`AbortHandle`]); a hung-up stream records no row.
-//! 9. Response branches: SSE streams through with the side observation;
-//!    non-SSE bodies buffer, observe, and forward unchanged; unexpected
-//!    compression passes through untouched and unledgered.
-//! 10. Recording on completion only — [`record::RecordCtx`] → row, plus
-//!     the lane-table note (the openai lane's clock is openrouter's
-//!     10-minute sticky window, [`lanes::OPENAI_LANE_TTL_MS`]).
+//! 8. The backend response is interpreted into canonical events or a complete
+//!    turn, then rendered back to Chat. Provider bytes feed accounting before
+//!    translation, preserving billed cost and raw usage evidence.
+//! 9. Recording on completion only — [`record::RecordCtx`] → row, plus
+//!    the lane-table note (the openai lane's clock is openrouter's
+//!    10-minute sticky window, [`lanes::OPENAI_LANE_TTL_MS`]).
 
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,12 +50,14 @@ use bytes::Bytes;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::{Stream, StreamExt};
 
-use crate::ir::{Fidelity, Request as IrRequest, Shape, compare};
+use crate::ir::{Request as IrRequest, Shape};
 use crate::middleware::cold;
 use crate::middleware::force_newest;
 use crate::middleware::lanes;
-use crate::observe::{SseSplitter, UsageObserver};
+use crate::observe::{SseEvent, SseSplitter, UsageObserver};
 use crate::providers::Provider;
+use crate::routing::DialectId;
+use crate::translate::{self, OpenAiChatRenderer};
 
 use super::InFlightGuard;
 use super::Server;
@@ -123,7 +119,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // it; for a streamed response it rides the body stream.
     let in_flight = Some(server.begin_in_flight());
 
-    // 2.-5. Parse, fidelity-check, route.
+    // 2.-5. Parse and route. Every supported Chat backend renders from
+    // canonical IR, including the same-protocol OpenRouter binding.
     let mut forward = original.clone();
     let mut record = None;
     // The request's own shape and ask, kept past the record context: the
@@ -136,25 +133,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let mut target_backend = default_backend;
     let mut parsed_for_codex = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
-        // 3. Invariant 5, verified per request: Exact is the normal case;
-        // Drift forwards the original buffer either way, and lands a
-        // visible fidelity-drift row at completion.
-        let mut drift = None;
-        if let Fidelity::Drift { digest, .. } = compare(&original, &ir.serialise()) {
-            drift = Some(digest);
-        }
-        // 4. Routing: read the model through the typed view; a provider
+        // Routing: read the model through the typed view; a provider
         // prefix overrides the backend per request.
         let model = ir.openai_chat().model().map(str::to_owned);
         let mut effective_model = model.clone();
         if let Some((provider, rest)) = model.as_deref().and_then(strip_chat_provider_prefix) {
-            // 5. A deliberate transform: forward the serialised IR (pure
-            // and deterministic, so the upstream prefix stays stable),
-            // recorded as requested vs effective — nothing is "forced".
             effective_model = Some(rest.to_owned());
             target_backend = provider.to_owned();
             ir.openai_chat_mut().set_model(rest);
-            forward = Bytes::from(ir.serialise());
         }
         let shape = ir.openai_chat().shape();
         let system_messages = shape.req_messages.map(|_| {
@@ -177,7 +163,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             ping,
             requested_model: model,
             effective_model,
-            drift,
+            drift: None,
             shape: Some(shape),
             system_messages,
         });
@@ -187,6 +173,32 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let Some(backend) = server.openai_chat_backend(&target_backend).cloned() else {
         return super::openai_not_configured();
     };
+
+    if backend.id() == "openrouter" {
+        let Some(ir) = parsed_for_codex.as_ref() else {
+            return compatibility_error(
+                "the request body could not be parsed as an OpenAI Chat request",
+            );
+        };
+        let rendered = translate::from_openai_chat(ir.value()).and_then(|mut canonical| {
+            canonical.model.clone_from(&gate_model);
+            translate::openai_chat_backend::render_openai_chat(
+                &canonical,
+                DialectId::OpenRouterChatCompletions,
+            )
+        });
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => return compatibility_error(&error.to_string()),
+        };
+        forward = match serde_json::to_vec(&rendered.value) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                tracing::error!(%error, "canonical chat request serialisation failed");
+                return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
+            }
+        };
+    }
 
     // 6. The cold-cache notice (see the module docs). Advisory like the
     // anthropic gate's: once per idle spell, re-armed by activity, and
@@ -363,7 +375,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     )
     .await
     {
-        Ok(upstream) => forward_upstream(upstream, record, in_flight).await,
+        Ok(upstream) => {
+            forward_openrouter_canonical(
+                upstream,
+                record,
+                in_flight,
+                gate_model.as_deref().unwrap_or_default(),
+            )
+            .await
+        }
         Err(error) => {
             // No upstream response: nothing measured, and the error row is
             // provider-response-shaped (status/type/retry-after), so this
@@ -407,7 +427,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
         }
     };
     match send_upstream(&server, openrouter.as_ref(), &parts, body, &[]).await {
-        Ok(upstream) => forward_upstream(upstream, None, None).await,
+        Ok(upstream) => forward_upstream(upstream).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
             transport_failure(ErrorWire::Openai, &error)
@@ -456,19 +476,8 @@ pub(crate) async fn send_upstream(
         .await
 }
 
-/// Forward one upstream response to the client, branching on
-/// compression / status / content-type. `record` is the chat-path
-/// completion context; `None` means pure transparent forwarding.
-/// `in_flight` is the request's sleep-lock hold: it rides the SSE
-/// stream (dropping when axum drops the body — the stream-close
-/// semantics, "however the exchange ends") and drops at the end of this
-/// function on every
-/// other branch, after whatever row was owed has landed.
-pub(crate) async fn forward_upstream(
-    upstream: reqwest::Response,
-    record: Option<RecordCtx>,
-    in_flight: Option<InFlightGuard>,
-) -> Response {
+/// Transparently forward one non-usage response such as a model catalogue.
+pub(crate) async fn forward_upstream(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
 
@@ -481,49 +490,261 @@ pub(crate) async fn forward_upstream(
         return build_response(status, response_headers(&upstream_headers, true), body);
     }
 
-    let Some(ctx) = record else {
-        // Transparent forwarding (models, non-JSON chat bodies): stream
-        // through; nothing observed, nothing recorded.
-        let body = Body::from_stream(upstream.bytes_stream());
-        return build_response(status, response_headers(&upstream_headers, false), body);
-    };
+    // Catalogue and other non-usage paths remain transparent: no canonical
+    // inference adapter, observation, or recording applies to them.
+    let body = Body::from_stream(upstream.bytes_stream());
+    build_response(status, response_headers(&upstream_headers, false), body)
+}
 
-    // Non-2xx on a usage path: error row (status, type, retry-after —
-    // never priced), body forwarded unchanged.
+/// The OpenRouter Chat binding's live universal-canonical response path.
+/// Accounting observes the provider bytes before translation, so billed cost
+/// and verbatim usage remain provider evidence rather than renderer output.
+async fn forward_openrouter_canonical(
+    upstream: reqwest::Response,
+    record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    model: &str,
+) -> Response {
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    if is_compressed(&upstream_headers) {
+        tracing::warn!("compressed canonical chat response could not be interpreted");
+        return upstream_failure(
+            ErrorWire::Openai,
+            "toker could not interpret a compressed upstream response",
+        );
+    }
+
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
             return truncated_body(ErrorWire::Openai);
         };
-        let error_type = parse_error_type(&buffered.bytes);
-        let retry_after = retry_after_ms(&upstream_headers);
-        record_error(&ctx, status.as_u16(), error_type, retry_after);
-        let body = buffered_body(buffered);
-        return build_response(status, response_headers(&upstream_headers, false), body);
+        if buffered.rest.is_some() {
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker could not interpret an oversized upstream error",
+            );
+        }
+        if let Some(ctx) = record.as_ref() {
+            record_error(
+                ctx,
+                status.as_u16(),
+                parse_error_type(&buffered.bytes),
+                retry_after_ms(&upstream_headers),
+            );
+        }
+        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+            .ok()
+            .and_then(|body| {
+                translate::openai_chat_backend::canonical_turn_from_openai_chat(&body).ok()
+            })
+            .map(|turn| translate::openai_chat_from_canonical(model, &turn));
+        let Some(rendered) = rendered else {
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker could not interpret the upstream error response",
+            );
+        };
+        return json_response(status, &upstream_headers, &rendered);
     }
 
-    // SSE: chunks stream through with backpressure (axum Body from a
-    // stream), each also feeding the side observation.
     if is_event_stream(&upstream_headers) {
-        let stream = ObservedStream::new(upstream, status.as_u16(), ctx, in_flight);
-        let body = Body::from_stream(stream);
-        return build_response(status, response_headers(&upstream_headers, false), body);
+        let stream = CanonicalChatStream::new(upstream, status.as_u16(), record, in_flight, model);
+        let mut headers = response_headers(&upstream_headers, false);
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return build_response(status, headers, Body::from_stream(stream));
     }
 
-    // Non-SSE: buffer, observe, forward the original bytes unchanged.
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
         return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {
-        tracing::warn!("non-streaming response exceeded the buffer cap; passed through unledgered");
-        let body = buffered_body(buffered);
-        return build_response(status, response_headers(&upstream_headers, false), body);
+        return upstream_failure(
+            ErrorWire::Openai,
+            "toker could not interpret an oversized upstream response",
+        );
     }
-    let mut observer = UsageObserver::new();
-    observer.observe_json(&buffered.bytes);
-    let capture = observer.finish();
-    record_measurement(&ctx, capture.as_ref(), status.as_u16());
-    let body = Body::from(Bytes::from(buffered.bytes));
-    build_response(status, response_headers(&upstream_headers, false), body)
+    let body = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+        .map_err(|error| error.to_string())
+        .and_then(|body| {
+            translate::openai_chat_backend::canonical_turn_from_openai_chat(&body)
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(turn) => translate::openai_chat_from_canonical(model, &turn),
+        Err(error) => {
+            tracing::warn!(%error, "canonical chat response interpretation failed");
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker could not interpret the upstream response",
+            );
+        }
+    };
+    if let Some(ctx) = record.as_ref() {
+        let mut observer = UsageObserver::new();
+        observer.observe_json(&buffered.bytes);
+        let capture = observer.finish();
+        record_measurement(ctx, capture.as_ref(), status.as_u16());
+    }
+    json_response(status, &upstream_headers, &body)
+}
+
+fn json_response(
+    status: StatusCode,
+    upstream_headers: &HeaderMap,
+    value: &serde_json::Value,
+) -> Response {
+    let mut headers = response_headers(upstream_headers, false);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    build_response(
+        status,
+        headers,
+        Body::from(serde_json::to_vec(value).unwrap_or_default()),
+    )
+}
+
+fn compatibility_error(message: &str) -> Response {
+    error_response(
+        ErrorWire::Openai,
+        StatusCode::BAD_REQUEST,
+        WireError {
+            anthropic_type: "invalid_request_error",
+            openai_type: "invalid_request_error",
+            openai_code: None,
+        },
+        message,
+    )
+}
+
+struct CanonicalChatStream {
+    inner: Pin<Box<Abortable<UpstreamBody>>>,
+    abort: AbortHandle,
+    splitter: SseSplitter,
+    backend: translate::openai_chat_backend::OpenAiChatResponseStream,
+    frontend: OpenAiChatRenderer,
+    observer: UsageObserver,
+    pending: VecDeque<Bytes>,
+    upstream_done: bool,
+    ctx: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    status: u16,
+}
+
+impl CanonicalChatStream {
+    fn new(
+        response: reqwest::Response,
+        status: u16,
+        ctx: Option<RecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        model: &str,
+    ) -> CanonicalChatStream {
+        let (abort, registration) = AbortHandle::new_pair();
+        let stream: UpstreamBody = Box::pin(response.bytes_stream());
+        CanonicalChatStream {
+            inner: Box::pin(Abortable::new(stream, registration)),
+            abort,
+            splitter: SseSplitter::new(),
+            backend: translate::openai_chat_backend::OpenAiChatResponseStream::new(),
+            frontend: OpenAiChatRenderer::new(model),
+            observer: UsageObserver::new(),
+            pending: VecDeque::new(),
+            upstream_done: false,
+            ctx,
+            in_flight,
+            status,
+        }
+    }
+
+    fn translate_event(&mut self, event: SseEvent) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            self.observer.observe_event(&event);
+        }));
+        let canonical = self.backend.feed_sse(&event);
+        for emitted in canonical.iter().flat_map(|event| self.frontend.feed(event)) {
+            self.pending.push_back(sse_bytes(&emitted));
+        }
+    }
+
+    fn finish_translation(&mut self) {
+        if let Some(event) = self.splitter.finish() {
+            self.translate_event(event);
+        }
+        let canonical = self.backend.finish();
+        for emitted in canonical.iter().flat_map(|event| self.frontend.feed(event)) {
+            self.pending.push_back(sse_bytes(&emitted));
+        }
+        self.upstream_done = true;
+    }
+
+    fn finish_recording(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            let capture = std::mem::take(&mut self.observer).finish();
+            record_measurement(&ctx, capture.as_ref(), self.status);
+        }
+        drop(self.in_flight.take());
+    }
+}
+
+impl Stream for CanonicalChatStream {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(bytes) = this.pending.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(bytes)));
+            }
+            if this.upstream_done {
+                this.finish_recording();
+                return std::task::Poll::Ready(None);
+            }
+            match this.inner.as_mut().poll_next(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    for event in this.splitter.feed(&chunk) {
+                        this.translate_event(event);
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    tracing::warn!(%error, "upstream canonical chat stream failed");
+                    this.ctx.take();
+                    drop(this.in_flight.take());
+                    return std::task::Poll::Ready(Some(Err(error)));
+                }
+                std::task::Poll::Ready(None) => this.finish_translation(),
+            }
+        }
+    }
+}
+
+impl Drop for CanonicalChatStream {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+fn sse_bytes(event: &SseEvent) -> Bytes {
+    let mut out = String::new();
+    if let Some(name) = &event.event {
+        out.push_str("event: ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    for line in &event.data_lines {
+        out.push_str("data: ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    Bytes::from(out)
 }
 
 /// Phase-1 routing (plan: Routing): an `openrouter/` prefix overrides the
@@ -844,133 +1065,9 @@ pub(crate) fn buffered_body(buffered: Buffered) -> Body {
     }
 }
 
-/// The upstream body stream type, boxed so [`ObservedStream`] can name it.
+/// The upstream body stream type, boxed so the canonical stream adapter can
+/// own it while remaining a named [`Stream`].
 pub(crate) type UpstreamBody = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
-
-/// The SSE response stream with the usage observation riding alongside:
-/// bytes pass through verbatim (backpressured by axum's poll-driven body),
-/// and each chunk *also* feeds the splitter/observer. Observation is a
-/// side effect that can never fail the stream (invariant 6): the observe
-/// APIs are infallible by construction, and the calls additionally run
-/// under [`std::panic::catch_unwind`] so no observation bug can take a
-/// live session down — the measurement is lost, not the response.
-struct ObservedStream {
-    /// The upstream body, wrapped [`Abortable`] so the handle below can
-    /// stop it.
-    inner: Pin<Box<Abortable<UpstreamBody>>>,
-    /// Fires in [`Drop`]: when axum drops the response body — client
-    /// hangup, shutdown — the upstream request is aborted too.
-    abort: AbortHandle,
-    splitter: SseSplitter,
-    observer: UsageObserver,
-    /// The recording context, taken at completion: only a completed
-    /// stream records (a hung-up one records nothing, plan: Server core).
-    ctx: Option<RecordCtx>,
-    /// The request's sleep-lock hold, riding the stream: it drops when
-    /// axum drops the body — natural completion or client hangup — so the
-    /// in-flight count never leaks on a streamed response (the
-    /// body-close event).
-    in_flight: Option<InFlightGuard>,
-    status: u16,
-}
-
-impl ObservedStream {
-    fn new(
-        response: reqwest::Response,
-        status: u16,
-        ctx: RecordCtx,
-        in_flight: Option<InFlightGuard>,
-    ) -> ObservedStream {
-        let (abort, registration) = AbortHandle::new_pair();
-        let stream: UpstreamBody = Box::pin(response.bytes_stream());
-        ObservedStream {
-            inner: Box::pin(Abortable::new(stream, registration)),
-            abort,
-            splitter: SseSplitter::new(),
-            observer: UsageObserver::new(),
-            ctx: Some(ctx),
-            in_flight,
-            status,
-        }
-    }
-}
-
-impl Stream for ObservedStream {
-    /// The upstream's own error type: an upstream failure is yielded, not
-    /// swallowed, so hyper aborts the client's response instead of
-    /// terminating it cleanly. A cleanly ended stream once let a
-    /// connection reset mid-turn reach the client as a complete
-    /// (truncated) turn, which it accepted rather than retried.
-    type Item = reqwest::Result<Bytes>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll_next(cx) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Some(Ok(chunk))) => {
-                observe_chunk(&mut this.splitter, &mut this.observer, &chunk);
-                std::task::Poll::Ready(Some(Ok(chunk)))
-            }
-            std::task::Poll::Ready(Some(Err(error))) => {
-                // Upstream transport died mid-stream (a reset, the idle
-                // timeout): the response is truncated. No completion, no
-                // row — drop the context so a later poll cannot record one.
-                tracing::warn!(%error, "upstream response stream failed");
-                this.ctx.take();
-                // The exchange is over however it ended (the close
-                // event fires on failure too): the in-flight hold goes
-                // with it.
-                drop(this.in_flight.take());
-                // Yielded, so the client sees a transport error (the
-                // predecessor destroyed the response), never a clean end.
-                std::task::Poll::Ready(Some(Err(error)))
-            }
-            std::task::Poll::Ready(None) => {
-                // Natural completion: flush the splitter's tail, finish the
-                // observation, record. Recording failures log, never
-                // propagate (invariant 6).
-                if let Some(ctx) = this.ctx.take() {
-                    let splitter = &mut this.splitter;
-                    let observer = &mut this.observer;
-                    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        if let Some(event) = splitter.finish() {
-                            observer.observe_event(&event);
-                        }
-                    }));
-                    let capture = std::mem::take(observer).finish();
-                    record_measurement(&ctx, capture.as_ref(), this.status);
-                }
-                // The response is done, so the in-flight hold ends now —
-                // the body-close event fires at stream end, and a
-                // hung-up stream ends it in Drop instead.
-                drop(this.in_flight.take());
-                std::task::Poll::Ready(None)
-            }
-        }
-    }
-}
-
-impl Drop for ObservedStream {
-    fn drop(&mut self) {
-        // Client hangup → axum drops the body → abort the upstream. Also
-        // fires after natural completion, where it is a no-op.
-        self.abort.abort();
-    }
-}
-
-/// Feed one chunk to the side observation, panic-guarded (invariant 6:
-/// accounting must never break a session — a lost measurement is the worst
-/// outcome, never a lost response).
-fn observe_chunk(splitter: &mut SseSplitter, observer: &mut UsageObserver, chunk: &[u8]) {
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        for event in splitter.feed(chunk) {
-            observer.observe_event(&event);
-        }
-    }));
-}
 
 /// Build a response with an explicit status and header set.
 pub(crate) fn build_response(status: StatusCode, headers: HeaderMap, body: Body) -> Response {

@@ -129,7 +129,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
     let mut headers = upstream_request_headers(request.headers(), &[]);
     headers.extend(codex.models_headers(auth.as_ref()));
     match server.http.get(url).headers(headers).send().await {
-        Ok(upstream) => forward_upstream(upstream, None, None).await,
+        Ok(upstream) => forward_upstream(upstream).await,
         Err(error) => {
             tracing::warn!(%error, "codex models upstream request failed");
             transport_failure(ErrorWire::Openai, &error)

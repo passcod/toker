@@ -43,11 +43,14 @@ lets a newer frontend shape reach a compatible backend without requiring toker
 to understand its contents. Toker always replaces the frontend credential
 with its shared Codex login before the request leaves loopback.
 
-The Chat route may select `codex_sub` as its configured default or with a
-`codex_sub/<model>` prefix. That route always parses Chat into canonical IR,
-renders a Responses request, and translates the Responses turn back to Chat
-SSE or complete JSON. Toker signs the upstream itself, records the route as
-`openai_chat:codex_sub`, and never forwards the frontend credential.
+Every Chat route is canonical. The OpenRouter binding deterministically renders
+Chat again and interprets its response before the frontend renders Chat. It
+observes the provider response before translation so billing evidence stays
+intact. Chat may also select `codex_sub` as its configured default or with a
+`codex_sub/<model>` prefix; that binding renders a Responses request and
+translates the Responses turn back to Chat SSE or complete JSON. Toker signs
+the Codex upstream itself, records the route as `openai_chat:codex_sub`, and
+never forwards the frontend credential.
 
 ### What differs per backend
 
@@ -162,9 +165,10 @@ owns only rows whose model starts with `openrouter/`, rewrites the file only
 when the rows changed (Claude Code hot-reloads it into every session), and
 changes nothing when the listing cannot be fetched.
 
-## Legacy same-protocol routes forward the client's bytes
+## Legacy Messages routes forward the client's bytes
 
-Every request is parsed into the IR, a `serde_json::Value` with `preserve_order`
+Every request on a Messages route not yet cut over is parsed into the IR, a
+`serde_json::Value` with `preserve_order`
 and `arbitrary_precision`, so re-serialising an untouched body reproduces it
 byte for byte. The server checks that on every request (`ir/fidelity.rs`): when
 the bytes match, the client's original buffer is forwarded; when they differ,
@@ -181,6 +185,15 @@ Setup's wiring check relies on that, posting an empty body and taking the
 upstream's own 401 as proof the chain is up. A route already cut over to the
 universal canonical path instead returns a typed compatibility error and never
 sends an unparsed body upstream.
+
+OpenAI Chat is fully canonical for both current backends. The frontend adapter
+parses every request, then either the OpenRouter Chat or Codex Responses backend
+adapter renders it. Responses take the reverse path through canonical events or
+a complete canonical turn. OpenRouter's original response bytes still feed the
+ledger observer before translation, so `usage_raw`, billed cost and the serving
+provider remain provider-attested evidence. An invalid Chat body is a local 400
+and a compressed or malformed upstream response is a local 502; neither is
+forwarded as though it had crossed the canonical boundary.
 
 ## Thinking that cannot be turned off
 

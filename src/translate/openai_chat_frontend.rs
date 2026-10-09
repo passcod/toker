@@ -337,14 +337,15 @@ fn tools_of(body: &Value) -> Result<Vec<CanonTool>, TranslateError> {
                 .ok_or_else(|| TranslateError::Malformed {
                     reason: format!("tools[{index}].function.name is missing"),
                 })?;
-            let parameters = function
-                .get("parameters")
-                .filter(|value| value.is_object())
-                .ok_or_else(|| TranslateError::Malformed {
-                    reason: format!(
-                        "tools[{index}].function.parameters is missing or not an object"
-                    ),
-                })?;
+            let parameters = match function.get("parameters") {
+                None | Some(Value::Null) => json!({}),
+                Some(value) if value.is_object() => value.clone(),
+                Some(_) => {
+                    return Err(TranslateError::Malformed {
+                        reason: format!("tools[{index}].function.parameters is not an object"),
+                    });
+                }
+            };
             let description = match function.get("description") {
                 None | Some(Value::Null) => "",
                 Some(Value::String(value)) => value,
@@ -363,7 +364,7 @@ fn tools_of(body: &Value) -> Result<Vec<CanonTool>, TranslateError> {
             Ok(CanonTool {
                 name: name.to_owned(),
                 description: description.to_owned(),
-                parameters: parameters.clone(),
+                parameters,
                 extensions: retained,
             })
         })
