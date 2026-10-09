@@ -1,13 +1,11 @@
-//! Invariant 5's corpus and monitor tests (plan: Invariants 4 and 5).
+//! Wire-preserving IR corpus tests (plan: Invariants 4 and 5).
 //!
 //! - [`fixtures_corpus_round_trips_byte_exactly`] and
 //!   [`generated_bodies_round_trip_byte_exactly`]:
 //!   `serialise(parse(body)) == body` over realistic OpenAI-chat bodies —
 //!   the round-trip byte-equality corpus the plan requires.
-//! - [`non_canonical_inputs_drift_and_the_monitor_reports_it`]: legal JSON
-//!   outside serde_json's canonical form (a `\/` escape, inter-token
-//!   whitespace) must NOT round-trip, and `compare` must say so — the
-//!   monitor detects drift, it does not assume its absence.
+//! - [`non_canonical_inputs_are_normalised`]: legal JSON outside
+//!   serde_json's canonical form does not round-trip byte-exactly.
 //! - [`set_model_changes_only_the_model_value_region`] and
 //!   [`set_model_inserts_at_the_end_when_absent`]: the one deliberate byte
 //!   edit touches only the model value's region, in place or appended.
@@ -18,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{Rng, conversation_body};
-use toker::ir::{Fidelity, Request, compare};
+use toker::ir::Request;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/openai_chat")
@@ -73,39 +71,18 @@ fn generated_bodies_round_trip_byte_exactly() {
 }
 
 #[test]
-fn non_canonical_inputs_drift_and_the_monitor_reports_it() {
-    // `\/` is a legal JSON escape for `/`; serde_json's canonical form
-    // never emits it. This input must NOT round-trip — proving the corpus
-    // above tests something — and the monitor must catch what it misses.
-    let escaped = b"{\"model\":\"a\\/b\",\"messages\":[]}";
-    let request = Request::parse(escaped).expect("\\/ is legal JSON");
+fn non_canonical_inputs_are_normalised() {
+    let escaped = br#"{"model":"a\/b","messages":[]}"#;
+    let request = Request::parse(escaped).expect("escaped slash is legal JSON");
     let serialised = request.serialise();
     assert_ne!(serialised.as_slice(), escaped.as_slice());
-    assert_eq!(
-        serialised.as_slice(),
-        b"{\"model\":\"a/b\",\"messages\":[]}".as_slice()
-    );
-    match compare(escaped, &serialised) {
-        Fidelity::Drift { offset: 11, .. } => {}
-        other => panic!("a \\/ escape must drift at the escape, got {other:?}"),
-    }
+    assert_eq!(serialised, br#"{"model":"a/b","messages":[]}"#);
 
-    // Whitespace between tokens: same story, region at the first space.
-    let padded = b"{ \"model\": \"x\", \"messages\": [] }";
-    let request = Request::parse(padded).expect("whitespace is legal JSON");
-    let serialised = request.serialise();
-    assert_eq!(
-        serialised.as_slice(),
-        b"{\"model\":\"x\",\"messages\":[]}".as_slice()
-    );
-    match compare(padded, &serialised) {
-        Fidelity::Drift { offset: 1, .. } => {}
-        other => panic!("whitespace must drift at the first space, got {other:?}"),
-    }
-
-    // And the normal case really is Exact, not assumed.
-    let canonical = b"{\"model\":\"x\",\"messages\":[]}";
-    assert_eq!(compare(canonical, canonical), Fidelity::Exact);
+    let padded = br#"{ "model": "x", "messages": [] }"#;
+    let serialised = Request::parse(padded)
+        .expect("whitespace is legal JSON")
+        .serialise();
+    assert_eq!(serialised, br#"{"model":"x","messages":[]}"#);
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> usize {

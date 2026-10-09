@@ -227,9 +227,8 @@ An anthropic-frontend request routed to `codex_sub` never byte-forwards. It goes
 through `translate::to_codex` into the canonical IR (`ir/canonical.rs`) and out
 onto the Responses wire, and the response comes back through
 `translate::AnthropicStream`. Every other stage of the anthropic pipeline runs
-first, so the codex request carries the final effective model. The fidelity
-check is skipped, because the upstream bytes never existed on the frontend's
-wire.
+first, so the codex request carries the final effective model. Backend
+rendering is canonical, so a frontend-byte fidelity check does not apply.
 
 The Responses frontend to Codex binding takes the same path despite matching
 protocol names. Protocol equality lets it replay compatible opaque extensions;

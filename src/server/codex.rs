@@ -3,9 +3,8 @@
 //! A request routed to the codex_sub backend never byte-forwards: the
 //! codex backend speaks the Responses dialect, so each supported frontend
 //! goes through [`crate::translate`] and canonical IR/events in both
-//! directions. The fidelity byte-compare is meaningless
-//! cross-protocol (the upstream bytes never existed on the frontend's
-//! wire), so translated routes skip it by construction.
+//! directions. Frontend-byte comparison does not apply to backend-rendered
+//! canonical requests.
 //!
 //! Every other pipeline stage ran before this branch: the release
 //! marker, the quota gate (anthropic_sub-only, never here), the cold
@@ -205,7 +204,6 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         session_id: request_session.clone(),
         requested_model: requested_model.clone(),
         effective_model: effective_model.clone(),
-        drift: None,
         backend: backend.clone(),
         betas: None,
         shape: Some(request.openai_responses().shape()),

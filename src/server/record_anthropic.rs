@@ -74,9 +74,6 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) requested_model: Option<String>,
     /// The model that served, after the routing rewrite.
     pub(crate) effective_model: Option<String>,
-    /// The fidelity monitor's divergence digest, when re-serialisation
-    /// drifted from the original bytes (invariant 5).
-    pub(crate) drift: Option<String>,
     /// The selected backend — provider column, route, cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
@@ -123,9 +120,8 @@ pub(crate) struct AnthropicRecordCtx {
 /// Record a completed anthropic usage-path response: the measurement row
 /// when the capture carries usage (only responses with usage are
 /// accounted for — a hung-up stream, an all-keepalive stream, or a
-/// usage-less capture on
-/// a 200 records no row), plus the fidelity-drift row when the request
-/// drifted. `rate_limits` is this response's own meter snapshot, parsed by
+/// usage-less capture on a 200 records no row). `rate_limits` is this
+/// response's own meter snapshot, parsed by
 /// the server from its headers. `status` is the upstream status the client
 /// saw.
 pub(crate) fn record_anthropic_measurement(
@@ -137,10 +133,6 @@ pub(crate) fn record_anthropic_measurement(
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of(ctx);
-
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
 
     let ledgered = match capture {
         Some(capture) if usage_bearing(capture) => {
@@ -175,13 +167,12 @@ pub(crate) fn record_anthropic_measurement(
         .and_then(AnthropicCapture::model)
         .or(ctx.effective_model.as_deref());
     tracing::info!(
-        "POST {} → {} ledgered={} model={} provider={}{} ({:.1}s)",
+        "POST {} → {} ledgered={} model={} provider={} ({:.1}s)",
         ctx.path,
         status,
         if ledgered { "yes" } else { "no" },
         model.unwrap_or("?"),
         ctx.backend.id(),
-        drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
 
@@ -195,8 +186,7 @@ pub(crate) fn record_anthropic_measurement(
 
 /// Record a non-2xx anthropic usage-path response (plan: Server core): an
 /// error row with status, the error pair, retry-after, and the response's
-/// own `rate_limits` — never priced, no usage buckets — plus the
-/// fidelity-drift row when the request drifted. The meters ride the row
+/// own `rate_limits` — never priced, no usage buckets. The meters ride the row
 /// because a failure carries no usage but is the only evidence of
 /// throttling (the predecessor's rule): a 429 with no meters on its row
 /// says only that something said no.
@@ -212,9 +202,6 @@ pub(crate) fn record_anthropic_error(
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of(ctx);
 
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
     insert(
         ctx,
         error_row(
@@ -229,12 +216,11 @@ pub(crate) fn record_anthropic_error(
     );
 
     tracing::info!(
-        "POST {} → {} ledgered=error model={} provider={}{} ({:.1}s)",
+        "POST {} → {} ledgered=error model={} provider={} ({:.1}s)",
         ctx.path,
         status,
         ctx.effective_model.as_deref().unwrap_or("?"),
         ctx.backend.id(),
-        drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
 }
@@ -242,13 +228,6 @@ pub(crate) fn record_anthropic_error(
 /// The route column, `frontend:backend`.
 fn route_of(ctx: &AnthropicRecordCtx) -> String {
     format!("anthropic:{}", ctx.backend.id())
-}
-
-fn drift_note(ctx: &AnthropicRecordCtx) -> String {
-    match &ctx.drift {
-        Some(digest) => format!(" drift={digest}"),
-        None => String::new(),
-    }
 }
 
 /// Insert one row; a store failure loses the row, never the request
@@ -673,72 +652,6 @@ fn error_row(
         // The schema has no error_message column; the pair's message half
         // rides in `extra` (the kind-specific payload column).
         extra: error_message.map(|message| json!({ "error_message": message })),
-        betas: None,
-        geo: None,
-        fast: None,
-    }
-}
-
-/// The fidelity-drift row (invariant 5): drift is a visible, queryable
-/// metric. Lean by design — frontend, route, digest, time.
-fn drift_row(ts_ms: i64, route: &str, digest: &str) -> RequestRow {
-    RequestRow {
-        id: None,
-        ts_ms,
-        duration_ms: None,
-        kind: Some(RowKind::FidelityDrift),
-        frontend: Some("anthropic".to_owned()),
-        provider: None,
-        route: Some(route.to_owned()),
-        session_id: None,
-        ping: None,
-        model: None,
-        raw_model: None,
-        requested_model: None,
-        effective_model: None,
-        input: None,
-        cache_read: None,
-        cache_write_total: None,
-        cache_write_5m: None,
-        cache_write_1h: None,
-        output: None,
-        reasoning: None,
-        iterations: None,
-        web_searches: None,
-        code_execs: None,
-        ttl_split_known: None,
-        usage_presence: None,
-        usage_raw: None,
-        cost_usd: None,
-        cost_kind: None,
-        rate_limits: None,
-        req_bytes: None,
-        req_messages: None,
-        req_tools: None,
-        tools_hash: None,
-        system_chars: None,
-        system_hash: None,
-        system_blocks: None,
-        system_messages: None,
-        compact_generations: None,
-        summarising: None,
-        system_change: None,
-        system_ladder: None,
-        system_tail: None,
-        gate_on: None,
-        cold_on: None,
-        forced_from: None,
-        forced_to: None,
-        downgraded_from: None,
-        downgraded_to: None,
-        cache_stripped: None,
-        system_merged: None,
-        model_mappings: None,
-        drift_digest: Some(digest.to_owned()),
-        status: None,
-        error_type: None,
-        retry_after_ms: None,
-        extra: None,
         betas: None,
         geo: None,
         fast: None,
@@ -1256,9 +1169,6 @@ pub(crate) fn record_codex_measurement(
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
     let route = format!("{frontend_protocol}:{}", ctx.backend.id());
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
     let usage = capture.usage();
     let shape = ctx.shape.as_ref();
 
@@ -1452,9 +1362,6 @@ pub(crate) fn record_codex_error(
 ) {
     let ts_ms = now_ms();
     let route = format!("{frontend_protocol}:{}", ctx.backend.id());
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
     let mut extra = serde_json::Map::new();
     extra.insert("error_message".to_owned(), json!(message));
     if let Some(resets_at) = resets_at {

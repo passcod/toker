@@ -67,9 +67,6 @@ pub(crate) struct RecordCtx {
     /// The model that served, after the routing rewrite (phase 1: the
     /// `openrouter/` prefix strip; nothing else rewrites).
     pub(crate) effective_model: Option<String>,
-    /// The fidelity monitor's divergence digest, when re-serialisation
-    /// drifted from the original bytes (invariant 5).
-    pub(crate) drift: Option<String>,
     /// The content-free request shape ([`crate::ir::openai_chat::Shape`]).
     pub(crate) shape: Option<Shape>,
     /// System-family message count, for the row's `system_messages`.
@@ -118,16 +115,11 @@ pub(crate) fn i64_of(value: u64) -> i64 {
 
 /// Record a completed usage-path response: the measurement row (when usage
 /// was observed — a completed stream with nothing usage-bearing records no
-/// row, like a hung-up one), plus the fidelity-drift row when the request
-/// drifted. `status` is the upstream status the client saw.
+/// row, like a hung-up one). `status` is the upstream status the client saw.
 pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>, status: u16) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of();
-
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
 
     let model = capture.and_then(UsageCapture::model);
     if let Some(capture) = capture {
@@ -169,12 +161,11 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
     }
 
     tracing::info!(
-        "POST /v1/chat/completions → {} ledgered={} model={} provider={}{} ({:.1}s)",
+        "POST /v1/chat/completions → {} ledgered={} model={} provider={} ({:.1}s)",
         status,
         if capture.is_some() { "yes" } else { "no" },
         model.or(ctx.effective_model.as_deref()).unwrap_or("?"),
         OPENAI_PROVIDER,
-        drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
 
@@ -186,7 +177,7 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
 
 /// Record a non-2xx usage-path response (plan: Server core): an error row
 /// with status, error type, and retry-after — never priced, no usage
-/// buckets — plus the fidelity-drift row when the request drifted.
+/// buckets.
 pub(crate) fn record_error(
     ctx: &RecordCtx,
     status: u16,
@@ -197,9 +188,6 @@ pub(crate) fn record_error(
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of();
 
-    if let Some(digest) = &ctx.drift {
-        insert(ctx, drift_row(ts_ms, &route, digest));
-    }
     insert(
         ctx,
         error_row(
@@ -214,11 +202,10 @@ pub(crate) fn record_error(
     );
 
     tracing::info!(
-        "POST /v1/chat/completions → {} ledgered=error model={} provider={}{} ({:.1}s)",
+        "POST /v1/chat/completions → {} ledgered=error model={} provider={} ({:.1}s)",
         status,
         ctx.effective_model.as_deref().unwrap_or("?"),
         OPENAI_PROVIDER,
-        drift_note(ctx),
         ctx.started.elapsed().as_secs_f64(),
     );
 }
@@ -562,13 +549,6 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
     );
 }
 
-fn drift_note(ctx: &RecordCtx) -> String {
-    match &ctx.drift {
-        Some(digest) => format!(" drift={digest}"),
-        None => String::new(),
-    }
-}
-
 /// Insert one row; a store failure loses the row, never the request
 /// (invariant 6) — it is logged as the visible breakage it is.
 ///
@@ -807,72 +787,6 @@ fn error_row(
         status: Some(status as i64),
         error_type,
         retry_after_ms,
-        extra: None,
-        betas: None,
-        geo: None,
-        fast: None,
-    }
-}
-
-/// The fidelity-drift row (invariant 5): drift is a visible, queryable
-/// metric. Lean by design — frontend, route, digest, time.
-fn drift_row(ts_ms: i64, route: &str, digest: &str) -> RequestRow {
-    RequestRow {
-        id: None,
-        ts_ms,
-        duration_ms: None,
-        kind: Some(RowKind::FidelityDrift),
-        frontend: Some("openai_chat".to_owned()),
-        provider: None,
-        route: Some(route.to_owned()),
-        session_id: None,
-        ping: None,
-        model: None,
-        raw_model: None,
-        requested_model: None,
-        effective_model: None,
-        input: None,
-        cache_read: None,
-        cache_write_total: None,
-        cache_write_5m: None,
-        cache_write_1h: None,
-        output: None,
-        reasoning: None,
-        iterations: None,
-        web_searches: None,
-        code_execs: None,
-        ttl_split_known: None,
-        usage_presence: None,
-        usage_raw: None,
-        cost_usd: None,
-        cost_kind: None,
-        rate_limits: None,
-        req_bytes: None,
-        req_messages: None,
-        req_tools: None,
-        tools_hash: None,
-        system_chars: None,
-        system_hash: None,
-        system_blocks: None,
-        system_messages: None,
-        compact_generations: None,
-        summarising: None,
-        system_change: None,
-        system_ladder: None,
-        system_tail: None,
-        gate_on: None,
-        cold_on: None,
-        forced_from: None,
-        forced_to: None,
-        downgraded_from: None,
-        downgraded_to: None,
-        cache_stripped: None,
-        system_merged: None,
-        model_mappings: None,
-        drift_digest: Some(digest.to_owned()),
-        status: None,
-        error_type: None,
-        retry_after_ms: None,
         extra: None,
         betas: None,
         geo: None,

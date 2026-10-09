@@ -367,6 +367,8 @@ requested model, and effective model.
   and quietness tests.
 - Once every usage route has moved, remove fidelity drift and atomically update
   `AGENTS.md` plus `docs/internals/` to the universal-rendering invariant.
+  Done: inference no longer emits drift rows, while historical rows remain
+  readable.
 
 ### 4. Own model discovery
 

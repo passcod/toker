@@ -38,7 +38,7 @@ topic says that too.
 | `src/server/quota_events.rs` | Console quota events: threshold crossings, claim changes and non-`allowed` statuses, latched per backend. |
 | `src/server/control.rs` | The `/_toker/*` control endpoints and their header gate. |
 | `src/server/record.rs`, `record_anthropic.rs` | Row assembly at stream completion; store errors are logged, never raised. |
-| `src/ir/` | The request IR: a `serde_json::Value` with typed views per protocol (`anthropic.rs`, `openai_chat.rs`), the canonical IR for cross-protocol routes (`canonical.rs`), and the per-request fidelity check (`fidelity.rs`). |
+| `src/ir/` | The request IR: a `serde_json::Value` with typed views per protocol (`anthropic.rs`, `openai_chat.rs`), and the canonical IR for inference routes (`canonical.rs`). |
 | `src/translate/` | Cross-protocol translation, Anthropic Messages ↔ codex Responses. Pure. |
 | `src/observe/` | The side-parser riding each response stream: SSE splitting and usage capture. Infallible. |
 | `src/middleware/quota.rs` | The quota gate: exhaustion, expiry, allowances, the block notice. Pure. |

@@ -67,7 +67,7 @@ use super::record::{
 };
 use super::record_anthropic::AnthropicRecordCtx;
 
-/// Request bodies are buffered for gating and the fidelity check; 64 MiB
+/// Request bodies are buffered for gating and canonical translation; 64 MiB
 /// is far beyond any chat body, so hitting the cap is a client bug worth a
 /// named status rather than a silent OOM.
 pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
@@ -167,7 +167,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             ping,
             requested_model: model,
             effective_model,
-            drift: None,
             shape: Some(shape),
             system_messages,
         });
@@ -788,7 +787,6 @@ fn chat_codex_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRec
         session_id: ctx.session_id,
         requested_model: ctx.requested_model,
         effective_model: ctx.effective_model,
-        drift: ctx.drift,
         backend,
         betas: None,
         shape,

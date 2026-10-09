@@ -37,17 +37,13 @@
 //! byte changes are deliberate: a middleware transform or a config change,
 //! each a user-visible, once-per-change event.
 //!
-//! Invariant 5 (prefix stability): untransformed requests are passthrough
-//! by construction, *verified per request* — the server byte-compares the
-//! re-serialised body against the original buffer ([`fidelity::compare`])
-//! and records a `fidelity-drift` ledger row when they differ, so drift is
-//! a visible, queryable metric, not a hoped-for absence. The property side
-//! — appended turns keep the serialised prefix stable — is enforced by the
-//! prefix-stability test over deterministic seeded conversations.
+//! The original wire-preserving IR remains useful for administrative paths
+//! and the licensed Messages middleware transforms. Inference requests cross
+//! canonical adapters, where backend-rendered prefix stability matters;
+//! byte equality with the client's body does not.
 
 pub mod anthropic;
 pub mod canonical;
-pub mod fidelity;
 pub mod openai_chat;
 pub mod openai_responses;
 
@@ -59,7 +55,6 @@ pub use canonical::{
     CanonBlock, CanonMessage, CanonRole, CanonTool, CanonToolChoice, CanonicalExtension,
     CanonicalRequest, Capabilities, SamplingSpec, ThinkingSpec, ToolResultContent,
 };
-pub use fidelity::{Fidelity, compare};
 pub use openai_chat::{
     BlockDigest, ChatBody, ChatBodyMut, Content, Message, Messages, Shape, Tool, Tools,
 };
@@ -199,8 +194,8 @@ mod tests {
 
     #[test]
     fn trailing_whitespace_parses_but_is_not_reproduced() {
-        // Legal JSON, non-canonical bytes: the fidelity monitor's domain
-        // (the drift tests in tests/ cover the reporting).
+        // Legal JSON, non-canonical bytes: this wire-preserving IR
+        // normalises them, while inference uses canonical adapters.
         let padded = b"{\"a\":1} \n";
         let request = Request::parse(padded).expect("trailing whitespace is legal JSON");
         assert_eq!(request.serialise(), b"{\"a\":1}");

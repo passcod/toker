@@ -312,8 +312,7 @@ impl AnthropicBodyMut<'_> {
     /// **Byte equivalence with a raw splice.** The predecessor
     /// byte-spliced the raw buffer because Node's `JSON.stringify` may reorder keys and
     /// renormalise escapes. toker's IR round-trip is byte-exact for
-    /// canonical input (proven per fixture by the fidelity corpus, and
-    /// per request in production by the fidelity monitor), and the marker
+    /// canonical input (covered by the wire-preserving corpus), and the marker
     /// contains no characters JSON escapes — so removing it from the
     /// parsed text blocks and re-serialising produces the identical bytes
     /// to a raw splice, with key order and every other byte preserved.
@@ -448,10 +447,9 @@ impl AnthropicBodyMut<'_> {
         // The raw scan: the marker needs no JSON escaping, so at
         // position 0 of a string it is always preceded by the opening
         // quote — that is what makes the scan unambiguous. The scan runs
-        // over the serialised bytes, which are the wire bytes for the
-        // canonical bodies that round-trip byte-exactly (and a strip on a
-        // non-canonical body surfaces as fidelity drift rather than
-        // passing silently, per invariant 5's per-request compare).
+        // over the serialised bytes, which match the wire bytes for
+        // canonical bodies. Inference normalises non-canonical bodies
+        // when the backend adapter renders them.
         let bytes = self.request.serialise();
         let needle = format!("\"{marker}");
         let hits = bytes

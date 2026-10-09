@@ -10,7 +10,7 @@
 //!
 //! - OpenAI-chat frontend (→ OpenRouter Chat or Codex Responses binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
-//!     the IR, fidelity-checked, routed, recorded ([`proxy`]).
+//!     the IR, routed, recorded ([`proxy`]).
 //!   - `GET /v1/models` — transparent forwarding, no recording.
 //! - Anthropic frontend (→ any registered Messages/Codex binding):
 //!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
@@ -1404,7 +1404,6 @@ api_key = "ak-literal-test"
             session_id: None,
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
-            drift: None,
             backend: server
                 .registry
                 .resolve(ProtocolId::AnthropicMessages, None)

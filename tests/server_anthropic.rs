@@ -10,9 +10,9 @@
 //! the right cost kind per backend (plan_equivalent on the sub, estimated
 //! on the api), error rows keep their meters but are never priced, the
 //! meters_state table feeds from every response on the meter-source
-//! backend (not just accounted ones), fidelity drift is visible, and
-//! unaccounted paths (count_tokens, batches, compression, non-JSON)
-//! record nothing.
+//! backend (not just accounted ones), canonical rendering produces no
+//! legacy byte-drift rows, and unaccounted paths (count_tokens, batches,
+//! compression, non-JSON) record nothing.
 
 mod common;
 
@@ -1573,13 +1573,11 @@ async fn unmatched_toker_paths_stay_local() {
 }
 
 #[tokio::test]
-async fn fidelity_drift_is_recorded_before_canonical_rendering() {
+async fn canonical_rendering_does_not_record_legacy_fidelity_drift() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
-    // `\/` is legal JSON that serde_json's canonical form never emits: the
-    // IR re-serialises to "/", so the monitor must report drift — and the
-    // canonical request rendering then normalises the equivalent spelling.
+    // A legal non-canonical spelling is rendered canonically.
     let body = br#"{"model":"claude-opus-5","messages":[{"role":"user","content":"a\/b"}]}"#;
     let response = post_messages(addr, "/v1/messages", &[], body).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1589,17 +1587,12 @@ async fn fidelity_drift_is_recorded_before_canonical_rendering() {
     assert_canonical_request(body, &captured[0].body, "claude-opus-5");
     assert_ne!(captured[0].body.as_ref(), body.as_slice());
 
-    let rows = wait_for_rows(&store, 2).await;
-    let mut drift_rows = rows
-        .iter()
-        .filter(|row| row.kind == Some(RowKind::FidelityDrift));
-    let drift = drift_rows.next().expect("a fidelity-drift row is recorded");
-    assert_eq!(drift.frontend.as_deref(), Some("anthropic"));
-    assert_eq!(drift.route.as_deref(), Some("anthropic:anthropic_sub"));
-    let digest = drift.drift_digest.as_deref().expect("drift digest set");
-    assert_eq!(digest.len(), 12, "the sha256/12 short digest");
-    assert!(drift_rows.next().is_none(), "exactly one drift row");
-
+    let rows = wait_for_rows(&store, 1).await;
+    assert!(
+        rows.iter()
+            .all(|row| row.kind != Some(RowKind::FidelityDrift)),
+        "canonical rendering must not produce legacy byte-drift rows"
+    );
     let measurement = rows
         .iter()
         .find(|row| row.kind.is_none())

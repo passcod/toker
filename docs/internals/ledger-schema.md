@@ -36,7 +36,7 @@ staleness back as the API's, which is how a 77-second observed lag first read as
 | `cold-recap` | A Claude Code recap on a cold lane was answered by the gate and never forwarded. `extra` carries the `cold` row's `idleMs`, `lastPrompt` and `reqMessages`. The lane is untouched, so the notice is still armed. Absent before 2026-10-06. |
 | `awake` | The sleep lock changed hands. No `rate_limits`, and no frontend, provider or route: the lock is not a route. |
 | `error` | A non-2xx on a usage path: `status`, `error_type`, `retry_after_ms`. Never priced. |
-| `fidelity-drift` | Re-serialisation diverged from the client's bytes; `drift_digest` says where. The original bytes were forwarded. |
+| `fidelity-drift` | Historical only: before universal canonical inference rendering, re-serialisation diverged from the client's bytes; `drift_digest` identifies the divergence. The original bytes were forwarded. New inference rows do not emit this kind. |
 
 `blocked` rows' `context_tokens` is the size of the session's largest lane, the
 figure the notice reported. It is NULL where the lane table did not know the
@@ -99,8 +99,8 @@ look like toker's own: `frontend` is `anthropic`, `provider` is `anthropic_sub`
 unless the row named one, `cost_kind` is `plan_equivalent` by default, and kind
 payloads ride `extra` in the shapes toker's writers use. What they cannot carry
 is anything ctp never recorded: no `usage_raw`, no `extra.frontend`, no
-`fidelity-drift` rows. A view over a range that reaches into imported rows must
-say so rather than read those absences as zeros.
+historical `fidelity-drift` rows. A view over a range that reaches into
+imported rows must say so rather than read those absences as zeros.
 
 ctp's own field eras carry over with the rows:
 

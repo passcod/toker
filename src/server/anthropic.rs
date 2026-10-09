@@ -19,12 +19,11 @@
 //!   body parses into canonical IR and the selected Messages binding renders
 //!   it. Provider bytes feed observation before canonical response rendering.
 //! - `POST /v1/messages/count_tokens`, `POST /v1/messages/batches` — the
-//!   same pipeline end to end (buffer → IR parse → fidelity check →
-//!   routing → forward → tee → record), but they are **never gated**
+//!   legacy pipeline (buffer → IR parse → routing → forward → tee →
+//!   record), but they are **never gated**
 //!   (blocking them protects no quota, only breaks the client). Their
 //!   responses carry no usage, so they record nothing in
-//!   practice — their error and drift rows are real, as the predecessor's
-//!   were.
+//!   practice — their error rows remain real.
 //! - The batch-result GETs and cancel — transparent forwarding, like the
 //!   openai path's `/v1/models`: no recording, no observation.
 //! - Every path the route table does not match — the router's fallback,
@@ -69,7 +68,7 @@ use futures::stream::Stream;
 
 use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
-use crate::ir::{Fidelity, Request as IrRequest, compare};
+use crate::ir::Request as IrRequest;
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
@@ -219,7 +218,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // response it rides the body stream.
     let in_flight = (path == "/v1/messages" && !ping).then(|| server.begin_in_flight());
 
-    // 2.-5. Parse, fidelity-check, route.
+    // Parse and route before applying the Messages middleware.
     let mut forward = original.clone();
     let mut record = None;
     // The parsed IR outlives the block below: the compaction retarget —
@@ -244,13 +243,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // even reading meters).
     let mut meters_snapshot: Option<serde_json::Value> = None;
     if let Ok(mut ir) = IrRequest::parse(&original) {
-        // 3. Invariant 5, verified per request: Exact is the normal case;
-        // Drift forwards the original buffer either way, and lands a
-        // visible fidelity-drift row at completion.
-        let mut drift = None;
-        if let Fidelity::Drift { digest, .. } = compare(&original, &ir.serialise()) {
-            drift = Some(digest);
-        }
         client_model = ir.anthropic().model().map(str::to_owned);
         stream_explicitly_false = ir.anthropic().stream_explicitly_false();
         // 4. Routing: read the model through the typed view; a provider
@@ -339,10 +331,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             }
         }
         if transformed {
-            // A deliberate transform: forward the serialised IR. When the
-            // only transform was a strip on a drifted (non-canonical)
-            // body, this surfaces as the drift row already recorded above
-            // — the marker still must not reach the model.
+            // A deliberate transform: forward the serialised IR so the
+            // marker never reaches the model.
             forward = Bytes::from(ir.serialise());
         }
         let shape = ir.anthropic().shape();
@@ -360,7 +350,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             session_id: session_id.clone(),
             requested_model: model,
             effective_model,
-            drift,
             backend: backend.clone(),
             betas,
             shape: Some(shape.clone()),
@@ -810,8 +799,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.
-                // The fidelity compare ran on the pre-transform body, so
-                // this deliberate rewrite can never surface as drift.
                 forward = Bytes::from(ir.serialise());
                 // A same-model strip is not a downgrade, and recording one
                 // would put a model in `downgradedFrom` that also served
@@ -862,9 +849,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // compaction will run on. The only body edit is set_model — every
     // cache_control survives, unlike the retarget, because this rewrite
     // STARTS a conversation that should cache its prefix on the model it
-    // is actually going to use. The fidelity compare ran on the
-    // pre-transform body, so this deliberate rewrite can never surface as
-    // drift.
+    // is actually going to use.
     if path == "/v1/messages"
         && server.config.gates.force_newest
         && picks_from_anthropic_catalogue(backend.as_ref())
@@ -923,9 +908,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // A provider carrying `[providers.<id>.model_map]` rewrites the
     // model positions in the serialised body: top-level on /v1/messages
     // and /count_tokens, per-request in batches. A deliberate transform —
-    // the spliced bytes are the point, and the fidelity compare ran on
-    // the pre-transform body, so a mapped model can never surface as
-    // drift. Matching is exact-identity first, then family; unmatched
+    // the spliced bytes are the point. Matching is exact-identity first,
+    // then family; unmatched
     // requests keep their exact bytes (the unchanged path). Applies AFTER
     // force-newest (which previewed through the map above), and BEFORE
     // the served-model mark — the mark must see what is actually sent.
