@@ -405,3 +405,9 @@ The feature is complete when one activated revision can, without a restart:
 - roll back by activating a prior policy as a new revision;
 - record every routing identity and decision without storing conversation
   content.
+
+It must also cover Claude Code's auxiliary bare `claude-*` requests when no
+Anthropic backend is configured: classifier, title, helper, and compaction
+calls resolve through policy to a configured backend instead of failing at an
+absent Anthropic default. The policy must not identify these calls by prompt
+or request shape.

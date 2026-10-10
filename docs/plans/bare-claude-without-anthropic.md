@@ -1,9 +1,10 @@
 # Bare `claude-*` side calls on a toker with no Anthropic backend
 
 Date: 2026-10-09
-Status: deferred. Another refactor was under way in a separate session when
-this was written and may change how a backend is chosen; reconcile with it
-before starting.
+Status: subsumed by the live model routing policy. The scenario remains
+unresolved until that policy is implemented; its completion criteria now name
+this case explicitly. Do not implement the older `openrouter`-as-default and
+provider-local model-map direction below.
 
 ## The problem
 
@@ -31,6 +32,9 @@ an Anthropic login. The classifier model comes from a server-side flag, so
 that depends on the account.
 
 ## Direction
+
+Historical direction, superseded by
+[`live-model-routing-policy.md`](live-model-routing-policy.md):
 
 Route by model family, not by recognising classifier calls. Every one of these
 side calls names a Claude family, so one mechanism covers all of them, whereas

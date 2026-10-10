@@ -1,5 +1,8 @@
 # Anthropic subscription signing: on-host test
 
+Status: implementation complete; the real-subscription checks below have not
+yet been run on a suitable host.
+
 This is a manual verification script for a machine with a Claude Code login.
 It remains after the mux implementation plan because it records on-host
 verification, not unfinished implementation. Run it only when a small real

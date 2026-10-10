@@ -1,7 +1,11 @@
 # toker — unified local proxy toolsuite
 
 Date: 2026-10-03
-Status: phases 1-3 shipped; codex_sub supports translated Anthropic traffic and the native Responses frontend (`/v1/responses`) used by the Codex CLI. Dogfooding live: opencode → openrouter, claude → codex_sub, and codex → codex_sub through one toker.
+Status: phases 1-3 and 5 shipped. Phase 4 retains the OpenAI API backend;
+Lunaroute was consciously dropped. The opencode dashboard's remaining lane
+view is tracked separately in
+[`opencode-session-lanes.md`](opencode-session-lanes.md). The live routing
+policy supersedes the original static routing design.
 
 ## Purpose
 
@@ -79,12 +83,11 @@ Providers within a protocol share an adapter; they differ in auth, cost semantic
 | openai api | OpenAI Chat | API key | token buckets incl. `cached_tokens` (automatic prefix caching), estimated cost |
 | codex sub | Responses | `~/.codex/auth.json` reuse + refresh | its usage-limit shape (verify at implementation; candidate meter source) |
 | openrouter | OpenAI Chat | API key | real billed `usage.cost` + serving provider captured verbatim — ledger parity |
-| lunaroute | OpenAI Chat | `lr_` API key | token buckets; whether their API exposes per-request cost to verify at implementation |
 
 ### Routing
 
 - Configured **default backend per frontend protocol**; bare model names go to the protocol default.
-- **`provider/model` names override per request** (`openrouter/z-ai/glm-5.3`, `anthropic/claude-opus-5`, `lunaroute/…`) — switch backends from the frontend without touching toker config.
+- **`provider/model` names override per request** (`openrouter/z-ai/glm-5.3`, `anthropic/claude-opus-5`, `openai_api/gpt-5`) — switch backends from the frontend without touching toker config.
 - Requested vs effective model always recorded.
 
 ### Dependencies
@@ -146,7 +149,7 @@ Carried over from ctp where marked, new where noted:
 
 ## Credentials (hybrid)
 
-- **API-key backends** (anthropic api, openai api, openrouter, lunaroute): keys entered in setup, stored via the system keyring (`keyring` crate / Secret Service) with 0600-file fallback; setup and `status` report which is in use (the hardened service unit needs dbus access for the keyring path and must degrade gracefully).
+- **API-key backends** (anthropic api, openai api, openrouter): keys entered in setup, stored via the system keyring (`keyring` crate / Secret Service) with 0600-file fallback; setup and `status` report which is in use (the hardened service unit needs dbus access for the keyring path and must degrade gracefully).
 - **Subscription backends** (anthropic sub, codex sub): OAuth tokens reused from the CLIs' own stores, with toker performing refresh when it must sign requests itself.
 - **Pass-through-when-present**: if the incoming request already carries an Authorization/api-key header, forward it verbatim — claude keeps bringing its own credential; toker injects stored creds only when the frontend has none for that backend.
 - The ping subsystem keeps shelling out to `claude -p` as the only credentialed client (ctp pattern).
@@ -178,7 +181,7 @@ SQLite, `$XDG_DATA_HOME/toker/toker.db`, WAL mode. Engine choice: plain **rusqli
 ## Model catalogues
 
 - **Learned-newest store**: per exact model identity, days served + max prompt observed; a model becomes its family's rewrite target after enough distinct days; never beyond the provider's listed window, or observed maxPrompt where none is listed. *(ctp, per-provider in toker)*
-- **Context-window ceilings**: hand-verified catalogue per provider (exact normalised identities; Anthropic native-1M/fixed-200k, Codex declarations like `gpt-5.6-sol`/`gpt-5.6-luna` at 872k, openrouter/lunaroute from their catalogues). Exact-identity matching throughout; unknown stays `?` rather than confidently wrong. *(ctp)*
+- **Context-window ceilings**: hand-verified catalogue per provider (exact normalised identities; Anthropic native-1M/fixed-200k, Codex declarations like `gpt-5.6-sol`/`gpt-5.6-luna` at 872k, and OpenRouter from its catalogue). Exact-identity matching throughout; unknown stays `?` rather than confidently wrong. *(ctp)*
 - **Pricing**: hand-verified per-provider table with a freshness date; unknown model → `costUsd: null` + one-time warning, never guessed. *(ctp)*
 
 ## Sleep lock, wake, ping
@@ -229,20 +232,22 @@ canonical route graph is described in [`routing.md`](../internals/routing.md).
    initial composition seams (`to_codex`, `AnthropicStream`) establish the
    canonical semantics and are migration inputs, not a permanent
    cross-protocol-only branch.
-4. **OpenAI api + lunaroute** backends (adapter exists; these are auth + costing semantics).
+4. **OpenAI API** backend (the Chat adapter exists; this is provider auth,
+   catalogue, and estimated-cost semantics). Lunaroute was dropped because it
+   was not adopted.
 5. **Grown TUI + `setup` wizard + wake/hold/ping units + attribution plugin fallback.**
 
 ## Stretch goals
 
-- **Per-session dashboard in the opencode sidebar.** Extend the opencode plugin beyond cost attribution: render the toker dashboard specialised to the *active* session — context occupancy, token/cache breakdown, spend, lane state — querying `/_toker`. Builds on the attribution plugin work (phase 5).
+- ~~**Per-session dashboard in the opencode sidebar.**~~ Context occupancy,
+  token/cache breakdown, and spend shipped. The remaining lane-state view is
+  split into [`opencode-session-lanes.md`](opencode-session-lanes.md).
 - **Native rendering for gate notices.** Gate and cold notices are synthetic assistant turns; render them in the frontend's own structured format where one exists. The frontend is named by a `/f/<frontend>` base-URL prefix that setup writes into each patched frontend (`/f/claude`, `/f/workhorse`); the router strips it and records the name on rows as `extra.frontend`. A `[notices]` table maps frontend → style, with `default` for unprefixed or unnamed frontends: claude gets `block` (a backticked `★ Toker` insight-style block, claude-only rendering), Workhorse gets `toker` (`> [!TOKER]`), everything else `gfm` (`> [!CAUTION]` for the quota block, `> [!WARNING]` for the cold notice — the level is decided where each notice is composed), and `plain` is opt-in. The old `[gates] notice_style` loads as `[notices] default`. Notice text stays a pure function of (style, level, content) (invariant 4) — the block's width is frozen (50 columns) so a rendered notice enters replayed history byte-stably like any other turn.
 
 ## Verify at implementation (known unknowns)
 
 - ~~Whether opencode supports per-provider custom headers for session attribution~~ **Resolved 2026-10-03: opencode sends `x-session-id` natively** (toker's default header list picks it up) — attribution is server-side and exact; no join plugin needed.
 
-- Codex sub's usage-limit reporting shape (headers vs response body).
-- Whether lunaroute exposes per-request cost or only dashboard usage reports.
 - ~~Codex sub's usage-limit reporting shape (headers vs response body)~~ **Resolved 2026-10-04, verified live**: `x-codex-{primary,secondary}-used-percent` headers on every /responses response (percent + window-minutes + reset-at, plus credits) — parsed and stored per-backend; a real meter source.
 - ~~Anthropic's cache granularity vs re-serialisation in practice~~ **Zero
   drift rows were observed on the original byte-forwarding path**; canonical
@@ -250,5 +255,8 @@ canonical route graph is described in [`routing.md`](../internals/routing.md).
   stability tests.
 - ~~System-role messages on the codex wire~~ **Resolved live**: the backend refuses system-role input items ("System messages are not allowed") — leading text goes to `instructions`, mid-conversation merges into the preceding user turn (ctp's pattern).
 - ~~Sampling parameters~~ **Dropped as a translation cost**: the backend rejects them ("Unsupported parameter: temperature"); its client sends none.
-- The `version` header gates models (a 400 "requires a newer version of Codex") — toker identifies with the installed CLI's tracked version from `~/.codex/version.json`.
+- ~~The `version` header gates models~~ **Resolved**: toker identifies with the
+  configured version, the installed CLI's tracked version from
+  `~/.codex/version.json`, or its built-in floor, and advances from the
+  upstream release probe.
 - claude CLI's Linux credential store location and refresh mechanics for the anthropic-sub signing path (still pending — matters when a non-claude frontend drives anthropic sub).
