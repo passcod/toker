@@ -665,6 +665,12 @@ fn thinking_of(body: &Value) -> Result<Option<ThinkingSpec>, TranslateError> {
                 })?;
             Ok(Some(ThinkingSpec::BudgetTokens(budget_tokens)))
         }
+        Some("adaptive") => Ok(Some(ThinkingSpec::Adaptive {
+            effort: body
+                .pointer("/output_config/effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })),
         Some("disabled") => Ok(Some(ThinkingSpec::Disabled)),
         Some("between_tools") => Ok(Some(ThinkingSpec::BetweenTools)),
         Some(kind) => Err(TranslateError::Malformed {
@@ -2066,6 +2072,26 @@ mod tests {
             .thinking,
             Some(ThinkingSpec::BudgetTokens(20_000))
         );
+        for (body, effort) in [
+            (
+                json!({"model": "m", "thinking": {"type": "adaptive"},
+                       "messages": [{"role": "user", "content": "Hi"}]}),
+                None,
+            ),
+            (
+                json!({"model": "m", "thinking": {"type": "adaptive"},
+                       "output_config": {"effort": "high"},
+                       "messages": [{"role": "user", "content": "Hi"}]}),
+                Some("high".to_owned()),
+            ),
+        ] {
+            assert_eq!(
+                from_anthropic(&body)
+                    .expect("adaptive thinking parses")
+                    .thinking,
+                Some(ThinkingSpec::Adaptive { effort })
+            );
+        }
         for (kind, expected) in [
             ("disabled", ThinkingSpec::Disabled),
             ("between_tools", ThinkingSpec::BetweenTools),

@@ -72,8 +72,7 @@ pub struct CanonicalRequest {
     /// refuses sampling declares so ([`Capabilities::sampling`]); a
     /// backend that takes it reads the specs.
     pub sampling: SamplingSpec,
-    /// The request-side thinking intent (parse `enabled` only;
-    /// anything else means "the client did not ask").
+    /// The request-side thinking intent.
     pub thinking: Option<ThinkingSpec>,
     /// The stream flag, tri-state: `Some(true)`/`Some(false)` when the
     /// frontend wire said, `None` when it did not. A backend whose
@@ -449,6 +448,9 @@ pub struct SamplingSpec {
 pub enum ThinkingSpec {
     /// Anthropic Messages' explicit reasoning-token budget.
     BudgetTokens(u64),
+    /// Anthropic Messages' request for model-selected reasoning, plus its
+    /// optional named effort control.
+    Adaptive { effort: Option<String> },
     /// Anthropic Messages' explicit request to disable reasoning.
     Disabled,
     /// Anthropic Messages' provider-requested reasoning between tool calls.

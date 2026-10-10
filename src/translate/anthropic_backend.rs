@@ -106,6 +106,12 @@ pub fn render_anthropic(
                     json!({"type": "enabled", "budget_tokens": budget_tokens}),
                 );
             }
+            ThinkingSpec::Adaptive { effort } => {
+                body.insert("thinking".to_owned(), json!({"type": "adaptive"}));
+                if let Some(effort) = effort {
+                    body.insert("output_config".to_owned(), json!({"effort": effort}));
+                }
+            }
             ThinkingSpec::Disabled => {
                 body.insert("thinking".to_owned(), json!({"type": "disabled"}));
             }
@@ -1067,6 +1073,22 @@ data: {"type":"message_stop"}
                 1,
             )]
         );
+    }
+
+    #[test]
+    fn adaptive_thinking_renders_with_its_optional_effort() {
+        let canonical = crate::ir::canonical::CanonicalRequest {
+            model: Some("claude-example".to_owned()),
+            thinking: Some(crate::ir::canonical::ThinkingSpec::Adaptive {
+                effort: Some("high".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let rendered = render_anthropic(&canonical, DialectId::AnthropicMessages)
+            .expect("adaptive thinking renders");
+        assert_eq!(rendered.value["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(rendered.value["output_config"], json!({"effort": "high"}));
+        assert!(rendered.report.is_empty());
     }
 
     #[test]

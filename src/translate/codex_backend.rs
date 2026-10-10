@@ -162,7 +162,12 @@ pub fn render_codex(
     // this backend's turns always stream (the wire constant), so it
     // is read for nothing here either.
     request.reasoning.effort = canonical.thinking.as_ref().and_then(effort_of);
-    replay_request_extensions(&mut request, &canonical.extensions, &mut report);
+    replay_request_extensions(
+        &mut request,
+        &canonical.extensions,
+        canonical.thinking.as_ref(),
+        &mut report,
+    );
     Ok(Rendered {
         value: request,
         report,
@@ -247,9 +252,30 @@ fn loss_report(canonical: &CanonicalRequest) -> TranslationReport {
 fn replay_request_extensions(
     request: &mut ResponsesRequest,
     extensions: &[CanonicalExtension],
+    thinking: Option<&ThinkingSpec>,
     report: &mut TranslationReport,
 ) {
     for extension in extensions {
+        // Adaptive Messages carries its named tier in `output_config`. The
+        // frontend parsed that semantic value into ThinkingSpec, so an
+        // effort-only object has already crossed onto Responses.reasoning.
+        // A larger output_config still reports a loss for the fields this
+        // binding did not represent.
+        if extension.source() == DialectId::AnthropicMessages
+            && extension.wire_path() == "$.output_config"
+            && matches!(
+                (thinking, extension.value().as_object()),
+                (
+                    Some(ThinkingSpec::Adaptive {
+                        effort: Some(expected)
+                    }),
+                    Some(object)
+                ) if object.len() == 1
+                    && object.get("effort").and_then(Value::as_str) == Some(expected.as_str())
+            )
+        {
+            continue;
+        }
         if extension.source() != DialectId::CodexResponses {
             report_incompatible(extension, report);
             continue;
@@ -589,6 +615,7 @@ fn tool_choice_of(choice: &CanonToolChoice) -> Result<String, TranslateError> {
 fn effort_of(thinking: &ThinkingSpec) -> Option<String> {
     match thinking {
         ThinkingSpec::Effort(effort) => Some(effort.clone()),
+        ThinkingSpec::Adaptive { effort } => effort.clone(),
         ThinkingSpec::BudgetTokens(0..=16_383) => Some("low".to_owned()),
         ThinkingSpec::BudgetTokens(16_384..=32_767) => Some("medium".to_owned()),
         ThinkingSpec::BudgetTokens(_) => Some("high".to_owned()),
@@ -1738,6 +1765,27 @@ mod tests {
                 .as_deref(),
             Some("xhigh")
         );
+
+        // Adaptive delegates to the backend default unless Anthropic's
+        // output_config supplied a named effort tier.
+        for (effort, expected) in [(None, None), (Some("high"), Some("high"))] {
+            let canonical = CanonicalRequest {
+                model: Some(MODEL.to_owned()),
+                thinking: Some(ThinkingSpec::Adaptive {
+                    effort: effort.map(str::to_owned),
+                }),
+                ..CanonicalRequest::default()
+            };
+            assert_eq!(
+                render_codex(&canonical, KEY)
+                    .expect("adaptive thinking renders")
+                    .value
+                    .reasoning
+                    .effort
+                    .as_deref(),
+                expected
+            );
+        }
     }
 
     // ── the response direction: interpretation ────────────────────

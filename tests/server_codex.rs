@@ -1426,6 +1426,11 @@ async fn an_invalid_responses_body_is_rejected_before_upstream_and_not_ledgered(
 async fn a_streaming_turn_translates_both_ways_and_records() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("live", upstream, true)).await;
+    let mut request_body: Value =
+        serde_json::from_slice(&messages_body("codex_sub/claude-opus-5", true))
+            .expect("messages body JSON");
+    request_body["thinking"] = json!({"type": "adaptive"});
+    request_body["output_config"] = json!({"effort": "high"});
 
     let response = client()
         .post(format!("http://{addr}/v1/messages"))
@@ -1435,7 +1440,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
         // The frontend's own (dummy) credential: must NEVER reach the
         // codex backend (pass-through-when-present's explicit opt-out).
         .header(header::AUTHORIZATION, "Bearer frontend-dummy")
-        .body(messages_body("codex_sub/claude-opus-5", true))
+        .json(&request_body)
         .send()
         .await
         .expect("toker answers");
@@ -1476,6 +1481,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["instructions"], "You are a test.");
     assert_eq!(body["tools"][0]["name"], "read_file");
+    assert_eq!(body["reasoning"]["effort"], "high");
     assert_eq!(body["input"][0]["type"], "message");
     assert_eq!(body["input"][0]["role"], "user");
     assert_eq!(

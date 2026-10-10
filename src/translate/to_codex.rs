@@ -184,6 +184,30 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_uses_the_codex_default_or_named_effort() {
+        for (output_config, expected) in [
+            (None, None),
+            (Some(json!({"effort": "high"})), Some("high")),
+        ] {
+            let mut body = json!({
+                "model": "claude-opus-example",
+                "thinking": {"type": "adaptive"},
+                "messages": [{"role": "user", "content": "Hi"}],
+            });
+            if let Some(output_config) = output_config {
+                body["output_config"] = output_config;
+            }
+            let rendered =
+                super::render_to_codex(&body, MODEL, KEY).expect("adaptive thinking translates");
+            assert_eq!(rendered.value.reasoning.effort.as_deref(), expected);
+            assert!(
+                rendered.report.is_empty(),
+                "an effort-only output_config crossed semantically"
+            );
+        }
+    }
+
+    #[test]
     fn the_extra_fields_follow_the_pinned_fields_in_a_fixed_order() {
         let body = json!({
             "model": "claude-opus-5",

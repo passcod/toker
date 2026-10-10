@@ -65,6 +65,10 @@ portable tool-call shape. This
 lets a newer frontend shape reach a compatible backend without requiring toker
 to understand its contents. Toker always replaces the frontend credential
 with its shared Codex login before the request leaves loopback.
+On a Messages-to-Codex route, an explicit thinking budget maps to the documented
+Codex effort ladder. Adaptive thinking leaves effort at the Codex model default,
+or carries `output_config.effort` across as the same named tier when Claude sends
+one.
 
 Every Chat route is canonical. The OpenRouter and direct OpenAI bindings
 deterministically render Chat again and interpret their responses before the

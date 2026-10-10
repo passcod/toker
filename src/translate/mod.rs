@@ -71,6 +71,7 @@
 //! | assistant `text` | `message{role:"assistant", content:[{type:"output_text", text}]}` |
 //! | assistant `tool_use` | `function_call{name, arguments: <input serialised as a JSON string>, call_id: id}` |
 //! | assistant `thinking` / `redacted_thinking` | **DROPPED** — this backend's declared cost (see below) |
+//! | `thinking: {type:"adaptive"}` | backend-default reasoning; `output_config.effort`, when present, becomes the same named Responses effort tier |
 //! | `role:"system"` messages (claude Code's mid-conversation reminders) | merged into the PRECEDING user turn as `[PROMPT_INJECTION]`-prefixed text parts (this backend refuses system-role input items — live-verified); with no preceding user item, the text joins `instructions` instead |
 //! | tools `{name, description, input_schema}` | `{type:"function", name, description, strict:false, parameters: input_schema}` (`description` `""` when absent) |
 //! | `max_tokens` / `temperature` / `top_p` | **DROPPED** — this backend's declared cost: it refuses sampling outright (live-verified: "Unsupported parameter: temperature") |
