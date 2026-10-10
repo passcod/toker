@@ -69,7 +69,7 @@ use futures::stream::Stream;
 use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
 use crate::ir::Request as IrRequest;
-use crate::ir::canonical::CanonicalRequest;
+use crate::ir::canonical::{CanonicalRequest, ResponseProjection};
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
@@ -1107,6 +1107,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // no codex equivalent (the CLI defines none) — those paths answer
     // with a typed anthropic error instead of forwarding JSON the
     // backend would only reject.
+    let response_projection = canonical
+        .as_ref()
+        .map(ResponseProjection::for_request)
+        .unwrap_or_default();
     if target
         .binding()
         .canonical_backend()
@@ -1228,6 +1232,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     record,
                     in_flight,
                     served_model.as_deref().unwrap_or_default(),
+                    response_projection,
                 )
                 .await
             } else {
@@ -1528,6 +1533,7 @@ async fn forward_canonical_messages(
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: &str,
+    response_projection: ResponseProjection,
 ) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -1585,6 +1591,7 @@ async fn forward_canonical_messages(
             rate_limits,
             in_flight,
             model,
+            response_projection,
         );
         let mut headers = response_headers(&upstream_headers, false);
         headers.insert(
@@ -1603,7 +1610,7 @@ async fn forward_canonical_messages(
             "toker could not interpret an oversized upstream response",
         );
     }
-    let turn = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+    let mut turn = match serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
         .map_err(|error| error.to_string())
         .and_then(|body| {
             translate::canonical_turn_from_anthropic(&body).map_err(|error| error.to_string())
@@ -1623,6 +1630,7 @@ async fn forward_canonical_messages(
         let capture = observer.finish();
         record_anthropic_measurement(ctx, capture.as_ref(), rate_limits.as_ref(), status.as_u16());
     }
+    response_projection.apply(&mut turn);
     let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
     anthropic_json_response(status, &upstream_headers, &body)
 }
@@ -1658,6 +1666,7 @@ struct CanonicalMessagesStream {
     rate_limits: Option<serde_json::Value>,
     in_flight: Option<InFlightGuard>,
     status: u16,
+    response_projection: ResponseProjection,
 }
 
 impl CanonicalMessagesStream {
@@ -1668,6 +1677,7 @@ impl CanonicalMessagesStream {
         rate_limits: Option<serde_json::Value>,
         in_flight: Option<InFlightGuard>,
         model: &str,
+        response_projection: ResponseProjection,
     ) -> CanonicalMessagesStream {
         let (abort, registration) = AbortHandle::new_pair();
         let stream: UpstreamBody = Box::pin(response.bytes_stream());
@@ -1685,6 +1695,7 @@ impl CanonicalMessagesStream {
             rate_limits,
             in_flight,
             status,
+            response_projection,
         }
     }
 
@@ -1693,7 +1704,11 @@ impl CanonicalMessagesStream {
             self.observer.observe_event(&event);
         }));
         let canonical = self.backend.feed_sse(&event);
-        for emitted in canonical.iter().flat_map(|event| self.frontend.feed(event)) {
+        for emitted in canonical
+            .iter()
+            .filter(|event| self.response_projection.allows(event))
+            .flat_map(|event| self.frontend.feed(event))
+        {
             self.pending.push_back(anthropic_sse_bytes(&emitted));
         }
     }

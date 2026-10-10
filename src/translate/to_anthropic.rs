@@ -33,6 +33,7 @@
 
 use serde_json::Value;
 
+use crate::ir::canonical::ResponseProjection;
 use crate::observe::sse::SseEvent;
 use crate::providers::codex::{ResponseError, ResponseEvent, TurnCapture};
 use crate::translate::anthropic_frontend::{self, AnthropicRenderer, anthropic_from_canonical};
@@ -71,9 +72,21 @@ impl AnthropicStream {
     /// not fit the typed view is skipped rather than corrupting the
     /// stream (invariant 6).
     pub fn feed(&mut self, event: &ResponseEvent) -> Vec<SseEvent> {
+        self.feed_projected(event, ResponseProjection::default())
+    }
+
+    /// Feed one Responses event through a request-derived response
+    /// projection before rendering it onto the Anthropic wire.
+    pub fn feed_projected(
+        &mut self,
+        event: &ResponseEvent,
+        projection: ResponseProjection,
+    ) -> Vec<SseEvent> {
         let mut out = Vec::new();
         for canon in self.canon.feed(event) {
-            out.extend(self.renderer.feed(&canon));
+            if projection.allows(&canon) {
+                out.extend(self.renderer.feed(&canon));
+            }
         }
         out
     }

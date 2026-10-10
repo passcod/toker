@@ -280,6 +280,14 @@ row carries `extra.thinkingRewrite` (see
 This keys on the upstream's answer, not on the backend or the model, so it
 applies wherever an Anthropic-wire upstream asks for it.
 
+`disabled` also governs the response independently of backend support. The
+canonical request carries it to any backend adapter that can express it. The
+same request creates a response projection that removes visible thinking,
+thinking signatures, redacted thinking, and provider-opaque reasoning before
+the frontend renderer. A backend without a disable control may still reason
+internally, and accounting still records the provider's reasoning tokens, but
+none of its reasoning blocks reach the client.
+
 ## Canonical routes translate, purely
 
 An anthropic-frontend request routed to `codex_sub` never byte-forwards. It goes

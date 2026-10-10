@@ -190,6 +190,31 @@ const ERROR_BODY: &str =
 
 const BETWEEN_TOOLS_ERROR: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"To turn thinking off on this model, send \"thinking\": {\"type\": \"between_tools\"} instead of {\"type\": \"disabled\"}. The model does not think before responding. The short updates it writes between tool calls come back as thinking blocks."}}"#;
 
+const THINKING_RESPONSE_SSE: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_thinking\",\"model\":\"thinking-response\",\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"allowed\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
 async fn read_and_capture(mock: &MockState, request: Request) -> (String, HeaderMap, Value, bool) {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
@@ -257,6 +282,18 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             StatusCode::OK,
             "application/json",
             Bytes::from_static(br#"{"unexpected":true}"#),
+        ),
+        "thinking-response" if stream => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(THINKING_RESPONSE_SSE),
+        ),
+        "thinking-response" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(
+                br#"{"id":"msg_thinking","type":"message","role":"assistant","model":"thinking-response","content":[{"type":"thinking","thinking":"private","signature":"sig"},{"type":"redacted_thinking","data":"opaque"},{"type":"text","text":"allowed"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":9}}"#,
+            ),
         ),
         "hang" if stream => {
             // First event, then nothing — the client hangs up mid-stream
@@ -1298,6 +1335,42 @@ async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
             Some("between_tools")
         );
         assert_no_more_rows(&store, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn thinking_disabled_reaches_a_messages_backend_and_filters_its_response() {
+    for stream in [false, true] {
+        let (mock, upstream) = spawn_mock().await;
+        let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+        let body = thinking_off_body("thinking-response", stream);
+        let response = post_messages(addr, "/v1/messages", &[], &body).await;
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let bytes = response.bytes().await.expect("response body");
+
+        let captured = mock.captured();
+        assert_eq!(captured.len(), 1);
+        let sent: Value = serde_json::from_slice(&captured[0].body).expect("sent JSON");
+        assert_eq!(
+            sent.pointer("/thinking/type"),
+            Some(&json!("disabled")),
+            "a capable backend receives the explicit request intent"
+        );
+
+        if stream {
+            let rendered = String::from_utf8(bytes.to_vec()).expect("SSE is UTF-8");
+            assert!(rendered.contains("allowed"), "text remains: {rendered}");
+            assert!(!rendered.contains("thinking_delta"), "{rendered}");
+            assert!(!rendered.contains("signature_delta"), "{rendered}");
+            assert!(!rendered.contains("redacted_thinking"), "{rendered}");
+        } else {
+            let rendered: Value = serde_json::from_slice(&bytes).expect("message JSON");
+            assert_eq!(
+                rendered["content"],
+                json!([{"type":"text","text":"allowed"}])
+            );
+        }
     }
 }
 

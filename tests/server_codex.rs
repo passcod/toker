@@ -1584,6 +1584,67 @@ async fn a_non_streaming_request_gets_an_aggregated_message() {
 }
 
 #[tokio::test]
+async fn thinking_disabled_filters_codex_reasoning_from_both_response_shapes() {
+    for stream in [false, true] {
+        let (upstream, mock) = spawn_mock().await;
+        let (addr, store) = spawn_toker(test_config("thinking-off", upstream, true)).await;
+        let body = json!({
+            "model": "claude-opus-5",
+            "system": "Classify the action.",
+            "messages": [{"role": "user", "content": "Check."}],
+            "max_tokens": 64,
+            "stop_sequences": ["</block>"],
+            "thinking": {"type": "disabled"},
+            "stream": stream,
+        });
+
+        let response = client()
+            .post(format!("http://{addr}/v1/messages"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::OK, "stream={stream}");
+        let bytes = response.bytes().await.expect("response body");
+
+        if stream {
+            let rendered = String::from_utf8(bytes.to_vec()).expect("SSE is UTF-8");
+            assert!(rendered.contains("I'll read the files"), "{rendered}");
+            assert!(!rendered.contains("thinking_delta"), "{rendered}");
+            assert!(!rendered.contains("redacted_thinking"), "{rendered}");
+        } else {
+            let rendered: Value = serde_json::from_slice(&bytes).expect("message JSON");
+            let content = rendered["content"].as_array().expect("content array");
+            assert!(
+                content.iter().any(|block| block["type"] == "text"),
+                "text remains: {rendered}"
+            );
+            assert!(
+                content.iter().all(
+                    |block| block["type"] != "thinking" && block["type"] != "redacted_thinking"
+                ),
+                "reasoning was filtered: {rendered}"
+            );
+        }
+
+        {
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let sent: Value = serde_json::from_slice(&requests[0].body).expect("codex request");
+            assert_eq!(sent["model"], "gpt-5.6-sol");
+        }
+
+        let rows = wait_for_rows(&store, 1).await;
+        assert_eq!(
+            rows[0].reasoning,
+            Some(96),
+            "filtering the client response does not erase provider accounting"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_untranslatable_body_never_reaches_the_upstream() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("ut", upstream, true)).await;

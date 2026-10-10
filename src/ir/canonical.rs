@@ -158,6 +158,18 @@ impl CanonicalExtension {
         }
     }
 
+    /// Whether this opaque value is part of a provider's reasoning wire.
+    ///
+    /// Known reasoning is modeled as canonical thinking blocks/events. This
+    /// catches the dialect-compatible opaque siblings so a response
+    /// projection cannot leak them after the frontend explicitly disabled
+    /// thinking.
+    fn is_reasoning_wire(&self) -> bool {
+        let kind = self.value.get("type").and_then(Value::as_str);
+        kind.is_some_and(|kind| kind == "reasoning" || kind.contains(".reasoning_"))
+            || self.value.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+    }
+
     pub fn source(&self) -> DialectId {
         self.source
     }
@@ -699,10 +711,134 @@ pub struct CanonTurn {
     pub thinking: BTreeMap<u64, String>,
 }
 
+/// Request-derived filtering applied to the canonical response before any
+/// frontend renders it.
+///
+/// A backend may support an explicit thinking control and receive it on its
+/// own wire, or it may reason internally despite lacking such a control. The
+/// frontend contract is independent: when the request says thinking is
+/// disabled, no visible, signed, redacted, or provider-opaque reasoning may
+/// cross the response boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseProjection {
+    include_thinking: bool,
+}
+
+impl Default for ResponseProjection {
+    fn default() -> Self {
+        ResponseProjection {
+            include_thinking: true,
+        }
+    }
+}
+
+impl ResponseProjection {
+    /// Derive the response contract from the request's explicit intent.
+    pub fn for_request(request: &CanonicalRequest) -> ResponseProjection {
+        ResponseProjection {
+            include_thinking: request.thinking != Some(ThinkingSpec::Disabled),
+        }
+    }
+
+    /// Whether one canonical stream event may reach the frontend renderer.
+    pub fn allows(&self, event: &CanonEvent) -> bool {
+        self.include_thinking
+            || !matches!(
+                event,
+                CanonEvent::ThinkingDelta { .. }
+                    | CanonEvent::ThinkingSignature { .. }
+                    | CanonEvent::ReasoningStarted { .. }
+                    | CanonEvent::RedactedThinking { .. }
+                    | CanonEvent::ThinkingEnded
+            ) && !matches!(event, CanonEvent::ProviderEvent(extension) if extension.is_reasoning_wire())
+    }
+
+    /// Remove every reasoning representation from a complete canonical turn.
+    pub fn apply(&self, turn: &mut CanonTurn) {
+        if self.include_thinking {
+            return;
+        }
+        if let Some(blocks) = turn.blocks.as_mut() {
+            blocks.retain(|block| {
+                !matches!(
+                    block.semantic(),
+                    CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
+                )
+            });
+        }
+        turn.thinking.clear();
+        turn.output_extensions
+            .retain(|extension| !extension.is_reasoning_wire());
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CanonBlock, CanonToolChoice, Capabilities, ToolResultContent};
+    use std::collections::BTreeMap;
+
+    use super::{
+        CanonBlock, CanonEvent, CanonStopReason, CanonToolChoice, CanonTurn, CanonicalExtension,
+        CanonicalRequest, Capabilities, ResponseProjection, ThinkingSpec, ToolResultContent,
+    };
+    use crate::routing::DialectId;
     use serde_json::json;
+
+    #[test]
+    fn disabled_thinking_projects_every_reasoning_form_out_of_the_response() {
+        let request = CanonicalRequest {
+            thinking: Some(ThinkingSpec::Disabled),
+            ..CanonicalRequest::default()
+        };
+        let projection = ResponseProjection::for_request(&request);
+        assert!(!projection.allows(&CanonEvent::ThinkingDelta {
+            part: 0,
+            delta: "summary".to_owned(),
+        }));
+        assert!(!projection.allows(&CanonEvent::ThinkingSignature {
+            part: 0,
+            signature: "signature".to_owned(),
+        }));
+        assert!(!projection.allows(&CanonEvent::RedactedThinking {
+            data: "opaque".to_owned(),
+            provider_id: Some("reasoning-1".to_owned()),
+        }));
+        assert!(projection.allows(&CanonEvent::TextDelta {
+            delta: "answer".to_owned(),
+        }));
+
+        let mut turn = CanonTurn {
+            turn_id: Some("turn-1".to_owned()),
+            stop_reason: CanonStopReason::EndTurn,
+            usage: None,
+            error: None,
+            tool_calls: Vec::new(),
+            output_extensions: vec![CanonicalExtension::new(
+                DialectId::CodexResponses,
+                "$.output[]",
+                json!({"type":"reasoning", "encrypted_content":"opaque"}),
+            )],
+            blocks: Some(vec![
+                CanonBlock::Thinking {
+                    text: "summary".to_owned(),
+                    signature: Some("signature".to_owned()),
+                },
+                CanonBlock::RedactedThinking {
+                    data: "opaque".to_owned(),
+                    provider_id: Some("reasoning-1".to_owned()),
+                },
+                CanonBlock::Text("answer".to_owned()),
+            ]),
+            text: "answer".to_owned(),
+            thinking: BTreeMap::from([(0, "summary".to_owned())]),
+        };
+        projection.apply(&mut turn);
+        assert_eq!(
+            turn.blocks,
+            Some(vec![CanonBlock::Text("answer".to_owned())])
+        );
+        assert!(turn.thinking.is_empty());
+        assert!(turn.output_extensions.is_empty());
+    }
 
     /// The capabilities the corpus and the backend adapter's drops
     /// both assume — pinned so a declaration change is a visible,

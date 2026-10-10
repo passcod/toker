@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use super::Server;
 use crate::ir::AnthropicShape;
-use crate::ir::canonical::CanonicalRequest;
+use crate::ir::canonical::{CanonicalRequest, ResponseProjection};
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
 use crate::providers::Provider;
@@ -310,6 +310,11 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             !stream_explicitly_false,
         );
     };
+    let response_projection = canonical
+        .as_ref()
+        .ok()
+        .map(ResponseProjection::for_request)
+        .unwrap_or_default();
 
     let model = served_model.clone().unwrap_or_default();
     let prompt_cache_key = session_id
@@ -459,6 +464,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             upstream,
             meter_snapshot,
             frontend_wire,
+            response_projection,
         )
         .await
     } else {
@@ -469,6 +475,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             upstream,
             meter_snapshot,
             frontend_wire,
+            response_projection,
         )
         .await
     }
@@ -484,6 +491,7 @@ async fn aggregated_turn(
     upstream: reqwest::Response,
     meters: Option<Value>,
     frontend_wire: CodexFrontendWire,
+    response_projection: ResponseProjection,
 ) -> Response {
     // The turn was recorded through the ctx (which carries the server);
     // the guard drops at return — a JSON answer is over when it is sent.
@@ -540,16 +548,16 @@ async fn aggregated_turn(
         );
     }
 
+    let mut turn = translate::codex_backend::canonical_turn_from_capture(&capture);
+    response_projection.apply(&mut turn);
     let message = match frontend_wire {
-        CodexFrontendWire::Anthropic => translate::message_from_capture(&model, &capture),
-        CodexFrontendWire::OpenAiChat => translate::openai_chat_from_canonical(
-            &model,
-            &translate::codex_backend::canonical_turn_from_capture(&capture),
-        ),
-        CodexFrontendWire::OpenAiResponses => translate::openai_responses_from_canonical(
-            &model,
-            &translate::codex_backend::canonical_turn_from_capture(&capture),
-        ),
+        CodexFrontendWire::Anthropic => {
+            translate::anthropic_frontend::anthropic_from_canonical(&model, &turn)
+        }
+        CodexFrontendWire::OpenAiChat => translate::openai_chat_from_canonical(&model, &turn),
+        CodexFrontendWire::OpenAiResponses => {
+            translate::openai_responses_from_canonical(&model, &turn)
+        }
     };
     if let Some(ctx) = record.as_ref() {
         record_responses_measurement(ctx, &capture, meters, 200, frontend_wire.protocol(), None);
@@ -577,6 +585,7 @@ async fn streamed_turn(
     upstream: reqwest::Response,
     meters: Option<Value>,
     frontend_wire: CodexFrontendWire,
+    response_projection: ResponseProjection,
 ) -> Response {
     let state = StreamState {
         upstream,
@@ -590,6 +599,7 @@ async fn streamed_turn(
         meters,
         in_flight,
         frontend_wire,
+        response_projection,
     };
 
     let stream = futures::stream::unfold(state, |mut state| async move {
@@ -664,6 +674,7 @@ struct StreamState {
     /// live exactly as long as the exchange does.
     in_flight: Option<InFlightGuard>,
     frontend_wire: CodexFrontendWire,
+    response_projection: ResponseProjection,
 }
 
 enum FrontendStream {
@@ -695,15 +706,20 @@ impl FrontendStream {
         }
     }
 
-    fn feed(&mut self, event: &ResponseEvent) -> Vec<SseEvent> {
+    fn feed(
+        &mut self,
+        event: &ResponseEvent,
+        response_projection: ResponseProjection,
+    ) -> Vec<SseEvent> {
         match self {
-            FrontendStream::Anthropic(stream) => stream.feed(event),
+            FrontendStream::Anthropic(stream) => stream.feed_projected(event, response_projection),
             FrontendStream::OpenAiChat {
                 canonical,
                 renderer,
             } => canonical
                 .feed(event)
                 .iter()
+                .filter(|event| response_projection.allows(event))
                 .flat_map(|event| renderer.feed(event))
                 .collect(),
             FrontendStream::OpenAiResponses {
@@ -712,6 +728,7 @@ impl FrontendStream {
             } => canonical
                 .feed(event)
                 .iter()
+                .filter(|event| response_projection.allows(event))
                 .flat_map(|event| renderer.feed(event))
                 .collect(),
         }
@@ -722,7 +739,7 @@ impl StreamState {
     /// One upstream event through both observers: the frontend renderer
     /// emits the client's events, the capture latches the ledger's.
     fn observe(&mut self, event: &ResponseEvent) {
-        for emitted in self.frontend.feed(event) {
+        for emitted in self.frontend.feed(event, self.response_projection) {
             self.pending.push_back(sse_bytes(&emitted));
         }
         self.capture.observe(event);

@@ -118,10 +118,14 @@
 //!   legible to the other. Replaying claude thinking as plain text
 //!   would leak chain-of-thought the source protocol deliberately
 //!   redacts. The drop is coherent both ways: the request direction
-//!   drops thinking blocks, and the response direction synthesises
-//!   **unsigned** thinking blocks from the codex summaries —
-//!   display-only, never replayed (and anthropic-side replay of
-//!   thinking needs a signature this translation never mints).
+//!   drops thinking blocks, and the response direction normally synthesises
+//!   **unsigned** thinking blocks from the codex summaries — display-only,
+//!   never replayed (and anthropic-side replay of thinking needs a signature
+//!   this translation never mints). An explicit request-side
+//!   `thinking: disabled` creates a canonical response projection that removes
+//!   visible, signed, redacted, and provider-opaque reasoning before the
+//!   frontend renderer; a backend may still reason internally, but that does
+//!   not override the frontend contract.
 //! - **`stop_sequences`** — no Responses equivalent, so the codex
 //!   backend drops it; the canonical carries it with the sampling
 //!   specs for a backend that takes it. **`top_k`**, **`metadata`**, and
