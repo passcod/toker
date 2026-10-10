@@ -108,6 +108,20 @@ impl CompiledPolicy {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
+
+    pub fn presentations(
+        &self,
+        scope: &FrontendScope,
+    ) -> impl Iterator<Item = (&str, &CompiledPresentation)> {
+        self.presentations
+            .get(&ScopeKey::from(scope))
+            .into_iter()
+            .flat_map(|items| {
+                items
+                    .iter()
+                    .map(|(slug, presentation)| (slug.as_str(), presentation))
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +131,7 @@ pub struct CompiledRoute {
     candidates: Vec<CompiledCandidate>,
     edges: Vec<CandidateEdge>,
     fingerprint: RouteFingerprint,
+    lane_transition: LaneTransitionPolicy,
 }
 
 impl CompiledRoute {
@@ -135,6 +150,9 @@ impl CompiledRoute {
     pub fn fingerprint(&self) -> &RouteFingerprint {
         &self.fingerprint
     }
+    pub fn lane_transition(&self) -> LaneTransitionPolicy {
+        self.lane_transition
+    }
 }
 
 #[derive(Debug)]
@@ -146,6 +164,7 @@ pub struct CompiledCandidate {
     alias_rules: Vec<CompiledAliasRule>,
     enabled: bool,
     inventory_winner: Option<String>,
+    required_capabilities: super::CapabilityFlags,
 }
 
 impl CompiledCandidate {
@@ -169,6 +188,9 @@ impl CompiledCandidate {
     }
     pub fn inventory_winner(&self) -> Option<&str> {
         self.inventory_winner.as_deref()
+    }
+    pub fn required_capabilities(&self) -> super::CapabilityFlags {
+        self.required_capabilities
     }
 }
 
@@ -621,6 +643,7 @@ impl<'a> Compiler<'a> {
                         candidates,
                         edges,
                         fingerprint,
+                        lane_transition: route.lane_transition,
                     },
                 );
             }
@@ -760,6 +783,7 @@ impl<'a> Compiler<'a> {
             alias_rules,
             enabled: candidate.enabled,
             inventory_winner: winner,
+            required_capabilities: candidate.required_capabilities,
         })
     }
 
@@ -1360,6 +1384,21 @@ impl<'a> Compiler<'a> {
                 .index(index)
                 .expect("bounded");
             let matcher = self.matcher(&rule.matcher, base.clone().field(f("matcher")), record)?;
+            let exclude = rule
+                .exclude
+                .iter()
+                .enumerate()
+                .map(|(exclude_index, matcher)| {
+                    self.matcher(
+                        matcher,
+                        base.clone()
+                            .field(f("exclude"))
+                            .index(exclude_index)
+                            .expect("bounded"),
+                        record,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
             let replacement = self.template(
                 &rule.replacement,
                 &Default::default(),
@@ -1369,6 +1408,7 @@ impl<'a> Compiler<'a> {
             )?;
             out.push(CompiledAliasRule {
                 matcher,
+                exclude,
                 replacement,
             });
         }
@@ -1814,6 +1854,7 @@ mod tests {
         alias.routes[0].chain.first.alias_policy = Some(AliasPolicy {
             rules: vec![AliasRule {
                 matcher: MatcherSpec::Regex("(".to_owned()),
+                exclude: vec![],
                 replacement: "target".to_owned(),
             }],
         });

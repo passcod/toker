@@ -28,6 +28,7 @@ use toker::config::{
     OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
+use toker::policy::{CollectingObserver, ShadowComparison, ShadowObserver, ShadowRecord};
 use toker::server::Server;
 use toker::store::{CostKind, RequestRow, RowKind, Store};
 
@@ -380,6 +381,30 @@ fn openai_test_config(upstream: reqwest::Url) -> Config {
         api_key: Some("sk-proj-test".to_owned()),
     });
     config
+}
+
+async fn spawn_toker_with_observer(
+    config: Config,
+    observer: Arc<dyn ShadowObserver>,
+) -> (SocketAddr, Arc<Store>) {
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::with_shadow_observer(
+        config,
+        store.clone(),
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        Arc::new(toker::secrets::MemoryStore::new()),
+        observer,
+    )
+    .expect("build server");
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    (addr, store)
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
@@ -1899,6 +1924,56 @@ async fn no_anthropic_backend_answers_every_anthropic_path_not_configured() {
         assert_eq!(body["error"]["type"], "not_found_error");
     }
     assert!(mock.captured().is_empty(), "nothing reached any upstream");
+}
+
+struct PanickingObserver;
+
+impl ShadowObserver for PanickingObserver {
+    fn observe(&self, _: ShadowRecord) {
+        panic!("shadow observer cannot affect traffic")
+    }
+}
+
+#[tokio::test]
+async fn shadow_observation_is_one_per_request_and_cannot_alter_chat_traffic() {
+    let (mock, upstream) = spawn_mock().await;
+    let observer = Arc::new(CollectingObserver::default());
+    let (addr, store) = spawn_toker_with_observer(
+        test_config(upstream.clone(), UNSET_KEY_ENV, None),
+        observer.clone(),
+    )
+    .await;
+
+    let body = chat_body("z-ai/glm-5.3", false);
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&mock.captured()[0].body).unwrap()["model"],
+        "z-ai/glm-5.3"
+    );
+    assert_eq!(store.count_requests().unwrap(), 1);
+    let records = observer.records();
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0].comparison,
+        ShadowComparison::Match | ShadowComparison::Mismatch | ShadowComparison::InternalError
+    ));
+
+    let (panic_mock, panic_upstream) = spawn_mock().await;
+    let (panic_addr, panic_store) = spawn_toker_with_observer(
+        test_config(panic_upstream, UNSET_KEY_ENV, None),
+        Arc::new(PanickingObserver),
+    )
+    .await;
+    let response = post_chat(panic_addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(panic_mock.captured().len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&panic_mock.captured()[0].body).unwrap()["model"],
+        "z-ai/glm-5.3"
+    );
+    assert_eq!(panic_store.count_requests().unwrap(), 1);
 }
 
 #[tokio::test]

@@ -80,12 +80,18 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::routing::{get, post};
 
 use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
+use crate::catalog::offers;
 use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
+use crate::policy::{
+    AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
+    LaneFacts, LegacyOutcome, PolicyShadow, ProfileId, RequestClass, RequestFacts, ShadowObserver,
+    TracingObserver,
+};
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
-use crate::routing::{FrontendProfile, ProtocolId, RouteRegistry};
+use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::Store;
 
@@ -207,6 +213,9 @@ pub struct Server {
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
+    /// In-memory revision-one resolver used only to compare decisions made by
+    /// the still-authoritative legacy path.
+    pub(crate) policy_shadow: Option<Arc<PolicyShadow<ModelStore>>>,
 }
 
 impl Server {
@@ -238,6 +247,18 @@ impl Server {
         store: Arc<Store>,
         spawner: Box<dyn LockSpawner>,
         secrets: Arc<dyn SecretStore>,
+    ) -> anyhow::Result<Server> {
+        Self::with_shadow_observer(config, store, spawner, secrets, Arc::new(TracingObserver))
+    }
+
+    /// [`Server::with_seams`], with the read-only shadow observer injected.
+    /// The observer is one-way and cannot affect a handler result.
+    pub fn with_shadow_observer(
+        config: Config,
+        store: Arc<Store>,
+        spawner: Box<dyn LockSpawner>,
+        secrets: Arc<dyn SecretStore>,
+        shadow_observer: Arc<dyn ShadowObserver>,
     ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
         // tests, any embedder) must not reach the registry with a default
@@ -344,6 +365,25 @@ impl Server {
             (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
         lanes::reseed(&store, &seed)?;
         let models = Arc::new(ModelStore::seeded(store.clone(), &seed, covered));
+        let initial_catalogs = FetchedCatalogs::default();
+        let inventory = offers::inventory(&registry, &initial_catalogs);
+        let policy_shadow = match crate::policy::legacy::compile(&config, &registry, &inventory)
+            .and_then(|compilation| {
+                compilation
+                    .into_policy()
+                    .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
+            }) {
+            Ok(policy) => Some(Arc::new(PolicyShadow::new(
+                Arc::new(policy),
+                Arc::new(inventory),
+                models.clone(),
+                shadow_observer.clone(),
+            ))),
+            Err(error) => {
+                tracing::warn!(code = "policy-shadow-startup-disabled", %error);
+                None
+            }
+        };
         Ok(Server {
             store,
             config: Arc::new(config),
@@ -351,7 +391,7 @@ impl Server {
             registry,
             codex_turn,
             models,
-            catalogs: Arc::new(std::sync::RwLock::new(FetchedCatalogs::default())),
+            catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
             catalog_dir: Arc::default(),
             catalog_borrowed_at: Arc::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -362,6 +402,7 @@ impl Server {
             shutdown: Arc::default(),
             force: Arc::default(),
             quota_events: Arc::default(),
+            policy_shadow,
         })
     }
 
@@ -397,6 +438,200 @@ impl Server {
     pub fn set_upstream_idle_timeout(&mut self, idle: Duration) -> anyhow::Result<()> {
         self.http = upstream_client(idle)?;
         Ok(())
+    }
+
+    pub(crate) fn compare_publication_shadow(
+        &self,
+        protocol: ProtocolId,
+        profile: Option<&str>,
+        legacy_models: impl IntoIterator<Item = String>,
+    ) {
+        let Some(shadow) = &self.policy_shadow else {
+            return;
+        };
+        let scope = profile
+            .and_then(|profile| ProfileId::new(profile).ok())
+            .map_or_else(
+                || crate::policy::FrontendScope::Protocol {
+                    protocol: policy_protocol(protocol),
+                },
+                |profile| crate::policy::FrontendScope::Profile {
+                    profile,
+                    protocol: policy_protocol(protocol),
+                },
+            );
+        let legacy: std::collections::BTreeSet<_> = legacy_models.into_iter().collect();
+        let compiled: std::collections::BTreeSet<_> = shadow
+            .policy()
+            .presentations(&scope)
+            .map(|(slug, _)| slug.to_owned())
+            .collect();
+        let record = crate::policy::ShadowRecord {
+            comparison: if legacy == compiled {
+                crate::policy::ShadowComparison::Match
+            } else {
+                crate::policy::ShadowComparison::Mismatch
+            },
+            code: if legacy == compiled {
+                "policy-shadow-publication-match"
+            } else {
+                "policy-shadow-publication-mismatch"
+            },
+            legacy: None,
+            shadow: None,
+        };
+        shadow.observe_record(record);
+    }
+
+    pub(crate) fn observe_policy_shadow(
+        &self,
+        facts: RequestFacts,
+        lane: Option<LaneFacts>,
+        legacy: LegacyOutcome,
+    ) {
+        let Some(shadow) = &self.policy_shadow else {
+            return;
+        };
+        shadow.observe(facts, lane, self.shadow_availability(), legacy);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shadow_facts(
+        &self,
+        protocol: ProtocolId,
+        profile: Option<&str>,
+        requested_model: Option<String>,
+        lane_reference: Option<String>,
+        prompt_bound: u64,
+        message_count: Option<u64>,
+        tool_count: u64,
+        required_capabilities: crate::policy::CapabilityFlags,
+        binding_affinity: Option<crate::policy::BindingId>,
+        class: RequestClass,
+    ) -> RequestFacts {
+        RequestFacts {
+            profile: profile
+                .and_then(|name| ProfileId::new(name).ok())
+                .or_else(|| ProfileId::new("unprefixed").ok()),
+            protocol: policy_protocol(protocol),
+            requested_model,
+            lane_reference,
+            prompt_bound,
+            message_count,
+            tool_count,
+            required_capabilities,
+            binding_affinity,
+            class,
+            now_ms: now_ms(),
+        }
+    }
+
+    pub(crate) fn shadow_lane(&self, key: Option<&str>, now: i64) -> Option<LaneFacts> {
+        let lane = key.and_then(|key| self.store.load_lane(key).ok().flatten())?;
+        let ttl = lane
+            .ttl
+            .unwrap_or(crate::middleware::force_newest::CACHE_TTL_MAX_MS);
+        Some(LaneFacts {
+            cold: now.saturating_sub(lane.updated_ms) >= ttl,
+            pinned: None,
+            forced_from: lane.forced_from,
+            forced_to: lane.forced_to,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn legacy_shadow_outcome(
+        &self,
+        facts: &RequestFacts,
+        target: &ModelTarget,
+        baseline_model: Option<String>,
+        upgraded_model: Option<String>,
+        aliased_model: Option<String>,
+        effective_model: Option<String>,
+        compaction: bool,
+    ) -> Option<LegacyOutcome> {
+        let baseline_model =
+            baseline_model.or_else(|| target.effective_model().map(str::to_owned))?;
+        let route_source = legacy_route_source(facts, target);
+        Some(LegacyOutcome {
+            protocol: facts.protocol,
+            profile: facts.profile.clone(),
+            requested_model: facts.requested_model.clone(),
+            provider: target.provider().id().to_owned(),
+            binding_id: target.binding().id().clone(),
+            route_source,
+            baseline_model,
+            upgraded_model,
+            aliased_model,
+            effective_model: effective_model
+                .or_else(|| target.effective_model().map(str::to_owned))
+                .unwrap_or_default(),
+            compaction,
+        })
+    }
+
+    fn shadow_availability(&self) -> AvailabilitySnapshot {
+        let catalogs = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bindings = self
+            .registry
+            .bindings()
+            .map(|binding| {
+                let configured = self.registry.binding_is_configured(binding);
+                let catalogue = FetchedCatalogs::source_of(binding.provider())
+                    .and_then(|source| catalogs.get(source))
+                    .map_or(CatalogueAvailability::Absent, |catalog| {
+                        if now_ms().saturating_sub(catalog.fetched_at_ms) <= fetched::CACHE_TTL_MS {
+                            CatalogueAvailability::Fresh {
+                                fetched_at_ms: catalog.fetched_at_ms,
+                            }
+                        } else {
+                            CatalogueAvailability::Stale {
+                                fetched_at_ms: catalog.fetched_at_ms,
+                            }
+                        }
+                    });
+                let canonical = binding.canonical_backend();
+                (
+                    binding.id().clone(),
+                    BindingAvailability {
+                        provider: binding.provider().to_owned(),
+                        configured: if configured {
+                            Evidence::Positive("configured")
+                        } else {
+                            Evidence::Negative("unconfigured")
+                        },
+                        enabled: if configured {
+                            Evidence::Positive("enabled")
+                        } else {
+                            Evidence::Negative("disabled")
+                        },
+                        // Credential preparation is expressly outside shadow.
+                        // Configuration is the only safe evidence available.
+                        credential: if configured {
+                            Evidence::Unknown
+                        } else {
+                            Evidence::Negative("provider-unconfigured")
+                        },
+                        catalogue,
+                        capabilities: canonical.map_or(
+                            crate::routing::Capabilities {
+                                sampling: false,
+                                system_in_messages: false,
+                                thinking_replay: false,
+                                images: false,
+                            },
+                            |canonical| canonical.capabilities(),
+                        ),
+                        cost_class: binding.cost_class(),
+                        cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
+                    },
+                )
+            })
+            .collect();
+        AvailabilitySnapshot::new(bindings)
     }
 
     // ── the idle-sleep lock ──────────────────────────────────────────
@@ -686,10 +921,17 @@ impl Server {
     /// disk cache. The source must be one of [`fetched::SOURCES`] to be
     /// reachable through the provider-mapped lookups.
     pub fn install_catalog(&self, source: &'static str, catalog: FetchedCatalog) {
-        self.catalogs
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set(source, catalog);
+        let inventory = {
+            let mut catalogs = self
+                .catalogs
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            catalogs.set(source, catalog);
+            offers::inventory(&self.registry, &catalogs)
+        };
+        if let Some(shadow) = &self.policy_shadow {
+            shadow.replace_inventory(Arc::new(inventory));
+        }
     }
 
     /// The models-catalogue sources as this server is configured
@@ -801,10 +1043,14 @@ impl Server {
                 }
             }
         }
+        let inventory = offers::inventory(&self.registry, &next);
         *self
             .catalogs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        if let Some(shadow) = &self.policy_shadow {
+            shadow.replace_inventory(Arc::new(inventory));
+        }
     }
 
     /// The models-catalogue refresh: all three sources at startup, then
@@ -930,6 +1176,48 @@ impl Server {
 }
 
 /// The frontend name a request carries, if it came through a prefix.
+fn policy_protocol(protocol: ProtocolId) -> FrontendProtocol {
+    match protocol {
+        ProtocolId::AnthropicMessages => FrontendProtocol::AnthropicMessages,
+        ProtocolId::OpenAiChat => FrontendProtocol::OpenaiChat,
+        ProtocolId::OpenAiResponses => FrontendProtocol::OpenaiResponses,
+    }
+}
+
+fn legacy_route_source(facts: &RequestFacts, target: &ModelTarget) -> String {
+    if let Some(requested) = facts.requested_model.as_deref() {
+        if requested
+            .strip_prefix(target.provider().id())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some()
+        {
+            return format!(
+                "protocol-rewrite:legacy-prefix-{}-{}",
+                match facts.protocol {
+                    FrontendProtocol::AnthropicMessages => "anthropic",
+                    FrontendProtocol::OpenaiChat => "openai-chat",
+                    FrontendProtocol::OpenaiResponses => "openai-responses",
+                },
+                target.provider().id()
+            );
+        }
+        if facts.protocol == FrontendProtocol::AnthropicMessages
+            && requested.starts_with("anthropic/")
+        {
+            return "protocol-rewrite:legacy-anthropic-protocol-alias".to_owned();
+        }
+    }
+    if facts
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.as_str() == "unprefixed")
+    {
+        "profile-default".to_owned()
+    } else {
+        "protocol-default".to_owned()
+    }
+}
+
 pub(crate) fn frontend_of(extensions: &axum::http::Extensions) -> Option<&str> {
     extensions
         .get::<FrontendProfile>()

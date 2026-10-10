@@ -28,6 +28,20 @@ pub struct OfferInventory {
 }
 
 impl OfferInventory {
+    pub fn from_offers(offers: impl IntoIterator<Item = BackendOffer>) -> Self {
+        Self {
+            by_backend: offers
+                .into_iter()
+                .map(|offer| {
+                    (
+                        (offer.binding_id.clone(), offer.backend_model_id.clone()),
+                        offer,
+                    )
+                })
+                .collect(),
+        }
+    }
+
     pub fn get(&self, binding_id: &BindingId, backend_model_id: &str) -> Option<&BackendOffer> {
         self.by_backend
             .get(&(binding_id.clone(), backend_model_id.to_owned()))

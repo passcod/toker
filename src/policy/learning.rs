@@ -80,6 +80,30 @@ impl LearningView for LegacyLearningView<'_> {
     }
 }
 
+impl LearningView for ModelStore {
+    type Error = crate::store::Error;
+
+    fn recently_sent(
+        &self,
+        _binding_id: &BindingId,
+        model_id: &str,
+    ) -> Result<Option<i64>, Self::Error> {
+        Ok(self.last_served(model_id))
+    }
+
+    fn learned(
+        &self,
+        _binding_id: &BindingId,
+        model_id: &str,
+    ) -> Result<Option<LearnedEvidence>, Self::Error> {
+        Ok(self.learned_entry(model_id)?.map(evidence))
+    }
+
+    fn known_models(&self, _binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
+        ModelStore::known_models(self)
+    }
+}
+
 fn evidence(entry: ModelEntry) -> LearnedEvidence {
     LearnedEvidence {
         distinct_days: days_of(&entry),

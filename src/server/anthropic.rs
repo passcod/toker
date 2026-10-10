@@ -69,7 +69,9 @@ use futures::stream::Stream;
 use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
 use crate::ir::Request as IrRequest;
-use crate::ir::canonical::{CanonicalRequest, ResponseProjection};
+use crate::ir::canonical::{
+    CanonBlock, CanonRole, CanonToolChoice, CanonicalRequest, ResponseProjection,
+};
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
@@ -159,6 +161,29 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     let Ok(default) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
         return super::anthropic_not_configured();
     };
+    let facts = server.shadow_facts(
+        ProtocolId::AnthropicMessages,
+        super::frontend_of(request.extensions()),
+        None,
+        None,
+        0,
+        None,
+        0,
+        Default::default(),
+        None,
+        crate::policy::RequestClass::Inference,
+    );
+    if let Some(legacy) = server.legacy_shadow_outcome(
+        &facts,
+        &default,
+        default.effective_model().map(str::to_owned),
+        None,
+        None,
+        default.effective_model().map(str::to_owned),
+        false,
+    ) {
+        server.observe_policy_shadow(facts, None, legacy);
+    }
     if default
         .binding()
         .canonical_backend()
@@ -185,6 +210,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     };
     let mut backend = target.provider().clone();
     let (parts, body) = request.into_parts();
+    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
 
     // Session identity and betas, read by name only — request headers are
     // never captured wholesale: they carry credentials (invariant 2).
@@ -241,6 +267,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut client_wants_json = false;
     // The model about to be sent upstream, for the served-model mark.
     let mut served_model: Option<String> = None;
+    let mut shadow_baseline: Option<String> = None;
+    let mut shadow_upgraded: Option<String> = None;
+    let mut shadow_compaction = false;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
@@ -257,6 +286,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             || ir.anthropic().wants_json_response(),
             |request| request.stream != Some(true),
         );
+        if path == "/v1/messages/batches" {
+            observe_batch_shadow(
+                &server,
+                &parts.extensions,
+                ir.value(),
+                original.len() as u64,
+            );
+        }
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
@@ -269,6 +306,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         };
         backend = target.provider().clone();
         let effective_model = target.effective_model().map(str::to_owned);
+        shadow_baseline.clone_from(&effective_model);
         let mut transformed = false;
         if effective_model.as_deref() != model.as_deref()
             && let Some(effective) = effective_model.as_deref()
@@ -874,6 +912,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.cache_stripped = (outcome.stripped > 0).then_some(true);
                     ctx.system_merged = (outcome.merged > 0).then_some(true);
                 }
+                shadow_compaction = true;
                 served_model = outcome.to.clone();
                 tracing::info!(
                     "compact: {} · {} breakpoint(s) dropped · {} system message(s) merged",
@@ -962,6 +1001,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             }
             // The served-model mark
             // must see the model actually being sent.
+            shadow_upgraded = Some(forced.to.clone());
             served_model = Some(forced.to.clone());
             tracing::info!("model: {} → {}", forced.from, forced.to);
         }
@@ -1059,6 +1099,48 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.model_mappings = Some(serde_json::Value::Array(mappings));
                 }
             }
+        }
+    }
+
+    // Compare only after all authoritative routing transforms have completed.
+    // The observer has no request body, headers, credentials, providers, or
+    // mutable state and its result is deliberately ignored.
+    if let Some(baseline) = shadow_baseline.clone() {
+        let shape = gate_shape.as_ref();
+        let required_capabilities = canonical
+            .as_ref()
+            .map(shadow_capabilities)
+            .unwrap_or_default();
+        let class = if shadow_compaction {
+            crate::policy::RequestClass::Compaction
+        } else {
+            crate::policy::RequestClass::Inference
+        };
+        let facts = server.shadow_facts(
+            ProtocolId::AnthropicMessages,
+            shadow_profile.as_deref(),
+            client_model.clone(),
+            cold_lane_key.clone(),
+            force_newest::prompt_bound(original.len() as u64),
+            shape.and_then(|shape| shape.req_messages),
+            shape.map_or(0, |shape| shape.req_tools),
+            required_capabilities,
+            None,
+            class,
+        );
+        if let Some(legacy) = server.legacy_shadow_outcome(
+            &facts,
+            &target,
+            Some(baseline),
+            shadow_upgraded.clone(),
+            (served_model != shadow_upgraded && served_model != shadow_baseline)
+                .then(|| served_model.clone())
+                .flatten(),
+            served_model.clone(),
+            shadow_compaction,
+        ) {
+            let lane = server.shadow_lane(cold_lane_key.as_deref(), facts.now_ms);
+            server.observe_policy_shadow(facts, lane, legacy);
         }
     }
 
@@ -1251,6 +1333,87 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             tracing::warn!(%error, "upstream request failed");
             transport_failure(ErrorWire::Anthropic, &error)
         }
+    }
+}
+
+fn observe_batch_shadow(
+    server: &Server,
+    extensions: &axum::http::Extensions,
+    body: &serde_json::Value,
+    body_bytes: u64,
+) {
+    let Some(requests) = body.get("requests").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let profile = super::frontend_of(extensions);
+    for request in requests {
+        let Some(model) = request
+            .get("params")
+            .and_then(|params| params.get("model"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(target) = server
+            .registry
+            .resolve(ProtocolId::AnthropicMessages, Some(model))
+        else {
+            continue;
+        };
+        let baseline = target.effective_model().map(str::to_owned);
+        let effective = baseline.as_deref().and_then(|model| {
+            model_map::preview_mapped_model(target.provider().model_map(), model).map(str::to_owned)
+        });
+        let facts = server.shadow_facts(
+            ProtocolId::AnthropicMessages,
+            profile,
+            Some(model.to_owned()),
+            None,
+            force_newest::prompt_bound(body_bytes),
+            None,
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        if let Some(legacy) = server.legacy_shadow_outcome(
+            &facts,
+            &target,
+            baseline.clone(),
+            None,
+            (effective != baseline).then(|| effective.clone()).flatten(),
+            effective,
+            false,
+        ) {
+            server.observe_policy_shadow(facts, None, legacy);
+        }
+    }
+}
+
+pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
+    let blocks = request
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .map(CanonBlock::semantic);
+    let has_images = blocks
+        .clone()
+        .any(|block| matches!(block, CanonBlock::Image { .. }));
+    let thinking_replay = blocks.clone().any(|block| {
+        matches!(
+            block,
+            CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
+        )
+    });
+    crate::policy::CapabilityFlags {
+        sampling: request.sampling != Default::default(),
+        system_in_messages: request
+            .messages
+            .iter()
+            .any(|message| matches!(message.role, CanonRole::System | CanonRole::Developer)),
+        thinking_replay,
+        images: has_images,
+        tools: !request.tools.is_empty() || request.tool_choice != CanonToolChoice::Auto,
     }
 }
 

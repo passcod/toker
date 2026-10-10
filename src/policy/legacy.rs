@@ -441,6 +441,7 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
         if let Some(model) = selector.strip_prefix("model:") {
             rules.push(AliasRule {
                 matcher: MatcherSpec::Exact(model.to_owned()),
+                exclude: vec![],
                 replacement: target.to_owned(),
             });
         }
@@ -456,6 +457,7 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
                 r"^(?:claude-)?{}-[0-9]+(?:-[0-9]+)*$",
                 regex::escape(family)
             )),
+            exclude: vec![],
             replacement: target.to_owned(),
         });
     }

@@ -11,6 +11,8 @@ pub mod document;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;
+pub mod resolve;
+pub mod shadow;
 pub mod version;
 
 pub use canonical::{
@@ -31,6 +33,16 @@ pub use learning::{LearnedEvidence, LearningView, LegacyLearningView};
 pub use matcher::{
     CaptureSchema, CompiledMatcher, MAX_MATCH_INPUT_BYTES, MAX_RENDERED_TEMPLATE_BYTES,
     MatcherCaptures, MatcherError, MatcherSpec, Template, TemplateError,
+};
+pub use resolve::{
+    AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
+    CatalogueAvailability, Evidence, LaneFacts, NoLearning, ProvisionalPin, RequestClass,
+    RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, TransitionDecision,
+    resolve,
+};
+pub use shadow::{
+    CollectingObserver, LegacyOutcome, PolicyShadow, ShadowComparison, ShadowObserver,
+    ShadowOutcome, ShadowRecord, TracingObserver,
 };
 pub use version::{
     DateFormat, NumericVersion, ParsedVersion, ReleaseDate, VersionError, VersionParserSpec,

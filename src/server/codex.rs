@@ -109,6 +109,7 @@ const RESPONSES_FRONTEND: &str = "openai_responses";
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
+    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -165,6 +166,44 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
+    if let Some(Ok(canonical_request)) = canonical.as_ref() {
+        let shape = AnthropicShape::from_canonical_responses(
+            canonical_request,
+            original.len() as u64,
+            parsed
+                .as_ref()
+                .and_then(|request| request.get("input"))
+                .and_then(Value::as_array)
+                .map(|input| input.len() as u64),
+        );
+        let lane_reference =
+            lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()));
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiResponses,
+            shadow_profile.as_deref(),
+            requested_model.clone(),
+            lane_reference.clone(),
+            crate::middleware::force_newest::prompt_bound(original.len() as u64),
+            shape.req_messages,
+            shape.req_tools,
+            super::anthropic::shadow_capabilities(canonical_request),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        if let Some(legacy) = server.legacy_shadow_outcome(
+            &facts,
+            &target,
+            effective_model.clone(),
+            None,
+            None,
+            effective_model.clone(),
+            false,
+        ) {
+            let lane = server.shadow_lane(lane_reference.as_deref(), facts.now_ms);
+            server.observe_policy_shadow(facts, lane, legacy);
+        }
+    }
+
     let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
         server: server.clone(),
         started,
