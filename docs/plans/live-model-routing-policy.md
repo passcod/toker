@@ -16,6 +16,10 @@ Provider credentials, endpoints, listener configuration, and provider enablement
 remain bootstrap configuration. Operational model policy moves into the SQLite
 state directory and can change without restarting the service.
 
+[`live-model-routing-implementation.md`](live-model-routing-implementation.md)
+maps this design onto the current store, route registry, inference handlers,
+publication adapters, control API, and TUI in implementation changesets.
+
 ## Outcomes
 
 - Every frontend sees a deliberate model list assembled from all configured
