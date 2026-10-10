@@ -182,7 +182,13 @@ catalogue chronology, never lexical guessing.
 A route has a stable id, display name, declared parameters, ordered candidates,
 and lane transition policy. `requested_model` is an explicit reserved parameter,
 not an ambient matcher capture. Every presentation, rewrite, or default that
-references a route must supply all of its other parameters. Candidate templates
+references a route carries an argument-binding map with exactly one value source
+for every declared parameter, including `requested_model`. A value source is a
+literal string, the request's requested model, or a named or numbered regular
+expression capture. Capture sources are valid only on rewrite references with a
+regular-expression matcher; presentation and default references cannot bind
+captures. Validation rejects missing or undeclared arguments, capture sources
+without a corresponding capture, and duplicate bindings. Candidate templates
 may reference only declared parameters.
 
 Each candidate carries:
@@ -256,7 +262,8 @@ Resolve every inference request through these stages:
 
 1. Parse the frontend protocol and requested model.
 2. Resolve an exact presented or virtual slug when one exists.
-3. Otherwise evaluate transparent rewrite rules, then the protocol default.
+3. Otherwise evaluate transparent rewrite rules, then the exact-profile default,
+   then the protocol default.
 4. Load or choose the lane's pinned route candidate.
 5. Reject candidates that cannot satisfy verified request capabilities.
 6. Apply that candidate's family classifier and upgrade policy.
@@ -302,11 +309,20 @@ any other valid first frame, or when the cap is reached. A client disconnect
 cancels the attempt rather than selecting another candidate. Never retry after
 the frontend response head or any body byte is committed.
 
-Crossing from a subscription to a billed or unknown-cost API or router is a
-cost boundary. `anthropic_sub` and `codex_sub` are subscription bindings;
-`anthropic_api`, `openai_api`, and `openrouter` are billed bindings. The policy
-must opt into such a fallback explicitly, and the TUI marks it before
-activation.
+Bindings have one of three cost classes: `subscription` for `anthropic_sub` and
+`codex_sub`, `billed` for `anthropic_api`, `openai_api`, and `openrouter`, and
+`unknown` when a binding's cost semantics are not verified. Every fallback edge
+uses this matrix:
+
+| source | destination | explicit edge consent | compile result |
+| --- | --- | --- | --- |
+| `subscription` | `subscription` | not required | valid |
+| `subscription` | `billed` | required | invalid without consent |
+| `subscription` | `unknown` | required | invalid without consent |
+| `billed` or `unknown` | any class | not required by the cost boundary | valid |
+
+The matrix applies equally to preflight skips and post-send fallback. The TUI
+marks every edge that grants consent before activation.
 
 Record attempted candidates and classified outcomes without storing provider
 error bodies beyond the existing safe error fields. Accounting for every
@@ -373,10 +389,13 @@ applied state.
 ### Dynamic model endpoints
 
 OpenAI Chat and Responses `/v1/models` responses derive directly from the
-active policy and current offers. A virtual entry uses its presented slug and
-safe known metadata; it never copies arbitrary provider catalogue objects.
-When no policy route is currently usable, the endpoint must distinguish a
-temporarily unavailable inventory from a genuinely empty configured list.
+active policy and current offers. Activation swaps their server-side projection
+with presentation, routing, and upgrade authority in one runtime snapshot and
+advances their desired and applied publication state in the same handoff. A
+virtual entry uses its presented slug and safe known metadata; it never copies
+arbitrary provider catalogue objects. When no policy route is currently usable,
+the endpoint must distinguish a temporarily unavailable inventory from a
+genuinely empty configured list.
 
 ### Claude Code settings
 
@@ -450,10 +469,14 @@ Destructive removal and immediate warm-lane activation require confirmation.
 
 Before database ownership begins, compile current static configuration in
 memory and run the final resolver in non-authoritative shadow mode. Compare its
-content-free decision with the legacy route for defaults, provider prefixes and
-aliases, model maps, picker rules, force-newest, and compaction. Shadow code may
-neither send nor persist nor change a client result. Unexplained mismatches
-block revision-one activation.
+content-free decision with the legacy route for every inference path and every
+administrative model path that will switch, including `count_tokens`, batches,
+unmatched or default binding lookup, dynamic model publication, and picker
+projection. Cover provider prefixes and aliases, model maps, force-newest, and
+compaction wherever they apply. Administrative comparisons use first-candidate
+selection without cross-binding fallback and exact-profile defaults before
+protocol defaults. Shadow code may neither send nor persist nor change a client
+result. Unexplained mismatches block revision-one activation.
 
 At the atomic runtime cutover, compile current static configuration into
 revision one:
@@ -495,10 +518,11 @@ database policy exists.
 6. Move family parsing and version comparison behind configured classifiers;
    adapt learned eligibility, promotion, context fit, and force-newest to the
    chosen candidate.
-7. Persist revision one from legacy configuration and switch runtime reads to
-   the active database policy.
-8. Generalise `/v1/models` projection and Claude picker reconciliation from the
-   active presentation records, including desired/applied revision state.
+7. Persist revision one from legacy configuration and atomically switch runtime
+   routing, upgrades, dynamic model publication, and desired publication state
+   to the active database policy.
+8. Generalise asynchronous Claude picker reconciliation from the active
+   presentation records, including applied revision state.
 9. Add the gated draft, validation, preview, activation, rollback, and promotion
    control endpoints.
 10. Add the routing TUI page and forms over those endpoints, including route

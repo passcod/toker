@@ -69,10 +69,15 @@ captures. Transparent requested-model rewrites use only these matcher kinds;
 binding-local family classifiers run after candidate selection.
 
 Routes declare their parameters. `requested_model` is a reserved explicit
-parameter. Templates use `${name}` and `${1}` placeholders and are rejected if
-they reference neither a declared route parameter nor a capture supplied by the
-referencing regular expression. Every presentation, rewrite, and default route
-reference must supply the route's required parameters.
+parameter. Templates use `${name}` placeholders and may reference only declared
+route parameters. Every presentation, rewrite, and default route reference has
+an argument-binding map with one entry for every declared parameter. Each entry
+selects exactly one typed source: `Literal(String)`, `RequestedModel`,
+`RegexCaptureName(String)`, or `RegexCaptureIndex(u32)`. Capture sources are
+accepted only on a rewrite reference whose matcher is a regular expression;
+presentations and defaults cannot bind captures. Compilation rejects missing,
+duplicate, or undeclared arguments, and capture bindings whose matcher does not
+provide the named or numbered capture.
 
 Rewrite priorities are integers unique within a frontend scope. Profile rules
 run before protocol rules. This makes overlap intentional and removes any need
@@ -101,16 +106,12 @@ Availability is `available`, `unavailable`, or `unknown`, with a list of
 content-free evidence. Only `unavailable` skips a candidate. An absent or stale
 catalogue is `unknown`, so it cannot remove a candidate.
 
-Provider bindings declare a cost class:
-
-- `subscription` for `anthropic_sub` and `codex_sub`;
-- `billed` for `anthropic_api`, `openai_api`, and `openrouter`;
-- `unknown` for a future binding whose cost semantics are not verified.
-
-A route's fallback edge, not merely its destination candidate, grants or
-refuses a move into `billed`. This applies to preflight skips and post-send
-fallback alike. A route that would cross that boundary without an explicit
-grant is invalid.
+Provider bindings declare the `subscription`, `billed`, or `unknown` cost class
+specified by the design's
+[cost-boundary matrix](live-model-routing-policy.md#availability-and-fallback).
+A route's fallback edge, not merely its destination candidate, grants consent.
+The compiler applies that matrix to preflight skips and post-send fallback and
+rejects every edge that requires consent but does not grant it.
 
 Health circuits are policy data. Each candidate may map a classified failure
 to a circuit duration. No implicit duration is guessed. A circuit key contains
@@ -166,13 +167,16 @@ only from explicit content-free wire evidence or a verified structural
 convention. Grouping a child for display and aggregate accounting must not
 merge its lane pin, allowance, prompt-cache key, or cache state with its parent.
 
-Recognise Codex's `guardian:<session-id>` convention as a `guardian` relation,
-retaining the raw id and using the suffix as its display parent. Claude action
-classifier calls already use the main session id. Do not attach Claude side
-queries that use fresh ids without a parent header. Named request-class headers
-may classify a request role when present, but timing, model names, request
-counts, transcript absence, connection reuse, and body shape are never lineage
-evidence.
+Recognise the `guardian:<session-id>` convention only on the known `codex`
+Responses profile and only from its configured raw-session header. The suffix
+must be nonempty. Retain the complete raw id, use the suffix as the display
+parent, and reject malformed, self-referential, or cyclic relations. Retain a
+valid relation when the parent has no ledger row so later display resolution can
+find it. Claude action classifier calls already use the main session id. Do not
+attach Claude side queries that use fresh ids without a parent header. Named
+request-class headers may classify a request role when present, but timing,
+model names, request counts, transcript absence, connection reuse, and body
+shape are never lineage evidence.
 
 ### Publication metadata
 
@@ -192,7 +196,7 @@ Add `src/policy/` and make its serialisable document independent of runtime
 provider objects. The top-level `PolicyDocument` has a format version and
 ordered collections of:
 
-- protocol defaults;
+- scoped defaults;
 - presentations;
 - named routes;
 - transparent rewrite rules;
@@ -210,7 +214,7 @@ Represent the three presentation sources explicitly:
 - `ExactOffer` names a binding and exact backend model id;
 - `OfferSelector` contains include and exclude matchers, ordering, keep count,
   and slug/label templates;
-- `Virtual` names an existing route.
+- `Virtual` names an existing route and supplies its argument-binding map.
 
 Every presentation also carries its frontend scope, slug or slug template,
 label, description, enabled state, shadow-native consent, and adapter-owned
@@ -285,15 +289,16 @@ edited policies use binding-scoped learning.
 
 ### Defaults and rewrites
 
-A default is a route id with a profile or protocol scope. The exact profile
-wins before the protocol default. It is the final compatibility route for an
-unmatched bare name and may supply the reserved requested-model parameter to a
-candidate template.
+A default is a route reference with a profile or protocol scope and an argument
+binding map. The exact profile default wins before the protocol default. It is
+the final compatibility route for an unmatched bare name and may bind
+`requested_model` from the request, but it cannot bind regular-expression
+captures.
 
-A rewrite rule contains frontend scope, unique priority, model matcher, route
-id, and optional capture values supplied to candidate templates. Exact
-presented slugs are compiled into a separate lookup and always precede this
-ordered rule set.
+A rewrite rule contains frontend scope, unique priority, model matcher, and a
+route reference with an argument-binding map. A regular-expression rewrite may
+bind route arguments from its named or numbered captures. Exact presented slugs
+are compiled into a separate lookup and always precede this ordered rule set.
 
 ## Stored representation
 
@@ -413,8 +418,8 @@ groups use an opaque unique id and zero-based indices for actual sends. The
 trace contains only ids, classifications, availability states, and reason codes.
 Preflight skips ride on the first attempted row or the local terminal row; a
 preflight-only `route-unavailable` row has a group id and no attempt index.
-Logical-request views group by attempt id, while cost, meters, errors, quota
-fitting, and model learning consume the relevant attempt evidence. The
+Logical-request views group by `attempt_group_id`, while cost, meters, errors,
+quota fitting, and model learning consume the relevant attempt evidence. The
 same-candidate `thinking: disabled` negotiation retry is an attempt in the same
 group. The existing requested and effective model columns retain their current
 meanings.
@@ -482,12 +487,14 @@ is carried beside it for recording and display and cannot affect resolution or
 lane selection.
 
 Model-bearing non-inference paths use the same policy vocabulary with narrower
-execution rules. `count_tokens` resolves the candidate whose tokenizer is
-being asked and remains unledgered. A batch resolves every embedded model and
-is accepted only when all entries select one batch-capable binding; it has no
-cross-binding post-send fallback. An unmatched model-free Anthropic path uses
-the active protocol default's binding and retains transparent forwarding.
-These paths do not retain a legacy model-map or bootstrap-default escape hatch.
+execution rules. `count_tokens` resolves only the first policy candidate whose
+tokenizer is being asked, sends no fallback attempt, and remains unledgered. A
+batch resolves every embedded model only to its first candidate and is accepted
+only when all entries select one batch-capable binding; it has no cross-binding
+fallback. An unmatched model-free Anthropic path resolves the exact-profile
+default before the protocol default and uses only that route's first binding
+while retaining transparent forwarding. These paths do not retain a legacy
+model-map or bootstrap-default escape hatch.
 
 ### Gate and transformation order
 
@@ -677,11 +684,16 @@ chosen activation scope before confirmation.
 Before policy persistence or authority lands, startup compiles the legacy
 configuration in memory and runs the final pure resolver in shadow mode. The
 legacy path remains authoritative for bodies, providers, credentials, gates,
-responses, lanes, and recording. Shadow comparison stores nothing and may emit
-only content-free stable ids, model identities, and reason codes. It cannot
+responses, lanes, and recording. Shadow every inference path and every
+administrative model path that will switch at cutover, including `count_tokens`,
+batches, unmatched or default administrative binding lookup, dynamic model
+publication, and Claude picker projection. Apply the restricted administrative
+semantics for first-candidate selection, cross-binding fallback, and scoped
+defaults when comparing those paths. Shadow comparison stores nothing and may
+emit only content-free stable ids, model identities, and reason codes. It cannot
 render or send an alternate request, and any compilation, comparison, or
 observer failure is swallowed without changing the client result. Unexplained
-mismatches across defaults, prefixes, aliases, model maps, picker expansion,
+mismatches across defaults, prefixes, aliases, model maps, publication,
 force-newest, and compaction block cutover.
 
 At the first all-policy runtime cutover, an absent active revision triggers one
@@ -769,10 +781,15 @@ policy revision or migration marker.
 Implement request facts, frontend inheritance, exact presentation lookup,
 rewrite/default resolution, candidate preflight, binding-local upgrade and
 alias selection, compaction routing, and content-free traces. Use this final
-pure resolver in non-authoritative shadow comparisons on Messages, Chat,
-Responses,
-and picker projection. It may neither render nor send nor persist nor alter the
-legacy result. Unexplained differences block the next changeset.
+pure resolver in non-authoritative shadow comparisons for Messages, Chat,
+Responses, `count_tokens`, batches, unmatched or default
+administrative binding lookup, dynamic Chat and Responses model publication,
+and Claude picker projection. Compare model-map, force-newest, and compaction
+outcomes on every path where they apply. Administrative shadows use the
+restricted execution semantics defined above: first candidate only, no
+cross-binding fallback, and exact-profile default before protocol default. The
+shadow may neither render nor send nor persist nor alter the legacy result.
+Unexplained differences block cutover.
 
 ### 6. Policy persistence and binding-scoped state
 
@@ -832,19 +849,23 @@ negotiation retry, and pin a successful fallback target.
 
 After shadow equivalence covers every inference and administrative model path,
 activate revision one and the database ownership marker in one transaction,
-atomically publish the compiled runtime snapshot, and switch target authority.
-Move `count_tokens`, batch model projection, unmatched default binding lookup,
-model maps, force-newest, and compaction model selection in this cutover so no
-path keeps a bootstrap-default escape hatch. Update invariant 6 concurrently.
-A corrupt or unsupported active policy fails startup rather than falling back.
+atomically publish one runtime snapshot containing routing, upgrades,
+presentations, dynamic Chat and Responses model lists, and desired publication
+state, and switch target authority. Move `count_tokens`, batch model projection,
+unmatched scoped-default binding lookup, model maps, force-newest, compaction
+model selection, and server-side dynamic model publication in this cutover so
+no path keeps a bootstrap-default or prior-publication escape hatch. Persist the
+desired publication revision and inventory generation in the same handoff.
+Update invariant 6 concurrently. A corrupt or unsupported active policy fails
+startup rather than falling back.
 
-### 13. Active-policy model publication
+### 13. External Claude settings reconciliation
 
-Render Chat and Responses model lists from active presentations and current
-inventory. Add safe virtual metadata and unavailable-inventory distinctions.
 Move Claude settings reconciliation into the shared publication adapter, use
-last-applied identities for ownership/collision checks, and persist
-desired/applied revision state.
+last-applied identities for ownership and collision checks, and persist applied
+revision state. Run this user-side reconciliation asynchronously after
+activation; failure leaves the atomically published server state active and the
+Claude adapter visibly pending or failed.
 
 ### 14. Routing control surface
 
