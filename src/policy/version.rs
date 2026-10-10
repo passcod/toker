@@ -63,12 +63,31 @@ impl VersionParserSpec {
 /// A parsed release date with calendar validity checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReleaseDate {
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
+    year: u16,
+    month: u8,
+    day: u8,
 }
 
 impl ReleaseDate {
+    pub fn new(year: u16, month: u8, day: u8) -> Result<Self, VersionError> {
+        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+            return Err(VersionError::Malformed);
+        }
+        Ok(Self { year, month, day })
+    }
+
+    pub const fn year(self) -> u16 {
+        self.year
+    }
+
+    pub const fn month(self) -> u8 {
+        self.month
+    }
+
+    pub const fn day(self) -> u8 {
+        self.day
+    }
+
     fn parse(value: &str, format: DateFormat) -> Result<Self, VersionError> {
         if !value.is_ascii() {
             return Err(VersionError::Malformed);
@@ -101,10 +120,7 @@ impl ReleaseDate {
         let year = u16::try_from(year).map_err(|_| VersionError::Overflow)?;
         let month = u8::try_from(month).map_err(|_| VersionError::Overflow)?;
         let day = u8::try_from(day).map_err(|_| VersionError::Overflow)?;
-        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
-            return Err(VersionError::Malformed);
-        }
-        Ok(Self { year, month, day })
+        Self::new(year, month, day)
     }
 }
 

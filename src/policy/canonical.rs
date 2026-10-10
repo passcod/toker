@@ -1,23 +1,30 @@
 //! Bounded canonical JSON and domain-separated policy fingerprints.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::str::FromStr;
 
-use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{Map, Number, Value};
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::document::{
-    Candidate, CandidateEdge, LaneTransitionPolicy, MAX_COLLECTION_ITEMS, MAX_DOCUMENT_BYTES,
-    MAX_DOCUMENT_DEPTH, MAX_STRING_BYTES, PolicyDocument, Route, StableId,
+    AliasPolicy, Candidate, CandidateEdge, CandidateId, ClassifierId, FamilyClassifier,
+    HealthCircuit, InventorySource, LaneTransitionPolicy, MAX_COLLECTION_ITEMS,
+    MAX_DESCRIPTION_BYTES, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_DEPTH, PolicyDocument, Route, RouteId,
+    RouteStep, StableId, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument,
 };
 
 const POLICY_FINGERPRINT_DOMAIN: &[u8] = b"toker.policy.document.v1\0";
-const ROUTE_FINGERPRINT_DOMAIN: &[u8] = b"toker.policy.route.v1\0";
+// Route semantics evolve independently from the document format. Change this
+// domain whenever the closed projection below changes meaning or shape.
+const ROUTE_FINGERPRINT_DOMAIN: &[u8] = b"toker.policy.route-semantics.v1\0";
 
 /// Limits applied before a document enters the runtime compiler.
+///
+/// Callers may tighten production limits, but values above the declared maxima
+/// are clamped and can never weaken them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalLimits {
     pub document_bytes: usize,
@@ -26,46 +33,62 @@ pub struct CanonicalLimits {
     pub string_bytes: usize,
 }
 
+impl CanonicalLimits {
+    fn hardened(self) -> Self {
+        Self {
+            document_bytes: self.document_bytes.min(MAX_DOCUMENT_BYTES),
+            depth: self.depth.min(MAX_DOCUMENT_DEPTH),
+            collection_items: self.collection_items.min(MAX_COLLECTION_ITEMS),
+            // The parser ceiling must admit descriptions; narrower fields are
+            // checked by typed document validation.
+            string_bytes: self.string_bytes.min(MAX_DESCRIPTION_BYTES),
+        }
+    }
+}
+
 impl Default for CanonicalLimits {
     fn default() -> Self {
         Self {
             document_bytes: MAX_DOCUMENT_BYTES,
             depth: MAX_DOCUMENT_DEPTH,
             collection_items: MAX_COLLECTION_ITEMS,
-            string_bytes: MAX_STRING_BYTES,
+            string_bytes: MAX_DESCRIPTION_BYTES,
         }
     }
 }
 
-/// Parse a bounded policy document while duplicate keys are still observable.
+/// Parse and validate a bounded policy while duplicate keys and number tokens
+/// are still lexically observable.
 pub fn decode_policy(
     bytes: &[u8],
     limits: CanonicalLimits,
-) -> Result<PolicyDocument, CanonicalError> {
+) -> Result<ValidatedPolicyDocument, CanonicalError> {
+    let limits = limits.hardened();
     if bytes.len() > limits.document_bytes {
         return Err(CanonicalError::DocumentTooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| CanonicalError::InvalidUtf8)?;
-    let mut deserializer = serde_json::Deserializer::from_str(text);
-    let value = BoundedValueSeed { limits, depth: 0 }
-        .deserialize(&mut deserializer)
-        .map_err(classify_json_error)?;
-    deserializer.end().map_err(classify_json_error)?;
-    let document = PolicyDocument::deserialize(value)
+    JsonBoundsParser::new(text, limits).parse()?;
+    // Deserialize from the original token stream, not through `Value`:
+    // arbitrary-precision `Value` uses a private sentinel map internally, and
+    // replaying a user object through it would make that sentinel forgeable.
+    let document: PolicyDocument = serde_json::from_str(text)
         .map_err(|error| CanonicalError::TypedDocument(error.to_string()))?;
     document
         .validate()
-        .map_err(|error| CanonicalError::InvalidDocument(error.to_string()))?;
-    Ok(document)
+        .map_err(|error| CanonicalError::InvalidDocument(error.to_string()))
 }
 
-/// Render any serialisable policy value as compact JSON with recursively sorted
-/// object keys. Array order is deliberately preserved.
-pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
+fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
     let value = serde_json::to_value(value)
         .map_err(|error| CanonicalError::Serialization(error.to_string()))?;
     let sorted = sort_value(value);
-    serde_json::to_vec(&sorted).map_err(|error| CanonicalError::Serialization(error.to_string()))
+    let bytes = serde_json::to_vec(&sorted)
+        .map_err(|error| CanonicalError::Serialization(error.to_string()))?;
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(CanonicalError::DocumentTooLarge);
+    }
+    Ok(bytes)
 }
 
 fn sort_value(value: Value) -> Value {
@@ -101,70 +124,265 @@ macro_rules! fingerprint_type {
                 Ok(())
             }
         }
+
+        impl FromStr for $name {
+            type Err = FingerprintParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                if value.len() != 64 {
+                    return Err(FingerprintParseError);
+                }
+                let mut bytes = [0; 32];
+                for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+                    let high = lower_hex(pair[0]).ok_or(FingerprintParseError)?;
+                    let low = lower_hex(pair[1]).ok_or(FingerprintParseError)?;
+                    bytes[index] = (high << 4) | low;
+                }
+                Ok(Self(bytes))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.collect_str(self)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
+            }
+        }
     };
 }
+
+fn lower_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("fingerprint must be exactly 64 lowercase hexadecimal characters")]
+pub struct FingerprintParseError;
 
 fingerprint_type!(PolicyFingerprint);
 fingerprint_type!(RouteFingerprint);
 
-pub fn policy_fingerprint(document: &PolicyDocument) -> Result<PolicyFingerprint, CanonicalError> {
+pub fn policy_bytes(document: &ValidatedPolicyDocument) -> Result<Vec<u8>, CanonicalError> {
+    canonical_bytes(document)
+}
+
+pub fn policy_fingerprint(
+    document: &ValidatedPolicyDocument,
+) -> Result<PolicyFingerprint, CanonicalError> {
     Ok(PolicyFingerprint(hash(
         POLICY_FINGERPRINT_DOMAIN,
-        &canonical_bytes(document)?,
+        &policy_bytes(document)?,
     )))
 }
 
-/// Fingerprint input for a route and its caller-supplied transitive semantic
-/// closure. The route projection omits display name and description. Current
-/// inventory winners are not document fields and must not be supplied in
-/// `semantic_closure` by the compiler.
-pub struct RouteSemanticFingerprintInput<'a, T: Serialize> {
-    route: &'a Route,
-    semantic_closure: &'a T,
+/// Closed, versioned projection of all semantics that can affect one route.
+/// Display fields and inventory-selected winners are absent by construction.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteSemantics {
+    route: SemanticRoute,
+    aliases: BTreeMap<CandidateId, AliasPolicy>,
+    upgrades: Vec<SemanticUpgrade>,
+    classifiers: Vec<FamilyClassifier>,
 }
 
-impl<'a, T: Serialize> RouteSemanticFingerprintInput<'a, T> {
-    pub fn new(route: &'a Route, semantic_closure: &'a T) -> Self {
+impl RouteSemantics {
+    /// This is compiler-owned until the compiler slice lands. It takes a
+    /// validated document so no unbounded or structurally invalid route can be
+    /// fingerprinted.
+    pub fn from_document(
+        document: &ValidatedPolicyDocument,
+        route_id: &RouteId,
+    ) -> Result<Self, CanonicalError> {
+        let document = document.document();
+        let route = document
+            .routes
+            .iter()
+            .find(|route| &route.id == route_id)
+            .ok_or_else(|| CanonicalError::MissingSemanticDependency(route_id.to_string()))?;
+
+        let mut aliases = BTreeMap::new();
+        let mut upgrade_ids = HashSet::new();
+        for candidate in route.chain.candidates() {
+            if let Some(alias) = &candidate.alias_policy {
+                aliases.insert(candidate.id.clone(), alias.clone());
+            }
+            if let Some(upgrade_id) = &candidate.upgrade_policy_id {
+                upgrade_ids.insert(upgrade_id.clone());
+            }
+        }
+
+        let mut upgrades = Vec::new();
+        let mut classifier_ids = HashSet::new();
+        for id in upgrade_ids {
+            let policy = document
+                .upgrades
+                .iter()
+                .find(|policy| policy.id == id)
+                .ok_or_else(|| CanonicalError::MissingSemanticDependency(id.to_string()))?;
+            classifier_ids.insert(policy.classifier_id.clone());
+            upgrades.push(SemanticUpgrade::from(policy));
+        }
+        upgrades.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut classifiers = Vec::new();
+        for id in classifier_ids {
+            let classifier = document
+                .classifiers
+                .iter()
+                .find(|classifier| classifier.id == id)
+                .ok_or_else(|| CanonicalError::MissingSemanticDependency(id.to_string()))?;
+            classifiers.push(classifier.clone());
+        }
+        classifiers.sort_by(|left, right| left.id.cmp(&right.id));
+
+        Ok(Self {
+            route: SemanticRoute::from(route),
+            aliases,
+            upgrades,
+            classifiers,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SemanticRoute {
+    id: RouteId,
+    parameters: Vec<StableId>,
+    first: SemanticCandidate,
+    steps: Vec<SemanticStep>,
+    lane_transition: LaneTransitionPolicy,
+}
+
+impl From<&Route> for SemanticRoute {
+    fn from(route: &Route) -> Self {
+        let mut parameters = route.parameters.clone();
+        parameters.sort();
         Self {
-            route,
-            semantic_closure,
+            id: route.id.clone(),
+            parameters,
+            first: SemanticCandidate::from(&route.chain.first),
+            steps: route.chain.steps.iter().map(SemanticStep::from).collect(),
+            lane_transition: route.lane_transition,
         }
     }
 }
 
-impl<T: Serialize> Serialize for RouteSemanticFingerprintInput<'_, T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        #[derive(Serialize)]
-        struct SemanticRoute<'a, T> {
-            id: &'a StableId,
-            parameters: &'a [StableId],
-            candidates: &'a [Candidate],
-            edges: &'a [CandidateEdge],
-            lane_transition: LaneTransitionPolicy,
-            semantic_closure: &'a T,
-        }
+#[derive(Debug, Clone, Serialize)]
+struct SemanticStep {
+    edge: SemanticEdge,
+    candidate: SemanticCandidate,
+}
 
-        SemanticRoute {
-            id: &self.route.id,
-            parameters: &self.route.parameters,
-            candidates: &self.route.candidates,
-            edges: &self.route.edges,
-            lane_transition: self.route.lane_transition,
-            semantic_closure: self.semantic_closure,
+impl From<&RouteStep> for SemanticStep {
+    fn from(step: &RouteStep) -> Self {
+        Self {
+            edge: SemanticEdge::from(&step.edge),
+            candidate: SemanticCandidate::from(&step.candidate),
         }
-        .serialize(serializer)
     }
 }
 
-pub fn route_fingerprint<T: Serialize>(
-    input: &RouteSemanticFingerprintInput<'_, T>,
-) -> Result<RouteFingerprint, CanonicalError> {
+#[derive(Debug, Clone, Serialize)]
+struct SemanticCandidate {
+    id: CandidateId,
+    binding_id: super::document::BindingId,
+    model: super::document::CandidateModel,
+    upgrade_policy_id: Option<UpgradePolicyId>,
+    required_capabilities: super::document::CapabilityFlags,
+    enabled: bool,
+    health_circuits: Vec<HealthCircuit>,
+}
+
+impl From<&Candidate> for SemanticCandidate {
+    fn from(candidate: &Candidate) -> Self {
+        let mut health_circuits = candidate.health_circuits.clone();
+        health_circuits.sort_by_key(|circuit| (circuit.failure, circuit.duration_seconds));
+        Self {
+            id: candidate.id.clone(),
+            binding_id: candidate.binding_id.clone(),
+            model: candidate.model.clone(),
+            upgrade_policy_id: candidate.upgrade_policy_id.clone(),
+            required_capabilities: candidate.required_capabilities,
+            enabled: candidate.enabled,
+            health_circuits,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SemanticEdge {
+    preflight: super::document::FallbackPermission,
+    post_send: Vec<super::document::FailureClass>,
+    billed_boundary: super::document::BoundaryConsent,
+    ambiguous_transport: super::document::BoundaryConsent,
+    cache_transition: super::document::CacheTransitionPolicy,
+}
+
+impl From<&CandidateEdge> for SemanticEdge {
+    fn from(edge: &CandidateEdge) -> Self {
+        let mut post_send = edge.post_send.clone();
+        post_send.sort();
+        post_send.dedup();
+        Self {
+            preflight: edge.preflight,
+            post_send,
+            billed_boundary: edge.billed_boundary,
+            ambiguous_transport: edge.ambiguous_transport,
+            cache_transition: edge.cache_transition,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SemanticUpgrade {
+    id: UpgradePolicyId,
+    classifier_id: ClassifierId,
+    enabled: bool,
+    minimum_learning: super::document::MinimumLearning,
+    allow_manual_promotion: bool,
+    inventory_sources: Vec<InventorySource>,
+    lane_transition: LaneTransitionPolicy,
+    allow_revision_one_legacy_learning: bool,
+}
+
+impl From<&UpgradePolicy> for SemanticUpgrade {
+    fn from(policy: &UpgradePolicy) -> Self {
+        let mut inventory_sources = policy.inventory_sources.clone();
+        inventory_sources.sort();
+        inventory_sources.dedup();
+        Self {
+            id: policy.id.clone(),
+            classifier_id: policy.classifier_id.clone(),
+            enabled: policy.enabled,
+            minimum_learning: policy.minimum_learning,
+            allow_manual_promotion: policy.allow_manual_promotion,
+            inventory_sources,
+            lane_transition: policy.lane_transition,
+            allow_revision_one_legacy_learning: policy.allow_revision_one_legacy_learning,
+        }
+    }
+}
+
+pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint, CanonicalError> {
     Ok(RouteFingerprint(hash(
         ROUTE_FINGERPRINT_DOMAIN,
-        &canonical_bytes(input)?,
+        &canonical_bytes(semantics)?,
     )))
 }
 
@@ -175,168 +393,201 @@ fn hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-#[derive(Clone, Copy)]
-struct BoundedValueSeed {
+/// A small lexical JSON parser used before serde. This is where duplicate keys,
+/// exact number spellings, and allocation bounds remain observable. It never
+/// interprets an object key as serde_json's private arbitrary-precision marker.
+struct JsonBoundsParser<'a> {
+    input: &'a [u8],
+    position: usize,
     limits: CanonicalLimits,
-    depth: usize,
 }
 
-impl BoundedValueSeed {
-    fn child(self) -> Result<Self, &'static str> {
-        let depth = self.depth + 1;
+impl<'a> JsonBoundsParser<'a> {
+    fn new(input: &'a str, limits: CanonicalLimits) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+            limits,
+        }
+    }
+
+    fn parse(mut self) -> Result<(), CanonicalError> {
+        self.skip_whitespace();
+        self.value(0)?;
+        self.skip_whitespace();
+        if self.position != self.input.len() {
+            return Err(self.invalid("trailing characters"));
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        match self.peek() {
+            Some(b'{') => self.object(depth + 1),
+            Some(b'[') => self.array(depth + 1),
+            Some(b'\"') => self.string().map(|_| ()),
+            Some(b't') => self.literal(b"true"),
+            Some(b'f') => self.literal(b"false"),
+            Some(b'n') => self.literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(self.invalid("expected a JSON value")),
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        self.check_depth(depth)?;
+        self.position += 1;
+        self.skip_whitespace();
+        let mut keys = HashSet::new();
+        if self.take(b'}') {
+            return Ok(());
+        }
+        loop {
+            if keys.len() == self.limits.collection_items {
+                return Err(CanonicalError::CollectionLimit);
+            }
+            let key = self.string()?;
+            if !keys.insert(key) {
+                return Err(CanonicalError::DuplicateKey);
+            }
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            self.value(depth)?;
+            self.skip_whitespace();
+            if self.take(b'}') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<(), CanonicalError> {
+        self.check_depth(depth)?;
+        self.position += 1;
+        self.skip_whitespace();
+        if self.take(b']') {
+            return Ok(());
+        }
+        let mut count = 0;
+        loop {
+            if count == self.limits.collection_items {
+                return Err(CanonicalError::CollectionLimit);
+            }
+            self.value(depth)?;
+            count += 1;
+            self.skip_whitespace();
+            if self.take(b']') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn string(&mut self) -> Result<String, CanonicalError> {
+        if self.peek() != Some(b'\"') {
+            return Err(self.invalid("expected an object key string"));
+        }
+        let start = self.position;
+        self.position += 1;
+        let mut escaped = false;
+        while let Some(byte) = self.peek() {
+            self.position += 1;
+            match byte {
+                b'\"' if !escaped => {
+                    let token = std::str::from_utf8(&self.input[start..self.position])
+                        .map_err(|_| CanonicalError::InvalidUtf8)?;
+                    let decoded: String = serde_json::from_str(token)
+                        .map_err(|error| CanonicalError::InvalidJson(error.to_string()))?;
+                    if decoded.len() > self.limits.string_bytes {
+                        return Err(CanonicalError::StringLimit);
+                    }
+                    return Ok(decoded);
+                }
+                b'\\' if !escaped => escaped = true,
+                _ => escaped = false,
+            }
+        }
+        Err(self.invalid("unterminated string"))
+    }
+
+    fn number(&mut self) -> Result<(), CanonicalError> {
+        let start = self.position;
+        if self.take(b'-') && !self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+            return Err(self.invalid("invalid number"));
+        }
+        if self.take(b'0') {
+            if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                return Err(self.invalid("leading zero in number"));
+            }
+        } else {
+            let before = self.position;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.position += 1;
+            }
+            if self.position == before {
+                return Err(self.invalid("invalid number"));
+            }
+        }
+        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+            return Err(CanonicalError::NonIntegerNumber);
+        }
+        if self.position == start {
+            return Err(self.invalid("invalid number"));
+        }
+        Ok(())
+    }
+
+    fn literal(&mut self, literal: &[u8]) -> Result<(), CanonicalError> {
+        if self.input.get(self.position..self.position + literal.len()) != Some(literal) {
+            return Err(self.invalid("invalid literal"));
+        }
+        self.position += literal.len();
+        Ok(())
+    }
+
+    fn check_depth(&self, depth: usize) -> Result<(), CanonicalError> {
         if depth > self.limits.depth {
-            return Err(DEPTH_MARKER);
+            Err(CanonicalError::DepthLimit)
+        } else {
+            Ok(())
         }
-        Ok(Self {
-            limits: self.limits,
-            depth,
-        })
-    }
-}
-
-const DUPLICATE_MARKER: &str = "policy duplicate object key";
-const NUMBER_MARKER: &str = "policy numeric value must be an integer";
-const DEPTH_MARKER: &str = "policy nesting depth exceeded";
-const COLLECTION_MARKER: &str = "policy collection size exceeded";
-const STRING_MARKER: &str = "policy string size exceeded";
-
-impl<'de> DeserializeSeed<'de> for BoundedValueSeed {
-    type Value = Value;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(BoundedValueVisitor(self))
-    }
-}
-
-struct BoundedValueVisitor(BoundedValueSeed);
-
-impl<'de> Visitor<'de> for BoundedValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("bounded policy JSON")
     }
 
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(Value::Bool(value))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(Value::Number(Number::from(value)))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(Value::Number(Number::from(value)))
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Err(E::custom(NUMBER_MARKER))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        self.visit_string(value.to_owned())
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        if value.len() > self.0.limits.string_bytes {
-            return Err(E::custom(STRING_MARKER));
+    fn expect(&mut self, byte: u8) -> Result<(), CanonicalError> {
+        if self.take(byte) {
+            Ok(())
+        } else {
+            Err(self.invalid("unexpected JSON token"))
         }
-        Ok(Value::String(value))
     }
 
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(Value::Null)
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        self.0.deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let child = self.0.child().map_err(serde::de::Error::custom)?;
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element_seed(child)? {
-            if values.len() == self.0.limits.collection_items {
-                return Err(serde::de::Error::custom(COLLECTION_MARKER));
-            }
-            values.push(value);
+    fn take(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.position += 1;
+            true
+        } else {
+            false
         }
-        Ok(Value::Array(values))
     }
 
-    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let child = self.0.child().map_err(serde::de::Error::custom)?;
-        let mut values = Map::new();
-        while let Some(key) = object.next_key::<String>()? {
-            // With serde_json's arbitrary_precision feature, a number reaches
-            // deserialize_any through this private one-field map. Inspecting
-            // it here preserves overflow and fractional evidence.
-            if key == "$serde_json::private::Number" && values.is_empty() {
-                let number = object.next_value::<String>()?;
-                if number.contains(['.', 'e', 'E']) {
-                    return Err(serde::de::Error::custom(NUMBER_MARKER));
-                }
-                let number = number.parse::<Number>().map_err(serde::de::Error::custom)?;
-                if object.next_key::<String>()?.is_some() {
-                    return Err(serde::de::Error::custom(NUMBER_MARKER));
-                }
-                return Ok(Value::Number(number));
-            }
-            if key.len() > self.0.limits.string_bytes {
-                return Err(serde::de::Error::custom(STRING_MARKER));
-            }
-            if values.len() == self.0.limits.collection_items {
-                return Err(serde::de::Error::custom(COLLECTION_MARKER));
-            }
-            if values.contains_key(&key) {
-                return Err(serde::de::Error::custom(DUPLICATE_MARKER));
-            }
-            let value = object.next_value_seed(child)?;
-            values.insert(key, value);
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.position).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position += 1;
         }
-        Ok(Value::Object(values))
     }
-}
 
-fn classify_json_error(error: serde_json::Error) -> CanonicalError {
-    let message = error.to_string();
-    if message.contains(DUPLICATE_MARKER) {
-        CanonicalError::DuplicateKey
-    } else if message.contains(NUMBER_MARKER) {
-        CanonicalError::NonIntegerNumber
-    } else if message.contains(DEPTH_MARKER) {
-        CanonicalError::DepthLimit
-    } else if message.contains(COLLECTION_MARKER) {
-        CanonicalError::CollectionLimit
-    } else if message.contains(STRING_MARKER) {
-        CanonicalError::StringLimit
-    } else {
-        CanonicalError::InvalidJson(message)
+    fn invalid(&self, reason: &str) -> CanonicalError {
+        CanonicalError::InvalidJson(format!("{reason} at byte {}", self.position))
     }
 }
 
@@ -362,20 +613,22 @@ pub enum CanonicalError {
     TypedDocument(String),
     #[error("invalid policy document: {0}")]
     InvalidDocument(String),
+    #[error("missing route semantic dependency {0}")]
+    MissingSemanticDependency(String),
     #[error("cannot serialise policy document: {0}")]
     Serialization(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use serde_json::json;
-
     use super::*;
     use crate::policy::document::{
-        CURRENT_FORMAT_VERSION, CacheTransitionPolicy, CandidateModel, CapabilityFlags,
+        AliasRule, BindingId, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy,
+        CandidateModel, CapabilityFlags, ClassifierId, FailureClass, FallbackPermission,
+        MinimumLearning, RouteChain,
     };
+    use crate::policy::matcher::MatcherSpec;
+    use crate::policy::version::VersionParserSpec;
 
     fn minimal_json() -> &'static [u8] {
         br#"{
@@ -389,24 +642,10 @@ mod tests {
         }"#
     }
 
-    fn empty_document() -> PolicyDocument {
-        PolicyDocument {
-            format_version: CURRENT_FORMAT_VERSION,
-            description: None,
-            defaults: vec![],
-            presentations: vec![],
-            routes: vec![],
-            rewrites: vec![],
-            classifiers: vec![],
-            upgrades: vec![],
-            compaction: None,
-        }
-    }
-
     #[test]
     fn valid_document_roundtrips_through_canonical_form() {
         let document = decode_policy(minimal_json(), CanonicalLimits::default()).unwrap();
-        let bytes = canonical_bytes(&document).unwrap();
+        let bytes = policy_bytes(&document).unwrap();
         assert_eq!(
             decode_policy(&bytes, CanonicalLimits::default()).unwrap(),
             document
@@ -418,7 +657,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_unknown_noninteger_and_invalid_utf8() {
+    fn private_number_marker_is_never_treated_as_a_number() {
+        let forged = br#"{
+          "format_version":{"$serde_json::private::Number":"1"},
+          "defaults":[],"presentations":[],"routes":[],"rewrites":[],
+          "classifiers":[],"upgrades":[]
+        }"#;
+        assert!(matches!(
+            decode_policy(forged, CanonicalLimits::default()),
+            Err(CanonicalError::TypedDocument(_))
+        ));
+    }
+
+    #[test]
+    fn numeric_positions_accept_integer_tokens_only_even_on_overflow() {
+        for token in ["1.0", "1e0", "-1E2"] {
+            let json = format!(r#"{{"format_version":{token}}}"#);
+            assert_eq!(
+                decode_policy(json.as_bytes(), CanonicalLimits::default()),
+                Err(CanonicalError::NonIntegerNumber)
+            );
+        }
+        for token in ["4294967296", "18446744073709551616"] {
+            let json = format!(r#"{{"format_version":{token}}}"#);
+            assert!(matches!(
+                decode_policy(json.as_bytes(), CanonicalLimits::default()),
+                Err(CanonicalError::TypedDocument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_unknown_and_invalid_utf8() {
         let duplicate = br#"{"format_version":1,"format_version":1}"#;
         assert_eq!(
             decode_policy(duplicate, CanonicalLimits::default()),
@@ -429,11 +699,6 @@ mod tests {
             decode_policy(unknown, CanonicalLimits::default()),
             Err(CanonicalError::TypedDocument(_))
         ));
-        let decimal = br#"{"format_version":1.0}"#;
-        assert_eq!(
-            decode_policy(decimal, CanonicalLimits::default()),
-            Err(CanonicalError::NonIntegerNumber)
-        );
         assert_eq!(
             decode_policy(&[0xff], CanonicalLimits::default()),
             Err(CanonicalError::InvalidUtf8)
@@ -441,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_configured_byte_depth_collection_and_string_limits() {
+    fn configured_limits_tighten_but_never_weaken_hard_bounds() {
         let tiny = CanonicalLimits {
             document_bytes: 2,
             ..CanonicalLimits::default()
@@ -460,92 +725,193 @@ mod tests {
             Err(CanonicalError::DepthLimit)
         );
 
-        let collection = CanonicalLimits {
-            collection_items: 1,
-            ..CanonicalLimits::default()
+        let permissive = CanonicalLimits {
+            document_bytes: usize::MAX,
+            depth: usize::MAX,
+            collection_items: usize::MAX,
+            string_bytes: usize::MAX,
         };
-        assert_eq!(
-            decode_policy(br#"{"format_version":1,"routes":[]}"#, collection),
-            Err(CanonicalError::CollectionLimit)
+        let oversized = format!(
+            r#"{{"format_version":1,"description":"{}"}}"#,
+            "x".repeat(MAX_DESCRIPTION_BYTES + 1)
         );
-
-        let strings = CanonicalLimits {
-            string_bytes: 3,
-            ..CanonicalLimits::default()
-        };
         assert_eq!(
-            decode_policy(br#"{"format_version":1}"#, strings),
+            decode_policy(oversized.as_bytes(), permissive),
             Err(CanonicalError::StringLimit)
         );
     }
 
     #[test]
-    fn canonical_objects_ignore_input_key_order_but_arrays_do_not() {
-        let a = json!({"z": 1, "a": {"y": 2, "x": 3}});
-        let b = json!({"a": {"x": 3, "y": 2}, "z": 1});
-        assert_eq!(canonical_bytes(&a).unwrap(), canonical_bytes(&b).unwrap());
-        assert_ne!(
-            canonical_bytes(&json!([1, 2])).unwrap(),
-            canonical_bytes(&json!([2, 1])).unwrap()
+    fn parser_admits_description_boundary_above_normal_string_limit() {
+        for length in [1024, 1025, 4096] {
+            let json = format!(
+                r#"{{"format_version":1,"description":"{}"}}"#,
+                "x".repeat(length)
+            );
+            assert!(decode_policy(json.as_bytes(), CanonicalLimits::default()).is_ok());
+        }
+        let json = format!(
+            r#"{{"format_version":1,"description":"{}"}}"#,
+            "x".repeat(4097)
+        );
+        assert_eq!(
+            decode_policy(json.as_bytes(), CanonicalLimits::default()),
+            Err(CanonicalError::StringLimit)
         );
     }
 
     #[test]
-    fn policy_fingerprint_is_stable_and_domain_separated() {
-        let document = empty_document();
+    fn policy_fingerprint_is_checked_and_domain_separated() {
+        let document = full_document(route("display", None)).validate().unwrap();
         let first = policy_fingerprint(&document).unwrap();
-        let second = policy_fingerprint(&document).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.to_string().len(), 64);
+        let parsed: PolicyFingerprint = first.to_string().parse().unwrap();
+        assert_eq!(first, parsed);
+        assert!(
+            first
+                .to_string()
+                .to_uppercase()
+                .parse::<PolicyFingerprint>()
+                .is_err()
+        );
+        assert!("00".parse::<PolicyFingerprint>().is_err());
+
+        let semantics =
+            RouteSemantics::from_document(&document, &RouteId::new("route").unwrap()).unwrap();
         assert_ne!(
             first.as_bytes(),
-            route_fingerprint(&RouteSemanticFingerprintInput::new(
-                &route("display", None),
-                &BTreeMap::<String, String>::new(),
-            ))
-            .unwrap()
-            .as_bytes()
+            route_fingerprint(&semantics).unwrap().as_bytes()
+        );
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PolicyFingerprint>(&encoded).unwrap(),
+            first
         );
     }
 
     #[test]
-    fn route_fingerprint_ignores_display_changes_but_tracks_semantics() {
-        let route_a = route("First", Some("description"));
-        let route_b = route("Renamed", Some("other"));
-        let closure = BTreeMap::from([("classifier", "alpha")]);
-        let a = route_fingerprint(&RouteSemanticFingerprintInput::new(&route_a, &closure)).unwrap();
-        let b = route_fingerprint(&RouteSemanticFingerprintInput::new(&route_b, &closure)).unwrap();
-        assert_eq!(a, b);
+    fn route_fingerprint_excludes_display_and_normalizes_sets() {
+        let mut first = full_document(route("First", Some("description")));
+        let mut second = full_document(route("Renamed", Some("other")));
+        first.upgrades[0].inventory_sources =
+            vec![InventorySource::Served, InventorySource::Catalogue];
+        second.upgrades[0].inventory_sources =
+            vec![InventorySource::Catalogue, InventorySource::Served];
+        first.routes[0].chain.steps[0].edge.post_send =
+            vec![FailureClass::Overload, FailureClass::RateLimit];
+        second.routes[0].chain.steps[0].edge.post_send =
+            vec![FailureClass::RateLimit, FailureClass::Overload];
+        assert_eq!(digest(first), digest(second));
+    }
 
-        let other_closure = BTreeMap::from([("classifier", "beta")]);
-        let changed = route_fingerprint(&RouteSemanticFingerprintInput::new(
-            &route_b,
-            &other_closure,
-        ))
-        .unwrap();
-        assert_ne!(a, changed);
+    #[test]
+    fn every_route_semantic_class_changes_the_digest() {
+        let base = full_document(route("display", None));
+        let expected = digest(base.clone());
+
+        let mut route_change = base.clone();
+        route_change.routes[0].lane_transition = LaneTransitionPolicy::AllowImmediate;
+        assert_ne!(expected, digest(route_change));
+
+        let mut alias_change = base.clone();
+        alias_change.routes[0]
+            .chain
+            .first
+            .alias_policy
+            .as_mut()
+            .unwrap()
+            .rules[0]
+            .replacement = "other".to_owned();
+        assert_ne!(expected, digest(alias_change));
+
+        let mut upgrade_change = base.clone();
+        upgrade_change.upgrades[0].allow_manual_promotion = true;
+        assert_ne!(expected, digest(upgrade_change));
+
+        let mut classifier_change = base;
+        classifier_change.classifiers[0].family_template = "other".to_owned();
+        assert_ne!(expected, digest(classifier_change));
+    }
+
+    fn digest(document: PolicyDocument) -> RouteFingerprint {
+        let document = document.validate().unwrap();
+        let semantics =
+            RouteSemantics::from_document(&document, &RouteId::new("route").unwrap()).unwrap();
+        route_fingerprint(&semantics).unwrap()
+    }
+
+    fn full_document(route: Route) -> PolicyDocument {
+        PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![],
+            presentations: vec![],
+            routes: vec![route],
+            rewrites: vec![],
+            classifiers: vec![FamilyClassifier {
+                id: ClassifierId::new("classifier").unwrap(),
+                binding_id: BindingId::new("provider.dialect").unwrap(),
+                model_matcher: MatcherSpec::Regex("^(.*)$".to_owned()),
+                family_template: "${1}".to_owned(),
+                version_template: "${1}".to_owned(),
+                version_parser: VersionParserSpec::Semver,
+            }],
+            upgrades: vec![UpgradePolicy {
+                id: UpgradePolicyId::new("upgrade").unwrap(),
+                classifier_id: ClassifierId::new("classifier").unwrap(),
+                enabled: true,
+                minimum_learning: MinimumLearning::None,
+                allow_manual_promotion: false,
+                inventory_sources: vec![InventorySource::Catalogue],
+                lane_transition: LaneTransitionPolicy::PreservePinned,
+                allow_revision_one_legacy_learning: false,
+            }],
+            compaction: None,
+        }
     }
 
     fn route(display_name: &str, description: Option<&str>) -> Route {
+        let mut first = candidate("candidate");
+        first.upgrade_policy_id = Some(UpgradePolicyId::new("upgrade").unwrap());
+        first.alias_policy = Some(AliasPolicy {
+            rules: vec![AliasRule {
+                matcher: MatcherSpec::Exact("old".to_owned()),
+                replacement: "new".to_owned(),
+            }],
+        });
         Route {
-            id: StableId::new("route").unwrap(),
+            id: RouteId::new("route").unwrap(),
             display_name: display_name.to_owned(),
             description: description.map(str::to_owned),
             parameters: vec![],
-            candidates: vec![Candidate {
-                id: StableId::new("candidate").unwrap(),
-                binding_id: StableId::new("provider.dialect").unwrap(),
-                model: CandidateModel::Exact {
-                    model_id: "model".to_owned(),
-                },
-                upgrade_policy_id: None,
-                alias_policy: None,
-                required_capabilities: CapabilityFlags::default(),
-                enabled: true,
-                health_circuits: vec![],
-            }],
-            edges: vec![],
+            chain: RouteChain {
+                first,
+                steps: vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Deny,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::PreserveWarm,
+                    },
+                    candidate: candidate("backup"),
+                }],
+            },
             lane_transition: LaneTransitionPolicy::PreservePinned,
+        }
+    }
+
+    fn candidate(id: &str) -> Candidate {
+        Candidate {
+            id: CandidateId::new(id).unwrap(),
+            binding_id: BindingId::new("provider.dialect").unwrap(),
+            model: CandidateModel::Exact {
+                model_id: "model".to_owned(),
+            },
+            upgrade_policy_id: None,
+            alias_policy: None,
+            required_capabilities: CapabilityFlags::default(),
+            enabled: true,
+            health_circuits: vec![],
         }
     }
 

@@ -1,6 +1,7 @@
 //! Bounded matching and checked `${name}` / `${1}` templates.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -8,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::document::{MAX_MATCHER_BYTES, MAX_TEMPLATE_BYTES, StableId};
+
+pub const MAX_MATCH_INPUT_BYTES: usize = 4_096;
+pub const MAX_RENDERED_TEMPLATE_BYTES: usize = 4_096;
 
 /// A serialisable matcher. Only regular expressions expose captures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +55,9 @@ impl MatcherSpec {
     }
 }
 
-/// The captures that one matcher can supply to templates.
+/// The captures that one matcher can supply to templates. `optional` names a
+/// capture which the regex can syntactically expose but may not populate for a
+/// particular match; rendering reports that case as a typed resolution error.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureSchema {
     numbered: BTreeSet<usize>,
@@ -101,48 +107,66 @@ impl CompiledMatcher {
         schema
     }
 
-    pub fn captures(&self, input: &str) -> Option<MatcherCaptures> {
+    pub fn captures<'a>(
+        &self,
+        input: &'a str,
+    ) -> Result<Option<MatcherCaptures<'a>>, MatcherError> {
+        if input.len() > MAX_MATCH_INPUT_BYTES {
+            return Err(MatcherError::InputTooLong);
+        }
         match self {
-            Self::Exact(value) => (value == input).then(MatcherCaptures::default),
-            Self::Glob(glob) => glob.is_match(input).then(MatcherCaptures::default),
+            Self::Exact(value) => Ok((value == input).then(|| MatcherCaptures::empty(input))),
+            Self::Glob(glob) => Ok(glob.is_match(input).then(|| MatcherCaptures::empty(input))),
             Self::Regex(regex) => {
-                let captures = regex.captures(input)?;
-                let mut result = MatcherCaptures::default();
+                let Some(captures) = regex.captures(input) else {
+                    return Ok(None);
+                };
+                let mut result = MatcherCaptures::empty(input);
                 for index in 1..captures.len() {
                     if let Some(value) = captures.get(index) {
-                        result.numbered.insert(index, value.as_str().to_owned());
+                        result.numbered.insert(index, value.range());
                     }
                 }
                 for name in regex.capture_names().flatten() {
                     if let Some(value) = captures.name(name) {
-                        result
-                            .named
-                            .insert(name.to_owned(), value.as_str().to_owned());
+                        result.named.insert(name.to_owned(), value.range());
                     }
                 }
-                Some(result)
+                Ok(Some(result))
             }
         }
     }
 
-    pub fn is_match(&self, input: &str) -> bool {
-        self.captures(input).is_some()
+    pub fn is_match(&self, input: &str) -> Result<bool, MatcherError> {
+        Ok(self.captures(input)?.is_some())
     }
 }
 
-/// Captures from one successful regular-expression match.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MatcherCaptures {
-    numbered: BTreeMap<usize, String>,
-    named: BTreeMap<String, String>,
+/// Borrowed captures from one successful regular-expression match. Overlapping
+/// numbered and named captures share the same input rather than cloning it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatcherCaptures<'a> {
+    input: &'a str,
+    numbered: BTreeMap<usize, Range<usize>>,
+    named: BTreeMap<String, Range<usize>>,
 }
 
-impl MatcherCaptures {
-    pub fn get(&self, reference: &str) -> Option<&str> {
-        if let Ok(number) = reference.parse::<usize>() {
-            return self.numbered.get(&number).map(String::as_str);
+impl<'a> MatcherCaptures<'a> {
+    fn empty(input: &'a str) -> Self {
+        Self {
+            input,
+            numbered: BTreeMap::new(),
+            named: BTreeMap::new(),
         }
-        self.named.get(reference).map(String::as_str)
+    }
+
+    pub fn get(&self, reference: &str) -> Option<&'a str> {
+        let range = if let Ok(number) = reference.parse::<usize>() {
+            self.numbered.get(&number)
+        } else {
+            self.named.get(reference)
+        }?;
+        self.input.get(range.clone())
     }
 }
 
@@ -155,7 +179,7 @@ pub struct Template {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TemplatePart {
-    Literal(String),
+    Literal(Range<usize>),
     Reference(String),
 }
 
@@ -174,10 +198,13 @@ impl Template {
             let TemplatePart::Reference(reference) = part else {
                 continue;
             };
-            let route_parameter = StableId::new(reference)
+            let parameter = StableId::new(reference)
                 .ok()
-                .is_some_and(|id| route_parameters.contains(&id));
-            if !route_parameter && !captures.contains(reference) {
+                .filter(|id| route_parameters.contains(id));
+            if parameter.is_some() && captures.contains(reference) {
+                return Err(TemplateError::AmbiguousReference(reference.clone()));
+            }
+            if parameter.is_none() && !captures.contains(reference) {
                 return Err(TemplateError::UnknownReference(reference.clone()));
             }
         }
@@ -191,23 +218,37 @@ impl Template {
     pub fn render(
         &self,
         route_parameters: &BTreeMap<StableId, String>,
-        captures: &MatcherCaptures,
+        captures: &MatcherCaptures<'_>,
     ) -> Result<String, TemplateError> {
-        let mut rendered = String::new();
+        let mut length = 0usize;
+        let mut values = Vec::with_capacity(self.parts.len());
         for part in &self.parts {
-            match part {
-                TemplatePart::Literal(value) => rendered.push_str(value),
+            let value = match part {
+                TemplatePart::Literal(range) => self
+                    .source
+                    .get(range.clone())
+                    .ok_or(TemplateError::InvalidReference)?,
                 TemplatePart::Reference(reference) => {
                     let parameter = StableId::new(reference)
                         .ok()
                         .and_then(|id| route_parameters.get(&id))
                         .map(String::as_str);
-                    let value = parameter
+                    parameter
                         .or_else(|| captures.get(reference))
-                        .ok_or_else(|| TemplateError::MissingValue(reference.clone()))?;
-                    rendered.push_str(value);
+                        .ok_or_else(|| TemplateError::MissingCapture(reference.clone()))?
                 }
+            };
+            length = length
+                .checked_add(value.len())
+                .ok_or(TemplateError::RenderedTooLong)?;
+            if length > MAX_RENDERED_TEMPLATE_BYTES {
+                return Err(TemplateError::RenderedTooLong);
             }
+            values.push(value);
+        }
+        let mut rendered = String::with_capacity(length);
+        for value in values {
+            rendered.push_str(value);
         }
         Ok(rendered)
     }
@@ -215,24 +256,26 @@ impl Template {
 
 fn parse_parts(source: &str) -> Result<Vec<TemplatePart>, TemplateError> {
     let mut parts = Vec::new();
-    let mut remaining = source;
-    while let Some(start) = remaining.find("${") {
-        if start > 0 {
-            parts.push(TemplatePart::Literal(remaining[..start].to_owned()));
+    let mut position = 0;
+    while let Some(relative_start) = source[position..].find("${") {
+        let start = position + relative_start;
+        if start > position {
+            parts.push(TemplatePart::Literal(position..start));
         }
-        let after_start = &remaining[start + 2..];
-        let end = after_start
+        let reference_start = start + 2;
+        let relative_end = source[reference_start..]
             .find('}')
             .ok_or(TemplateError::UnclosedReference)?;
-        let reference = &after_start[..end];
+        let end = reference_start + relative_end;
+        let reference = &source[reference_start..end];
         if reference.is_empty() || reference.contains("${") {
             return Err(TemplateError::InvalidReference);
         }
         parts.push(TemplatePart::Reference(reference.to_owned()));
-        remaining = &after_start[end + 1..];
+        position = end + 1;
     }
-    if !remaining.is_empty() {
-        parts.push(TemplatePart::Literal(remaining.to_owned()));
+    if position < source.len() {
+        parts.push(TemplatePart::Literal(position..source.len()));
     }
     Ok(parts)
 }
@@ -241,6 +284,8 @@ fn parse_parts(source: &str) -> Result<Vec<TemplatePart>, TemplateError> {
 pub enum MatcherError {
     #[error("matcher exceeds its byte limit")]
     TooLong,
+    #[error("match input exceeds its byte limit")]
+    InputTooLong,
     #[error("invalid glob: {0}")]
     InvalidGlob(String),
     #[error("invalid regular expression: {0}")]
@@ -251,14 +296,18 @@ pub enum MatcherError {
 pub enum TemplateError {
     #[error("template exceeds its byte limit")]
     TooLong,
+    #[error("rendered template exceeds its byte limit")]
+    RenderedTooLong,
     #[error("template reference is not closed")]
     UnclosedReference,
     #[error("template reference is malformed")]
     InvalidReference,
     #[error("template references unknown value {0}")]
     UnknownReference(String),
-    #[error("template value {0} was not supplied")]
-    MissingValue(String),
+    #[error("template reference {0} collides between a parameter and capture")]
+    AmbiguousReference(String),
+    #[error("template capture {0} did not participate in this match")]
+    MissingCapture(String),
 }
 
 #[cfg(test)]
@@ -269,14 +318,14 @@ mod tests {
     fn exact_and_glob_match_without_exposing_captures() {
         let exact = MatcherSpec::Exact("model-1".to_owned()).compile().unwrap();
         let glob = MatcherSpec::Glob("model-*".to_owned()).compile().unwrap();
-        assert!(exact.is_match("model-1"));
-        assert!(glob.is_match("model-2"));
+        assert!(exact.is_match("model-1").unwrap());
+        assert!(glob.is_match("model-2").unwrap());
         assert_eq!(exact.capture_schema(), CaptureSchema::default());
         assert_eq!(glob.capture_schema(), CaptureSchema::default());
     }
 
     #[test]
-    fn regex_exposes_named_and_numbered_captures_to_templates() {
+    fn regex_exposes_borrowed_named_and_numbered_captures() {
         let matcher = MatcherSpec::Regex(r"^model-(?P<family>[a-z]+)-(\d+)$".to_owned())
             .compile()
             .unwrap();
@@ -287,7 +336,7 @@ mod tests {
             &matcher.capture_schema(),
         )
         .unwrap();
-        let captures = matcher.captures("model-alpha-12").unwrap();
+        let captures = matcher.captures("model-alpha-12").unwrap().unwrap();
         let values = BTreeMap::from([(
             StableId::new("requested_model").unwrap(),
             "original".to_owned(),
@@ -295,6 +344,53 @@ mod tests {
         assert_eq!(
             template.render(&values, &captures).unwrap(),
             "alpha/12/original"
+        );
+    }
+
+    #[test]
+    fn rejects_parameter_capture_name_collisions() {
+        let matcher = MatcherSpec::Regex(r"^(?P<model>.*)$".to_owned())
+            .compile()
+            .unwrap();
+        let parameters = BTreeSet::from([StableId::new("model").unwrap()]);
+        assert_eq!(
+            Template::parse("${model}", &parameters, &matcher.capture_schema()),
+            Err(TemplateError::AmbiguousReference("model".to_owned()))
+        );
+    }
+
+    #[test]
+    fn optional_unmatched_capture_is_a_typed_resolution_error() {
+        let matcher = MatcherSpec::Regex(r"^(?P<optional>x)?$".to_owned())
+            .compile()
+            .unwrap();
+        let template =
+            Template::parse("${optional}", &BTreeSet::new(), &matcher.capture_schema()).unwrap();
+        let captures = matcher.captures("").unwrap().unwrap();
+        assert_eq!(
+            template.render(&BTreeMap::new(), &captures),
+            Err(TemplateError::MissingCapture("optional".to_owned()))
+        );
+    }
+
+    #[test]
+    fn bounds_match_input_and_template_amplification() {
+        let exact = MatcherSpec::Exact("x".to_owned()).compile().unwrap();
+        assert_eq!(
+            exact.is_match(&"x".repeat(MAX_MATCH_INPUT_BYTES + 1)),
+            Err(MatcherError::InputTooLong)
+        );
+
+        let matcher = MatcherSpec::Regex(r"^(?P<x>.*)$".to_owned())
+            .compile()
+            .unwrap();
+        let template =
+            Template::parse("${x}${x}", &BTreeSet::new(), &matcher.capture_schema()).unwrap();
+        let input = "x".repeat(MAX_RENDERED_TEMPLATE_BYTES / 2 + 1);
+        let captures = matcher.captures(&input).unwrap().unwrap();
+        assert_eq!(
+            template.render(&BTreeMap::new(), &captures),
+            Err(TemplateError::RenderedTooLong)
         );
     }
 

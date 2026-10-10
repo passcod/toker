@@ -1,4 +1,9 @@
 //! Stable serialisable vocabulary for routing policy documents.
+//!
+//! The JSON structs are editable DTOs. Only [`ValidatedPolicyDocument`] may
+//! cross into fingerprinting or, later, compilation. Because every struct uses
+//! `deny_unknown_fields`, adding even an optional field changes which inputs
+//! are accepted and therefore requires an explicit format-version evolution.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -93,7 +98,70 @@ pub enum IdError {
     InvalidCharacter,
 }
 
-/// The complete independently parseable policy document.
+macro_rules! category_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(transparent)]
+        pub struct $name(StableId);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
+                StableId::new(value).map(Self)
+            }
+
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+
+            pub fn as_stable_id(&self) -> &StableId {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = IdError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                self.0.serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                StableId::deserialize(deserializer).map(Self)
+            }
+        }
+    };
+}
+
+category_id!(BindingId);
+category_id!(RouteId);
+category_id!(CandidateId);
+category_id!(ClassifierId);
+category_id!(UpgradePolicyId);
+category_id!(PresentationId);
+category_id!(RewriteId);
+category_id!(ProfileId);
+
+/// Editable policy DTO. Validate it before any authoritative use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyDocument {
@@ -116,10 +184,30 @@ pub struct PolicyDocument {
     pub compaction: Option<CompactionPolicy>,
 }
 
+/// A policy whose complete intrinsic shape and bounds have been checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ValidatedPolicyDocument(PolicyDocument);
+
+impl ValidatedPolicyDocument {
+    pub fn document(&self) -> &PolicyDocument {
+        &self.0
+    }
+
+    pub fn into_document(self) -> PolicyDocument {
+        self.0
+    }
+}
+
 impl PolicyDocument {
-    /// Validate intrinsic document bounds and identities. Cross-reference and
-    /// topology checks belong to the later compiler.
-    pub fn validate(&self) -> Result<(), DocumentError> {
+    /// Validate intrinsic bounds and identities. Cross-reference and topology
+    /// checks that need external binding data belong to the later compiler.
+    pub fn validate(&self) -> Result<ValidatedPolicyDocument, DocumentError> {
+        self.validate_inner()?;
+        Ok(ValidatedPolicyDocument(self.clone()))
+    }
+
+    fn validate_inner(&self) -> Result<(), DocumentError> {
         if self.format_version != CURRENT_FORMAT_VERSION {
             return Err(DocumentError::UnsupportedFormat(self.format_version));
         }
@@ -137,22 +225,22 @@ impl PolicyDocument {
         unique_ids(&self.upgrades, "/upgrades")?;
 
         for (index, item) in self.defaults.iter().enumerate() {
-            item.validate(&format!("/defaults/{index}"))?;
+            item.validate(&indexed("/defaults", index))?;
         }
         for (index, item) in self.presentations.iter().enumerate() {
-            item.validate(&format!("/presentations/{index}"))?;
+            item.validate(&indexed("/presentations", index))?;
         }
         for (index, item) in self.routes.iter().enumerate() {
-            item.validate(&format!("/routes/{index}"))?;
+            item.validate(&indexed("/routes", index))?;
         }
         for (index, item) in self.rewrites.iter().enumerate() {
-            item.validate(&format!("/rewrites/{index}"))?;
+            item.validate(&indexed("/rewrites", index))?;
         }
         for (index, item) in self.classifiers.iter().enumerate() {
-            item.validate(&format!("/classifiers/{index}"))?;
+            item.validate(&indexed("/classifiers", index))?;
         }
         for (index, item) in self.upgrades.iter().enumerate() {
-            item.validate(&format!("/upgrades/{index}"))?;
+            item.validate(&indexed("/upgrades", index))?;
         }
         if let Some(compaction) = &self.compaction {
             compaction.validate("/compaction")?;
@@ -162,7 +250,8 @@ impl PolicyDocument {
 }
 
 trait Identified {
-    fn id(&self) -> &StableId;
+    type Id: Eq + std::hash::Hash + Clone + fmt::Display;
+    fn id(&self) -> &Self::Id;
 }
 
 fn unique_ids<T: Identified>(items: &[T], path: &str) -> Result<(), DocumentError> {
@@ -171,7 +260,7 @@ fn unique_ids<T: Identified>(items: &[T], path: &str) -> Result<(), DocumentErro
         if !seen.insert(item.id()) {
             return Err(DocumentError::DuplicateId {
                 path: path.to_owned(),
-                id: item.id().clone(),
+                id: item.id().to_string(),
             });
         }
     }
@@ -191,7 +280,7 @@ pub enum FrontendProtocol {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FrontendScope {
     Profile {
-        profile: StableId,
+        profile: ProfileId,
         protocol: FrontendProtocol,
     },
     Protocol {
@@ -202,18 +291,19 @@ pub enum FrontendScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteReference {
-    pub route_id: StableId,
+    pub route_id: RouteId,
     #[serde(default)]
     pub parameters: BTreeMap<StableId, String>,
 }
 
 impl RouteReference {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        let parameters_path = field(path, "parameters");
         if self.parameters.len() > MAX_ROUTE_PARAMETERS {
-            return Err(DocumentError::CollectionTooLarge(path.to_owned()));
+            return Err(DocumentError::CollectionTooLarge(parameters_path));
         }
-        for value in self.parameters.values() {
-            check_string(value, path)?;
+        for (parameter, value) in &self.parameters {
+            check_string(value, &keyed(&parameters_path, parameter.as_str()))?;
         }
         Ok(())
     }
@@ -228,14 +318,14 @@ pub struct DefaultRoute {
 
 impl DefaultRoute {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        self.target.validate(path)
+        self.target.validate(&field(path, "target"))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Presentation {
-    pub id: StableId,
+    pub id: PresentationId,
     pub scope: FrontendScope,
     pub slug: String,
     #[serde(default)]
@@ -252,22 +342,24 @@ pub struct Presentation {
 }
 
 impl Identified for Presentation {
-    fn id(&self) -> &StableId {
+    type Id = PresentationId;
+
+    fn id(&self) -> &Self::Id {
         &self.id
     }
 }
 
 impl Presentation {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_template(&self.slug, path)?;
-        check_optional_string(&self.label, path)?;
-        check_optional_description(&self.description, path)?;
-        self.source.validate(path)?;
+        check_template(&self.slug, &field(path, "slug"))?;
+        check_optional_string(&self.label, &field(path, "label"))?;
+        check_optional_description(&self.description, &field(path, "description"))?;
+        self.source.validate(&field(path, "source"))?;
         if let Some(AdapterMetadata::Claude {
             behaves_as: Some(behaves_as),
         }) = &self.metadata
         {
-            check_string(behaves_as, path)?;
+            check_string(behaves_as, &field(&field(path, "metadata"), "behaves_as"))?;
         }
         Ok(())
     }
@@ -277,7 +369,7 @@ impl Presentation {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PresentationSource {
     ExactOffer {
-        binding_id: StableId,
+        binding_id: BindingId,
         model_id: String,
     },
     OfferSelector {
@@ -293,18 +385,18 @@ pub enum PresentationSource {
 impl PresentationSource {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
         match self {
-            Self::ExactOffer { model_id, .. } => check_string(model_id, path),
+            Self::ExactOffer { model_id, .. } => check_string(model_id, &field(path, "model_id")),
             Self::OfferSelector {
                 selector,
                 label_template,
             } => {
-                selector.validate(path)?;
+                selector.validate(&field(path, "selector"))?;
                 if let Some(template) = label_template {
-                    check_template(template, path)?;
+                    check_template(template, &field(path, "label_template"))?;
                 }
                 Ok(())
             }
-            Self::Virtual { target } => target.validate(path),
+            Self::Virtual { target } => target.validate(&field(path, "target")),
         }
     }
 }
@@ -334,94 +426,168 @@ pub struct OfferSelector {
 
 impl OfferSelector {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_collection(&self.include, path)?;
-        check_collection(&self.exclude, path)?;
+        validate_selector(&self.include, &self.exclude, &self.ordering, path)?;
         if self.keep == 0 {
-            return Err(DocumentError::InvalidValue(path.to_owned()));
-        }
-        for matcher in self.include.iter().chain(&self.exclude) {
-            check_matcher(matcher, path)?;
-        }
-        if let SelectorOrdering::Explicit { model_ids } = &self.ordering {
-            check_collection(model_ids, path)?;
-            for model_id in model_ids {
-                check_string(model_id, path)?;
-            }
+            return Err(DocumentError::InvalidValue(field(path, "keep")));
         }
         Ok(())
     }
+}
+
+/// A selector whose type guarantees that exactly one offer is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateSelector {
+    #[serde(default)]
+    pub include: Vec<MatcherSpec>,
+    #[serde(default)]
+    pub exclude: Vec<MatcherSpec>,
+    pub ordering: SelectorOrdering,
+}
+
+impl CandidateSelector {
+    fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        validate_selector(&self.include, &self.exclude, &self.ordering, path)
+    }
+}
+
+fn validate_selector(
+    include: &[MatcherSpec],
+    exclude: &[MatcherSpec],
+    ordering: &SelectorOrdering,
+    path: &str,
+) -> Result<(), DocumentError> {
+    let include_path = field(path, "include");
+    let exclude_path = field(path, "exclude");
+    check_collection(include, &include_path)?;
+    check_collection(exclude, &exclude_path)?;
+    for (index, matcher) in include.iter().enumerate() {
+        check_matcher(matcher, &indexed(&include_path, index))?;
+    }
+    for (index, matcher) in exclude.iter().enumerate() {
+        check_matcher(matcher, &indexed(&exclude_path, index))?;
+    }
+    if let SelectorOrdering::Explicit { model_ids } = ordering {
+        let model_ids_path = field(&field(path, "ordering"), "model_ids");
+        check_collection(model_ids, &model_ids_path)?;
+        for (index, model_id) in model_ids.iter().enumerate() {
+            check_string(model_id, &indexed(&model_ids_path, index))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorOrdering {
     CatalogueChronology,
-    ClassifiedVersion { classifier_id: StableId },
+    ClassifiedVersion { classifier_id: ClassifierId },
     Explicit { model_ids: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
-    pub id: StableId,
+    pub id: RouteId,
     pub display_name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub parameters: Vec<StableId>,
-    pub candidates: Vec<Candidate>,
-    #[serde(default)]
-    pub edges: Vec<CandidateEdge>,
+    pub chain: RouteChain,
     pub lane_transition: LaneTransitionPolicy,
 }
 
 impl Identified for Route {
-    fn id(&self) -> &StableId {
+    type Id = RouteId;
+
+    fn id(&self) -> &Self::Id {
         &self.id
     }
 }
 
 impl Route {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_string(&self.display_name, path)?;
-        check_optional_description(&self.description, path)?;
+        check_string(&self.display_name, &field(path, "display_name"))?;
+        check_optional_description(&self.description, &field(path, "description"))?;
+        let parameters_path = field(path, "parameters");
         if self.parameters.len() > MAX_ROUTE_PARAMETERS {
-            return Err(DocumentError::CollectionTooLarge(path.to_owned()));
+            return Err(DocumentError::CollectionTooLarge(parameters_path));
         }
         let mut parameters = HashSet::new();
-        for parameter in &self.parameters {
+        for (index, parameter) in self.parameters.iter().enumerate() {
             if !parameters.insert(parameter) {
                 return Err(DocumentError::DuplicateId {
-                    path: path.to_owned(),
-                    id: parameter.clone(),
+                    path: indexed(&parameters_path, index),
+                    id: parameter.to_string(),
                 });
             }
         }
-        if self.candidates.is_empty() || self.candidates.len() > MAX_ROUTE_CANDIDATES {
-            return Err(DocumentError::CollectionTooLarge(path.to_owned()));
+        self.chain.validate(&field(path, "chain"))
+    }
+}
+
+/// A non-empty candidate chain. Every candidate after the first is paired with
+/// the edge that grants transition to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteChain {
+    pub first: Candidate,
+    #[serde(default)]
+    pub steps: Vec<RouteStep>,
+}
+
+impl RouteChain {
+    fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        if self.steps.len() >= MAX_ROUTE_CANDIDATES {
+            return Err(DocumentError::CollectionTooLarge(field(path, "steps")));
         }
-        if self.edges.len() != self.candidates.len().saturating_sub(1) {
-            return Err(DocumentError::InvalidEdgeCount(path.to_owned()));
+        let mut ids = HashSet::new();
+        if !ids.insert(&self.first.id) {
+            unreachable!("the first insertion cannot be a duplicate");
         }
-        unique_ids(&self.candidates, path)?;
-        for candidate in &self.candidates {
-            candidate.validate(path)?;
-        }
-        for edge in &self.edges {
-            edge.validate(path)?;
+        self.first.validate(&field(path, "first"))?;
+        let steps_path = field(path, "steps");
+        for (index, step) in self.steps.iter().enumerate() {
+            let step_path = indexed(&steps_path, index);
+            if !ids.insert(&step.candidate.id) {
+                return Err(DocumentError::DuplicateId {
+                    path: field(&step_path, "candidate"),
+                    id: step.candidate.id.to_string(),
+                });
+            }
+            step.validate(&step_path)?;
         }
         Ok(())
+    }
+
+    pub fn candidates(&self) -> impl Iterator<Item = &Candidate> {
+        std::iter::once(&self.first).chain(self.steps.iter().map(|step| &step.candidate))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteStep {
+    pub edge: CandidateEdge,
+    pub candidate: Candidate,
+}
+
+impl RouteStep {
+    fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        self.edge.validate(&field(path, "edge"))?;
+        self.candidate.validate(&field(path, "candidate"))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Candidate {
-    pub id: StableId,
-    pub binding_id: StableId,
+    pub id: CandidateId,
+    pub binding_id: BindingId,
     pub model: CandidateModel,
     #[serde(default)]
-    pub upgrade_policy_id: Option<StableId>,
+    pub upgrade_policy_id: Option<UpgradePolicyId>,
     #[serde(default)]
     pub alias_policy: Option<AliasPolicy>,
     #[serde(default)]
@@ -432,25 +598,21 @@ pub struct Candidate {
     pub health_circuits: Vec<HealthCircuit>,
 }
 
-impl Identified for Candidate {
-    fn id(&self) -> &StableId {
-        &self.id
-    }
-}
-
 impl Candidate {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        self.model.validate(path)?;
+        self.model.validate(&field(path, "model"))?;
         if let Some(policy) = &self.alias_policy {
-            policy.validate(path)?;
+            policy.validate(&field(path, "alias_policy"))?;
         }
-        check_collection(&self.health_circuits, path)?;
-        if self
-            .health_circuits
-            .iter()
-            .any(|circuit| circuit.duration_seconds == 0)
-        {
-            return Err(DocumentError::InvalidValue(path.to_owned()));
+        let circuits_path = field(path, "health_circuits");
+        check_collection(&self.health_circuits, &circuits_path)?;
+        for (index, circuit) in self.health_circuits.iter().enumerate() {
+            if circuit.duration_seconds == 0 {
+                return Err(DocumentError::InvalidValue(field(
+                    &indexed(&circuits_path, index),
+                    "duration_seconds",
+                )));
+            }
         }
         Ok(())
     }
@@ -462,22 +624,16 @@ pub enum CandidateModel {
     Exact { model_id: String },
     RequestedModel,
     Template { template: String },
-    OfferSelector { selector: OfferSelector },
+    OfferSelector { selector: CandidateSelector },
 }
 
 impl CandidateModel {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
         match self {
-            Self::Exact { model_id } => check_string(model_id, path),
+            Self::Exact { model_id } => check_string(model_id, &field(path, "model_id")),
             Self::RequestedModel => Ok(()),
-            Self::Template { template } => check_template(template, path),
-            Self::OfferSelector { selector } => {
-                selector.validate(path)?;
-                if selector.keep != 1 {
-                    return Err(DocumentError::InvalidValue(path.to_owned()));
-                }
-                Ok(())
-            }
+            Self::Template { template } => check_template(template, &field(path, "template")),
+            Self::OfferSelector { selector } => selector.validate(&field(path, "selector")),
         }
     }
 }
@@ -492,10 +648,12 @@ pub struct AliasPolicy {
 
 impl AliasPolicy {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_collection(&self.rules, path)?;
-        for rule in &self.rules {
-            check_matcher(&rule.matcher, path)?;
-            check_template(&rule.replacement, path)?;
+        let rules_path = field(path, "rules");
+        check_collection(&self.rules, &rules_path)?;
+        for (index, rule) in self.rules.iter().enumerate() {
+            let rule_path = indexed(&rules_path, index);
+            check_matcher(&rule.matcher, &field(&rule_path, "matcher"))?;
+            check_template(&rule.replacement, &field(&rule_path, "replacement"))?;
         }
         Ok(())
     }
@@ -536,7 +694,7 @@ pub struct CandidateEdge {
 
 impl CandidateEdge {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_collection(&self.post_send, path)
+        check_collection(&self.post_send, &field(path, "post_send"))
     }
 }
 
@@ -547,7 +705,7 @@ pub enum FallbackPermission {
     Enabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     Authentication,
@@ -609,7 +767,7 @@ pub struct HealthCircuit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RewriteRule {
-    pub id: StableId,
+    pub id: RewriteId,
     pub scope: FrontendScope,
     pub priority: i32,
     pub model_matcher: MatcherSpec,
@@ -617,23 +775,25 @@ pub struct RewriteRule {
 }
 
 impl Identified for RewriteRule {
-    fn id(&self) -> &StableId {
+    type Id = RewriteId;
+
+    fn id(&self) -> &Self::Id {
         &self.id
     }
 }
 
 impl RewriteRule {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_matcher(&self.model_matcher, path)?;
-        self.target.validate(path)
+        check_matcher(&self.model_matcher, &field(path, "model_matcher"))?;
+        self.target.validate(&field(path, "target"))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FamilyClassifier {
-    pub id: StableId,
-    pub binding_id: StableId,
+    pub id: ClassifierId,
+    pub binding_id: BindingId,
     pub model_matcher: MatcherSpec,
     pub family_template: String,
     pub version_template: String,
@@ -641,27 +801,35 @@ pub struct FamilyClassifier {
 }
 
 impl Identified for FamilyClassifier {
-    fn id(&self) -> &StableId {
+    type Id = ClassifierId;
+
+    fn id(&self) -> &Self::Id {
         &self.id
     }
 }
 
 impl FamilyClassifier {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_matcher(&self.model_matcher, path)?;
-        check_template(&self.family_template, path)?;
-        check_template(&self.version_template, path)?;
+        check_matcher(&self.model_matcher, &field(path, "model_matcher"))?;
+        check_template(&self.family_template, &field(path, "family_template"))?;
+        check_template(&self.version_template, &field(path, "version_template"))?;
+        if let VersionParserSpec::NumericTuple { separator, .. } = &self.version_parser {
+            check_string(
+                separator,
+                &field(&field(path, "version_parser"), "separator"),
+            )?;
+        }
         self.version_parser
             .validate()
-            .map_err(|_| DocumentError::InvalidValue(path.to_owned()))
+            .map_err(|_| DocumentError::InvalidValue(field(path, "version_parser")))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpgradePolicy {
-    pub id: StableId,
-    pub classifier_id: StableId,
+    pub id: UpgradePolicyId,
+    pub classifier_id: ClassifierId,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub minimum_learning: MinimumLearning,
@@ -675,14 +843,16 @@ pub struct UpgradePolicy {
 }
 
 impl Identified for UpgradePolicy {
-    fn id(&self) -> &StableId {
+    type Id = UpgradePolicyId;
+
+    fn id(&self) -> &Self::Id {
         &self.id
     }
 }
 
 impl UpgradePolicy {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        check_collection(&self.inventory_sources, path)
+        check_collection(&self.inventory_sources, &field(path, "inventory_sources"))
     }
 }
 
@@ -694,7 +864,7 @@ pub enum MinimumLearning {
     ExplicitPromotion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InventorySource {
     Catalogue,
@@ -712,7 +882,7 @@ pub struct CompactionPolicy {
 
 impl CompactionPolicy {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        self.target.validate(path)
+        self.target.validate(&field(path, "target"))
     }
 }
 
@@ -765,6 +935,19 @@ fn check_template(value: &str, path: &str) -> Result<(), DocumentError> {
     Ok(())
 }
 
+fn field(path: &str, name: &str) -> String {
+    format!("{path}/{name}")
+}
+
+fn indexed(path: &str, index: usize) -> String {
+    format!("{path}/{index}")
+}
+
+fn keyed(path: &str, key: &str) -> String {
+    let escaped = key.replace('~', "~0").replace('/', "~1");
+    format!("{path}/{escaped}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DocumentError {
     #[error("unsupported policy format version {0}")]
@@ -779,10 +962,8 @@ pub enum DocumentError {
     MatcherTooLong(String),
     #[error("template exceeds its limit at {0}")]
     TemplateTooLong(String),
-    #[error("duplicate id {id} in {path}")]
-    DuplicateId { path: String, id: StableId },
-    #[error("candidate edge count is invalid at {0}")]
-    InvalidEdgeCount(String),
+    #[error("duplicate id {id} at {path}")]
+    DuplicateId { path: String, id: String },
     #[error("invalid value at {0}")]
     InvalidValue(String),
 }
@@ -792,13 +973,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stable_ids_accept_only_the_contract_spelling() {
+    fn stable_and_category_ids_preserve_validated_spelling() {
         for valid in ["a", "model-1", "openrouter.messages", "a_b"] {
             assert_eq!(StableId::new(valid).unwrap().as_str(), valid);
+            assert_eq!(RouteId::new(valid).unwrap().as_str(), valid);
         }
         for invalid in ["", "Upper", "has space", "slash/name", "é"] {
             assert!(StableId::new(invalid).is_err(), "accepted {invalid:?}");
         }
+        let route = RouteId::new("same").unwrap();
+        let candidate = CandidateId::new("same").unwrap();
+        assert_eq!(serde_json::to_string(&route).unwrap(), r#""same""#);
+        assert_eq!(serde_json::to_string(&candidate).unwrap(), r#""same""#);
     }
 
     #[test]
@@ -812,45 +998,64 @@ mod tests {
     }
 
     #[test]
-    fn route_requires_one_edge_between_adjacent_candidates() {
+    fn route_chain_is_nonempty_and_pairs_edges_with_destinations() {
         let route = Route {
-            id: StableId::new("route").unwrap(),
+            id: RouteId::new("route").unwrap(),
             display_name: "Route".to_owned(),
             description: None,
             parameters: vec![],
-            candidates: vec![candidate("one"), candidate("two")],
-            edges: vec![],
+            chain: RouteChain {
+                first: candidate("one"),
+                steps: vec![RouteStep {
+                    edge: edge(),
+                    candidate: candidate("two"),
+                }],
+            },
             lane_transition: LaneTransitionPolicy::PreservePinned,
         };
+        assert_eq!(route.chain.candidates().count(), 2);
+        assert!(route.validate("/routes/0").is_ok());
+    }
+
+    #[test]
+    fn document_description_has_its_wider_exact_bound() {
+        let mut document = empty_document();
+        document.description = Some("x".repeat(MAX_STRING_BYTES));
+        assert!(document.validate().is_ok());
+        document.description = Some("x".repeat(MAX_STRING_BYTES + 1));
+        assert!(document.validate().is_ok());
+        document.description = Some("x".repeat(MAX_DESCRIPTION_BYTES));
+        assert!(document.validate().is_ok());
+        document.description = Some("x".repeat(MAX_DESCRIPTION_BYTES + 1));
         assert!(matches!(
-            route.validate("/routes/0"),
-            Err(DocumentError::InvalidEdgeCount(_))
+            document.validate(),
+            Err(DocumentError::DescriptionTooLong(path)) if path == "/description"
         ));
     }
 
     #[test]
-    fn document_checks_collection_and_text_bounds() {
+    fn nested_string_errors_report_the_specific_path() {
         let mut document = empty_document();
-        document.description = Some("x".repeat(MAX_DESCRIPTION_BYTES + 1));
+        document.routes.push(Route {
+            id: RouteId::new("route").unwrap(),
+            display_name: "Route".to_owned(),
+            description: None,
+            parameters: vec![],
+            chain: RouteChain {
+                first: Candidate {
+                    model: CandidateModel::Exact {
+                        model_id: "x".repeat(MAX_STRING_BYTES + 1),
+                    },
+                    ..candidate("one")
+                },
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        });
         assert!(matches!(
             document.validate(),
-            Err(DocumentError::DescriptionTooLong(_))
-        ));
-        document.description = None;
-        document.defaults = (0..=MAX_COLLECTION_ITEMS)
-            .map(|_| DefaultRoute {
-                scope: FrontendScope::Protocol {
-                    protocol: FrontendProtocol::AnthropicMessages,
-                },
-                target: RouteReference {
-                    route_id: StableId::new("r").unwrap(),
-                    parameters: BTreeMap::new(),
-                },
-            })
-            .collect();
-        assert!(matches!(
-            document.validate(),
-            Err(DocumentError::CollectionTooLarge(_))
+            Err(DocumentError::StringTooLong(path))
+                if path == "/routes/0/chain/first/model/model_id"
         ));
     }
 
@@ -870,14 +1075,24 @@ mod tests {
 
     fn candidate(id: &str) -> Candidate {
         Candidate {
-            id: StableId::new(id).unwrap(),
-            binding_id: StableId::new("provider.dialect").unwrap(),
+            id: CandidateId::new(id).unwrap(),
+            binding_id: BindingId::new("provider.dialect").unwrap(),
             model: CandidateModel::RequestedModel,
             upgrade_policy_id: None,
             alias_policy: None,
             required_capabilities: CapabilityFlags::default(),
             enabled: true,
             health_circuits: vec![],
+        }
+    }
+
+    fn edge() -> CandidateEdge {
+        CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::PreserveWarm,
         }
     }
 }
