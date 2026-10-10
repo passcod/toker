@@ -8,13 +8,19 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
+use crate::policy::{BindingId, CostClass};
 use crate::providers::Provider;
 
 /// One inference wire protocol understood by a frontend or backend binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProtocolId {
+    #[serde(rename = "anthropic")]
     AnthropicMessages,
+    #[serde(rename = "openai_chat")]
     OpenAiChat,
+    #[serde(rename = "openai_responses")]
     OpenAiResponses,
 }
 
@@ -41,13 +47,19 @@ impl fmt::Display for ProtocolId {
 /// identity selects the provider-specific rendering and interpretation rules
 /// within that shape; it must therefore never be inferred from
 /// [`ProtocolId`] alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DialectId {
+    #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
+    #[serde(rename = "openai_chat_completions")]
     OpenAiChatCompletions,
+    #[serde(rename = "openrouter_messages")]
     OpenRouterMessages,
+    #[serde(rename = "openrouter_chat_completions")]
     OpenRouterChatCompletions,
+    #[serde(rename = "openrouter_responses")]
     OpenRouterResponses,
+    #[serde(rename = "codex_responses")]
     CodexResponses,
 }
 
@@ -128,12 +140,33 @@ impl Capabilities {
 /// This is code identity, not provider identity. Multiple provider dialects
 /// may eventually share one adapter; the dialect remains an explicit input to
 /// that adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendAdapterId {
+    #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
+    #[serde(rename = "openai_chat_completions")]
     OpenAiChatCompletions,
+    #[serde(rename = "codex_responses")]
     CodexResponses,
+    #[serde(rename = "openrouter_responses")]
     OpenRouterResponses,
+}
+
+impl BackendAdapterId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BackendAdapterId::AnthropicMessages => "anthropic_messages",
+            BackendAdapterId::OpenAiChatCompletions => "openai_chat_completions",
+            BackendAdapterId::CodexResponses => "codex_responses",
+            BackendAdapterId::OpenRouterResponses => "openrouter_responses",
+        }
+    }
+}
+
+impl fmt::Display for BackendAdapterId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// A configured client identity carried by `/f/<name>`.
@@ -170,38 +203,84 @@ impl FrontendProfile {
     }
 }
 
+/// Verified prompt-cache continuity for one backend binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheDomain {
+    id: &'static str,
+    ttl_ms: i64,
+}
+
+impl CacheDomain {
+    pub const fn new(id: &'static str, ttl_ms: i64) -> CacheDomain {
+        CacheDomain { id, ttl_ms }
+    }
+
+    pub const fn id(self) -> &'static str {
+        self.id
+    }
+
+    pub const fn ttl_ms(self) -> i64 {
+        self.ttl_ms
+    }
+}
+
 /// One native wire exposed by a provider.
 ///
 /// A binding is a verified declaration, not an inference from an endpoint's
-/// spelling. Later phases attach a dialect adapter and capabilities here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// spelling. Its id is closed static topology, while provider configuration is
+/// resolved separately by [`RouteRegistry`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BackendBinding {
+    id: BindingId,
+    provider: &'static str,
     protocol: ProtocolId,
     dialect: DialectId,
+    cost_class: CostClass,
+    cache_domain: Option<CacheDomain>,
     canonical: Option<CanonicalBackend>,
 }
 
 impl BackendBinding {
     /// Declare a live wire binding whose universal canonical egress adapter
     /// has not been completed yet.
-    pub const fn declared(protocol: ProtocolId, dialect: DialectId) -> BackendBinding {
+    pub const fn declared(
+        id: &'static str,
+        provider: &'static str,
+        protocol: ProtocolId,
+        dialect: DialectId,
+        cost_class: CostClass,
+        cache_domain: Option<CacheDomain>,
+    ) -> BackendBinding {
         BackendBinding {
+            id: BindingId::from_static(id),
+            provider,
             protocol,
             dialect,
+            cost_class,
+            cache_domain,
             canonical: None,
         }
     }
 
     /// Declare a binding with a verified canonical egress adapter.
+    #[allow(clippy::too_many_arguments)]
     pub const fn canonical(
+        id: &'static str,
+        provider: &'static str,
         protocol: ProtocolId,
         dialect: DialectId,
+        cost_class: CostClass,
+        cache_domain: Option<CacheDomain>,
         adapter: BackendAdapterId,
         capabilities: Capabilities,
     ) -> BackendBinding {
         BackendBinding {
+            id: BindingId::from_static(id),
+            provider,
             protocol,
             dialect,
+            cost_class,
+            cache_domain,
             canonical: Some(CanonicalBackend {
                 adapter,
                 capabilities,
@@ -209,20 +288,127 @@ impl BackendBinding {
         }
     }
 
-    pub const fn protocol(self) -> ProtocolId {
+    pub fn id(&self) -> &BindingId {
+        &self.id
+    }
+
+    pub fn id_str(&self) -> &str {
+        self.id.as_str()
+    }
+
+    pub const fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    pub const fn protocol(&self) -> ProtocolId {
         self.protocol
     }
 
-    pub const fn dialect(self) -> DialectId {
+    pub const fn dialect(&self) -> DialectId {
         self.dialect
+    }
+
+    pub const fn cost_class(&self) -> CostClass {
+        self.cost_class
+    }
+
+    pub const fn cache_domain(&self) -> Option<CacheDomain> {
+        self.cache_domain
     }
 
     /// The canonical implementation and verified capabilities, once this
     /// binding can participate in the universal pipeline.
-    pub const fn canonical_backend(self) -> Option<CanonicalBackend> {
+    pub const fn canonical_backend(&self) -> Option<CanonicalBackend> {
         self.canonical
     }
 }
+
+pub const ANTHROPIC_SUB_MESSAGES: BackendBinding = BackendBinding::canonical(
+    "anthropic_sub.anthropic_messages",
+    "anthropic_sub",
+    ProtocolId::AnthropicMessages,
+    DialectId::AnthropicMessages,
+    CostClass::Subscription,
+    None,
+    BackendAdapterId::AnthropicMessages,
+    Capabilities::MESSAGES,
+);
+
+pub const ANTHROPIC_API_MESSAGES: BackendBinding = BackendBinding::canonical(
+    "anthropic_api.anthropic_messages",
+    "anthropic_api",
+    ProtocolId::AnthropicMessages,
+    DialectId::AnthropicMessages,
+    CostClass::Billed,
+    None,
+    BackendAdapterId::AnthropicMessages,
+    Capabilities::MESSAGES,
+);
+
+pub const OPENAI_API_CHAT: BackendBinding = BackendBinding::canonical(
+    "openai_api.openai_chat_completions",
+    "openai_api",
+    ProtocolId::OpenAiChat,
+    DialectId::OpenAiChatCompletions,
+    CostClass::Billed,
+    None,
+    BackendAdapterId::OpenAiChatCompletions,
+    Capabilities::CHAT,
+);
+
+pub const OPENROUTER_CHAT: BackendBinding = BackendBinding::canonical(
+    "openrouter.openrouter_chat_completions",
+    "openrouter",
+    ProtocolId::OpenAiChat,
+    DialectId::OpenRouterChatCompletions,
+    CostClass::Billed,
+    Some(CacheDomain::new("openrouter.chat", 10 * 60 * 1000)),
+    BackendAdapterId::OpenAiChatCompletions,
+    Capabilities::CHAT,
+);
+
+pub const OPENROUTER_MESSAGES: BackendBinding = BackendBinding::canonical(
+    "openrouter.openrouter_messages",
+    "openrouter",
+    ProtocolId::AnthropicMessages,
+    DialectId::OpenRouterMessages,
+    CostClass::Billed,
+    None,
+    BackendAdapterId::AnthropicMessages,
+    Capabilities::MESSAGES,
+);
+
+pub const OPENROUTER_RESPONSES: BackendBinding = BackendBinding::canonical(
+    "openrouter.openrouter_responses",
+    "openrouter",
+    ProtocolId::OpenAiResponses,
+    DialectId::OpenRouterResponses,
+    CostClass::Billed,
+    None,
+    BackendAdapterId::OpenRouterResponses,
+    Capabilities::OPENROUTER_RESPONSES,
+);
+
+pub const CODEX_SUB_RESPONSES: BackendBinding = BackendBinding::canonical(
+    "codex_sub.codex_responses",
+    "codex_sub",
+    ProtocolId::OpenAiResponses,
+    DialectId::CodexResponses,
+    CostClass::Subscription,
+    None,
+    BackendAdapterId::CodexResponses,
+    Capabilities::CODEX,
+);
+
+pub const BACKEND_BINDINGS: &[BackendBinding] = &[
+    ANTHROPIC_SUB_MESSAGES,
+    ANTHROPIC_API_MESSAGES,
+    OPENAI_API_CHAT,
+    OPENROUTER_CHAT,
+    OPENROUTER_MESSAGES,
+    OPENROUTER_RESPONSES,
+    CODEX_SUB_RESPONSES,
+];
 
 /// The canonical egress half of a backend binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -242,78 +428,74 @@ impl CanonicalBackend {
 }
 
 /// One implemented path through the canonical adapter graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RouteDeclaration {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDeclaration {
     frontend: ProtocolId,
-    provider: &'static str,
-    backend: ProtocolId,
+    binding: BackendBinding,
 }
 
-const ROUTES: &[RouteDeclaration] = &[
+impl RouteDeclaration {
+    pub const fn frontend(&self) -> ProtocolId {
+        self.frontend
+    }
+
+    pub const fn binding(&self) -> &BackendBinding {
+        &self.binding
+    }
+}
+
+pub const ROUTES: &[RouteDeclaration] = &[
     RouteDeclaration {
         frontend: ProtocolId::AnthropicMessages,
-        provider: "anthropic_sub",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_SUB_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::AnthropicMessages,
-        provider: "anthropic_api",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_API_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::AnthropicMessages,
-        provider: "openrouter",
-        backend: ProtocolId::AnthropicMessages,
+        binding: OPENROUTER_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::AnthropicMessages,
-        provider: "codex_sub",
-        backend: ProtocolId::OpenAiResponses,
+        binding: CODEX_SUB_RESPONSES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
-        provider: "openrouter",
-        backend: ProtocolId::OpenAiChat,
+        binding: OPENROUTER_CHAT,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
-        provider: "openai_api",
-        backend: ProtocolId::OpenAiChat,
+        binding: OPENAI_API_CHAT,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
-        provider: "codex_sub",
-        backend: ProtocolId::OpenAiResponses,
+        binding: CODEX_SUB_RESPONSES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
-        provider: "anthropic_api",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_API_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
-        provider: "anthropic_sub",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_SUB_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
-        provider: "codex_sub",
-        backend: ProtocolId::OpenAiResponses,
+        binding: CODEX_SUB_RESPONSES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
-        provider: "anthropic_api",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_API_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
-        provider: "anthropic_sub",
-        backend: ProtocolId::AnthropicMessages,
+        binding: ANTHROPIC_SUB_MESSAGES,
     },
     RouteDeclaration {
         frontend: ProtocolId::OpenAiResponses,
-        provider: "openrouter",
-        backend: ProtocolId::OpenAiResponses,
+        binding: OPENROUTER_RESPONSES,
     },
 ];
 
@@ -336,8 +518,8 @@ impl ModelTarget {
         &self.provider
     }
 
-    pub const fn binding(&self) -> BackendBinding {
-        self.binding
+    pub const fn binding(&self) -> &BackendBinding {
+        &self.binding
     }
 
     pub fn requested_model(&self) -> Option<&str> {
@@ -381,6 +563,31 @@ impl RouteRegistry {
         self.providers.get(id)
     }
 
+    /// Every declared backend binding, regardless of configured providers.
+    pub fn bindings(&self) -> impl ExactSizeIterator<Item = &BackendBinding> + '_ {
+        BACKEND_BINDINGS.iter()
+    }
+
+    pub fn binding(&self, id: &BindingId) -> Option<&'static BackendBinding> {
+        BACKEND_BINDINGS
+            .iter()
+            .find(|binding| binding.id_str() == id.as_str())
+    }
+
+    /// Every implemented frontend-to-binding edge, regardless of configured
+    /// providers.
+    pub fn routes(&self) -> impl ExactSizeIterator<Item = &RouteDeclaration> + '_ {
+        ROUTES.iter()
+    }
+
+    pub fn provider_is_configured(&self, provider: &str) -> bool {
+        self.providers.contains_key(provider)
+    }
+
+    pub fn binding_is_configured(&self, binding: &BackendBinding) -> bool {
+        self.provider_is_configured(binding.provider())
+    }
+
     /// Resolve a frontend model spelling to its provider, backend binding, and
     /// two model identities. Unknown prefixes are provider-owned model ids and
     /// therefore remain intact on the protocol default.
@@ -395,9 +602,9 @@ impl RouteRegistry {
                 .filter(|route| route.frontend == frontend)
                 .find_map(|route| {
                     model
-                        .strip_prefix(route.provider)
+                        .strip_prefix(route.binding.provider())
                         .and_then(|rest| rest.strip_prefix('/'))
-                        .map(|rest| (*route, rest))
+                        .map(|rest| (route, rest))
                 })
         });
         let protocol_alias = (frontend == ProtocolId::AnthropicMessages)
@@ -406,27 +613,27 @@ impl RouteRegistry {
             .and_then(|model| model.strip_prefix("anthropic/"));
 
         let (provider_id, effective_model) = if let Some((route, rest)) = explicit {
-            (route.provider, Some(rest))
+            (route.binding.provider(), Some(rest))
         } else {
             let provider = self.defaults.get(&frontend).ok_or(RouteNotConfigured)?;
             (provider.as_str(), protocol_alias.or(requested_model))
         };
         let declaration = ROUTES
             .iter()
-            .find(|route| route.frontend == frontend && route.provider == provider_id)
+            .find(|route| route.frontend == frontend && route.binding.provider() == provider_id)
             .ok_or(RouteNotConfigured)?;
         let provider = self
             .providers
-            .get(declaration.provider)
+            .get(declaration.binding.provider())
             .cloned()
             .ok_or(RouteNotConfigured)?;
         let binding = provider
             .bindings()
             .iter()
-            .copied()
             .find(|binding| {
-                binding.protocol() == declaration.backend && binding.canonical_backend().is_some()
+                **binding == declaration.binding && binding.canonical_backend().is_some()
             })
+            .cloned()
             .ok_or(RouteNotConfigured)?;
         Ok(ModelTarget {
             provider,
@@ -444,10 +651,12 @@ mod tests {
     use axum::http::HeaderMap;
     use reqwest::Url;
 
-    use super::Capabilities;
     use super::{
-        BackendAdapterId, BackendBinding, DialectId, FrontendProfile, ProtocolId, RouteRegistry,
+        ANTHROPIC_SUB_MESSAGES, BACKEND_BINDINGS, BackendAdapterId, BackendBinding, Capabilities,
+        DialectId, FrontendProfile, OPENROUTER_CHAT, OPENROUTER_MESSAGES, ProtocolId, ROUTES,
+        RouteRegistry,
     };
+    use crate::policy::CostClass;
     use crate::providers::Provider;
 
     struct FakeProvider {
@@ -471,26 +680,8 @@ mod tests {
         fn inject_auth(&self, _outgoing: &mut HeaderMap) {}
     }
 
-    const MESSAGES: &[BackendBinding] = &[BackendBinding::canonical(
-        ProtocolId::AnthropicMessages,
-        DialectId::AnthropicMessages,
-        BackendAdapterId::AnthropicMessages,
-        Capabilities::MESSAGES,
-    )];
-    const OPENROUTER: &[BackendBinding] = &[
-        BackendBinding::canonical(
-            ProtocolId::OpenAiChat,
-            DialectId::OpenRouterChatCompletions,
-            BackendAdapterId::OpenAiChatCompletions,
-            Capabilities::CHAT,
-        ),
-        BackendBinding::canonical(
-            ProtocolId::AnthropicMessages,
-            DialectId::OpenRouterMessages,
-            BackendAdapterId::AnthropicMessages,
-            Capabilities::MESSAGES,
-        ),
-    ];
+    const MESSAGES: &[BackendBinding] = &[ANTHROPIC_SUB_MESSAGES];
+    const OPENROUTER: &[BackendBinding] = &[OPENROUTER_CHAT, OPENROUTER_MESSAGES];
 
     #[test]
     fn known_frontend_profiles_name_their_ambiguous_protocol() {
@@ -521,21 +712,202 @@ mod tests {
 
     #[test]
     fn a_binding_separates_protocol_dialect_and_adapter_readiness() {
-        let pending =
-            BackendBinding::declared(ProtocolId::AnthropicMessages, DialectId::OpenRouterMessages);
+        let pending = BackendBinding::declared(
+            "openrouter.openrouter_messages",
+            "openrouter",
+            ProtocolId::AnthropicMessages,
+            DialectId::OpenRouterMessages,
+            CostClass::Billed,
+            None,
+        );
         assert_eq!(pending.protocol(), ProtocolId::AnthropicMessages);
         assert_eq!(pending.dialect(), DialectId::OpenRouterMessages);
         assert_eq!(pending.canonical_backend(), None);
 
         let ready = BackendBinding::canonical(
+            "codex_sub.codex_responses",
+            "codex_sub",
             ProtocolId::OpenAiResponses,
             DialectId::CodexResponses,
+            CostClass::Subscription,
+            None,
             BackendAdapterId::CodexResponses,
             Capabilities::CODEX,
         );
         let canonical = ready.canonical_backend().expect("adapter is verified");
         assert_eq!(canonical.adapter(), BackendAdapterId::CodexResponses);
         assert_eq!(canonical.capabilities(), Capabilities::CODEX);
+    }
+
+    #[test]
+    fn stable_wire_identities_round_trip_and_reject_unknown_spellings() {
+        for (value, protocol) in [
+            ("anthropic", ProtocolId::AnthropicMessages),
+            ("openai_chat", ProtocolId::OpenAiChat),
+            ("openai_responses", ProtocolId::OpenAiResponses),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&protocol).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ProtocolId>(&format!("\"{value}\"")).unwrap(),
+                protocol
+            );
+        }
+        for (value, dialect) in [
+            ("anthropic_messages", DialectId::AnthropicMessages),
+            ("openai_chat_completions", DialectId::OpenAiChatCompletions),
+            ("openrouter_messages", DialectId::OpenRouterMessages),
+            (
+                "openrouter_chat_completions",
+                DialectId::OpenRouterChatCompletions,
+            ),
+            ("openrouter_responses", DialectId::OpenRouterResponses),
+            ("codex_responses", DialectId::CodexResponses),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&dialect).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<DialectId>(&format!("\"{value}\"")).unwrap(),
+                dialect
+            );
+        }
+        for (value, adapter) in [
+            ("anthropic_messages", BackendAdapterId::AnthropicMessages),
+            (
+                "openai_chat_completions",
+                BackendAdapterId::OpenAiChatCompletions,
+            ),
+            ("codex_responses", BackendAdapterId::CodexResponses),
+            (
+                "openrouter_responses",
+                BackendAdapterId::OpenRouterResponses,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&adapter).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<BackendAdapterId>(&format!("\"{value}\"")).unwrap(),
+                adapter
+            );
+        }
+        assert!(serde_json::from_str::<ProtocolId>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<DialectId>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<BackendAdapterId>(r#""unknown""#).is_err());
+    }
+
+    #[test]
+    fn topology_is_static_and_configuration_is_separate() {
+        let registry = RouteRegistry::new(
+            [Arc::new(FakeProvider {
+                id: "anthropic_sub",
+                bindings: MESSAGES,
+            }) as Arc<dyn Provider>],
+            [],
+        );
+        assert_eq!(registry.bindings().count(), BACKEND_BINDINGS.len());
+        assert_eq!(registry.routes().count(), ROUTES.len());
+        assert!(registry.provider_is_configured("anthropic_sub"));
+        assert!(!registry.provider_is_configured("openrouter"));
+        assert!(registry.binding_is_configured(&ANTHROPIC_SUB_MESSAGES));
+        assert!(!registry.binding_is_configured(&OPENROUTER_MESSAGES));
+        assert!(registry.routes().any(|route| {
+            route.frontend() == ProtocolId::OpenAiChat
+                && route.binding().id_str() == "openrouter.openrouter_chat_completions"
+        }));
+        assert!(registry.binding(OPENROUTER_MESSAGES.id()).is_some());
+    }
+
+    #[test]
+    fn declared_bindings_pin_identity_cost_adapter_capabilities_and_cache_evidence() {
+        let expected = [
+            (
+                "anthropic_sub.anthropic_messages",
+                CostClass::Subscription,
+                ProtocolId::AnthropicMessages,
+                DialectId::AnthropicMessages,
+                BackendAdapterId::AnthropicMessages,
+                Capabilities::MESSAGES,
+                None,
+            ),
+            (
+                "anthropic_api.anthropic_messages",
+                CostClass::Billed,
+                ProtocolId::AnthropicMessages,
+                DialectId::AnthropicMessages,
+                BackendAdapterId::AnthropicMessages,
+                Capabilities::MESSAGES,
+                None,
+            ),
+            (
+                "openai_api.openai_chat_completions",
+                CostClass::Billed,
+                ProtocolId::OpenAiChat,
+                DialectId::OpenAiChatCompletions,
+                BackendAdapterId::OpenAiChatCompletions,
+                Capabilities::CHAT,
+                None,
+            ),
+            (
+                "openrouter.openrouter_chat_completions",
+                CostClass::Billed,
+                ProtocolId::OpenAiChat,
+                DialectId::OpenRouterChatCompletions,
+                BackendAdapterId::OpenAiChatCompletions,
+                Capabilities::CHAT,
+                Some(("openrouter.chat", 600_000)),
+            ),
+            (
+                "openrouter.openrouter_messages",
+                CostClass::Billed,
+                ProtocolId::AnthropicMessages,
+                DialectId::OpenRouterMessages,
+                BackendAdapterId::AnthropicMessages,
+                Capabilities::MESSAGES,
+                None,
+            ),
+            (
+                "openrouter.openrouter_responses",
+                CostClass::Billed,
+                ProtocolId::OpenAiResponses,
+                DialectId::OpenRouterResponses,
+                BackendAdapterId::OpenRouterResponses,
+                Capabilities::OPENROUTER_RESPONSES,
+                None,
+            ),
+            (
+                "codex_sub.codex_responses",
+                CostClass::Subscription,
+                ProtocolId::OpenAiResponses,
+                DialectId::CodexResponses,
+                BackendAdapterId::CodexResponses,
+                Capabilities::CODEX,
+                None,
+            ),
+        ];
+        assert_eq!(BACKEND_BINDINGS.len(), expected.len());
+        for (binding, (id, cost, protocol, dialect, adapter, capabilities, cache)) in
+            BACKEND_BINDINGS.iter().zip(expected)
+        {
+            assert_eq!(binding.id_str(), id);
+            assert_eq!(binding.cost_class(), cost);
+            assert_eq!(binding.protocol(), protocol);
+            assert_eq!(binding.dialect(), dialect);
+            let canonical = binding.canonical_backend().expect("implemented adapter");
+            assert_eq!(canonical.adapter(), adapter);
+            assert_eq!(canonical.capabilities(), capabilities);
+            assert_eq!(
+                binding
+                    .cache_domain()
+                    .map(|domain| (domain.id(), domain.ttl_ms())),
+                cache
+            );
+        }
     }
 
     #[test]

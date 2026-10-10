@@ -34,14 +34,10 @@ use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 
 use super::Provider;
-use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
+use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, BackendBinding, ProtocolId};
 
-const BINDINGS: &[BackendBinding] = &[BackendBinding::canonical(
-    ProtocolId::AnthropicMessages,
-    DialectId::AnthropicMessages,
-    BackendAdapterId::AnthropicMessages,
-    Capabilities::MESSAGES,
-)];
+const ANTHROPIC_SUB_BINDINGS: &[BackendBinding] = &[ANTHROPIC_SUB_MESSAGES];
+const ANTHROPIC_API_BINDINGS: &[BackendBinding] = &[ANTHROPIC_API_MESSAGES];
 
 /// The header carrying the API key (Anthropic's API auth is `x-api-key`,
 /// not a bearer).
@@ -159,7 +155,7 @@ impl Provider for AnthropicSub {
     }
 
     fn bindings(&self) -> &'static [BackendBinding] {
-        BINDINGS
+        ANTHROPIC_SUB_BINDINGS
     }
 
     fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
@@ -219,7 +215,7 @@ impl Provider for AnthropicApi {
     }
 
     fn bindings(&self) -> &'static [BackendBinding] {
-        BINDINGS
+        ANTHROPIC_API_BINDINGS
     }
 
     fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {

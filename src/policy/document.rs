@@ -5,6 +5,7 @@
 //! `deny_unknown_fields`, adding even an optional field changes which inputs
 //! are accepted and therefore requires an explicit format-version evolution.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -96,6 +97,8 @@ pub enum IdError {
     TooLong,
     #[error("identifier contains a character outside [a-z0-9-_.]")]
     InvalidCharacter,
+    #[error("binding identifier must be `<provider-id>.<dialect-id>`")]
+    InvalidBinding,
 }
 
 macro_rules! category_id {
@@ -152,7 +155,77 @@ macro_rules! category_id {
     };
 }
 
-category_id!(BindingId);
+/// A closed backend binding identity.
+///
+/// Runtime topology constructs these from the verified provider and dialect.
+/// Policy documents still parse the same stable spelling, but reject ids that
+/// cannot denote exactly one `<provider-id>.<dialect-id>` binding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct BindingId(Cow<'static, str>);
+
+impl BindingId {
+    pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
+        Self::validate(value.into()).map(Cow::Owned).map(Self)
+    }
+
+    pub const fn from_static(value: &'static str) -> Self {
+        Self(Cow::Borrowed(value))
+    }
+
+    pub fn from_parts(provider_id: &str, dialect_id: &str) -> Result<Self, IdError> {
+        Self::new(format!("{provider_id}.{dialect_id}"))
+    }
+
+    fn validate(value: String) -> Result<String, IdError> {
+        let mut parts = value.split('.');
+        let provider = parts.next().unwrap_or_default();
+        let dialect = parts.next().unwrap_or_default();
+        if provider.is_empty() || dialect.is_empty() || parts.next().is_some() {
+            return Err(IdError::InvalidBinding);
+        }
+        StableId::new(value.clone())?;
+        Ok(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BindingId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for BindingId {
+    type Err = IdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for BindingId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BindingId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 category_id!(RouteId);
 category_id!(CandidateId);
 category_id!(ClassifierId);
@@ -725,7 +798,7 @@ pub enum BoundaryConsent {
     Allow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostClass {
     Subscription,
@@ -985,6 +1058,23 @@ mod tests {
         let candidate = CandidateId::new("same").unwrap();
         assert_eq!(serde_json::to_string(&route).unwrap(), r#""same""#);
         assert_eq!(serde_json::to_string(&candidate).unwrap(), r#""same""#);
+    }
+
+    #[test]
+    fn binding_ids_require_exactly_provider_and_dialect() {
+        let id = BindingId::new("openrouter.openrouter_messages").unwrap();
+        assert_eq!(id.as_str(), "openrouter.openrouter_messages");
+        assert_eq!(
+            serde_json::to_string(&id).unwrap(),
+            r#""openrouter.openrouter_messages""#
+        );
+        assert_eq!(
+            serde_json::from_str::<BindingId>(r#""openrouter.openrouter_messages""#).unwrap(),
+            id
+        );
+        for invalid in ["openrouter", ".messages", "openrouter.", "a.b.c"] {
+            assert!(BindingId::new(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

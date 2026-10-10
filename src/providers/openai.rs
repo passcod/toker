@@ -6,14 +6,9 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
-use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
+use crate::routing::{BackendBinding, OPENAI_API_CHAT};
 
-const BINDINGS: &[BackendBinding] = &[BackendBinding::canonical(
-    ProtocolId::OpenAiChat,
-    DialectId::OpenAiChatCompletions,
-    BackendAdapterId::OpenAiChatCompletions,
-    Capabilities::CHAT,
-)];
+const BINDINGS: &[BackendBinding] = &[OPENAI_API_CHAT];
 
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
@@ -103,7 +98,7 @@ mod tests {
         assert!(provider.supports_protocol(ProtocolId::OpenAiChat));
         assert!(!provider.supports_protocol(ProtocolId::AnthropicMessages));
         assert!(!provider.supports_protocol(ProtocolId::OpenAiResponses));
-        let binding = provider.bindings()[0];
+        let binding = &provider.bindings()[0];
         assert_eq!(binding.dialect(), DialectId::OpenAiChatCompletions);
         assert_eq!(
             binding.canonical_backend().expect("canonical").adapter(),

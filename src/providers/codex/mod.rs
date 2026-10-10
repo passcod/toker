@@ -488,13 +488,7 @@ impl Provider for CodexSub {
     }
 
     fn bindings(&self) -> &'static [crate::routing::BackendBinding] {
-        const BINDINGS: &[crate::routing::BackendBinding] =
-            &[crate::routing::BackendBinding::canonical(
-                crate::routing::ProtocolId::OpenAiResponses,
-                crate::routing::DialectId::CodexResponses,
-                crate::routing::BackendAdapterId::CodexResponses,
-                crate::ir::canonical::Capabilities::CODEX,
-            )];
+        const BINDINGS: &[crate::routing::BackendBinding] = &[crate::routing::CODEX_SUB_RESPONSES];
         BINDINGS
     }
 
