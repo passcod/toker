@@ -691,7 +691,6 @@ unsupported active policy fails startup rather than reverting to TOML. The
 compiler consumes:
 
 - protocol defaults from `Config`;
-- every provider model map;
 - configured or built-in OpenRouter picker rules;
 - the force-newest gate;
 - `compact_model` as a generated compaction route;
