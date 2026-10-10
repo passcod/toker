@@ -708,6 +708,13 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         "instructions": "private instructions",
         "input": [
             {"role": "user", "content": "private prompt"},
+            {"type": "function_call", "name": "inspect_image", "call_id": "call-1",
+             "arguments": "{\"path\":\"shot.png\"}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": [
+                {"type": "input_text", "text": "Image read successfully"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAECAw==",
+                 "detail": "auto"}
+            ]},
             {"type": "additional_tools", "id": "at_1", "role": "developer",
              "tools": [{"type": "custom", "name": "exec"}]},
             {"type": "future_provider_item", "opaque": true}
@@ -755,12 +762,29 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(
         rendered["input"][1],
         json!({
+            "type": "function_call", "name": "inspect_image", "call_id": "call-1",
+            "arguments": "{\"path\":\"shot.png\"}"
+        })
+    );
+    assert_eq!(
+        rendered["input"][2],
+        json!({
+            "type": "function_call_output", "call_id": "call-1", "output": [
+                {"type": "input_text", "text": "Image read successfully"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAECAw==",
+                 "detail": "auto"}
+            ]
+        })
+    );
+    assert_eq!(
+        rendered["input"][3],
+        json!({
             "type": "additional_tools", "id": "at_1", "role": "developer",
             "tools": [{"type": "custom", "name": "exec"}]
         })
     );
     assert_eq!(
-        rendered["input"][2],
+        rendered["input"][4],
         json!({"type": "future_provider_item", "opaque": true})
     );
     assert_eq!(rendered["tools"][0]["name"], "shell");
@@ -800,7 +824,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         Some("codex_sub/gpt-5.6-sol")
     );
     assert_eq!(row.effective_model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(row.req_messages, Some(3));
+    assert_eq!(row.req_messages, Some(5));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
     assert_eq!(row.input, Some(658));

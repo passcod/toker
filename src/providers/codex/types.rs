@@ -130,8 +130,9 @@ impl Item {
         }))
     }
 
-    /// A function call's result: `{"type":"function_call_output",
-    /// "call_id","output"}`.
+    /// A function call's text result: `{"type":"function_call_output",
+    /// "call_id","output"}`. The wire also permits structured output arrays;
+    /// callers preserving those use the raw [`Item`] value.
     pub fn function_call_output(call_id: &str, output: &str) -> Item {
         Item(json!({
             "type": "function_call_output",
@@ -213,7 +214,8 @@ pub struct FunctionCall {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FunctionCallOutput {
     pub call_id: String,
-    pub output: String,
+    /// A text string or an array of structured content items.
+    pub output: Value,
 }
 
 /// The typed `message` view.
@@ -612,8 +614,15 @@ mod tests {
         );
         assert_eq!(
             output.as_function_call_output().expect("view").output,
-            "file contents"
+            json!("file contents")
         );
+
+        let structured = Item(json!({
+            "type": "function_call_output",
+            "call_id": "call_2",
+            "output": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]
+        }));
+        assert!(structured.as_function_call_output().is_some());
 
         // reasoning: summary parts and encrypted content.
         let reasoning = Item::reasoning(

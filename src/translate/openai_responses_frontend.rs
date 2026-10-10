@@ -264,21 +264,73 @@ fn function_call_of(item: &Value, index: usize) -> Result<CanonMessage, Translat
 
 fn function_output_of(item: &Value, index: usize) -> Result<CanonMessage, TranslateError> {
     let call_id = required_string(item, "call_id", index, "function_call_output")?;
-    let output = required_string(item, "output", index, "function_call_output")?;
+    let output = item
+        .get("output")
+        .ok_or_else(|| TranslateError::Malformed {
+            reason: format!("input[{index}]: function_call_output output is missing"),
+        })?;
+    let (content, output_extension) = match output {
+        Value::String(text) => (ToolResultContent::String(text.clone()), None),
+        Value::Array(items) => (
+            responses_tool_result_content(items),
+            Some(CanonicalExtension::node_field(
+                DIALECT,
+                "$.input[].output",
+                "output",
+                output.clone(),
+            )),
+        ),
+        _ => {
+            return Err(TranslateError::Malformed {
+                reason: format!(
+                    "input[{index}]: function_call_output output is neither a string nor an array"
+                ),
+            });
+        }
+    };
+    let mut item_extensions = extensions(item, "$.input[]", &["type", "call_id", "output"]);
+    item_extensions.extend(output_extension);
     Ok(CanonMessage {
         role: CanonRole::User,
         blocks: vec![
             CanonBlock::ToolResult {
                 tool_use_id: call_id.to_owned(),
-                content: ToolResultContent::String(output.to_owned()),
+                content,
             }
-            .annotated(
-                None,
-                extensions(item, "$.input[]", &["type", "call_id", "output"]),
-            ),
+            .annotated(None, item_extensions),
         ],
         extensions: Vec::new(),
     })
+}
+
+/// Extract the portable meaning of a Responses structured tool result.
+///
+/// The complete array also rides as a same-dialect extension on the enclosing
+/// tool result, so rendering back to Responses is exact. Text and image items
+/// can cross to another backend through canonical blocks. If any item is not
+/// portable, the raw JSON string is the only lossless cross-dialect fallback.
+fn responses_tool_result_content(items: &[Value]) -> ToolResultContent {
+    let raw = || serde_json::to_string(items).expect("a parsed Value always serialises");
+    let blocks = items
+        .iter()
+        .map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("input_text") => item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| CanonBlock::Text(text.to_owned())),
+            Some("input_image") => {
+                item.get("image_url")
+                    .and_then(Value::as_str)
+                    .map(|url| CanonBlock::Image {
+                        url: url.to_owned(),
+                    })
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    blocks
+        .map(ToolResultContent::Blocks)
+        .unwrap_or_else(|| ToolResultContent::String(raw()))
 }
 
 fn required_string<'a>(
@@ -1013,7 +1065,10 @@ mod tests {
                 ], "item_meta": 1},
                 {"type": "function_call", "name": "lookup", "call_id": "call-1",
                  "arguments": "{\"id\":1}"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "done"},
+                {"type": "function_call_output", "call_id": "call-1", "output": [
+                    {"type": "input_text", "text": "done"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA==", "detail": "auto"}
+                ]},
                 {"type": "reasoning", "summary": [{"type": "summary_text", "text": "opaque"}],
                  "encrypted_content": "ciphertext"}
             ],
@@ -1056,6 +1111,12 @@ mod tests {
                 .iter()
                 .any(|extension| extension.wire_path() == "$.store")
         );
+        let rendered = render_codex(&canonical, "cache-key").expect("render");
+        assert!(rendered.report.is_empty(), "{:?}", rendered.report);
+        assert_eq!(
+            serde_json::to_value(rendered.value).expect("wire value")["input"][2],
+            body["input"][2]
+        );
     }
 
     #[test]
@@ -1095,6 +1156,28 @@ mod tests {
         assert_eq!(value["store"], json!(true));
         assert_eq!(value["include"], body["include"]);
         assert_eq!(value["service_tier"], json!("flex"));
+    }
+
+    #[test]
+    fn structured_function_outputs_with_provider_items_replay_exactly() {
+        let body = json!({
+            "model": "gpt-example",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [
+                    {"type": "input_audio", "audio_url": "data:audio/wav;base64,AA=="},
+                    {"type": "encrypted_content", "encrypted_content": "ciphertext"}
+                ]
+            }]
+        });
+        let canonical = from_openai_responses(&body).expect("parse structured output");
+        let rendered = render_codex(&canonical, "cache-key").expect("render structured output");
+        assert!(rendered.report.is_empty(), "{:?}", rendered.report);
+        assert_eq!(
+            serde_json::to_value(rendered.value).expect("wire value")["input"][0],
+            body["input"][0]
+        );
     }
 
     #[test]

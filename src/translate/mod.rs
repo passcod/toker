@@ -78,7 +78,12 @@
 //! | `tool_choice {type:"any"}` | `tool_choice:"required"` (the Responses equivalent) |
 //! | `tool_choice {type:"tool"}` or an unknown type | reported — no faithful string form on this wire |
 //! | `tool_result.content` string | `function_call_output.output` text |
-//! | `tool_result.content` block array | `function_call_output.output` as the JSON of the array (the only lossless string form; the wire's own content-item array output does not fit unit A's typed view, whose `output` is a string) |
+//! | `tool_result.content` block array | `function_call_output.output` as the JSON of the Anthropic array (its lossless cross-protocol string form) |
+//!
+//! Native Responses input also permits `function_call_output.output` to be an
+//! array of structured content items. The Responses frontend extracts portable
+//! text and image semantics and retains the complete array for exact replay to
+//! a compatible Responses backend.
 //!
 //! Consecutive text/image blocks of one message group into ONE message
 //! item; a `tool_use`/`tool_result` switches to its own input item,
