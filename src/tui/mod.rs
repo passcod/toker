@@ -264,6 +264,10 @@ pub fn run(
             if mouse.kind
                 == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
             {
+                if drawn.legend_button.contains(at) {
+                    toggle_legend(&mut ui);
+                    continue;
+                }
                 match (&mut ui.detail, &drawn.popup) {
                     (Some(popup), Some(drawn_popup)) => match drawn_popup.control_at(at) {
                         Some(control) => {
@@ -329,10 +333,7 @@ pub fn run(
                 }
                 // ? toggles the legend over the frame; Esc closes it, or
                 // the detail popup. The two are never open together.
-                crossterm::event::KeyCode::Char('?') => {
-                    ui.legend = !ui.legend;
-                    ui.detail = None;
-                }
+                crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc => {
                     ui.legend = false;
                     ui.detail = None;
@@ -375,6 +376,13 @@ pub fn run(
         )));
     }
     Ok(())
+}
+
+/// Open or close the legend, always dismissing the mutually exclusive
+/// session detail. Both its visible header action and `?` use this.
+fn toggle_legend(ui: &mut view::Ui) {
+    ui.legend = !ui.legend;
+    ui.detail = None;
 }
 
 /// Read one session's detail, with its row from the current snapshot.

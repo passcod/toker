@@ -89,6 +89,13 @@ const IDLE_SECS: i64 = 180;
 /// thresholds, kept so a glance reads the same).
 const FRESH_SECS: i64 = 30;
 
+/// A header action is a compact inverse-video chip. Keeping its width
+/// fixed leaves a predictable strip where more page actions can sit.
+const HEADER_ACTION_WIDTH: u16 = 3;
+
+/// The status text does not run into the header actions.
+const HEADER_ACTION_GAP: u16 = 1;
+
 /// Past this the proxy has been quiet long enough to look dead: the
 /// freshness turns red and counts in minutes.
 const STALE_SECS: i64 = 300;
@@ -297,6 +304,8 @@ pub(crate) struct Scroll {
 /// for hit-testing the wheel, and how far it can scroll.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
+    /// The inverse-video `?` in the header, which toggles the legend.
+    pub legend_button: Rect,
     pub sessions: DrawnList,
     pub context: DrawnList,
     /// CACHE REBUILDS' causes and details; not clickable either.
@@ -365,7 +374,15 @@ pub(crate) fn render(
     let layout = plan_layout(snap, frame.area());
     let chrome = layout.chrome;
 
-    render_header(frame, layout.header, snap, clock);
+    // The layout may surrender the header's only row to RATE & QUOTA
+    // on a one-row terminal. The action remains anchored at the top;
+    // it is the way out to the legend even at that size.
+    let action_header = Rect {
+        height: layout.header.height.max(frame.area().height.min(1)),
+        ..layout.header
+    };
+    let (legend_button, header) = header_actions(action_header);
+    render_header(frame, header, snap, clock);
     let (sessions_offset, sessions_rows) = render_sessions(
         frame,
         layout.sessions,
@@ -377,6 +394,7 @@ pub(crate) fn render(
     let (context_offset, context_rows) =
         render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context);
     let mut drawn = Drawn {
+        legend_button,
         sessions: DrawnList {
             area: layout.sessions,
             max_offset: sessions_offset,
@@ -414,6 +432,9 @@ pub(crate) fn render(
         );
     }
     render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
+    // Short layouts can make the bottom panel share the header row;
+    // keep the discoverability control above the page's data.
+    render_header_action(frame, legend_button);
     // The overlays are exclusive (the loop opens one by closing the
     // other); the legend wins if both are ever set.
     if ui.legend {
@@ -434,6 +455,39 @@ pub(crate) fn render(
         strip_colour(frame);
     }
     drawn
+}
+
+/// Header actions at the far left, followed by the remaining status
+/// area. The chip narrows with the terminal, so even a one-cell frame
+/// still renders and hit-tests safely. Future page actions belong
+/// immediately after this one, before the gutter.
+fn header_actions(area: Rect) -> (Rect, Rect) {
+    let button_width = area.width.min(HEADER_ACTION_WIDTH);
+    let gap = (area.width - button_width).min(HEADER_ACTION_GAP);
+    let button = Rect::new(area.x, area.y, button_width, area.height.min(1));
+    let header = Rect::new(
+        area.x + button_width + gap,
+        area.y,
+        area.width - button_width - gap,
+        area.height,
+    );
+    (button, header)
+}
+
+fn render_header_action(frame: &mut Frame, button: Rect) {
+    let label = if button.width >= HEADER_ACTION_WIDTH {
+        " ? "
+    } else {
+        "?"
+    };
+    frame.render_widget(
+        Paragraph::new(label).style(
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::REVERSED),
+        ),
+        button,
+    );
 }
 
 /// Every colour off the finished frame, modifiers kept: `NO_COLOR` is
@@ -3060,6 +3114,55 @@ mod tests {
     }
 
     #[test]
+    fn the_header_starts_with_a_clickable_legend_button() {
+        let snap = with_latest(snapshot(), Some(NOW - 4_000));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+        let mut drawn = super::Drawn::default();
+        terminal
+            .draw(|frame| {
+                drawn = super::render(frame, &snap, "12:34:56", &utc(), &plain());
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(drawn.legend_button, ratatui::layout::Rect::new(0, 0, 3, 1));
+        assert_eq!(
+            (0..3)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>(),
+            " ? "
+        );
+        for x in 0..3 {
+            let cell = &buffer[(x, 0)];
+            assert_eq!(cell.fg, Color::DarkGray);
+            assert!(cell.modifier.contains(Modifier::REVERSED));
+            assert!(
+                drawn
+                    .legend_button
+                    .contains(ratatui::layout::Position::new(x, 0))
+            );
+        }
+        assert_eq!(buffer[(3, 0)].symbol(), " ", "a gutter follows the action");
+        assert_eq!(buffer[(4, 0)].symbol(), "l", "the status follows the gutter");
+    }
+
+    #[test]
+    fn the_legend_button_collapses_with_a_tiny_header() {
+        let snap = snapshot();
+        for width in 1..=2 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("terminal");
+            let mut drawn = super::Drawn::default();
+            terminal
+                .draw(|frame| {
+                    drawn = super::render(frame, &snap, "12:34:56", &utc(), &plain());
+                })
+                .expect("draw");
+            assert_eq!(drawn.legend_button.width, width);
+            assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "?");
+        }
+    }
+
+    #[test]
     fn freshness_is_yellow_while_stale() {
         let snap = with_latest(snapshot(), Some(NOW - 120_000));
         let (row, fg) = header_fg(&snap, 100, "120s ago");
@@ -3126,7 +3229,7 @@ mod tests {
         // "last req 4s ago · 12:34:56" is 26 cells; one more for the gap.
         let (row, _) = header_fg(&snap, 40, "4s ago");
         assert!(row.contains("last req 4s ago · 12:34:56"), "{row:?}");
-        assert!(row.starts_with("last 30m"), "summary clips: {row:?}");
+        assert!(row.starts_with(" ?  last 30m"), "summary clips: {row:?}");
         assert!(!row.contains("2 sessions"), "summary clips: {row:?}");
 
         let (row, _) = header_fg(&snap, 20, "4s ago");
