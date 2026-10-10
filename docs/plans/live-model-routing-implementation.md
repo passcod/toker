@@ -115,6 +115,36 @@ happened before the request was accepted. It is never enabled by migration and
 requires an explicit fallback condition because the first provider may have
 accepted and billed the request.
 
+### Model identity and response projection
+
+Carry requested, baseline, effective, and reported model identities as separate
+typed values. Backend adapters observe and record the provider's reported model
+before frontend projection. A missing response model remains absent rather
+than being filled from the effective target for display purposes.
+
+Frontend renderers receive the exact requested identity in addition to the
+accepted canonical response and use it for every response model echo. They do
+not expose the effective target merely because a rewrite, virtual presentation,
+upgrade, or fallback selected a differently named backend model. Internal
+learning and served-model tracking continue to use the reported identity when
+present and the effective target only where an internal fallback is required.
+
+### Session lineage
+
+Treat the incoming session id as the raw lane and prompt-cache identity. Add an
+independent, nullable display parent, child role, and relation source derived
+only from explicit content-free wire evidence or a verified structural
+convention. Grouping a child for display and aggregate accounting must not
+merge its lane pin, allowance, prompt-cache key, or cache state with its parent.
+
+Recognise Codex's `guardian:<session-id>` convention as a `guardian` relation,
+retaining the raw id and using the suffix as its display parent. Claude action
+classifier calls already use the main session id. Do not attach Claude side
+queries that use fresh ids without a parent header. Named request-class headers
+may classify a request role when present, but timing, model names, request
+counts, transcript absence, connection reuse, and body shape are never lineage
+evidence.
+
 ### Publication metadata
 
 A concrete presentation may publish verified fields from its exact offer. A
@@ -320,10 +350,23 @@ Extend `requests` with nullable:
 - fallback reason;
 - routing trace JSON.
 
+Also add nullable content-free session lineage fields:
+
+- parent session id;
+- child role;
+- relation source.
+
+The existing session id remains the raw wire identity used by lanes and prompt
+caches. Parent aggregation is a read-model concern and never rewrites it.
+
 Every upstream attempt gets its own ledger row and cost semantics. The trace
 contains only ids, classifications, availability states, and reason codes.
 Preflight skips ride on the first attempted row or the local terminal row. The
 existing requested and effective model columns retain their current meanings.
+`raw_model` remains the provider-reported wire identity. Operational views
+labelled `reported` read that field and show absence as `-`; the normalised
+`model` fallback remains available only to internal served-model and learning
+paths.
 When every candidate is unavailable before send, write one proxy-kind
 `route-unavailable` row carrying the trace; absence of an upstream attempt does
 not make the routing decision disappear from the ledger.
@@ -379,6 +422,10 @@ bound, message/tool counts, required capability flags, and opaque provider
 affinity. Encrypted or provider-owned reasoning carries an affinity to the
 binding that can replay it; policy routing cannot erase that constraint.
 
+Session/lane identity here is always the raw request identity. Session lineage
+is carried beside it for recording and display and cannot affect resolution or
+lane selection.
+
 Model-bearing non-inference paths use the same policy vocabulary with narrower
 execution rules. `count_tokens` resolves the candidate whose tokenizer is
 being asked and remains unledgered. A batch resolves every embedded model and
@@ -419,7 +466,9 @@ The coordinator:
 5. retains the response until it is accepted or classified for fallback;
 6. records each completed or failed attempt against its actual backend;
 7. pins the successful candidate and effective model;
-8. hands the accepted canonical response to the frontend renderer.
+8. records the accepted provider-reported model before projection;
+9. hands the accepted canonical response and original requested identity to
+   the frontend renderer.
 
 An attempt never mutates the canonical request used to render a later attempt.
 Provider-specific semantic changes are applied to a fresh render. This keeps a
@@ -506,6 +555,18 @@ dashboard modules focused on the operational page, and add:
 path. The routing client runs on a small background worker with bounded request
 and reply channels, so a slow or restarting daemon never blocks terminal event
 handling. Dashboard reads continue directly against SQLite.
+
+Extend the dashboard read model to preserve each row's raw session while
+grouping rows with explicit lineage under their display parent. Parent totals
+include linked child accounting, and session detail shows a child-role
+breakdown; lane and cache panels continue to render the child lanes separately.
+Resolve a linked child's title and cwd through its parent transcript while
+still displaying its raw id and role in detail. Unlinked UUID sessions remain
+separate rather than being guessed into the nearest active conversation.
+
+The model detail line keeps `asked`, `sent`, and `reported`: requested identity,
+effective target, and `raw_model`, respectively. A response that did not name a
+model displays `reported -`.
 
 The header action strip renders the existing inverse-video `?` followed by a
 blue inverse-video `⇄` routing action. `Tab` or clicking `⇄` toggles the
@@ -601,7 +662,9 @@ stable spellings.
 Add the policy, publication, binding-learning, lane-pin, and ledger-provenance
 schema. Add transactional store methods for draft compare-and-swap,
 activation, revision loading, publication status, and binding-scoped learning.
-Keep policy writes out of the insert-only ledger path.
+Add content-free session-lineage columns and reads in the same schema change,
+while retaining raw session ids as lane keys. Keep policy writes out of the
+insert-only ledger path.
 
 ### 3. Route topology and canonical offer inventory
 
@@ -656,6 +719,11 @@ administrative and control paths in their protocol modules, but move
 `count_tokens`, batch model projection, and unmatched default binding lookup to
 their restricted policy-resolution paths in the same changeset.
 
+Make every frontend renderer echo the original requested model identity while
+the coordinator records the effective and reported identities independently.
+Remove any renderer construction that substitutes the effective model into the
+frontend-visible response.
+
 ### 10. Lane pins and activation scopes
 
 Persist successful route, candidate, binding, baseline, effective model,
@@ -698,6 +766,11 @@ Add the page enum, routing header action, control client, routing state, and
 the four master/detail views. Preserve the dashboard's cadence and overlay
 behavior while routing data refreshes on its own generation.
 
+Update the operational dashboard read model in this changeset as well: group
+only explicitly linked child sessions, resolve their parent labels, retain
+separate child lanes, and make `reported` use `raw_model` without an effective
+model fallback.
+
 ### 16. TUI editing, preview, and activation
 
 Add typed forms, selector completion, candidate ordering, confirmations,
@@ -726,4 +799,5 @@ moved into another recorded plan, remove this file in its own `unplan:` commit.
 The reconciliation must include the auxiliary bare `claude-*` scenario: with
 no Anthropic binding configured, Claude Code's classifier, title, helper, and
 compaction calls route by model policy without inspecting their content or
-shape.
+shape. It must not invent parentage for auxiliary calls whose wire identity has
+no explicit relation to an originating session.

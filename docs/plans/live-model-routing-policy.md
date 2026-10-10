@@ -41,8 +41,14 @@ publication adapters, control API, and TUI in implementation changesets.
 - Existing warm lanes remain stable unless the activation or fallback policy
   explicitly permits a transition.
 - The ledger records the frontend-visible identity, baseline resolved target,
-  final upgraded target, policy revision, and fallback reason without recording
-  request or response content.
+  final upgraded target, provider-reported identity, policy revision, and
+  fallback reason without recording request or response content.
+- A translated or rewritten response echoes the model identity the frontend
+  requested. Routing remains transparent even when the effective backend model
+  has a different provider-owned name.
+- Explicit child-session relationships are grouped under their originating
+  session in the operational TUI without changing the child's lane or cache
+  identity.
 
 ## Non-goals
 
@@ -66,9 +72,13 @@ Keep these identities distinct throughout routing and recording:
    and catalogue freshness.
 2. **Presented identity**: the slug, label, description, and compatibility hints
    exposed to one frontend.
-3. **Route identity**: a named policy containing ordered backend candidates.
-4. **Baseline target**: the candidate and model chosen before an upgrade.
-5. **Effective target**: the exact backend and model sent upstream.
+3. **Requested identity**: the exact model spelling received from the frontend,
+   whether it came from a presentation or matched a compatibility rewrite.
+4. **Route identity**: a named policy containing ordered backend candidates.
+5. **Baseline target**: the candidate and model chosen before an upgrade.
+6. **Effective target**: the exact backend and model sent upstream.
+7. **Reported identity**: the model the accepted provider response actually
+   named, when it named one.
 
 A presented identity may reference a concrete offer or a route identity. A
 virtual model is a presented identity backed by a route identity and need not
@@ -78,6 +88,35 @@ The same virtual slug may be exposed on several frontends. Each exposure names
 the route used for that frontend protocol and carries frontend-specific
 metadata. Policy validation refuses duplicate slugs within one frontend
 namespace and requires an explicit override to shadow a native model.
+
+Frontend response renderers use the requested identity for their model echo,
+not the effective or reported identity. The ledger retains all three so this
+projection does not erase routing or provider evidence. A provider response
+that omits its model leaves the reported identity absent; the TUI renders that
+as `-` rather than filling it from the effective target.
+
+## Session lineage
+
+Keep the session identity received on the wire as the request's raw session and
+lane identity. Separately record a parent session, child role, and evidence
+source when the frontend supplies an explicit relationship or uses a verified
+structural convention. Parent grouping is for TUI attribution and aggregate
+accounting only. It never merges lane state, prompt-cache keys, allowances, or
+cache-safety decisions.
+
+Codex guardian requests use the verified `guardian:<session-id>` convention.
+Record them as `guardian` children of the suffix session, retain the complete
+raw id, resolve their display label through the parent transcript, and show
+their usage in the parent's aggregate with a child-role breakdown.
+
+Claude Code action-classifier calls already carry the originating session id
+and require no synthetic link. Current Claude side queries instead carry a
+fresh session id and no parent identifier. Leave those sessions unattached.
+Do not infer parentage from timing, model name, message/tool counts, missing
+transcripts, connection reuse, or request shape. If a future frontend sends an
+explicit parent or request-class header, read only those named content-free
+headers: a request class may label a role, but it does not establish a parent
+unless the wire also supplies a verifiable relation.
 
 ## Policy data model
 
@@ -186,6 +225,10 @@ Resolve every inference request through these stages:
 The result includes content-free provenance for every decision: policy
 revision, presentation or rewrite rule, chosen candidate, skipped candidates
 and reasons, upgrade decision, and final binding.
+
+The accepted canonical response is observed under the reported provider
+identity before its frontend renderer projects the requested identity back
+onto the frontend wire.
 
 ## Availability and fallback
 
@@ -407,7 +450,11 @@ The feature is complete when one activated revision can, without a restart:
 - reconcile external frontend configuration and report its applied revision;
 - roll back by activating a prior policy as a new revision;
 - record every routing identity and decision without storing conversation
-  content.
+  content;
+- echo the requested or virtual model identity on frontend responses while
+  preserving the effective and provider-reported identities in the ledger;
+- group explicitly linked utility sessions under their parent without merging
+  their independent lane state, and leave unlinked side queries ungrouped.
 
 It must also cover Claude Code's auxiliary bare `claude-*` requests when no
 Anthropic backend is configured: classifier, title, helper, and compaction
