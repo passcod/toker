@@ -3127,9 +3127,7 @@ mod tests {
 
         assert_eq!(drawn.legend_button, ratatui::layout::Rect::new(0, 0, 3, 1));
         assert_eq!(
-            (0..3)
-                .map(|x| buffer[(x, 0)].symbol())
-                .collect::<String>(),
+            (0..3).map(|x| buffer[(x, 0)].symbol()).collect::<String>(),
             " ? "
         );
         for x in 0..3 {
@@ -3143,7 +3141,11 @@ mod tests {
             );
         }
         assert_eq!(buffer[(3, 0)].symbol(), " ", "a gutter follows the action");
-        assert_eq!(buffer[(4, 0)].symbol(), "l", "the status follows the gutter");
+        assert_eq!(
+            buffer[(4, 0)].symbol(),
+            "l",
+            "the status follows the gutter"
+        );
     }
 
     #[test]
