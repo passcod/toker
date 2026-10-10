@@ -1584,6 +1584,41 @@ async fn a_non_streaming_request_gets_an_aggregated_message() {
 }
 
 #[tokio::test]
+async fn an_omitted_messages_stream_flag_defaults_to_a_complete_message() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("stream-default", upstream, true)).await;
+    let body = json!({
+        "model": "claude-opus-5",
+        "system": "Classify the action.",
+        "messages": [{"role": "user", "content": "Check."}],
+        "max_tokens": 64,
+        "stop_sequences": ["</block>"],
+        "thinking": {"type": "disabled"},
+    });
+
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json",
+        "Anthropic defaults an omitted stream flag to false"
+    );
+    let message: Value = response.json().await.expect("complete message JSON");
+    assert_eq!(message["type"], "message");
+    assert!(message["usage"]["input_tokens"].is_number());
+    assert!(message["usage"]["output_tokens"].is_number());
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, None);
+}
+
+#[tokio::test]
 async fn thinking_disabled_filters_codex_reasoning_from_both_response_shapes() {
     for stream in [false, true] {
         let (upstream, mock) = spawn_mock().await;

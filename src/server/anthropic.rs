@@ -231,11 +231,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // shape fields stay the PRE-transform shape's, in the same order.
     let mut gate_shape: Option<AnthropicShape> = None;
     // The client's own wants: the client's own model and
-    // whether it explicitly asked for a plain JSON Message — both read
+    // whether it expects a plain JSON Message — both read
     // BEFORE any transform, because the blocked answer renders the model
     // the client named and in the shape it asked for.
     let mut client_model: Option<String> = None;
-    let mut stream_explicitly_false = false;
+    // A body that cannot be parsed keeps the legacy SSE fallback because its
+    // requested response shape is unknowable. Every parsed request below uses
+    // the protocol default (`stream` absent means false).
+    let mut client_wants_json = false;
     // The model about to be sent upstream, for the served-model mark.
     let mut served_model: Option<String> = None;
     // The gate's meter snapshot, loaded at most once per request and only
@@ -250,9 +253,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .as_ref()
             .and_then(|request| request.model.clone())
             .or_else(|| ir.anthropic().model().map(str::to_owned));
-        stream_explicitly_false = ingress_canonical.as_ref().map_or_else(
-            || ir.anthropic().stream_explicitly_false(),
-            |request| request.stream == Some(false),
+        client_wants_json = ingress_canonical.as_ref().map_or_else(
+            || ir.anthropic().wants_json_response(),
+            |request| request.stream != Some(true),
         );
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
@@ -471,7 +474,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 &jiff::tz::TimeZone::system(),
                 server.config.notices.style_for(frontend.as_deref()),
             );
-            let rendering = if stream_explicitly_false {
+            let rendering = if client_wants_json {
                 Rendering::Json
             } else {
                 Rendering::Sse
@@ -629,7 +632,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     compact_target: None,
                     gate_on: server.config.gates.quota_enabled,
                 });
-                let rendering = if stream_explicitly_false {
+                let rendering = if client_wants_json {
                     Rendering::Json
                 } else {
                     Rendering::Sse
@@ -739,7 +742,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         &jiff::tz::TimeZone::system(),
                         server.config.notices.style_for(frontend.as_deref()),
                     );
-                    let rendering = if stream_explicitly_false {
+                    let rendering = if client_wants_json {
                         Rendering::Json
                     } else {
                         Rendering::Sse
@@ -1131,7 +1134,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 thread_id: None,
                 request_id: None,
                 served_model,
-                stream_explicitly_false,
+                client_wants_json,
                 frontend_wire: codex::CodexFrontendWire::Anthropic,
             })
             .await;

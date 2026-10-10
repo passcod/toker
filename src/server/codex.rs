@@ -72,8 +72,8 @@ pub(crate) struct CodexTurn {
     pub(crate) request_id: Option<String>,
     /// The final effective model (routing, retarget, force-newest, map).
     pub(crate) served_model: Option<String>,
-    /// Whether the client explicitly asked for a plain JSON Message.
-    pub(crate) stream_explicitly_false: bool,
+    /// Whether the frontend expects one complete JSON response rather than SSE.
+    pub(crate) client_wants_json: bool,
     pub(crate) frontend_wire: CodexFrontendWire,
 }
 
@@ -162,9 +162,9 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     };
     let backend = target.provider().clone();
     let effective_model = target.effective_model().map(str::to_owned);
-    let stream_explicitly_false = parsed
+    let client_wants_json = parsed
         .as_ref()
-        .is_some_and(|request| request.get("stream").and_then(Value::as_bool) == Some(false));
+        .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
     let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
         server: server.clone(),
         started,
@@ -211,7 +211,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "the request body could not be parsed for translation to this backend",
-                !stream_explicitly_false,
+                !client_wants_json,
             );
         };
         return super::anthropic_target::turn(
@@ -242,7 +242,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "the request body could not be parsed for translation to this backend",
-                !stream_explicitly_false,
+                !client_wants_json,
             );
         };
         return super::openrouter_responses::turn(
@@ -270,7 +270,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         thread_id,
         request_id,
         served_model: effective_model,
-        stream_explicitly_false,
+        client_wants_json,
         frontend_wire: CodexFrontendWire::OpenAiResponses,
     })
     .await
@@ -289,7 +289,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         thread_id,
         request_id,
         served_model,
-        stream_explicitly_false,
+        client_wants_json,
         frontend_wire,
     } = args;
 
@@ -307,7 +307,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "the request body could not be parsed for translation to this backend",
-            !stream_explicitly_false,
+            !client_wants_json,
         );
     };
     let response_projection = canonical
@@ -348,7 +348,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                 status,
                 "invalid_request_error",
                 &message,
-                !stream_explicitly_false,
+                !client_wants_json,
             );
         }
     };
@@ -447,16 +447,10 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
                 frontend_wire.protocol(),
             );
         }
-        return frontend_error_response(
-            frontend_wire,
-            status,
-            kind,
-            &message,
-            !stream_explicitly_false,
-        );
+        return frontend_error_response(frontend_wire, status, kind, &message, !client_wants_json);
     }
 
-    if stream_explicitly_false {
+    if client_wants_json {
         aggregated_turn(
             record,
             in_flight,

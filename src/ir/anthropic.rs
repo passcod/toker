@@ -137,13 +137,12 @@ impl<'a> AnthropicBody<'a> {
         self.request.value.get("stream") == Some(&Value::Bool(true))
     }
 
-    /// `stream` is **explicitly** `false`
-    /// (`parsed?.stream === false`). Not the
-    /// negation of [`AnthropicBody::stream`]: a client that omitted the
-    /// field cannot be assumed to parse a plain JSON body, so the gates
-    /// answer everyone else with the SSE turn.
-    pub fn stream_explicitly_false(&self) -> bool {
-        self.request.value.get("stream") == Some(&Value::Bool(false))
+    /// Whether the Messages response must be a complete JSON object.
+    /// Anthropic defines `stream` as false when omitted, so only an explicit
+    /// `true` asks for SSE. A non-boolean value also reads as the default here;
+    /// schema validation, where required, is a separate concern.
+    pub fn wants_json_response(&self) -> bool {
+        !self.stream()
     }
 
     /// The `system` field, which the Messages API accepts as a plain string
@@ -1723,30 +1722,29 @@ mod tests {
     // ── stream flag semantics ───────────────────────────────────────────
 
     #[test]
-    fn stream_true_and_explicitly_false_are_distinct_from_an_omitted_field() {
-        // `streamFalse` is
-        // `stream === false` — only an explicit false. The gates use it to
-        // pick the synthetic turn's rendering: a client that omitted the
-        // field gets SSE, not a JSON body it may not parse.
+    fn only_stream_true_requests_an_sse_response() {
         let request = parse(br#"{"model":"m","messages":[],"stream":true}"#);
         let view = request.anthropic();
         assert!(view.stream());
-        assert!(!view.stream_explicitly_false());
+        assert!(!view.wants_json_response());
 
         let request = parse(br#"{"model":"m","messages":[],"stream":false}"#);
         let view = request.anthropic();
         assert!(!view.stream());
-        assert!(view.stream_explicitly_false());
+        assert!(view.wants_json_response());
 
         let request = parse(br#"{"model":"m","messages":[]}"#);
         let view = request.anthropic();
         assert!(!view.stream());
-        assert!(!view.stream_explicitly_false(), "omitted is not false");
+        assert!(view.wants_json_response(), "omitted defaults to false");
 
         let request = parse(br#"{"model":"m","messages":[],"stream":"no"}"#);
         let view = request.anthropic();
         assert!(!view.stream());
-        assert!(!view.stream_explicitly_false(), "a non-bool is not false");
+        assert!(
+            view.wants_json_response(),
+            "a non-bool does not request SSE"
+        );
     }
 
     #[test]

@@ -2020,9 +2020,8 @@ fn poison_meters(store: &Store, util5h: f64, offset_secs: i64) -> (i64, Value) {
     (reset5h, snapshot)
 }
 
-/// A Messages body without a `stream` field — the shape that must be
-/// answered with the SSE turn, since a client that omitted the field
-/// cannot be assumed to parse a plain JSON body.
+/// A Messages body without a `stream` field. Anthropic defines omission as
+/// non-streaming, so responses to this shape are complete JSON Messages.
 fn messages_body_no_stream(model: &str) -> Vec<u8> {
     format!(r#"{{"model":"{model}","messages":[{{"role":"user","content":"Hi"}}]}}"#).into_bytes()
 }
@@ -2041,13 +2040,13 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     let (reset5h, snapshot) = poison_meters(&store, 1.0, 3600);
 
-    // `stream` omitted → the SSE turn. The notice names the meter, the
+    // `stream` omitted → the JSON turn. The notice names the meter, the
     // reset (in the local zone, the same one the server renders in), and
     // the resume path; the turn carries the model the client asked for.
     let body = messages_body_no_stream("claude-opus-5");
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
     assert_eq!(response.status(), StatusCode::OK, "never an error status");
-    assert_eq!(content_type(&response), "text/event-stream");
+    assert_eq!(content_type(&response), "application/json");
     let bytes = response.bytes().await.expect("blocked bytes");
     let tz = jiff::tz::TimeZone::system();
     // GatesConfig::default() above → the notice renders in the default
@@ -2061,11 +2060,11 @@ async fn a_spent_meter_blocks_with_a_synthetic_200_and_never_reaches_upstream() 
         &tz,
         NoticeStyle::Gfm,
     );
-    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Json);
     assert_eq!(
         bytes.as_ref(),
         expected.as_slice(),
-        "the synthetic SSE turn, the exact event shape"
+        "the synthetic JSON turn, byte for byte"
     );
 
     // Upstream NEVER hit: the gate is the only thing that may stop a
@@ -2178,7 +2177,7 @@ async fn a_block_states_the_size_of_the_session_s_largest_lane() {
         NoticeStyle::Gfm,
     );
     assert!(notice.contains("This session's context is 412,345 tokens."));
-    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+    let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Json);
     assert_eq!(bytes.as_ref(), expected.as_slice());
     assert!(mock.captured().is_empty());
 
@@ -2262,7 +2261,7 @@ async fn the_notice_style_follows_the_frontend_prefix() {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let bytes = response.bytes().await.expect("blocked bytes");
         let notice = Blocking::notice(Meter::FiveHour, Some(reset5h), false, None, &tz, style);
-        let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Sse);
+        let expected = Blocking::blocked_turn(&notice, Some("claude-opus-5"), Rendering::Json);
         assert_eq!(
             bytes.as_ref(),
             expected.as_slice(),
