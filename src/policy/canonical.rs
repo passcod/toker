@@ -875,6 +875,7 @@ mod tests {
         first.alias_policy = Some(AliasPolicy {
             rules: vec![AliasRule {
                 matcher: MatcherSpec::Exact("old".to_owned()),
+                exclude: vec![],
                 replacement: "new".to_owned(),
             }],
         });

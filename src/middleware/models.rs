@@ -765,6 +765,14 @@ impl ModelStore {
         ))
     }
 
+    /// Read one exact learned entry without mutating the legacy table.
+    pub fn learned_entry(&self, model: &str) -> crate::store::Result<Option<ModelEntry>> {
+        let Some(model) = model_identity(model) else {
+            return Ok(None);
+        };
+        self.store.load_model(&model)
+    }
+
     /// Every exact identity the store has learned, sorted (for the
     /// control endpoint's "what is known" reply).
     pub fn known_models(&self) -> crate::store::Result<Vec<String>> {

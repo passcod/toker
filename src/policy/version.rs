@@ -20,8 +20,18 @@ pub enum DateFormat {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VersionParserSpec {
     Semver,
-    Date { format: DateFormat },
-    NumericTuple { components: u8, separator: String },
+    Date {
+        format: DateFormat,
+    },
+    NumericTuple {
+        components: u8,
+        separator: String,
+    },
+    /// Revision-one compatibility for the legacy family parser, whose
+    /// numeric suffix has one to eight components.
+    LegacyNumericTuple {
+        separator: String,
+    },
 }
 
 impl VersionParserSpec {
@@ -39,6 +49,9 @@ impl VersionParserSpec {
                 separator,
             } => NumericVersion::parse(value, *components, separator)
                 .map(ParsedVersion::NumericTuple),
+            Self::LegacyNumericTuple { separator } => {
+                NumericVersion::parse_variable(value, separator).map(ParsedVersion::NumericTuple)
+            }
         }
     }
 
@@ -52,7 +65,9 @@ impl VersionParserSpec {
             {
                 Err(VersionError::ComponentCount)
             }
-            Self::NumericTuple { separator, .. } if separator.is_empty() => {
+            Self::NumericTuple { separator, .. } | Self::LegacyNumericTuple { separator }
+                if separator.is_empty() =>
+            {
                 Err(VersionError::EmptySeparator)
             }
             _ => Ok(()),
@@ -148,6 +163,21 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
 pub struct NumericVersion(Vec<u64>);
 
 impl NumericVersion {
+    fn parse_variable(value: &str, separator: &str) -> Result<Self, VersionError> {
+        if separator.is_empty() {
+            return Err(VersionError::EmptySeparator);
+        }
+        let values: Vec<u64> = value
+            .split(separator)
+            .map(parse_digits)
+            .collect::<Result<_, _>>()?;
+        if values.is_empty() || values.len() > usize::from(VersionParserSpec::MAX_TUPLE_COMPONENTS)
+        {
+            return Err(VersionError::ComponentCount);
+        }
+        Ok(Self(values))
+    }
+
     fn parse(value: &str, components: u8, separator: &str) -> Result<Self, VersionError> {
         if !(VersionParserSpec::MIN_TUPLE_COMPONENTS..=VersionParserSpec::MAX_TUPLE_COMPONENTS)
             .contains(&components)
@@ -174,7 +204,7 @@ impl NumericVersion {
 
 impl PartialOrd for NumericVersion {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        (self.0.len() == other.0.len()).then(|| self.0.cmp(&other.0))
+        Some(self.0.cmp(&other.0))
     }
 }
 
@@ -257,6 +287,24 @@ mod tests {
         assert_eq!(
             parser.parse("2.18446744073709551616.0"),
             Err(VersionError::Overflow)
+        );
+    }
+
+    #[test]
+    fn revision_one_variable_tuples_preserve_legacy_segment_order() {
+        let parser = VersionParserSpec::LegacyNumericTuple {
+            separator: "-".to_owned(),
+        };
+        assert!(parser.validate().is_ok());
+        assert!(parser.parse("5").unwrap() > parser.parse("4-8").unwrap());
+        assert!(parser.parse("5-1").unwrap() > parser.parse("5").unwrap());
+        assert_eq!(parser.parse(""), Err(VersionError::Malformed));
+        assert_eq!(
+            VersionParserSpec::LegacyNumericTuple {
+                separator: String::new(),
+            }
+            .validate(),
+            Err(VersionError::EmptySeparator)
         );
     }
 

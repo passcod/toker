@@ -340,7 +340,7 @@ fn unique_ids<T: Identified>(items: &[T], path: &str) -> Result<(), DocumentErro
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrontendProtocol {
     AnthropicMessages,
@@ -366,7 +366,7 @@ pub enum FrontendScope {
 pub struct RouteReference {
     pub route_id: RouteId,
     #[serde(default)]
-    pub parameters: BTreeMap<StableId, String>,
+    pub parameters: BTreeMap<StableId, ArgumentBinding>,
 }
 
 impl RouteReference {
@@ -375,10 +375,33 @@ impl RouteReference {
         if self.parameters.len() > MAX_ROUTE_PARAMETERS {
             return Err(DocumentError::CollectionTooLarge(parameters_path));
         }
-        for (parameter, value) in &self.parameters {
-            check_string(value, &keyed(&parameters_path, parameter.as_str()))?;
+        for (parameter, binding) in &self.parameters {
+            binding.validate(&keyed(&parameters_path, parameter.as_str()))?;
         }
         Ok(())
+    }
+}
+
+/// One typed source for a declared route parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArgumentBinding {
+    Literal { value: String },
+    RequestedModel,
+    RegexCaptureName { name: String },
+    RegexCaptureIndex { index: u32 },
+}
+
+impl ArgumentBinding {
+    fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        match self {
+            Self::Literal { value } => check_string(value, &field(path, "value")),
+            Self::RegexCaptureName { name } => check_string(name, &field(path, "name")),
+            Self::RegexCaptureIndex { index: 0 } => {
+                Err(DocumentError::InvalidValue(field(path, "index")))
+            }
+            Self::RequestedModel | Self::RegexCaptureIndex { .. } => Ok(()),
+        }
     }
 }
 
@@ -489,6 +512,8 @@ pub enum AdapterMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfferSelector {
+    /// Restrict selection to one stable backend namespace.
+    pub binding_id: BindingId,
     #[serde(default)]
     pub include: Vec<MatcherSpec>,
     #[serde(default)]
@@ -726,6 +751,11 @@ impl AliasPolicy {
         for (index, rule) in self.rules.iter().enumerate() {
             let rule_path = indexed(&rules_path, index);
             check_matcher(&rule.matcher, &field(&rule_path, "matcher"))?;
+            let exclude_path = field(&rule_path, "exclude");
+            check_collection(&rule.exclude, &exclude_path)?;
+            for (exclude_index, matcher) in rule.exclude.iter().enumerate() {
+                check_matcher(matcher, &indexed(&exclude_path, exclude_index))?;
+            }
             check_template(&rule.replacement, &field(&rule_path, "replacement"))?;
         }
         Ok(())
@@ -736,6 +766,8 @@ impl AliasPolicy {
 #[serde(deny_unknown_fields)]
 pub struct AliasRule {
     pub matcher: MatcherSpec,
+    #[serde(default)]
+    pub exclude: Vec<MatcherSpec>,
     pub replacement: String,
 }
 
@@ -886,7 +918,9 @@ impl FamilyClassifier {
         check_matcher(&self.model_matcher, &field(path, "model_matcher"))?;
         check_template(&self.family_template, &field(path, "family_template"))?;
         check_template(&self.version_template, &field(path, "version_template"))?;
-        if let VersionParserSpec::NumericTuple { separator, .. } = &self.version_parser {
+        if let VersionParserSpec::NumericTuple { separator, .. }
+        | VersionParserSpec::LegacyNumericTuple { separator } = &self.version_parser
+        {
             check_string(
                 separator,
                 &field(&field(path, "version_parser"), "separator"),
