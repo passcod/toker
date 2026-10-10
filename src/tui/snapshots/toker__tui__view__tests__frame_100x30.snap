@@ -2,7 +2,7 @@
 source: src/tui/view.rs
 expression: "rows.join(\"\\n\")"
 ---
-last 30m · 2 sessions · 38 requests                                      last req no data · 12:34:56
+ ?  last 30m · 2 sessions · 38 requests                                  last req no data · 12:34:56
 ┌SESSIONS──────────────────────────────────────────────────────────────────────────────────────────┐
 │session                                   ctx model        reqs prompt now    peak msgs ↺ out idle│
 │-                                           ? z-ai/glm-5.3    1          ?       ?    - -   ?  45s│
