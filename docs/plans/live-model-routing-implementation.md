@@ -32,7 +32,16 @@ This gives named frontends local overrides while allowing new or hand-written
 frontend prefixes to inherit a useful protocol policy.
 
 The unprefixed frontend is a real profile named `unprefixed`; it does not
-silently borrow the policy of a named frontend.
+silently borrow the policy of a named frontend. Defaults use the same scope and
+precedence: an exact profile default wins before the protocol default.
+
+### Stable binding identity
+
+A binding is a closed static-topology identity with the stable spelling
+`<provider-id>.<dialect-id>`, for example
+`openrouter.openrouter_messages` and `codex_sub.codex_responses`. It is not the
+provider id and not a frontend-to-binding route. Policy, inventory, learning,
+health, pin, and ledger references all use this identity.
 
 ### Draft and activation ownership
 
@@ -56,8 +65,14 @@ therefore do not get reinterpreted through the current policy.
 Policy matchers are exact strings, globs, or Rust regular expressions. Globs
 use `globset`. Regular expressions use the Rust `regex` crate, added with
 `cargo add` when the matcher compiler lands. Only regular expressions expose
-captures. Templates use `${name}` and `${1}` placeholders and are rejected if
-they reference a capture their matcher does not define.
+captures. Transparent requested-model rewrites use only these matcher kinds;
+binding-local family classifiers run after candidate selection.
+
+Routes declare their parameters. `requested_model` is a reserved explicit
+parameter. Templates use `${name}` and `${1}` placeholders and are rejected if
+they reference neither a declared route parameter nor a capture supplied by the
+referencing regular expression. Every presentation, rewrite, and default route
+reference must supply the route's required parameters.
 
 Rewrite priorities are integers unique within a frontend scope. Profile rules
 run before protocol rules. This makes overlap intentional and removes any need
@@ -89,7 +104,7 @@ catalogue is `unknown`, so it cannot remove a candidate.
 Provider bindings declare a cost class:
 
 - `subscription` for `anthropic_sub` and `codex_sub`;
-- `billed` for `anthropic_api` and `openrouter`;
+- `billed` for `anthropic_api`, `openai_api`, and `openrouter`;
 - `unknown` for a future binding whose cost semantics are not verified.
 
 A route's fallback edge, not merely its destination candidate, grants or
@@ -98,17 +113,29 @@ fallback alike. A route that would cross that boundary without an explicit
 grant is invalid.
 
 Health circuits are policy data. Each candidate may map a classified failure
-to a circuit duration. No implicit duration is guessed. A successful attempt,
-a policy activation, or a relevant credential/catalogue generation change
-clears the matching circuit.
+to a circuit duration. No implicit duration is guessed. A circuit key contains
+the captured policy revision, route and candidate, binding, concrete model, and
+failure class. A matching successful attempt, policy activation, or relevant
+credential/catalogue generation change clears the affected circuit.
+Request-specific validation failures never open shared circuits.
+
+Credential availability is evaluated for each request and attempt as passing
+native, held, refreshable, known missing or expired, or unknown until attempt.
+Traces retain only that state. Every attempt builds a fresh safe header map from
+named frontend inputs before the destination provider strips foreign credentials
+and injects its own; no attempt reuses another candidate's outgoing headers.
 
 ### Response commitment
 
 Fallback is possible only before the frontend response head is committed.
-For a streaming attempt, the backend adapter retains the upstream head and
-enough of the stream to classify an immediate provider error or the first
-canonical event. Once the frontend head or any body bytes are emitted, the
-attempt is committed and no later failure can select another candidate.
+For a streaming attempt, the backend adapter retains the upstream head and no
+more than the fixed precommit byte cap while classifying a complete immediate
+provider error or the first canonical event. It commits on an accepted canonical
+event, any other valid first frame, or reaching the cap. SSE comments and
+keepalives do not commit unless retaining them reaches the cap. A client
+disconnect cancels the attempt rather than falling back. Once the frontend head
+or any body bytes are emitted, the attempt is committed and no later failure
+can select another candidate.
 
 `ambiguous_transport` is distinct from a transport failure proven to have
 happened before the request was accepted. It is never enabled by migration and
@@ -125,9 +152,11 @@ than being filled from the effective target for display purposes.
 Frontend renderers receive the exact requested identity in addition to the
 accepted canonical response and use it for every response model echo. They do
 not expose the effective target merely because a rewrite, virtual presentation,
-upgrade, or fallback selected a differently named backend model. Internal
-learning and served-model tracking continue to use the reported identity when
-present and the effective target only where an internal fallback is required.
+upgrade, or fallback selected a differently named backend model.
+Recently-sent cache evidence uses the effective target and is marked before the
+send. Learned days, prompt ceilings, pricing identity, and context evidence
+require a completed provider-reported identity. A missing reported identity is
+never synthesized from the effective target for learning or display.
 
 ### Session lineage
 
@@ -205,16 +234,24 @@ never as evidence that one model is newer.
 
 ### Routes and edges
 
-A route contains ordered candidates and an edge between each adjacent pair.
-A route also has a display name and its lane transition policy. A candidate
-has:
+A route contains declared parameters, ordered candidates, and an edge between
+each adjacent pair. A route also has a display name and its lane transition
+policy. A candidate has:
 
 - stable candidate id;
 - binding id;
-- exact model, requested model, capture template, or offer selector;
+- exact model, requested-model parameter, parameter template, or single-winner
+  offer selector;
 - optional upgrade-policy id;
-- required capability additions;
+- optional binding-local alias-policy id, applied after upgrading;
+- hard capability requirements whose loss would invalidate the route;
 - enabled state.
+
+Presentation selectors may retain several offers; a route candidate selector
+must select exactly one winner by its declared order. A stale inventory with a
+previous winner supplies unknown availability; stale or absent inventory with
+no winner is unresolved and cannot be skipped as positively unavailable. Only
+a fresh catalogue's positive miss is unavailable.
 
 An edge has:
 
@@ -248,9 +285,10 @@ edited policies use binding-scoped learning.
 
 ### Defaults and rewrites
 
-A protocol default is a route id scoped to a frontend protocol. It is the final
-compatibility route for an unmatched bare name and may use the requested model
-as a candidate template.
+A default is a route id with a profile or protocol scope. The exact profile
+wins before the protocol default. It is the final compatibility route for an
+unmatched bare name and may supply the reserved requested-model parameter to a
+candidate template.
 
 A rewrite rule contains frontend scope, unique priority, model matcher, route
 id, and optional capture values supplied to candidate templates. Exact
@@ -279,6 +317,14 @@ The document is stored as canonical JSON because it is loaded, validated, and
 activated as one unit. Child policy records are not independently mutable, so
 normalising them into editable SQL rows would introduce partial-policy states
 without providing a query path the service needs.
+
+Canonical policy JSON rejects duplicate keys, unknown fields, non-integer
+numeric policy values, invalid UTF-8, and values above explicit document,
+collection, string, matcher, and template limits. Object keys sort
+lexicographically, semantically ordered arrays retain their order, and output is
+compact UTF-8. A fingerprint is the full SHA-256 over a versioned domain tag and
+those bytes. A route fingerprint covers its transitive semantic dependencies
+but excludes display text and current inventory winners.
 
 ### `routing_policy_state`
 
@@ -331,9 +377,12 @@ Extend `lanes` with nullable:
 - baseline model;
 - effective model.
 
-Old rows remain unpinned and acquire a pin only after the active policy serves
-a response. A pin moves on a permitted activation transition or successful
-fallback, never merely because catalogue or health state changed.
+Old rows are seeded or conservatively preserved during cutover rather than
+being treated as new merely because they lack policy columns. A pin moves on a
+permitted activation transition or successful fallback, never merely because
+catalogue or health state changed. Pin writes use compare-and-swap: the first
+successful concurrent request to pin an unpinned lane wins, and an old-revision
+completion cannot restore an old pin after an activation transition.
 
 ### Ledger provenance
 
@@ -359,10 +408,16 @@ Also add nullable content-free session lineage fields:
 The existing session id remains the raw wire identity used by lanes and prompt
 caches. Parent aggregation is a read-model concern and never rewrites it.
 
-Every upstream attempt gets its own ledger row and cost semantics. The trace
-contains only ids, classifications, availability states, and reason codes.
-Preflight skips ride on the first attempted row or the local terminal row. The
-existing requested and effective model columns retain their current meanings.
+Every upstream attempt gets its own ledger row and cost semantics. Attempt
+groups use an opaque unique id and zero-based indices for actual sends. The
+trace contains only ids, classifications, availability states, and reason codes.
+Preflight skips ride on the first attempted row or the local terminal row; a
+preflight-only `route-unavailable` row has a group id and no attempt index.
+Logical-request views group by attempt id, while cost, meters, errors, quota
+fitting, and model learning consume the relevant attempt evidence. The
+same-candidate `thinking: disabled` negotiation retry is an attempt in the same
+group. The existing requested and effective model columns retain their current
+meanings.
 `raw_model` remains the provider-reported wire identity. Operational views
 labelled `reported` read that field and show absence as `-`; the normalised
 `model` fallback remains available only to internal served-model and learning
@@ -433,6 +488,22 @@ is accepted only when all entries select one batch-capable binding; it has no
 cross-binding post-send fallback. An unmatched model-free Anthropic path uses
 the active protocol default's binding and retains transparent forwarding.
 These paths do not retain a legacy model-map or bootstrap-default escape hatch.
+
+### Gate and transformation order
+
+Resolution chooses the initial or pinned candidate before the existing gates.
+Local quota exhaustion remains a gate and cannot make a subscription candidate
+fall through to billed service. The cold decision is based on the selected
+cache identity. A cold compaction may then select the policy's explicit
+compaction route and apply the separately licensed cache/system transforms.
+Upgrade and candidate-local aliasing produce the effective first attempt.
+Fallback does not rerun a gate notice.
+
+The existing `thinking: disabled` negotiation retry runs once on the same
+candidate before route fallback. It saves meter evidence, records its own
+attempt, and the expected `between_tools` refusal does not open a health
+circuit. If that retry also fails, its result enters ordinary failure
+classification.
 
 ### Resolution
 
@@ -603,13 +674,28 @@ chosen activation scope before confirmation.
 
 ## Legacy migration and steady state
 
-At server startup, an absent active revision triggers one legacy compilation
-and activation transaction. The compiler consumes:
+Before policy persistence or authority lands, startup compiles the legacy
+configuration in memory and runs the final pure resolver in shadow mode. The
+legacy path remains authoritative for bodies, providers, credentials, gates,
+responses, lanes, and recording. Shadow comparison stores nothing and may emit
+only content-free stable ids, model identities, and reason codes. It cannot
+render or send an alternate request, and any compilation, comparison, or
+observer failure is swallowed without changing the client result. Unexplained
+mismatches across defaults, prefixes, aliases, model maps, picker expansion,
+force-newest, and compaction block cutover.
+
+At the first all-policy runtime cutover, an absent active revision triggers one
+legacy compilation and activation transaction. The ownership marker is written
+only in that transaction, never by an earlier schema-aware binary. A corrupt or
+unsupported active policy fails startup rather than reverting to TOML. The
+compiler consumes:
 
 - protocol defaults from `Config`;
 - every provider model map;
 - configured or built-in OpenRouter picker rules;
 - the force-newest gate;
+- `compact_model` as a generated compaction route;
+- provider model maps as generated candidate-local alias policies;
 - the existing family behavior as explicit generated classifiers.
 
 The generated document reproduces provider-prefix routing, protocol aliases,
@@ -652,124 +738,131 @@ moves.
 ### 1. Policy vocabulary and canonical documents
 
 Add `src/policy/document.rs`, `matcher.rs`, `version.rs`, and shared ids,
-frontend scopes, binding ids, capability flags, candidate edges, and
-diagnostics. Add canonical JSON rendering and semantic fingerprints. Make
-protocol, dialect, and adapter identities serialisable with their existing
-stable spellings.
+frontend scopes, binding ids, capability flags, candidate edges, alias policies,
+compaction policy, and diagnostics. Add bounded canonical JSON rendering and
+semantic fingerprints. Make protocol, dialect, and adapter identities
+serialisable with their existing stable spellings.
 
-### 2. Policy persistence and binding-scoped state
-
-Add the policy, publication, binding-learning, lane-pin, and ledger-provenance
-schema. Add transactional store methods for draft compare-and-swap,
-activation, revision loading, publication status, and binding-scoped learning.
-Add content-free session-lineage columns and reads in the same schema change,
-while retaining raw session ids as lane keys. Keep policy writes out of the
-insert-only ledger path.
-
-### 3. Route topology and canonical offer inventory
+### 2. Route topology and canonical offer inventory
 
 Give every implemented provider binding a stable id, cost class, capability
 set, and configured-state lookup. Refactor `RouteRegistry` into topology and
 provider lookup. Refactor `catalog::offers` to emit canonical backend offers
 without frontend aliases.
 
-### 4. Matcher, classifier, selector, and compiler
+### 3. Matcher, classifier, selector, and compiler
 
 Compile policy documents into indexed matchers, structured versions, expanded
-presentations, candidate chains, and route fingerprints. Produce structured
-diagnostics for every invalid reference or unsafe transition. Keep compilation
-independent of live provider availability.
+presentations, candidate chains, alias policies, compaction routes, and route
+fingerprints. Produce structured diagnostics for every invalid reference or
+unsafe transition. Keep compilation independent of live provider availability.
 
-### 5. Legacy compiler and revision-one startup
+### 4. Legacy compiler and binding-aware read interfaces
 
-Translate the loaded config and legacy family behavior into a complete policy
-document. On first policy-aware startup, persist and activate it before the
-listener begins serving inference. Load later startups strictly from the
-active database revision.
+Translate loaded config and legacy family behavior into a complete in-memory
+policy document. Add the binding-keyed learning interface the final resolver
+uses, backed temporarily by a read-only adapter over `ModelStore`; generated
+legacy policies alone may consult unattributable legacy learning. Do not write a
+policy revision or migration marker.
 
-### 6. Policy runtime and revision cache
-
-Add `PolicyRuntime` to `Server`, including active-policy capture, old-revision
-loading for pinned lanes, mutation serialization, inventory generations, and
-health-circuit state. Make catalogue refresh replace the immutable offer
-inventory and advance its generation without rebuilding or mutating an
-in-flight request's policy snapshot.
-
-### 7. Pure resolver and preview trace
+### 5. Pure resolver and shadow equivalence
 
 Implement request facts, frontend inheritance, exact presentation lookup,
-rewrite/default resolution, lane-pin selection, candidate preflight,
-binding-local upgrade selection, and content-free traces. Use the same pure
-resolver for live requests and invented previews.
+rewrite/default resolution, candidate preflight, binding-local upgrade and
+alias selection, compaction routing, and content-free traces. Use this final
+pure resolver in non-authoritative shadow comparisons on Messages, Chat,
+Responses,
+and picker projection. It may neither render nor send nor persist nor alter the
+legacy result. Unexplained differences block the next changeset.
 
-### 8. Binding-scoped learning and promotion
+### 6. Policy persistence and binding-scoped state
 
-Move observations, recently-served state, family elections, context fit, and
+Only after the document and resolver contracts pass shadow review, add the
+policy, publication, binding-learning, lane-pin, lineage, and
+ledger-provenance schema in one reviewed append-only migration. Specify all
+keys, indexes, null meanings, JSON columns, compare-and-swap and activation
+transactions, attempt-group read semantics, and startup recovery first. Add
+transactional store methods, but do not write the ownership marker or steer
+traffic yet.
+
+Move new observations, recently-sent state, family elections, context fit, and
 promotion onto binding ids and compiled classifiers. Preserve the legacy table
-only through revision-one upgrade policies. Change CLI promotion to accept a
-binding when the model is ambiguous and route the existing handover through
-the binding-aware control operation.
+only through revision-one policies. Change CLI promotion to require a binding
+when the model is ambiguous.
 
-### 9. Shared inference coordinator
+### 7. Policy runtime and revision cache
+
+Add `PolicyRuntime` to `Server`, including atomically captured policy plus offer
+inventory, old-revision loading for pinned lanes, mutation serialization,
+generations, and health circuits. Load and compile a candidate revision-one
+snapshot in shadow mode; catalogue refresh replaces an inventory `Arc` without
+mutating in-flight snapshots.
+
+### 8. Shared inference coordinator
 
 Introduce the canonical attempt coordinator and backend attempt interface.
-Move Messages, Chat, and Responses inference onto it one frontend at a time,
-removing each handler's direct registry resolution when it moves. Keep
-administrative and control paths in their protocol modules, but move
-`count_tokens`, batch model projection, and unmatched default binding lookup to
-their restricted policy-resolution paths in the same changeset.
+Move Messages, Chat, and Responses inference onto it one frontend at a time
+while retaining the legacy target decision as authority. Keep administrative
+and control paths in their protocol modules. Make renderers accept the original
+requested identity while observation retains effective and reported identities.
 
-Make every frontend renderer echo the original requested model identity while
-the coordinator records the effective and reported identities independently.
-Remove any renderer construction that substitutes the effective model into the
-frontend-visible response.
-
-### 10. Lane pins and activation scopes
+### 9. Lane pins and the common transition decision
 
 Persist successful route, candidate, binding, baseline, effective model,
-fingerprint, and revision on the lane. Apply `new lanes`, `new and cold lanes`,
-and `immediate` transitions through one decision function. Feed affected-lane
-summaries to activation preview and require the forced flag for cache-losing
-immediate moves.
+fingerprint, and revision on the lane with compare-and-swap. Seed or
+conservatively preserve existing warm lanes. Apply activation, upgrade,
+fallback, explicit user changes, and compaction through one cache-domain-aware
+transition function; an unknown binding TTL never establishes coldness.
 
-### 11. Preflight availability and cost edges
+### 10. Preflight availability and cost edges
 
-Add dynamic provider credential state, verified binding checks, capability
-requirements, fresh-catalogue absence, disabled candidates, and policy-driven
-health circuits. Walk route edges for skips and enforce billed-boundary consent
-before choosing the next candidate.
+Add request-specific credential state, verified binding checks, hard capability
+requirements, fresh-catalogue absence, disabled candidates, and keyed health
+circuits. Walk every crossed edge and enforce billed/unknown-cost and warm-cache
+consent before selecting the next candidate. Local quota exhaustion remains a
+gate and is never candidate unavailability.
 
-### 12. Post-send fallback and attempt accounting
+### 11. Post-send fallback and attempt accounting
 
-Add provider error classifiers, delayed response commitment, edge-conditioned
-retry, and fresh rendering from canonical IR. Record one ledger row per
-upstream attempt with shared attempt-group provenance and pin a successful
-fallback target for later lane turns.
+Add provider error classifiers, bounded delayed commitment, edge-conditioned
+retry, and fresh body/header construction from canonical inputs. Record one row
+per actual attempt with group provenance, including the same-candidate thinking
+negotiation retry, and pin a successful fallback target.
+
+### 12. Atomic revision-one cutover
+
+After shadow equivalence covers every inference and administrative model path,
+activate revision one and the database ownership marker in one transaction,
+atomically publish the compiled runtime snapshot, and switch target authority.
+Move `count_tokens`, batch model projection, unmatched default binding lookup,
+model maps, force-newest, and compaction model selection in this cutover so no
+path keeps a bootstrap-default escape hatch. Update invariant 6 concurrently.
+A corrupt or unsupported active policy fails startup rather than falling back.
 
 ### 13. Active-policy model publication
 
 Render Chat and Responses model lists from active presentations and current
 inventory. Add safe virtual metadata and unavailable-inventory distinctions.
-Move Claude settings reconciliation into the shared publication adapter and
-persist desired/applied revision state.
+Move Claude settings reconciliation into the shared publication adapter, use
+last-applied identities for ownership/collision checks, and persist
+desired/applied revision state.
 
 ### 14. Routing control surface
 
 Add snapshot, draft replace/patch, validation, preview, activation, revision,
-reactivation, and binding-aware promotion endpoints. Apply control gates,
-content-type checks, body limits, optimistic generations, and structured
-diagnostics consistently.
+reactivation, and binding-aware promotion endpoints. Apply operation-specific
+control gates to reads and writes, content-type checks, body limits, optimistic
+generations, and structured diagnostics; add no browser-preflight route.
 
 ### 15. TUI page framework and read-only routing views
 
-Add the page enum, routing header action, control client, routing state, and
-the four master/detail views. Preserve the dashboard's cadence and overlay
-behavior while routing data refreshes on its own generation.
+Add the page enum, routing header action, control client, routing state, and the
+four master/detail views. Preserve the dashboard's cadence and overlay behavior
+while routing data refreshes independently.
 
-Update the operational dashboard read model in this changeset as well: group
-only explicitly linked child sessions, resolve their parent labels, retain
-separate child lanes, and make `reported` use `raw_model` without an effective
-model fallback.
+Update the operational dashboard read model in this changeset too: group only
+explicitly linked child sessions, resolve parent labels, retain separate child
+lanes, and make `reported` use `raw_model` without an effective fallback.
 
 ### 16. TUI editing, preview, and activation
 
@@ -780,17 +873,18 @@ after successful activation without coupling its failure to server policy.
 
 ### 17. Setup ownership and explicit legacy import
 
-Teach setup to detect active database ownership, stop generating new
-operational routing fields, and retain bootstrap provider configuration. Add
-the TUI legacy-import action and update the periodic picker unit to reconcile
-the active presentation policy.
+Teach setup to recover the specified config/database activation transaction,
+detect active database ownership, stop generating new operational routing
+fields, and retain bootstrap provider configuration. Add explicit
+import-to-draft and update the periodic picker unit to reconcile active policy.
 
 ### 18. Remove superseded runtime machinery and document internals
 
-Remove the old model-map, default/prefix, hard-coded family, force-newest, and
+Remove old model-map, default/prefix, hard-coded family, force-newest, and
 picker runtime paths after their callers have moved. Document the final policy
-lifecycle, resolver, fallback commitment point, lane pins, publication
-adapters, control operations, and migration behavior under `docs/internals/`.
+lifecycle, resolver, fallback commitment, lane/cache domains, attempt read
+models, publication ownership, control operations, lineage evidence, and
+migration recovery under `docs/internals/`.
 
 Re-read this plan and the design plan against the resulting implementation.
 When every promised implementation item is present or has been consciously

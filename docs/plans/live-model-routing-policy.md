@@ -104,10 +104,13 @@ structural convention. Parent grouping is for TUI attribution and aggregate
 accounting only. It never merges lane state, prompt-cache keys, allowances, or
 cache-safety decisions.
 
-Codex guardian requests use the verified `guardian:<session-id>` convention.
-Record them as `guardian` children of the suffix session, retain the complete
-raw id, resolve their display label through the parent transcript, and show
-their usage in the parent's aggregate with a child-role breakdown.
+On the known `codex` Responses profile, Codex guardian requests use the
+configured raw session header and the exact verified
+`guardian:<non-empty-session-id>` convention. Record them as `guardian` children
+of the suffix session, retain the complete raw id, reject malformed, self, and
+cyclic relations, resolve their display label through the parent transcript,
+and show their usage in the parent's aggregate with a child-role breakdown. A
+parent without a ledger row is retained for later display resolution.
 
 Claude Code action-classifier calls already carry the originating session id
 and require no synthetic link. Current Claude side queries instead carry a
@@ -123,6 +126,26 @@ unless the wire also supplies a verifiable relation.
 Store immutable activated revisions plus one mutable draft in SQLite. Normal
 service startup reads the active revision before serving inference traffic.
 One activation transaction validates and promotes the complete draft.
+
+### Stable identities and documents
+
+A backend binding is a closed topology identity, distinct from a provider and
+from a frontend-to-binding route. Its stable spelling is
+`<provider-id>.<dialect-id>`, for example
+`openrouter.openrouter_messages` or `codex_sub.codex_responses`. Renaming a
+binding is a policy migration, not a display change.
+
+Policy JSON is typed and rejects duplicate keys, unknown fields, non-integer
+numeric policy values, invalid UTF-8, and documents above its declared size and
+collection limits. Its canonical encoding sorts object keys lexicographically,
+preserves the semantic order of arrays, and emits compact UTF-8. A fingerprint
+is the full SHA-256 of a versioned domain tag followed by those canonical bytes.
+
+A route fingerprint covers the transitive semantic closure of its candidates,
+edges, alias and upgrade policies, classifiers, capability requirements, and
+lane-transition policy. Labels, descriptions, current inventory winners, and
+other display data do not participate. The exact model selected from inventory
+is pinned separately.
 
 ### Policy revisions
 
@@ -156,15 +179,29 @@ catalogue chronology, never lexical guessing.
 
 ### Routes and candidates
 
-A route has a stable id, display name, ordered candidates, and lane transition
-policy. Each candidate carries:
+A route has a stable id, display name, declared parameters, ordered candidates,
+and lane transition policy. `requested_model` is an explicit reserved parameter,
+not an ambient matcher capture. Every presentation, rewrite, or default that
+references a route must supply all of its other parameters. Candidate templates
+may reference only declared parameters.
+
+Each candidate carries:
 
 - backend binding;
-- exact model or offer selector;
+- exact model, parameter template, or single-winner offer selector;
 - optional upgrade policy;
-- required request capabilities;
+- optional binding-local alias policy applied after upgrading;
+- hard request capabilities whose loss would make the route invalid;
 - classified fallback conditions;
-- whether falling to it crosses a cost boundary that needs explicit consent.
+- whether falling to it crosses a cost or live-cache boundary that needs
+  explicit consent.
+
+A candidate selector chooses exactly one winner by its declared order.
+Presentation selectors may keep several offers. An absent or stale inventory
+with no winner is unresolved, not positive evidence for fallback; only a fresh
+catalogue positively missing a target makes it unavailable. Existing deliberate
+lossy canonical translations remain recorded by `TranslationReport` and are
+not converted into hard capability failures.
 
 Presentation records and transparent rewrite rules both reference routes. This
 keeps fallback behavior in one place and prevents a picker entry from silently
@@ -176,9 +213,11 @@ An ordered rewrite rule matches:
 
 - frontend identity;
 - frontend protocol;
-- requested model by exact value, glob, or configured family classifier.
+- requested model by exact value, glob, or regular expression.
 
-It resolves to a route and may supply captures to a candidate's model template.
+Backend-local family classification happens only after a binding is selected;
+it is not meaningful in the frontend requested-model namespace. A rewrite
+resolves to a route and may supply captures to a candidate's model template.
 Rules therefore choose the backend as well as the rewritten model. A model
 string rewrite that leaves backend selection to a protocol default is not a
 complete rule.
@@ -188,9 +227,11 @@ General rules handle frontend-owned names that were never presented, including
 Claude Code side calls. Ambiguous rules at the same priority are validation
 errors rather than first-match accidents.
 
-Protocol defaults remain a final compatibility fallback for unmatched bare
-names. The TUI shows them alongside policy rules, but a presented or virtual
-model never relies on one implicitly.
+Defaults remain a final compatibility fallback for unmatched bare names. They
+use the same profile-or-protocol scope as other policy items: an exact profile
+default wins, then a protocol default, and the unprefixed listener is the
+explicit `unprefixed` profile. The TUI shows defaults alongside policy rules,
+but a presented or virtual model never relies on one implicitly.
 
 ### Family classifiers and versions
 
@@ -248,14 +289,23 @@ Positive preflight evidence of unavailability includes:
 A stale or absent catalogue is unknown, not proof that a target is absent.
 
 Each candidate declares its post-send fallback conditions. Initially support
-explicit provider authentication failure, model-not-found, rate limit, quota,
-overload, server error, and transport failure before response bytes. Keep
-ambiguous transport failure distinct because the provider may already have
-accepted and billed the request. Never retry another candidate after any
-response byte has crossed to the frontend.
+explicit provider authentication failure, model-not-found, rate limit, provider
+quota, overload, server error, and transport failure before response commitment.
+The local quota gate is not candidate unavailability and never silently falls
+through to billed service. Keep ambiguous transport failure distinct because
+the provider may already have accepted and billed the request.
 
-Crossing from a subscription to a billed API or router is a cost boundary. The
-policy must opt into such a fallback explicitly, and the TUI marks it before
+For a streaming attempt, retain the upstream response head and at most the
+policy's fixed precommit byte cap while classifying a complete immediate error
+or the first canonical event. Commit on the first accepted canonical event, on
+any other valid first frame, or when the cap is reached. A client disconnect
+cancels the attempt rather than selecting another candidate. Never retry after
+the frontend response head or any body byte is committed.
+
+Crossing from a subscription to a billed or unknown-cost API or router is a
+cost boundary. `anthropic_sub` and `codex_sub` are subscription bindings;
+`anthropic_api`, `openai_api`, and `openrouter` are billed bindings. The policy
+must opt into such a fallback explicitly, and the TUI marks it before
 activation.
 
 Record attempted candidates and classified outcomes without storing provider
@@ -283,9 +333,18 @@ itself. A mid-session fallback pins the replacement candidate for later turns.
 When the move crosses providers, compatible opaque replay rules still apply;
 the fallback mechanism does not make foreign encrypted reasoning usable.
 
-The existing cache rule remains authoritative: a model transition happens only
-when no cache can be lost or the activation explicitly forces it. Forced
-activation is recorded as such.
+One transition decision governs activation, upgrade, fallback, an explicit user
+model change, and compaction. The lane key remains raw session id plus tools
+hash; cache identity additionally contains the binding and effective model.
+Binding-specific verified TTL evidence determines coldness, and an unknown TTL
+is never treated as cold. A warm cache-losing move requires consent from the
+mechanism causing it: forced immediate activation, the upgrade transition
+policy, or the crossed fallback edge. Every such move records its source.
+
+Pin writes use compare-and-swap. The first successful concurrent request to pin
+an unpinned lane wins; a later completion records its own request but cannot
+overwrite that pin. A request holding an older revision likewise cannot restore
+an old pin after an activation transition.
 
 ## Upgrade policy
 
@@ -323,9 +382,13 @@ temporarily unavailable inventory from a genuinely empty configured list.
 
 Claude's model picker remains a user-side reconciliation target because the
 service may write only in its state directory. Generalise `toker picker sync`
-from OpenRouter rules to the active presentation policy. It owns only entries
-tagged by toker, retains unrelated user rows, and writes the desired policy
-revision into its own state after a successful atomic settings update.
+from OpenRouter rules to the active presentation policy. The reconciler tracks
+the exact identities of rows it last applied rather than inferring ownership
+from a slug prefix. It retains unrelated user rows, refuses a collision with a
+user-owned identity, and writes the desired policy revision into its own state
+after a successful atomic settings update. Because Claude has one user settings
+file, incompatible profile-specific sets are reported as unsupported or
+conflicting rather than silently merged.
 
 The TUI runs as the user and may invoke the same reconciliation library after
 activation. Failure to update Claude settings does not roll back the server
@@ -385,22 +448,33 @@ Destructive removal and immediate warm-lane activation require confirmation.
 
 ## Configuration migration
 
-On first startup without an active database policy, compile current static
-configuration into revision one:
+Before database ownership begins, compile current static configuration in
+memory and run the final resolver in non-authoritative shadow mode. Compare its
+content-free decision with the legacy route for defaults, provider prefixes and
+aliases, model maps, picker rules, force-newest, and compaction. Shadow code may
+neither send nor persist nor change a client result. Unexplained mismatches
+block revision-one activation.
+
+At the atomic runtime cutover, compile current static configuration into
+revision one:
 
 - OpenRouter picker rules become presentation selectors and Claude metadata;
-- each provider model map becomes ordered transparent rewrite rules targeting
-  that provider binding;
-- protocol defaults become compatibility default routes;
-- existing learned model rows and promotion state remain in their current
-  tables and are interpreted through the migrated classifiers;
-- the force-newest toggle becomes the enabled state of the generated upgrade
-  policies.
+- each provider model map becomes a candidate-local alias policy on that
+  provider binding;
+- profile and protocol defaults become compatibility default routes;
+- existing learned model rows and promotion state remain a revision-one-only
+  learning source interpreted through generated classifiers;
+- the force-newest toggle becomes the enabled state of generated upgrade
+  policies;
+- `compact_model` becomes an explicit generated compaction route, while the
+  cold gate retains ownership of its cache and system-message transforms.
 
-Write a migration marker so later TOML edits do not silently replace live
-policy. After migration, setup reports that operational model routing is owned
-by the TUI and offers an explicit re-import action rather than merging files
-implicitly.
+Write the migration marker only in the transaction used by the first binary
+that routes every relevant path from revision one. An absent active policy may
+trigger that one migration; a corrupt or unsupported active policy fails
+startup and never silently falls back to TOML. After migration, setup reports
+that operational model routing is owned by the TUI and offers an explicit
+re-import action rather than merging files implicitly.
 
 Config serialization retains legacy fields while migration support is needed,
 but generated setup config stops expanding model policy into TOML once the
