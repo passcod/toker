@@ -245,7 +245,7 @@ pub(crate) fn lines(
             model(latest.and_then(|row| row.requested_model.as_ref())),
             Span::styled(", sent ", dim),
             model(latest.and_then(|row| row.effective_model.as_ref())),
-            Span::styled(", served ", dim),
+            Span::styled(", reported ", dim),
             model(latest.and_then(|row| row.model.as_ref())),
         ],
     ));
@@ -689,7 +689,7 @@ mod tests {
     }
 
     /// The content names the session in full, the models asked for, sent
-    /// and served with the forcing that moved them, and the gate with
+    /// and reported with the forcing that moved them, and the gate with
     /// what the session holds.
     #[test]
     fn the_content_names_the_session_its_models_and_its_gate() {
@@ -716,7 +716,7 @@ mod tests {
         assert!(all.contains("ses-detail-0001"), "{all}");
         assert!(all.contains("via     claude → anthropic_sub"), "{all}");
         assert!(
-            all.contains("asked claude-opus-5, sent claude-opus-5-5, served claude-opus-5-5"),
+            all.contains("asked claude-opus-5, sent claude-opus-5-5, reported claude-opus-5-5"),
             "{all}"
         );
         assert!(
