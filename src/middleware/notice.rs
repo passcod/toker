@@ -1,5 +1,5 @@
-//! Native rendering for gate notices (plan: "Native rendering for gate
-//! notices", docs/plans/toker-toolsuite.md:191). A blocked request is
+//! Native rendering for gate notices (see docs/internals/notices.md). A
+//! blocked request is
 //! answered with a synthetic assistant turn, and the client renders that
 //! turn's text however it renders any assistant text — so a frontend with
 //! a structured format of its own should see the notice in it.
@@ -16,7 +16,7 @@
 //! [`NoticeLevel::Warning`], decided where each notice is written.
 //!
 //! [`render`] is a pure function of (style, level, content), like every
-//! byte the gate emits (invariant 4, docs/plans/toker-toolsuite.md:93): a
+//! byte the gate emits (invariant 8 in AGENTS.md): a
 //! rendered notice enters replayed history, and the block's width is
 //! FROZEN for exactly that reason — a width that varied with anything
 //! (the content, the terminal, the version) would invalidate cache

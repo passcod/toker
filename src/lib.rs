@@ -1,8 +1,9 @@
 //! toker — unified local proxy toolsuite: the library crate.
 //!
-//! Design: docs/plans/toker-toolsuite.md. Three layers: frontend protocol
-//! adapters ([proto]) → middleware chain ([middleware]) → backend providers
-//! ([providers]), with [ir] as the canonical request model they share,
+//! The implemented design is documented under docs/internals/. Three layers:
+//! frontend protocol adapters ([proto]) → middleware chain ([middleware]) →
+//! backend providers ([providers]), with [ir] as the canonical request model
+//! they share,
 //! [store] as the SQLite ledger, [server] as the listener, [tui] as the
 //! dashboard, [setup] as the wizard's library half (the tested
 //! modules the interactive `toker setup` composes), [timers] as the

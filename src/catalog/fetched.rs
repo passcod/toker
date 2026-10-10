@@ -1041,7 +1041,7 @@ mod tests {
             None
         );
         assert_eq!(
-            catalogs.cache_writes_free("lunaroute", "z-ai/glm-5.3"),
+            catalogs.cache_writes_free("unknown_router", "z-ai/glm-5.3"),
             None
         );
     }
@@ -1135,7 +1135,7 @@ mod tests {
         // A provider with no catalogue (unwired, or a serving-provider
         // label) answers nothing.
         assert_eq!(
-            catalogs.context_window_of("lunaroute", "z-ai/glm-5.3"),
+            catalogs.context_window_of("unknown_router", "z-ai/glm-5.3"),
             None
         );
         // An openrouter row does not consult the codex listing and vice

@@ -1,6 +1,6 @@
 [Unit]
 Description=toker proxy socket (local proxy + measurement for AI coding traffic)
-Documentation=file:///home/passcod/code/rust/toker/docs/plans/toker-toolsuite.md
+Documentation=file:///home/passcod/code/rust/toker/docs/internals/routing.md
 
 [Socket]
 # One long-lived server process is handed the listening socket, rather than one

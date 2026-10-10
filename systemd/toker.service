@@ -1,6 +1,6 @@
 [Unit]
 Description=toker proxy service (socket-activated)
-Documentation=file:///home/passcod/code/rust/toker/docs/plans/toker-toolsuite.md
+Documentation=file:///home/passcod/code/rust/toker/docs/internals/routing.md
 Requires=toker.socket
 After=toker.socket
 

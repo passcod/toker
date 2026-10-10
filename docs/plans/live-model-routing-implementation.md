@@ -723,8 +723,7 @@ Re-read this plan and the design plan against the resulting implementation.
 When every promised implementation item is present or has been consciously
 moved into another recorded plan, remove this file in its own `unplan:` commit.
 
-The reconciliation must include the auxiliary bare `claude-*` scenario from
-[`bare-claude-without-anthropic.md`](bare-claude-without-anthropic.md): with no
-Anthropic binding configured, Claude Code's classifier, title, helper, and
+The reconciliation must include the auxiliary bare `claude-*` scenario: with
+no Anthropic binding configured, Claude Code's classifier, title, helper, and
 compaction calls route by model policy without inspecting their content or
 shape.

@@ -2,11 +2,12 @@
 
 A local proxy and ledger for LLM traffic: Claude Code, opencode and the codex
 CLI talk to it on loopback, and it forwards to the configured backends
-(anthropic subscription or API, openrouter, codex subscription) while recording
+(anthropic subscription or API, OpenAI API, openrouter, codex subscription)
+while recording
 what each request cost, gating sessions that would spend quota or re-read a cold
 cache, and showing it all in `toker tui`. `README.md` says what it does and how
-to install it; `docs/plans/toker-toolsuite.md` is the design. This file is the
-rules for changing it; [`docs/internals/`](docs/internals/README.md) has the
+to install it; [`docs/internals/`](docs/internals/README.md) is the implemented
+design. This file is the rules for changing it; the internals have the
 layout and, topic by topic, the reasons behind the rules. Read the topic before
 changing the code it covers: most of it records a bug already paid for, much of
 it in claude-token-proxy (ctp), the Node proxy toker replaces.

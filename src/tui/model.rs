@@ -969,7 +969,16 @@ mod tests {
                 1,
                 2.5,
             ),
-            display_billed(mins_ago(7), Some("ses-b"), "gpt", "lunaroute", 1, 1, 1, 1.0),
+            display_billed(
+                mins_ago(7),
+                Some("ses-b"),
+                "gpt",
+                "example_router",
+                1,
+                1,
+                1,
+                1.0,
+            ),
             display_billed(mins_ago(6), None, "glm", "openrouter", 1, 1, 1, 0.25),
             display_bare(mins_ago(5)), // measurement without cost: no cost data
             display_bare(mins_ago(4)), // …and another
@@ -1006,7 +1015,7 @@ mod tests {
                 spend.breakdown[1].provider.as_deref(),
                 spend.breakdown[1].billed
             ),
-            (Some("lunaroute"), 1.0)
+            (Some("example_router"), 1.0)
         );
 
         // NULL provider/model group under the dash, not under a fake name.
@@ -1355,7 +1364,7 @@ mod tests {
                     mins_ago(15),
                     None,
                     "z-ai/glm-5.3",
-                    "lunaroute",
+                    "example_router",
                     200,
                     50,
                     20,
@@ -2219,7 +2228,7 @@ mod tests {
         let mut glm_elsewhere = display_bare(mins_ago(2));
         glm_elsewhere.session_id = Some("ses-drift".into());
         glm_elsewhere.model = Some("z-ai/glm-5.3".into());
-        glm_elsewhere.provider = Some("lunaroute".into());
+        glm_elsewhere.provider = Some("example_router".into());
         let mut modelless = display_bare(mins_ago(1));
         modelless.session_id = Some("ses-drift".into());
         let snap = super::aggregate(
@@ -2235,7 +2244,7 @@ mod tests {
         );
         assert_eq!(
             snap.sessions[0].provider.as_deref(),
-            Some("lunaroute"),
+            Some("example_router"),
             "the latest row that named the model names its provider"
         );
         assert_eq!(

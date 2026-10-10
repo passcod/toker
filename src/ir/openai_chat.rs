@@ -1,6 +1,6 @@
 //! Typed views over OpenAI Chat request bodies.
 //!
-//! Shared by the openai_chat frontend and the openai/openrouter/lunaroute
+//! Shared by the openai_chat frontend and the direct OpenAI/OpenRouter
 //! backends. The IR is a [`serde_json::Value`] (see the module docs), so a
 //! view is a read-only lens ([`ChatBody`]) plus the typed mutations
 //! middleware needs ([`ChatBodyMut`]: [`ChatBodyMut::set_model`],

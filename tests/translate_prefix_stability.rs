@@ -1,5 +1,5 @@
-//! Invariant 5's prefix-stability property for the translated route
-//! (docs/plans/toker-toolsuite.md:96): for a conversation that only
+//! The translated route's prefix-stability property
+//! (docs/internals/routing.md): for a conversation that only
 //! appends, the codex request reproduces byte-identically wherever the
 //! conversation did not change — even though the upstream bytes never
 //! existed in the frontend's wire format. 20 deterministic seeded
