@@ -375,14 +375,17 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
         if row.kind.is_some() {
             continue;
         }
-        // Lanes are per-protocol cache concepts, and each protocol's rows
-        // carry their own TTL semantics: the anthropic rows the 5m/1h
-        // write-tier ladder, the openai rows openrouter's sticky window
-        // ([`OPENAI_LANE_TTL_MS`]) — the wire has no cache-write tiers,
-        // so the provider's documented duration is the honest clock.
+        // Lanes are binding-specific cache concepts. Anthropic rows carry
+        // the 5m/1h write-tier ladder; OpenRouter Chat rows carry its sticky
+        // window ([`OPENAI_LANE_TTL_MS`]). Other Chat bindings do not borrow
+        // OpenRouter's clock: absent cache-lifetime evidence seeds nothing.
         // Anything else (a frontend this table does not know) seeds
         // nothing: no TTL semantics can be derived for it.
-        let openai = row.frontend.as_deref() == Some("openai_chat");
+        let openai = row.frontend.as_deref() == Some("openai_chat")
+            && row.provider.as_deref() == Some("openrouter");
+        if row.frontend.as_deref() == Some("openai_chat") && !openai {
+            continue;
+        }
         if !openai && row.frontend.as_deref() != Some("anthropic") {
             continue;
         }
@@ -857,6 +860,7 @@ mod tests {
         // per request).
         let mut row = measurement_row(Some("ses-1"), Some("t1"), 1_000);
         row.frontend = Some("openai_chat".to_owned());
+        row.provider = Some("openrouter".to_owned());
         row.input = Some(50_000);
         row.cache_read = Some(1_200);
         // The conservative ledger apportionment charges the whole write
@@ -891,6 +895,7 @@ mod tests {
         anthropic.cache_write_1h = Some(5_000);
         let mut openai = measurement_row(Some("ses-2"), Some("t2"), 2_000);
         openai.frontend = Some("openai_chat".to_owned());
+        openai.provider = Some("openrouter".to_owned());
         openai.input = Some(20);
 
         let lanes = lanes_from_rows(&[anthropic, openai]);
@@ -904,6 +909,7 @@ mod tests {
         // openai-path notice survives a restart the same way.
         let mut rows = vec![measurement_row(Some("ses-1"), Some("t1"), 1_000)];
         rows[0].frontend = Some("openai_chat".to_owned());
+        rows[0].provider = Some("openrouter".to_owned());
         rows[0].input = Some(500_000);
         let mut cold = measurement_row(Some("ses-1"), Some("t1"), 6_000);
         cold.frontend = Some("openai_chat".to_owned());

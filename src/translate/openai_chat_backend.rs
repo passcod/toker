@@ -15,13 +15,18 @@ use crate::translate::{
     Rendered, TranslateError, TranslationLoss, TranslationLossReason, TranslationReport,
 };
 
-const DIALECT: DialectId = DialectId::OpenRouterChatCompletions;
+fn compatible_dialect(dialect: DialectId) -> bool {
+    matches!(
+        dialect,
+        DialectId::OpenAiChatCompletions | DialectId::OpenRouterChatCompletions
+    )
+}
 
 pub fn render_openai_chat(
     canonical: &CanonicalRequest,
     dialect: DialectId,
 ) -> Result<Rendered<Value>, TranslateError> {
-    if dialect != DIALECT {
+    if !compatible_dialect(dialect) {
         return Err(TranslateError::Malformed {
             reason: format!("{dialect} is not an OpenAI Chat dialect"),
         });
@@ -78,6 +83,20 @@ pub fn render_openai_chat(
         ));
     }
     replay_extensions(&mut body, &canonical.extensions, &mut report);
+    if dialect == DialectId::OpenAiChatCompletions && canonical.stream == Some(true) {
+        let options = body
+            .entry("stream_options".to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(options) = options.as_object_mut() else {
+            return Err(TranslateError::Malformed {
+                reason: "stream_options is not an object".to_owned(),
+            });
+        };
+        // OpenAI streams omit usage unless explicitly asked. Accounting may
+        // lose a measurement but must not silently make every streamed turn
+        // unobservable, so the direct API binding always requests it.
+        options.insert("include_usage".to_owned(), Value::Bool(true));
+    }
     Ok(Rendered {
         value: Value::Object(body),
         report,
@@ -244,7 +263,7 @@ fn content_part(
         return Ok(value);
     };
     for extension in extensions {
-        if extension.source() != DIALECT {
+        if !compatible_dialect(extension.source()) {
             report_incompatible(extension, report);
             continue;
         }
@@ -277,7 +296,7 @@ fn apply_tool_call_annotations(
         return;
     };
     for extension in extensions {
-        if extension.source() != DIALECT {
+        if !compatible_dialect(extension.source()) {
             report_incompatible(extension, report);
             continue;
         }
@@ -360,7 +379,7 @@ fn tool_value(tool: &CanonTool, report: &mut TranslationReport) -> Value {
         },
     });
     for extension in &tool.extensions {
-        if extension.source() != DIALECT {
+        if !compatible_dialect(extension.source()) {
             report_incompatible(extension, report);
             continue;
         }
@@ -420,7 +439,7 @@ fn replay_extensions(
     report: &mut TranslationReport,
 ) {
     for extension in extensions {
-        if extension.source() == DIALECT
+        if compatible_dialect(extension.source())
             && let Some(name) = extension.wire_name()
         {
             object.insert(name.to_owned(), extension.value().clone());

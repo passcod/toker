@@ -27,7 +27,13 @@ pub fn for_frontend(
     frontend: ProtocolId,
 ) -> Vec<ModelOffer> {
     let mut offers = Vec::new();
-    for provider in ["anthropic_sub", "anthropic_api", "openrouter", "codex_sub"] {
+    for provider in [
+        "anthropic_sub",
+        "anthropic_api",
+        "openrouter",
+        "openai_api",
+        "codex_sub",
+    ] {
         if registry.provider(provider).is_none() {
             continue;
         }

@@ -1,5 +1,7 @@
 # Live model routing implementation
 
+Status: planned; implementation has not started.
+
 ## Purpose
 
 Implement the policy described in

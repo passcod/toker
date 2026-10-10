@@ -1,5 +1,4 @@
-//! Per-response usage observation for the OpenAI-chat shape
-//! (openrouter backend first).
+//! Per-response usage observation for the OpenAI Chat shape.
 //!
 //! The back half of the Server core's side-parser: a [`UsageObserver`]
 //! takes the events the [`SseSplitter`](super::sse::SseSplitter) emits for
@@ -62,6 +61,7 @@ pub struct UsageCapture {
     id: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    service_tier: Option<String>,
     usage_raw: Option<String>,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
@@ -88,6 +88,11 @@ impl UsageCapture {
     /// endpoint.
     pub fn provider(&self) -> Option<&str> {
         self.provider.as_deref()
+    }
+
+    /// The processing tier the provider says served the request.
+    pub fn service_tier(&self) -> Option<&str> {
+        self.service_tier.as_deref()
     }
 
     /// The usage object exactly as it arrived: the original data-line
@@ -204,6 +209,7 @@ impl UsageObserver {
             ("id", &mut self.capture.id),
             ("model", &mut self.capture.model),
             ("provider", &mut self.capture.provider),
+            ("service_tier", &mut self.capture.service_tier),
         ] {
             if let Some(seen) = object.get(key).and_then(Value::as_str) {
                 *latched = Some(seen.to_string());

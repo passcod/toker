@@ -33,28 +33,28 @@
 //! errors are logged and swallowed; the insert is a single-row local
 //! SQLite write, brief enough to run inline at stream completion.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
+use crate::catalog::openai_pricing;
 use crate::ir::Shape;
 use crate::middleware::awake;
 use crate::middleware::lanes;
 use crate::observe::UsageCapture;
+use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
 
 use super::Server;
-
-/// The openai-chat path's one backend. Its rows are only ever written
-/// for a request that reached it, so the id is a constant rather than a
-/// lookup through the (optional) provider slot.
-const OPENAI_PROVIDER: &str = "openrouter";
 
 /// Everything a completion point knows about one request, minus the
 /// response itself.
 pub(crate) struct RecordCtx {
     /// The server (for the store and the route/backend id).
     pub(crate) server: Server,
+    /// The selected backend owns route identity and cost semantics.
+    pub(crate) backend: Arc<dyn Provider>,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -119,7 +119,7 @@ pub(crate) fn i64_of(value: u64) -> i64 {
 pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>, status: u16) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
-    let route = route_of();
+    let route = route_of(ctx.backend.id());
 
     let model = capture.and_then(UsageCapture::model);
     if let Some(capture) = capture {
@@ -127,12 +127,11 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             ctx,
             measurement_row(ctx, ts_ms, duration_ms, &route, capture),
         );
-        // The lane table moves alongside the row, on the response
-        // identity — the openai path's own lane note (the phase-2
-        // exclusion reversed): session × tools-hash from the request's
-        // own shape, the held total as the prompt, and the provider's
-        // sticky window as the TTL (openrouter has no cache-write
-        // tiers; [`lanes::OPENAI_LANE_TTL_MS`] is the honest clock).
+        // OpenRouter's lane table moves alongside the row: session ×
+        // tools-hash from the request shape, held prompt total, and its
+        // verified sticky window. Other Chat bindings do not inherit that
+        // provider-specific clock; they remain unlaned until their cache
+        // semantics can be represented without guessing.
         // Accounting must never break a session (invariant 6): a store
         // error is logged and lost — the measurement row is already in.
         let buckets = token_buckets(capture);
@@ -141,21 +140,23 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             .unwrap_or(0)
             .saturating_add(buckets.cache_read.unwrap_or(0))
             .saturating_add(buckets.cache_write_total.unwrap_or(0));
-        if let Err(error) = lanes::note_lane_response(
-            &ctx.server.store,
-            lanes::LaneResponse {
-                session_id: ctx.session_id.as_deref(),
-                tools_hash: ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
-                at_ms: ts_ms,
-                prompt: held,
-                write_5m: 0,
-                write_1h: 0,
-                ping: ctx.ping,
-                ttl_ms: Some(lanes::OPENAI_LANE_TTL_MS),
-                forced: None,
-                compaction: false,
-            },
-        ) {
+        if ctx.backend.id() == "openrouter"
+            && let Err(error) = lanes::note_lane_response(
+                &ctx.server.store,
+                lanes::LaneResponse {
+                    session_id: ctx.session_id.as_deref(),
+                    tools_hash: ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+                    at_ms: ts_ms,
+                    prompt: held,
+                    write_5m: 0,
+                    write_1h: 0,
+                    ping: ctx.ping,
+                    ttl_ms: Some(lanes::OPENAI_LANE_TTL_MS),
+                    forced: None,
+                    compaction: false,
+                },
+            )
+        {
             tracing::error!(%error, "lane table update failed");
         }
     }
@@ -165,7 +166,7 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
         status,
         if capture.is_some() { "yes" } else { "no" },
         model.or(ctx.effective_model.as_deref()).unwrap_or("?"),
-        OPENAI_PROVIDER,
+        ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
     );
 
@@ -186,7 +187,7 @@ pub(crate) fn record_error(
 ) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
-    let route = route_of();
+    let route = route_of(ctx.backend.id());
 
     insert(
         ctx,
@@ -205,7 +206,7 @@ pub(crate) fn record_error(
         "POST /v1/chat/completions → {} ledgered=error model={} provider={} ({:.1}s)",
         status,
         ctx.effective_model.as_deref().unwrap_or("?"),
-        OPENAI_PROVIDER,
+        ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
     );
 }
@@ -236,6 +237,7 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         req_messages,
         compact_target,
         frontend,
+        backend_id,
     } = record;
     let row = RequestRow {
         id: None,
@@ -243,8 +245,8 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::Cold),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(OPENAI_PROVIDER.to_owned()),
-        route: Some(route_of()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(route_of(backend_id)),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,
@@ -346,6 +348,7 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         idle_ms,
         prompt,
         frontend,
+        backend_id,
         ..
     } = record;
     let row = RequestRow {
@@ -354,8 +357,8 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::ColdQuiet),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(OPENAI_PROVIDER.to_owned()),
-        route: Some(route_of()),
+        provider: Some(backend_id.to_owned()),
+        route: Some(route_of(backend_id)),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,
@@ -452,11 +455,13 @@ pub(crate) struct ColdOpenaiRecord<'a> {
     pub(crate) compact_target: Option<&'a str>,
     /// The frontend's prefix name, for `extra.frontend`.
     pub(crate) frontend: Option<&'a str>,
+    /// The selected backend, for route and provider columns.
+    pub(crate) backend_id: &'a str,
 }
 
 /// The route column, `frontend:backend`.
-fn route_of() -> String {
-    format!("openai_chat:{OPENAI_PROVIDER}")
+fn route_of(backend_id: &str) -> String {
+    format!("openai_chat:{backend_id}")
 }
 
 /// Record one sleep-lock transition (the `kind: "awake"` row
@@ -627,7 +632,23 @@ fn measurement_row(
     capture: &UsageCapture,
 ) -> RequestRow {
     let buckets = token_buckets(capture);
-    let cost = capture.cost();
+    let (cost, cost_kind) = if ctx.backend.id() == "openrouter" {
+        (capture.cost(), capture.cost().map(|_| CostKind::Billed))
+    } else if ctx.backend.id() == "openai_api" {
+        let cost = capture.model().and_then(|model| {
+            openai_pricing::estimate(
+                model,
+                capture.service_tier(),
+                capture.prompt_tokens(),
+                capture.cached_tokens(),
+                capture.cache_write_tokens(),
+                capture.completion_tokens(),
+            )
+        });
+        (cost, cost.map(|_| CostKind::Estimated))
+    } else {
+        (None, None)
+    };
     let model = capture.model();
     // openrouter's serving provider and the response id, for cross-
     // referencing the provider's own logs (ledger parity); only keys that
@@ -647,7 +668,7 @@ fn measurement_row(
         duration_ms: Some(duration_ms),
         kind: None,
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(OPENAI_PROVIDER.to_owned()),
+        provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
         ping: None,
@@ -674,9 +695,9 @@ fn measurement_row(
         usage_presence: Some(buckets.usage_presence),
         usage_raw: capture.usage_raw().map(str::to_owned),
         cost_usd: cost,
-        // Billed when the provider reported a cost; absent cost is never
-        // estimated (that is a later unit's explicit kind).
-        cost_kind: cost.map(|_| CostKind::Billed),
+        // Provider semantics decide whether this is attested billing or a
+        // verified list-price estimate. Missing evidence stays unpriced.
+        cost_kind,
         rate_limits: None,
         req_bytes: shape.map(|s| i64_of(s.req_bytes)),
         req_messages: shape.and_then(|s| s.req_messages.map(i64_of)),
@@ -737,7 +758,7 @@ fn error_row(
         duration_ms: Some(duration_ms),
         kind: Some(RowKind::Error),
         frontend: Some("openai_chat".to_owned()),
-        provider: Some(OPENAI_PROVIDER.to_owned()),
+        provider: Some(ctx.backend.id().to_owned()),
         route: Some(route.to_owned()),
         session_id: ctx.session_id.clone(),
         ping: None,

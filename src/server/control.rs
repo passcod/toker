@@ -113,6 +113,19 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
             }),
         );
     }
+    if let Some(api) = &config.openai_api {
+        let sources = api.key_sources();
+        providers.insert(
+            "openai_api".to_owned(),
+            json!({
+                "upstream": api.upstream.as_str(),
+                "api_key_env": api.api_key_env,
+                "api_key_env_set": sources.env_set,
+                "api_key_keyring_configured": sources.keyring_configured,
+                "api_key_literal_set": sources.literal_set,
+            }),
+        );
+    }
     let body = json!({
         "port": config.port,
         "db_path": config.db_path.display().to_string(),

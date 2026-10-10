@@ -52,9 +52,20 @@ pub const DEFAULT_OPENROUTER_UPSTREAM: &str = "https://openrouter.ai/api/v1";
 /// The env var holding the OpenRouter API key.
 pub const DEFAULT_OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
+/// OpenAI's API base, including the `/v1` prefix.
+pub const DEFAULT_OPENAI_API_UPSTREAM: &str = "https://api.openai.com/v1";
+
+/// The conventional env var holding an OpenAI API key.
+pub const DEFAULT_OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
 /// The openai_chat protocol's backends, in historical-default order.
-pub const OPENAI_CHAT_BACKENDS: &[&str] =
-    &["openrouter", "codex_sub", "anthropic_api", "anthropic_sub"];
+pub const OPENAI_CHAT_BACKENDS: &[&str] = &[
+    "openrouter",
+    "openai_api",
+    "codex_sub",
+    "anthropic_api",
+    "anthropic_sub",
+];
 
 /// Anthropic's upstream base — the API root, no `/v1` prefix: the
 /// frontend's `/v1/messages…` paths are already the upstream's paths.
@@ -110,6 +121,8 @@ pub struct Config {
     /// The openrouter provider block; `None` when absent, which is the
     /// disabled state: a `[providers.X]` block's presence enables X.
     pub openrouter: Option<OpenRouterConfig>,
+    /// The OpenAI API provider block (`None`: disabled).
+    pub openai_api: Option<OpenAiApiConfig>,
     /// The default backend for the anthropic protocol (plan: Routing —
     /// bare model names go to the protocol default), always one of the
     /// enabled providers; `None` when no anthropic backend is enabled.
@@ -314,6 +327,34 @@ impl OpenRouterConfig {
     }
 }
 
+/// The direct OpenAI API provider block, resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAiApiConfig {
+    /// Upstream base including `/v1`.
+    pub upstream: reqwest::Url,
+    /// The env var the API key is read from.
+    pub api_key_env: String,
+    /// The key is in the OS keyring, under `openai_api`.
+    pub api_key_keyring: bool,
+    /// An optional literal key, used only after env and keyring sources.
+    pub api_key: Option<String>,
+}
+
+impl OpenAiApiConfig {
+    pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        resolve_api_key(
+            &self.api_key_env,
+            self.api_key_keyring,
+            keyring,
+            &self.api_key,
+        )
+    }
+
+    pub fn key_sources(&self) -> KeySources {
+        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+    }
+}
+
 /// The anthropic subscription provider block, resolved.
 #[derive(Clone, PartialEq)]
 pub struct AnthropicSubConfig {
@@ -455,6 +496,19 @@ impl Default for OpenRouterConfig {
             api_key_keyring: false,
             api_key: None,
             picker: None,
+        }
+    }
+}
+
+impl Default for OpenAiApiConfig {
+    fn default() -> Self {
+        OpenAiApiConfig {
+            upstream: DEFAULT_OPENAI_API_UPSTREAM
+                .parse()
+                .expect("built-in OpenAI API upstream is a URL"),
+            api_key_env: DEFAULT_OPENAI_API_KEY_ENV.to_owned(),
+            api_key_keyring: false,
+            api_key: None,
         }
     }
 }
@@ -696,6 +750,12 @@ impl Config {
                     api_key: openrouter.api_key.clone(),
                     picker: openrouter.picker.clone(),
                 }),
+                openai_api: self.openai_api.as_ref().map(|api| FileOpenAiApi {
+                    upstream: Some(api.upstream.to_string()),
+                    api_key_env: Some(api.api_key_env.clone()),
+                    api_key_keyring: api.api_key_keyring.then_some(true),
+                    api_key: api.api_key.clone(),
+                }),
                 anthropic_sub: self.anthropic_sub.as_ref().map(|sub| FileAnthropicSub {
                     upstream: Some(sub.upstream.to_string()),
                     oauth_token_env: Some(sub.oauth_token_env.clone()),
@@ -753,6 +813,7 @@ impl Config {
     fn resolve_file(file: FileConfig) -> anyhow::Result<Config> {
         let FileProviders {
             openrouter,
+            openai_api,
             anthropic_sub,
             anthropic_api,
             codex_sub,
@@ -780,6 +841,23 @@ impl Config {
                             anyhow::Ok(rules)
                         })
                         .transpose()?,
+                })
+            })
+            .transpose()?;
+        let openai_api = openai_api
+            .map(|block| -> anyhow::Result<OpenAiApiConfig> {
+                Ok(OpenAiApiConfig {
+                    upstream: parse_upstream(
+                        block
+                            .upstream
+                            .as_deref()
+                            .unwrap_or(DEFAULT_OPENAI_API_UPSTREAM),
+                    )?,
+                    api_key_env: block
+                        .api_key_env
+                        .unwrap_or_else(|| DEFAULT_OPENAI_API_KEY_ENV.to_owned()),
+                    api_key_keyring: block.api_key_keyring.unwrap_or(false),
+                    api_key: block.api_key,
                 })
             })
             .transpose()?;
@@ -873,6 +951,7 @@ impl Config {
         .collect();
         let enabled_openai_legacy: Vec<&str> = [
             ("openrouter", openrouter.is_some()),
+            ("openai_api", openai_api.is_some()),
             ("codex_sub", codex_sub.is_some()),
         ]
         .into_iter()
@@ -912,6 +991,7 @@ impl Config {
                 Some("openrouter"),
             )?,
             openrouter,
+            openai_api,
             default_backend_anthropic: default_backend(
                 "default_backend_anthropic",
                 file.default_backend_anthropic,
@@ -990,7 +1070,7 @@ impl Config {
         let legacy_chat_enabled: Vec<&str> = chat_enabled
             .iter()
             .copied()
-            .filter(|provider| matches!(*provider, "openrouter" | "codex_sub"))
+            .filter(|provider| matches!(*provider, "openrouter" | "openai_api" | "codex_sub"))
             .collect();
         check_default(
             "default_backend_openai_chat",
@@ -1034,6 +1114,7 @@ impl Config {
     pub fn enabled_openai_chat(&self) -> Vec<&'static str> {
         [
             self.openrouter.is_some().then_some("openrouter"),
+            self.openai_api.is_some().then_some("openai_api"),
             self.codex_sub.is_some().then_some("codex_sub"),
             self.anthropic_api.is_some().then_some("anthropic_api"),
             self.anthropic_sub.is_some().then_some("anthropic_sub"),
@@ -1216,11 +1297,26 @@ pub(crate) struct FileProviders {
     #[serde(skip_serializing_if = "Option::is_none")]
     openrouter: Option<FileOpenRouter>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    openai_api: Option<FileOpenAiApi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     anthropic_sub: Option<FileAnthropicSub>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anthropic_api: Option<FileAnthropicApi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_sub: Option<FileCodexSub>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct FileOpenAiApi {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_keyring: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -1356,8 +1452,8 @@ mod tests {
     use super::{
         DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_ANTHROPIC_UPSTREAM, DEFAULT_CODEX_AUTH_PATH,
         DEFAULT_CODEX_ORIGINATOR, DEFAULT_CODEX_REFRESH_URL, DEFAULT_CODEX_UPSTREAM,
-        DEFAULT_OPENROUTER_UPSTREAM, DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources,
-        OpenRouterConfig,
+        DEFAULT_OPENAI_API_KEY_ENV, DEFAULT_OPENAI_API_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM,
+        DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources, OpenRouterConfig,
     };
     use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
@@ -1418,6 +1514,7 @@ mod tests {
         // No block, no backend: a fresh config enables nothing, and
         // neither protocol has a default to route to.
         assert_eq!(config.openrouter, None);
+        assert_eq!(config.openai_api, None);
         assert_eq!(config.anthropic_sub, None);
         assert_eq!(config.anthropic_api, None);
         assert_eq!(config.codex_sub, None);
@@ -1471,14 +1568,20 @@ mod tests {
         let dir = test_dir("empty-blocks");
         fs::write(
             dir.join("toker.toml"),
-            "[providers.openrouter]\n[providers.anthropic_sub]\n\
+            "[providers.openrouter]\n[providers.openai_api]\n[providers.anthropic_sub]\n\
              [providers.anthropic_api]\n[providers.codex_sub]\n",
         )
         .expect("write config");
         let config = load_from(&dir);
         assert_eq!(
             config.enabled_backends(),
-            vec!["anthropic_sub", "anthropic_api", "codex_sub", "openrouter"]
+            vec![
+                "anthropic_sub",
+                "anthropic_api",
+                "codex_sub",
+                "openrouter",
+                "openai_api"
+            ]
         );
         // Several anthropic backends and no named default: the historical
         // one, so a config written before backends were optional routes
@@ -1525,6 +1628,10 @@ mod tests {
         assert_eq!(openrouter.upstream.as_str(), DEFAULT_OPENROUTER_UPSTREAM);
         assert_eq!(openrouter.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(openrouter.api_key, None);
+        let openai = config.openai_api.as_ref().expect("openai api enabled");
+        assert_eq!(openai.upstream.as_str(), DEFAULT_OPENAI_API_UPSTREAM);
+        assert_eq!(openai.api_key_env, DEFAULT_OPENAI_API_KEY_ENV);
+        assert_eq!(openai.api_key, None);
 
         // The Default impls the wizard enables a backend with are exactly
         // what an empty block resolves to.
@@ -1532,6 +1639,7 @@ mod tests {
         assert_eq!(*sub, super::AnthropicSubConfig::default());
         assert_eq!(*api, super::AnthropicApiConfig::default());
         assert_eq!(*openrouter, super::OpenRouterConfig::default());
+        assert_eq!(*openai, super::OpenAiApiConfig::default());
     }
 
     #[test]

@@ -10,6 +10,9 @@
 //! - openrouter: the public `GET {upstream}/models` — `{data: [{id,
 //!   context_length, pricing, supported_parameters, …}]}` (no auth;
 //!   the transparent forward already serves opencode's own use of it).
+//! - openai api: authenticated `GET {upstream}/models` — `{data: [{id,
+//!   created, owned_by, …}]}`. The listing is presence metadata only; it
+//!   does not declare context windows.
 //! - codex: `GET {base}/models?client_version=…` — `{"models":
 //!   [{slug, context_window, max_context_window,
 //!   supported_reasoning_levels, truncation_policy, …}]}`, the
@@ -97,7 +100,7 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// [`FetchedCatalogs`]: openrouter (the public listing), anthropic (the
 /// listing both anthropic backends share), codex_sub (the codex
 /// backend's own models endpoint).
-pub const SOURCES: &[&str] = &["openrouter", "anthropic", "codex_sub"];
+pub const SOURCES: &[&str] = &["openrouter", "openai_api", "anthropic", "codex_sub"];
 
 /// One provider's response parser: the listing shape's reader.
 pub type Parse = fn(&Value, i64) -> anyhow::Result<FetchedCatalog>;
@@ -106,6 +109,7 @@ pub type Parse = fn(&Value, i64) -> anyhow::Result<FetchedCatalog>;
 pub fn parse_for(source: &str) -> Option<Parse> {
     match source {
         "openrouter" => Some(parse_openrouter),
+        "openai_api" => Some(parse_openai),
         "anthropic" => Some(parse_anthropic),
         "codex_sub" => Some(parse_codex),
         _ => None,
@@ -224,11 +228,12 @@ impl FetchedCatalogs {
 
     /// The cache source whose listing covers a backend by provider id:
     /// both anthropic backends share anthropic's listing,
-    /// openrouter and codex_sub are their own. A provider with no
+    /// openrouter, openai_api and codex_sub are their own. A provider with no
     /// source has no fetched catalogue at all.
     pub fn source_of(provider: &str) -> Option<&'static str> {
         match provider {
             "openrouter" => Some("openrouter"),
+            "openai_api" => Some("openai_api"),
             "codex_sub" => Some("codex_sub"),
             // One upstream listing covers both anthropic backends; it
             // carries windows but no prices.
@@ -534,6 +539,30 @@ pub fn parse_openrouter(response: &Value, fetched_at_ms: i64) -> anyhow::Result<
     })
 }
 
+/// Parse OpenAI's models listing. It intentionally provides no context
+/// ceiling: the endpoint documents identity and ownership, not token limits.
+pub fn parse_openai(response: &Value, fetched_at_ms: i64) -> anyhow::Result<FetchedCatalog> {
+    let data = response
+        .get("data")
+        .and_then(Value::as_array)
+        .context("openai models listing: no `data` array")?;
+    let models = data
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.trim();
+            (!id.is_empty()).then(|| FetchedModel {
+                id: id.to_owned(),
+                context_window: None,
+                raw: entry.clone(),
+            })
+        })
+        .collect();
+    Ok(FetchedCatalog {
+        fetched_at_ms,
+        models,
+    })
+}
+
 /// Parse the codex backend's listing: `{"models": [{slug,
 /// context_window, max_context_window, …}]}` → id from `slug`.
 ///
@@ -624,7 +653,8 @@ fn price_at(pricing: &Value, key: &str) -> Option<f64> {
 mod tests {
     use super::{
         CACHE_TTL_MS, CatalogSource, FetchedCatalog, FetchedCatalogs, FetchedModel, SOURCES,
-        cache_path, load_cache, parse_anthropic, parse_codex, parse_for, parse_openrouter, refresh,
+        cache_path, load_cache, parse_anthropic, parse_codex, parse_for, parse_openai,
+        parse_openrouter, refresh,
     };
     use crate::setup::test_dir;
     use serde_json::{Value, json};
@@ -1118,8 +1148,11 @@ mod tests {
             catalogs.context_window_of("codex_sub", "z-ai/glm-5.3"),
             None
         );
-        // The cache-file names are exactly the three sources.
-        assert_eq!(SOURCES, &["openrouter", "anthropic", "codex_sub"]);
+        // The cache-file names are exactly the four sources.
+        assert_eq!(
+            SOURCES,
+            &["openrouter", "openai_api", "anthropic", "codex_sub"]
+        );
         for source in SOURCES {
             assert!(parse_for(source).is_some(), "{source} has a parser");
         }
@@ -1140,10 +1173,30 @@ mod tests {
                 "openrouter shape broke: {bad}"
             );
             assert!(
+                parse_openai(&bad, NOW).is_err(),
+                "openai shape broke: {bad}"
+            );
+            assert!(
                 parse_anthropic(&bad, NOW).is_err(),
                 "anthropic shape broke: {bad}"
             );
         }
+
+        let openai = parse_openai(
+            &json!({
+                "data": [
+                    {"id": "gpt-6.1-sol", "created": 1, "owned_by": "openai"},
+                    {"id": ""},
+                    {"owned_by": "openai"}
+                ]
+            }),
+            NOW,
+        )
+        .expect("openai listing");
+        assert_eq!(openai.models.len(), 1);
+        assert_eq!(openai.models[0].id, "gpt-6.1-sol");
+        assert_eq!(openai.models[0].context_window, None);
+        assert_eq!(openai.models[0].raw["owned_by"], "openai");
         for bad in [json!({}), json!({"models": "no"}), json!([])] {
             assert!(parse_codex(&bad, NOW).is_err(), "codex shape broke: {bad}");
         }

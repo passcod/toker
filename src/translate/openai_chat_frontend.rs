@@ -16,7 +16,7 @@ use crate::observe::sse::SseEvent;
 use crate::routing::DialectId;
 use crate::translate::TranslateError;
 
-const DIALECT: DialectId = DialectId::OpenRouterChatCompletions;
+const DIALECT: DialectId = DialectId::OpenAiChatCompletions;
 
 pub fn from_openai_chat(body: &Value) -> Result<CanonicalRequest, TranslateError> {
     if let (Some(legacy), Some(current)) = (

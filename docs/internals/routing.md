@@ -12,16 +12,17 @@ serves them all, because the paths do not collide:
 | Protocol | Paths | Backends |
 | --- | --- | --- |
 | Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
-| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `codex_sub`, `anthropic_api`, `anthropic_sub` (translated) |
+| OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `openai_api`, `codex_sub`, `anthropic_api`, `anthropic_sub` (last three translated) |
 | OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `openrouter`, `anthropic_api`, `anthropic_sub` (translated) |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
 Each protocol has a default (`default_backend_anthropic`,
 `default_backend_openai_chat`), which bare model names go to. A model string can
 name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
-`anthropic/…` (the Messages protocol default), `openrouter/…`, and
-`codex_sub/…` are stripped and routed where the shared route registry declares
-that frontend-to-binding path. The resolved `ModelTarget` keeps the provider,
+`anthropic/…` (the Messages protocol default), `openrouter/…`,
+`openai_api/…`, and `codex_sub/…` are stripped and routed where the shared
+route registry declares that frontend-to-binding path. The resolved
+`ModelTarget` keeps the provider,
 verified backend binding, requested model, and effective model distinct; the
 row records both model spellings. A prefix naming a backend whose block is
 absent is answered locally, never sent to the default with the prefix still on.
@@ -43,8 +44,10 @@ their metadata projection is verified.
 When no usable catalogue has arrived, the endpoint returns 503, not a false
 empty list. Unknown and unprefixed profiles keep path-driven forwarding.
 The service loads cached catalogues before serving, then refreshes in the
-background. Claude's picker filters the OpenRouter Messages offers from the
-same join, subject to its own tool/text and user-rule constraints.
+background. OpenRouter's public listing needs no key; OpenAI's `/v1/models`
+listing uses the configured direct-API credential and remains cache-only when
+none is stored. Claude's picker filters the OpenRouter Messages offers from
+the same join, subject to its own tool/text and user-rule constraints.
 
 Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
@@ -63,14 +66,17 @@ lets a newer frontend shape reach a compatible backend without requiring toker
 to understand its contents. Toker always replaces the frontend credential
 with its shared Codex login before the request leaves loopback.
 
-Every Chat route is canonical. The OpenRouter binding deterministically renders
-Chat again and interprets its response before the frontend renders Chat. It
-observes the provider response before translation so billing evidence stays
-intact. Chat may also select `codex_sub` as its configured default or with a
-`codex_sub/<model>` prefix; that binding renders a Responses request and
-translates the Responses turn back to Chat SSE or complete JSON. Toker signs
-the Codex upstream itself, records the route as `openai_chat:codex_sub`, and
-never forwards the frontend credential.
+Every Chat route is canonical. The OpenRouter and direct OpenAI bindings
+deterministically render Chat again and interpret their responses before the
+frontend renders Chat. Provider response bytes are observed before translation
+so billing or usage evidence stays intact. OpenRouter records the provider's
+`usage.cost`; direct OpenAI requests terminal usage on every stream and uses
+only the separately verified exact-model estimator. Chat may also select
+`codex_sub` as its configured default or with a `codex_sub/<model>` prefix;
+that binding renders a Responses request and translates the Responses turn
+back to Chat SSE or complete JSON. Toker signs the Codex upstream itself,
+records the route as `openai_chat:codex_sub`, and never forwards the frontend
+credential.
 The Anthropic Messages bindings accept Chat and Responses requests after
 canonical rendering. A foreign OpenAI bearer is removed before provider-owned
 authentication is added. Responses and Chat output limits are optional on
@@ -87,9 +93,17 @@ translation.
 | `anthropic_sub` | native Claude bearer passed through; foreign frontend bearer replaced by a toker-held OAuth token or Claude's local login (in that order) | `anthropic-ratelimit-*` headers, the quota gate's only source | `plan_equivalent` (list price on a subscription) |
 | `anthropic_api` | `x-api-key`, injected only when the request has none | none (its RPM headers are not quota meters and must never overwrite the gate's snapshot) | `estimated` |
 | `openrouter` | stored key, injected only when the request has none; an Anthropic credential is dropped first | none | `billed`, from `usage.cost`, on both routes |
+| `openai_api` | stored key, injected only when the request has no native bearer; Anthropic and OpenRouter credentials are dropped first | none | `estimated`, only for exact verified models, tiers, and complete usage |
 | `codex_sub` | always toker-signed from `~/.codex/auth.json` | `x-codex-*` headers, stored per backend, not gated | NULL: no per-token price to verify |
 
-The three cost kinds are never conflated (`CostKind`).
+The three cost kinds are never conflated (`CostKind`). Direct OpenAI pricing is
+kept separately in `catalog/openai_pricing.rs`; unknown models, service tiers,
+or token categories leave cost NULL rather than filling a guessed zero.
+
+The OpenRouter Chat cold gate uses its documented ten-minute sticky-session
+clock. Other Chat bindings do not inherit that clock. Until the live-routing
+work stores cache state per binding, direct OpenAI and translated Chat routes
+remain unlaned and cannot emit that cold notice.
 
 For a foreign frontend, `anthropic_sub` resolves its own token from
 `oauth_token_env`, the `anthropic_sub` keyring entry when configured, then a
@@ -226,13 +240,14 @@ paths stream without inference observation.
 
 OpenAI Chat is canonical for every declared route. The frontend adapter parses
 each request; routing and cold-gate shape extraction read that canonical
-request. Then the OpenRouter Chat, Codex Responses, or Anthropic Messages
-backend adapter renders it. Responses take the reverse path through canonical
-events or a complete canonical turn. OpenRouter's original response bytes still
-feed the ledger observer before translation, so `usage_raw`, billed cost and
-the serving provider remain provider-attested evidence. An invalid Chat body
-is a local 400 and a compressed or malformed upstream response is a local
-502; neither is forwarded as though it had crossed the canonical boundary.
+request. Then the OpenRouter or direct OpenAI Chat, Codex Responses, or
+Anthropic Messages backend adapter renders it. Responses take the reverse path
+through canonical events or a complete canonical turn. Original provider
+response bytes feed the ledger observer before translation, so `usage_raw`,
+billed cost, estimated-cost inputs, and the serving provider remain
+provider-attested evidence. An invalid Chat body is a local 400 and a
+compressed or malformed upstream response is a local 502; neither is forwarded
+as though it had crossed the canonical boundary.
 
 ## Thinking that cannot be turned off
 

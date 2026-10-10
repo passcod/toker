@@ -9,8 +9,8 @@
 //! 3. Routing: a known provider prefix selects that backend and is
 //!    stripped; bare models go to the protocol default.
 //! 4. The selected backend adapter renders the request deterministically.
-//! 5. **The cold-cache notice** (plan: Middleware — cold gate): the openai
-//!    path's own gate, on the lane the request itself keys (session ×
+//! 5. **The cold-cache notice** (plan: Middleware — cold gate): the
+//!    OpenRouter Chat binding's gate, on the lane the request itself keys (session ×
 //!    tools-hash) and the post-routing model. A summarising request is
 //!    exempt, as on the anthropic path. No quota outlook is applied on the
 //!    Chat path yet. A per-model writes-free exemption applies to
@@ -32,7 +32,7 @@
 //!    turn, then rendered back to Chat. Provider bytes feed accounting before
 //!    translation, preserving billed cost and raw usage evidence.
 //! 9. Recording on completion only — [`record::RecordCtx`] → row, plus
-//!    the lane-table note (the openai lane's clock is openrouter's
+//!    an OpenRouter lane-table note (that binding's clock is its
 //!    10-minute sticky window, [`lanes::OPENAI_LANE_TTL_MS`]).
 
 use std::collections::VecDeque;
@@ -153,9 +153,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     );
     let stream_requested = canonical.stream == Some(true);
     let gate_shape = Some(shape.clone());
+    let backend = target.provider().clone();
     let record = Some(RecordCtx {
         frontend: frontend.clone(),
         server: server.clone(),
+        backend: backend.clone(),
         started,
         session_id: session_id.clone(),
         ping,
@@ -165,8 +167,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         system_messages,
     });
     canonical.model.clone_from(&gate_model);
-
-    let backend = target.provider().clone();
 
     if target
         .binding()
@@ -197,7 +197,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // lane (the same verdict a keyless miss reaches), and every failure
     // below is "a lost notice, never a lost request": a store error
     // reads as absence and the request forwards.
-    let cold_armed = server.config.gates.cold_enabled;
+    // Cache lifetime belongs to the selected binding. Only OpenRouter's
+    // Chat lifetime is currently verified; assigning its ten-minute clock
+    // to direct OpenAI, Codex, or Anthropic would turn missing evidence into
+    // a false cold notice. Binding-scoped lane state in the live-routing
+    // plan generalises this once each binding has a supported clock.
+    let cold_armed = server.config.gates.cold_enabled && backend.id() == "openrouter";
     let cold_lane_key = gate_shape
         .as_ref()
         .map(|shape| shape.tools_hash.as_str())
@@ -265,6 +270,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     prompt,
                     req_messages: None,
                     compact_target: None,
+                    backend_id: backend.id(),
                 });
             } else {
                 // No compaction target is named: this path never
@@ -318,6 +324,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                         .and_then(|shape| shape.req_messages)
                         .map(|messages| messages as i64),
                     compact_target: None,
+                    backend_id: backend.id(),
                 });
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -395,7 +402,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     .await
     {
         Ok(upstream) => {
-            forward_openrouter_canonical(
+            forward_chat_canonical(
                 upstream,
                 record,
                 in_flight,
@@ -452,7 +459,12 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
         };
         return axum::Json(body).into_response();
     }
-    let Some(openrouter) = server.registry.provider("openrouter").cloned() else {
+    let Some(provider) = server
+        .registry
+        .resolve(ProtocolId::OpenAiChat, None)
+        .ok()
+        .map(|target| target.provider().clone())
+    else {
         return super::anthropic::unmatched(State(server), request).await;
     };
     let (parts, body) = request.into_parts();
@@ -466,7 +478,7 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
             );
         }
     };
-    match send_upstream(&server, openrouter.as_ref(), &parts, body, &[]).await {
+    match send_upstream(&server, provider.as_ref(), &parts, body, &[]).await {
         Ok(upstream) => forward_upstream(upstream).await,
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
@@ -561,10 +573,10 @@ pub(crate) async fn forward_upstream(upstream: reqwest::Response) -> Response {
     build_response(status, response_headers(&upstream_headers, false), body)
 }
 
-/// The OpenRouter Chat binding's live universal-canonical response path.
-/// Accounting observes the provider bytes before translation, so billed cost
+/// A Chat binding's live universal-canonical response path. Accounting
+/// observes the provider bytes before translation, so billed cost, estimates,
 /// and verbatim usage remain provider evidence rather than renderer output.
-async fn forward_openrouter_canonical(
+async fn forward_chat_canonical(
     upstream: reqwest::Response,
     record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,

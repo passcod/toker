@@ -44,6 +44,7 @@ impl fmt::Display for ProtocolId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DialectId {
     AnthropicMessages,
+    OpenAiChatCompletions,
     OpenRouterMessages,
     OpenRouterChatCompletions,
     OpenRouterResponses,
@@ -54,6 +55,7 @@ impl DialectId {
     pub const fn as_str(self) -> &'static str {
         match self {
             DialectId::AnthropicMessages => "anthropic_messages",
+            DialectId::OpenAiChatCompletions => "openai_chat_completions",
             DialectId::OpenRouterMessages => "openrouter_messages",
             DialectId::OpenRouterChatCompletions => "openrouter_chat_completions",
             DialectId::OpenRouterResponses => "openrouter_responses",
@@ -271,6 +273,11 @@ const ROUTES: &[RouteDeclaration] = &[
     RouteDeclaration {
         frontend: ProtocolId::OpenAiChat,
         provider: "openrouter",
+        backend: ProtocolId::OpenAiChat,
+    },
+    RouteDeclaration {
+        frontend: ProtocolId::OpenAiChat,
+        provider: "openai_api",
         backend: ProtocolId::OpenAiChat,
     },
     RouteDeclaration {

@@ -140,6 +140,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
         ping_header_name: "x-toker-ping".to_owned(),
         default_backend_openai_chat: None,
         openrouter: None,
+        openai_api: None,
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,

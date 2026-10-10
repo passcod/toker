@@ -207,6 +207,10 @@ cold_min_tokens = 50000
 upstream = "http://localhost:9/v1"
 api_key = "literal-key"
 
+[providers.openai_api]
+upstream = "http://localhost:10/v1"
+api_key_env = "MY_OPENAI_KEY"
+
 [providers.codex_sub]
 auth_path = "~/.codex/auth.json"
 "#,
@@ -233,6 +237,9 @@ auth_path = "~/.codex/auth.json"
             "http://localhost:9/v1",
             "the upstream survived"
         );
+        let openai = reloaded.openai_api.as_ref().expect("still enabled");
+        assert_eq!(openai.api_key_env, "MY_OPENAI_KEY");
+        assert_eq!(openai.upstream.as_str(), "http://localhost:10/v1");
         // The `~` normalisation: auth_path expanded at load, written
         // absolute — semantics identical, bytes deliberately not.
         let expected_auth = PathBuf::from(std::env::var("HOME").expect("tests run with a home"))

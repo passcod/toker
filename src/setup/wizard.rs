@@ -63,8 +63,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::config::{
-    ANTHROPIC_BACKENDS, Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENROUTER_API_KEY_ENV,
-    DEFAULT_PORT,
+    ANTHROPIC_BACKENDS, Config, DEFAULT_ANTHROPIC_API_KEY_ENV, DEFAULT_OPENAI_API_KEY_ENV,
+    DEFAULT_OPENROUTER_API_KEY_ENV, DEFAULT_PORT, OPENAI_CHAT_BACKENDS,
 };
 use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
@@ -1036,10 +1036,15 @@ struct Choices {
     /// The anthropic protocol's default, among the ticked; `None` when
     /// no anthropic backend is ticked.
     anthropic_default: Option<&'static str>,
+    /// The openai_chat protocol's default, among the ticked; `None` when
+    /// no Chat-capable backend is ticked.
+    openai_chat_default: Option<&'static str>,
     /// Asked only when anthropic_api is ticked.
     anthropic_api_key: Option<KeyChoice>,
     /// Asked only when openrouter is ticked.
     openrouter_key: Option<KeyChoice>,
+    /// Asked only when openai_api is ticked.
+    openai_api_key: Option<KeyChoice>,
     awake: bool,
 }
 
@@ -1061,6 +1066,10 @@ const BACKENDS: &[(&str, &str)] = &[
     (
         "openrouter",
         "openrouter — the openai-chat protocol (opencode), by API key",
+    ),
+    (
+        "openai_api",
+        "openai_api — the direct OpenAI Chat Completions API, by API key",
     ),
 ];
 
@@ -1576,10 +1585,24 @@ impl<'a> Wizard<'a> {
         } else {
             None
         };
+        let openai_api_key = if ticked("openai_api") {
+            let api = existing.and_then(|config| config.openai_api.as_ref());
+            Some(self.ask_api_key(
+                "openai_api",
+                DEFAULT_OPENAI_API_KEY_ENV,
+                api.map(|api| {
+                    (
+                        api.api_key_env.as_str(),
+                        api.api_key_keyring,
+                        api.api_key.is_some(),
+                    )
+                }),
+            )?)
+        } else {
+            None
+        };
 
-        // The anthropic protocol's default, among the ticked anthropic
-        // backends. The openai protocol has one backend, so it never
-        // asks.
+        // Each protocol's default, among the ticked backends that bind it.
         let candidates: Vec<&'static str> = ANTHROPIC_BACKENDS
             .iter()
             .copied()
@@ -1604,6 +1627,30 @@ impl<'a> Wizard<'a> {
             }
         };
 
+        let candidates: Vec<&'static str> = OPENAI_CHAT_BACKENDS
+            .iter()
+            .copied()
+            .filter(|name| ticked(name))
+            .collect();
+        let openai_chat_default = match candidates.as_slice() {
+            [] => None,
+            [only] => Some(*only),
+            several => {
+                let current = existing
+                    .and_then(|config| config.default_backend_openai_chat.as_deref())
+                    .unwrap_or(OPENAI_CHAT_BACKENDS[0]);
+                let default = several.iter().position(|name| *name == current);
+                Some(
+                    several[self.prompt.select(
+                        "Default backend for the openai_chat protocol (opencode and friends)? \
+                         (bare model names go here; a provider/ prefix picks another per request)",
+                        several,
+                        default.or(Some(0)),
+                    )?],
+                )
+            }
+        };
+
         let awake_default = existing.map(|config| config.awake).unwrap_or(true);
         let awake = self.prompt.confirm(
             "Hold an idle-sleep lock while agent sessions are live (awake)?",
@@ -1616,8 +1663,10 @@ impl<'a> Wizard<'a> {
             port,
             backends,
             anthropic_default,
+            openai_chat_default,
             anthropic_api_key,
             openrouter_key,
+            openai_api_key,
             awake,
         }))
     }
@@ -1770,6 +1819,7 @@ impl<'a> Wizard<'a> {
         for (provider, slot) in [
             ("anthropic_api", &mut choices.anthropic_api_key),
             ("openrouter", &mut choices.openrouter_key),
+            ("openai_api", &mut choices.openai_api_key),
         ] {
             let Some(KeyChoice::Store(key)) = slot.as_ref() else {
                 continue;
@@ -1885,6 +1935,9 @@ impl<'a> Wizard<'a> {
                 openrouter.key_sources(),
                 &openrouter.api_key_env,
             ))?;
+        }
+        if let Some(api) = &config.openai_api {
+            self.say(&key_line("openai_api", api.key_sources(), &api.api_key_env))?;
         }
         report.config_written = true;
         Ok(config)
@@ -2961,14 +3014,9 @@ fn apply_choices(
     keep_or_create(&mut config.anthropic_api, ticked("anthropic_api"));
     keep_or_create(&mut config.codex_sub, ticked("codex_sub"));
     keep_or_create(&mut config.openrouter, ticked("openrouter"));
+    keep_or_create(&mut config.openai_api, ticked("openai_api"));
     config.default_backend_anthropic = choices.anthropic_default.map(str::to_owned);
-    config.default_backend_openai_chat = if ticked("openrouter") {
-        Some("openrouter".to_owned())
-    } else if ticked("codex_sub") {
-        Some("codex_sub".to_owned())
-    } else {
-        None
-    };
+    config.default_backend_openai_chat = choices.openai_chat_default.map(str::to_owned);
     if let (Some(api), Some(key)) = (config.anthropic_api.as_mut(), &choices.anthropic_api_key) {
         apply_key(
             key,
@@ -2983,6 +3031,14 @@ fn apply_choices(
             &mut openrouter.api_key_env,
             &mut openrouter.api_key_keyring,
             &mut openrouter.api_key,
+        )?;
+    }
+    if let (Some(api), Some(key)) = (config.openai_api.as_mut(), &choices.openai_api_key) {
+        apply_key(
+            key,
+            &mut api.api_key_env,
+            &mut api.api_key_keyring,
+            &mut api.api_key,
         )?;
     }
     config.awake = choices.awake;
@@ -3674,6 +3730,7 @@ default_backend_anthropic = "codex_sub"
             multi(&[0, 3]),          // backends: anthropic_sub + openrouter
             select(2),               // key source: env var
             text(""),                // env name: keep the default
+            select(0),               // openai_chat default: openrouter
             confirm(true),           // awake
             text(&port.to_string()), // the listener port
             confirm(true),           // claude
@@ -4088,7 +4145,7 @@ default_backend_anthropic = "codex_sub"
         // question.
         let first = &rig.prompt.asked()[0];
         assert_eq!(first.kind, "multi_select");
-        assert_eq!(first.options.len(), 4);
+        assert_eq!(first.options.len(), BACKENDS.len());
         for (option, name) in first
             .options
             .iter()
@@ -4097,13 +4154,14 @@ default_backend_anthropic = "codex_sub"
             assert!(option.starts_with(name), "{option} offers {name}");
         }
         assert_eq!(first.default.as_deref(), Some("[0, 3]"));
-        assert!(
-            !rig.prompt
-                .asked()
-                .iter()
-                .any(|asked| asked.message.contains("Default backend")),
-            "one candidate per protocol, no default asked"
-        );
+        let chat_default = rig
+            .prompt
+            .asked()
+            .iter()
+            .find(|asked| asked.message.contains("openai_chat protocol"))
+            .expect("multiple Chat-capable backends ask for their default");
+        assert_eq!(chat_default.options, ["openrouter", "anthropic_sub"]);
+        assert_eq!(chat_default.default.as_deref(), Some("0"));
     }
 
     #[tokio::test]
@@ -4306,6 +4364,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(2),      // openrouter key: an env var
                 text(""),
+                select(0), // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
             ],
@@ -4347,7 +4406,7 @@ default_backend_anthropic = "codex_sub"
         assert!(rig.toml_path().exists());
         assert_eq!(rig.runner.installed().len(), 2);
         // And nothing was asked past the port.
-        assert_eq!(rig.prompt.asked().len(), 5);
+        assert_eq!(rig.prompt.asked().len(), 6);
     }
 
     #[tokio::test]
@@ -4455,6 +4514,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[0, 3]),          // backends: anthropic_sub + openrouter
                 select(2),               // key source: env var
                 text(""),                // env name: keep the default
+                select(0),               // openai_chat default: openrouter
                 confirm(true),           // awake
                 text(&port.to_string()), // the listener port
                 confirm(true),           // workhorse
@@ -4545,6 +4605,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(2),      // openrouter key: an env var
                 text(""),
+                select(0), // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
                 confirm(false), // wake/hold/ping timers: no
@@ -4602,7 +4663,7 @@ default_backend_anthropic = "codex_sub"
                 let mut answers = answers_fresh(port);
                 answers[1] = select(1); // key source: literal in toker.toml
                 answers[2] = text(KEY); // the key itself, masked in the real UI
-                answers.truncate(5); // nothing past the port is asked
+                answers.truncate(6); // nothing past the port is asked
                 answers.push(confirm(false)); // wake/hold/ping timers: no
                 answers
             },
@@ -4673,6 +4734,7 @@ default_backend_anthropic = "codex_sub"
                 select(1),      // anthropic_api: give it to toker
                 text(KEY),      // the key, masked in the real UI
                 select(0),      // openrouter: the frontend brings its own
+                select(0),      // openai_chat default: openrouter
                 confirm(true),  // awake
                 text(&port.to_string()),
                 confirm(false), // wake/hold/ping timers: no
@@ -4716,6 +4778,7 @@ default_backend_anthropic = "codex_sub"
                 select(1),        // anthropic_api: still toker's
                 text(""),         // empty keeps the stored key
                 select(0),        // openrouter: the frontend's own
+                select(0),        // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
                 confirm(false),
@@ -4738,6 +4801,47 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[tokio::test]
+    async fn direct_openai_can_be_the_only_backend() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "openai-only",
+            vec![
+                multi(&[4]),             // openai_api only
+                select(2),               // key source: env var
+                text(""),                // keep OPENAI_API_KEY
+                confirm(true),           // awake
+                text(&port.to_string()), // listener port
+                confirm(false),          // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+
+        rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        let config = Config::load_from(&rig.toml_path()).expect("the written config loads");
+        assert_eq!(config.enabled_backends(), ["openai_api"]);
+        assert_eq!(config.default_backend_anthropic, None);
+        assert_eq!(
+            config.default_backend_openai_chat.as_deref(),
+            Some("openai_api")
+        );
+        let api = config.openai_api.as_ref().expect("openai_api enabled");
+        assert_eq!(api.api_key_env, DEFAULT_OPENAI_API_KEY_ENV);
+        assert!(!api.api_key_keyring && api.api_key.is_none());
+        assert!(
+            rig.out()
+                .contains("openai_api key: env OPENAI_API_KEY (systemd user environment)")
+        );
+        assert!(
+            !rig.prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("Default backend")),
+            "one Chat backend needs no default question"
+        );
+    }
+
+    #[tokio::test]
     async fn the_ticked_set_is_the_enabled_set_and_a_default_is_asked_among_several() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
@@ -4747,6 +4851,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[]),              // nothing ticked: asked again
                 multi(&[0, 2]),          // anthropic_sub + codex_sub
                 select(1),               // the anthropic default: codex_sub
+                select(0),               // openai_chat default: codex_sub
                 confirm(true),           // awake
                 text(&port.to_string()), // the port
                 confirm(false),          // wake/hold/ping timers: no
@@ -4804,6 +4909,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(2),      // openrouter key: an env var
                 text(""),
+                select(0), // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
             ],
@@ -4863,6 +4969,7 @@ default_backend_anthropic = "codex_sub"
                 multi(&[0, 3]), // backends: anthropic_sub + openrouter
                 select(2),      // openrouter key: an env var
                 text(""),
+                select(0), // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
             ],
@@ -4945,7 +5052,7 @@ default_backend_anthropic = "codex_sub"
             "plugin-declined",
             {
                 let mut answers = answers_fresh(port);
-                answers[8] = confirm(false); // the opt-out
+                answers[9] = confirm(false); // the opt-out
                 answers
             },
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
@@ -4984,7 +5091,7 @@ default_backend_anthropic = "codex_sub"
             "plugin-guarded",
             {
                 let mut answers = answers_fresh(port);
-                answers[8] = confirm(false); // the reinstall refusal
+                answers[9] = confirm(false); // the reinstall refusal
                 answers
             },
             with_picker(vec![inactive(), ok_empty(), ok_empty()]),
@@ -5028,7 +5135,7 @@ default_backend_anthropic = "codex_sub"
             "timers-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("09:00, 12:30")]);
+                answers.splice(10..11, [confirm(true), text("09:00, 12:30")]);
                 answers
             },
             with_picker(vec![
@@ -5156,7 +5263,7 @@ default_backend_anthropic = "codex_sub"
             "timers-sudo-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -5240,7 +5347,7 @@ default_backend_anthropic = "codex_sub"
             "timers-enable-refused",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -5291,7 +5398,7 @@ default_backend_anthropic = "codex_sub"
             "timers-user-fail",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("09:00")]); // one slot
+                answers.splice(10..11, [confirm(true), text("09:00")]); // one slot
                 answers
             },
             with_picker(vec![
@@ -5437,7 +5544,7 @@ default_backend_anthropic = "codex_sub"
             "timers-default-slots",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("")]);
+                answers.splice(10..11, [confirm(true), text("")]);
                 answers
             },
             with_picker(vec![
@@ -5617,7 +5724,7 @@ default_backend_anthropic = "codex_sub"
             "timers-retire-stale",
             {
                 let mut answers = answers_fresh(port);
-                answers.splice(9..10, [confirm(true), text("07:20, 12:20")]);
+                answers.splice(10..11, [confirm(true), text("07:20, 12:20")]);
                 answers
             },
             with_picker(vec![

@@ -55,6 +55,25 @@ keep = 1                              # how many of the newest matches to offer
 
 Your list replaces the built-in one; `picker = []` offers nothing. `behaves_as` tells Claude Code which of its own models to treat the row like (its prompting and effort settings); pick the closest in cost and capability. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
 
+## Direct OpenAI API
+
+The setup wizard can enable `openai_api` and place its key in the OS keyring,
+read it from `OPENAI_API_KEY`, or leave authentication to the frontend. To
+configure it by hand:
+
+```toml
+default_backend_openai_chat = "openai_api"
+
+[providers.openai_api]
+```
+
+Bare Chat model names then use `https://api.openai.com/v1`; with several Chat
+backends enabled, `openai_api/<model>` selects it for one request. Toker asks
+streaming completions to include terminal usage and estimates cost only when
+the exact model, service tier, and every required token category are known.
+Unknown pricing evidence leaves the cost blank. `/v1/models` is authenticated
+with the same key and feeds the shared model catalogue.
+
 ## Codex subscription from OpenAI Chat clients
 
 An OpenAI Chat frontend such as opencode can use the Codex subscription

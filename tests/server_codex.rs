@@ -498,6 +498,7 @@ fn test_config(tag: &str, codex_upstream: reqwest::Url, family_map: bool) -> Tes
             api_key: None,
             picker: None,
         }),
+        openai_api: None,
         default_backend_anthropic: Some("codex_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,

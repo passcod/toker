@@ -8,7 +8,8 @@
 //!
 //! Routes:
 //!
-//! - OpenAI-chat frontend (→ OpenRouter Chat or Codex Responses binding):
+//! - OpenAI-chat frontend (→ any registered Chat, Responses, or Messages
+//!   binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
 //!     the IR, routed, recorded ([`proxy`]).
 //!   - `GET /v1/models` — local route-graph projection for a known Chat
@@ -83,7 +84,7 @@ use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
-use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenRouter, Provider};
+use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::Store;
@@ -251,6 +252,14 @@ impl Server {
                 }),
             )) as Arc<dyn Provider>
         });
+        let openai_api = config.openai_api.as_ref().map(|api| {
+            Arc::new(OpenAiApi::new(
+                api.upstream.clone(),
+                api.api_key(|| {
+                    secrets::read_key(secrets.clone(), "openai_api", KEYRING_READ_TIMEOUT)
+                }),
+            )) as Arc<dyn Provider>
+        });
         let anthropic_sub = config.anthropic_sub.as_ref().map(|sub| {
             Arc::new(AnthropicSub::new(
                 sub.upstream.clone(),
@@ -285,6 +294,7 @@ impl Server {
         let codex_sub = codex_turn.clone().map(|codex| codex as Arc<dyn Provider>);
         let providers = [
             openrouter.clone(),
+            openai_api.clone(),
             anthropic_sub.clone(),
             anthropic_api.clone(),
             codex_sub.clone(),
@@ -702,6 +712,19 @@ impl Server {
                 url: openrouter.endpoint("/v1/models"),
                 headers: HeaderMap::new(),
                 fetch: true,
+            });
+        }
+        if let Some(openai) = self.registry.provider("openai_api") {
+            let mut headers = HeaderMap::new();
+            openai.inject_auth(&mut headers);
+            for value in headers.values_mut() {
+                value.set_sensitive(true);
+            }
+            sources.push(fetched::CatalogSource {
+                provider: "openai_api",
+                url: openai.endpoint("/v1/models"),
+                fetch: !headers.is_empty(),
+                headers,
             });
         }
         if let Some(anthropic) = self

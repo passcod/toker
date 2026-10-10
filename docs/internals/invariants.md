@@ -1,9 +1,8 @@
 # The invariants, with their history
 
-The design's own list is in `docs/plans/toker-toolsuite.md` under Invariants,
-numbered differently (it adds serialisation purity and prefix stability, which
-[routing.md](routing.md) covers). This is the list AGENTS.md states, with the
-reasons.
+This is the list AGENTS.md states, with the incidents and reasons behind it.
+Serialisation purity and prefix stability are covered by
+[routing.md](routing.md).
 
 1. **Never log or store prompt or completion content.** Only counts, lengths,
    and digests. Bodies are parsed for `usage` and discarded. The compaction
@@ -29,7 +28,9 @@ reasons.
      `authorization`. On a route to openrouter another provider's credential is
      dropped before the stored one is injected, never forwarded: on the openai
      path, and on the anthropic path's `openrouter/` route, where every request
-     carries Claude's subscription bearer.
+     carries Claude's subscription bearer. The direct OpenAI binding likewise
+     drops Anthropic and OpenRouter credentials before adding its configured
+     bearer; an unknown bearer on its native Chat wire passes through.
    - One request toker makes itself uses a passing credential: the anthropic
      models listing, which names each model's context window. With no API key
      stored, toker has no other way to read it. While that catalogue is stale,
@@ -111,8 +112,9 @@ reasons.
    better, do not add one.
 
 5. **Never guess prices.** Verify against the published pricing page and move
-   `catalog::pricing::VERIFIED_ON`; the context-window table has its own
-   `catalog::windows::VERIFIED_ON`. Cache-read rates are stored explicitly
+   the relevant `VERIFIED_ON`: `catalog::pricing` for Anthropic-compatible
+   pricing, `catalog::openai_pricing` for direct OpenAI, and
+   `catalog::windows` for context windows. Cache-read rates are stored explicitly
    rather than derived as `0.1×` because some models read at `0.025×`, and
    deriving them would overcharge those 4×. A model missing from the table gets
    a NULL cost and a one-time warning, never a number. Codex rows are
@@ -134,8 +136,8 @@ reasons.
      toggled strip would change the cached prefix of every conversation
      carrying one.
    - The `provider/model` prefix strip (`anthropic_sub/`, `anthropic_api/`,
-     `anthropic/`, `openrouter/`) is the client choosing a backend in the model
-     string; `set_model` writes the rest back.
+     `anthropic/`, `openrouter/`, `openai_api/`, `codex_sub/`) is the client
+     choosing a backend in the model string; `set_model` writes the rest back.
    - Force-newest's `set_model` changes the model on a request that can lose no
      cache by it, and nothing else, keeping `cache_control` because that
      conversation still has a cache to build. See [models.md](models.md).

@@ -24,7 +24,8 @@ use futures::Stream;
 use serde_json::Value;
 
 use toker::config::{
-    AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
+    AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenAiApiConfig,
+    OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
 use toker::server::Server;
@@ -101,6 +102,15 @@ const NON_STREAM_BODY: &str = concat!(
     r#""cost":0.000128,"cost_details":{"upstream":0.0001}}}"#,
 );
 
+const OPENAI_NON_STREAM_BODY: &str = concat!(
+    r#"{"id":"chatcmpl-openai","model":"gpt-6.1-sol","service_tier":"default","#,
+    r#""object":"chat.completion","created":1760000600,"#,
+    r#""choices":[{"index":0,"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}],"#,
+    r#""usage":{"prompt_tokens":1100,"completion_tokens":50,"total_tokens":1150,"#,
+    r#""prompt_tokens_details":{"cached_tokens":100,"cache_write_tokens":200},"#,
+    r#""completion_tokens_details":{"reasoning_tokens":10}}}"#,
+);
+
 /// A non-streaming completion carrying a 500k-token prompt — the
 /// cold-gate tests' lane seeder: one recorded response with this shape
 /// lands a lane holding 500,000 tokens, over the 175k cold bar.
@@ -137,6 +147,11 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
     let stream = json.get("stream") == Some(&Value::Bool(true));
 
     match model {
+        "gpt-6.1-sol" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(OPENAI_NON_STREAM_BODY.as_bytes()),
+        ),
         "err-401" => {
             let mut response = raw_response(
                 StatusCode::UNAUTHORIZED,
@@ -312,6 +327,7 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
             api_key,
             picker: None,
         }),
+        openai_api: None,
         default_backend_anthropic: Some("anthropic_sub".to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
@@ -351,6 +367,19 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
         awake: false,
         transcript_roots: Vec::new(),
     }
+}
+
+fn openai_test_config(upstream: reqwest::Url) -> Config {
+    let mut config = test_config(upstream.clone(), UNSET_KEY_ENV, None);
+    config.default_backend_openai_chat = Some("openai_api".to_owned());
+    config.openrouter = None;
+    config.openai_api = Some(OpenAiApiConfig {
+        upstream,
+        api_key_env: UNSET_KEY_ENV.to_owned(),
+        api_key_keyring: false,
+        api_key: Some("sk-proj-test".to_owned()),
+    });
+    config
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
@@ -521,6 +550,61 @@ async fn seed_cold_lane(addr: SocketAddr, store: &Store, body: &[u8]) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(openai_test_config(upstream)).await;
+
+    let response = post_chat(addr, &chat_body("openai_api/gpt-6.1-sol", false)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("chat response");
+    assert_eq!(body["model"], "gpt-6.1-sol");
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].path, "/v1/chat/completions");
+    assert_eq!(
+        captured[0].headers[header::AUTHORIZATION],
+        "Bearer sk-proj-test"
+    );
+    let sent: Value = serde_json::from_slice(&captured[0].body).expect("rendered request");
+    assert_eq!(sent["model"], "gpt-6.1-sol");
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.provider.as_deref(), Some("openai_api"));
+    assert_eq!(row.route.as_deref(), Some("openai_chat:openai_api"));
+    assert_eq!(
+        row.requested_model.as_deref(),
+        Some("openai_api/gpt-6.1-sol")
+    );
+    assert_eq!(row.effective_model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(row.input, Some(800));
+    assert_eq!(row.cache_read, Some(100));
+    assert_eq!(row.cache_write_total, Some(200));
+    assert_eq!(row.output, Some(40));
+    assert_eq!(row.reasoning, Some(10));
+    let expected = (800.0 * 2.0 + 100.0 * 0.1 + 200.0 * 2.5 + 50.0 * 10.0) / 1e6;
+    assert!((row.cost_usd.expect("estimated cost") - expected).abs() < 1e-12);
+    assert_eq!(row.cost_kind, Some(CostKind::Estimated));
+    assert!(
+        store.load_lanes().expect("lanes").is_empty(),
+        "direct OpenAI does not inherit OpenRouter's cache lifetime"
+    );
+}
+
+#[tokio::test]
+async fn direct_openai_streams_always_request_the_usage_chunk() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(openai_test_config(upstream)).await;
+
+    let response = post_chat(addr, &chat_body("gpt-6-luna", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("stream");
+    let sent: Value = serde_json::from_slice(&mock.captured()[0].body).expect("request");
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+}
 
 #[tokio::test]
 async fn sse_completions_cross_canonical_adapters_and_ledger() {
@@ -827,6 +911,57 @@ async fn models_passthrough_is_byte_identical_and_unledgered() {
     // Not a usage path: nothing recorded. Give any racing write a moment
     // to prove its absence.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn unprefixed_models_uses_the_openai_default_and_its_auth() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(openai_test_config(upstream)).await;
+
+    let response = client()
+        .get(toker_url(addr, "/v1/models"))
+        .header(header::AUTHORIZATION, "Bearer sk-or-foreign")
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.expect("models bytes"), MODELS_BODY);
+    let captured = mock.captured();
+    assert_eq!(captured[0].path, "/v1/models");
+    assert_eq!(
+        captured[0].headers[header::AUTHORIZATION],
+        "Bearer sk-proj-test"
+    );
+    assert_eq!(store.count_requests().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn openai_catalogue_projects_bare_and_prefixed_models() {
+    let (mock, upstream) = spawn_mock().await;
+    let config = openai_test_config(upstream);
+    let listing = serde_json::json!({
+        "data": [{"id": "gpt-invented", "created": 123, "owned_by": "openai"}]
+    });
+    let catalog = toker::catalog::fetched::parse_openai(&listing, 1).expect("catalog");
+    let (addr, store) = spawn_toker_cataloged(config, "openai_api", catalog).await;
+
+    let response = client()
+        .get(toker_url(addr, "/f/opencode/v1/models"))
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("models JSON");
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, ["gpt-invented", "openai_api/gpt-invented"]);
+    assert_eq!(body["data"][0]["owned_by"], "openai_api");
+    assert!(mock.captured().is_empty());
     assert_eq!(store.count_requests().expect("count"), 0);
 }
 

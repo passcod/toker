@@ -33,7 +33,7 @@ topic says that too.
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
 | `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick, the drain on shutdown. |
 | `src/server/anthropic.rs` | The Anthropic Messages frontend: release marker, quota gate, cold gate, compaction retarget, force-newest, model map, in that order. |
-| `src/server/proxy.rs` | The OpenAI-chat frontend (opencode → openrouter), with its own cold notice. |
+| `src/server/proxy.rs` | The OpenAI Chat frontend across its configured backend bindings; OpenRouter carries the verified Chat cold notice. |
 | `src/server/codex.rs` | The anthropic frontend's branch onto the codex backend: translate both ways instead of forwarding bytes. |
 | `src/server/quota_events.rs` | Console quota events: threshold crossings, claim changes and non-`allowed` statuses, latched per backend. |
 | `src/server/control.rs` | The `/_toker/*` control endpoints and their header gate. |
@@ -51,8 +51,8 @@ topic says that too.
 | `src/middleware/model_map.rs` | The configured model routing map: model positions only, untouched bytes elsewhere. |
 | `src/middleware/notice.rs` | Rendering a notice in the frontend's style. Pure. |
 | `src/middleware/awake.rs` | The idle-sleep lock: what counts as live, the platform command, the detached child. |
-| `src/providers/` | Backends: `anthropic.rs` (sub and API, and the meter-header parser), `openrouter.rs`, `codex/` (login, wire types, SSE, meters). |
-| `src/catalog/` | Hand-verified prices (`pricing.rs`) and context windows (`windows.rs`), each with a `VERIFIED_ON`; fetched listings (`fetched.rs`) and routable frontend offers (`offers.rs`). |
+| `src/providers/` | Backends: `anthropic.rs` (sub and API, and the meter-header parser), `openrouter.rs`, `openai.rs`, `codex/` (login, wire types, SSE, meters). |
+| `src/catalog/` | Hand-verified Anthropic-compatible and direct OpenAI prices (`pricing.rs`, `openai_pricing.rs`) and context windows (`windows.rs`), each with a `VERIFIED_ON`; fetched listings (`fetched.rs`) and routable frontend offers (`offers.rs`). |
 | `src/store/` | The SQLite ledger (`ledger.rs`), the state tables (`state.rs`), and the append-only migrations (`schema.rs`). |
 | `src/picker.rs` | Claude Code `/model` rows for OpenRouter Messages offers: the rules, the built-in set, and `toker picker sync`. |
 | `src/import.rs` | `toker import`: ctp's `usage.jsonl` into the ledger, with a checkpoint. |

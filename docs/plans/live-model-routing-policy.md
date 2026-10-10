@@ -1,5 +1,8 @@
 # Live model routing policy and TUI
 
+Status: accepted design; not implemented. The companion implementation plan
+is the active execution sequence.
+
 ## Purpose
 
 Replace the growing collection of provider-specific model picker, model map,

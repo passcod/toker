@@ -54,7 +54,8 @@ and a request with no tools keys the empty tool list's lane, as a real tool set
 of its own. The TUI's rebuild walk gives a NULL `tools_hash` its own lane rather
 than a shared one.
 
-The openai path's lanes run on openrouter's 10-minute sticky window
+OpenRouter Chat lanes run on its 10-minute sticky window
 (`lanes::OPENAI_LANE_TTL_MS`), a recognised duration in `cold::ttl_of`. Reading
 it as the unrecognised long tier would hold the sleep lock for an hour after
-every openai request.
+every OpenRouter request. Other Chat bindings have no lane until their cache
+lifetime is represented per binding; they must not borrow OpenRouter's clock.

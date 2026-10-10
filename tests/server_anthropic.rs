@@ -551,6 +551,7 @@ fn test_config(
             api_key: None,
             picker: None,
         }),
+        openai_api: None,
         default_backend_anthropic: Some(default_backend.to_owned()),
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,

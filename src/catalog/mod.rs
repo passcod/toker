@@ -38,6 +38,7 @@
 
 pub mod fetched;
 pub mod offers;
+pub mod openai_pricing;
 pub mod pricing;
 pub mod windows;
 
