@@ -48,12 +48,12 @@
 //! | `output_item.done` of a `message` | [`TextEnded`](CanonEvent::TextEnded) — the text part completed |
 //! | `output_item.done` of a `reasoning` item | [`ThinkingEnded`](CanonEvent::ThinkingEnded) — the reasoning part completed |
 //! | `output_item.done` of a `function_call` | [`ToolCall`](CanonEvent::ToolCall), COMPLETE — the done item carries the whole arguments; a call whose fields do not fit the typed view is skipped, never corrupted into the stream (invariant 6) |
-//! | `output_item.done` of any other kind | nothing |
-//! | `response.completed` | [`TurnEnded`](CanonEvent::TurnEnded) — `tool_use` when any function call completed, else `end_turn`; the usage → [`CanonicalUsage`] |
+//! | output events for a provider-owned item kind | [`ProviderEvent`](CanonEvent::ProviderEvent), opaque and tagged with the Responses dialect so only a compatible frontend replays it |
+//! | `response.completed` | [`TurnEnded`](CanonEvent::TurnEnded) — explicit `end_turn` wins; only an absent flag falls back to whether a function call completed; the usage → [`CanonicalUsage`] |
 //! | `response.incomplete` | [`TurnEnded`](CanonEvent::TurnEnded) — `content_filter` reads as the refusal, anything else as the incomplete stop reason (verbatim) |
 //! | `response.failed` | [`TurnFailed`](CanonEvent::TurnFailed) — terminal |
 //! | a top-level `error` | [`Error`](CanonEvent::Error) — not terminal |
-//! | `output_item.added`, unknown kinds | nothing (they never had a canonical shape) |
+//! | other `output_item.added` and unknown kinds | nothing (they never had a canonical shape) |
 //!
 //! ## The error table's interpretation half
 //!
@@ -72,6 +72,8 @@
 //! (the canonical carries the result, never the fallback chain):
 //! the wire's message, standing in on the `code`, then the `kind`,
 //! then the constant `"upstream error"` — never invented.
+
+use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
@@ -613,8 +615,9 @@ fn wire_role(role: CanonRole) -> &'static str {
 /// [`CanonEvent`]s they mean (the interpretation table lives in the
 /// module docs). One stream per turn.
 ///
-/// The interpretation is stateful in exactly one fact — whether any
-/// function call completed, the `completed` stop reason's input.
+/// The interpretation is stateful in the completed function-call fact and
+/// the identities of provider-owned output items whose incremental events a
+/// compatible Responses frontend may replay.
 /// Everything else is a pure function of the event under
 /// interpretation (invariant 4).
 #[derive(Debug, Clone, Default)]
@@ -623,6 +626,7 @@ pub struct CanonStream {
     /// (the tool_use stop reason) — a call whose fields did not fit
     /// the typed view was skipped, so it does not count.
     function_calls: bool,
+    opaque_item_ids: HashSet<String>,
 }
 
 impl CanonStream {
@@ -664,18 +668,31 @@ impl CanonStream {
                     delta: delta.clone(),
                 });
             }
-            ResponseEvent::OutputItemAdded { item } if item.kind() == Some("reasoning") => {
+            ResponseEvent::OutputItemAdded { item, .. } if item.kind() == Some("reasoning") => {
                 out.push(CanonEvent::ReasoningStarted {
                     provider_id: item.id().map(str::to_owned),
                 });
             }
-            ResponseEvent::OutputItemDone { item } => self.item_done(item, &mut out),
+            ResponseEvent::OutputItemAdded { item, data } if is_provider_owned(item) => {
+                if let Some(id) = item.id() {
+                    self.opaque_item_ids.insert(id.to_owned());
+                }
+                out.push(provider_event("response.output_item.added", data));
+            }
+            ResponseEvent::OutputItemDone { item, data } if is_provider_owned(item) => {
+                out.push(provider_event("response.output_item.done", data));
+                if let Some(id) = item.id() {
+                    self.opaque_item_ids.remove(id);
+                }
+            }
+            ResponseEvent::OutputItemDone { item, .. } => self.item_done(item, &mut out),
             ResponseEvent::Completed { response } => {
                 out.push(CanonEvent::TurnEnded {
-                    stop_reason: if self.function_calls {
-                        CanonStopReason::ToolUse
-                    } else {
-                        CanonStopReason::EndTurn
+                    stop_reason: match response.end_turn {
+                        Some(false) => CanonStopReason::ToolUse,
+                        Some(true) => CanonStopReason::EndTurn,
+                        None if self.function_calls => CanonStopReason::ToolUse,
+                        None => CanonStopReason::EndTurn,
                     },
                     usage: response.usage.as_ref().map(canonical_usage),
                 });
@@ -701,6 +718,14 @@ impl CanonStream {
                 out.push(CanonEvent::Error {
                     error: canon_error_from_response(error),
                 });
+            }
+            ResponseEvent::Unknown { kind, data }
+                if data
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| self.opaque_item_ids.contains(id)) =>
+            {
+                out.push(provider_event(kind, data));
             }
             ResponseEvent::OutputItemAdded { .. } | ResponseEvent::Unknown { .. } => {}
         }
@@ -741,6 +766,18 @@ impl CanonStream {
             _ => {}
         }
     }
+}
+
+fn is_provider_owned(item: &Item) -> bool {
+    !matches!(item.kind(), Some("message" | "reasoning" | "function_call"))
+}
+
+fn provider_event(kind: &str, data: &Value) -> CanonEvent {
+    CanonEvent::ProviderEvent(CanonicalExtension::new(
+        DialectId::CodexResponses,
+        format!("$.events.{kind}"),
+        data.clone(),
+    ))
 }
 
 /// One Responses usage → the canonical buckets, with the raw usage
@@ -828,6 +865,8 @@ pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
         stop_reason: match capture.incomplete_reason() {
             Some("content_filter") => CanonStopReason::Refusal,
             Some(other) => CanonStopReason::Incomplete(other.to_owned()),
+            None if capture.end_turn() == Some(false) => CanonStopReason::ToolUse,
+            None if capture.end_turn() == Some(true) => CanonStopReason::EndTurn,
             None if !capture.function_calls().is_empty() => CanonStopReason::ToolUse,
             None => CanonStopReason::EndTurn,
         },
@@ -840,6 +879,13 @@ pub fn canonical_turn_from_capture(capture: &TurnCapture) -> CanonTurn {
                 id: call.call_id,
                 name: call.name,
                 arguments: call.arguments,
+            })
+            .collect(),
+        output_extensions: capture
+            .items()
+            .iter()
+            .map(|item| {
+                CanonicalExtension::new(DialectId::CodexResponses, "$.output[]", item.0.clone())
             })
             .collect(),
         blocks: blocks_from_capture(capture),
@@ -1888,26 +1934,34 @@ mod tests {
         assert_eq!(
             stream.feed(&ResponseEvent::OutputItemDone {
                 item: Item::message("assistant", vec![ContentPart::output_text("text")]),
+                data: json!({}),
             }),
             vec![CanonEvent::TextEnded]
         );
         assert_eq!(
             stream.feed(&ResponseEvent::OutputItemDone {
                 item: Item::reasoning(vec!["thought".to_owned()], None),
+                data: json!({}),
             }),
             vec![CanonEvent::ThinkingEnded]
         );
         assert_eq!(
             stream.feed(&ResponseEvent::OutputItemDone {
                 item: Item(json!({"type": "web_search_call", "id": "ws_1"})),
+                data: json!({"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}),
             }),
-            Vec::<CanonEvent>::new()
+            vec![CanonEvent::ProviderEvent(CanonicalExtension::new(
+                DialectId::CodexResponses,
+                "$.events.response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}),
+            ))]
         );
         // A function_call whose fields do not fit the typed view is
         // skipped, never corrupted — and does not count as a call.
         assert_eq!(
             stream.feed(&ResponseEvent::OutputItemDone {
                 item: Item(json!({"type": "function_call", "name": 5})),
+                data: json!({}),
             }),
             Vec::<CanonEvent>::new()
         );
@@ -1925,6 +1979,7 @@ mod tests {
         assert_eq!(
             stream.feed(&ResponseEvent::OutputItemAdded {
                 item: Item::message("assistant", vec![]),
+                data: json!({}),
             }),
             Vec::<CanonEvent>::new()
         );
@@ -1938,15 +1993,46 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_turn_reads_its_stop_reason_from_the_items() {
+    fn a_completed_turn_prefers_its_explicit_end_turn_semantics() {
         let call = || ResponseEvent::OutputItemDone {
             item: Item::function_call("read_file", r#"{"a":1}"#, "call_1"),
+            data: json!({}),
         };
         // No call: the natural end.
         let mut stream = CanonStream::new();
         assert_eq!(
             stream.feed(&ResponseEvent::Completed {
                 response: CompletedResponse::default(),
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::EndTurn,
+                usage: None,
+            }]
+        );
+        // A provider-owned tool kind has no portable ToolCall, but the
+        // terminal flag still says the client must continue with a result.
+        let mut stream = CanonStream::new();
+        assert_eq!(
+            stream.feed(&ResponseEvent::Completed {
+                response: CompletedResponse {
+                    end_turn: Some(false),
+                    ..CompletedResponse::default()
+                },
+            }),
+            vec![CanonEvent::TurnEnded {
+                stop_reason: CanonStopReason::ToolUse,
+                usage: None,
+            }]
+        );
+        // The terminal flag is authoritative in the other direction too.
+        let mut stream = CanonStream::new();
+        stream.feed(&call());
+        assert_eq!(
+            stream.feed(&ResponseEvent::Completed {
+                response: CompletedResponse {
+                    end_turn: Some(true),
+                    ..CompletedResponse::default()
+                },
             }),
             vec![CanonEvent::TurnEnded {
                 stop_reason: CanonStopReason::EndTurn,
@@ -1997,6 +2083,65 @@ mod tests {
                 }),
             }]
         );
+    }
+
+    #[test]
+    fn provider_owned_output_item_events_cross_the_canonical_stream_opaquely() {
+        let item = Item(json!({
+            "type": "custom_tool_call", "id": "ctc_probe", "call_id": "call_probe",
+            "name": "exec", "input": "PROBE_INPUT", "status": "in_progress"
+        }));
+        let added = json!({
+            "type": "response.output_item.added", "sequence_number": 1,
+            "output_index": 0, "item": item.0
+        });
+        let delta = json!({
+            "type": "response.custom_tool_call_input.delta", "sequence_number": 2,
+            "item_id": "ctc_probe", "output_index": 0, "delta": "PROBE_INPUT"
+        });
+        let done = json!({
+            "type": "response.output_item.done", "sequence_number": 3,
+            "output_index": 0, "item": {
+                "type": "custom_tool_call", "id": "ctc_probe", "call_id": "call_probe",
+                "name": "exec", "input": "PROBE_INPUT", "status": "completed"
+            }
+        });
+        let mut stream = CanonStream::new();
+        for (event, kind, data) in [
+            (
+                ResponseEvent::OutputItemAdded {
+                    item,
+                    data: added.clone(),
+                },
+                "response.output_item.added",
+                added,
+            ),
+            (
+                ResponseEvent::Unknown {
+                    kind: "response.custom_tool_call_input.delta".to_owned(),
+                    data: delta.clone(),
+                },
+                "response.custom_tool_call_input.delta",
+                delta,
+            ),
+            (
+                ResponseEvent::OutputItemDone {
+                    item: Item(done["item"].clone()),
+                    data: done.clone(),
+                },
+                "response.output_item.done",
+                done,
+            ),
+        ] {
+            assert_eq!(
+                stream.feed(&event),
+                vec![CanonEvent::ProviderEvent(CanonicalExtension::new(
+                    DialectId::CodexResponses,
+                    format!("$.events.{kind}"),
+                    data,
+                ))]
+            );
+        }
     }
 
     #[test]
@@ -2185,6 +2330,23 @@ mod tests {
                     name: "read_file".to_owned(),
                     arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
                 }],
+                output_extensions: vec![
+                    CanonicalExtension::new(
+                        DialectId::CodexResponses,
+                        "$.output[]",
+                        json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Reading the thread files."}],"encrypted_content":"opaque-encrypted-reasoning"}),
+                    ),
+                    CanonicalExtension::new(
+                        DialectId::CodexResponses,
+                        "$.output[]",
+                        json!({"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"I'll read the files, then café."}],"status":"completed"}),
+                    ),
+                    CanonicalExtension::new(
+                        DialectId::CodexResponses,
+                        "$.output[]",
+                        json!({"type":"function_call","id":"fc_1","call_id":"call_read1","name":"read_file","arguments":"{\"path\":\"src/main.rs\"}","status":"completed"}),
+                    ),
+                ],
                 blocks: Some(vec![
                     CanonBlock::Thinking {
                         text: "Reading the thread files.".to_owned(),
@@ -2241,6 +2403,7 @@ mod tests {
                 usage: None,
                 error: None,
                 tool_calls: Vec::new(),
+                output_extensions: Vec::new(),
                 blocks: None,
                 text: String::new(),
                 thinking: [].into(),

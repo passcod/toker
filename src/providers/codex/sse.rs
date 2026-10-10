@@ -119,11 +119,15 @@ fn event_of(raw: SseEvent) -> Option<ResponseEvent> {
             Some(ResponseEvent::Created { response_id, model })
         }
         "response.output_item.added" => {
-            item_of(&value).map(|item| ResponseEvent::OutputItemAdded { item })
+            item_of(&value).map(|item| ResponseEvent::OutputItemAdded {
+                item,
+                data: value.clone(),
+            })
         }
-        "response.output_item.done" => {
-            item_of(&value).map(|item| ResponseEvent::OutputItemDone { item })
-        }
+        "response.output_item.done" => item_of(&value).map(|item| ResponseEvent::OutputItemDone {
+            item,
+            data: value.clone(),
+        }),
         "response.output_text.delta" => {
             str_of(&value, "delta").map(|delta| ResponseEvent::OutputTextDelta { delta })
         }
@@ -242,7 +246,7 @@ impl TurnCapture {
                     self.model.clone_from(model);
                 }
             }
-            ResponseEvent::OutputItemDone { item } => self.items.push(item.clone()),
+            ResponseEvent::OutputItemDone { item, .. } => self.items.push(item.clone()),
             ResponseEvent::OutputTextDelta { delta } => self.text.push_str(delta),
             ResponseEvent::ReasoningSummaryDelta {
                 delta,

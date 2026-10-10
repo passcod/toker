@@ -616,6 +616,22 @@ impl OpenAiResponsesRenderer {
             CanonEvent::Error { error } => {
                 out.push(self.sse("error", json!({"error": responses_error(error)})));
             }
+            CanonEvent::ProviderEvent(extension)
+                if extension.source() == DialectId::CodexResponses =>
+            {
+                let Some(kind) = extension.value().get("type").and_then(Value::as_str) else {
+                    return out;
+                };
+                if let Some(index) = extension
+                    .value()
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                {
+                    self.next_output_index = self.next_output_index.max(index.saturating_add(1));
+                }
+                out.push(self.sse(kind, extension.value().clone()));
+            }
+            CanonEvent::ProviderEvent(_) => {}
         }
         out
     }
@@ -754,6 +770,17 @@ pub fn openai_responses_from_canonical(model: &str, turn: &CanonTurn) -> Value {
 }
 
 fn response_output(turn: &CanonTurn) -> Vec<Value> {
+    let provider_output = turn
+        .output_extensions
+        .iter()
+        .filter(|extension| {
+            extension.source() == DialectId::CodexResponses && extension.wire_path() == "$.output[]"
+        })
+        .map(|extension| extension.value().clone())
+        .collect::<Vec<_>>();
+    if !provider_output.is_empty() {
+        return provider_output;
+    }
     if let Some(blocks) = &turn.blocks {
         let mut output = Vec::new();
         let mut index = 0;
@@ -1247,6 +1274,7 @@ mod tests {
                 name: "lookup".to_owned(),
                 arguments: "{\"id\":1}".to_owned(),
             }],
+            output_extensions: Vec::new(),
             blocks: Some(vec![
                 CanonBlock::Thinking {
                     text: "consider".to_owned(),

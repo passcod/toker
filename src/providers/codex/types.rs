@@ -361,10 +361,10 @@ pub enum ResponseEvent {
     },
     /// `response.output_item.added` — an item mid-assembly (a function
     /// call's arguments may still be partial here).
-    OutputItemAdded { item: Item },
+    OutputItemAdded { item: Item, data: Value },
     /// `response.output_item.done` — the item complete: a function
     /// call's arguments arrive whole here, never via the deltas.
-    OutputItemDone { item: Item },
+    OutputItemDone { item: Item, data: Value },
     /// `response.output_text.delta`.
     OutputTextDelta { delta: String },
     /// `response.reasoning_summary_text.delta` — one summary, indexed.

@@ -550,6 +550,7 @@ impl OpenAiChatRenderer {
                     event: None,
                 }]
             }
+            CanonEvent::ProviderEvent(_) => Vec::new(),
         }
     }
 
@@ -828,6 +829,7 @@ mod tests {
             usage: None,
             error: None,
             tool_calls: Vec::new(),
+            output_extensions: Vec::new(),
             blocks: None,
             text: "hello".to_owned(),
             thinking: BTreeMap::new(),
@@ -859,6 +861,7 @@ mod tests {
             usage: Some(usage.clone()),
             error: None,
             tool_calls: Vec::new(),
+            output_extensions: Vec::new(),
             blocks: None,
             text: "done".to_owned(),
             thinking: BTreeMap::new(),

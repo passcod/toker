@@ -479,10 +479,10 @@ pub struct CanonToolCall {
     pub arguments: String,
 }
 
-/// Why the turn ended. The codex backend's reading of its wire: any
-/// completed function call →
-/// [`ToolUse`](CanonStopReason::ToolUse), else
-/// [`EndTurn`](CanonStopReason::EndTurn); an incomplete turn's
+/// Why the turn ended. The codex backend's explicit `end_turn` flag maps to
+/// [`ToolUse`](CanonStopReason::ToolUse) when false and
+/// [`EndTurn`](CanonStopReason::EndTurn) when true; only its absence falls
+/// back to whether a completed function call was observed. An incomplete turn's
 /// `content_filter` → [`Refusal`](CanonStopReason::Refusal), any
 /// other incompleteness →
 /// [`Incomplete`](CanonStopReason::Incomplete) with the reason
@@ -657,6 +657,9 @@ pub enum CanonEvent {
     /// backend whose error ENDS the turn emits
     /// [`CanonEvent::TurnFailed`] instead).
     Error { error: CanonError },
+    /// A provider-owned stream event that has no portable semantic shape.
+    /// Only a frontend of the same dialect may replay its opaque payload.
+    ProviderEvent(CanonicalExtension),
 }
 
 /// One canonical turn, complete — the non-streaming path's unit: a
@@ -678,6 +681,9 @@ pub struct CanonTurn {
     pub error: Option<CanonError>,
     /// The complete tool calls, in completion order, arguments whole.
     pub tool_calls: Vec<CanonToolCall>,
+    /// Provider-owned complete output items, in wire order. A compatible
+    /// frontend may replay them; foreign frontends ignore the opaque values.
+    pub output_extensions: Vec<CanonicalExtension>,
     /// Exact canonical response blocks when the backend supplied a complete
     /// ordered message. Streaming-only backends and older aggregators leave
     /// this absent and use the flattened fields below.

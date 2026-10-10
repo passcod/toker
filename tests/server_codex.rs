@@ -138,6 +138,36 @@ fn turn_opening() -> Bytes {
     turn.slice(..cut)
 }
 
+fn custom_tool_turn() -> Bytes {
+    Bytes::from_static(
+        br#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_probe","object":"response","status":"in_progress","model":"custom-tool-probe"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_probe","role":"assistant","content":[],"status":"in_progress"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_probe","output_index":0,"content_index":0,"delta":"PROBE_TEXT"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"message","id":"msg_probe","role":"assistant","content":[{"type":"output_text","text":"PROBE_TEXT"}],"status":"completed"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":4,"output_index":1,"item":{"type":"custom_tool_call","id":"ctc_probe","call_id":"call_probe","name":"exec","input":"PROBE_INPUT","status":"in_progress"}}
+
+event: response.custom_tool_call_input.delta
+data: {"type":"response.custom_tool_call_input.delta","sequence_number":5,"item_id":"ctc_probe","output_index":1,"delta":"PROBE_INPUT"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":6,"output_index":1,"item":{"type":"custom_tool_call","id":"ctc_probe","call_id":"call_probe","name":"exec","input":"PROBE_INPUT","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":7,"response":{"id":"resp_probe","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"end_turn":false}}
+
+"#,
+    )
+}
+
 async fn mock_responses(State(mock): State<MockState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024)
@@ -164,6 +194,9 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
             "text/event-stream",
             fixture("01_tool_call_turn.sse"),
         ),
+        "custom-tool-probe" => {
+            raw_response(StatusCode::OK, "text/event-stream", custom_tool_turn())
+        }
         "err-401" => raw_response(
             StatusCode::UNAUTHORIZED,
             "application/json",
@@ -787,6 +820,55 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         row.extra.as_ref().and_then(|extra| extra.get("frontend")),
         Some(&json!("codex"))
     );
+}
+
+#[tokio::test]
+async fn native_responses_replays_provider_owned_custom_tool_calls() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config("native-custom-tool", upstream, false)).await;
+    let request = json!({
+        "model": "codex_sub/custom-tool-probe",
+        "prompt_cache_key": "custom-tool-session",
+        "instructions": "PROBE_INSTRUCTIONS",
+        "input": [{"role": "user", "content": "PROBE_REQUEST"}],
+        "tools": [{
+            "type": "custom", "name": "exec", "description": "PROBE_TOOL",
+            "format": {"type": "text"}
+        }],
+        "stream": true
+    });
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer frontend-must-not-pass")
+        .json(&request)
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("Responses SSE");
+    assert!(body.contains(r#""type":"custom_tool_call""#));
+    assert!(body.contains(r#""type":"response.custom_tool_call_input.delta""#));
+    assert!(body.contains(r#""input":"PROBE_INPUT""#));
+    assert!(body.contains(r#""end_turn":false"#));
+    assert!(!body.contains(r#""end_turn":true"#));
+
+    let mut complete_request = request;
+    complete_request["stream"] = json!(false);
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer frontend-must-not-pass")
+        .json(&complete_request)
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("complete Responses JSON");
+    assert_eq!(body["end_turn"], false);
+    assert_eq!(body["output"][0]["content"][0]["text"], "PROBE_TEXT");
+    assert_eq!(body["output"][1]["type"], "custom_tool_call");
+    assert_eq!(body["output"][1]["input"], "PROBE_INPUT");
 }
 
 #[tokio::test]

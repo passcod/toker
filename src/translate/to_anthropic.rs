@@ -356,15 +356,18 @@ mod tests {
             },
             ResponseEvent::OutputItemDone {
                 item: Item::message("assistant", vec![ContentPart::output_text("Part one.")]),
+                data: json!({}),
             },
             ResponseEvent::OutputItemDone {
                 item: Item::function_call("read_file", r#"{"a":1}"#, "call_1"),
+                data: json!({}),
             },
             ResponseEvent::OutputTextDelta {
                 delta: "Part two.".to_owned(),
             },
             ResponseEvent::OutputItemDone {
                 item: Item::message("assistant", vec![ContentPart::output_text("Part two.")]),
+                data: json!({}),
             },
             ResponseEvent::Completed {
                 response: CompletedResponse {
@@ -428,6 +431,7 @@ mod tests {
             stream
                 .feed(&ResponseEvent::OutputItemAdded {
                     item: Item::message("assistant", vec![]),
+                    data: json!({}),
                 })
                 .is_empty()
         );

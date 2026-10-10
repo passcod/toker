@@ -1096,6 +1096,7 @@ impl AnthropicRenderer {
             CanonEvent::Error { error } => {
                 out.push(sse_event("error", anthropic_error_event_data(error)));
             }
+            CanonEvent::ProviderEvent(_) => {}
         }
         out
     }
@@ -2798,6 +2799,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
             }],
+            output_extensions: Vec::new(),
             blocks: None,
             text: "I'll read the files.".to_owned(),
             thinking: [
@@ -2834,6 +2836,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 arguments: "not json at all".to_owned(),
             }],
+            output_extensions: Vec::new(),
             blocks: None,
             text: String::new(),
             thinking: BTreeMap::new(),
@@ -2858,6 +2861,7 @@ mod tests {
                 resets_at: None,
             }),
             tool_calls: Vec::new(),
+            output_extensions: Vec::new(),
             blocks: None,
             text: "partial".to_owned(),
             thinking: BTreeMap::new(),
@@ -2881,6 +2885,7 @@ mod tests {
             usage: None,
             error: None,
             tool_calls: Vec::new(),
+            output_extensions: Vec::new(),
             blocks: None,
             text: String::new(),
             thinking: BTreeMap::new(),

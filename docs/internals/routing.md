@@ -55,7 +55,10 @@ parses the request into canonical IR, deterministically renders it for the
 Codex binding, interprets upstream events canonically, and renders Responses
 events back to the client. Compatible extensions, provider-owned input items
 (including encrypted reasoning and incremental tool declarations), and
-provider-owned tool kinds replay opaquely through the canonical model. This
+provider-owned tool kinds replay opaquely through the canonical model. The
+same applies to provider-owned response items and their incremental events;
+the terminal `end_turn` flag remains authoritative even when the item has no
+portable tool-call shape. This
 lets a newer frontend shape reach a compatible backend without requiring toker
 to understand its contents. Toker always replaces the frontend credential
 with its shared Codex login before the request leaves loopback.
