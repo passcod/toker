@@ -217,6 +217,9 @@ pub struct Server {
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
+    /// Atomically captured candidate policy and live evidence. It remains
+    /// non-authoritative until the explicit routing cutover.
+    pub(crate) policy_runtime: Option<Arc<crate::policy::PolicyRuntime>>,
     /// In-memory revision-one resolver used only to compare decisions made by
     /// the still-authoritative legacy path.
     pub(crate) policy_shadow: Option<Arc<PolicyShadow<LegacyLearningView>>>,
@@ -375,24 +378,31 @@ impl Server {
         ));
         let initial_catalogs = FetchedCatalogs::default();
         let inventory = offers::inventory(&registry, &initial_catalogs);
-        let policy_shadow = match crate::policy::legacy::compile(&config, &registry, &inventory)
+        let policy_runtime = match crate::policy::legacy::compile(&config, &registry, &inventory)
             .and_then(|compilation| {
                 compilation
                     .into_policy()
                     .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
             }) {
-            Ok(policy) => Some(Arc::new(PolicyShadow::new(
+            Ok(policy) => Some(Arc::new(crate::policy::PolicyRuntime::new(
+                store.clone(),
+                registry.clone(),
                 Arc::new(policy),
                 Arc::new(inventory),
                 Arc::new(availability_for(&registry, &initial_catalogs)),
-                Arc::new(LegacyLearningView::new(models.clone())),
-                shadow_observer.clone(),
             ))),
             Err(error) => {
                 tracing::warn!(code = "policy-shadow-startup-disabled", %error);
                 None
             }
         };
+        let policy_shadow = policy_runtime.as_ref().map(|runtime| {
+            Arc::new(PolicyShadow::new(
+                runtime.clone(),
+                Arc::new(LegacyLearningView::new(models.clone())),
+                shadow_observer.clone(),
+            ))
+        });
         Ok(Server {
             store,
             config: Arc::new(config),
@@ -412,6 +422,7 @@ impl Server {
             shutdown: Arc::default(),
             force: Arc::default(),
             quota_events: Arc::default(),
+            policy_runtime,
             policy_shadow,
         })
     }
@@ -914,11 +925,11 @@ impl Server {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *catalogs = next;
-        if let Some(shadow) = &self.policy_shadow {
+        if let Some(runtime) = &self.policy_runtime {
             // Model-list readers retain this catalogue guard through their
             // comparison, so they can observe only the old pair or new pair.
             if let Some(policy) = policy {
-                shadow.replace_snapshot(
+                runtime.replace_candidate(
                     Arc::new(policy),
                     Arc::new(inventory),
                     Arc::new(availability),
@@ -928,7 +939,10 @@ impl Server {
                     code = "policy-shadow-refresh-disabled",
                     "policy shadow disabled for catalogue generation"
                 );
-                shadow.clear_snapshot();
+                runtime.replace_evidence_and_clear_candidate(
+                    Arc::new(inventory),
+                    Arc::new(availability),
+                );
             }
         }
     }

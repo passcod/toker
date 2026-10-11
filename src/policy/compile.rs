@@ -214,6 +214,7 @@ pub struct CompiledCandidate {
     model: CompiledCandidateModel,
     upgrade_policy_id: Option<UpgradePolicyId>,
     alias_rules: Vec<CompiledAliasRule>,
+    health_circuits: BTreeMap<FailureClass, u64>,
     enabled: bool,
     required_capabilities: super::CapabilityFlags,
 }
@@ -233,6 +234,9 @@ impl CompiledCandidate {
     }
     pub fn alias_rules(&self) -> &[CompiledAliasRule] {
         &self.alias_rules
+    }
+    pub fn health_circuit_seconds(&self, failure: FailureClass) -> Option<u64> {
+        self.health_circuits.get(&failure).copied()
     }
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -925,12 +929,18 @@ impl<'a> Compiler<'a> {
             path,
             candidate.id.as_stable_id(),
         )?;
+        let health_circuits = candidate
+            .health_circuits
+            .iter()
+            .map(|circuit| (circuit.failure, circuit.duration_seconds))
+            .collect();
         Some(CompiledCandidate {
             id: candidate.id.clone(),
             binding_id: candidate.binding_id.clone(),
             model,
             upgrade_policy_id: candidate.upgrade_policy_id.clone(),
             alias_rules,
+            health_circuits,
             enabled: candidate.enabled,
             required_capabilities: candidate.required_capabilities,
         })
@@ -1975,12 +1985,40 @@ mod tests {
     fn authored_document_compiles_to_closed_lookup_indexes() {
         let compilation = compile_document(document(), PolicyOrigin::Authored);
         let policy = compilation.policy().expect("compiled");
-        assert!(policy.route(&route_id("route")).is_some());
+        let route = policy.route(&route_id("route")).expect("route");
+        assert_eq!(
+            route.candidates()[0].health_circuit_seconds(FailureClass::Overload),
+            None
+        );
         assert!(policy.presentation(&scope(), "friendly").is_some());
         assert!(policy.default_route(&scope()).is_some());
         assert_eq!(
             codes(&compilation),
             ["binding-unconfigured", "offer-unknown"]
+        );
+    }
+
+    #[test]
+    fn candidate_health_circuit_durations_survive_compilation() {
+        let mut document = document();
+        document.routes[0].chain.first.health_circuits = vec![HealthCircuit {
+            failure: FailureClass::Overload,
+            duration_seconds: 17,
+        }];
+        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let candidate = &compilation
+            .policy()
+            .expect("compiled")
+            .route(&route_id("route"))
+            .expect("route")
+            .candidates()[0];
+        assert_eq!(
+            candidate.health_circuit_seconds(FailureClass::Overload),
+            Some(17)
+        );
+        assert_eq!(
+            candidate.health_circuit_seconds(FailureClass::ServerError),
+            None
         );
     }
 

@@ -724,7 +724,14 @@ impl Candidate {
         }
         let circuits_path = field(path, "health_circuits");
         check_collection(&self.health_circuits, &circuits_path)?;
+        let mut failures = HashSet::new();
         for (index, circuit) in self.health_circuits.iter().enumerate() {
+            if !failures.insert(circuit.failure) {
+                return Err(DocumentError::DuplicateId {
+                    path: circuits_path,
+                    id: format!("{:?}", circuit.failure).to_ascii_lowercase(),
+                });
+            }
             if circuit.duration_seconds == 0 {
                 return Err(DocumentError::InvalidValue(field(
                     &indexed(&circuits_path, index),
@@ -1245,6 +1252,45 @@ mod tests {
             enabled: true,
             health_circuits: vec![],
         }
+    }
+
+    #[test]
+    fn candidate_health_circuits_require_one_positive_duration_per_failure() {
+        let mut candidate = candidate("candidate");
+        candidate.health_circuits = vec![
+            HealthCircuit {
+                failure: FailureClass::Overload,
+                duration_seconds: 10,
+            },
+            HealthCircuit {
+                failure: FailureClass::Overload,
+                duration_seconds: 20,
+            },
+        ];
+        let mut document = empty_document();
+        document.routes.push(Route {
+            id: RouteId::new("route").unwrap(),
+            display_name: "route".to_owned(),
+            description: None,
+            parameters: vec![],
+            chain: RouteChain {
+                first: candidate,
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        });
+        assert!(matches!(
+            document.validate(),
+            Err(DocumentError::DuplicateId { path, .. })
+                if path == "/routes/0/chain/first/health_circuits"
+        ));
+        document.routes[0].chain.first.health_circuits[1].failure = FailureClass::ServerError;
+        document.routes[0].chain.first.health_circuits[1].duration_seconds = 0;
+        assert!(matches!(
+            document.validate(),
+            Err(DocumentError::InvalidValue(path))
+                if path == "/routes/0/chain/first/health_circuits/1/duration_seconds"
+        ));
     }
 
     fn edge() -> CandidateEdge {

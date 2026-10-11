@@ -7,15 +7,13 @@
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use super::{
-    AttemptPlan, AvailabilitySnapshot, CompiledPolicy, LaneFacts, LearningView, RequestFacts,
+    AttemptPlan, LaneFacts, LearningView, PolicyRuntime, PolicySnapshot, RequestFacts,
     ResolveFailure, RouteProvenance, resolve,
 };
-use crate::catalog::offers::OfferInventory;
-
 const SHADOW_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,20 +114,14 @@ impl ShadowObserver for CollectingObserver {
 }
 
 pub struct PolicyShadow<L> {
-    snapshot: Arc<RwLock<Option<Arc<ShadowSnapshot>>>>,
+    policy_runtime: Arc<PolicyRuntime>,
     runtime: Arc<ShadowRuntime>,
     _learning: std::marker::PhantomData<fn() -> L>,
 }
 
-struct ShadowSnapshot {
-    policy: Arc<CompiledPolicy>,
-    inventory: Arc<OfferInventory>,
-    availability: Arc<AvailabilitySnapshot>,
-}
-
 enum ShadowJob {
     Resolve {
-        snapshot: Arc<ShadowSnapshot>,
+        snapshot: Arc<PolicySnapshot>,
         facts: RequestFacts,
         lane: Option<LaneFacts>,
         legacy: LegacyOutcome,
@@ -163,7 +155,7 @@ impl Drop for ShadowRuntime {
 impl<L> Clone for PolicyShadow<L> {
     fn clone(&self) -> Self {
         Self {
-            snapshot: self.snapshot.clone(),
+            policy_runtime: self.policy_runtime.clone(),
             runtime: self.runtime.clone(),
             _learning: std::marker::PhantomData,
         }
@@ -175,9 +167,7 @@ where
     L: LearningView + Send + Sync + 'static,
 {
     pub fn new(
-        policy: Arc<CompiledPolicy>,
-        inventory: Arc<OfferInventory>,
-        availability: Arc<AvailabilitySnapshot>,
+        policy_runtime: Arc<PolicyRuntime>,
         learning: Arc<L>,
         observer: Arc<dyn ShadowObserver>,
     ) -> Self {
@@ -187,11 +177,7 @@ where
             .spawn(move || worker_loop(receiver, learning, observer))
             .expect("policy shadow worker thread");
         Self {
-            snapshot: Arc::new(RwLock::new(Some(Arc::new(ShadowSnapshot {
-                policy,
-                inventory,
-                availability,
-            })))),
+            policy_runtime,
             runtime: Arc::new(ShadowRuntime {
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
@@ -201,44 +187,16 @@ where
         }
     }
 
-    pub fn replace_snapshot(
-        &self,
-        policy: Arc<CompiledPolicy>,
-        inventory: Arc<OfferInventory>,
-        availability: Arc<AvailabilitySnapshot>,
-    ) {
-        *self
-            .snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(ShadowSnapshot {
-            policy,
-            inventory,
-            availability,
-        }));
-    }
-
-    /// Disable observations until a complete replacement snapshot is ready.
-    pub fn clear_snapshot(&self) {
-        *self
-            .snapshot
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    }
-
     /// Return the inherited publication from one immutable policy snapshot.
     pub fn publication_slugs(
         &self,
         profile: Option<&super::ProfileId>,
         protocol: super::FrontendProtocol,
     ) -> Option<BTreeSet<String>> {
-        let snapshot = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()?;
+        let snapshot = self.policy_runtime.capture()?;
         Some(
             snapshot
-                .policy
+                .policy()
                 .publication_slugs(profile, protocol)
                 .into_iter()
                 .map(str::to_owned)
@@ -251,12 +209,7 @@ where
     }
 
     pub fn observe(&self, facts: RequestFacts, lane: Option<LaneFacts>, legacy: LegacyOutcome) {
-        let Some(snapshot) = self
-            .snapshot
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
+        let Some(snapshot) = self.policy_runtime.capture() else {
             return;
         };
         self.enqueue(ShadowJob::Resolve {
@@ -296,18 +249,9 @@ where
     }
 
     #[cfg(test)]
-    fn with_runtime(
-        policy: Arc<CompiledPolicy>,
-        inventory: Arc<OfferInventory>,
-        availability: Arc<AvailabilitySnapshot>,
-        runtime: Arc<ShadowRuntime>,
-    ) -> Self {
+    fn with_runtime(policy_runtime: Arc<PolicyRuntime>, runtime: Arc<ShadowRuntime>) -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(Some(Arc::new(ShadowSnapshot {
-                policy,
-                inventory,
-                availability,
-            })))),
+            policy_runtime,
             runtime,
             _learning: std::marker::PhantomData,
         }
@@ -329,11 +273,11 @@ fn worker_loop<L: LearningView>(
                 legacy,
             } => {
                 let availability = snapshot
-                    .availability
+                    .availability()
                     .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS);
                 match resolve(
-                    &snapshot.policy,
-                    &snapshot.inventory,
+                    snapshot.policy(),
+                    snapshot.inventory(),
                     learning.as_ref(),
                     lane.as_ref(),
                     &availability,
@@ -405,7 +349,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    use crate::catalog::offers::BackendOffer;
+    use crate::catalog::offers::{BackendOffer, OfferInventory};
     use crate::policy::*;
     use crate::routing::ANTHROPIC_SUB_MESSAGES;
 
@@ -560,6 +504,23 @@ mod tests {
         }
     }
 
+    fn runtime(
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+    ) -> Arc<PolicyRuntime> {
+        Arc::new(PolicyRuntime::new(
+            Arc::new(crate::store::Store::open(":memory:").unwrap()),
+            crate::routing::RouteRegistry::new(
+                std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+                std::iter::empty::<(crate::routing::ProtocolId, String)>(),
+            ),
+            policy,
+            inventory,
+            availability,
+        ))
+    }
+
     fn wait_for(observer: &CollectingObserver, count: usize) -> Vec<ShadowRecord> {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -576,13 +537,8 @@ mod tests {
     fn bounded_worker_records_match_mismatch_and_survives_observer_panic() {
         let (policy, inventory, availability) = fixture();
         let observer = Arc::new(CollectingObserver::default());
-        let shadow = PolicyShadow::new(
-            policy.clone(),
-            inventory.clone(),
-            availability.clone(),
-            Arc::new(NoLearning),
-            observer.clone(),
-        );
+        let policy_runtime = runtime(policy.clone(), inventory.clone(), availability.clone());
+        let shadow = PolicyShadow::new(policy_runtime, Arc::new(NoLearning), observer.clone());
         shadow.observe(facts(), None, outcome("model-a"));
         shadow.observe(facts(), None, outcome("model-b"));
         let records = wait_for(&observer, 2);
@@ -590,9 +546,7 @@ mod tests {
         assert_eq!(records[1].comparison, ShadowComparison::Mismatch);
 
         let panicking = PolicyShadow::new(
-            policy,
-            inventory,
-            availability,
+            runtime(policy, inventory, availability),
             Arc::new(NoLearning),
             Arc::new(Panics),
         );
@@ -613,13 +567,13 @@ mod tests {
                 shadow: None,
             }))
             .unwrap();
-        let runtime = Arc::new(ShadowRuntime {
+        let shadow_runtime = Arc::new(ShadowRuntime {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(None),
             dropped: AtomicU64::new(0),
         });
         let shadow: PolicyShadow<NoLearning> =
-            PolicyShadow::with_runtime(policy, inventory, availability, runtime);
+            PolicyShadow::with_runtime(runtime(policy, inventory, availability), shadow_runtime);
         shadow.observe_record(ShadowRecord {
             comparison: ShadowComparison::Mismatch,
             code: "dropped",
@@ -642,16 +596,15 @@ mod tests {
     fn replacing_snapshot_changes_subsequent_resolution() {
         let (policy, inventory, availability) = fixture();
         let observer = Arc::new(CollectingObserver::default());
+        let policy_runtime = runtime(policy.clone(), inventory.clone(), availability.clone());
         let shadow = PolicyShadow::new(
-            policy.clone(),
-            inventory.clone(),
-            availability.clone(),
+            policy_runtime.clone(),
             Arc::new(NoLearning),
             observer.clone(),
         );
         shadow.observe(facts(), None, outcome("model-a"));
         wait_for(&observer, 1);
-        shadow.replace_snapshot(policy, Arc::new(OfferInventory::default()), availability);
+        policy_runtime.replace_candidate(policy, Arc::new(OfferInventory::default()), availability);
         shadow.observe(facts(), None, outcome("model-a"));
         let records = wait_for(&observer, 2);
         assert_eq!(records[1].comparison, ShadowComparison::InternalError);

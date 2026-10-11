@@ -12,6 +12,7 @@ pub mod learning;
 pub mod legacy;
 pub mod matcher;
 pub mod resolve;
+pub mod runtime;
 mod selector;
 pub mod shadow;
 pub mod version;
@@ -43,6 +44,7 @@ pub use resolve::{
     RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, TransitionDecision,
     resolve,
 };
+pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
 pub use shadow::{
     CollectingObserver, LegacyOutcome, PolicyShadow, ShadowComparison, ShadowObserver,
     ShadowOutcome, ShadowRecord, TracingObserver,
