@@ -11,6 +11,7 @@ pub mod document;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;
+pub mod pinning;
 pub mod resolve;
 pub mod runtime;
 mod selector;
@@ -39,6 +40,7 @@ pub use matcher::{
     CaptureSchema, CompiledMatcher, MAX_MATCH_INPUT_BYTES, MAX_RENDERED_TEMPLATE_BYTES,
     MatcherCaptures, MatcherError, MatcherSpec, Template, TemplateError,
 };
+pub use pinning::{PinPersistence, persist_transition};
 pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
     CatalogueAvailability, Evidence, LaneFacts, NoLearning, ProvisionalPin, RequestClass,
