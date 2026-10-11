@@ -28,23 +28,16 @@ struct Cli {
 enum Command {
     /// Run the proxy server (plan: Server core).
     Serve,
-    /// Grant a served model the days to become its family's rewrite
-    /// target early (the promote-model handover).
+    /// Mark a served backend model eligible for policy-managed upgrades.
     Promote {
-        /// The exact model identity, as the ledger recorded it.
+        /// The exact provider-reported model identity stored in binding learning.
         #[arg(long = "model")]
         model: String,
-        /// How many days the model should hold after the grant, drawn
-        /// from days the ledger already holds, newest first. Default: the
-        /// fewest that clear the election's bar.
-        #[arg(long = "days")]
-        days: Option<u32>,
-        /// The prompt ceiling to grant alongside the days, in tokens.
-        /// Default: the family's best observed. It only ever raises the
-        /// ceiling, and never declares context capacity.
-        #[arg(long = "max-prompt")]
-        max_prompt: Option<u64>,
-        /// Print what would be granted; change nothing.
+        /// The backend binding to promote. Required when more than one binding
+        /// has learned the same model identity.
+        #[arg(long = "binding")]
+        binding: Option<toker::policy::BindingId>,
+        /// Print the evidence change; write nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
@@ -218,10 +211,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Promote {
             model,
-            days,
-            max_prompt,
+            binding,
             dry_run,
-        } => cmds::promote(model, days, max_prompt, dry_run),
+        } => cmds::promote(model, binding, dry_run),
         Command::Restart { max_wait, now } => cmds::restart(max_wait, now),
         Command::Tui { window_mins, db } => cmds::tui(window_mins, db),
         Command::Setup => cmds::setup(),
@@ -264,5 +256,55 @@ fn main() -> anyhow::Result<()> {
         Command::WakeArm => cmds::wake_arm(),
         Command::Hold { for_ } => cmds::hold(for_),
         Command::PingWindow { slot } => cmds::ping_window(slot),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn promote_parses_an_optional_typed_binding_and_rejects_removed_grants() {
+        let parsed = Cli::try_parse_from([
+            "toker",
+            "promote",
+            "--model",
+            "claude-opus-5",
+            "--binding",
+            "anthropic_sub.anthropic_messages",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Promote {
+                binding: Some(binding),
+                dry_run: true,
+                ..
+            } if binding.as_str() == "anthropic_sub.anthropic_messages"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "toker",
+                "promote",
+                "--model",
+                "claude-opus-5",
+                "--binding",
+                "not-a-binding",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "toker",
+                "promote",
+                "--model",
+                "claude-opus-5",
+                "--days",
+                "3",
+            ])
+            .is_err()
+        );
     }
 }

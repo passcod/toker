@@ -14,7 +14,7 @@
 //! `restart` drives the running service's `/_toker/status` and
 //! `/_toker/shutdown` to restart it without cutting a response.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -389,218 +389,171 @@ pub fn ping_window(slot: String) -> anyhow::Result<()> {
     )
 }
 
-/// `toker promote` — the promote-model handover (the control
-/// endpoint is the same one the predecessor's promote script used):
-/// grant a served model the days (and the prompt ceiling) to become its
-/// family's rewrite target early. The days are drawn only from days the
-/// ledger already holds, newest first; by default just enough to clear
-/// the election's bar (see [`crate::middleware::models::plan_promotion`]).
+/// `toker promote`: mark an already learned binding/model pair as explicitly
+/// eligible for a policy-managed upgrade. Observed days, empirical prompt
+/// ceilings, and declared context remain provider evidence and are never
+/// fabricated by this command.
 pub fn promote(
     model: String,
-    days: Option<u32>,
-    max_prompt: Option<u64>,
+    binding: Option<crate::policy::BindingId>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let opts = PromoteOpts {
-        model,
-        days: days.map(|days| days as usize),
-        max_prompt: max_prompt.map(|max_prompt| i64::try_from(max_prompt).unwrap_or(i64::MAX)),
-        dry_run,
-    };
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(promote_run(
-            &config.db_path,
-            config.port,
-            &opts,
-            &mut std::io::stdout(),
-        ))
+    promote_run(
+        &config,
+        &PromoteOpts {
+            model,
+            binding,
+            dry_run,
+        },
+        &mut std::io::stdout(),
+    )
 }
 
 /// What `toker promote` was asked to do.
 #[derive(Debug, Clone)]
 pub struct PromoteOpts {
     pub model: String,
-    /// Days the model should hold after the grant; `None` for the fewest
-    /// that clear the bar.
-    pub days: Option<usize>,
-    /// An explicit prompt ceiling; `None` for the family's best.
-    pub max_prompt: Option<i64>,
-    /// Print the plan and change nothing.
+    pub binding: Option<crate::policy::BindingId>,
+    /// Print the evidence mutation and change nothing.
     pub dry_run: bool,
 }
 
-/// The promote verb over an explicit ledger and port, writing its report
-/// to `out`: plan from the ledger, then hand the grant to the server on
-/// `port`, or, when nothing listens there, apply the same merge to the
-/// ledger directly.
-pub async fn promote_run(
-    db: &Path,
-    port: u16,
+/// Apply one binding-local promotion directly to the configured ledger. The
+/// binding-aware daemon endpoint belongs to the later authoritative control
+/// surface; this non-authoritative changeset must not route through the legacy
+/// global merge endpoint or write the legacy `models` table.
+pub fn promote_run(
+    config: &Config,
     opts: &PromoteOpts,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
-    use crate::middleware::models::{
-        MergeOutcome, PromotionRefusal, merge_learned, plan_promotion,
-    };
+    use crate::catalog::offers::OfferInventory;
+    use crate::routing::{ProtocolId, RouteRegistry};
 
-    // Opening a missing ledger would create an empty one, and a promotion
-    // can only grant from what a ledger holds.
-    if !db.exists() {
+    if !config.db_path.exists() {
         bail!(
             "no ledger at {}: toker writes it once it has served a request",
-            db.display()
+            config.db_path.display()
         );
     }
-    let store = Store::open(db)?;
-    let entries = store.load_models()?;
-    let model = &opts.model;
-    let plan = match plan_promotion(&entries, model, opts.days, opts.max_prompt) {
-        Ok(plan) => plan,
-        Err(PromotionRefusal::Unseen { known }) => bail!(unseen_message(model, &known)),
-        Err(PromotionRefusal::Already {
-            model_id,
-            days,
-            active_days,
-            needed,
-        }) => {
-            writeln!(
-                out,
-                "{model_id} already qualifies: seen on {days} day(s), more than \
-                 {needed} of {active_days} active — nothing to do."
-            )?;
-            return Ok(());
+    let model = opts.model.as_str();
+    if model.trim().is_empty() {
+        bail!("the model identity is blank");
+    }
+    let store = Store::open(&config.db_path)?;
+    let matching = store.load_binding_learnings_for_model(model)?;
+    let binding = match (&opts.binding, matching.as_slice()) {
+        (Some(binding), _) => binding.clone(),
+        (None, [entry]) => entry.binding_id.clone(),
+        (None, []) => bail!(binding_unseen_message(model, &[])),
+        (None, entries) => {
+            let bindings = entries
+                .iter()
+                .map(|entry| entry.binding_id.as_str())
+                .collect::<Vec<_>>();
+            bail!(
+                "{model} is learned under multiple bindings; pass --binding with one of: {}",
+                bindings.join(", ")
+            )
         }
     };
-    render_plan(&plan, out)?;
+    let topology = RouteRegistry::new(
+        std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+        [
+            config
+                .default_backend_anthropic
+                .clone()
+                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
+            config
+                .default_backend_openai_chat
+                .clone()
+                .map(|provider| (ProtocolId::OpenAiChat, provider)),
+            Some((ProtocolId::OpenAiResponses, "codex_sub".to_owned())),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    if topology.binding(&binding).is_none() {
+        bail!("{binding} is not a declared backend binding");
+    }
+    let entry = store
+        .load_binding_learning(&binding, model)?
+        .ok_or_else(|| anyhow::anyhow!(binding_unseen_message(model, &[binding.as_str()])))?;
+    let policy = crate::policy::legacy::compile(config, &topology, &OfferInventory::default())?
+        .into_policy()
+        .map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "the generated revision-one policy has {} diagnostic(s)",
+                diagnostics.len()
+            )
+        })?;
+    let mut applicable = policy
+        .upgrades()
+        .filter(|upgrade| upgrade.policy().enabled && upgrade.policy().allow_manual_promotion)
+        .filter_map(|upgrade| {
+            let classifier = policy.classifier(&upgrade.policy().classifier_id)?;
+            (classifier.binding_id() == &binding)
+                .then(|| classifier.classify(model))
+                .flatten()
+        });
+    let classified = applicable
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{model} is not manually promotable under {binding}"))?;
+    if applicable.next().is_some() {
+        bail!("{model} matches multiple manual-promotion policies under {binding}");
+    }
+
+    writeln!(out, "{model}")?;
+    writeln!(out, "  binding      {binding}")?;
+    writeln!(out, "  family       {}", classified.family)?;
+    writeln!(
+        out,
+        "  promotion    {}",
+        if entry.explicitly_promoted {
+            "already explicit"
+        } else {
+            "set explicit eligibility"
+        }
+    )?;
     if opts.dry_run {
         writeln!(out, "\n  --dry-run, nothing written.")?;
         return Ok(());
     }
-
-    let url = format!("http://127.0.0.1:{port}/_toker/models/merge");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let sent = client
-        .post(&url)
-        .header("x-toker-control", "models-merge")
-        .json(&plan.request_body())
-        .send()
-        .await;
-    let response = match sent {
-        Ok(response) => response,
-        // Nothing listening: apply the same merge, with the same
-        // validation, to the ledger itself. The server reads the learned
-        // store per decision and never caches it, so the write is seen
-        // by whichever server next opens this ledger.
-        Err(error) if error.is_connect() => {
-            return match merge_learned(&store, &plan.incoming())? {
-                MergeOutcome::Merged { entry, target } => {
-                    writeln!(
-                        out,
-                        "\n  nothing is listening on 127.0.0.1:{port}, so the grant was \
-                         written to {} directly",
-                        db.display()
-                    )?;
-                    report_target(out, &entry.model_id, target.as_deref())?;
-                    Ok(())
-                }
-                MergeOutcome::Unseen => {
-                    let known: Vec<String> =
-                        entries.into_iter().map(|entry| entry.model_id).collect();
-                    bail!(unseen_message(model, &known))
-                }
-                MergeOutcome::InventedDays(days) => bail!(invented_message(&days)),
-            };
-        }
-        // Sent, but no answer: the server may or may not have applied it.
-        Err(error) => bail!(
-            "posting to {url} failed ({error}); the grant may or may not have \
-             landed. Run the same promote again: it says \"already qualifies\" if it did."
-        ),
+    if store
+        .promote_binding_learning(&binding, model, jiff::Timestamp::now().as_millisecond())?
+        .is_none()
+    {
+        bail!("{model} disappeared from {binding} before promotion; nothing was written");
+    }
+    let outcome = if entry.explicitly_promoted {
+        "was already present"
+    } else {
+        "written"
     };
-    let status = response.status();
-    let reply: serde_json::Value = response.json().await.unwrap_or_default();
-    if reply.get("toker").and_then(serde_json::Value::as_str) != Some("models-merge") {
-        bail!(
-            "something is listening on 127.0.0.1:{port} but did not take the merge \
-             ({}), so it is not this toker. Nothing was written.",
-            status.as_u16()
-        );
-    }
-    if status.is_success() {
-        writeln!(out, "\n  merged into the running server")?;
-        let targets = reply
-            .get("targets")
-            .and_then(|targets| targets.as_object())
-            .cloned()
-            .unwrap_or_default();
-        for (_family, target) in targets {
-            report_target(out, &plan.model_id, target.as_str())?;
-        }
-        return Ok(());
-    }
-    let strings = |key: &str| -> Vec<String> {
-        reply
-            .get(key)
-            .and_then(|values| values.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    match reply.get("error").and_then(serde_json::Value::as_str) {
-        // The server's view is the one that counts: it answered, and has
-        // never served the model.
-        Some("unseen") => bail!(unseen_message(model, &strings("known"))),
-        Some("invented days") => bail!(invented_message(&strings("days"))),
-        _ => bail!("the merge refused: {} {}", status.as_u16(), reply),
-    }
-}
-
-/// What the family's election names now: the effect, not the intent.
-fn report_target(
-    out: &mut impl std::io::Write,
-    model_id: &str,
-    target: Option<&str>,
-) -> std::io::Result<()> {
-    let family = crate::middleware::models::family_of(model_id)
-        .map(|family| family.name)
-        .unwrap_or_else(|| model_id.to_owned());
     writeln!(
         out,
-        "  {family} now rewrites to {}",
-        target.unwrap_or("nothing")
-    )
+        "\n  binding-scoped promotion {outcome} in {}",
+        config.db_path.display()
+    )?;
+    writeln!(
+        out,
+        "  routing remains legacy-authoritative until policy cutover"
+    )?;
+    Ok(())
 }
 
-/// The refusal for days the ledger holds for no model. The plan draws only
-/// from held days, so this means the ledger changed between the plan and
-/// the merge, or the server reads a different ledger from this one.
-fn invented_message(days: &[String]) -> String {
-    format!(
-        "the merge refused days the ledger holds for no model: {}. Nothing was \
-         written; is the server reading a different ledger?",
-        days.join(", ")
-    )
-}
-
-/// The refusal for a model the ledger has never served — almost always a
-/// typo, and promoting an id the API rejects would redirect a whole
-/// family's traffic to a dead end.
-fn unseen_message(model: &str, known: &[String]) -> String {
-    format!(
-        "{model} has never been served through toker. Promoting a model id \
-         the API will reject would redirect a whole family's traffic to a \
-         dead end; use it once, then promote it.\n  known: {}",
-        known.join(", ")
-    )
+fn binding_unseen_message(model: &str, bindings: &[&str]) -> String {
+    if bindings.is_empty() {
+        format!(
+            "{model} has not been learned under any backend binding; use it once, then promote it"
+        )
+    } else {
+        format!(
+            "{model} has not been learned under {}; use it once through that binding, then promote it",
+            bindings.join(", ")
+        )
+    }
 }
 
 /// A token count with thousands separators, as the predecessor printed
@@ -618,73 +571,6 @@ pub(crate) fn thousands(count: i64) -> String {
         out.insert(0, '-');
     }
     out
-}
-
-/// The plan, as the predecessor's promote script reported it: the bar and
-/// its denominator, the days before and after, whether the model now
-/// clears the bar, and what the family's election will name.
-fn render_plan(
-    plan: &crate::middleware::models::PromotionPlan,
-    out: &mut impl std::io::Write,
-) -> std::io::Result<()> {
-    writeln!(out, "{}", plan.model_id)?;
-    writeln!(
-        out,
-        "  bar          seen on more than {} of {} active day(s)",
-        plan.needed, plan.active_days
-    )?;
-    writeln!(
-        out,
-        "  days         {} → {}  (+{} granted from days the ledger already holds)",
-        plan.days_before,
-        plan.days.len(),
-        plan.granted.len()
-    )?;
-    if plan.qualifies() {
-        writeln!(out, "  qualifies    yes")?;
-    } else {
-        writeln!(
-            out,
-            "  qualifies    no: {} day(s) is not more than {}",
-            plan.days.len(),
-            plan.needed
-        )?;
-    }
-    if plan.raises_ceiling() {
-        writeln!(
-            out,
-            "  rewrite-safe {} → {} tokens",
-            thousands(plan.max_prompt_before.unwrap_or(0)),
-            thousands(plan.max_prompt.unwrap_or(0))
-        )?;
-        if plan.ceiling_explicit {
-            writeln!(out, "               set by --max-prompt.")?;
-        } else {
-            writeln!(
-                out,
-                "               raised to the family's best empirical bound, assuming a newer"
-            )?;
-            writeln!(
-                out,
-                "               version holds at least as much. --max-prompt=N to set it yourself."
-            )?;
-        }
-        writeln!(
-            out,
-            "               declared context capacity is separate and is not widened."
-        )?;
-    }
-    let target = plan.target.as_deref().unwrap_or("nothing");
-    let held = if plan.target.as_deref() == Some(plan.model_id.as_str()) {
-        ""
-    } else if plan.target.is_none() && plan.qualifies() {
-        "   ← it belongs to no family, so no election names it"
-    } else if plan.qualifies() {
-        "   ← a newer version still holds the slot"
-    } else {
-        "   ← below the bar, so the slot is not this model's"
-    };
-    writeln!(out, "  target       {target}{held}")
 }
 
 // ── toker restart ──────────────────────────────────────────────────────
@@ -1198,252 +1084,176 @@ pub fn wake_arm() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromoteOpts, promote_run, render_plan};
-    use crate::middleware::models::plan_promotion;
-    use crate::store::{ModelEntry, Store};
-    use serde_json::json;
-    use std::path::PathBuf;
+    use std::collections::BTreeSet;
 
-    fn entry(model_id: &str, days: &[&str], max_prompt: Option<i64>) -> ModelEntry {
-        ModelEntry {
-            model_id: model_id.to_owned(),
-            days_json: Some(json!(days)),
-            max_prompt,
-            context_window_json: None,
-        }
-    }
+    use super::{PromoteOpts, promote_run};
+    use crate::catalog::DeclaredWindow;
+    use crate::config::Config;
+    use crate::policy::BindingId;
+    use crate::store::{BindingLearningUpdate, ModelEntry, Store};
 
-    fn rendered(entries: &[ModelEntry], model: &str, days: Option<usize>) -> String {
-        let plan = plan_promotion(entries, model, days, None).expect("plans");
-        let mut out = Vec::new();
-        render_plan(&plan, &mut out).expect("render");
-        String::from_utf8(out).expect("utf-8")
-    }
-
-    const NINE: [&str; 9] = [
-        "2026-09-20",
-        "2026-09-21",
-        "2026-09-22",
-        "2026-09-23",
-        "2026-09-24",
-        "2026-09-25",
-        "2026-09-26",
-        "2026-09-27",
-        "2026-09-28",
-    ];
-
-    #[test]
-    fn the_report_names_the_bar_the_days_and_the_effect() {
-        let entries = vec![
-            entry("claude-opus-5", &NINE, Some(150_000)),
-            entry("claude-opus-5-5", &["2026-09-28"], Some(150_000)),
-        ];
-        let report = rendered(&entries, "claude-opus-5-5", None);
-        assert!(
-            !report.contains('\u{2190}'),
-            "no slot note when the model takes it: {report}"
-        );
-        insta::assert_snapshot!("qualifies", report);
-
-        // Too few days asked for: it says so, and who keeps the slot.
-        let report = rendered(&entries, "claude-opus-5-5", Some(4));
-        insta::assert_snapshot!("too_few_days", report);
-
-        // The ceiling: raised to the family's best by default, and said so.
-        let entries = vec![
-            entry("claude-opus-5", &NINE, Some(480_000)),
-            entry("claude-opus-5-5", &["2026-09-28"], Some(4_000)),
-        ];
-        let report = rendered(&entries, "claude-opus-5-5", None);
-        assert!(report.contains("480,000"), "{report}");
-        insta::assert_snapshot!("ceiling_raised", report);
-
-        // A newer version holds the slot.
-        let entries = vec![
-            entry("claude-opus-5-5", &NINE, Some(150_000)),
-            entry("claude-opus-5", &["2026-09-28"], Some(150_000)),
-        ];
-        let report = rendered(&entries, "claude-opus-5", None);
-        insta::assert_snapshot!("newer_holds_slot", report);
-    }
-
-    /// A fresh ledger in a directory of its own, holding the given
-    /// learned entries.
-    fn ledger(name: &str, entries: &[ModelEntry]) -> (crate::test_support::TestDir, PathBuf) {
+    fn config(name: &str) -> (crate::test_support::TestDir, Config) {
         let dir = crate::test_support::tempdir(&format!("toker-promote-{name}-"));
-        let db = dir.join("toker.db");
-        let store = Store::open(&db).expect("open ledger");
-        for entry in entries {
-            store.upsert_model(entry).expect("upsert");
-        }
-        (dir, db)
+        let path = dir.join("toker.toml");
+        std::fs::write(&path, "[providers.anthropic_sub]\n").unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.db_path = dir.join("toker.db");
+        (dir, config)
     }
 
-    /// A loopback port nothing listens on: bound, then released.
-    fn closed_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("addr").port()
+    fn binding(value: &str) -> BindingId {
+        value.parse().unwrap()
     }
 
-    fn opts(model: &str, dry_run: bool) -> PromoteOpts {
+    fn learn(store: &Store, binding_id: &BindingId, model_id: &str) {
+        store
+            .merge_binding_learning(&BindingLearningUpdate {
+                binding_id: binding_id.clone(),
+                model_id: model_id.to_owned(),
+                days: BTreeSet::from(["2026-10-01".to_owned()]),
+                max_prompt: Some(123),
+                context_window: DeclaredWindow::new(100, 200),
+                explicitly_promoted: false,
+                updated_ms: 1,
+            })
+            .unwrap();
+    }
+
+    fn opts(model: &str, binding_id: Option<&str>, dry_run: bool) -> PromoteOpts {
         PromoteOpts {
             model: model.to_owned(),
-            days: None,
-            max_prompt: None,
+            binding: binding_id.map(binding),
             dry_run,
         }
     }
 
-    fn promoting_entries() -> Vec<ModelEntry> {
-        vec![
-            entry("claude-opus-5", &NINE, Some(480_000)),
-            entry("claude-opus-5-5", &["2026-09-28"], Some(4_000)),
-        ]
-    }
+    #[test]
+    fn unique_binding_is_inferred_and_only_promotion_state_changes() {
+        let (_dir, config) = config("unique");
+        let store = Store::open(&config.db_path).unwrap();
+        let selected = binding("anthropic_sub.anthropic_messages");
+        learn(&store, &selected, "claude-opus-5");
+        store
+            .upsert_model(&ModelEntry {
+                model_id: "claude-opus-5".to_owned(),
+                days_json: Some(serde_json::json!(["2026-10-01"])),
+                max_prompt: Some(999),
+                context_window_json: None,
+            })
+            .unwrap();
 
-    #[tokio::test]
-    async fn with_nothing_listening_the_grant_is_written_to_the_ledger() {
-        let (_dir, db) = ledger("offline", &promoting_entries());
         let mut out = Vec::new();
-        promote_run(
-            &db,
-            closed_port(),
-            &opts("claude-opus-5-5", false),
-            &mut out,
-        )
-        .await
-        .expect("promotes offline");
-        let report = String::from_utf8(out).expect("utf-8");
-        assert!(report.contains("written to"), "{report}");
+        promote_run(&config, &opts("claude-opus-5", None, false), &mut out).unwrap();
+        let report = String::from_utf8(out).unwrap();
+        assert!(report.contains(selected.as_str()), "{report}");
+        assert!(report.contains("family       opus"), "{report}");
         assert!(
-            report.contains("opus now rewrites to claude-opus-5-5"),
+            report.contains("routing remains legacy-authoritative"),
             "{report}"
         );
-
-        let store = Store::open(&db).expect("reopen");
+        let learned = store
+            .load_binding_learning(&selected, "claude-opus-5")
+            .unwrap()
+            .unwrap();
+        assert!(learned.explicitly_promoted);
+        assert_eq!(learned.days, BTreeSet::from(["2026-10-01".to_owned()]));
+        assert_eq!(learned.max_prompt, Some(123));
+        assert_eq!(learned.context_window, DeclaredWindow::new(100, 200));
         assert_eq!(
-            store.load_model("claude-opus-5-5").expect("load"),
-            Some(entry(
-                "claude-opus-5-5",
-                &[
-                    "2026-09-24",
-                    "2026-09-25",
-                    "2026-09-26",
-                    "2026-09-27",
-                    "2026-09-28"
-                ],
-                Some(480_000)
-            )),
-            "five held days and the family's ceiling"
+            store
+                .load_model("claude-opus-5")
+                .unwrap()
+                .unwrap()
+                .max_prompt,
+            Some(999),
+            "binding promotion never dual-writes legacy learning",
         );
-        assert_eq!(
-            crate::middleware::models::newest_in_family(
-                &store.load_models().expect("load"),
-                "opus"
-            ),
-            Some("claude-opus-5-5".to_owned())
-        );
+    }
 
-        // Run again: it now qualifies, so there is nothing to do.
-        let mut out = Vec::new();
+    #[test]
+    fn ambiguous_model_requires_binding_and_explicit_binding_is_isolated() {
+        let (_dir, config) = config("ambiguous");
+        let store = Store::open(&config.db_path).unwrap();
+        let first = binding("anthropic_api.anthropic_messages");
+        let second = binding("anthropic_sub.anthropic_messages");
+        learn(&store, &first, "claude-opus-5");
+        learn(&store, &second, "claude-opus-5");
+
+        let error = promote_run(
+            &config,
+            &opts("claude-opus-5", None, false),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("multiple bindings"), "{error}");
+        assert!(error.contains(first.as_str()), "{error}");
+        assert!(error.contains(second.as_str()), "{error}");
+
         promote_run(
-            &db,
-            closed_port(),
-            &opts("claude-opus-5-5", false),
-            &mut out,
-        )
-        .await
-        .expect("already");
-        let report = String::from_utf8(out).expect("utf-8");
-        assert!(report.contains("already qualifies"), "{report}");
-
-        // An unseen model is refused offline too, naming what is known.
-        let error = promote_run(
-            &db,
-            closed_port(),
-            &opts("claude-opus-6", false),
+            &config,
+            &opts("claude-opus-5", Some(second.as_str()), false),
             &mut Vec::new(),
         )
-        .await
-        .expect_err("unseen");
-        assert!(error.to_string().contains("claude-opus-5-5"), "{error}");
+        .unwrap();
+        assert!(
+            !store
+                .load_binding_learning(&first, "claude-opus-5")
+                .unwrap()
+                .unwrap()
+                .explicitly_promoted
+        );
+        assert!(
+            store
+                .load_binding_learning(&second, "claude-opus-5")
+                .unwrap()
+                .unwrap()
+                .explicitly_promoted
+        );
     }
 
-    #[tokio::test]
-    async fn a_dry_run_reports_the_plan_and_touches_nothing() {
-        let (_dir, db) = ledger("dry-run", &promoting_entries());
-        // A listener that would see any attempt to reach the server.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
-        let port = listener.local_addr().expect("addr").port();
+    #[test]
+    fn dry_run_and_refusals_write_nothing() {
+        let (_dir, config) = config("refusals");
+        let store = Store::open(&config.db_path).unwrap();
+        let selected = binding("anthropic_sub.anthropic_messages");
+        learn(&store, &selected, "claude-opus-5");
 
         let mut out = Vec::new();
-        promote_run(&db, port, &opts("claude-opus-5-5", true), &mut out)
-            .await
-            .expect("dry run");
-        let report = String::from_utf8(out).expect("utf-8");
-        assert!(report.contains("--dry-run"), "{report}");
-        insta::assert_snapshot!(report);
+        promote_run(&config, &opts("claude-opus-5", None, true), &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("--dry-run"));
         assert!(
-            listener.accept().is_err(),
-            "a dry run never contacts the server"
+            !store
+                .load_binding_learning(&selected, "claude-opus-5")
+                .unwrap()
+                .unwrap()
+                .explicitly_promoted
         );
-        assert_eq!(
-            Store::open(&db)
-                .expect("reopen")
-                .load_model("claude-opus-5-5")
-                .expect("load"),
-            Some(entry("claude-opus-5-5", &["2026-09-28"], Some(4_000))),
-            "the ledger is untouched"
-        );
-    }
 
-    #[tokio::test]
-    async fn a_listener_that_is_not_toker_gets_nothing_written() {
-        let (_dir, db) = ledger("not-toker", &promoting_entries());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = vec![0; 64 * 1024];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                    )
-                    .await;
-            }
-        });
-        let error = promote_run(&db, port, &opts("claude-opus-5-5", false), &mut Vec::new())
-            .await
-            .expect_err("not toker");
-        assert!(error.to_string().contains("Nothing was written"), "{error}");
-        assert_eq!(
-            Store::open(&db)
-                .expect("reopen")
-                .load_model("claude-opus-5-5")
-                .expect("load"),
-            Some(entry("claude-opus-5-5", &["2026-09-28"], Some(4_000)))
-        );
-    }
-
-    #[tokio::test]
-    async fn a_missing_ledger_is_never_created() {
-        let dir = crate::test_support::tempdir("toker-promote-missing-");
-        let db = dir.join("toker.db");
+        let wrong = binding("anthropic_api.anthropic_messages");
         let error = promote_run(
-            &db,
-            closed_port(),
-            &opts("claude-opus-5", true),
+            &config,
+            &opts("claude-opus-5", Some(wrong.as_str()), false),
             &mut Vec::new(),
         )
-        .await
-        .expect_err("no ledger");
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(wrong.as_str()), "{error}");
+        assert!(
+            promote_run(&config, &opts("opaque-model", None, false), &mut Vec::new(),)
+                .unwrap_err()
+                .to_string()
+                .contains("not been learned")
+        );
+    }
+
+    #[test]
+    fn missing_ledger_is_never_created() {
+        let (_dir, config) = config("missing");
+        let error =
+            promote_run(&config, &opts("claude-opus-5", None, true), &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains("no ledger"), "{error}");
-        assert!(!db.exists());
+        assert!(!config.db_path.exists());
     }
 }
 

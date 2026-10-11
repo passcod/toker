@@ -512,12 +512,25 @@ impl Store {
         state::replay_attributable_binding_learning(&mut *self.conn()?, local_time_zone)
     }
 
+    pub fn promote_binding_learning(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        model_id: &str,
+        updated_ms: i64,
+    ) -> Result<Option<BindingLearning>> {
+        state::promote_binding_learning(&mut *self.conn()?, binding_id, model_id, updated_ms)
+    }
+
     pub fn load_binding_learning(
         &self,
         binding_id: &crate::policy::BindingId,
         model_id: &str,
     ) -> Result<Option<BindingLearning>> {
         state::load_binding_learning(&*self.conn()?, binding_id, model_id)
+    }
+
+    pub fn load_binding_learnings_for_model(&self, model_id: &str) -> Result<Vec<BindingLearning>> {
+        state::load_binding_learnings_for_model(&*self.conn()?, model_id)
     }
 
     pub fn load_binding_learnings(
@@ -2766,6 +2779,65 @@ mod tests {
         assert_eq!(
             store.load_binding_learnings(&binding).unwrap(),
             vec![replaced]
+        );
+    }
+
+    #[test]
+    fn binding_promotion_is_existing_only_and_model_lookup_is_binding_sorted() {
+        let store = mem_store();
+        let first = BindingId::new("anthropic_api.anthropic_messages").unwrap();
+        let second = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
+        for binding in [&second, &first] {
+            store
+                .merge_binding_learning(&BindingLearningUpdate {
+                    binding_id: binding.clone(),
+                    model_id: "same-model".to_owned(),
+                    days: ["2026-10-01".to_owned()].into_iter().collect(),
+                    max_prompt: Some(100),
+                    context_window: DeclaredWindow::new(100, 200),
+                    explicitly_promoted: false,
+                    updated_ms: 10,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .load_binding_learnings_for_model("same-model")
+                .unwrap()
+                .into_iter()
+                .map(|row| row.binding_id)
+                .collect::<Vec<_>>(),
+            [first.clone(), second.clone()],
+        );
+        let promoted = store
+            .promote_binding_learning(&first, "same-model", 20)
+            .unwrap()
+            .unwrap();
+        assert!(promoted.explicitly_promoted);
+        assert_eq!(
+            promoted.days,
+            ["2026-10-01".to_owned()].into_iter().collect()
+        );
+        assert_eq!(promoted.max_prompt, Some(100));
+        assert_eq!(promoted.context_window, DeclaredWindow::new(100, 200));
+        assert_eq!(promoted.updated_ms, 20);
+        assert!(
+            !store
+                .load_binding_learning(&second, "same-model")
+                .unwrap()
+                .unwrap()
+                .explicitly_promoted
+        );
+        assert_eq!(
+            store
+                .promote_binding_learning(&first, "never-served", 30)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            store.load_binding_learning(&first, "never-served").unwrap(),
+            None,
         );
     }
 

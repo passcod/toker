@@ -1273,6 +1273,27 @@ pub(super) fn replay_attributable_binding_learning(
     })
 }
 
+pub(super) fn promote_binding_learning(
+    conn: &mut Connection,
+    binding_id: &BindingId,
+    model_id: &str,
+    updated_ms: i64,
+) -> Result<Option<BindingLearning>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE learned_models_by_binding
+         SET explicitly_promoted = 1, updated_ms = max(updated_ms, ?3)
+         WHERE binding_id = ?1 AND model_id = ?2",
+        rusqlite::params![binding_id.as_str(), model_id, updated_ms],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let promoted = load_binding_learning(&tx, binding_id, model_id)?;
+    tx.commit()?;
+    Ok(promoted)
+}
+
 pub(super) fn load_binding_learning(
     conn: &Connection,
     binding_id: &BindingId,
@@ -1284,6 +1305,20 @@ pub(super) fn load_binding_learning(
                 explicitly_promoted, updated_ms
          FROM learned_models_by_binding WHERE binding_id = ?1 AND model_id = ?2",
         [binding_id.as_str(), model_id],
+        read_binding_learning,
+    )
+}
+
+pub(super) fn load_binding_learnings_for_model(
+    conn: &Connection,
+    model_id: &str,
+) -> Result<Vec<BindingLearning>> {
+    rows_of(
+        conn,
+        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
+                explicitly_promoted, updated_ms
+         FROM learned_models_by_binding WHERE model_id = ?1 ORDER BY binding_id",
+        [model_id],
         read_binding_learning,
     )
 }

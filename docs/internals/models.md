@@ -154,11 +154,15 @@ same separation covers an upstream that falls back to a model nobody asked for.
 
 ## Promotion
 
-`toker promote --model …` grants a served model the days to become its family's
-target early (`plan_promotion`). It grants only days the ledger already holds,
-because invented days would raise the bar they were meant to clear and un-elect
-other families' targets, and it refuses a model never served. It raises the
-prompt ceiling to the family's best by default, since a promotion left at "seen
-holding 4,000 tokens" would apply only to new conversations; it never declares a
-context capacity. A running service takes it through `/_toker/models/merge`;
-with nothing listening it applies to the ledger directly.
+`toker promote --model …` marks a provider-reported model explicitly eligible
+for policy-managed upgrades in `learned_models_by_binding`. If exactly one
+binding has learned the exact identity it is inferred; otherwise `--binding
+<provider>.<dialect>` is required. The operation refuses unseen pairs and
+changes only the sticky `explicitly_promoted` bit: observed days, prompt
+ceilings, and context declarations remain provider evidence.
+
+Until compiled policy becomes authoritative, this evidence does not change the
+legacy live rewrite path. The predecessor-compatible `/_toker/models/merge`
+endpoint remains available to existing clients, but this CLI no longer calls it
+or writes the unattributable `models` table. The binding-aware daemon endpoint
+lands with the later routing control surface.
