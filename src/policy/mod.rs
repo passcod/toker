@@ -15,6 +15,7 @@ pub mod resolve;
 pub mod runtime;
 mod selector;
 pub mod shadow;
+pub mod transition;
 pub mod version;
 
 pub use canonical::{
@@ -48,6 +49,11 @@ pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySna
 pub use shadow::{
     CollectingObserver, LegacyOutcome, PolicyShadow, ShadowComparison, ShadowObserver,
     ShadowOutcome, ShadowRecord, TracingObserver,
+};
+pub use transition::{
+    CacheTemperature, LaneState, PinIdentity, TransitionCause,
+    TransitionDecision as LaneTransitionDecision, TransitionDenied, TransitionSource,
+    decide_transition,
 };
 pub use version::{
     DateFormat, NumericVersion, ParsedVersion, ReleaseDate, VersionError, VersionParserSpec,
