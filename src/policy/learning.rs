@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::middleware::models::{ModelStore, active_days_of, days_of};
-use crate::store::ModelEntry;
+use crate::store::{BindingLearning, ModelEntry, Store};
 
 use super::BindingId;
 
@@ -80,6 +80,61 @@ impl LegacyLearningView {
     }
 }
 
+/// Binding-local learning over the non-authoritative routing state tables.
+///
+/// Recently-sent evidence has a separate write path and is not persisted in
+/// this storage slice, so this view reports it as absent rather than borrowing
+/// the unattributable legacy map.
+pub struct BindingLearningView {
+    store: Arc<Store>,
+}
+
+impl BindingLearningView {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
+
+impl LearningView for BindingLearningView {
+    type Error = crate::store::Error;
+
+    fn recently_sent(
+        &self,
+        _binding_id: &BindingId,
+        _model_id: &str,
+    ) -> Result<Option<i64>, Self::Error> {
+        Ok(None)
+    }
+
+    fn learned(
+        &self,
+        binding_id: &BindingId,
+        model_id: &str,
+    ) -> Result<Option<LearnedEvidence>, Self::Error> {
+        Ok(self
+            .store
+            .load_binding_learning(binding_id, model_id)?
+            .map(binding_evidence))
+    }
+
+    fn known_models(&self, binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
+        Ok(self
+            .store
+            .load_binding_learnings(binding_id)?
+            .into_iter()
+            .map(|entry| entry.model_id)
+            .collect())
+    }
+
+    fn active_days(&self, binding_id: &BindingId) -> Result<usize, Self::Error> {
+        let mut days = std::collections::BTreeSet::new();
+        for entry in self.store.load_binding_learnings(binding_id)? {
+            days.extend(entry.days);
+        }
+        Ok(days.len())
+    }
+}
+
 impl LearningView for LegacyLearningView {
     type Error = crate::store::Error;
 
@@ -108,6 +163,14 @@ impl LearningView for LegacyLearningView {
     }
 }
 
+fn binding_evidence(entry: BindingLearning) -> LearnedEvidence {
+    LearnedEvidence {
+        distinct_days: entry.days.into_iter().collect(),
+        max_prompt: entry.max_prompt.and_then(|value| u64::try_from(value).ok()),
+        explicitly_promoted: entry.explicitly_promoted,
+    }
+}
+
 fn evidence(entry: ModelEntry) -> LearnedEvidence {
     LearnedEvidence {
         distinct_days: days_of(&entry),
@@ -120,13 +183,14 @@ fn evidence(entry: ModelEntry) -> LearnedEvidence {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use serde_json::json;
 
     use super::*;
     use crate::middleware::models::ModelStore;
-    use crate::store::{ModelEntry, RequestRow, Store};
+    use crate::store::{BindingLearningUpdate, ModelEntry, RequestRow, Store};
 
     fn binding(value: &str) -> BindingId {
         BindingId::new(value).unwrap()
@@ -248,5 +312,58 @@ mod tests {
         assert_eq!(view.recently_sent(&binding, "unknown-model").unwrap(), None);
         assert_eq!(view.learned(&binding, "unknown-model").unwrap(), None);
         assert!(view.known_models(&binding).unwrap().is_empty());
+    }
+    #[test]
+    fn binding_adapter_isolates_bindings_and_never_falls_back_to_legacy_rows() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let first = binding("anthropic_sub.anthropic_messages");
+        let second = binding("anthropic_api.anthropic_messages");
+        store
+            .upsert_model(&ModelEntry {
+                model_id: "legacy-only".to_owned(),
+                days_json: Some(json!(["2026-10-01"])),
+                max_prompt: Some(999),
+                context_window_json: None,
+            })
+            .unwrap();
+        store
+            .merge_binding_learning(&BindingLearningUpdate {
+                binding_id: first.clone(),
+                model_id: "shared-name".to_owned(),
+                days: ["2026-10-01".to_owned(), "2026-10-02".to_owned()]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                max_prompt: Some(100),
+                context_window: None,
+                explicitly_promoted: true,
+                updated_ms: 10,
+            })
+            .unwrap();
+        store
+            .merge_binding_learning(&BindingLearningUpdate {
+                binding_id: second.clone(),
+                model_id: "other".to_owned(),
+                days: ["2026-10-03".to_owned()]
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                max_prompt: Some(200),
+                context_window: None,
+                explicitly_promoted: false,
+                updated_ms: 11,
+            })
+            .unwrap();
+        let view = BindingLearningView::new(store);
+
+        let learned = view.learned(&first, "shared-name").unwrap().unwrap();
+        assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
+        assert_eq!(learned.max_prompt(), Some(100));
+        assert!(learned.explicitly_promoted());
+        assert_eq!(view.learned(&second, "shared-name").unwrap(), None);
+        assert_eq!(view.learned(&first, "legacy-only").unwrap(), None);
+        assert_eq!(view.known_models(&first).unwrap(), ["shared-name"]);
+        assert_eq!(view.known_models(&second).unwrap(), ["other"]);
+        assert_eq!(view.active_days(&first).unwrap(), 2);
+        assert_eq!(view.active_days(&second).unwrap(), 1);
+        assert_eq!(view.recently_sent(&first, "shared-name").unwrap(), None);
     }
 }
