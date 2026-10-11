@@ -3180,7 +3180,7 @@ mod tests {
         let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
         let mut attributable = bare_row(1_760_000_000_000);
         attributable.provider = Some("openrouter".to_owned());
-        attributable.raw_model = Some("Model-X".to_owned());
+        attributable.raw_model = Some("Model-X-20261001".to_owned());
         attributable.binding_id = Some(binding.clone());
         attributable.input = Some(40);
         attributable.cache_read = Some(60);
@@ -3198,7 +3198,7 @@ mod tests {
         assert_eq!(first.attributable_rows, 1);
         assert_eq!(first.merged_models, 1);
         let learned = store
-            .load_binding_learning(&binding, "model-x")
+            .load_binding_learning(&binding, "Model-X-20261001")
             .unwrap()
             .unwrap();
         assert_eq!(learned.max_prompt, Some(100));
@@ -3214,7 +3214,7 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(
             store
-                .load_binding_learning(&binding, "model-x")
+                .load_binding_learning(&binding, "Model-X-20261001")
                 .unwrap()
                 .unwrap(),
             learned,

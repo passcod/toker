@@ -148,10 +148,14 @@ impl BindingLearningView {
     pub fn seeded(store: Arc<Store>, rows: &[crate::store::RequestRow]) -> Self {
         let mut recency = BindingRecency::default();
         for row in rows {
-            // Error rows currently include both provider responses and local
-            // pre-transport failures, so they cannot prove a send after a
-            // restart. Runtime pre-send marks still cover actual sends.
-            if row.kind.is_some() {
+            // An attributed error row may be a provider response, so it must
+            // remain conservatively warm after restart. Local pre-transport
+            // failures share this shape; retaining those can only postpone a
+            // move, while dropping an actual send can lose a live cache.
+            if row
+                .kind
+                .is_some_and(|kind| kind != crate::store::RowKind::Error)
+            {
                 continue;
             }
             let (Some(binding_id), Some(model_id)) =
@@ -191,7 +195,7 @@ impl BindingLearningView {
         prompt: Option<u64>,
         tz: &jiff::tz::TimeZone,
     ) -> crate::store::Result<()> {
-        let Some(model_id) = crate::catalog::windows::model_identity(reported_model) else {
+        let Some(model_id) = exact_reported_model(reported_model) else {
             return Ok(());
         };
         let Some(day) = crate::middleware::models::local_day(at_ms, tz) else {
@@ -214,6 +218,10 @@ impl BindingLearningView {
 fn exact_effective_model(model: Option<&str>) -> Option<String> {
     let model = model?;
     (!model.is_empty()).then(|| model.to_owned())
+}
+
+fn exact_reported_model(model: &str) -> Option<String> {
+    (!model.trim().is_empty()).then(|| model.to_owned())
 }
 
 impl LearningView for BindingLearningView {
@@ -583,10 +591,10 @@ mod tests {
         assert_eq!(
             view.recently_sent(&first, "errored-effective").unwrap(),
             RecencyEvidence::Covered {
-                last_sent: None,
+                last_sent: Some(13_000),
                 covered_since: Some(9_000),
             },
-            "an error row cannot distinguish a provider response from a local failure",
+            "a possible provider send must remain warm after restart",
         );
     }
 
@@ -697,6 +705,14 @@ mod tests {
             .unwrap();
         view.note_observed(&first, "day-only-model", 1_770_044_400_000, None, &tz)
             .unwrap();
+        view.note_observed(
+            &first,
+            "Claude-Haiku-4-5-20251001",
+            1_770_044_400_000,
+            Some(200),
+            &tz,
+        )
+        .unwrap();
 
         let first_learned = view.learned(&first, "same-model").unwrap().unwrap();
         assert_eq!(first_learned.distinct_days(), ["2026-02-01"]);
@@ -707,5 +723,11 @@ mod tests {
         let day_only = view.learned(&first, "day-only-model").unwrap().unwrap();
         assert_eq!(day_only.distinct_days(), ["2026-02-02"]);
         assert_eq!(day_only.max_prompt(), None);
+        let snapshot = view
+            .learned(&first, "Claude-Haiku-4-5-20251001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.max_prompt(), Some(200));
+        assert_eq!(view.learned(&first, "claude-haiku-4-5").unwrap(), None);
     }
 }

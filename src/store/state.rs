@@ -1208,8 +1208,9 @@ pub(super) fn replay_attributable_binding_learning(
                 observation.row_id, observation.binding
             ))
         })?;
-        let model =
-            crate::catalog::windows::model_identity(&observation.model).ok_or_else(|| {
+        let model = (!observation.model.trim().is_empty())
+            .then_some(observation.model)
+            .ok_or_else(|| {
                 Error::InvalidRoutingState(format!(
                     "request row {} has blank raw_model",
                     observation.row_id
