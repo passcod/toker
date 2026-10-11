@@ -120,15 +120,18 @@ pub struct PolicyShadow<L> {
 }
 
 enum ShadowJob {
-    Resolve {
-        snapshot: Arc<PolicySnapshot>,
-        pinned_revision: Option<i64>,
-        evidence: super::runtime::PolicyEvidence,
-        facts: RequestFacts,
-        lane: Option<LaneFacts>,
-        legacy: LegacyOutcome,
-    },
-    Record(ShadowRecord),
+    Resolve(Box<ResolveJob>),
+    Record(Box<ShadowRecord>),
+}
+
+struct ResolveJob {
+    snapshot: Arc<PolicySnapshot>,
+    pinned_revision: Option<i64>,
+    evidence: super::runtime::PolicyEvidence,
+    facts: RequestFacts,
+    credentials: super::CredentialSnapshot,
+    lane: Option<LaneFacts>,
+    legacy: LegacyOutcome,
 }
 
 struct ShadowRuntime {
@@ -208,10 +211,16 @@ where
     }
 
     pub fn observe_record(&self, record: ShadowRecord) {
-        self.enqueue(ShadowJob::Record(record));
+        self.enqueue(ShadowJob::Record(Box::new(record)));
     }
 
-    pub fn observe(&self, facts: RequestFacts, lane: Option<LaneFacts>, legacy: LegacyOutcome) {
+    pub fn observe(
+        &self,
+        facts: RequestFacts,
+        credentials: super::CredentialSnapshot,
+        lane: Option<LaneFacts>,
+        legacy: LegacyOutcome,
+    ) {
         let Some(snapshot) = self.policy_runtime.capture() else {
             return;
         };
@@ -219,14 +228,15 @@ where
             .as_ref()
             .and_then(|lane| lane.pinned.as_ref())
             .and_then(|pin| pin.policy_revision_id);
-        self.enqueue(ShadowJob::Resolve {
+        self.enqueue(ShadowJob::Resolve(Box::new(ResolveJob {
             snapshot,
             pinned_revision,
             evidence: self.policy_runtime.capture_evidence(),
             facts,
+            credentials,
             lane,
             legacy,
-        });
+        })));
     }
 
     /// Number of observations dropped because the bounded worker queue was
@@ -275,15 +285,17 @@ fn worker_loop<L: LearningView>(
 ) {
     while let Ok(job) = receiver.recv() {
         let record = catch_unwind(AssertUnwindSafe(|| match job {
-            ShadowJob::Record(record) => record,
-            ShadowJob::Resolve {
-                snapshot,
-                pinned_revision,
-                evidence,
-                facts,
-                mut lane,
-                legacy,
-            } => {
+            ShadowJob::Record(record) => *record,
+            ShadowJob::Resolve(job) => {
+                let ResolveJob {
+                    snapshot,
+                    pinned_revision,
+                    evidence,
+                    facts,
+                    credentials,
+                    mut lane,
+                    legacy,
+                } = *job;
                 let snapshot = match pinned_revision {
                     Some(revision_id) => match policy_runtime
                         .capture_revision_with_evidence(revision_id, &evidence)
@@ -305,7 +317,8 @@ fn worker_loop<L: LearningView>(
                 }
                 let availability = snapshot
                     .availability()
-                    .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS);
+                    .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+                    .with_credentials(&credentials);
                 match resolve(
                     snapshot.policy(),
                     snapshot.inventory(),
@@ -571,8 +584,8 @@ mod tests {
         let observer = Arc::new(CollectingObserver::default());
         let policy_runtime = runtime(policy.clone(), inventory.clone(), availability.clone());
         let shadow = PolicyShadow::new(policy_runtime, Arc::new(NoLearning), observer.clone());
-        shadow.observe(facts(), None, outcome("model-a"));
-        shadow.observe(facts(), None, outcome("model-b"));
+        shadow.observe(facts(), Default::default(), None, outcome("model-a"));
+        shadow.observe(facts(), Default::default(), None, outcome("model-b"));
         let records = wait_for(&observer, 2);
         assert_eq!(records[0].comparison, ShadowComparison::Match);
         assert_eq!(records[1].comparison, ShadowComparison::Mismatch);
@@ -582,8 +595,8 @@ mod tests {
             Arc::new(NoLearning),
             Arc::new(Panics),
         );
-        panicking.observe(facts(), None, outcome("model-a"));
-        panicking.observe(facts(), None, outcome("model-a"));
+        panicking.observe(facts(), Default::default(), None, outcome("model-a"));
+        panicking.observe(facts(), Default::default(), None, outcome("model-a"));
         drop(panicking);
     }
 
@@ -592,12 +605,12 @@ mod tests {
         let (policy, inventory, availability) = fixture();
         let (sender, receiver) = mpsc::sync_channel(1);
         sender
-            .try_send(ShadowJob::Record(ShadowRecord {
+            .try_send(ShadowJob::Record(Box::new(ShadowRecord {
                 comparison: ShadowComparison::Match,
                 code: "occupied",
                 legacy: None,
                 shadow: None,
-            }))
+            })))
             .unwrap();
         let shadow_runtime = Arc::new(ShadowRuntime {
             sender: Mutex::new(Some(sender)),
@@ -634,10 +647,10 @@ mod tests {
             Arc::new(NoLearning),
             observer.clone(),
         );
-        shadow.observe(facts(), None, outcome("model-a"));
+        shadow.observe(facts(), Default::default(), None, outcome("model-a"));
         wait_for(&observer, 1);
         policy_runtime.replace_candidate(policy, Arc::new(OfferInventory::default()), availability);
-        shadow.observe(facts(), None, outcome("model-a"));
+        shadow.observe(facts(), Default::default(), None, outcome("model-a"));
         let records = wait_for(&observer, 2);
         assert_eq!(records[1].comparison, ShadowComparison::InternalError);
     }
@@ -650,7 +663,7 @@ mod tests {
         fn code(&self) -> &'static str {
             match self {
                 ShadowJob::Record(record) => record.code,
-                ShadowJob::Resolve { .. } => "resolve",
+                ShadowJob::Resolve(_) => "resolve",
             }
         }
     }

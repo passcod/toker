@@ -192,7 +192,12 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             effective_model.clone(),
             false,
         ) {
-            server.observe_policy_shadow(facts, None, legacy);
+            let credentials = server.shadow_credentials(
+                &parts.headers,
+                ProtocolId::OpenAiResponses,
+                facts.now_ms,
+            );
+            server.observe_policy_shadow(facts, credentials, None, legacy);
         }
     }
 

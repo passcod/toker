@@ -344,7 +344,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         false,
     ) {
         let lane = server.shadow_lane(cold_lane.as_ref(), Some(target.binding()), facts.now_ms);
-        server.observe_policy_shadow(facts, lane, legacy);
+        let credentials =
+            server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
+        server.observe_policy_shadow(facts, credentials, lane, legacy);
     }
 
     let adapter = target

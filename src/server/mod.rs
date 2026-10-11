@@ -530,13 +530,43 @@ impl Server {
     pub(crate) fn observe_policy_shadow(
         &self,
         facts: RequestFacts,
+        credentials: crate::policy::CredentialSnapshot,
         lane: Option<LaneFacts>,
         legacy: LegacyOutcome,
     ) {
         let Some(shadow) = &self.policy_shadow else {
             return;
         };
-        shadow.observe(facts, lane, legacy);
+        shadow.observe(facts, credentials, lane, legacy);
+    }
+
+    pub(crate) fn shadow_credentials(
+        &self,
+        headers: &HeaderMap,
+        frontend: ProtocolId,
+        now_ms: i64,
+    ) -> crate::policy::CredentialSnapshot {
+        self.registry
+            .bindings()
+            .filter_map(|binding| {
+                let provider = self.registry.provider(binding.provider())?;
+                let state = provider.credential_availability(headers, frontend, now_ms / 1000);
+                let evidence = match state {
+                    crate::providers::CredentialAvailability::KnownMissingOrExpired => {
+                        Evidence::Negative(state.reason())
+                    }
+                    crate::providers::CredentialAvailability::UnknownUntilAttempt => {
+                        Evidence::Unknown
+                    }
+                    crate::providers::CredentialAvailability::PassingNative
+                    | crate::providers::CredentialAvailability::Held
+                    | crate::providers::CredentialAvailability::Refreshable => {
+                        Evidence::Positive(state.reason())
+                    }
+                };
+                Some((binding.id().clone(), evidence))
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -180,7 +180,12 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         default.effective_model().map(str::to_owned),
         false,
     ) {
-        server.observe_policy_shadow(facts, None, legacy);
+        let credentials = server.shadow_credentials(
+            request.headers(),
+            ProtocolId::AnthropicMessages,
+            facts.now_ms,
+        );
+        server.observe_policy_shadow(facts, credentials, None, legacy);
     }
     if default
         .binding()
@@ -286,12 +291,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             |request| request.stream != Some(true),
         );
         if path == "/v1/messages/batches" {
-            observe_batch_shadow(
-                &server,
-                &parts.extensions,
-                ir.value(),
-                original.len() as u64,
-            );
+            observe_batch_shadow(&server, &parts, ir.value(), original.len() as u64);
         }
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
@@ -543,6 +543,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             });
             observe_messages_shadow(
                 &server,
+                &parts.headers,
                 &target,
                 shadow_profile.as_deref(),
                 client_model.clone(),
@@ -703,6 +704,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 );
                 observe_messages_shadow(
                     &server,
+                    &parts.headers,
                     &target,
                     shadow_profile.as_deref(),
                     client_model.clone(),
@@ -859,6 +861,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     );
                     observe_messages_shadow(
                         &server,
+                        &parts.headers,
                         &target,
                         shadow_profile.as_deref(),
                         client_model.clone(),
@@ -1175,6 +1178,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // mutable state and its result is deliberately ignored.
     observe_messages_shadow(
         &server,
+        &parts.headers,
         &target,
         shadow_profile.as_deref(),
         client_model.clone(),
@@ -1292,14 +1296,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
 
 fn observe_batch_shadow(
     server: &Server,
-    extensions: &axum::http::Extensions,
+    parts: &axum::http::request::Parts,
     body: &serde_json::Value,
     body_bytes: u64,
 ) {
     let Some(requests) = body.get("requests").and_then(serde_json::Value::as_array) else {
         return;
     };
-    let profile = super::frontend_of(extensions);
+    let profile = super::frontend_of(&parts.extensions);
     for request in requests {
         let Some(model) = request
             .get("params")
@@ -1339,7 +1343,12 @@ fn observe_batch_shadow(
             effective,
             false,
         ) {
-            server.observe_policy_shadow(facts, None, legacy);
+            let credentials = server.shadow_credentials(
+                &parts.headers,
+                ProtocolId::AnthropicMessages,
+                facts.now_ms,
+            );
+            server.observe_policy_shadow(facts, credentials, None, legacy);
         }
     }
 }
@@ -1347,6 +1356,7 @@ fn observe_batch_shadow(
 #[allow(clippy::too_many_arguments)]
 fn observe_messages_shadow(
     server: &Server,
+    headers: &HeaderMap,
     target: &ModelTarget,
     profile: Option<&str>,
     requested_model: Option<String>,
@@ -1396,7 +1406,9 @@ fn observe_messages_shadow(
         return;
     };
     let lane = server.shadow_lane(lane, Some(target.binding()), facts.now_ms);
-    server.observe_policy_shadow(facts, lane, legacy);
+    let credentials =
+        server.shadow_credentials(headers, ProtocolId::AnthropicMessages, facts.now_ms);
+    server.observe_policy_shadow(facts, credentials, lane, legacy);
 }
 
 pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {

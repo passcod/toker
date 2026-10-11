@@ -99,6 +99,8 @@ pub struct AvailabilitySnapshot {
     bindings: BTreeMap<BindingId, BindingAvailability>,
 }
 
+pub type CredentialSnapshot = BTreeMap<BindingId, Evidence<&'static str>>;
+
 impl AvailabilitySnapshot {
     pub fn new(bindings: BTreeMap<BindingId, BindingAvailability>) -> Self {
         Self { bindings }
@@ -108,10 +110,12 @@ impl AvailabilitySnapshot {
         self.bindings.get(binding)
     }
 
-    pub fn with_credential(&self, binding: &BindingId, credential: Evidence<&'static str>) -> Self {
+    pub fn with_credentials(&self, credentials: &CredentialSnapshot) -> Self {
         let mut snapshot = self.clone();
-        if let Some(availability) = snapshot.bindings.get_mut(binding) {
-            availability.credential = credential;
+        for (binding, credential) in credentials {
+            if let Some(availability) = snapshot.bindings.get_mut(binding) {
+                availability.credential = *credential;
+            }
         }
         snapshot
     }
