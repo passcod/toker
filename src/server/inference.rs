@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::ir::canonical::CanonicalRequest;
+use crate::middleware::model_map::ModelMap;
 use crate::providers::Provider;
 use crate::routing::{BackendBinding, ModelTarget};
 
@@ -32,9 +33,27 @@ impl InferenceRequest {
     pub(crate) fn prepare(
         &self,
         target: ModelTarget,
-        effective_model: Option<String>,
+        baseline_model: Option<String>,
     ) -> InferenceAttempt {
-        self.prepared_from(target, effective_model, self.canonical())
+        self.prepare_with_map(target, baseline_model, None)
+    }
+
+    pub(crate) fn prepare_with_map(
+        &self,
+        target: ModelTarget,
+        baseline_model: Option<String>,
+        model_map: Option<&ModelMap>,
+    ) -> InferenceAttempt {
+        let mut canonical = self.canonical();
+        canonical.model.clone_from(&baseline_model);
+        crate::middleware::canonical::map_model(&mut canonical, model_map);
+        let effective_model = canonical.model.clone();
+        InferenceAttempt {
+            target,
+            requested_model: self.requested_model.clone(),
+            effective_model,
+            canonical,
+        }
     }
 
     /// Temporary bridge for Messages while its existing candidate-local
@@ -101,6 +120,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::middleware::model_map::parse_model_map;
     use crate::providers::{OpenRouter, Provider};
     use crate::routing::{ProtocolId, RouteRegistry};
 
@@ -140,5 +160,41 @@ mod tests {
         let second = attempt.canonical();
         assert_eq!(second.model.as_deref(), Some("invented-model"));
         assert_eq!(second.system.len(), 1);
+    }
+
+    #[test]
+    fn provider_mapping_is_candidate_local_and_keeps_baseline_identity() {
+        let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(
+            "https://openrouter.ai/api/v1".parse().unwrap(),
+            None,
+        ));
+        let registry = RouteRegistry::new(
+            [provider],
+            [(ProtocolId::OpenAiChat, "openrouter".to_owned())],
+        );
+        let target = registry
+            .resolve(ProtocolId::OpenAiChat, Some("openrouter/asked-model"))
+            .unwrap();
+        let request = InferenceRequest::new(
+            Some("openrouter/asked-model".to_owned()),
+            CanonicalRequest {
+                model: Some("openrouter/asked-model".to_owned()),
+                ..CanonicalRequest::default()
+            },
+        );
+        let map = parse_model_map(r#"{"model:asked-model":"served-model"}"#)
+            .unwrap()
+            .unwrap();
+        let mapped =
+            request.prepare_with_map(target.clone(), Some("asked-model".to_owned()), Some(&map));
+        let plain = request.prepare(target, Some("asked-model".to_owned()));
+
+        assert_eq!(mapped.effective_model(), Some("served-model"));
+        assert_eq!(mapped.canonical().model.as_deref(), Some("served-model"));
+        assert_eq!(plain.effective_model(), Some("asked-model"));
+        assert_eq!(
+            request.canonical().model.as_deref(),
+            Some("openrouter/asked-model")
+        );
     }
 }
