@@ -172,6 +172,17 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     };
     let backend = target.provider().clone();
     let effective_model = target.effective_model().map(str::to_owned);
+    let canonical = canonical.map(|result| {
+        result.map(|canonical| {
+            super::inference::InferenceAttempt::new(
+                target.clone(),
+                requested_model.clone(),
+                effective_model.clone(),
+                canonical,
+            )
+            .canonical()
+        })
+    });
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));

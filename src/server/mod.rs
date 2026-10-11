@@ -64,6 +64,7 @@ pub(crate) mod anthropic;
 pub(crate) mod anthropic_target;
 pub(crate) mod codex;
 pub(crate) mod control;
+pub(crate) mod inference;
 pub(crate) mod openrouter_responses;
 pub(crate) mod proxy;
 pub(crate) mod quota_events;

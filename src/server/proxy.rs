@@ -131,7 +131,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         Ok(value) => value,
         Err(_) => return compatibility_error("the request body is not valid JSON"),
     };
-    let mut canonical = match translate::from_openai_chat(&value) {
+    let canonical = match translate::from_openai_chat(&value) {
         Ok(canonical) => canonical,
         Err(error) => return compatibility_error(&error.to_string()),
     };
@@ -144,6 +144,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         Err(_) => return super::openai_not_configured(),
     };
     let gate_model = target.effective_model().map(str::to_owned);
+    let attempt = super::inference::InferenceAttempt::new(
+        target.clone(),
+        model.clone(),
+        gate_model.clone(),
+        canonical,
+    );
+    let gate_model = attempt.effective_model().map(str::to_owned);
+    let canonical = attempt.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
     let system_messages = Some(
         canonical
@@ -154,21 +162,20 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     );
     let stream_requested = canonical.stream == Some(true);
     let gate_shape = Some(shape.clone());
-    let backend = target.provider().clone();
+    let backend = attempt.backend().clone();
     let record = Some(RecordCtx {
         frontend: frontend.clone(),
         server: server.clone(),
         backend: backend.clone(),
-        binding_id: target.binding().id().clone(),
+        binding_id: attempt.binding().id().clone(),
         started,
         session_id: session_id.clone(),
         ping,
-        requested_model: model.clone(),
+        requested_model: attempt.requested_model().map(str::to_owned),
         effective_model: gate_model.clone(),
         shape: Some(shape),
         system_messages,
     });
-    canonical.model.clone_from(&gate_model);
 
     if target
         .binding()
@@ -177,7 +184,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     {
         let rendered = translate::openai_chat_backend::render_openai_chat(
             &canonical,
-            target.binding().dialect(),
+            attempt.binding().dialect(),
         );
         let rendered = match rendered {
             Ok(rendered) => rendered,
@@ -421,7 +428,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     }
 
     // 7. Upstream; 8.-10. in forward_upstream.
-    server.note_binding_sent(target.binding().id(), gate_model.as_deref());
+    server.note_binding_sent(attempt.binding().id(), gate_model.as_deref());
     match send_upstream(
         &server,
         backend.as_ref(),

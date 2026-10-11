@@ -1206,6 +1206,23 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.models.note_served(served_model.as_deref(), now_ms());
     }
 
+    // Freeze the post-gate, post-routing semantics before any backend adapter
+    // receives them. Even the current single authoritative attempt gets a
+    // fresh clone, so later fallback cannot inherit mutations from attempt one.
+    if path == "/v1/messages"
+        && let Some(request) = canonical.take()
+    {
+        canonical = Some(
+            super::inference::InferenceAttempt::new(
+                target.clone(),
+                client_model.clone(),
+                served_model.clone(),
+                request,
+            )
+            .canonical(),
+        );
+    }
+
     // ── the codex branch: translate instead of byte-forward ──
     //
     // The codex backend speaks the Responses dialect, not Anthropic's:
