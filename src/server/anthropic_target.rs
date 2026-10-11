@@ -191,31 +191,6 @@ pub(crate) fn prepare(
     })
 }
 
-pub(crate) async fn turn(
-    server: Server,
-    parts: Parts,
-    attempt: super::inference::InferenceAttempt,
-    limit_field: Option<Value>,
-    record: Option<AnthropicRecordCtx>,
-    in_flight: Option<InFlightGuard>,
-    frontend: FrontendWire,
-) -> Response {
-    let ready = match prepare(
-        &server,
-        parts,
-        attempt,
-        limit_field,
-        record,
-        in_flight,
-        frontend,
-    ) {
-        Ok(ready) => ready,
-        Err(response) => return *response,
-    };
-    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready.execute(server).await
-}
-
 fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
     let catalogs = server
         .catalogs

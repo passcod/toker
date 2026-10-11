@@ -18,6 +18,7 @@ use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
 use crate::translate::{Rendered, TranslateError};
 
 use super::codex::{CodexFrontendWire, frontend_error_response};
+use super::record::RecordCtx;
 use super::record_anthropic::AnthropicRecordCtx;
 use super::{InFlightGuard, Server};
 
@@ -63,6 +64,15 @@ pub(crate) struct InferenceAttempt {
     effective_model: Option<String>,
     mapped: Option<MapTarget>,
     canonical: CanonicalRequest,
+}
+
+pub(crate) struct ChatAttemptInput {
+    pub(crate) parts: Parts,
+    pub(crate) max_tokens: Option<Value>,
+    pub(crate) record: Option<RecordCtx>,
+    pub(crate) in_flight: Option<InFlightGuard>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) client_wants_json: bool,
 }
 
 pub(crate) struct ResponsesAttemptInput {
@@ -170,15 +180,63 @@ impl InferenceAttempt {
     }
 }
 
-enum ReadyResponsesAttempt {
+struct ReadyChatAttempt {
+    parts: Parts,
+    backend: Arc<dyn Provider>,
+    binding_id: crate::policy::BindingId,
+    effective_model: String,
+    response_model: String,
+    body: bytes::Bytes,
+    record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+}
+
+impl ReadyChatAttempt {
+    fn binding_id(&self) -> &crate::policy::BindingId {
+        &self.binding_id
+    }
+
+    fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    async fn execute(self, server: Server) -> Response {
+        let upstream = match super::proxy::send_upstream(
+            &server,
+            self.backend.as_ref(),
+            &self.parts,
+            self.body,
+            &[],
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(%error, "upstream request failed");
+                return super::proxy::transport_failure(super::proxy::ErrorWire::Openai, &error);
+            }
+        };
+        super::proxy::forward_chat_canonical(
+            upstream,
+            self.record,
+            self.in_flight,
+            &self.response_model,
+        )
+        .await
+    }
+}
+
+enum ReadyBackendAttempt {
+    Chat(ReadyChatAttempt),
     Anthropic(super::anthropic_target::ReadyAttempt),
     OpenRouter(super::openrouter_responses::ReadyAttempt),
     Codex(super::codex::ReadyAttempt),
 }
 
-impl ReadyResponsesAttempt {
+impl ReadyBackendAttempt {
     fn binding_id(&self) -> &crate::policy::BindingId {
         match self {
+            Self::Chat(ready) => ready.binding_id(),
             Self::Anthropic(ready) => ready.binding_id(),
             Self::OpenRouter(ready) => ready.binding_id(),
             Self::Codex(ready) => ready.binding_id(),
@@ -187,6 +245,7 @@ impl ReadyResponsesAttempt {
 
     fn effective_model(&self) -> &str {
         match self {
+            Self::Chat(ready) => ready.effective_model(),
             Self::Anthropic(ready) => ready.effective_model(),
             Self::OpenRouter(ready) => ready.effective_model(),
             Self::Codex(ready) => ready.effective_model(),
@@ -195,11 +254,106 @@ impl ReadyResponsesAttempt {
 
     async fn execute(self, server: Server) -> Response {
         match self {
+            Self::Chat(ready) => ready.execute(server).await,
             Self::Anthropic(ready) => ready.execute(server).await,
             Self::OpenRouter(ready) => ready.execute(server).await,
             Self::Codex(ready) => ready.execute(server).await,
         }
     }
+}
+
+fn prepare_chat(
+    parts: Parts,
+    attempt: InferenceAttempt,
+    record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+) -> Result<ReadyChatAttempt, Box<Response>> {
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt
+        .requested_model()
+        .unwrap_or(&effective_model)
+        .to_owned();
+    let rendered = attempt
+        .render_json()
+        .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;
+    let body = serde_json::to_vec(&rendered.value)
+        .map(bytes::Bytes::from)
+        .map_err(|error| {
+            tracing::error!(%error, "canonical chat request serialisation failed");
+            Box::new(super::proxy::plain_status(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "translation failed\n",
+            ))
+        })?;
+    Ok(ReadyChatAttempt {
+        parts,
+        backend: attempt.backend().clone(),
+        binding_id: attempt.binding().id().clone(),
+        effective_model,
+        response_model,
+        body,
+        record,
+        in_flight,
+    })
+}
+
+pub(crate) async fn coordinate_chat(
+    server: Server,
+    adapter: Option<BackendAdapterId>,
+    attempt: InferenceAttempt,
+    input: ChatAttemptInput,
+) -> Response {
+    let ChatAttemptInput {
+        parts,
+        max_tokens,
+        record,
+        in_flight,
+        session_id,
+        client_wants_json,
+    } = input;
+    let prepared = match adapter {
+        Some(BackendAdapterId::OpenAiChatCompletions) => {
+            prepare_chat(parts, attempt, record, in_flight).map(ReadyBackendAttempt::Chat)
+        }
+        Some(BackendAdapterId::AnthropicMessages) => {
+            let backend = attempt.backend().clone();
+            super::anthropic_target::prepare(
+                &server,
+                parts,
+                attempt,
+                max_tokens,
+                record.map(|ctx| super::proxy::chat_cross_record(ctx, backend)),
+                in_flight,
+                super::anthropic_target::FrontendWire::Chat,
+            )
+            .map(ReadyBackendAttempt::Anthropic)
+        }
+        Some(BackendAdapterId::CodexResponses) => {
+            let backend = attempt.backend().clone();
+            super::codex::prepare(
+                &server,
+                super::codex::AttemptInput {
+                    attempt: Ok(attempt),
+                    record: record.map(|ctx| super::proxy::chat_cross_record(ctx, backend)),
+                    in_flight,
+                    session_id,
+                    thread_id: None,
+                    request_id: None,
+                    client_wants_json,
+                    frontend_wire: CodexFrontendWire::OpenAiChat,
+                },
+            )
+            .await
+            .map(ReadyBackendAttempt::Codex)
+        }
+        _ => Err(Box::new(super::openai_not_configured())),
+    };
+    let ready = match prepared {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+    ready.execute(server).await
 }
 
 pub(crate) async fn coordinate_responses(
@@ -234,7 +388,7 @@ pub(crate) async fn coordinate_responses(
                 in_flight,
                 super::anthropic_target::FrontendWire::Responses,
             )
-            .map(ReadyResponsesAttempt::Anthropic)
+            .map(ReadyBackendAttempt::Anthropic)
         }
         Some(BackendAdapterId::OpenRouterResponses) => {
             let attempt = match attempt {
@@ -248,7 +402,7 @@ pub(crate) async fn coordinate_responses(
                 record,
                 in_flight,
             )
-            .map(ReadyResponsesAttempt::OpenRouter)
+            .map(ReadyBackendAttempt::OpenRouter)
         }
         Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
             &server,
@@ -264,7 +418,7 @@ pub(crate) async fn coordinate_responses(
             },
         )
         .await
-        .map(ReadyResponsesAttempt::Codex),
+        .map(ReadyBackendAttempt::Codex),
         _ => Err(Box::new(super::responses_not_configured())),
     };
     let ready = match prepared {

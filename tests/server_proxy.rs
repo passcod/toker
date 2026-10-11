@@ -608,7 +608,7 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
     let response = post_chat(addr, &chat_body("openai_api/gpt-6.1-sol", false)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("chat response");
-    assert_eq!(body["model"], "gpt-6.1-sol");
+    assert_eq!(body["model"], "openai_api/gpt-6.1-sol");
 
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
@@ -655,7 +655,8 @@ async fn direct_openai_streams_always_request_the_usage_chunk() {
 
     let response = post_chat(addr, &chat_body("gpt-6-luna", true)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.bytes().await.expect("stream");
+    let stream = response.text().await.expect("stream");
+    assert!(stream.contains(r#""model":"gpt-6-luna""#));
     let sent: Value = serde_json::from_slice(&mock.captured()[0].body).expect("request");
     assert_eq!(sent["stream_options"]["include_usage"], true);
 }

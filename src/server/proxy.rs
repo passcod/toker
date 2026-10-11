@@ -59,7 +59,7 @@ use crate::middleware::force_newest;
 use crate::middleware::lanes;
 use crate::observe::{SseEvent, SseSplitter, UsageObserver};
 use crate::providers::Provider;
-use crate::routing::{BackendAdapterId, ProtocolId};
+use crate::routing::ProtocolId;
 use crate::translate::{self, OpenAiChatRenderer};
 
 use super::InFlightGuard;
@@ -122,7 +122,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 
     // 2.-5. Parse and route. Every supported Chat backend renders from
     // canonical IR, including the same-protocol OpenRouter binding.
-    let mut forward = original.clone();
     // The request's own shape and ask, kept past the record context: the
     // cold gate keys the lane on the session × tools-hash the request
     // itself carries, answers in the wire form the request asked for,
@@ -172,24 +171,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         shape: Some(shape),
         system_messages,
     });
-
-    if target
-        .binding()
-        .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
-    {
-        let rendered = match attempt.render_json() {
-            Ok(rendered) => rendered,
-            Err(error) => return compatibility_error(&error.to_string()),
-        };
-        forward = match serde_json::to_vec(&rendered.value) {
-            Ok(body) => Bytes::from(body),
-            Err(error) => {
-                tracing::error!(%error, "canonical chat request serialisation failed");
-                return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
-            }
-        };
-    }
 
     // 6. The cold-cache notice (see the module docs). Advisory like the
     // anthropic gate's: once per idle spell, re-armed by activity, and
@@ -371,81 +352,28 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         server.observe_policy_shadow(facts, lane, legacy);
     }
 
-    if target
+    let adapter = target
         .binding()
         .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
-    {
-        let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
-        return super::anthropic_target::turn(
-            server,
+        .map(|backend| backend.adapter());
+    super::inference::coordinate_chat(
+        server,
+        adapter,
+        attempt,
+        super::inference::ChatAttemptInput {
             parts,
-            attempt,
-            value
+            max_tokens: value
                 .get("max_completion_tokens")
                 .filter(|value| !value.is_null())
                 .or_else(|| value.get("max_tokens"))
                 .cloned(),
             record,
             in_flight,
-            super::anthropic_target::FrontendWire::Chat,
-        )
-        .await;
-    }
-
-    if target
-        .binding()
-        .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
-    {
-        let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
-        return super::codex::turn(super::codex::CodexTurn {
-            server,
-            attempt: Some(Ok(attempt)),
-            record,
-            in_flight,
             session_id,
-            thread_id: None,
-            request_id: None,
             client_wants_json: !stream_requested,
-            frontend_wire: super::codex::CodexFrontendWire::OpenAiChat,
-        })
-        .await;
-    }
-
-    // 7. Upstream; 8.-10. in forward_upstream.
-    server.note_binding_sent(attempt.binding().id(), gate_model.as_deref());
-    match send_upstream(
-        &server,
-        backend.as_ref(),
-        &parts,
-        forward,
-        // Sticky routing: openrouter consumes the session headers as its
-        // cache-affinity key, so they ride upstream, not into the strip
-        // list (see send_upstream's docs).
-        &[],
+        },
     )
     .await
-    {
-        Ok(upstream) => {
-            forward_chat_canonical(
-                upstream,
-                record,
-                in_flight,
-                gate_model.as_deref().unwrap_or_default(),
-            )
-            .await
-        }
-        Err(error) => {
-            // No upstream response: nothing measured, and the error row is
-            // provider-response-shaped (status/type/retry-after), so this
-            // surfaces as 502 unledgered and logged — never a fabricated
-            // provider status. The guard drops here too: the exchange is
-            // over, however it ended.
-            tracing::warn!(%error, "upstream request failed");
-            transport_failure(ErrorWire::Openai, &error)
-        }
-    }
 }
 
 /// `GET /v1/models` is a local route-graph projection for known OpenAI
@@ -607,7 +535,7 @@ pub(crate) async fn forward_upstream(upstream: reqwest::Response) -> Response {
 /// A Chat binding's live universal-canonical response path. Accounting
 /// observes the provider bytes before translation, so billed cost, estimates,
 /// and verbatim usage remain provider evidence rather than renderer output.
-async fn forward_chat_canonical(
+pub(crate) async fn forward_chat_canonical(
     upstream: reqwest::Response,
     record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,
@@ -721,7 +649,7 @@ fn json_response(
     )
 }
 
-fn compatibility_error(message: &str) -> Response {
+pub(crate) fn compatibility_error(message: &str) -> Response {
     error_response(
         ErrorWire::Openai,
         StatusCode::BAD_REQUEST,
@@ -865,7 +793,7 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
     Bytes::from(out)
 }
 
-fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
+pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRecordCtx {
     let shape = ctx.shape.map(|shape| crate::ir::AnthropicShape {
         req_bytes: shape.req_bytes,
         req_messages: shape.req_messages,
