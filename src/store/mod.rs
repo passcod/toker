@@ -680,6 +680,7 @@ mod tests {
         RowKind, SessionCostGroup, SessionLineage, Store, StoredRoutingTrace,
         StoredRoutingTraceEvent, is_api_measurement,
     };
+    use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, FrontendProtocol,
@@ -2732,11 +2733,21 @@ mod tests {
             .merge_binding_learning(&update(
                 &["2026-10-02"],
                 Some(100),
-                Some(json!({"kind":"declared","tokens":200})),
+                DeclaredWindow::new(100, 200),
                 false,
                 20,
             ))
             .unwrap();
+        let stored: String = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT context_window_json FROM learned_models_by_binding",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, r#"{"default":100,"max":200}"#);
         let merged = store
             .merge_binding_learning(&update(&["2026-10-01"], Some(50), None, true, 10))
             .unwrap();
@@ -2745,29 +2756,44 @@ mod tests {
             ["2026-10-01", "2026-10-02"]
         );
         assert_eq!(merged.max_prompt, Some(100));
-        assert_eq!(
-            merged.context_window,
-            Some(json!({"kind":"declared","tokens":200}))
-        );
+        assert_eq!(merged.context_window, DeclaredWindow::new(100, 200));
         assert!(merged.explicitly_promoted);
         assert_eq!(merged.updated_ms, 20);
         let replaced = store
-            .merge_binding_learning(&update(
-                &[],
-                None,
-                Some(json!({"kind":"exact","tokens":300})),
-                false,
-                30,
-            ))
+            .merge_binding_learning(&update(&[], None, DeclaredWindow::new(200, 300), false, 30))
             .unwrap();
-        assert_eq!(
-            replaced.context_window,
-            Some(json!({"kind":"exact","tokens":300}))
-        );
+        assert_eq!(replaced.context_window, DeclaredWindow::new(200, 300));
         assert_eq!(
             store.load_binding_learnings(&binding).unwrap(),
             vec![replaced]
         );
+    }
+
+    #[test]
+    fn binding_learning_errors_on_malformed_stored_declaration() {
+        let store = mem_store();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        store
+            .execute_for_test("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        for (model, value) in [
+            ("bad-json", "{"),
+            ("bad-shape", r#"{"default":200,"max":100}"#),
+            ("extra-field", r#"{"default":100,"max":200,"extra":1}"#),
+        ] {
+            store
+                .execute_for_test(&format!(
+                    "INSERT INTO learned_models_by_binding
+                     (binding_id, model_id, context_window_json, updated_ms)
+                     VALUES ('openrouter.openrouter_messages', '{model}',
+                             '{value}', 1);"
+                ))
+                .unwrap();
+            assert!(matches!(
+                store.load_binding_learning(&binding, model),
+                Err(Error::InvalidRoutingState(_))
+            ));
+        }
     }
 
     #[test]
@@ -3291,7 +3317,7 @@ mod tests {
                 model_id: "model".to_owned(),
                 days: ["2026-10-01".to_owned()].into_iter().collect(),
                 max_prompt: Some(100),
-                context_window: Some(json!({"default": 100, "max": 200})),
+                context_window: DeclaredWindow::new(100, 200),
                 explicitly_promoted: true,
                 updated_ms: 20,
             })
@@ -3321,10 +3347,7 @@ mod tests {
             ["2026-10-01", "2026-10-02"]
         );
         assert_eq!(merged.max_prompt, Some(100));
-        assert_eq!(
-            merged.context_window,
-            Some(json!({"default": 100, "max": 200}))
-        );
+        assert_eq!(merged.context_window, DeclaredWindow::new(100, 200));
         assert!(merged.explicitly_promoted);
         assert_eq!(merged.updated_ms, 20);
     }

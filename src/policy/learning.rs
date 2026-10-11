@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::catalog::DeclaredWindow;
 use crate::middleware::models::{ModelStore, active_days_of, days_of};
 use crate::store::{BindingLearning, ModelEntry, Store};
 
@@ -17,6 +18,7 @@ use super::BindingId;
 pub struct LearnedEvidence {
     distinct_days: Vec<String>,
     max_prompt: Option<u64>,
+    declared_window: Option<DeclaredWindow>,
     explicitly_promoted: bool,
 }
 
@@ -24,11 +26,13 @@ impl LearnedEvidence {
     pub fn new(
         distinct_days: Vec<String>,
         max_prompt: Option<u64>,
+        declared_window: Option<DeclaredWindow>,
         explicitly_promoted: bool,
     ) -> Self {
         Self {
             distinct_days,
             max_prompt,
+            declared_window,
             explicitly_promoted,
         }
     }
@@ -39,6 +43,10 @@ impl LearnedEvidence {
 
     pub fn max_prompt(&self) -> Option<u64> {
         self.max_prompt
+    }
+
+    pub fn declared_window(&self) -> Option<DeclaredWindow> {
+        self.declared_window
     }
 
     pub fn explicitly_promoted(&self) -> bool {
@@ -302,6 +310,7 @@ fn binding_evidence(entry: BindingLearning) -> LearnedEvidence {
     LearnedEvidence {
         distinct_days: entry.days.into_iter().collect(),
         max_prompt: entry.max_prompt.and_then(|value| u64::try_from(value).ok()),
+        declared_window: entry.context_window,
         explicitly_promoted: entry.explicitly_promoted,
     }
 }
@@ -310,6 +319,7 @@ fn evidence(entry: ModelEntry) -> LearnedEvidence {
     LearnedEvidence {
         distinct_days: days_of(&entry),
         max_prompt: entry.max_prompt.and_then(|value| u64::try_from(value).ok()),
+        declared_window: None,
         // Legacy grants are encoded by adding ordinary days, so the legacy
         // table cannot distinguish an explicit grant from observations.
         explicitly_promoted: false,
@@ -481,7 +491,7 @@ mod tests {
                     .into_iter()
                     .collect::<BTreeSet<_>>(),
                 max_prompt: Some(100),
-                context_window: None,
+                context_window: DeclaredWindow::new(100, 200),
                 explicitly_promoted: true,
                 updated_ms: 10,
             })
@@ -504,6 +514,7 @@ mod tests {
         let learned = view.learned(&first, "shared-name").unwrap().unwrap();
         assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
         assert_eq!(learned.max_prompt(), Some(100));
+        assert_eq!(learned.declared_window(), DeclaredWindow::new(100, 200));
         assert!(learned.explicitly_promoted());
         assert_eq!(view.learned(&second, "shared-name").unwrap(), None);
         assert_eq!(view.learned(&first, "legacy-only").unwrap(), None);

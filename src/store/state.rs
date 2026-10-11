@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use crate::catalog::DeclaredWindow;
 use crate::ir::Release;
 use crate::middleware::models::local_day;
 use crate::policy::{
@@ -251,7 +252,7 @@ pub struct BindingLearning {
     pub model_id: String,
     pub days: BTreeSet<String>,
     pub max_prompt: Option<i64>,
-    pub context_window: Option<Value>,
+    pub context_window: Option<DeclaredWindow>,
     pub explicitly_promoted: bool,
     pub updated_ms: i64,
 }
@@ -263,7 +264,7 @@ pub struct BindingLearningUpdate {
     pub model_id: String,
     pub days: BTreeSet<String>,
     pub max_prompt: Option<i64>,
-    pub context_window: Option<Value>,
+    pub context_window: Option<DeclaredWindow>,
     pub explicitly_promoted: bool,
     pub updated_ms: i64,
 }
@@ -1109,8 +1110,7 @@ fn merge_binding_learning_in_transaction(
     };
     let context_window = update
         .context_window
-        .clone()
-        .or_else(|| existing.as_ref().and_then(|v| v.context_window.clone()));
+        .or_else(|| existing.as_ref().and_then(|v| v.context_window));
     let explicitly_promoted =
         update.explicitly_promoted || existing.as_ref().is_some_and(|v| v.explicitly_promoted);
     let updated_ms = existing
@@ -1121,8 +1121,8 @@ fn merge_binding_learning_in_transaction(
     } else {
         Some(serde_json::to_string(&days.iter().collect::<Vec<_>>())?)
     };
-    let context_json = match &context_window {
-        Some(value) => Some(serde_json::to_string(value)?),
+    let context_json = match context_window {
+        Some(value) => Some(serde_json::to_string(&value)?),
         None => None,
     };
     conn.execute(
@@ -1318,7 +1318,12 @@ fn read_binding_learning(row: &rusqlite::Row<'_>) -> Result<BindingLearning> {
             set
         }
     };
-    let context_window = super::opt_json_from_text(row.get("context_window_json")?)?;
+    let context_window = match row.get::<_, Option<String>>("context_window_json")? {
+        None => None,
+        Some(json) => Some(serde_json::from_str::<DeclaredWindow>(&json).map_err(|_| {
+            Error::InvalidRoutingState("stored learned context window is invalid".into())
+        })?),
+    };
     let max_prompt: Option<i64> = row.get("max_prompt")?;
     if max_prompt.is_some_and(|value: i64| value < 0) {
         return Err(Error::InvalidRoutingState(

@@ -970,7 +970,12 @@ fn fits_context<L: LearningView>(
     Ok(learning
         .learned(binding, model)
         .map_err(|_| ResolveFailure::LearningUnavailable)?
-        .and_then(|evidence| evidence.max_prompt())
+        .and_then(|evidence| {
+            evidence
+                .declared_window()
+                .map(|window| window.max_tokens())
+                .or_else(|| evidence.max_prompt())
+        })
         .is_some_and(|max| prompt <= max))
 }
 
@@ -1061,6 +1066,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::catalog::DeclaredWindow;
     use crate::catalog::offers::{BackendOffer, OfferInventory};
     use crate::policy::*;
     use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, RouteRegistry};
@@ -1298,6 +1304,102 @@ mod tests {
 
         assert_eq!(plan.effective_model, "claude-opus-4-8");
         assert_eq!(plan.upgraded_model, None);
+    }
+
+    #[test]
+    fn context_fit_prefers_inventory_then_declaration_then_empirical_maximum() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        store
+            .merge_binding_learning(&crate::store::BindingLearningUpdate {
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                model_id: "model".to_owned(),
+                days: Default::default(),
+                max_prompt: Some(300),
+                context_window: DeclaredWindow::new(100, 200),
+                explicitly_promoted: false,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let learning = BindingLearningView::new(store);
+        let inventory = OfferInventory::from_offers([BackendOffer {
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            provider: "anthropic_sub".to_owned(),
+            backend_model_id: "model".to_owned(),
+            binding: ANTHROPIC_SUB_MESSAGES.clone(),
+            context_window: Some(100),
+            chronology: None,
+            fetched_at_ms: 1,
+            raw: serde_json::Value::Null,
+        }]);
+
+        assert!(
+            !fits_context(
+                &inventory,
+                &learning,
+                ANTHROPIC_SUB_MESSAGES.id(),
+                "model",
+                150,
+            )
+            .unwrap()
+        );
+        assert!(
+            fits_context(
+                &OfferInventory::default(),
+                &learning,
+                ANTHROPIC_SUB_MESSAGES.id(),
+                "model",
+                150,
+            )
+            .unwrap()
+        );
+        assert!(
+            !fits_context(
+                &OfferInventory::default(),
+                &learning,
+                ANTHROPIC_SUB_MESSAGES.id(),
+                "model",
+                250,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn context_fit_keeps_learned_evidence_binding_local() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        store
+            .merge_binding_learning(&crate::store::BindingLearningUpdate {
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                model_id: "same-model".to_owned(),
+                days: Default::default(),
+                max_prompt: Some(300),
+                context_window: None,
+                explicitly_promoted: false,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let learning = BindingLearningView::new(store);
+
+        assert!(
+            fits_context(
+                &OfferInventory::default(),
+                &learning,
+                ANTHROPIC_SUB_MESSAGES.id(),
+                "same-model",
+                250,
+            )
+            .unwrap()
+        );
+        assert!(
+            !fits_context(
+                &OfferInventory::default(),
+                &learning,
+                ANTHROPIC_API_MESSAGES.id(),
+                "same-model",
+                250,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
