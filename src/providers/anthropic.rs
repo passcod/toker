@@ -185,6 +185,23 @@ impl Provider for AnthropicSub {
         self.token_for_turn().is_some()
     }
 
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.token_for_turn().is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
+        }
+    }
+
     fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
         if frontend != ProtocolId::AnthropicMessages {
             outgoing.remove(header::AUTHORIZATION);
@@ -245,6 +262,23 @@ impl Provider for AnthropicApi {
         outgoing
             .entry("anthropic-version")
             .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.api_key.is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
+        }
     }
 
     fn inject_auth(&self, outgoing: &mut HeaderMap) {

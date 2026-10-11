@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 
 use super::Provider;
-use crate::routing::{BackendBinding, OPENAI_API_CHAT};
+use crate::routing::{BackendBinding, OPENAI_API_CHAT, ProtocolId};
 
 const BINDINGS: &[BackendBinding] = &[OPENAI_API_CHAT];
 
@@ -65,6 +65,23 @@ impl Provider for OpenAiApi {
         outgoing.remove(&X_API_KEY);
         if carries_foreign_bearer(outgoing) {
             outgoing.remove(AUTHORIZATION);
+        }
+    }
+
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.api_key.is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
         }
     }
 

@@ -121,6 +121,23 @@ impl Provider for OpenRouter {
         model.starts_with("anthropic/")
     }
 
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.api_key.is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
+        }
+    }
+
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
         let Some(key) = &self.api_key else {
             // No key: forward unauthenticated; openrouter's 401 body passes
@@ -284,6 +301,30 @@ mod tests {
         assert_eq!(
             headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
             Some("Bearer sk-or-v1-own")
+        );
+    }
+
+    #[test]
+    fn credential_evidence_is_destination_specific() {
+        let provider = provider();
+        let mut native = HeaderMap::new();
+        native.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-or-v1-own"),
+        );
+        assert_eq!(
+            provider.credential_availability(&native, ProtocolId::OpenAiChat, 0),
+            super::super::CredentialAvailability::PassingNative
+        );
+        assert_eq!(
+            provider.credential_availability(&native, ProtocolId::OpenAiResponses, 0),
+            super::super::CredentialAvailability::Held,
+            "a Codex frontend bearer is stripped before OpenRouter signs"
+        );
+        let keyless = OpenRouter::new("https://openrouter.ai/api/v1".parse().unwrap(), None);
+        assert_eq!(
+            keyless.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiChat, 0),
+            super::super::CredentialAvailability::KnownMissingOrExpired
         );
     }
 }

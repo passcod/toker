@@ -108,6 +108,14 @@ impl AvailabilitySnapshot {
         self.bindings.get(binding)
     }
 
+    pub fn with_credential(&self, binding: &BindingId, credential: Evidence<&'static str>) -> Self {
+        let mut snapshot = self.clone();
+        if let Some(availability) = snapshot.bindings.get_mut(binding) {
+            availability.credential = credential;
+        }
+        snapshot
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&BindingId, &BindingAvailability)> {
         self.bindings.iter()
     }

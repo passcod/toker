@@ -78,6 +78,7 @@ use reqwest::Url;
 use serde_json::Value;
 
 use super::Provider;
+use crate::routing::ProtocolId;
 
 /// The `version` header: toker's own crate version (the codex client
 /// sends its version the same way).
@@ -511,6 +512,22 @@ impl Provider for CodexSub {
 
     /// The codex bearer + account id + FedRAMP marker, over a stripped
     /// `authorization` — [`auth_headers`].
+    fn credential_availability(
+        &self,
+        _incoming: &HeaderMap,
+        _frontend: ProtocolId,
+        now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let Some(auth) = self.auth() else {
+            return super::CredentialAvailability::KnownMissingOrExpired;
+        };
+        if auth.needs_refresh(now_unix_seconds) {
+            super::CredentialAvailability::Refreshable
+        } else {
+            super::CredentialAvailability::Held
+        }
+    }
+
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
         auth_headers(self.auth().as_ref(), outgoing);
     }
