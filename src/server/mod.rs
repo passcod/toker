@@ -1225,6 +1225,7 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
             let configured = registry.binding_is_configured(binding);
             let catalogue = FetchedCatalogs::source_of(binding.provider())
                 .and_then(|source| catalogs.get(source))
+                .filter(|catalog| !catalog.models.is_empty())
                 .map_or(CatalogueAvailability::Absent, |catalog| {
                     CatalogueAvailability::Fresh {
                         fetched_at_ms: catalog.fetched_at_ms,
@@ -1891,6 +1892,49 @@ api_key = "ak-literal-test"
         assert_eq!(
             super::cache_temperature(&lane, Some(no_ttl), now),
             CacheTemperature::Unknown
+        );
+    }
+
+    #[test]
+    fn empty_incident_catalogue_is_absent_but_nonempty_catalogue_is_fresh() {
+        let dir = crate::setup::test_dir("catalogue-availability");
+        let server = server(&dir);
+        let binding = "openrouter.openrouter_chat_completions"
+            .parse::<crate::policy::BindingId>()
+            .unwrap();
+        let mut catalogs = crate::catalog::FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            crate::catalog::FetchedCatalog {
+                fetched_at_ms: 10,
+                models: vec![],
+            },
+        );
+        assert_eq!(
+            super::availability_for(&server.registry, &catalogs)
+                .get(&binding)
+                .unwrap()
+                .catalogue,
+            crate::policy::CatalogueAvailability::Absent
+        );
+        catalogs.set(
+            "openrouter",
+            crate::catalog::FetchedCatalog {
+                fetched_at_ms: 20,
+                models: vec![crate::catalog::FetchedModel {
+                    id: "model".to_owned(),
+                    context_window: None,
+                    chronology: None,
+                    raw: serde_json::Value::Null,
+                }],
+            },
+        );
+        assert_eq!(
+            super::availability_for(&server.registry, &catalogs)
+                .get(&binding)
+                .unwrap()
+                .catalogue,
+            crate::policy::CatalogueAvailability::Fresh { fetched_at_ms: 20 }
         );
     }
 
