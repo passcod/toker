@@ -69,9 +69,7 @@ use futures::stream::Stream;
 use crate::config::GatesConfig;
 use crate::ir::AnthropicShape;
 use crate::ir::Request as IrRequest;
-use crate::ir::canonical::{
-    CanonBlock, CanonRole, CanonToolChoice, CanonicalRequest, ResponseProjection,
-};
+use crate::ir::canonical::{CanonBlock, CanonToolChoice, CanonicalRequest, ResponseProjection};
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
@@ -1481,19 +1479,16 @@ pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::
     let has_images = blocks
         .clone()
         .any(|block| matches!(block, CanonBlock::Image { .. }));
-    let thinking_replay = blocks.clone().any(|block| {
-        matches!(
-            block,
-            CanonBlock::Thinking { .. } | CanonBlock::RedactedThinking { .. }
-        )
-    });
     crate::policy::CapabilityFlags {
-        sampling: request.sampling != Default::default(),
-        system_in_messages: request
-            .messages
-            .iter()
-            .any(|message| matches!(message.role, CanonRole::System | CanonRole::Developer)),
-        thinking_replay,
+        // These flags are hard routing requirements, not a list of every
+        // semantic field the request uses. Sampling and system roles have
+        // deliberate canonical degradation paths, while provider-owned opaque
+        // reasoning is constrained separately by binding affinity. Treating
+        // those as hard would reject routes the live adapters intentionally
+        // serve.
+        sampling: false,
+        system_in_messages: false,
+        thinking_replay: false,
         images: has_images,
         tools: !request.tools.is_empty() || request.tool_choice != CanonToolChoice::Auto,
     }
@@ -2280,9 +2275,42 @@ fn observe_chunk(splitter: &mut SseSplitter, observer: &mut AnthropicObserver, c
 
 #[cfg(test)]
 mod tests {
-    use super::request_betas;
+    use super::{request_betas, shadow_capabilities};
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    #[test]
+    fn shadow_requires_only_semantics_without_a_canonical_degradation() {
+        let request = crate::translate::from_anthropic(&json!({
+            "model": "claude-opus-5",
+            "system": "instruction",
+            "temperature": 0.4,
+            "tools": [{
+                "name": "lookup",
+                "description": "lookup",
+                "input_schema": {"type": "object"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aGVsbG8="
+                    }
+                }]
+            }],
+            "max_tokens": 10
+        }))
+        .expect("canonical request");
+        let required = shadow_capabilities(&request);
+        assert!(!required.sampling);
+        assert!(!required.system_in_messages);
+        assert!(!required.thinking_replay);
+        assert!(required.images);
+        assert!(required.tools);
+    }
 
     #[test]
     fn betas_split_trim_and_keep_absence_distinct_from_empty() {
