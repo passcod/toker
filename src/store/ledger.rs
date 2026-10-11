@@ -7,7 +7,15 @@
 //! builder, so callers must spell out every field and a new column is a
 //! compile error at every call site.
 
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::policy::{
+    BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, StableId,
+};
 
 use super::{Error, Result, rows_of};
 use rusqlite::Connection;
@@ -121,6 +129,106 @@ impl std::str::FromStr for CostKind {
 /// one place so every consumer (TUI, export) classifies identically.
 pub fn is_api_measurement(kind: Option<RowKind>) -> bool {
     kind.is_none()
+}
+
+/// Lowercase random 128-bit identity shared by one logical request's attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttemptGroupId(String);
+
+impl AttemptGroupId {
+    pub fn new(value: impl Into<String>) -> std::result::Result<Self, String> {
+        let value = value.into();
+        if value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(value))
+        } else {
+            Err("attempt group id must be exactly 32 lowercase hexadecimal characters".into())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AttemptGroupId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AttemptGroupId {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRole {
+    Guardian,
+}
+
+impl ChildRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Guardian => "guardian",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        (value == "guardian").then_some(Self::Guardian)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationSource {
+    CodexGuardian,
+}
+
+impl RelationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexGuardian => "codex_guardian",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        (value == "codex_guardian").then_some(Self::CodexGuardian)
+    }
+}
+
+/// One validated explicit parent relation. Missing parents remain valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLineage {
+    pub parent_session_id: String,
+    pub child_role: ChildRole,
+    pub relation_source: RelationSource,
+}
+
+/// Stable content-free trace event. Values are identifiers or closed reason
+/// codes; no prompt, completion, tool argument, or provider body can enter it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredRoutingTrace {
+    pub events: Vec<StoredRoutingTraceEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoredRoutingTraceEvent {
+    Lookup {
+        source: StableId,
+    },
+    Candidate {
+        candidate_id: CandidateId,
+        state: StableId,
+        reason: Option<StableId>,
+    },
+    Transition {
+        reason: StableId,
+    },
 }
 
 /// One `requests` row: the complete column list as a single struct. Field
@@ -268,6 +376,51 @@ pub struct RequestRow {
     pub geo: Option<String>,
     /// Provider's fast/low-latency tier flag, when reported.
     pub fast: Option<bool>,
+    /// Immutable policy revision used by this attempt.
+    pub policy_revision_id: Option<i64>,
+    pub presentation_id: Option<PresentationId>,
+    pub rewrite_id: Option<RewriteId>,
+    pub policy_route_id: Option<RouteId>,
+    pub route_fingerprint: Option<RouteFingerprint>,
+    pub candidate_id: Option<CandidateId>,
+    pub binding_id: Option<BindingId>,
+    pub baseline_model: Option<String>,
+    pub attempt_group_id: Option<AttemptGroupId>,
+    /// Zero-based actual-send index; NULL for a preflight terminal row.
+    pub attempt_index: Option<i64>,
+    pub fallback_reason: Option<StableId>,
+    pub routing_trace: Option<StoredRoutingTrace>,
+    pub lineage: Option<SessionLineage>,
+}
+
+fn validate_request_provenance(row: &RequestRow) -> Result<()> {
+    if row.attempt_index.is_some_and(|value| value < 0) {
+        return Err(Error::InvalidRoutingState("negative attempt index".into()));
+    }
+    if row.attempt_index.is_some() && row.attempt_group_id.is_none() {
+        return Err(Error::InvalidRoutingState(
+            "attempt index requires an attempt group".into(),
+        ));
+    }
+    if let Some(lineage) = &row.lineage {
+        if row
+            .session_id
+            .as_deref()
+            .is_none_or(|child| child == lineage.parent_session_id)
+        {
+            return Err(Error::InvalidRoutingState(
+                "lineage requires a distinct child session id".into(),
+            ));
+        }
+        if (lineage.child_role, lineage.relation_source)
+            != (ChildRole::Guardian, RelationSource::CodexGuardian)
+        {
+            return Err(Error::InvalidRoutingState(
+                "unsupported lineage evidence".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Insert one row. The only writer to `requests`; named parameters keep the
@@ -282,6 +435,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let system_change = super::opt_json_to_text(&row.system_change)?;
     let model_mappings = super::opt_json_to_text(&row.model_mappings)?;
     let extra = super::opt_json_to_text(&row.extra)?;
+    let routing_trace = match &row.routing_trace {
+        Some(trace) => Some(serde_json::to_string(trace)?),
+        None => None,
+    };
+    validate_request_provenance(row)?;
     let kind = row.kind.map(RowKind::as_str);
     let cost_kind = row.cost_kind.map(CostKind::as_str);
 
@@ -297,7 +455,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             compact_generations, summarising, system_change, system_ladder, system_tail,
             gate_on, cold_on, forced_from, forced_to, downgraded_from, downgraded_to,
             cache_stripped, system_merged, model_mappings, drift_digest,
-            status, error_type, retry_after_ms, extra, betas, geo, fast
+            status, error_type, retry_after_ms, extra, betas, geo, fast,
+            policy_revision_id, presentation_id, rewrite_id, policy_route_id,
+            route_fingerprint, candidate_id, binding_id, baseline_model,
+            attempt_group_id, attempt_index, fallback_reason, routing_trace,
+            parent_session_id, child_role, relation_source
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :model, :raw_model, :requested_model, :effective_model,
@@ -309,7 +471,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :compact_generations, :summarising, :system_change, :system_ladder, :system_tail,
             :gate_on, :cold_on, :forced_from, :forced_to, :downgraded_from, :downgraded_to,
             :cache_stripped, :system_merged, :model_mappings, :drift_digest,
-            :status, :error_type, :retry_after_ms, :extra, :betas, :geo, :fast
+            :status, :error_type, :retry_after_ms, :extra, :betas, :geo, :fast,
+            :policy_revision_id, :presentation_id, :rewrite_id, :policy_route_id,
+            :route_fingerprint, :candidate_id, :binding_id, :baseline_model,
+            :attempt_group_id, :attempt_index, :fallback_reason, :routing_trace,
+            :parent_session_id, :child_role, :relation_source
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -371,6 +537,21 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":betas": row.betas,
         ":geo": row.geo,
         ":fast": row.fast,
+        ":policy_revision_id": row.policy_revision_id,
+        ":presentation_id": row.presentation_id.as_ref().map(PresentationId::as_str),
+        ":rewrite_id": row.rewrite_id.as_ref().map(RewriteId::as_str),
+        ":policy_route_id": row.policy_route_id.as_ref().map(RouteId::as_str),
+        ":route_fingerprint": row.route_fingerprint.as_ref().map(ToString::to_string),
+        ":candidate_id": row.candidate_id.as_ref().map(CandidateId::as_str),
+        ":binding_id": row.binding_id.as_ref().map(BindingId::as_str),
+        ":baseline_model": row.baseline_model,
+        ":attempt_group_id": row.attempt_group_id.as_ref().map(AttemptGroupId::as_str),
+        ":attempt_index": row.attempt_index,
+        ":fallback_reason": row.fallback_reason.as_ref().map(StableId::as_str),
+        ":routing_trace": routing_trace,
+        ":parent_session_id": row.lineage.as_ref().map(|value| value.parent_session_id.as_str()),
+        ":child_role": row.lineage.as_ref().map(|value| value.child_role.as_str()),
+        ":relation_source": row.lineage.as_ref().map(|value| value.relation_source.as_str()),
     })?;
     Ok(())
 }
@@ -1331,7 +1512,96 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         betas: row.get("betas")?,
         geo: row.get("geo")?,
         fast: row.get("fast")?,
+        policy_revision_id: row.get("policy_revision_id")?,
+        presentation_id: parse_optional_id(
+            "requests.presentation_id",
+            row.get("presentation_id")?,
+        )?,
+        rewrite_id: parse_optional_id("requests.rewrite_id", row.get("rewrite_id")?)?,
+        policy_route_id: parse_optional_id(
+            "requests.policy_route_id",
+            row.get("policy_route_id")?,
+        )?,
+        route_fingerprint: parse_optional_id(
+            "requests.route_fingerprint",
+            row.get("route_fingerprint")?,
+        )?,
+        candidate_id: parse_optional_id("requests.candidate_id", row.get("candidate_id")?)?,
+        binding_id: parse_optional_id("requests.binding_id", row.get("binding_id")?)?,
+        baseline_model: row.get("baseline_model")?,
+        attempt_group_id: parse_optional_id(
+            "requests.attempt_group_id",
+            row.get("attempt_group_id")?,
+        )?,
+        attempt_index: {
+            let value: Option<i64> = row.get("attempt_index")?;
+            if value.is_some_and(|value| value < 0) {
+                return Err(Error::InvalidRoutingState(
+                    "negative stored attempt index".into(),
+                ));
+            }
+            value
+        },
+        fallback_reason: parse_optional_id(
+            "requests.fallback_reason",
+            row.get("fallback_reason")?,
+        )?,
+        routing_trace: match row.get::<_, Option<String>>("routing_trace")? {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            None => None,
+        },
+        lineage: read_lineage(row)?,
     })
+}
+
+fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    value
+        .map(|value| {
+            value.parse().map_err(|error| {
+                Error::InvalidRoutingState(format!("invalid {column} {value:?}: {error}"))
+            })
+        })
+        .transpose()
+}
+
+fn read_lineage(row: &rusqlite::Row<'_>) -> Result<Option<SessionLineage>> {
+    let parent: Option<String> = row.get("parent_session_id")?;
+    let role: Option<String> = row.get("child_role")?;
+    let source: Option<String> = row.get("relation_source")?;
+    match (parent, role, source) {
+        (None, None, None) => Ok(None),
+        (Some(parent_session_id), Some(role), Some(source)) => {
+            let child_role = ChildRole::parse(&role).ok_or(Error::UnknownDbValue {
+                column: "requests.child_role",
+                value: role,
+            })?;
+            let relation_source = RelationSource::parse(&source).ok_or(Error::UnknownDbValue {
+                column: "requests.relation_source",
+                value: source,
+            })?;
+            let child: Option<String> = row.get("session_id")?;
+            if child
+                .as_deref()
+                .is_none_or(|child| child == parent_session_id)
+            {
+                return Err(Error::InvalidRoutingState(
+                    "stored lineage has no distinct child".into(),
+                ));
+            }
+            Ok(Some(SessionLineage {
+                parent_session_id,
+                child_role,
+                relation_source,
+            }))
+        }
+        _ => Err(Error::InvalidRoutingState(
+            "lineage fields must be all NULL or all present".into(),
+        )),
+    }
 }
 
 /// Parse a stored enum column, rejecting unknown values instead of silently
@@ -1439,6 +1709,7 @@ pub const JSON_TEXT_COLUMNS: &[&str] = &[
     "system_tail",
     "model_mappings",
     "extra",
+    "routing_trace",
     "betas",
 ];
 

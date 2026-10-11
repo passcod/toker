@@ -30,11 +30,17 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, MeterRow,
-    ModelObservation, OBSERVATION_BUCKET_MS, RebuildRow, RequestFilter, RequestRow, RowKind,
-    SessionCostGroup, SessionSummary, StoredLadders, is_api_measurement,
+    AttemptGroupId, ChildRole, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow,
+    LocalisationRow, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS, RebuildRow, RelationSource,
+    RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionLineage, SessionSummary,
+    StoredLadders, StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
 };
-pub use state::{Allowance, Lane, MetersSnapshot, ModelEntry, PingAction, PingRecord};
+pub use state::{
+    Allowance, BindingLearning, BindingLearningUpdate, DraftCasResult, Lane, LanePin,
+    LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
+    PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
+    PublicationState, RoutingPolicyState, RoutingPublication,
+};
 
 use std::env;
 use std::fs;
@@ -60,6 +66,10 @@ pub enum Error {
     NoDataHome,
     #[error("unknown value {value:?} in column {column}")]
     UnknownDbValue { column: &'static str, value: String },
+    #[error("invalid stored routing state: {0}")]
+    InvalidRoutingState(String),
+    #[error("invalid policy document: {0}")]
+    InvalidPolicyDocument(String),
 }
 
 /// Result type for all store operations.
@@ -377,6 +387,135 @@ impl Store {
         state::load_lanes(&*self.conn()?)
     }
 
+    /// Replace a lane's complete policy pin only if generation and prior
+    /// identity still match the caller's snapshot.
+    pub fn compare_and_swap_lane_pin(
+        &self,
+        key: &str,
+        expected_generation: i64,
+        expected_pin: Option<&LanePin>,
+        new_pin: Option<&LanePin>,
+    ) -> Result<LanePinCasResult> {
+        state::compare_and_swap_lane_pin(
+            &*self.conn()?,
+            key,
+            expected_generation,
+            expected_pin,
+            new_pin,
+        )
+    }
+
+    /// Insert an immutable revision without activating it.
+    pub fn insert_policy_revision(
+        &self,
+        revision: &NewPolicyRevision<'_>,
+    ) -> Result<PolicyRevision> {
+        state::insert_policy_revision(&*self.conn()?, revision)
+    }
+
+    pub fn load_policy_revision(&self, revision_id: i64) -> Result<Option<PolicyRevision>> {
+        state::load_policy_revision(&*self.conn()?, revision_id)
+    }
+
+    pub fn load_policy_revisions(&self) -> Result<Vec<PolicyRevision>> {
+        state::load_policy_revisions(&*self.conn()?)
+    }
+
+    pub fn load_routing_policy_state(&self) -> Result<RoutingPolicyState> {
+        state::load_routing_policy_state(&*self.conn()?)
+    }
+
+    pub fn compare_and_swap_policy_draft(
+        &self,
+        expected_generation: i64,
+        base_revision_id: i64,
+        document: &crate::policy::ValidatedPolicyDocument,
+        updated_ms: i64,
+    ) -> Result<DraftCasResult> {
+        state::compare_and_swap_policy_draft(
+            &*self.conn()?,
+            expected_generation,
+            base_revision_id,
+            document,
+            updated_ms,
+        )
+    }
+
+    pub fn clear_policy_draft(&self, expected_generation: i64) -> Result<DraftCasResult> {
+        state::clear_policy_draft(&*self.conn()?, expected_generation)
+    }
+
+    pub fn set_publication_desired(
+        &self,
+        key: &PublicationKey,
+        desired_revision_id: i64,
+        desired_inventory_generation: i64,
+        updated_ms: i64,
+    ) -> Result<()> {
+        state::set_publication_desired(
+            &*self.conn()?,
+            key,
+            desired_revision_id,
+            desired_inventory_generation,
+            updated_ms,
+        )
+    }
+
+    pub fn load_publication(&self, key: &PublicationKey) -> Result<Option<RoutingPublication>> {
+        state::load_publication(&*self.conn()?, key)
+    }
+
+    pub fn load_publications(&self) -> Result<Vec<RoutingPublication>> {
+        state::load_publications(&*self.conn()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compare_and_swap_publication_result(
+        &self,
+        key: &PublicationKey,
+        expected_revision_id: i64,
+        expected_inventory_generation: i64,
+        state_value: PublicationState,
+        applied_revision_id: Option<i64>,
+        applied_inventory_generation: Option<i64>,
+        detail_code: Option<&str>,
+        updated_ms: i64,
+    ) -> Result<PublicationCasResult> {
+        state::compare_and_swap_publication_result(
+            &*self.conn()?,
+            key,
+            expected_revision_id,
+            expected_inventory_generation,
+            state_value,
+            applied_revision_id,
+            applied_inventory_generation,
+            detail_code,
+            updated_ms,
+        )
+    }
+
+    pub fn merge_binding_learning(
+        &self,
+        update: &BindingLearningUpdate,
+    ) -> Result<BindingLearning> {
+        state::merge_binding_learning(&*self.conn()?, update)
+    }
+
+    pub fn load_binding_learning(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        model_id: &str,
+    ) -> Result<Option<BindingLearning>> {
+        state::load_binding_learning(&*self.conn()?, binding_id, model_id)
+    }
+
+    pub fn load_binding_learnings(
+        &self,
+        binding_id: &crate::policy::BindingId,
+    ) -> Result<Vec<BindingLearning>> {
+        state::load_binding_learnings(&*self.conn()?, binding_id)
+    }
+
     /// Age and cap the lanes table (see `state::prune_lanes`): future-dated
     /// rows, rows older than `max_age_ms`, and everything beyond the
     /// newest `max_lanes` go. The caller owns the cadence — the prune
@@ -618,6 +757,19 @@ mod tests {
             betas: Some("context-1m-2025-08-07".to_string()),
             geo: Some("NZ".to_string()),
             fast: Some(true),
+            policy_revision_id: None,
+            presentation_id: None,
+            rewrite_id: None,
+            policy_route_id: None,
+            route_fingerprint: None,
+            candidate_id: None,
+            binding_id: None,
+            baseline_model: None,
+            attempt_group_id: None,
+            attempt_index: None,
+            fallback_reason: None,
+            routing_trace: None,
+            lineage: None,
         }
     }
 
@@ -683,6 +835,19 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
+            policy_revision_id: None,
+            presentation_id: None,
+            rewrite_id: None,
+            policy_route_id: None,
+            route_fingerprint: None,
+            candidate_id: None,
+            binding_id: None,
+            baseline_model: None,
+            attempt_group_id: None,
+            attempt_index: None,
+            fallback_reason: None,
+            routing_trace: None,
+            lineage: None,
         }
     }
 
@@ -1849,6 +2014,8 @@ mod tests {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+            pin_generation: 0,
+            pin: None,
         };
         store.upsert_lane(&lane).expect("upsert lane");
         assert_eq!(
@@ -2095,6 +2262,8 @@ mod tests {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+            pin_generation: 0,
+            pin: None,
         };
 
         // Fresh, within the age window: kept.

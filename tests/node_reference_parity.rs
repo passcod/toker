@@ -103,6 +103,10 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
                             .map(|noticed| noticed as i64),
                         forced_from: None,
                         forced_to: None,
+
+                        pin_generation: 0,
+
+                        pin: None,
                     });
                 let summarising = input.get("summarising") == Some(&Value::Bool(true));
                 let decision = cold::decide_cold(
@@ -387,6 +391,10 @@ fn awake_cases_pass_against_the_vendored_contract() {
                                 noticed_at: None,
                                 forced_from: None,
                                 forced_to: None,
+
+                                pin_generation: 0,
+
+                                pin: None,
                             })
                             .collect()
                     })

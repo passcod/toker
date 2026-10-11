@@ -541,6 +541,19 @@ fn measurement_row(
         betas: ctx.betas.as_ref().map(|betas| betas.to_string()),
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     }
 }
 
@@ -663,6 +676,19 @@ fn error_row(
         betas: None,
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     }
 }
 
@@ -833,6 +859,19 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -964,6 +1003,19 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         betas: None,
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -1120,6 +1172,19 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -1308,6 +1373,19 @@ pub(crate) fn record_responses_measurement(
         betas: ctx.betas.clone().map(|betas| betas.to_string()),
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     };
     insert(ctx, row);
 
@@ -1457,6 +1535,19 @@ pub(crate) fn record_codex_error(
         betas: None,
         geo: None,
         fast: None,
+        policy_revision_id: None,
+        presentation_id: None,
+        rewrite_id: None,
+        policy_route_id: None,
+        route_fingerprint: None,
+        candidate_id: None,
+        binding_id: None,
+        baseline_model: None,
+        attempt_group_id: None,
+        attempt_index: None,
+        fallback_reason: None,
+        routing_trace: None,
+        lineage: None,
     };
     insert(ctx, row);
     tracing::info!(

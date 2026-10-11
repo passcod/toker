@@ -2159,6 +2159,10 @@ async fn a_block_states_the_size_of_the_session_s_largest_lane() {
                 noticed_at: None,
                 forced_from: None,
                 forced_to: None,
+
+                pin_generation: 0,
+
+                pin: None,
             })
             .expect("seed lane");
     }

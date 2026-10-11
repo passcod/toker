@@ -556,6 +556,10 @@ mod tests {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         }
     }
 

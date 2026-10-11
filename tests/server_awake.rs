@@ -411,6 +411,8 @@ fn poison_lane(store: &Store, body: &[u8], at_ms: i64, ping: bool) {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+            pin_generation: 0,
+            pin: None,
         })
         .expect("poison lane");
 }

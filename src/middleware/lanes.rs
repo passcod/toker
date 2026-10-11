@@ -337,6 +337,8 @@ fn merge_lane(prev: Option<&Lane>, key: &str, response: &LaneResponse<'_>) -> La
         noticed_at: prev.and_then(|lane| lane.noticed_at),
         forced_from,
         forced_to,
+        pin_generation: prev.map_or(0, |lane| lane.pin_generation),
+        pin: prev.and_then(|lane| lane.pin.clone()),
     }
 }
 
@@ -427,6 +429,8 @@ pub fn lanes_from_rows(rows: &[RequestRow]) -> BTreeMap<String, Lane> {
             forced_from,
             forced_to,
             key,
+            pin_generation: 0,
+            pin: None,
         };
         lanes.insert(lane.key.clone(), lane);
     }
@@ -617,6 +621,19 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
+            policy_revision_id: None,
+            presentation_id: None,
+            rewrite_id: None,
+            policy_route_id: None,
+            route_fingerprint: None,
+            candidate_id: None,
+            binding_id: None,
+            baseline_model: None,
+            attempt_group_id: None,
+            attempt_index: None,
+            fallback_reason: None,
+            routing_trace: None,
+            lineage: None,
         }
     }
 
@@ -1023,6 +1040,10 @@ mod tests {
                 noticed_at: Some(4_500),
                 forced_from: None,
                 forced_to: None,
+
+                pin_generation: 0,
+
+                pin: None,
             })
             .expect("upsert stored lane");
         // A ledger-only lane the table never saw.
@@ -1043,6 +1064,10 @@ mod tests {
                 noticed_at: None,
                 forced_from: None,
                 forced_to: None,
+
+                pin_generation: 0,
+
+                pin: None,
             })
             .expect("upsert stored lane");
 
@@ -1084,6 +1109,10 @@ mod tests {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         }
     }
 

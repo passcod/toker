@@ -179,6 +179,19 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
+            policy_revision_id: None,
+            presentation_id: None,
+            rewrite_id: None,
+            policy_route_id: None,
+            route_fingerprint: None,
+            candidate_id: None,
+            binding_id: None,
+            baseline_model: None,
+            attempt_group_id: None,
+            attempt_index: None,
+            fallback_reason: None,
+            routing_trace: None,
+            lineage: None,
         }
     }
 
@@ -244,6 +257,19 @@ mod tests {
             betas: Some(r#"["claude-code-20250219"]"#.to_owned()),
             geo: Some("us".to_owned()),
             fast: Some(false),
+            policy_revision_id: None,
+            presentation_id: None,
+            rewrite_id: None,
+            policy_route_id: None,
+            route_fingerprint: None,
+            candidate_id: None,
+            binding_id: None,
+            baseline_model: None,
+            attempt_group_id: None,
+            attempt_index: None,
+            fallback_reason: None,
+            routing_trace: None,
+            lineage: None,
         }
     }
 

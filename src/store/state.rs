@@ -9,7 +9,14 @@
 //! window's reset passes, the 30-day lane prune) are the caller's too — the
 //! store has no clock beyond `ts_ms` values handed to it.
 
+use std::collections::BTreeSet;
+use std::str::FromStr;
+
 use crate::ir::Release;
+use crate::policy::{
+    ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
+    RouteId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
+};
 use serde_json::Value;
 
 use super::{Error, Result, row_of, rows_of};
@@ -42,6 +49,202 @@ pub struct Lane {
     pub forced_from: Option<String>,
     /// The model its cache now lives on.
     pub forced_to: Option<String>,
+    /// Generation for compare-and-swap pin replacement.
+    pub pin_generation: i64,
+    /// Complete policy pin, or `None` when every stored pin field is NULL.
+    pub pin: Option<LanePin>,
+}
+
+/// The complete route identity pinned to one lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanePin {
+    pub policy_revision_id: i64,
+    pub policy_route_id: RouteId,
+    pub route_fingerprint: RouteFingerprint,
+    pub candidate_id: CandidateId,
+    pub binding_id: BindingId,
+    pub baseline_model: String,
+    pub effective_model: String,
+}
+
+/// Result of a generation-and-prior-identity compare-and-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanePinCasResult {
+    Updated { generation: i64 },
+    Conflict,
+}
+
+/// Immutable policy revision source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRevisionSource {
+    Legacy,
+    Draft,
+    Reactivation,
+}
+
+impl PolicyRevisionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Draft => "draft",
+            Self::Reactivation => "reactivation",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "legacy" => Some(Self::Legacy),
+            "draft" => Some(Self::Draft),
+            "reactivation" => Some(Self::Reactivation),
+            _ => None,
+        }
+    }
+}
+
+/// One immutable stored policy revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRevision {
+    pub revision_id: i64,
+    pub created_ms: i64,
+    pub activated_ms: i64,
+    pub description: Option<String>,
+    pub activation_scope: ActivationScope,
+    pub forced_cache_transition: bool,
+    pub source: PolicyRevisionSource,
+    pub parent_revision_id: Option<i64>,
+    pub document: ValidatedPolicyDocument,
+    pub fingerprint: PolicyFingerprint,
+}
+
+/// Input for inserting a revision without changing routing authority.
+#[derive(Debug, Clone)]
+pub struct NewPolicyRevision<'a> {
+    pub created_ms: i64,
+    pub activated_ms: i64,
+    pub description: Option<&'a str>,
+    pub activation_scope: ActivationScope,
+    pub forced_cache_transition: bool,
+    pub source: PolicyRevisionSource,
+    pub parent_revision_id: Option<i64>,
+    pub document: &'a ValidatedPolicyDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDraft {
+    pub base_revision_id: i64,
+    pub document: ValidatedPolicyDocument,
+    pub fingerprint: PolicyFingerprint,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingPolicyState {
+    /// Non-NULL only in raw cutover fixtures in this changeset.
+    pub active_revision_id: Option<i64>,
+    pub draft_generation: i64,
+    pub draft: Option<PolicyDraft>,
+    pub legacy_imported_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftCasResult {
+    Updated {
+        generation: i64,
+        draft: Option<PolicyDraft>,
+    },
+    Conflict {
+        current: RoutingPolicyState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationState {
+    Pending,
+    Applied,
+    Failed,
+    Unsupported,
+}
+
+impl PublicationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Applied => "applied",
+            Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "applied" => Some(Self::Applied),
+            "failed" => Some(Self::Failed),
+            "unsupported" => Some(Self::Unsupported),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical publication identity. Its components use policy identifier rules.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublicationKey {
+    pub scope_key: String,
+    pub adapter: String,
+}
+
+impl PublicationKey {
+    pub fn new(scope_key: impl Into<String>, adapter: impl Into<String>) -> Result<Self> {
+        let scope_key = scope_key.into();
+        validate_scope_key(&scope_key)?;
+        let adapter = adapter.into();
+        crate::policy::StableId::new(adapter.clone()).map_err(|error| {
+            Error::InvalidRoutingState(format!("invalid publication adapter: {error}"))
+        })?;
+        Ok(Self { scope_key, adapter })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingPublication {
+    pub key: PublicationKey,
+    pub desired_revision_id: i64,
+    pub applied_revision_id: Option<i64>,
+    pub desired_inventory_generation: i64,
+    pub applied_inventory_generation: Option<i64>,
+    pub state: PublicationState,
+    pub detail_code: Option<String>,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationCasResult {
+    Updated,
+    Conflict { current: Option<RoutingPublication> },
+}
+
+/// Binding-scoped model evidence. Days are a sorted canonical local-day set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingLearning {
+    pub binding_id: BindingId,
+    pub model_id: String,
+    pub days: BTreeSet<String>,
+    pub max_prompt: Option<i64>,
+    pub context_window: Option<Value>,
+    pub explicitly_promoted: bool,
+    pub updated_ms: i64,
+}
+
+/// Merge input. `context_window` replaces stored context only when supplied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingLearningUpdate {
+    pub binding_id: BindingId,
+    pub model_id: String,
+    pub days: BTreeSet<String>,
+    pub max_prompt: Option<i64>,
+    pub context_window: Option<Value>,
+    pub explicitly_promoted: bool,
+    pub updated_ms: i64,
 }
 
 /// One learned-model row: days served and max prompt observed for an exact
@@ -152,6 +355,9 @@ pub struct MetersSnapshot {
 }
 
 pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
+    // Ordinary lane observations intentionally omit every pin column. On an
+    // existing row this preserves a concurrent routing decision and its CAS
+    // generation; on a new row the schema supplies generation zero and NULLs.
     conn.execute(
         "INSERT INTO lanes (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
                             noticed_at, forced_from, forced_to)
@@ -183,12 +389,15 @@ pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
     Ok(())
 }
 
+const LANE_COLUMNS: &str = "key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+    noticed_at, forced_from, forced_to, pin_generation, policy_revision_id,
+    policy_route_id, route_fingerprint, candidate_id, binding_id, baseline_model,
+    effective_model";
+
 pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
     row_of(
         conn,
-        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
-                noticed_at, forced_from, forced_to
-         FROM lanes WHERE key = ?1",
+        &format!("SELECT {LANE_COLUMNS} FROM lanes WHERE key = ?1"),
         [key],
         read_lane,
     )
@@ -197,15 +406,53 @@ pub(super) fn load_lane(conn: &Connection, key: &str) -> Result<Option<Lane>> {
 pub(super) fn load_lanes(conn: &Connection) -> Result<Vec<Lane>> {
     rows_of(
         conn,
-        "SELECT key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
-                noticed_at, forced_from, forced_to
-         FROM lanes ORDER BY key",
+        &format!("SELECT {LANE_COLUMNS} FROM lanes ORDER BY key"),
         [],
         read_lane,
     )
 }
 
 fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
+    let revision: Option<i64> = row.get("policy_revision_id")?;
+    let route: Option<String> = row.get("policy_route_id")?;
+    let fingerprint: Option<String> = row.get("route_fingerprint")?;
+    let candidate: Option<String> = row.get("candidate_id")?;
+    let binding: Option<String> = row.get("binding_id")?;
+    let baseline: Option<String> = row.get("baseline_model")?;
+    let effective: Option<String> = row.get("effective_model")?;
+    let pin = match (
+        revision,
+        route,
+        fingerprint,
+        candidate,
+        binding,
+        baseline,
+        effective,
+    ) {
+        (None, None, None, None, None, None, None) => None,
+        (
+            Some(policy_revision_id),
+            Some(route),
+            Some(fingerprint),
+            Some(candidate),
+            Some(binding),
+            Some(baseline_model),
+            Some(effective_model),
+        ) => Some(LanePin {
+            policy_revision_id,
+            policy_route_id: parse_id("lanes.policy_route_id", route)?,
+            route_fingerprint: parse_id("lanes.route_fingerprint", fingerprint)?,
+            candidate_id: parse_id("lanes.candidate_id", candidate)?,
+            binding_id: parse_id("lanes.binding_id", binding)?,
+            baseline_model,
+            effective_model,
+        }),
+        _ => {
+            return Err(Error::InvalidRoutingState(
+                "lane pin fields must be all NULL or all present".into(),
+            ));
+        }
+    };
     Ok(Lane {
         key: row.get("key")?,
         session_id: row.get("session_id")?,
@@ -217,6 +464,683 @@ fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
         noticed_at: row.get("noticed_at")?,
         forced_from: row.get("forced_from")?,
         forced_to: row.get("forced_to")?,
+        pin_generation: row.get("pin_generation")?,
+        pin,
+    })
+}
+
+pub(super) fn compare_and_swap_lane_pin(
+    conn: &Connection,
+    key: &str,
+    expected_generation: i64,
+    expected_pin: Option<&LanePin>,
+    new_pin: Option<&LanePin>,
+) -> Result<LanePinCasResult> {
+    if expected_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative lane pin generation".into(),
+        ));
+    }
+    let current = load_lane(conn, key)?;
+    let Some(current) = current else {
+        return Ok(LanePinCasResult::Conflict);
+    };
+    if current.pin_generation != expected_generation || current.pin.as_ref() != expected_pin {
+        return Ok(LanePinCasResult::Conflict);
+    }
+    let (revision, route, fingerprint, candidate, binding, baseline, effective) =
+        pin_parts(new_pin);
+    let changed = conn.execute(
+        "UPDATE lanes SET pin_generation = pin_generation + 1,
+             policy_revision_id = ?1, policy_route_id = ?2, route_fingerprint = ?3,
+             candidate_id = ?4, binding_id = ?5, baseline_model = ?6,
+             effective_model = ?7
+         WHERE key = ?8 AND pin_generation = ?9
+           AND policy_revision_id IS ?10 AND policy_route_id IS ?11
+           AND route_fingerprint IS ?12 AND candidate_id IS ?13
+           AND binding_id IS ?14 AND baseline_model IS ?15
+           AND effective_model IS ?16",
+        rusqlite::params![
+            revision,
+            route,
+            fingerprint,
+            candidate,
+            binding,
+            baseline,
+            effective,
+            key,
+            expected_generation,
+            expected_pin.map(|p| p.policy_revision_id),
+            expected_pin.map(|p| p.policy_route_id.as_str()),
+            expected_pin.map(|p| p.route_fingerprint.to_string()),
+            expected_pin.map(|p| p.candidate_id.as_str()),
+            expected_pin.map(|p| p.binding_id.as_str()),
+            expected_pin.map(|p| p.baseline_model.as_str()),
+            expected_pin.map(|p| p.effective_model.as_str()),
+        ],
+    )?;
+    if changed == 1 {
+        Ok(LanePinCasResult::Updated {
+            generation: expected_generation + 1,
+        })
+    } else {
+        Ok(LanePinCasResult::Conflict)
+    }
+}
+
+fn pin_parts(
+    pin: Option<&LanePin>,
+) -> (
+    Option<i64>,
+    Option<&str>,
+    Option<String>,
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+    Option<&str>,
+) {
+    match pin {
+        Some(pin) => (
+            Some(pin.policy_revision_id),
+            Some(pin.policy_route_id.as_str()),
+            Some(pin.route_fingerprint.to_string()),
+            Some(pin.candidate_id.as_str()),
+            Some(pin.binding_id.as_str()),
+            Some(&pin.baseline_model),
+            Some(&pin.effective_model),
+        ),
+        None => (None, None, None, None, None, None, None),
+    }
+}
+
+fn parse_id<T>(column: &'static str, value: String) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|error| Error::InvalidRoutingState(format!("invalid {column} {value:?}: {error}")))
+}
+
+fn activation_scope_name(scope: ActivationScope) -> &'static str {
+    match scope {
+        ActivationScope::NewLanes => "new_lanes",
+        ActivationScope::NewAndColdLanes => "new_and_cold_lanes",
+        ActivationScope::Immediate => "immediate",
+    }
+}
+
+fn parse_activation_scope(value: &str) -> Option<ActivationScope> {
+    match value {
+        "new_lanes" => Some(ActivationScope::NewLanes),
+        "new_and_cold_lanes" => Some(ActivationScope::NewAndColdLanes),
+        "immediate" => Some(ActivationScope::Immediate),
+        _ => None,
+    }
+}
+
+fn parse_required<T>(
+    column: &'static str,
+    value: String,
+    parse: fn(&str) -> Option<T>,
+) -> Result<T> {
+    parse(&value).ok_or(Error::UnknownDbValue { column, value })
+}
+
+fn validated_stored_document(
+    json: String,
+    fingerprint: String,
+) -> Result<(ValidatedPolicyDocument, PolicyFingerprint)> {
+    let document = decode_policy(json.as_bytes(), CanonicalLimits::default())
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let canonical =
+        policy_bytes(&document).map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    if canonical != json.as_bytes() {
+        return Err(Error::InvalidPolicyDocument(
+            "stored policy JSON is not canonical".into(),
+        ));
+    }
+    let stored: PolicyFingerprint = parse_id("policy fingerprint", fingerprint)?;
+    let calculated = policy_fingerprint(&document)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    if stored != calculated {
+        return Err(Error::InvalidPolicyDocument(
+            "stored policy fingerprint does not match document".into(),
+        ));
+    }
+    Ok((document, stored))
+}
+
+pub(super) fn insert_policy_revision(
+    conn: &Connection,
+    revision: &NewPolicyRevision<'_>,
+) -> Result<PolicyRevision> {
+    let document = policy_bytes(revision.document)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let document_json = String::from_utf8(document)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let fingerprint = policy_fingerprint(revision.document)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO routing_policy_revisions
+         (created_ms, activated_ms, description, activation_scope,
+          forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            revision.created_ms,
+            revision.activated_ms,
+            revision.description,
+            activation_scope_name(revision.activation_scope),
+            revision.forced_cache_transition,
+            revision.source.as_str(),
+            revision.parent_revision_id,
+            document_json,
+            fingerprint.to_string(),
+        ],
+    )?;
+    load_policy_revision(conn, conn.last_insert_rowid())?
+        .ok_or_else(|| Error::InvalidRoutingState("inserted policy revision disappeared".into()))
+}
+
+pub(super) fn load_policy_revision(
+    conn: &Connection,
+    revision_id: i64,
+) -> Result<Option<PolicyRevision>> {
+    row_of(
+        conn,
+        "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
+                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+         FROM routing_policy_revisions WHERE revision_id = ?1",
+        [revision_id],
+        read_policy_revision,
+    )
+}
+
+pub(super) fn load_policy_revisions(conn: &Connection) -> Result<Vec<PolicyRevision>> {
+    rows_of(
+        conn,
+        "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
+                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+         FROM routing_policy_revisions ORDER BY revision_id",
+        [],
+        read_policy_revision,
+    )
+}
+
+fn read_policy_revision(row: &rusqlite::Row<'_>) -> Result<PolicyRevision> {
+    let (document, fingerprint) =
+        validated_stored_document(row.get("document_json")?, row.get("fingerprint")?)?;
+    Ok(PolicyRevision {
+        revision_id: row.get("revision_id")?,
+        created_ms: row.get("created_ms")?,
+        activated_ms: row.get("activated_ms")?,
+        description: row.get("description")?,
+        activation_scope: parse_required(
+            "routing_policy_revisions.activation_scope",
+            row.get("activation_scope")?,
+            parse_activation_scope,
+        )?,
+        forced_cache_transition: row.get("forced_cache_transition")?,
+        source: parse_required(
+            "routing_policy_revisions.source",
+            row.get("source")?,
+            PolicyRevisionSource::parse,
+        )?,
+        parent_revision_id: row.get("parent_revision_id")?,
+        document,
+        fingerprint,
+    })
+}
+
+pub(super) fn load_routing_policy_state(conn: &Connection) -> Result<RoutingPolicyState> {
+    let mut states = rows_of(
+        conn,
+        "SELECT active_revision_id, draft_generation, draft_base_revision_id,
+                draft_document_json, draft_fingerprint, draft_updated_ms, legacy_imported_ms
+         FROM routing_policy_state WHERE id = 1",
+        [],
+        |row| {
+            let base: Option<i64> = row.get("draft_base_revision_id")?;
+            let json: Option<String> = row.get("draft_document_json")?;
+            let fingerprint: Option<String> = row.get("draft_fingerprint")?;
+            let updated: Option<i64> = row.get("draft_updated_ms")?;
+            let draft = match (base, json, fingerprint, updated) {
+                (None, None, None, None) => None,
+                (Some(base_revision_id), Some(json), Some(fingerprint), Some(updated_ms)) => {
+                    let (document, fingerprint) = validated_stored_document(json, fingerprint)?;
+                    Some(PolicyDraft {
+                        base_revision_id,
+                        document,
+                        fingerprint,
+                        updated_ms,
+                    })
+                }
+                _ => {
+                    return Err(Error::InvalidRoutingState(
+                        "draft fields must be all NULL or all present".into(),
+                    ));
+                }
+            };
+            Ok(RoutingPolicyState {
+                active_revision_id: row.get("active_revision_id")?,
+                draft_generation: row.get("draft_generation")?,
+                draft,
+                legacy_imported_ms: row.get("legacy_imported_ms")?,
+            })
+        },
+    )?;
+    states.pop().ok_or_else(|| {
+        Error::InvalidRoutingState("routing_policy_state singleton row is missing".into())
+    })
+}
+
+pub(super) fn compare_and_swap_policy_draft(
+    conn: &Connection,
+    expected_generation: i64,
+    base_revision_id: i64,
+    document: &ValidatedPolicyDocument,
+    updated_ms: i64,
+) -> Result<DraftCasResult> {
+    if expected_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative draft generation".into(),
+        ));
+    }
+    let bytes =
+        policy_bytes(document).map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let json = String::from_utf8(bytes)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let fingerprint = policy_fingerprint(document)
+        .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let changed = conn.execute(
+        "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
+             draft_base_revision_id = ?1, draft_document_json = ?2,
+             draft_fingerprint = ?3, draft_updated_ms = ?4
+         WHERE id = 1 AND draft_generation = ?5",
+        rusqlite::params![
+            base_revision_id,
+            json,
+            fingerprint.to_string(),
+            updated_ms,
+            expected_generation
+        ],
+    )?;
+    if changed == 1 {
+        Ok(DraftCasResult::Updated {
+            generation: expected_generation + 1,
+            draft: Some(PolicyDraft {
+                base_revision_id,
+                document: document.clone(),
+                fingerprint,
+                updated_ms,
+            }),
+        })
+    } else {
+        Ok(DraftCasResult::Conflict {
+            current: load_routing_policy_state(conn)?,
+        })
+    }
+}
+
+pub(super) fn clear_policy_draft(
+    conn: &Connection,
+    expected_generation: i64,
+) -> Result<DraftCasResult> {
+    let changed = conn.execute(
+        "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
+             draft_base_revision_id = NULL, draft_document_json = NULL,
+             draft_fingerprint = NULL, draft_updated_ms = NULL
+         WHERE id = 1 AND draft_generation = ?1",
+        [expected_generation],
+    )?;
+    if changed == 1 {
+        Ok(DraftCasResult::Updated {
+            generation: expected_generation + 1,
+            draft: None,
+        })
+    } else {
+        Ok(DraftCasResult::Conflict {
+            current: load_routing_policy_state(conn)?,
+        })
+    }
+}
+
+fn validate_scope_key(value: &str) -> Result<()> {
+    let valid = if let Some(rest) = value.strip_prefix("protocol:") {
+        !rest.is_empty() && !rest.contains(':')
+    } else if let Some(rest) = value.strip_prefix("profile:") {
+        let mut parts = rest.split(':');
+        parts.next().is_some_and(|v| !v.is_empty())
+            && parts.next().is_some_and(|v| !v.is_empty())
+            && parts.next().is_none()
+    } else {
+        false
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidRoutingState(format!(
+            "invalid publication scope key {value:?}"
+        )))
+    }
+}
+
+fn validate_detail_code(value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        crate::policy::StableId::new(value.to_owned()).map_err(|error| {
+            Error::InvalidRoutingState(format!("invalid publication detail code: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+pub(super) fn set_publication_desired(
+    conn: &Connection,
+    key: &PublicationKey,
+    desired_revision_id: i64,
+    desired_inventory_generation: i64,
+    updated_ms: i64,
+) -> Result<()> {
+    if desired_inventory_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative inventory generation".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO routing_publications
+         (scope_key, adapter, desired_revision_id, desired_inventory_generation, state, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+         ON CONFLICT(scope_key, adapter) DO UPDATE SET
+           desired_revision_id = excluded.desired_revision_id,
+           desired_inventory_generation = excluded.desired_inventory_generation,
+           state = 'pending', detail_code = NULL, updated_ms = excluded.updated_ms",
+        rusqlite::params![
+            key.scope_key,
+            key.adapter,
+            desired_revision_id,
+            desired_inventory_generation,
+            updated_ms
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn load_publication(
+    conn: &Connection,
+    key: &PublicationKey,
+) -> Result<Option<RoutingPublication>> {
+    row_of(
+        conn,
+        "SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
+                desired_inventory_generation, applied_inventory_generation,
+                state, detail_code, updated_ms
+         FROM routing_publications WHERE scope_key = ?1 AND adapter = ?2",
+        [&key.scope_key, &key.adapter],
+        read_publication,
+    )
+}
+
+pub(super) fn load_publications(conn: &Connection) -> Result<Vec<RoutingPublication>> {
+    rows_of(
+        conn,
+        "SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
+                desired_inventory_generation, applied_inventory_generation,
+                state, detail_code, updated_ms
+         FROM routing_publications ORDER BY scope_key, adapter",
+        [],
+        read_publication,
+    )
+}
+
+fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
+    let key = PublicationKey::new(
+        row.get::<_, String>("scope_key")?,
+        row.get::<_, String>("adapter")?,
+    )?;
+    let state = parse_required(
+        "routing_publications.state",
+        row.get("state")?,
+        PublicationState::parse,
+    )?;
+    let desired_revision_id = row.get("desired_revision_id")?;
+    let applied_revision_id = row.get("applied_revision_id")?;
+    let desired_inventory_generation = row.get("desired_inventory_generation")?;
+    let applied_inventory_generation = row.get("applied_inventory_generation")?;
+    let detail_code: Option<String> = row.get("detail_code")?;
+    validate_detail_code(detail_code.as_deref())?;
+    if state == PublicationState::Applied
+        && (applied_revision_id != Some(desired_revision_id)
+            || applied_inventory_generation != Some(desired_inventory_generation))
+    {
+        return Err(Error::InvalidRoutingState(
+            "applied publication does not match desired identity".into(),
+        ));
+    }
+    Ok(RoutingPublication {
+        key,
+        desired_revision_id,
+        applied_revision_id,
+        desired_inventory_generation,
+        applied_inventory_generation,
+        state,
+        detail_code,
+        updated_ms: row.get("updated_ms")?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compare_and_swap_publication_result(
+    conn: &Connection,
+    key: &PublicationKey,
+    expected_revision_id: i64,
+    expected_inventory_generation: i64,
+    state: PublicationState,
+    applied_revision_id: Option<i64>,
+    applied_inventory_generation: Option<i64>,
+    detail_code: Option<&str>,
+    updated_ms: i64,
+) -> Result<PublicationCasResult> {
+    validate_detail_code(detail_code)?;
+    if applied_revision_id.is_some() != applied_inventory_generation.is_some() {
+        return Err(Error::InvalidRoutingState(
+            "applied publication identity must be all NULL or all present".into(),
+        ));
+    }
+    if state == PublicationState::Applied
+        && (applied_revision_id != Some(expected_revision_id)
+            || applied_inventory_generation != Some(expected_inventory_generation))
+    {
+        return Err(Error::InvalidRoutingState(
+            "applied result must match expected desired identity".into(),
+        ));
+    }
+    let changed = conn.execute(
+        "UPDATE routing_publications SET state = ?1, applied_revision_id = ?2,
+             applied_inventory_generation = ?3, detail_code = ?4, updated_ms = ?5
+         WHERE scope_key = ?6 AND adapter = ?7 AND desired_revision_id = ?8
+           AND desired_inventory_generation = ?9",
+        rusqlite::params![
+            state.as_str(),
+            applied_revision_id,
+            applied_inventory_generation,
+            detail_code,
+            updated_ms,
+            key.scope_key,
+            key.adapter,
+            expected_revision_id,
+            expected_inventory_generation
+        ],
+    )?;
+    if changed == 1 {
+        Ok(PublicationCasResult::Updated)
+    } else {
+        Ok(PublicationCasResult::Conflict {
+            current: load_publication(conn, key)?,
+        })
+    }
+}
+
+fn validate_learning(update: &BindingLearningUpdate) -> Result<()> {
+    if update.model_id.is_empty() {
+        return Err(Error::InvalidRoutingState(
+            "binding learning model id is empty".into(),
+        ));
+    }
+    if update.max_prompt.is_some_and(|value| value < 0) {
+        return Err(Error::InvalidRoutingState(
+            "negative learned max prompt".into(),
+        ));
+    }
+    if update.days.iter().any(|day| !valid_local_day(day)) {
+        return Err(Error::InvalidRoutingState(
+            "invalid learned local day".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_local_day(day: &str) -> bool {
+    let bytes = day.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+        && day.parse::<jiff::civil::Date>().is_ok()
+}
+
+pub(super) fn merge_binding_learning(
+    conn: &Connection,
+    update: &BindingLearningUpdate,
+) -> Result<BindingLearning> {
+    validate_learning(update)?;
+    let existing = load_binding_learning(conn, &update.binding_id, &update.model_id)?;
+    let mut days = existing
+        .as_ref()
+        .map_or_else(BTreeSet::new, |entry| entry.days.clone());
+    days.extend(update.days.iter().cloned());
+    let max_prompt = match (
+        existing.as_ref().and_then(|v| v.max_prompt),
+        update.max_prompt,
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
+    };
+    let context_window = update
+        .context_window
+        .clone()
+        .or_else(|| existing.as_ref().and_then(|v| v.context_window.clone()));
+    let explicitly_promoted =
+        update.explicitly_promoted || existing.as_ref().is_some_and(|v| v.explicitly_promoted);
+    let updated_ms = existing
+        .as_ref()
+        .map_or(update.updated_ms, |v| v.updated_ms.max(update.updated_ms));
+    let days_json = if days.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&days.iter().collect::<Vec<_>>())?)
+    };
+    let context_json = match &context_window {
+        Some(value) => Some(serde_json::to_string(value)?),
+        None => None,
+    };
+    conn.execute(
+        "INSERT INTO learned_models_by_binding
+         (binding_id, model_id, days_json, max_prompt, context_window_json,
+          explicitly_promoted, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(binding_id, model_id) DO UPDATE SET
+           days_json = excluded.days_json, max_prompt = excluded.max_prompt,
+           context_window_json = excluded.context_window_json,
+           explicitly_promoted = excluded.explicitly_promoted, updated_ms = excluded.updated_ms",
+        rusqlite::params![
+            update.binding_id.as_str(),
+            update.model_id,
+            days_json,
+            max_prompt,
+            context_json,
+            explicitly_promoted,
+            updated_ms
+        ],
+    )?;
+    Ok(BindingLearning {
+        binding_id: update.binding_id.clone(),
+        model_id: update.model_id.clone(),
+        days,
+        max_prompt,
+        context_window,
+        explicitly_promoted,
+        updated_ms,
+    })
+}
+
+pub(super) fn load_binding_learning(
+    conn: &Connection,
+    binding_id: &BindingId,
+    model_id: &str,
+) -> Result<Option<BindingLearning>> {
+    row_of(
+        conn,
+        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
+                explicitly_promoted, updated_ms
+         FROM learned_models_by_binding WHERE binding_id = ?1 AND model_id = ?2",
+        [binding_id.as_str(), model_id],
+        read_binding_learning,
+    )
+}
+
+pub(super) fn load_binding_learnings(
+    conn: &Connection,
+    binding_id: &BindingId,
+) -> Result<Vec<BindingLearning>> {
+    rows_of(
+        conn,
+        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
+                explicitly_promoted, updated_ms
+         FROM learned_models_by_binding WHERE binding_id = ?1 ORDER BY model_id",
+        [binding_id.as_str()],
+        read_binding_learning,
+    )
+}
+
+fn read_binding_learning(row: &rusqlite::Row<'_>) -> Result<BindingLearning> {
+    let days = match row.get::<_, Option<String>>("days_json")? {
+        None => BTreeSet::new(),
+        Some(json) => {
+            let values: Vec<String> = serde_json::from_str(&json)?;
+            let set: BTreeSet<_> = values.iter().cloned().collect();
+            if set.len() != values.len()
+                || values.iter().any(|value| !valid_local_day(value))
+                || values.iter().ne(set.iter())
+            {
+                return Err(Error::InvalidRoutingState(
+                    "stored learned days are not a canonical sorted set".into(),
+                ));
+            }
+            set
+        }
+    };
+    let context_window = super::opt_json_from_text(row.get("context_window_json")?)?;
+    let max_prompt: Option<i64> = row.get("max_prompt")?;
+    if max_prompt.is_some_and(|value: i64| value < 0) {
+        return Err(Error::InvalidRoutingState(
+            "stored learned max prompt is negative".into(),
+        ));
+    }
+    Ok(BindingLearning {
+        binding_id: parse_id(
+            "learned_models_by_binding.binding_id",
+            row.get("binding_id")?,
+        )?,
+        model_id: row.get("model_id")?,
+        days,
+        max_prompt,
+        context_window,
+        explicitly_promoted: row.get("explicitly_promoted")?,
+        updated_ms: row.get("updated_ms")?,
     })
 }
 

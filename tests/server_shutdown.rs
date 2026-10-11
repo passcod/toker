@@ -359,6 +359,10 @@ async fn a_stream_under_way_finishes_while_new_connections_are_refused() {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         })
         .expect("lane");
 
@@ -466,6 +470,10 @@ async fn a_forced_shutdown_does_not_wait_for_a_stream_but_exits_cleanly() {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         })
         .expect("lane");
 
