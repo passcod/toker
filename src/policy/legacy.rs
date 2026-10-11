@@ -132,7 +132,7 @@ impl<'a> LegacyBuilder<'a> {
     fn add_backend_routes(&mut self) -> anyhow::Result<()> {
         for binding in self.topology.bindings() {
             let route_id = backend_route_id(binding)?;
-            let alias_policy = model_map_for(self.config, binding.provider())
+            let alias_policy = model_map_for(self.topology, binding.provider())
                 .map(alias_policy)
                 .transpose()?;
             let upgrade_policy_id = supports_legacy_families(binding)
@@ -182,7 +182,7 @@ impl<'a> LegacyBuilder<'a> {
         protocol: FrontendProtocol,
         provider: Option<&str>,
     ) -> anyhow::Result<()> {
-        let Some(binding) = binding_for(self.topology, protocol_id(protocol), provider) else {
+        let Some(binding) = binding_for(self.topology, protocol.into(), provider) else {
             return Ok(());
         };
         let target = requested_reference(backend_route_id(binding)?)?;
@@ -214,7 +214,7 @@ impl<'a> LegacyBuilder<'a> {
                     provider
                 ))?,
                 scope: FrontendScope::Protocol {
-                    protocol: frontend_protocol(route.frontend()),
+                    protocol: route.frontend().into(),
                 },
                 priority: prefix_priority(route.frontend(), provider),
                 model_matcher: MatcherSpec::Regex(pattern),
@@ -271,7 +271,7 @@ impl<'a> LegacyBuilder<'a> {
             .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
             .find(|route| {
                 self.topology.binding_is_configured(route.binding())
-                    && model_map_for(self.config, route.binding().provider()).is_some()
+                    && model_map_for(self.topology, route.binding().provider()).is_some()
             });
         let Some(route) = candidate else {
             return Ok(());
@@ -369,7 +369,7 @@ impl<'a> LegacyBuilder<'a> {
                     binding_id: binding.id().clone(),
                     model,
                     upgrade_policy_id,
-                    alias_policy: model_map_for(self.config, provider)
+                    alias_policy: model_map_for(self.topology, provider)
                         .map(alias_policy)
                         .transpose()?,
                     required_capabilities: Default::default(),
@@ -464,13 +464,10 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
     Ok(AliasPolicy { rules })
 }
 
-fn model_map_for<'a>(config: &'a Config, provider: &str) -> Option<&'a ModelMap> {
-    match provider {
-        "anthropic_sub" => config.anthropic_sub.as_ref()?.model_map.as_ref(),
-        "anthropic_api" => config.anthropic_api.as_ref()?.model_map.as_ref(),
-        "codex_sub" => config.codex_sub.as_ref()?.model_map.as_ref(),
-        _ => None,
-    }
+fn model_map_for<'a>(topology: &'a RouteRegistry, provider: &str) -> Option<&'a ModelMap> {
+    topology
+        .provider(provider)
+        .and_then(|provider| provider.model_map())
 }
 
 fn requested_reference(route_id: RouteId) -> anyhow::Result<RouteReference> {
@@ -560,22 +557,6 @@ fn protocol_slug(protocol: ProtocolId) -> &'static str {
         ProtocolId::AnthropicMessages => "anthropic",
         ProtocolId::OpenAiChat => "openai-chat",
         ProtocolId::OpenAiResponses => "openai-responses",
-    }
-}
-
-fn frontend_protocol(protocol: ProtocolId) -> FrontendProtocol {
-    match protocol {
-        ProtocolId::AnthropicMessages => FrontendProtocol::AnthropicMessages,
-        ProtocolId::OpenAiChat => FrontendProtocol::OpenaiChat,
-        ProtocolId::OpenAiResponses => FrontendProtocol::OpenaiResponses,
-    }
-}
-
-fn protocol_id(protocol: FrontendProtocol) -> ProtocolId {
-    match protocol {
-        FrontendProtocol::AnthropicMessages => ProtocolId::AnthropicMessages,
-        FrontendProtocol::OpenaiChat => ProtocolId::OpenAiChat,
-        FrontendProtocol::OpenaiResponses => ProtocolId::OpenAiResponses,
     }
 }
 

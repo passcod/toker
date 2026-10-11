@@ -348,6 +348,26 @@ pub enum FrontendProtocol {
     OpenaiResponses,
 }
 
+impl From<crate::routing::ProtocolId> for FrontendProtocol {
+    fn from(protocol: crate::routing::ProtocolId) -> Self {
+        match protocol {
+            crate::routing::ProtocolId::AnthropicMessages => Self::AnthropicMessages,
+            crate::routing::ProtocolId::OpenAiChat => Self::OpenaiChat,
+            crate::routing::ProtocolId::OpenAiResponses => Self::OpenaiResponses,
+        }
+    }
+}
+
+impl From<FrontendProtocol> for crate::routing::ProtocolId {
+    fn from(protocol: FrontendProtocol) -> Self {
+        match protocol {
+            FrontendProtocol::AnthropicMessages => Self::AnthropicMessages,
+            FrontendProtocol::OpenaiChat => Self::OpenAiChat,
+            FrontendProtocol::OpenaiResponses => Self::OpenAiResponses,
+        }
+    }
+}
+
 /// Profile policy wins over protocol policy for the same frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

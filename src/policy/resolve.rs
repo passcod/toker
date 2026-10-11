@@ -9,7 +9,7 @@ use std::convert::Infallible;
 
 use thiserror::Error;
 
-use crate::catalog::offers::{BackendOffer, OfferInventory};
+use crate::catalog::offers::OfferInventory;
 use crate::middleware::force_newest::{NEW_CONVERSATION_MESSAGES, idle_for_ttl};
 use crate::routing::Capabilities;
 
@@ -19,8 +19,7 @@ use super::{
     CompiledRoute, CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol,
     FrontendScope, InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures,
     MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute,
-    ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, SelectorOrdering,
-    StableId,
+    ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -111,6 +110,29 @@ impl AvailabilitySnapshot {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&BindingId, &BindingAvailability)> {
         self.bindings.iter()
+    }
+
+    /// Re-evaluate catalogue age from one caller-owned clock reading.
+    pub fn at(&self, now_ms: i64, fresh_for_ms: i64) -> Self {
+        let bindings = self
+            .bindings
+            .iter()
+            .map(|(id, availability)| {
+                let mut availability = availability.clone();
+                if let CatalogueAvailability::Fresh { fetched_at_ms }
+                | CatalogueAvailability::Stale { fetched_at_ms } = availability.catalogue
+                {
+                    availability.catalogue = if now_ms.saturating_sub(fetched_at_ms) <= fresh_for_ms
+                    {
+                        CatalogueAvailability::Fresh { fetched_at_ms }
+                    } else {
+                        CatalogueAvailability::Stale { fetched_at_ms }
+                    };
+                }
+                (id.clone(), availability)
+            })
+            .collect();
+        Self { bindings }
     }
 }
 
@@ -257,10 +279,8 @@ pub fn resolve<L: LearningView>(
         let live = availability.get(binding_id);
         let evidence = exact_evidence(binding_id, model, live, inventory, facts);
         trace.push(TraceEvent::Candidate(evidence.clone()));
-        if let Err(reason) = evidence.result {
-            return Err(ResolveFailure::RouteUnavailable {
-                trace: with_terminal(trace, reason),
-            });
+        if evidence.result.is_err() {
+            return Err(ResolveFailure::RouteUnavailable { trace });
         }
         let provider = live.map_or_else(String::new, |live| live.provider.clone());
         return Ok(AttemptPlan {
@@ -534,14 +554,19 @@ fn materialize_candidate(
             .render(parameters, &empty_captures()?)
             .map(Some)
             .map_err(|_| ResolveFailure::InvalidTemplate),
-        CompiledCandidateModel::OfferSelector(selector) => {
-            Ok(
-                select_offers(inventory, candidate.binding_id(), selector, policy)
-                    .into_iter()
-                    .next()
-                    .map(|offer| offer.backend_model_id.clone()),
-            )
-        }
+        CompiledCandidateModel::OfferSelector(selector) => Ok(super::selector::winner(
+            inventory,
+            candidate.binding_id(),
+            selector,
+            |classifier_id, offer| {
+                policy
+                    .classifier(classifier_id)
+                    .and_then(|classifier| classify(classifier, &offer.backend_model_id).ok())
+                    .flatten()
+                    .map(|(_, version)| version)
+            },
+        )
+        .map(|offer| offer.backend_model_id.clone())),
     }
 }
 
@@ -905,71 +930,6 @@ fn apply_alias(
             .map_err(|_| ResolveFailure::InvalidTemplate);
     }
     Ok(None)
-}
-
-fn select_offers<'a>(
-    inventory: &'a OfferInventory,
-    binding: &BindingId,
-    selector: &super::CompiledSelector,
-    policy: &CompiledPolicy,
-) -> Vec<&'a BackendOffer> {
-    let mut offers: Vec<_> = inventory
-        .iter()
-        .filter(|offer| &offer.binding_id == binding)
-        .filter(|offer| {
-            selector.include().is_empty()
-                || selector
-                    .include()
-                    .iter()
-                    .any(|matcher| matcher.is_match(&offer.backend_model_id).unwrap_or(false))
-        })
-        .filter(|offer| {
-            !selector
-                .exclude()
-                .iter()
-                .any(|matcher| matcher.is_match(&offer.backend_model_id).unwrap_or(false))
-        })
-        .collect();
-    match selector.ordering() {
-        SelectorOrdering::CatalogueChronology => offers.sort_by(|a, b| {
-            b.fetched_at_ms
-                .cmp(&a.fetched_at_ms)
-                .then_with(|| a.backend_model_id.cmp(&b.backend_model_id))
-        }),
-        SelectorOrdering::Explicit { model_ids } => {
-            let positions: BTreeMap<_, _> = model_ids
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect();
-            offers.retain(|offer| positions.contains_key(offer.backend_model_id.as_str()));
-            offers.sort_by_key(|offer| positions[offer.backend_model_id.as_str()]);
-        }
-        SelectorOrdering::ClassifiedVersion { classifier_id } => {
-            let Some(classifier) = policy.classifier(classifier_id) else {
-                return vec![];
-            };
-            offers.sort_by(|a, b| {
-                let av = classify(classifier, &a.backend_model_id)
-                    .ok()
-                    .flatten()
-                    .map(|(_, version)| version);
-                let bv = classify(classifier, &b.backend_model_id)
-                    .ok()
-                    .flatten()
-                    .map(|(_, version)| version);
-                bv.partial_cmp(&av)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.backend_model_id.cmp(&b.backend_model_id))
-            });
-        }
-    }
-    offers
-}
-
-fn with_terminal(mut trace: Vec<TraceEvent>, _reason: SkipReason) -> Vec<TraceEvent> {
-    trace.shrink_to_fit();
-    trace
 }
 
 /// Empty learning input for publication and tests that require no learning.

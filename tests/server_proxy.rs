@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -1953,6 +1954,13 @@ async fn shadow_observation_is_one_per_request_and_cannot_alter_chat_traffic() {
         "z-ai/glm-5.3"
     );
     assert_eq!(store.count_requests().unwrap(), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while observer.records().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shadow observation");
     let records = observer.records();
     assert_eq!(records.len(), 1);
     assert!(matches!(

@@ -376,6 +376,7 @@ impl Server {
             Ok(policy) => Some(Arc::new(PolicyShadow::new(
                 Arc::new(policy),
                 Arc::new(inventory),
+                Arc::new(availability_for(&registry, &initial_catalogs)),
                 models.clone(),
                 shadow_observer.clone(),
             ))),
@@ -453,11 +454,11 @@ impl Server {
             .and_then(|profile| ProfileId::new(profile).ok())
             .map_or_else(
                 || crate::policy::FrontendScope::Protocol {
-                    protocol: policy_protocol(protocol),
+                    protocol: protocol.into(),
                 },
                 |profile| crate::policy::FrontendScope::Profile {
                     profile,
-                    protocol: policy_protocol(protocol),
+                    protocol: protocol.into(),
                 },
             );
         let legacy: std::collections::BTreeSet<_> = legacy_models.into_iter().collect();
@@ -492,7 +493,7 @@ impl Server {
         let Some(shadow) = &self.policy_shadow else {
             return;
         };
-        shadow.observe(facts, lane, self.shadow_availability(), legacy);
+        shadow.observe(facts, lane, legacy);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -513,7 +514,7 @@ impl Server {
             profile: profile
                 .and_then(|name| ProfileId::new(name).ok())
                 .or_else(|| ProfileId::new("unprefixed").ok()),
-            protocol: policy_protocol(protocol),
+            protocol: protocol.into(),
             requested_model,
             lane_reference,
             prompt_bound,
@@ -526,16 +527,19 @@ impl Server {
         }
     }
 
-    pub(crate) fn shadow_lane(&self, key: Option<&str>, now: i64) -> Option<LaneFacts> {
-        let lane = key.and_then(|key| self.store.load_lane(key).ok().flatten())?;
-        let ttl = lane
-            .ttl
-            .unwrap_or(crate::middleware::force_newest::CACHE_TTL_MAX_MS);
+    pub(crate) fn shadow_lane(
+        &self,
+        lane: Option<&crate::store::Lane>,
+        min_tokens: u64,
+        min_idle_ms: Option<i64>,
+        now: i64,
+    ) -> Option<LaneFacts> {
+        let lane = lane?;
         Some(LaneFacts {
-            cold: now.saturating_sub(lane.updated_ms) >= ttl,
+            cold: crate::middleware::cold::lane_is_cold(Some(lane), min_tokens, min_idle_ms, now),
             pinned: None,
-            forced_from: lane.forced_from,
-            forced_to: lane.forced_to,
+            forced_from: lane.forced_from.clone(),
+            forced_to: lane.forced_to.clone(),
         })
     }
 
@@ -568,70 +572,6 @@ impl Server {
                 .unwrap_or_default(),
             compaction,
         })
-    }
-
-    fn shadow_availability(&self) -> AvailabilitySnapshot {
-        let catalogs = self
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bindings = self
-            .registry
-            .bindings()
-            .map(|binding| {
-                let configured = self.registry.binding_is_configured(binding);
-                let catalogue = FetchedCatalogs::source_of(binding.provider())
-                    .and_then(|source| catalogs.get(source))
-                    .map_or(CatalogueAvailability::Absent, |catalog| {
-                        if now_ms().saturating_sub(catalog.fetched_at_ms) <= fetched::CACHE_TTL_MS {
-                            CatalogueAvailability::Fresh {
-                                fetched_at_ms: catalog.fetched_at_ms,
-                            }
-                        } else {
-                            CatalogueAvailability::Stale {
-                                fetched_at_ms: catalog.fetched_at_ms,
-                            }
-                        }
-                    });
-                let canonical = binding.canonical_backend();
-                (
-                    binding.id().clone(),
-                    BindingAvailability {
-                        provider: binding.provider().to_owned(),
-                        configured: if configured {
-                            Evidence::Positive("configured")
-                        } else {
-                            Evidence::Negative("unconfigured")
-                        },
-                        enabled: if configured {
-                            Evidence::Positive("enabled")
-                        } else {
-                            Evidence::Negative("disabled")
-                        },
-                        // Credential preparation is expressly outside shadow.
-                        // Configuration is the only safe evidence available.
-                        credential: if configured {
-                            Evidence::Unknown
-                        } else {
-                            Evidence::Negative("provider-unconfigured")
-                        },
-                        catalogue,
-                        capabilities: canonical.map_or(
-                            crate::routing::Capabilities {
-                                sampling: false,
-                                system_in_messages: false,
-                                thinking_replay: false,
-                                images: false,
-                            },
-                            |canonical| canonical.capabilities(),
-                        ),
-                        cost_class: binding.cost_class(),
-                        cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
-                    },
-                )
-            })
-            .collect();
-        AvailabilitySnapshot::new(bindings)
     }
 
     // ── the idle-sleep lock ──────────────────────────────────────────
@@ -921,16 +861,33 @@ impl Server {
     /// disk cache. The source must be one of [`fetched::SOURCES`] to be
     /// reachable through the provider-mapped lookups.
     pub fn install_catalog(&self, source: &'static str, catalog: FetchedCatalog) {
-        let inventory = {
-            let mut catalogs = self
-                .catalogs
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            catalogs.set(source, catalog);
-            offers::inventory(&self.registry, &catalogs)
-        };
-        if let Some(shadow) = &self.policy_shadow {
-            shadow.replace_inventory(Arc::new(inventory));
+        let mut next = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        next.set(source, catalog);
+        self.replace_catalogs(next);
+    }
+
+    /// Replace catalogue state and every immutable shadow projection derived
+    /// from it as one update. In-flight observations retain the old snapshot.
+    fn replace_catalogs(&self, next: FetchedCatalogs) {
+        let inventory = offers::inventory(&self.registry, &next);
+        let availability = availability_for(&self.registry, &next);
+        let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
+            .ok()
+            .and_then(|compilation| compilation.into_policy().ok());
+        *self
+            .catalogs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        if let (Some(shadow), Some(policy)) = (&self.policy_shadow, policy) {
+            shadow.replace_snapshot(
+                Arc::new(policy),
+                Arc::new(inventory),
+                Arc::new(availability),
+            );
         }
     }
 
@@ -1043,14 +1000,7 @@ impl Server {
                 }
             }
         }
-        let inventory = offers::inventory(&self.registry, &next);
-        *self
-            .catalogs
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
-        if let Some(shadow) = &self.policy_shadow {
-            shadow.replace_inventory(Arc::new(inventory));
-        }
+        self.replace_catalogs(next);
     }
 
     /// The models-catalogue refresh: all three sources at startup, then
@@ -1062,10 +1012,7 @@ impl Server {
     fn spawn_catalog_refresh(&self) {
         match fetched::cache_dir() {
             Ok(dir) => {
-                *self
-                    .catalogs
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fetched::load_cached(&dir);
+                self.replace_catalogs(fetched::load_cached(&dir));
                 let _ = self.catalog_dir.set(dir);
             }
             Err(_) => {
@@ -1175,13 +1122,55 @@ impl Server {
     }
 }
 
-/// The frontend name a request carries, if it came through a prefix.
-fn policy_protocol(protocol: ProtocolId) -> FrontendProtocol {
-    match protocol {
-        ProtocolId::AnthropicMessages => FrontendProtocol::AnthropicMessages,
-        ProtocolId::OpenAiChat => FrontendProtocol::OpenaiChat,
-        ProtocolId::OpenAiResponses => FrontendProtocol::OpenaiResponses,
-    }
+fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> AvailabilitySnapshot {
+    let bindings = registry
+        .bindings()
+        .map(|binding| {
+            let configured = registry.binding_is_configured(binding);
+            let catalogue = FetchedCatalogs::source_of(binding.provider())
+                .and_then(|source| catalogs.get(source))
+                .map_or(CatalogueAvailability::Absent, |catalog| {
+                    CatalogueAvailability::Fresh {
+                        fetched_at_ms: catalog.fetched_at_ms,
+                    }
+                });
+            let canonical = binding.canonical_backend();
+            (
+                binding.id().clone(),
+                BindingAvailability {
+                    provider: binding.provider().to_owned(),
+                    configured: if configured {
+                        Evidence::Positive("configured")
+                    } else {
+                        Evidence::Negative("unconfigured")
+                    },
+                    enabled: if configured {
+                        Evidence::Positive("enabled")
+                    } else {
+                        Evidence::Negative("disabled")
+                    },
+                    credential: if configured {
+                        Evidence::Unknown
+                    } else {
+                        Evidence::Negative("provider-unconfigured")
+                    },
+                    catalogue,
+                    capabilities: canonical.map_or(
+                        crate::routing::Capabilities {
+                            sampling: false,
+                            system_in_messages: false,
+                            thinking_replay: false,
+                            images: false,
+                        },
+                        |canonical| canonical.capabilities(),
+                    ),
+                    cost_class: binding.cost_class(),
+                    cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
+                },
+            )
+        })
+        .collect();
+    AvailabilitySnapshot::new(bindings)
 }
 
 fn legacy_route_source(facts: &RequestFacts, target: &ModelTarget) -> String {

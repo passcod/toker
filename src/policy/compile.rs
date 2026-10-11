@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::catalog::offers::{BackendOffer, OfferInventory};
+use crate::catalog::offers::OfferInventory;
 use crate::routing::{BackendBinding, Capabilities, ProtocolId, RouteRegistry};
 
 use super::{
@@ -64,7 +64,6 @@ pub struct CompiledPolicy {
     classifiers: BTreeMap<ClassifierId, CompiledClassifier>,
     upgrades: BTreeMap<UpgradePolicyId, CompiledUpgradePolicy>,
     compaction: Option<CompiledCompaction>,
-    diagnostics: Vec<Diagnostic>,
 }
 
 impl CompiledPolicy {
@@ -103,10 +102,6 @@ impl CompiledPolicy {
 
     pub fn compaction(&self) -> Option<&CompiledCompaction> {
         self.compaction.as_ref()
-    }
-
-    pub fn diagnostics(&self) -> &[Diagnostic] {
-        &self.diagnostics
     }
 
     pub fn presentations(
@@ -163,7 +158,6 @@ pub struct CompiledCandidate {
     upgrade_policy_id: Option<UpgradePolicyId>,
     alias_rules: Vec<CompiledAliasRule>,
     enabled: bool,
-    inventory_winner: Option<String>,
     required_capabilities: super::CapabilityFlags,
 }
 
@@ -185,9 +179,6 @@ impl CompiledCandidate {
     }
     pub fn enabled(&self) -> bool {
         self.enabled
-    }
-    pub fn inventory_winner(&self) -> Option<&str> {
-        self.inventory_winner.as_deref()
     }
     pub fn required_capabilities(&self) -> super::CapabilityFlags {
         self.required_capabilities
@@ -462,7 +453,6 @@ impl<'a> Compiler<'a> {
         }
         let fingerprint =
             policy_fingerprint(&self.document).expect("validated bounded policy canonicalises");
-        let diagnostics = self.diagnostics.clone();
         Compilation {
             policy: Some(CompiledPolicy {
                 fingerprint,
@@ -473,7 +463,6 @@ impl<'a> Compiler<'a> {
                 classifiers,
                 upgrades,
                 compaction,
-                diagnostics,
             }),
             diagnostics: self.diagnostics,
         }
@@ -700,7 +689,7 @@ impl<'a> Compiler<'a> {
             }
         }
         let model_path = path.clone().field(f("model"));
-        let (model, winner) = match &candidate.model {
+        let model = match &candidate.model {
             CandidateModel::Exact { model_id } => {
                 if self
                     .inventory
@@ -713,7 +702,7 @@ impl<'a> Compiler<'a> {
                         candidate.id.as_stable_id(),
                     );
                 }
-                (CompiledCandidateModel::Exact(model_id.clone()), None)
+                CompiledCandidateModel::Exact(model_id.clone())
             }
             CandidateModel::RequestedModel => {
                 if !parameters
@@ -726,7 +715,7 @@ impl<'a> Compiler<'a> {
                         candidate.id.as_stable_id(),
                     );
                 }
-                (CompiledCandidateModel::RequestedModel, None)
+                CompiledCandidateModel::RequestedModel
             }
             CandidateModel::Template { template } => {
                 let empty = Default::default();
@@ -737,7 +726,7 @@ impl<'a> Compiler<'a> {
                     model_path.clone().field(f("template")),
                     candidate.id.as_stable_id(),
                 )?;
-                (CompiledCandidateModel::Template(template), None)
+                CompiledCandidateModel::Template(template)
             }
             CandidateModel::OfferSelector { selector } => {
                 self.validate_ordering(
@@ -755,19 +744,28 @@ impl<'a> Compiler<'a> {
                     &model_path,
                     candidate.id.as_stable_id(),
                 )?;
-                let winner = self
-                    .select_offers(&candidate.binding_id, &compiled, classifier_by_id)
-                    .into_iter()
-                    .next()
-                    .map(|offer| offer.backend_model_id.clone());
-                if winner.is_none() {
+                if super::selector::winner(
+                    self.inventory,
+                    &candidate.binding_id,
+                    &compiled,
+                    |classifier_id, offer| {
+                        classifier_by_id
+                            .get(classifier_id)
+                            .filter(|classifier| classifier.binding_id == offer.binding_id)
+                            .and_then(|classifier| {
+                                classify_version(classifier, &offer.backend_model_id)
+                            })
+                    },
+                )
+                .is_none()
+                {
                     self.info(
                         "selector-unresolved",
                         model_path.clone().field(f("selector")),
                         candidate.id.as_stable_id(),
                     );
                 }
-                (CompiledCandidateModel::OfferSelector(compiled), winner)
+                CompiledCandidateModel::OfferSelector(compiled)
             }
         };
         let alias_rules = self.aliases(
@@ -782,7 +780,6 @@ impl<'a> Compiler<'a> {
             upgrade_policy_id: candidate.upgrade_policy_id.clone(),
             alias_rules,
             enabled: candidate.enabled,
-            inventory_winner: winner,
             required_capabilities: candidate.required_capabilities,
         })
     }
@@ -1072,12 +1069,20 @@ impl<'a> Compiler<'a> {
                         );
                         continue;
                     }
-                    let mut selected = self.select_offers_optional(
+                    let selected = super::selector::select(
+                        self.inventory,
                         Some(&selector.binding_id),
                         &compiled,
-                        &classifier_raw,
+                        usize::from(selector.keep),
+                        |classifier_id, offer| {
+                            classifier_raw
+                                .get(classifier_id)
+                                .filter(|classifier| classifier.binding_id == offer.binding_id)
+                                .and_then(|classifier| {
+                                    classify_version(classifier, &offer.backend_model_id)
+                                })
+                        },
                     );
-                    selected.truncate(usize::from(selector.keep));
                     if selected.is_empty() {
                         self.info("selector-unresolved", selector_path, item.id.as_stable_id());
                     }
@@ -1415,78 +1420,6 @@ impl<'a> Compiler<'a> {
         Some(out)
     }
 
-    fn select_offers<'b>(
-        &self,
-        binding: &BindingId,
-        selector: &CompiledSelector,
-        classifiers: &HashMap<ClassifierId, FamilyClassifier>,
-    ) -> Vec<&'b BackendOffer>
-    where
-        'a: 'b,
-    {
-        self.select_offers_optional(Some(binding), selector, classifiers)
-    }
-
-    fn select_offers_optional<'b>(
-        &self,
-        binding: Option<&BindingId>,
-        selector: &CompiledSelector,
-        classifiers: &HashMap<ClassifierId, FamilyClassifier>,
-    ) -> Vec<&'b BackendOffer>
-    where
-        'a: 'b,
-    {
-        let mut offers: Vec<_> =
-            self.inventory
-                .iter()
-                .filter(|offer| binding.is_none_or(|binding| &offer.binding_id == binding))
-                .filter(|offer| {
-                    selector.include.is_empty()
-                        || selector.include.iter().any(|matcher| {
-                            matcher.is_match(&offer.backend_model_id).unwrap_or(false)
-                        })
-                })
-                .filter(|offer| {
-                    !selector
-                        .exclude
-                        .iter()
-                        .any(|matcher| matcher.is_match(&offer.backend_model_id).unwrap_or(false))
-                })
-                .collect();
-        match &selector.ordering {
-            SelectorOrdering::CatalogueChronology => offers.sort_by(|left, right| {
-                right
-                    .fetched_at_ms
-                    .cmp(&left.fetched_at_ms)
-                    .then_with(|| left.backend_model_id.cmp(&right.backend_model_id))
-            }),
-            SelectorOrdering::Explicit { model_ids } => {
-                let positions: HashMap<_, _> = model_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(index, id)| (id.as_str(), index))
-                    .collect();
-                offers.retain(|offer| positions.contains_key(offer.backend_model_id.as_str()));
-                offers.sort_by_key(|offer| positions[offer.backend_model_id.as_str()]);
-            }
-            SelectorOrdering::ClassifiedVersion { classifier_id } => {
-                let Some(classifier) = classifiers.get(classifier_id) else {
-                    return vec![];
-                };
-                offers.retain(|offer| offer.binding_id == classifier.binding_id);
-                offers.sort_by(|left, right| {
-                    let left_version = classify_version(classifier, &left.backend_model_id);
-                    let right_version = classify_version(classifier, &right.backend_model_id);
-                    right_version
-                        .partial_cmp(&left_version)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| left.backend_model_id.cmp(&right.backend_model_id))
-                });
-            }
-        }
-        offers
-    }
-
     fn matcher(
         &mut self,
         spec: &MatcherSpec,
@@ -1593,13 +1526,10 @@ fn classify_version(classifier: &FamilyClassifier, model: &str) -> Option<Parsed
 }
 
 fn protocol(scope: &FrontendScope) -> ProtocolId {
-    let protocol = match scope {
-        FrontendScope::Profile { protocol, .. } | FrontendScope::Protocol { protocol } => protocol,
-    };
-    match protocol {
-        FrontendProtocol::AnthropicMessages => ProtocolId::AnthropicMessages,
-        FrontendProtocol::OpenaiChat => ProtocolId::OpenAiChat,
-        FrontendProtocol::OpenaiResponses => ProtocolId::OpenAiResponses,
+    match scope {
+        FrontendScope::Profile { protocol, .. } | FrontendScope::Protocol { protocol } => {
+            (*protocol).into()
+        }
     }
 }
 

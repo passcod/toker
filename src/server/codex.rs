@@ -199,8 +199,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             effective_model.clone(),
             false,
         ) {
-            let lane = server.shadow_lane(lane_reference.as_deref(), facts.now_ms);
-            server.observe_policy_shadow(facts, lane, legacy);
+            server.observe_policy_shadow(facts, None, legacy);
         }
     }
 

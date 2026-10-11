@@ -12,6 +12,7 @@ pub mod learning;
 pub mod legacy;
 pub mod matcher;
 pub mod resolve;
+mod selector;
 pub mod shadow;
 pub mod version;
 

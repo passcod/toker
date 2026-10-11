@@ -24,35 +24,33 @@ pub struct BackendOffer {
 /// Canonical provider inventory, keyed without frontend aliases.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OfferInventory {
-    by_backend: BTreeMap<(BindingId, String), BackendOffer>,
+    by_backend: BTreeMap<BindingId, BTreeMap<String, BackendOffer>>,
 }
 
 impl OfferInventory {
     pub fn from_offers(offers: impl IntoIterator<Item = BackendOffer>) -> Self {
-        Self {
-            by_backend: offers
-                .into_iter()
-                .map(|offer| {
-                    (
-                        (offer.binding_id.clone(), offer.backend_model_id.clone()),
-                        offer,
-                    )
-                })
-                .collect(),
+        let mut by_backend = BTreeMap::<BindingId, BTreeMap<String, BackendOffer>>::new();
+        for offer in offers {
+            by_backend
+                .entry(offer.binding_id.clone())
+                .or_default()
+                .insert(offer.backend_model_id.clone(), offer);
         }
+        Self { by_backend }
     }
 
     pub fn get(&self, binding_id: &BindingId, backend_model_id: &str) -> Option<&BackendOffer> {
         self.by_backend
-            .get(&(binding_id.clone(), backend_model_id.to_owned()))
+            .get(binding_id)
+            .and_then(|offers| offers.get(backend_model_id))
     }
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &BackendOffer> {
-        self.by_backend.values()
+    pub fn iter(&self) -> impl Iterator<Item = &BackendOffer> {
+        self.by_backend.values().flat_map(|offers| offers.values())
     }
 
     pub fn len(&self) -> usize {
-        self.by_backend.len()
+        self.by_backend.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -79,16 +77,19 @@ pub fn inventory(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> OfferI
         };
         for model in &catalog.models {
             let binding_id = binding.id().clone();
-            let key = (binding_id.clone(), model.id.clone());
-            by_backend.entry(key).or_insert_with(|| BackendOffer {
-                binding_id,
-                provider: provider.to_owned(),
-                backend_model_id: model.id.clone(),
-                binding: binding.clone(),
-                context_window: model.context_window,
-                fetched_at_ms: catalog.fetched_at_ms,
-                raw: model.raw.clone(),
-            });
+            by_backend
+                .entry(binding_id.clone())
+                .or_insert_with(BTreeMap::new)
+                .entry(model.id.clone())
+                .or_insert_with(|| BackendOffer {
+                    binding_id,
+                    provider: provider.to_owned(),
+                    backend_model_id: model.id.clone(),
+                    binding: binding.clone(),
+                    context_window: model.context_window,
+                    fetched_at_ms: catalog.fetched_at_ms,
+                    raw: model.raw.clone(),
+                });
         }
     }
     OfferInventory { by_backend }

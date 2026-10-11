@@ -1,11 +1,12 @@
 //! Non-authoritative observation of legacy-policy equivalence.
 //!
-//! Shadow comparison receives already-derived facts and an already-made legacy
-//! decision. It can only resolve immutable inputs and notify an observer. All
-//! failures and panics are caught and never reach request handling.
+//! Request handlers only enqueue fully owned, content-free observations into a
+//! bounded worker. Queue pressure, resolution failures, and observer panics can
+//! therefore never delay or change authoritative traffic.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::thread;
 
 use super::{
     AttemptPlan, AvailabilitySnapshot, CompiledPolicy, LaneFacts, LearningView, RequestFacts,
@@ -13,7 +14,8 @@ use super::{
 };
 use crate::catalog::offers::OfferInventory;
 
-/// Content-free projection shared by legacy and shadow decisions.
+const SHADOW_QUEUE_CAPACITY: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowOutcome {
     pub protocol: super::FrontendProtocol,
@@ -29,7 +31,6 @@ pub struct ShadowOutcome {
     pub compaction: bool,
 }
 
-/// The authoritative decision already made by existing code.
 pub type LegacyOutcome = ShadowOutcome;
 
 impl ShadowOutcome {
@@ -57,7 +58,6 @@ pub enum ShadowComparison {
     InternalError,
 }
 
-/// Stable content-free observer record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowRecord {
     pub comparison: ShadowComparison,
@@ -66,8 +66,6 @@ pub struct ShadowRecord {
     pub shadow: Option<ShadowOutcome>,
 }
 
-/// Observation is deliberately one-way; an observer cannot return a value that
-/// might influence request handling.
 pub trait ShadowObserver: Send + Sync + 'static {
     fn observe(&self, record: ShadowRecord);
 }
@@ -115,24 +113,56 @@ impl ShadowObserver for CollectingObserver {
     }
 }
 
-/// Immutable policy inputs and a one-way observer.
 pub struct PolicyShadow<L> {
     snapshot: Arc<RwLock<Arc<ShadowSnapshot>>>,
-    learning: Arc<L>,
-    observer: Arc<dyn ShadowObserver>,
+    runtime: Arc<ShadowRuntime>,
+    _learning: std::marker::PhantomData<fn() -> L>,
 }
 
 struct ShadowSnapshot {
     policy: Arc<CompiledPolicy>,
     inventory: Arc<OfferInventory>,
+    availability: Arc<AvailabilitySnapshot>,
+}
+
+enum ShadowJob {
+    Resolve {
+        snapshot: Arc<ShadowSnapshot>,
+        facts: RequestFacts,
+        lane: Option<LaneFacts>,
+        legacy: LegacyOutcome,
+    },
+    Record(ShadowRecord),
+}
+
+struct ShadowRuntime {
+    sender: Mutex<Option<mpsc::SyncSender<ShadowJob>>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for ShadowRuntime {
+    fn drop(&mut self) {
+        self.sender
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl<L> Clone for PolicyShadow<L> {
     fn clone(&self) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
-            learning: self.learning.clone(),
-            observer: self.observer.clone(),
+            runtime: self.runtime.clone(),
+            _learning: std::marker::PhantomData,
         }
     }
 }
@@ -144,31 +174,43 @@ where
     pub fn new(
         policy: Arc<CompiledPolicy>,
         inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
         learning: Arc<L>,
         observer: Arc<dyn ShadowObserver>,
     ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
+        let worker = thread::Builder::new()
+            .name("toker-policy-shadow".to_owned())
+            .spawn(move || worker_loop(receiver, learning, observer))
+            .expect("policy shadow worker thread");
         Self {
             snapshot: Arc::new(RwLock::new(Arc::new(ShadowSnapshot {
                 policy,
                 inventory,
+                availability,
             }))),
-            learning,
-            observer,
+            runtime: Arc::new(ShadowRuntime {
+                sender: Mutex::new(Some(sender)),
+                worker: Mutex::new(Some(worker)),
+            }),
+            _learning: std::marker::PhantomData,
         }
     }
 
-    /// Atomically replace the compiled legacy policy and immutable offer
-    /// inventory together. In-flight observations keep their captured pair.
     pub fn replace_snapshot(
         &self,
         policy: Arc<CompiledPolicy>,
         inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
     ) {
         *self
             .snapshot
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Arc::new(ShadowSnapshot { policy, inventory });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(ShadowSnapshot {
+            policy,
+            inventory,
+            availability,
+        });
     }
 
     pub fn policy(&self) -> Arc<CompiledPolicy> {
@@ -180,51 +222,98 @@ where
     }
 
     pub fn observe_record(&self, record: ShadowRecord) {
-        let _ = catch_unwind(AssertUnwindSafe(|| self.observer.observe(record)));
+        self.enqueue(ShadowJob::Record(record));
     }
 
-    /// Compare one already-authoritative decision. This function never returns
-    /// a result to the caller and contains both resolver and observer panics.
-    pub fn observe(
-        &self,
-        facts: RequestFacts,
-        lane: Option<LaneFacts>,
-        availability: AvailabilitySnapshot,
-        legacy: LegacyOutcome,
-    ) {
-        let record = catch_unwind(AssertUnwindSafe(|| {
-            let inventory = self
-                .inventory
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            match resolve(
-                &self.policy,
-                &inventory,
-                self.learning.as_ref(),
-                lane.as_ref(),
-                &availability,
-                &facts,
-            ) {
-                Ok(plan) => {
-                    let shadow = ShadowOutcome::from_plan(&facts, &plan);
-                    let comparison = if legacy == shadow {
-                        ShadowComparison::Match
-                    } else {
-                        ShadowComparison::Mismatch
-                    };
-                    ShadowRecord {
-                        comparison,
-                        code: if comparison == ShadowComparison::Match {
-                            "policy-shadow-match"
+    pub fn observe(&self, facts: RequestFacts, lane: Option<LaneFacts>, legacy: LegacyOutcome) {
+        let snapshot = self
+            .snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.enqueue(ShadowJob::Resolve {
+            snapshot,
+            facts,
+            lane,
+            legacy,
+        });
+    }
+
+    fn enqueue(&self, job: ShadowJob) {
+        let sender = self
+            .runtime
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = sender.as_ref() {
+            let _ = sender.try_send(job);
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runtime(
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        runtime: Arc<ShadowRuntime>,
+    ) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(Arc::new(ShadowSnapshot {
+                policy,
+                inventory,
+                availability,
+            }))),
+            runtime,
+            _learning: std::marker::PhantomData,
+        }
+    }
+}
+
+fn worker_loop<L: LearningView>(
+    receiver: mpsc::Receiver<ShadowJob>,
+    learning: Arc<L>,
+    observer: Arc<dyn ShadowObserver>,
+) {
+    while let Ok(job) = receiver.recv() {
+        let record = catch_unwind(AssertUnwindSafe(|| match job {
+            ShadowJob::Record(record) => record,
+            ShadowJob::Resolve {
+                snapshot,
+                facts,
+                lane,
+                legacy,
+            } => {
+                let availability = snapshot
+                    .availability
+                    .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS);
+                match resolve(
+                    &snapshot.policy,
+                    &snapshot.inventory,
+                    learning.as_ref(),
+                    lane.as_ref(),
+                    &availability,
+                    &facts,
+                ) {
+                    Ok(plan) => {
+                        let shadow = ShadowOutcome::from_plan(&facts, &plan);
+                        let comparison = if legacy == shadow {
+                            ShadowComparison::Match
                         } else {
-                            "policy-shadow-mismatch"
-                        },
-                        legacy: Some(legacy),
-                        shadow: Some(shadow),
+                            ShadowComparison::Mismatch
+                        };
+                        ShadowRecord {
+                            comparison,
+                            code: if comparison == ShadowComparison::Match {
+                                "policy-shadow-match"
+                            } else {
+                                "policy-shadow-mismatch"
+                            },
+                            legacy: Some(legacy),
+                            shadow: Some(shadow),
+                        }
                     }
+                    Err(error) => failure_record(error, legacy),
                 }
-                Err(error) => failure_record(error, legacy),
             }
         }))
         .unwrap_or(ShadowRecord {
@@ -233,8 +322,7 @@ where
             legacy: None,
             shadow: None,
         });
-
-        let _ = catch_unwind(AssertUnwindSafe(|| self.observer.observe(record)));
+        let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(record)));
     }
 }
 
@@ -270,6 +358,11 @@ fn provenance_code(provenance: &RouteProvenance) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use crate::catalog::offers::BackendOffer;
+    use crate::policy::*;
+    use crate::routing::ANTHROPIC_SUB_MESSAGES;
 
     struct Panics;
     impl ShadowObserver for Panics {
@@ -302,5 +395,229 @@ mod tests {
             })))
             .is_err()
         );
+    }
+
+    fn fixture() -> (
+        Arc<CompiledPolicy>,
+        Arc<OfferInventory>,
+        Arc<AvailabilitySnapshot>,
+    ) {
+        let binding = ANTHROPIC_SUB_MESSAGES.clone();
+        let document = PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![DefaultRoute {
+                scope: FrontendScope::Protocol {
+                    protocol: FrontendProtocol::AnthropicMessages,
+                },
+                target: RouteReference {
+                    route_id: RouteId::new("route").unwrap(),
+                    parameters: Default::default(),
+                },
+            }],
+            presentations: vec![],
+            routes: vec![Route {
+                id: RouteId::new("route").unwrap(),
+                display_name: "route".to_owned(),
+                description: None,
+                parameters: vec![],
+                chain: RouteChain {
+                    first: Candidate {
+                        id: CandidateId::new("candidate").unwrap(),
+                        binding_id: binding.id().clone(),
+                        model: CandidateModel::Exact {
+                            model_id: "model-a".to_owned(),
+                        },
+                        upgrade_policy_id: None,
+                        alias_policy: None,
+                        required_capabilities: Default::default(),
+                        enabled: true,
+                        health_circuits: vec![],
+                    },
+                    steps: vec![],
+                },
+                lane_transition: LaneTransitionPolicy::PreservePinned,
+            }],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
+        };
+        let inventory = Arc::new(OfferInventory::from_offers([BackendOffer {
+            binding_id: binding.id().clone(),
+            provider: "anthropic_sub".to_owned(),
+            backend_model_id: "model-a".to_owned(),
+            binding: binding.clone(),
+            context_window: None,
+            fetched_at_ms: 10,
+            raw: serde_json::json!({}),
+        }]));
+        let topology = crate::routing::RouteRegistry::new(
+            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
+        );
+        let policy = crate::policy::compile(
+            document.validate().unwrap(),
+            &topology,
+            &inventory,
+            PolicyOrigin::Authored,
+        )
+        .into_policy()
+        .unwrap();
+        let availability = Arc::new(AvailabilitySnapshot::new(std::collections::BTreeMap::from(
+            [(
+                binding.id().clone(),
+                BindingAvailability {
+                    provider: "anthropic_sub".to_owned(),
+                    configured: Evidence::Positive("configured"),
+                    enabled: Evidence::Positive("enabled"),
+                    credential: Evidence::Unknown,
+                    catalogue: CatalogueAvailability::Fresh { fetched_at_ms: 10 },
+                    capabilities: crate::routing::Capabilities::MESSAGES,
+                    cost_class: CostClass::Subscription,
+                    cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
+                },
+            )],
+        )));
+        (Arc::new(policy), inventory, availability)
+    }
+
+    fn facts() -> RequestFacts {
+        RequestFacts {
+            profile: None,
+            protocol: FrontendProtocol::AnthropicMessages,
+            requested_model: None,
+            lane_reference: None,
+            prompt_bound: 1,
+            message_count: Some(1),
+            tool_count: 0,
+            required_capabilities: Default::default(),
+            binding_affinity: None,
+            class: RequestClass::Inference,
+            now_ms: 10,
+        }
+    }
+
+    fn outcome(model: &str) -> LegacyOutcome {
+        LegacyOutcome {
+            protocol: FrontendProtocol::AnthropicMessages,
+            profile: None,
+            requested_model: None,
+            provider: "anthropic_sub".to_owned(),
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            route_source: "protocol-default".to_owned(),
+            baseline_model: model.to_owned(),
+            upgraded_model: None,
+            aliased_model: None,
+            effective_model: model.to_owned(),
+            compaction: false,
+        }
+    }
+
+    fn wait_for(observer: &CollectingObserver, count: usize) -> Vec<ShadowRecord> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let records = observer.records();
+            if records.len() >= count {
+                return records;
+            }
+            assert!(Instant::now() < deadline, "shadow worker did not drain");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn bounded_worker_records_match_mismatch_and_survives_observer_panic() {
+        let (policy, inventory, availability) = fixture();
+        let observer = Arc::new(CollectingObserver::default());
+        let shadow = PolicyShadow::new(
+            policy.clone(),
+            inventory.clone(),
+            availability.clone(),
+            Arc::new(NoLearning),
+            observer.clone(),
+        );
+        shadow.observe(facts(), None, outcome("model-a"));
+        shadow.observe(facts(), None, outcome("model-b"));
+        let records = wait_for(&observer, 2);
+        assert_eq!(records[0].comparison, ShadowComparison::Match);
+        assert_eq!(records[1].comparison, ShadowComparison::Mismatch);
+
+        let panicking = PolicyShadow::new(
+            policy,
+            inventory,
+            availability,
+            Arc::new(NoLearning),
+            Arc::new(Panics),
+        );
+        panicking.observe(facts(), None, outcome("model-a"));
+        panicking.observe(facts(), None, outcome("model-a"));
+        drop(panicking);
+    }
+
+    #[test]
+    fn full_or_closed_queue_drops_without_blocking() {
+        let (policy, inventory, availability) = fixture();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .try_send(ShadowJob::Record(ShadowRecord {
+                comparison: ShadowComparison::Match,
+                code: "occupied",
+                legacy: None,
+                shadow: None,
+            }))
+            .unwrap();
+        let runtime = Arc::new(ShadowRuntime {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(None),
+        });
+        let shadow: PolicyShadow<NoLearning> =
+            PolicyShadow::with_runtime(policy, inventory, availability, runtime);
+        shadow.observe_record(ShadowRecord {
+            comparison: ShadowComparison::Mismatch,
+            code: "dropped",
+            legacy: None,
+            shadow: None,
+        });
+        assert_eq!(receiver.try_recv().unwrap().code(), "occupied");
+        drop(receiver);
+        shadow.observe_record(ShadowRecord {
+            comparison: ShadowComparison::Mismatch,
+            code: "closed",
+            legacy: None,
+            shadow: None,
+        });
+    }
+
+    #[test]
+    fn replacing_snapshot_changes_subsequent_resolution() {
+        let (policy, inventory, availability) = fixture();
+        let observer = Arc::new(CollectingObserver::default());
+        let shadow = PolicyShadow::new(
+            policy.clone(),
+            inventory.clone(),
+            availability.clone(),
+            Arc::new(NoLearning),
+            observer.clone(),
+        );
+        shadow.observe(facts(), None, outcome("model-a"));
+        wait_for(&observer, 1);
+        shadow.replace_snapshot(policy, Arc::new(OfferInventory::default()), availability);
+        shadow.observe(facts(), None, outcome("model-a"));
+        let records = wait_for(&observer, 2);
+        assert_eq!(records[1].comparison, ShadowComparison::InternalError);
+    }
+
+    trait JobCode {
+        fn code(&self) -> &'static str;
+    }
+
+    impl JobCode for ShadowJob {
+        fn code(&self) -> &'static str {
+            match self {
+                ShadowJob::Record(record) => record.code,
+                ShadowJob::Resolve { .. } => "resolve",
+            }
+        }
     }
 }

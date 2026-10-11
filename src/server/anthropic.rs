@@ -1139,7 +1139,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             served_model.clone(),
             shadow_compaction,
         ) {
-            let lane = server.shadow_lane(cold_lane_key.as_deref(), facts.now_ms);
+            let lane = server.shadow_lane(
+                cold_lane.as_ref(),
+                server.config.gates.cold_min_tokens,
+                cold_idle_ms(&server.config.gates),
+                facts.now_ms,
+            );
             server.observe_policy_shadow(facts, lane, legacy);
         }
     }
