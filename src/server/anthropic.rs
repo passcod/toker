@@ -923,7 +923,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .and_then(|lane| lane.prompt_tokens)
                 .filter(|prompt| *prompt >= 0)
                 .unwrap_or_default() as u64;
-            let target = server
+            let compaction_target = server
                 .models
                 .compaction_target(
                     &compact_spec(gates),
@@ -933,22 +933,23 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()
                 .flatten();
-            let retargeted = canonical.as_mut().and_then(|canonical| {
-                let outcome = crate::middleware::canonical::retarget_compaction(
-                    canonical,
-                    target.as_deref(),
-                    true,
+            let retargeted = inference_baseline.as_ref().and_then(|inference| {
+                let (attempt, outcome) = inference.prepare_compaction(
+                    target.clone(),
+                    compaction_target.as_deref(),
                     backend.model_map(),
                 )?;
+                let prepared = attempt.canonical();
                 let rendered = translate::render_anthropic(
-                    canonical,
+                    &prepared,
                     crate::routing::DialectId::AnthropicMessages,
                 )
                 .ok()?;
                 let bytes = serde_json::to_vec(&rendered.value).ok()?;
-                Some((outcome, bytes))
+                Some((prepared, outcome, bytes))
             });
-            if let Some((outcome, bytes)) = retargeted {
+            if let Some((prepared, outcome, bytes)) = retargeted {
+                canonical = Some(prepared);
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::ir::canonical::CanonicalRequest;
+use crate::middleware::cold::RetargetOutcome;
 use crate::middleware::model_map::{MapTarget, ModelMap};
 use crate::providers::Provider;
 use crate::routing::{BackendBinding, ModelTarget};
@@ -57,7 +58,33 @@ impl InferenceRequest {
         }
     }
 
-    /// Temporary bridge for Messages while its existing candidate-local
+    pub(crate) fn prepare_compaction(
+        &self,
+        target: ModelTarget,
+        compaction_model: Option<&str>,
+        model_map: Option<&ModelMap>,
+    ) -> Option<(InferenceAttempt, RetargetOutcome)> {
+        let mut canonical = self.canonical();
+        let outcome = crate::middleware::canonical::retarget_compaction(
+            &mut canonical,
+            compaction_model,
+            true,
+            model_map,
+        )?;
+        let effective_model = canonical.model.clone();
+        Some((
+            InferenceAttempt {
+                target,
+                requested_model: self.requested_model.clone(),
+                effective_model,
+                mapped: None,
+                canonical,
+            },
+            outcome,
+        ))
+    }
+
+    /// Temporary bridge for Messages while its remaining candidate-local
     /// transforms are moved behind `prepare`. The method name prevents a
     /// transformed request from masquerading as the immutable baseline.
     pub(crate) fn prepare_legacy_transformed(
@@ -171,6 +198,43 @@ mod tests {
         let second = attempt.canonical();
         assert_eq!(second.model.as_deref(), Some("invented-model"));
         assert_eq!(second.system.len(), 1);
+    }
+
+    #[test]
+    fn compaction_is_candidate_local_and_preserves_the_baseline() {
+        let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(
+            "https://openrouter.ai/api/v1".parse().unwrap(),
+            None,
+        ));
+        let registry = RouteRegistry::new(
+            [provider],
+            [(ProtocolId::OpenAiChat, "openrouter".to_owned())],
+        );
+        let target = registry
+            .resolve(ProtocolId::OpenAiChat, Some("openrouter/claude-opus-4-1"))
+            .unwrap();
+        let mut canonical = CanonicalRequest {
+            model: Some("claude-opus-4-1".to_owned()),
+            ..CanonicalRequest::default()
+        };
+        canonical.messages.push(crate::ir::canonical::CanonMessage {
+            role: crate::ir::canonical::CanonRole::User,
+            blocks: vec![crate::ir::canonical::CanonBlock::Text("prompt".to_owned())],
+            extensions: vec![],
+        });
+        let request =
+            InferenceRequest::new(Some("openrouter/claude-opus-4-1".to_owned()), canonical);
+        let (attempt, outcome) = request
+            .prepare_compaction(target, Some("claude-haiku-3-5"), None)
+            .expect("retargeted");
+
+        assert_eq!(outcome.from.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(outcome.to.as_deref(), Some("claude-haiku-3-5"));
+        assert_eq!(attempt.effective_model(), Some("claude-haiku-3-5"));
+        assert_eq!(
+            request.canonical().model.as_deref(),
+            Some("claude-opus-4-1")
+        );
     }
 
     #[test]
