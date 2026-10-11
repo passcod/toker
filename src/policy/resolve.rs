@@ -1592,6 +1592,76 @@ mod tests {
     }
 
     #[test]
+    fn disabled_candidate_is_positive_preflight_evidence() {
+        let mut disabled = candidate(
+            "disabled",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "disabled".to_owned(),
+            },
+        );
+        disabled.enabled = false;
+        let fallback = candidate(
+            "fallback",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "fallback".to_owned(),
+            },
+        );
+        let edge = CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let policy = compile(
+            document(route(
+                disabled.clone(),
+                vec![RouteStep {
+                    edge,
+                    candidate: fallback,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let selected = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap();
+        assert_eq!(selected.candidate_id, Some(id("fallback")));
+        assert!(matches!(
+            &selected.trace[1],
+            TraceEvent::Candidate(evidence) if evidence.result == Err(SkipReason::Disabled)
+        ));
+
+        let policy = compile(
+            document(route(disabled, vec![])),
+            &OfferInventory::default(),
+        );
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace }
+                if matches!(&trace[1], TraceEvent::Candidate(evidence)
+                    if evidence.result == Err(SkipReason::Disabled))
+        ));
+    }
+
+    #[test]
     fn unresolved_selector_does_not_authorize_preflight_fallback() {
         let first = candidate(
             "first",
