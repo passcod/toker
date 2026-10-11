@@ -1789,17 +1789,7 @@ api_key = "ak-literal-test"
         let rows = server.store.requests_since(0, 10).expect("ledger rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].binding_id, Some(ctx.binding_id.clone()));
-        assert_eq!(rows[0].policy_revision_id, None);
-        assert_eq!(rows[0].presentation_id, None);
-        assert_eq!(rows[0].rewrite_id, None);
-        assert_eq!(rows[0].policy_route_id, None);
-        assert_eq!(rows[0].route_fingerprint, None);
-        assert_eq!(rows[0].candidate_id, None);
-        assert_eq!(rows[0].baseline_model, None);
-        assert_eq!(rows[0].attempt_group_id, None);
-        assert_eq!(rows[0].attempt_index, None);
-        assert_eq!(rows[0].fallback_reason, None);
-        assert_eq!(rows[0].routing_trace, None);
+        assert_eq!(rows[0].policy_routing, None);
         assert_eq!(rows[0].lineage, None);
         assert!(
             server.models.last_served("claude-sonnet-5").is_some(),

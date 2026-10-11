@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::policy::{
-    BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, StableId,
-    TraceEvent,
+    BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, TraceEvent,
 };
 
 use super::{Error, Result, rows_of};
@@ -495,6 +494,86 @@ impl StoredRoutingTraceEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptReason {
+    Initial,
+    ThinkingNegotiation,
+    Authentication,
+    ModelNotFound,
+    RateLimit,
+    ProviderQuota,
+    Overload,
+    ServerError,
+    TransportBeforeAccept,
+    AmbiguousTransport,
+}
+
+impl AttemptReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ThinkingNegotiation => "thinking_negotiation",
+            Self::Authentication => "authentication",
+            Self::ModelNotFound => "model_not_found",
+            Self::RateLimit => "rate_limit",
+            Self::ProviderQuota => "provider_quota",
+            Self::Overload => "overload",
+            Self::ServerError => "server_error",
+            Self::TransportBeforeAccept => "transport_before_accept",
+            Self::AmbiguousTransport => "ambiguous_transport",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "initial" => Self::Initial,
+            "thinking_negotiation" => Self::ThinkingNegotiation,
+            "authentication" => Self::Authentication,
+            "model_not_found" => Self::ModelNotFound,
+            "rate_limit" => Self::RateLimit,
+            "provider_quota" => Self::ProviderQuota,
+            "overload" => Self::Overload,
+            "server_error" => Self::ServerError,
+            "transport_before_accept" => Self::TransportBeforeAccept,
+            "ambiguous_transport" => Self::AmbiguousTransport,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestLookupProvenance {
+    ProfilePresentation(PresentationId),
+    ProtocolPresentation(PresentationId),
+    ProfileRewrite(RewriteId),
+    ProtocolRewrite(RewriteId),
+    ProfileDefault,
+    ProtocolDefault,
+    Compaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRouteProvenance {
+    pub policy_revision_id: i64,
+    pub lookup: RequestLookupProvenance,
+    pub route_id: RouteId,
+    pub route_fingerprint: RouteFingerprint,
+    pub attempt_group_id: AttemptGroupId,
+    pub trace: StoredRoutingTrace,
+    pub outcome: PolicyRoutingOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRoutingOutcome {
+    Attempt {
+        candidate_id: CandidateId,
+        baseline_model: String,
+        attempt_index: i64,
+        reason: AttemptReason,
+    },
+    RouteUnavailable,
+}
+
 /// One `requests` row: the complete column list as a single struct. Field
 /// names match their SQL columns one-to-one. Every field except `ts_ms` is
 /// an `Option` — absence is stored and read back as NULL, never as zero or
@@ -640,30 +719,135 @@ pub struct RequestRow {
     pub geo: Option<String>,
     /// Provider's fast/low-latency tier flag, when reported.
     pub fast: Option<bool>,
-    /// Immutable policy revision used by this attempt.
-    pub policy_revision_id: Option<i64>,
-    pub presentation_id: Option<PresentationId>,
-    pub rewrite_id: Option<RewriteId>,
-    pub policy_route_id: Option<RouteId>,
-    pub route_fingerprint: Option<RouteFingerprint>,
-    pub candidate_id: Option<CandidateId>,
+    /// Selected backend binding. Legacy-attributed rows may carry it without
+    /// policy provenance; a policy actual attempt must carry the selected
+    /// binding while a preflight terminal must not.
     pub binding_id: Option<BindingId>,
-    pub baseline_model: Option<String>,
-    pub attempt_group_id: Option<AttemptGroupId>,
-    /// Zero-based actual-send index; NULL for a preflight terminal row.
-    pub attempt_index: Option<i64>,
-    pub fallback_reason: Option<StableId>,
-    pub routing_trace: Option<StoredRoutingTrace>,
+    /// Closed policy-routing provenance, absent on legacy/non-routing rows.
+    pub policy_routing: Option<PolicyRouteProvenance>,
     pub lineage: Option<SessionLineage>,
 }
 
-fn validate_request_provenance(row: &RequestRow) -> Result<()> {
-    if row.attempt_index.is_some_and(|value| value < 0) {
-        return Err(Error::InvalidRoutingState("negative attempt index".into()));
+struct FlatPolicyRouting<'a> {
+    policy_revision_id: i64,
+    presentation_id: Option<&'a PresentationId>,
+    rewrite_id: Option<&'a RewriteId>,
+    policy_route_id: &'a RouteId,
+    route_fingerprint: &'a RouteFingerprint,
+    candidate_id: Option<&'a CandidateId>,
+    baseline_model: Option<&'a str>,
+    attempt_group_id: &'a AttemptGroupId,
+    attempt_index: Option<i64>,
+    reason: Option<AttemptReason>,
+    trace: &'a StoredRoutingTrace,
+}
+
+impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
+    fn from(routing: &'a PolicyRouteProvenance) -> Self {
+        let (presentation_id, rewrite_id) = match &routing.lookup {
+            RequestLookupProvenance::ProfilePresentation(id)
+            | RequestLookupProvenance::ProtocolPresentation(id) => (Some(id), None),
+            RequestLookupProvenance::ProfileRewrite(id)
+            | RequestLookupProvenance::ProtocolRewrite(id) => (None, Some(id)),
+            RequestLookupProvenance::ProfileDefault
+            | RequestLookupProvenance::ProtocolDefault
+            | RequestLookupProvenance::Compaction => (None, None),
+        };
+        let (candidate_id, baseline_model, attempt_index, reason) = match &routing.outcome {
+            PolicyRoutingOutcome::Attempt {
+                candidate_id,
+                baseline_model,
+                attempt_index,
+                reason,
+            } => (
+                Some(candidate_id),
+                Some(baseline_model.as_str()),
+                Some(*attempt_index),
+                Some(*reason),
+            ),
+            PolicyRoutingOutcome::RouteUnavailable => (None, None, None, None),
+        };
+        Self {
+            policy_revision_id: routing.policy_revision_id,
+            presentation_id,
+            rewrite_id,
+            policy_route_id: &routing.route_id,
+            route_fingerprint: &routing.route_fingerprint,
+            candidate_id,
+            baseline_model,
+            attempt_group_id: &routing.attempt_group_id,
+            attempt_index,
+            reason,
+            trace: &routing.trace,
+        }
     }
-    if row.attempt_index.is_some() && row.attempt_group_id.is_none() {
+}
+
+fn validate_request_provenance(row: &RequestRow) -> Result<()> {
+    if let Some(routing) = &row.policy_routing {
+        routing.trace.validate()?;
+        let expected_lookup = match &routing.lookup {
+            RequestLookupProvenance::ProfilePresentation(id) => {
+                (StoredLookupSource::ProfilePresentation, Some(id), None)
+            }
+            RequestLookupProvenance::ProtocolPresentation(id) => {
+                (StoredLookupSource::ProtocolPresentation, Some(id), None)
+            }
+            RequestLookupProvenance::ProfileRewrite(id) => {
+                (StoredLookupSource::ProfileRewrite, None, Some(id))
+            }
+            RequestLookupProvenance::ProtocolRewrite(id) => {
+                (StoredLookupSource::ProtocolRewrite, None, Some(id))
+            }
+            RequestLookupProvenance::ProfileDefault => {
+                (StoredLookupSource::ProfileDefault, None, None)
+            }
+            RequestLookupProvenance::ProtocolDefault => {
+                (StoredLookupSource::ProtocolDefault, None, None)
+            }
+            RequestLookupProvenance::Compaction => (StoredLookupSource::Compaction, None, None),
+        };
+        let actual_lookup = routing.trace.events.first().and_then(|event| match event {
+            StoredRoutingTraceEvent::Lookup {
+                source,
+                presentation_id,
+                rewrite_id,
+            } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+            _ => None,
+        });
+        if actual_lookup != Some(expected_lookup) {
+            return Err(Error::InvalidRoutingState(
+                "policy lookup disagrees with its trace".into(),
+            ));
+        }
+        match &routing.outcome {
+            PolicyRoutingOutcome::Attempt {
+                baseline_model,
+                attempt_index,
+                ..
+            } => {
+                if *attempt_index < 0 || baseline_model.is_empty() || row.binding_id.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "invalid policy routing attempt".into(),
+                    ));
+                }
+                if row.kind == Some(RowKind::RouteUnavailable) {
+                    return Err(Error::InvalidRoutingState(
+                        "actual attempt cannot be route-unavailable".into(),
+                    ));
+                }
+            }
+            PolicyRoutingOutcome::RouteUnavailable => {
+                if row.kind != Some(RowKind::RouteUnavailable) || row.binding_id.is_some() {
+                    return Err(Error::InvalidRoutingState(
+                        "invalid route-unavailable terminal".into(),
+                    ));
+                }
+            }
+        }
+    } else if row.kind == Some(RowKind::RouteUnavailable) {
         return Err(Error::InvalidRoutingState(
-            "attempt index requires an attempt group".into(),
+            "route-unavailable requires policy routing provenance".into(),
         ));
     }
     if let Some(lineage) = &row.lineage {
@@ -699,14 +883,12 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let system_change = super::opt_json_to_text(&row.system_change)?;
     let model_mappings = super::opt_json_to_text(&row.model_mappings)?;
     let extra = super::opt_json_to_text(&row.extra)?;
-    let routing_trace = match &row.routing_trace {
-        Some(trace) => {
-            trace.validate()?;
-            Some(serde_json::to_string(trace)?)
-        }
-        None => None,
-    };
     validate_request_provenance(row)?;
+    let flattened = row.policy_routing.as_ref().map(FlatPolicyRouting::from);
+    let routing_trace = flattened
+        .as_ref()
+        .map(|routing| serde_json::to_string(routing.trace))
+        .transpose()?;
     let kind = row.kind.map(RowKind::as_str);
     let cost_kind = row.cost_kind.map(CostKind::as_str);
 
@@ -804,17 +986,17 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":betas": row.betas,
         ":geo": row.geo,
         ":fast": row.fast,
-        ":policy_revision_id": row.policy_revision_id,
-        ":presentation_id": row.presentation_id.as_ref().map(PresentationId::as_str),
-        ":rewrite_id": row.rewrite_id.as_ref().map(RewriteId::as_str),
-        ":policy_route_id": row.policy_route_id.as_ref().map(RouteId::as_str),
-        ":route_fingerprint": row.route_fingerprint.as_ref().map(ToString::to_string),
-        ":candidate_id": row.candidate_id.as_ref().map(CandidateId::as_str),
+        ":policy_revision_id": flattened.as_ref().map(|routing| routing.policy_revision_id),
+        ":presentation_id": flattened.as_ref().and_then(|routing| routing.presentation_id).map(PresentationId::as_str),
+        ":rewrite_id": flattened.as_ref().and_then(|routing| routing.rewrite_id).map(RewriteId::as_str),
+        ":policy_route_id": flattened.as_ref().map(|routing| routing.policy_route_id.as_str()),
+        ":route_fingerprint": flattened.as_ref().map(|routing| routing.route_fingerprint.to_string()),
+        ":candidate_id": flattened.as_ref().and_then(|routing| routing.candidate_id).map(CandidateId::as_str),
         ":binding_id": row.binding_id.as_ref().map(BindingId::as_str),
-        ":baseline_model": row.baseline_model,
-        ":attempt_group_id": row.attempt_group_id.as_ref().map(AttemptGroupId::as_str),
-        ":attempt_index": row.attempt_index,
-        ":fallback_reason": row.fallback_reason.as_ref().map(StableId::as_str),
+        ":baseline_model": flattened.as_ref().and_then(|routing| routing.baseline_model),
+        ":attempt_group_id": flattened.as_ref().map(|routing| routing.attempt_group_id.as_str()),
+        ":attempt_index": flattened.as_ref().and_then(|routing| routing.attempt_index),
+        ":fallback_reason": flattened.as_ref().and_then(|routing| routing.reason).map(AttemptReason::as_str),
         ":routing_trace": routing_trace,
         ":parent_session_id": row.lineage.as_ref().map(|value| value.parent_session_id.as_str()),
         ":child_role": row.lineage.as_ref().map(|value| value.child_role.as_str()),
@@ -1711,15 +1893,18 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
 /// `None` — a corrupted enum value must never reclassify a row as an API
 /// measurement (invariant 3).
 fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
+    let kind = parse_stored(
+        "kind",
+        row.get::<_, Option<String>>("kind")?,
+        RowKind::parse,
+    )?;
+    let binding_id = parse_optional_id("requests.binding_id", row.get("binding_id")?)?;
+    let policy_routing = read_policy_routing(row, kind, binding_id.as_ref())?;
     Ok(RequestRow {
         id: row.get("id")?,
         ts_ms: row.get("ts_ms")?,
         duration_ms: row.get("duration_ms")?,
-        kind: parse_stored(
-            "kind",
-            row.get::<_, Option<String>>("kind")?,
-            RowKind::parse,
-        )?,
+        kind,
         frontend: row.get("frontend")?,
         provider: row.get("provider")?,
         route: row.get("route")?,
@@ -1779,50 +1964,161 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         betas: row.get("betas")?,
         geo: row.get("geo")?,
         fast: row.get("fast")?,
-        policy_revision_id: row.get("policy_revision_id")?,
-        presentation_id: parse_optional_id(
-            "requests.presentation_id",
-            row.get("presentation_id")?,
-        )?,
-        rewrite_id: parse_optional_id("requests.rewrite_id", row.get("rewrite_id")?)?,
-        policy_route_id: parse_optional_id(
-            "requests.policy_route_id",
-            row.get("policy_route_id")?,
-        )?,
-        route_fingerprint: parse_optional_id(
-            "requests.route_fingerprint",
-            row.get("route_fingerprint")?,
-        )?,
-        candidate_id: parse_optional_id("requests.candidate_id", row.get("candidate_id")?)?,
-        binding_id: parse_optional_id("requests.binding_id", row.get("binding_id")?)?,
-        baseline_model: row.get("baseline_model")?,
-        attempt_group_id: parse_optional_id(
-            "requests.attempt_group_id",
-            row.get("attempt_group_id")?,
-        )?,
-        attempt_index: {
-            let value: Option<i64> = row.get("attempt_index")?;
-            if value.is_some_and(|value| value < 0) {
-                return Err(Error::InvalidRoutingState(
-                    "negative stored attempt index".into(),
-                ));
-            }
-            value
-        },
-        fallback_reason: parse_optional_id(
-            "requests.fallback_reason",
-            row.get("fallback_reason")?,
-        )?,
-        routing_trace: match row.get::<_, Option<String>>("routing_trace")? {
-            Some(json) => {
-                let trace: StoredRoutingTrace = serde_json::from_str(&json)?;
-                trace.validate()?;
-                Some(trace)
-            }
-            None => None,
-        },
+        binding_id,
+        policy_routing,
         lineage: read_lineage(row)?,
     })
+}
+
+fn read_policy_routing(
+    row: &rusqlite::Row<'_>,
+    kind: Option<RowKind>,
+    binding_id: Option<&BindingId>,
+) -> Result<Option<PolicyRouteProvenance>> {
+    let revision: Option<i64> = row.get("policy_revision_id")?;
+    let presentation: Option<PresentationId> =
+        parse_optional_id("requests.presentation_id", row.get("presentation_id")?)?;
+    let rewrite: Option<RewriteId> =
+        parse_optional_id("requests.rewrite_id", row.get("rewrite_id")?)?;
+    let route: Option<RouteId> =
+        parse_optional_id("requests.policy_route_id", row.get("policy_route_id")?)?;
+    let fingerprint: Option<RouteFingerprint> =
+        parse_optional_id("requests.route_fingerprint", row.get("route_fingerprint")?)?;
+    let candidate: Option<CandidateId> =
+        parse_optional_id("requests.candidate_id", row.get("candidate_id")?)?;
+    let baseline: Option<String> = row.get("baseline_model")?;
+    let group: Option<AttemptGroupId> =
+        parse_optional_id("requests.attempt_group_id", row.get("attempt_group_id")?)?;
+    let index: Option<i64> = row.get("attempt_index")?;
+    let reason = parse_stored(
+        "requests.fallback_reason",
+        row.get("fallback_reason")?,
+        AttemptReason::parse,
+    )?;
+    let trace = match row.get::<_, Option<String>>("routing_trace")? {
+        Some(json) => {
+            let trace: StoredRoutingTrace = serde_json::from_str(&json)?;
+            trace.validate()?;
+            Some(trace)
+        }
+        None => None,
+    };
+    let values_present = [
+        revision.is_some(),
+        presentation.is_some(),
+        rewrite.is_some(),
+        route.is_some(),
+        fingerprint.is_some(),
+        candidate.is_some(),
+        baseline.is_some(),
+        group.is_some(),
+        index.is_some(),
+        reason.is_some(),
+        trace.is_some(),
+    ];
+    if values_present.iter().all(|present| !present) {
+        return Ok(None);
+    }
+    let trace_lookup = trace
+        .as_ref()
+        .and_then(|trace| trace.events.first())
+        .and_then(|event| match event {
+            StoredRoutingTraceEvent::Lookup {
+                source,
+                presentation_id,
+                rewrite_id,
+            } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+            _ => None,
+        });
+    let lookup = match (presentation, rewrite, trace_lookup) {
+        (Some(id), None, Some((StoredLookupSource::ProfilePresentation, Some(trace_id), None)))
+            if id == *trace_id =>
+        {
+            RequestLookupProvenance::ProfilePresentation(id)
+        }
+        (
+            Some(id),
+            None,
+            Some((StoredLookupSource::ProtocolPresentation, Some(trace_id), None)),
+        ) if id == *trace_id => RequestLookupProvenance::ProtocolPresentation(id),
+        (None, Some(id), Some((StoredLookupSource::ProfileRewrite, None, Some(trace_id))))
+            if id == *trace_id =>
+        {
+            RequestLookupProvenance::ProfileRewrite(id)
+        }
+        (None, Some(id), Some((StoredLookupSource::ProtocolRewrite, None, Some(trace_id))))
+            if id == *trace_id =>
+        {
+            RequestLookupProvenance::ProtocolRewrite(id)
+        }
+        (None, None, Some((StoredLookupSource::ProfileDefault, None, None))) => {
+            RequestLookupProvenance::ProfileDefault
+        }
+        (None, None, Some((StoredLookupSource::ProtocolDefault, None, None))) => {
+            RequestLookupProvenance::ProtocolDefault
+        }
+        (None, None, Some((StoredLookupSource::Compaction, None, None))) => {
+            RequestLookupProvenance::Compaction
+        }
+        _ => {
+            return Err(Error::InvalidRoutingState(
+                "stored policy lookup disagrees with its trace".into(),
+            ));
+        }
+    };
+    let (
+        Some(policy_revision_id),
+        Some(route_id),
+        Some(route_fingerprint),
+        Some(attempt_group_id),
+        Some(trace),
+    ) = (revision, route, fingerprint, group, trace)
+    else {
+        return Err(Error::InvalidRoutingState(
+            "stored policy routing provenance is partial".into(),
+        ));
+    };
+    let outcome = if kind == Some(RowKind::RouteUnavailable) {
+        if candidate.is_some()
+            || baseline.is_some()
+            || index.is_some()
+            || reason.is_some()
+            || binding_id.is_some()
+        {
+            return Err(Error::InvalidRoutingState(
+                "stored route-unavailable terminal carries attempt fields".into(),
+            ));
+        }
+        PolicyRoutingOutcome::RouteUnavailable
+    } else {
+        let (Some(candidate_id), Some(baseline_model), Some(attempt_index), Some(reason)) =
+            (candidate, baseline, index, reason)
+        else {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing attempt is partial".into(),
+            ));
+        };
+        if attempt_index < 0 || binding_id.is_none() {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing attempt is invalid".into(),
+            ));
+        }
+        PolicyRoutingOutcome::Attempt {
+            candidate_id,
+            baseline_model,
+            attempt_index,
+            reason,
+        }
+    };
+    Ok(Some(PolicyRouteProvenance {
+        policy_revision_id,
+        lookup,
+        route_id,
+        route_fingerprint,
+        attempt_group_id,
+        trace,
+        outcome,
+    }))
 }
 
 fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>

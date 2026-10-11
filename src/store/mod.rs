@@ -30,11 +30,12 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    AttemptGroupId, ChildRole, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow,
-    LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS,
-    RebuildRow, RelationSource, RequestFilter, RequestRow, RowKind, SessionCostGroup,
-    SessionLineage, SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource,
-    StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+    AttemptGroupId, AttemptReason, ChildRole, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter,
+    LaneSystemRow, LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation,
+    OBSERVATION_BUCKET_MS, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource,
+    RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage,
+    SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource, StoredRoutingTrace,
+    StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
 };
 pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
@@ -687,19 +688,19 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, AttemptGroupId, BindingLearningUpdate, ChildRole, CostKind, DisplayRow,
-        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
-        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
-        PolicyRevisionSource, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationState, RelationSource, RequestRow, RowKind, SessionCostGroup, SessionLineage,
-        Store, StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
-        is_api_measurement,
+        Allowance, AttemptGroupId, AttemptReason, BindingLearningUpdate, ChildRole, CostKind,
+        DisplayRow, DraftCasResult, Error, Lane, LanePin, LanePinCasResult,
+        MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
+        PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
+        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState, RelationSource,
+        RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateEvidence, CandidateId,
-        FrontendProtocol, FrontendScope, PolicyDocument, PresentationId, ProfileId, RewriteId,
+        FrontendProtocol, FrontendScope, PolicyDocument, PresentationId, ProfileId,
         RouteFingerprint, RouteId, RouteProvenance, SkipReason, StableId, TraceEvent,
     };
     use rusqlite::Connection;
@@ -760,27 +761,38 @@ mod tests {
     fn provenanced_row(revision_id: i64) -> RequestRow {
         let mut row = bare_row(1_800_000_000_000);
         row.session_id = Some("guardian:parent-session".to_owned());
-        row.policy_revision_id = Some(revision_id);
-        row.presentation_id = Some(PresentationId::new("presented").unwrap());
-        row.rewrite_id = Some(RewriteId::new("rewrite").unwrap());
-        row.policy_route_id = Some(RouteId::new("route").unwrap());
-        row.route_fingerprint = Some("22".repeat(32).parse().unwrap());
-        row.candidate_id = Some(CandidateId::new("candidate").unwrap());
         row.binding_id = Some(BindingId::new("codex_sub.codex_responses").unwrap());
-        row.baseline_model = Some("baseline".to_owned());
-        row.attempt_group_id =
-            Some(AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap());
-        row.attempt_index = Some(0);
-        row.fallback_reason = Some(StableId::new("initial").unwrap());
-        row.routing_trace = Some(StoredRoutingTrace {
-            version: 1,
-            events: vec![StoredRoutingTraceEvent::Candidate {
+        row.policy_routing = Some(PolicyRouteProvenance {
+            policy_revision_id: revision_id,
+            lookup: RequestLookupProvenance::ProfilePresentation(
+                PresentationId::new("presented").unwrap(),
+            ),
+            route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "22".repeat(32).parse().unwrap(),
+            attempt_group_id: AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap(),
+            trace: StoredRoutingTrace {
+                version: 1,
+                events: vec![
+                    StoredRoutingTraceEvent::Lookup {
+                        source: super::StoredLookupSource::ProfilePresentation,
+                        presentation_id: Some(PresentationId::new("presented").unwrap()),
+                        rewrite_id: None,
+                    },
+                    StoredRoutingTraceEvent::Candidate {
+                        candidate_id: CandidateId::new("candidate").unwrap(),
+                        binding_id: BindingId::new("codex_sub.codex_responses").unwrap(),
+                        model: Some("baseline".to_owned()),
+                        state: StoredCandidateState::Available,
+                        reason: None,
+                    },
+                ],
+            },
+            outcome: PolicyRoutingOutcome::Attempt {
                 candidate_id: CandidateId::new("candidate").unwrap(),
-                binding_id: BindingId::new("codex_sub.codex_responses").unwrap(),
-                model: Some("baseline".to_owned()),
-                state: StoredCandidateState::Available,
-                reason: None,
-            }],
+                baseline_model: "baseline".to_owned(),
+                attempt_index: 0,
+                reason: AttemptReason::Initial,
+            },
         });
         row.lineage = Some(SessionLineage {
             parent_session_id: "parent-session".to_owned(),
@@ -877,18 +889,8 @@ mod tests {
             betas: Some("context-1m-2025-08-07".to_string()),
             geo: Some("NZ".to_string()),
             fast: Some(true),
-            policy_revision_id: None,
-            presentation_id: None,
-            rewrite_id: None,
-            policy_route_id: None,
-            route_fingerprint: None,
-            candidate_id: None,
             binding_id: None,
-            baseline_model: None,
-            attempt_group_id: None,
-            attempt_index: None,
-            fallback_reason: None,
-            routing_trace: None,
+            policy_routing: None,
             lineage: None,
         }
     }
@@ -955,18 +957,8 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
-            policy_revision_id: None,
-            presentation_id: None,
-            rewrite_id: None,
-            policy_route_id: None,
-            route_fingerprint: None,
-            candidate_id: None,
             binding_id: None,
-            baseline_model: None,
-            attempt_group_id: None,
-            attempt_index: None,
-            fallback_reason: None,
-            routing_trace: None,
+            policy_routing: None,
             lineage: None,
         }
     }
@@ -1099,11 +1091,23 @@ mod tests {
             let mut row = bare_row(1_000 + i as i64);
             row.kind = Some(*kind);
             if *kind == RowKind::RouteUnavailable {
-                row.attempt_group_id =
-                    Some(AttemptGroupId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
-                row.routing_trace = Some(StoredRoutingTrace {
-                    version: 1,
-                    events: vec![],
+                let revision_id = revision(&store, "terminal-kind", None);
+                row.policy_routing = Some(PolicyRouteProvenance {
+                    policy_revision_id: revision_id,
+                    lookup: RequestLookupProvenance::ProtocolDefault,
+                    route_id: RouteId::new("route").unwrap(),
+                    route_fingerprint: "33".repeat(32).parse().unwrap(),
+                    attempt_group_id: AttemptGroupId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                        .unwrap(),
+                    trace: StoredRoutingTrace {
+                        version: 1,
+                        events: vec![StoredRoutingTraceEvent::Lookup {
+                            source: super::StoredLookupSource::ProtocolDefault,
+                            presentation_id: None,
+                            rewrite_id: None,
+                        }],
+                    },
+                    outcome: PolicyRoutingOutcome::RouteUnavailable,
                 });
             }
             store.record_request(&row).expect("record");
@@ -3192,9 +3196,7 @@ mod tests {
         assert_eq!(lane.pin_generation, 0);
         assert_eq!(lane.pin, None);
         let row = store.requests_since(0, 10).unwrap().pop().unwrap();
-        assert_eq!(row.policy_revision_id, None);
-        assert_eq!(row.attempt_group_id, None);
-        assert_eq!(row.routing_trace, None);
+        assert_eq!(row.policy_routing, None);
         assert_eq!(row.lineage, None);
     }
 
@@ -3237,10 +3239,26 @@ mod tests {
             "events": []
         }))
         .unwrap();
+        let store = mem_store();
+        let revision_id = revision(&store, "malformed-trace", None);
         let mut row = bare_row(1);
-        row.routing_trace = Some(malformed);
+        row.binding_id = Some(BindingId::new("openrouter.openrouter_messages").unwrap());
+        row.policy_routing = Some(PolicyRouteProvenance {
+            policy_revision_id: revision_id,
+            lookup: RequestLookupProvenance::ProtocolDefault,
+            route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "44".repeat(32).parse().unwrap(),
+            attempt_group_id: AttemptGroupId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+            trace: malformed,
+            outcome: PolicyRoutingOutcome::Attempt {
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                baseline_model: "model".to_owned(),
+                attempt_index: 0,
+                reason: AttemptReason::Initial,
+            },
+        });
         assert!(matches!(
-            mem_store().record_request(&row),
+            store.record_request(&row),
             Err(Error::InvalidRoutingState(_))
         ));
     }
@@ -3261,8 +3279,7 @@ mod tests {
         let store = mem_store();
         let revision_id = revision(&store, "lineage", None);
         let mut child = provenanced_row(revision_id);
-        child.attempt_group_id = None;
-        child.attempt_index = None;
+        child.policy_routing = None;
         store.record_request(&child).unwrap();
 
         let mut parent = bare_row(child.ts_ms + 1);
@@ -3292,53 +3309,84 @@ mod tests {
 
     #[test]
     fn request_attempt_provenance_round_trips_and_sequence_is_enforced() {
+        fn routing(revision_id: i64, group: AttemptGroupId, index: i64) -> PolicyRouteProvenance {
+            PolicyRouteProvenance {
+                policy_revision_id: revision_id,
+                lookup: RequestLookupProvenance::ProtocolDefault,
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "55".repeat(32).parse().unwrap(),
+                attempt_group_id: group,
+                trace: StoredRoutingTrace {
+                    version: 1,
+                    events: vec![StoredRoutingTraceEvent::Lookup {
+                        source: super::StoredLookupSource::ProtocolDefault,
+                        presentation_id: None,
+                        rewrite_id: None,
+                    }],
+                },
+                outcome: PolicyRoutingOutcome::Attempt {
+                    candidate_id: CandidateId::new("candidate").unwrap(),
+                    baseline_model: "model".to_owned(),
+                    attempt_index: index,
+                    reason: AttemptReason::Initial,
+                },
+            }
+        }
+
         let store = mem_store();
         let revision_id = revision(&store, "request", None);
         let group = AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap();
         let mut first = bare_row(1);
-        first.policy_revision_id = Some(revision_id);
-        first.attempt_group_id = Some(group.clone());
-        first.attempt_index = Some(0);
+        first.binding_id = Some(BindingId::new("openrouter.openrouter_messages").unwrap());
+        first.policy_routing = Some(routing(revision_id, group.clone(), 0));
         store.record_request(&first).unwrap();
         let mut second = first.clone();
         second.ts_ms = 2;
-        second.attempt_index = Some(1);
+        second.policy_routing = Some(routing(revision_id, group.clone(), 1));
         store.record_request(&second).unwrap();
         let rows = store.requests_since(0, 10).unwrap();
-        assert_eq!(rows[0].attempt_group_id.as_ref(), Some(&group));
-        assert_eq!(rows[0].attempt_index, Some(0));
-        assert_eq!(rows[0].policy_revision_id, Some(revision_id));
-        assert_eq!(rows[1].attempt_index, Some(1));
+        assert_eq!(rows[0].policy_routing, first.policy_routing);
+        assert_eq!(rows[1].policy_routing, second.policy_routing);
 
         let mut gap = first.clone();
         gap.ts_ms = 3;
-        gap.attempt_index = Some(3);
+        gap.policy_routing = Some(routing(revision_id, group, 3));
         assert!(matches!(store.record_request(&gap), Err(Error::Sqlite(_))));
 
         let terminal_group = AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
         let mut terminal = bare_row(4);
         terminal.kind = Some(RowKind::RouteUnavailable);
-        terminal.attempt_group_id = Some(terminal_group);
-        terminal.routing_trace = Some(StoredRoutingTrace {
-            version: 1,
-            events: vec![],
+        terminal.policy_routing = Some(PolicyRouteProvenance {
+            policy_revision_id: revision_id,
+            lookup: RequestLookupProvenance::ProtocolDefault,
+            route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "66".repeat(32).parse().unwrap(),
+            attempt_group_id: terminal_group,
+            trace: StoredRoutingTrace {
+                version: 1,
+                events: vec![StoredRoutingTraceEvent::Lookup {
+                    source: super::StoredLookupSource::ProtocolDefault,
+                    presentation_id: None,
+                    rewrite_id: None,
+                }],
+            },
+            outcome: PolicyRoutingOutcome::RouteUnavailable,
         });
         store.record_request(&terminal).unwrap();
         let mut wrong_kind = terminal.clone();
         wrong_kind.ts_ms = 5;
         wrong_kind.kind = Some(RowKind::Error);
-        wrong_kind.attempt_group_id =
-            Some(AttemptGroupId::new("11111111111111111111111111111111").unwrap());
         assert!(matches!(
             store.record_request(&wrong_kind),
-            Err(Error::Sqlite(_))
+            Err(Error::InvalidRoutingState(_))
         ));
-        let mut missing_group = terminal;
-        missing_group.ts_ms = 6;
-        missing_group.attempt_group_id = None;
+        let mut selected_binding = terminal;
+        selected_binding.ts_ms = 6;
+        selected_binding.binding_id =
+            Some(BindingId::new("openrouter.openrouter_messages").unwrap());
         assert!(matches!(
-            store.record_request(&missing_group),
-            Err(Error::Sqlite(_))
+            store.record_request(&selected_binding),
+            Err(Error::InvalidRoutingState(_))
         ));
     }
     #[test]
@@ -3682,8 +3730,16 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO requests (ts_ms, policy_revision_id) VALUES (8,2)",
-                [],
+                "INSERT INTO requests
+                 (ts_ms, policy_revision_id, policy_route_id, route_fingerprint,
+                  candidate_id, binding_id, baseline_model, attempt_group_id,
+                  attempt_index, fallback_reason, routing_trace)
+                 VALUES (8,2,'route',?1,'candidate','openrouter.openrouter_messages',
+                         'base','abcdefabcdefabcdefabcdefabcdefab',0,'initial',?2)",
+                rusqlite::params![
+                    "22".repeat(32),
+                    r#"{"version":1,"events":[{"kind":"lookup","source":"protocol_default","presentation_id":null,"rewrite_id":null}]}"#,
+                ],
             )
             .unwrap();
         }
@@ -3720,7 +3776,10 @@ mod tests {
             1
         );
         assert_eq!(
-            store.requests_since(0, 10).unwrap()[0].policy_revision_id,
+            store.requests_since(0, 10).unwrap()[0]
+                .policy_routing
+                .as_ref()
+                .map(|routing| routing.policy_revision_id),
             Some(2)
         );
         let reactivated = store

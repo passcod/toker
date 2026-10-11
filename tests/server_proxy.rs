@@ -606,17 +606,7 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
         row.binding_id.as_ref().map(|binding| binding.as_str()),
         Some("openai_api.openai_chat_completions")
     );
-    assert_eq!(row.policy_revision_id, None);
-    assert_eq!(row.presentation_id, None);
-    assert_eq!(row.rewrite_id, None);
-    assert_eq!(row.policy_route_id, None);
-    assert_eq!(row.route_fingerprint, None);
-    assert_eq!(row.candidate_id, None);
-    assert_eq!(row.baseline_model, None);
-    assert_eq!(row.attempt_group_id, None);
-    assert_eq!(row.attempt_index, None);
-    assert_eq!(row.fallback_reason, None);
-    assert_eq!(row.routing_trace, None);
+    assert_eq!(row.policy_routing, None);
     assert_eq!(
         row.requested_model.as_deref(),
         Some("openai_api/gpt-6.1-sol")

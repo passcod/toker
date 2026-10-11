@@ -115,11 +115,12 @@ mod tests {
     use super::{is_broken_pipe, kind_arg, parse_instant, write_jsonl};
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, PolicyDocument,
-        PresentationId, RewriteId, RouteFingerprint, RouteId, StableId,
+        PresentationId, RewriteId, RouteFingerprint, RouteId,
     };
     use crate::store::{
-        AttemptGroupId, ChildRole, CostKind, KindFilter, NewPolicyRevision, PolicyRevisionSource,
-        RelationSource, RequestFilter, RequestRow, RowKind, SessionLineage, Store,
+        AttemptGroupId, AttemptReason, ChildRole, CostKind, KindFilter, NewPolicyRevision,
+        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RelationSource,
+        RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store,
         StoredRoutingTrace, StoredRoutingTraceEvent,
     };
     use serde_json::{Value, json};
@@ -218,18 +219,8 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
-            policy_revision_id: None,
-            presentation_id: None,
-            rewrite_id: None,
-            policy_route_id: None,
-            route_fingerprint: None,
-            candidate_id: None,
             binding_id: None,
-            baseline_model: None,
-            attempt_group_id: None,
-            attempt_index: None,
-            fallback_reason: None,
-            routing_trace: None,
+            policy_routing: None,
             lineage: None,
         }
     }
@@ -296,25 +287,35 @@ mod tests {
             betas: Some(r#"["claude-code-20250219"]"#.to_owned()),
             geo: Some("us".to_owned()),
             fast: Some(false),
-            policy_revision_id: Some(1),
-            presentation_id: Some(PresentationId::new("presented").unwrap()),
-            rewrite_id: Some(RewriteId::new("rewrite").unwrap()),
-            policy_route_id: Some(RouteId::new("route").unwrap()),
-            route_fingerprint: Some("11".repeat(32).parse::<RouteFingerprint>().unwrap()),
-            candidate_id: Some(CandidateId::new("candidate").unwrap()),
             binding_id: Some(BindingId::new("openrouter.openrouter_messages").unwrap()),
-            baseline_model: Some("claude-opus-5".to_owned()),
-            attempt_group_id: Some(
-                AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
-            ),
-            attempt_index: Some(0),
-            fallback_reason: Some(StableId::new("initial").unwrap()),
-            routing_trace: Some(StoredRoutingTrace {
-                version: 1,
-                events: vec![StoredRoutingTraceEvent::Upgrade {
-                    from: "claude-opus-4".to_owned(),
-                    to: "claude-opus-5".to_owned(),
-                }],
+            policy_routing: Some(PolicyRouteProvenance {
+                policy_revision_id: 1,
+                lookup: RequestLookupProvenance::ProfilePresentation(
+                    PresentationId::new("presented").unwrap(),
+                ),
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
+                attempt_group_id: AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
+                trace: StoredRoutingTrace {
+                    version: 1,
+                    events: vec![
+                        StoredRoutingTraceEvent::Lookup {
+                            source: crate::store::StoredLookupSource::ProfilePresentation,
+                            presentation_id: Some(PresentationId::new("presented").unwrap()),
+                            rewrite_id: None,
+                        },
+                        StoredRoutingTraceEvent::Upgrade {
+                            from: "claude-opus-4".to_owned(),
+                            to: "claude-opus-5".to_owned(),
+                        },
+                    ],
+                },
+                outcome: PolicyRoutingOutcome::Attempt {
+                    candidate_id: CandidateId::new("candidate").unwrap(),
+                    baseline_model: "claude-opus-5".to_owned(),
+                    attempt_index: 0,
+                    reason: AttemptReason::Initial,
+                },
             }),
             lineage: Some(SessionLineage {
                 parent_session_id: "parent-session".to_owned(),
@@ -369,14 +370,25 @@ mod tests {
         let dir = crate::test_support::tempdir("toker-export-cols-");
         let path = dir.join("toker.db");
         let store = store_with_revision(&path);
-        store.record_request(&full(T0)).expect("full");
-        let row = lines(&export(&store, &RequestFilter::default())).remove(0);
-        let keys: Vec<&str> = row
-            .as_object()
-            .expect("object")
-            .keys()
-            .map(String::as_str)
-            .collect();
+        store.record_request(&full(T0)).expect("presentation row");
+        let mut rewrite = full(T0 + 1);
+        let Some(routing) = rewrite.policy_routing.as_mut() else {
+            panic!("fixture provenance")
+        };
+        routing.lookup =
+            RequestLookupProvenance::ProfileRewrite(RewriteId::new("rewrite").unwrap());
+        routing.attempt_group_id = AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
+        routing.trace.events[0] = StoredRoutingTraceEvent::Lookup {
+            source: crate::store::StoredLookupSource::ProfileRewrite,
+            presentation_id: None,
+            rewrite_id: Some(RewriteId::new("rewrite").unwrap()),
+        };
+        store.record_request(&rewrite).expect("rewrite row");
+        let rows = lines(&export(&store, &RequestFilter::default()));
+        let mut keys = std::collections::BTreeSet::new();
+        for row in &rows {
+            keys.extend(row.as_object().expect("object").keys().map(String::as_str));
+        }
         let conn = rusqlite::Connection::open(&path).expect("second connection");
         let mut stmt = conn
             .prepare("SELECT name FROM pragma_table_info('requests')")
@@ -388,9 +400,9 @@ mod tests {
             .expect("columns");
         // `kind` is the one column a measurement leaves NULL: its
         // absence is what makes the row a measurement.
-        let mut expected = vec!["ts"];
+        let mut expected = std::collections::BTreeSet::from(["ts"]);
         expected.extend(columns.iter().map(String::as_str).filter(|c| *c != "kind"));
-        assert_eq!(keys, expected, "ts, then every column of requests in order");
+        assert_eq!(keys, expected, "the fixtures cover every requests column");
         for column in crate::store::JSON_TEXT_COLUMNS {
             assert!(
                 columns.iter().any(|c| c == column),
