@@ -392,6 +392,34 @@ pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint,
     )))
 }
 
+/// Fingerprint a compiler-generated one-candidate presentation route.
+///
+/// The binding, model, and stable generated identities close the complete
+/// semantics; presentation display metadata is deliberately absent.
+pub(crate) fn generated_route_fingerprint(
+    route_id: &RouteId,
+    candidate_id: &CandidateId,
+    binding_id: &super::BindingId,
+    model_id: &str,
+) -> Result<RouteFingerprint, CanonicalError> {
+    #[derive(Serialize)]
+    struct Generated<'a> {
+        route_id: &'a RouteId,
+        candidate_id: &'a CandidateId,
+        binding_id: &'a super::BindingId,
+        model_id: &'a str,
+    }
+    Ok(RouteFingerprint(hash(
+        ROUTE_FINGERPRINT_DOMAIN,
+        &canonical_bytes(&Generated {
+            route_id,
+            candidate_id,
+            binding_id,
+            model_id,
+        })?,
+    )))
+}
+
 fn hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(domain);

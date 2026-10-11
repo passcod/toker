@@ -248,7 +248,13 @@ pub enum ResolveFailure {
 
 struct SelectedRoute<'a> {
     route: Option<&'a CompiledRoute>,
-    exact: Option<(&'a BindingId, &'a str)>,
+    exact: Option<(
+        &'a BindingId,
+        &'a str,
+        &'a RouteId,
+        &'a RouteFingerprint,
+        &'a CandidateId,
+    )>,
     parameters: BTreeMap<StableId, String>,
     provenance: RouteProvenance,
     lane_transition: Option<LaneTransitionPolicy>,
@@ -280,7 +286,7 @@ pub fn resolve<L: LearningView>(
     }
 
     let mut trace = vec![TraceEvent::Lookup(selected.provenance.clone())];
-    if let Some((binding_id, model)) = selected.exact {
+    if let Some((binding_id, model, route_id, fingerprint, candidate_id)) = selected.exact {
         let live = availability.get(binding_id);
         let evidence = exact_evidence(binding_id, model, live, inventory, facts);
         trace.push(TraceEvent::Candidate(evidence.clone()));
@@ -291,10 +297,10 @@ pub fn resolve<L: LearningView>(
         return Ok(AttemptPlan {
             policy_fingerprint: policy.fingerprint().clone(),
             policy_revision: None,
-            route_id: None,
-            route_fingerprint: None,
+            route_id: Some(route_id.clone()),
+            route_fingerprint: Some(fingerprint.clone()),
             provenance: selected.provenance,
-            candidate_id: None,
+            candidate_id: Some(candidate_id.clone()),
             binding_id: binding_id.clone(),
             provider,
             requested_model: facts.requested_model.clone(),
@@ -525,11 +531,20 @@ fn from_presentation<'a>(
             from_reference(policy, reference, facts, None, provenance)
         }
         PresentationRoute::Exact {
+            route_id,
+            fingerprint,
+            candidate_id,
             binding_id,
             model_id,
         } => Ok(SelectedRoute {
             route: None,
-            exact: Some((binding_id, model_id)),
+            exact: Some((
+                binding_id,
+                model_id,
+                route_id,
+                fingerprint,
+                candidate_id,
+            )),
             parameters: BTreeMap::new(),
             provenance,
             lane_transition: None,

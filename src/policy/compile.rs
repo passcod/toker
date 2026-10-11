@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use sha2::{Digest, Sha256};
+
 use crate::catalog::offers::OfferInventory;
 use crate::routing::{BackendBinding, Capabilities, ProtocolId, RouteRegistry};
 
@@ -21,6 +23,7 @@ use super::{
     StableId, Template, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec,
     policy_fingerprint, route_fingerprint,
 };
+use super::canonical::generated_route_fingerprint;
 
 /// Whether compilation is allowed to consume revision-one legacy learning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -234,6 +237,11 @@ impl CompiledSelector {
 #[derive(Debug)]
 pub struct CompiledPresentation {
     id: PresentationId,
+    slug: String,
+    label: Option<String>,
+    description: Option<String>,
+    enabled: bool,
+    shadow_native: bool,
     route: PresentationRoute,
     metadata: Option<AdapterMetadata>,
 }
@@ -241,6 +249,21 @@ pub struct CompiledPresentation {
 impl CompiledPresentation {
     pub fn id(&self) -> &PresentationId {
         &self.id
+    }
+    pub fn slug(&self) -> &str {
+        &self.slug
+    }
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+    pub fn shadow_native(&self) -> bool {
+        self.shadow_native
     }
     pub fn route(&self) -> &PresentationRoute {
         &self.route
@@ -254,6 +277,9 @@ impl CompiledPresentation {
 pub enum PresentationRoute {
     Reference(CompiledRouteReference),
     Exact {
+        route_id: RouteId,
+        fingerprint: RouteFingerprint,
+        candidate_id: CandidateId,
         binding_id: BindingId,
         model_id: String,
     },
@@ -984,21 +1010,27 @@ impl<'a> Compiler<'a> {
                             item.id.as_stable_id(),
                         );
                     }
-                    self.insert_presentation(
-                        &mut out,
-                        scope,
-                        item.slug.clone(),
-                        CompiledPresentation {
-                            id: item.id.clone(),
-                            route: PresentationRoute::Exact {
-                                binding_id: binding_id.clone(),
-                                model_id: model_id.clone(),
-                            },
-                            metadata: item.metadata.clone(),
-                        },
+                    let slug = item.slug.clone();
+                    if !self.validate_shadow_native(item, &slug, &base) {
+                        continue;
+                    }
+                    if let Some(presentation) = self.exact_presentation(
+                        item,
+                        slug.clone(),
+                        item.label.clone(),
+                        binding_id.clone(),
+                        model_id.clone(),
                         &base,
-                        item.id.as_stable_id(),
-                    );
+                    ) {
+                        self.insert_presentation(
+                            &mut out,
+                            scope,
+                            slug,
+                            presentation,
+                            &base,
+                            item.id.as_stable_id(),
+                        );
+                    }
                 }
                 PresentationSource::Virtual { target } => {
                     let Some(target) = self.route_reference(
@@ -1016,12 +1048,20 @@ impl<'a> Compiler<'a> {
                         compiled_routes,
                         base.clone().field(f("source")),
                     );
+                    if !self.validate_shadow_native(item, &item.slug, &base) {
+                        continue;
+                    }
                     self.insert_presentation(
                         &mut out,
                         scope,
                         item.slug.clone(),
                         CompiledPresentation {
                             id: item.id.clone(),
+                            slug: item.slug.clone(),
+                            label: item.label.clone(),
+                            description: item.description.clone(),
+                            enabled: item.enabled,
+                            shadow_native: item.shadow_native,
                             route: PresentationRoute::Reference(target),
                             metadata: item.metadata.clone(),
                         },
@@ -1029,7 +1069,10 @@ impl<'a> Compiler<'a> {
                         item.id.as_stable_id(),
                     );
                 }
-                PresentationSource::OfferSelector { selector, .. } => {
+                PresentationSource::OfferSelector {
+                    selector,
+                    label_template,
+                } => {
                     let selector_path = base.clone().field(f("source")).field(f("selector"));
                     let Some(compiled) = self.selector(
                         &selector.include,
@@ -1145,26 +1188,126 @@ impl<'a> Compiler<'a> {
                             );
                             break;
                         };
-                        self.insert_presentation(
-                            &mut out,
-                            scope.clone(),
-                            slug,
-                            CompiledPresentation {
-                                id: item.id.clone(),
-                                route: PresentationRoute::Exact {
-                                    binding_id: offer.binding_id.clone(),
-                                    model_id: offer.backend_model_id.clone(),
-                                },
-                                metadata: item.metadata.clone(),
-                            },
+                        if !self.validate_shadow_native(item, &slug, &base) {
+                            continue;
+                        }
+                        let label = if let Some(source) = label_template {
+                            let Some(template) = self.template(
+                                source,
+                                &template_parameters,
+                                &captures,
+                                base.clone().field(f("source")).field(f("label_template")),
+                                item.id.as_stable_id(),
+                            ) else {
+                                break;
+                            };
+                            let Some(label) = template.render(&values, &empty_captures).ok() else {
+                                self.error(
+                                    "invalid-template",
+                                    base.clone()
+                                        .field(f("source"))
+                                        .field(f("label_template")),
+                                    item.id.as_stable_id(),
+                                );
+                                break;
+                            };
+                            Some(label)
+                        } else {
+                            item.label.clone()
+                        };
+                        if let Some(presentation) = self.exact_presentation(
+                            item,
+                            slug.clone(),
+                            label,
+                            offer.binding_id.clone(),
+                            offer.backend_model_id.clone(),
                             &base,
-                            item.id.as_stable_id(),
-                        );
+                        ) {
+                            self.insert_presentation(
+                                &mut out,
+                                scope.clone(),
+                                slug,
+                                presentation,
+                                &base,
+                                item.id.as_stable_id(),
+                            );
+                        }
                     }
                 }
             }
         }
         out
+    }
+
+    fn validate_shadow_native(
+        &mut self,
+        item: &super::Presentation,
+        slug: &str,
+        path: &DiagnosticPath,
+    ) -> bool {
+        let collision = self.inventory.iter().any(|offer| {
+            self.route_exists(protocol(&item.scope), &offer.binding)
+                && (offer.backend_model_id == slug
+                    || format!("{}/{}", offer.provider, offer.backend_model_id) == slug)
+        });
+        if collision && !item.shadow_native {
+            self.error(
+                "native-presentation-shadow-consent-required",
+                path.clone().field(f("shadow_native")),
+                item.id.as_stable_id(),
+            );
+            false
+        } else {
+            true
+        }
+    }
+
+    fn exact_presentation(
+        &mut self,
+        item: &super::Presentation,
+        slug: String,
+        label: Option<String>,
+        binding_id: BindingId,
+        model_id: String,
+        path: &DiagnosticPath,
+    ) -> Option<CompiledPresentation> {
+        let suffix = generated_id_suffix(&item.id, &binding_id, &model_id);
+        let route_id = RouteId::new(format!("presentation-{suffix}"))
+            .expect("hash-derived generated route id");
+        let candidate_id = CandidateId::new(format!("candidate-{suffix}"))
+            .expect("hash-derived generated candidate id");
+        let fingerprint = match generated_route_fingerprint(
+            &route_id,
+            &candidate_id,
+            &binding_id,
+            &model_id,
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                self.error(
+                    "route-semantics-invalid",
+                    path.clone().field(f("source")),
+                    item.id.as_stable_id(),
+                );
+                return None;
+            }
+        };
+        Some(CompiledPresentation {
+            id: item.id.clone(),
+            slug,
+            label,
+            description: item.description.clone(),
+            enabled: item.enabled,
+            shadow_native: item.shadow_native,
+            route: PresentationRoute::Exact {
+                route_id,
+                fingerprint,
+                candidate_id,
+                binding_id,
+                model_id,
+            },
+            metadata: item.metadata.clone(),
+        })
     }
 
     fn insert_presentation(
@@ -1506,6 +1649,27 @@ impl<'a> Compiler<'a> {
         self.diagnostics
             .push(diagnostic(code, Severity::Info, path, Some(record)));
     }
+}
+
+fn generated_id_suffix(
+    presentation_id: &PresentationId,
+    binding_id: &BindingId,
+    model_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"toker.presentation-route.v1\0");
+    digest.update(presentation_id.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(binding_id.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(model_id.as_bytes());
+    let digest = digest.finalize();
+    let mut suffix = String::with_capacity(24);
+    for byte in &digest[..12] {
+        use std::fmt::Write as _;
+        write!(suffix, "{byte:02x}").expect("writing to string");
+    }
+    suffix
 }
 
 fn classify_version(classifier: &FamilyClassifier, model: &str) -> Option<ParsedVersion> {

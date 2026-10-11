@@ -418,7 +418,8 @@ fn picker_presentation(
         label: None,
         description: None,
         enabled: true,
-        shadow_native: false,
+        // Legacy picker rows intentionally publish the native routed slug.
+        shadow_native: true,
         source: PresentationSource::OfferSelector {
             selector: OfferSelector {
                 binding_id: binding.id().clone(),
