@@ -122,6 +122,8 @@ pub struct PolicyShadow<L> {
 enum ShadowJob {
     Resolve {
         snapshot: Arc<PolicySnapshot>,
+        pinned_revision: Option<i64>,
+        evidence: super::runtime::PolicyEvidence,
         facts: RequestFacts,
         lane: Option<LaneFacts>,
         legacy: LegacyOutcome,
@@ -172,9 +174,10 @@ where
         observer: Arc<dyn ShadowObserver>,
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
+        let worker_runtime = policy_runtime.clone();
         let worker = thread::Builder::new()
             .name("toker-policy-shadow".to_owned())
-            .spawn(move || worker_loop(receiver, learning, observer))
+            .spawn(move || worker_loop(receiver, worker_runtime, learning, observer))
             .expect("policy shadow worker thread");
         Self {
             policy_runtime,
@@ -212,8 +215,14 @@ where
         let Some(snapshot) = self.policy_runtime.capture() else {
             return;
         };
+        let pinned_revision = lane
+            .as_ref()
+            .and_then(|lane| lane.pinned.as_ref())
+            .and_then(|pin| pin.policy_revision_id);
         self.enqueue(ShadowJob::Resolve {
             snapshot,
+            pinned_revision,
+            evidence: self.policy_runtime.capture_evidence(),
             facts,
             lane,
             legacy,
@@ -260,6 +269,7 @@ where
 
 fn worker_loop<L: LearningView>(
     receiver: mpsc::Receiver<ShadowJob>,
+    policy_runtime: Arc<PolicyRuntime>,
     learning: Arc<L>,
     observer: Arc<dyn ShadowObserver>,
 ) {
@@ -268,10 +278,31 @@ fn worker_loop<L: LearningView>(
             ShadowJob::Record(record) => record,
             ShadowJob::Resolve {
                 snapshot,
+                pinned_revision,
+                evidence,
                 facts,
-                lane,
+                mut lane,
                 legacy,
             } => {
+                let snapshot = match pinned_revision {
+                    Some(revision_id) => match policy_runtime
+                        .capture_revision_with_evidence(revision_id, &evidence)
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => {
+                            return ShadowRecord {
+                                comparison: ShadowComparison::InternalError,
+                                code: "policy-shadow-revision-unavailable",
+                                legacy: Some(legacy),
+                                shadow: None,
+                            };
+                        }
+                    },
+                    None => snapshot,
+                };
+                if let Some(pin) = lane.as_mut().and_then(|lane| lane.pinned.as_mut()) {
+                    pin.policy_fingerprint = Some(snapshot.policy().fingerprint().clone());
+                }
                 let availability = snapshot
                     .availability()
                     .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS);

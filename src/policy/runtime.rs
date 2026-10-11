@@ -29,6 +29,14 @@ pub struct PolicySnapshot {
     credential_generations: Arc<BTreeMap<BindingId, u64>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct PolicyEvidence {
+    inventory: Arc<OfferInventory>,
+    availability: Arc<AvailabilitySnapshot>,
+    inventory_generation: u64,
+    credential_generations: Arc<BTreeMap<BindingId, u64>>,
+}
+
 impl PolicySnapshot {
     pub fn revision_id(&self) -> Option<i64> {
         self.revision_id
@@ -250,6 +258,15 @@ impl PolicyRuntime {
         &self,
         revision_id: i64,
     ) -> Result<Arc<PolicySnapshot>, PolicyRuntimeError> {
+        let evidence = self.capture_evidence();
+        self.capture_revision_with_evidence(revision_id, &evidence)
+    }
+
+    pub(crate) fn capture_revision_with_evidence(
+        &self,
+        revision_id: i64,
+        evidence: &PolicyEvidence,
+    ) -> Result<Arc<PolicySnapshot>, PolicyRuntimeError> {
         let _mutation = self
             .mutation
             .lock()
@@ -266,39 +283,47 @@ impl PolicyRuntime {
                 .store
                 .load_policy_revision(revision_id)?
                 .ok_or(PolicyRuntimeError::MissingRevision(revision_id))?;
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let origin = if revision.source == PolicyRevisionSource::Legacy {
                 PolicyOrigin::GeneratedRevisionOne
             } else {
                 PolicyOrigin::Authored
             };
-            let policy =
-                super::compile(revision.document, &self.topology, &state.inventory, origin)
-                    .into_policy()
-                    .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
+            let policy = super::compile(
+                revision.document,
+                &self.topology,
+                &evidence.inventory,
+                origin,
+            )
+            .into_policy()
+            .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
             let policy = Arc::new(policy);
-            drop(state);
             self.revisions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(revision_id, policy.clone());
             policy
         };
+        Ok(Arc::new(PolicySnapshot {
+            revision_id: Some(revision_id),
+            policy,
+            inventory: evidence.inventory.clone(),
+            availability: evidence.availability.clone(),
+            inventory_generation: evidence.inventory_generation,
+            credential_generations: evidence.credential_generations.clone(),
+        }))
+    }
+
+    pub(crate) fn capture_evidence(&self) -> PolicyEvidence {
         let state = self
             .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(Arc::new(PolicySnapshot {
-            revision_id: Some(revision_id),
-            policy,
+        PolicyEvidence {
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
             inventory_generation: state.inventory_generation,
             credential_generations: state.credential_generations.clone(),
-        }))
+        }
     }
 
     pub fn bump_credential_generation(&self, binding_id: &BindingId) -> u64 {

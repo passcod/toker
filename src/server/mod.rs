@@ -579,7 +579,17 @@ impl Server {
         let lane = lane?;
         Some(LaneFacts {
             temperature: cache_temperature(lane, binding, now),
-            pinned: None,
+            pinned: lane.pin.as_ref().map(|pin| crate::policy::ProvisionalPin {
+                policy_revision_id: Some(pin.policy_revision_id),
+                // The shadow worker fills this after loading the pin's
+                // immutable revision.
+                policy_fingerprint: None,
+                route_fingerprint: pin.route_fingerprint.clone(),
+                candidate_id: pin.candidate_id.clone(),
+                binding_id: pin.binding_id.clone(),
+                baseline_model: pin.baseline_model.clone(),
+                effective_model: pin.effective_model.clone(),
+            }),
             forced_from: lane.forced_from.clone(),
             forced_to: lane.forced_to.clone(),
         })

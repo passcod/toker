@@ -148,7 +148,8 @@ pub struct LaneFacts {
 /// An immutable prospective pin. Slice five never persists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionalPin {
-    pub policy_fingerprint: PolicyFingerprint,
+    pub policy_revision_id: Option<i64>,
+    pub policy_fingerprint: Option<PolicyFingerprint>,
     pub route_fingerprint: RouteFingerprint,
     pub candidate_id: CandidateId,
     pub binding_id: BindingId,
@@ -317,7 +318,7 @@ pub fn resolve<L: LearningView>(
     let route = selected.route.ok_or(ResolveFailure::MissingRoute)?;
     let pinned = lane
         .and_then(|lane| lane.pinned.as_ref())
-        .filter(|pin| pin.policy_fingerprint == *policy.fingerprint())
+        .filter(|pin| pin.policy_fingerprint.as_ref() == Some(policy.fingerprint()))
         .filter(|pin| pin.route_fingerprint == *route.fingerprint());
     let start = pinned
         .and_then(|pin| {
