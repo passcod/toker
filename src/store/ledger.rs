@@ -206,9 +206,35 @@ impl RelationSource {
 /// One validated explicit parent relation. Missing parents remain valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLineage {
-    pub parent_session_id: String,
-    pub child_role: ChildRole,
-    pub relation_source: RelationSource,
+    parent_session_id: String,
+    child_role: ChildRole,
+    relation_source: RelationSource,
+}
+
+impl SessionLineage {
+    pub fn codex_guardian(raw_session_id: &str) -> Option<Self> {
+        let parent_session_id = raw_session_id.strip_prefix("guardian:")?;
+        if parent_session_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            parent_session_id: parent_session_id.to_owned(),
+            child_role: ChildRole::Guardian,
+            relation_source: RelationSource::CodexGuardian,
+        })
+    }
+
+    pub fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+
+    pub const fn child_role(&self) -> ChildRole {
+        self.child_role
+    }
+
+    pub const fn relation_source(&self) -> RelationSource {
+        self.relation_source
+    }
 }
 
 pub const ROUTING_TRACE_VERSION: u8 = 1;
@@ -2159,11 +2185,16 @@ fn read_lineage(row: &rusqlite::Row<'_>) -> Result<Option<SessionLineage>> {
                     "stored lineage has no distinct child".into(),
                 ));
             }
-            Ok(Some(SessionLineage {
-                parent_session_id,
-                child_role,
-                relation_source,
-            }))
+            let lineage = SessionLineage::codex_guardian(&format!("guardian:{parent_session_id}"))
+                .ok_or_else(|| {
+                    Error::InvalidRoutingState("stored lineage has an empty parent".into())
+                })?;
+            if lineage.child_role != child_role || lineage.relation_source != relation_source {
+                return Err(Error::InvalidRoutingState(
+                    "stored lineage evidence is unsupported".into(),
+                ));
+            }
+            Ok(Some(lineage))
         }
         _ => Err(Error::InvalidRoutingState(
             "lineage fields must be all NULL or all present".into(),

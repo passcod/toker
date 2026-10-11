@@ -30,7 +30,7 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    AttemptGroupId, AttemptReason, ChildRole, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter,
+    AttemptGroupId, AttemptReason, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter,
     LaneSystemRow, LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation,
     OBSERVATION_BUCKET_MS, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource,
     RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage,
@@ -688,13 +688,13 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, AttemptGroupId, AttemptReason, BindingLearningUpdate, ChildRole, CostKind,
-        DisplayRow, DraftCasResult, Error, Lane, LanePin, LanePinCasResult,
-        MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
-        PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
-        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState, RelationSource,
-        RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, Store,
-        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
+        Allowance, AttemptGroupId, AttemptReason, BindingLearningUpdate, CostKind, DisplayRow,
+        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
+        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
+        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, PublicationAdapter,
+        PublicationCasResult, PublicationKey, PublicationState, RequestLookupProvenance,
+        RequestRow, RowKind, SessionCostGroup, SessionLineage, Store, StoredCandidateState,
+        StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -794,11 +794,7 @@ mod tests {
                 reason: AttemptReason::Initial,
             },
         });
-        row.lineage = Some(SessionLineage {
-            parent_session_id: "parent-session".to_owned(),
-            child_role: ChildRole::Guardian,
-            relation_source: RelationSource::CodexGuardian,
-        });
+        row.lineage = Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap());
         row
     }
 
@@ -3284,11 +3280,13 @@ mod tests {
 
         let mut parent = bare_row(child.ts_ms + 1);
         parent.session_id = Some("parent-session".to_owned());
-        parent.lineage = Some(SessionLineage {
-            parent_session_id: child.session_id.clone().unwrap(),
-            child_role: ChildRole::Guardian,
-            relation_source: RelationSource::CodexGuardian,
-        });
+        parent.lineage = Some(
+            SessionLineage::codex_guardian(&format!(
+                "guardian:{}",
+                child.session_id.clone().unwrap()
+            ))
+            .unwrap(),
+        );
         assert!(matches!(
             store.record_request(&parent),
             Err(Error::Sqlite(_))
@@ -3296,11 +3294,7 @@ mod tests {
 
         let mut self_parent = bare_row(child.ts_ms + 2);
         self_parent.session_id = Some("same".to_owned());
-        self_parent.lineage = Some(SessionLineage {
-            parent_session_id: "same".to_owned(),
-            child_role: ChildRole::Guardian,
-            relation_source: RelationSource::CodexGuardian,
-        });
+        self_parent.lineage = Some(SessionLineage::codex_guardian("guardian:same").unwrap());
         assert!(matches!(
             store.record_request(&self_parent),
             Err(Error::InvalidRoutingState(_))

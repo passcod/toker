@@ -118,10 +118,10 @@ mod tests {
         PresentationId, RewriteId, RouteFingerprint, RouteId,
     };
     use crate::store::{
-        AttemptGroupId, AttemptReason, ChildRole, CostKind, KindFilter, NewPolicyRevision,
-        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RelationSource,
-        RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store,
-        StoredRoutingTrace, StoredRoutingTraceEvent,
+        AttemptGroupId, AttemptReason, CostKind, KindFilter, NewPolicyRevision,
+        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RequestFilter,
+        RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store, StoredRoutingTrace,
+        StoredRoutingTraceEvent,
     };
     use serde_json::{Value, json};
 
@@ -317,11 +317,7 @@ mod tests {
                     reason: AttemptReason::Initial,
                 },
             }),
-            lineage: Some(SessionLineage {
-                parent_session_id: "parent-session".to_owned(),
-                child_role: ChildRole::Guardian,
-                relation_source: RelationSource::CodexGuardian,
-            }),
+            lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
         }
     }
 

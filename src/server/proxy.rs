@@ -901,6 +901,7 @@ fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> AnthropicRec
         started: ctx.started,
         path: "/v1/chat/completions",
         session_id: ctx.session_id,
+        lineage: None,
         requested_model: ctx.requested_model,
         effective_model: ctx.effective_model,
         backend,

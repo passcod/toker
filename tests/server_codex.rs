@@ -1320,6 +1320,70 @@ async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet
 }
 
 #[tokio::test]
+async fn codex_guardian_lineage_requires_the_exact_profile_header_and_child_identity() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("guardian-lineage", upstream, false)).await;
+    let send = |path: &'static str, header: Option<&'static str>, body_key: &'static str| {
+        let client = client();
+        async move {
+            let mut request = client
+                .post(format!("http://{addr}{path}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(header) = header {
+                request = request.header("x-toker-session", header);
+            }
+            request
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "prompt_cache_key": body_key,
+                    "input": "private prompt",
+                    "stream": false
+                }))
+                .send()
+                .await
+                .expect("toker answers")
+                .bytes()
+                .await
+                .expect("response body");
+        }
+    };
+
+    send(
+        "/f/codex/v1/responses",
+        Some("guardian:parent-session"),
+        "guardian:parent-session",
+    )
+    .await;
+    send(
+        "/v1/responses",
+        Some("guardian:not-codex-profile"),
+        "guardian:not-codex-profile",
+    )
+    .await;
+    send(
+        "/f/codex/v1/responses",
+        Some("guardian:header-parent"),
+        "body-child-wins",
+    )
+    .await;
+    send("/f/codex/v1/responses", Some("guardian:"), "guardian:").await;
+
+    let rows = wait_for_rows(&store, 4).await;
+    let linked = rows
+        .iter()
+        .find(|row| row.session_id.as_deref() == Some("guardian:parent-session"))
+        .unwrap();
+    let lineage = linked.lineage.as_ref().expect("verified lineage");
+    assert_eq!(lineage.parent_session_id(), "parent-session");
+    assert!(
+        rows.iter()
+            .filter(|row| row.session_id.as_deref() != Some("guardian:parent-session"))
+            .all(|row| row.lineage.is_none()),
+        "no other route/body/header shape proves guardian lineage",
+    );
+}
+
+#[tokio::test]
 async fn non_streaming_responses_are_aggregated_from_canonical_turns() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("responses-json", upstream, false)).await;

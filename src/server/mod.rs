@@ -1761,6 +1761,7 @@ api_key = "ak-literal-test"
             started: std::time::Instant::now(),
             path: "/v1/messages",
             session_id: None,
+            lineage: None,
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
             backend: target.provider().clone(),

@@ -54,7 +54,7 @@ use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{CostKind, RequestRow, RowKind};
+use crate::store::{CostKind, RequestRow, RowKind, SessionLineage};
 use crate::translate::TranslationReport;
 
 use super::Server;
@@ -71,6 +71,8 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) path: &'static str,
     /// Session identity, read by header name only (invariant 2).
     pub(crate) session_id: Option<String>,
+    /// Verified frontend-derived lineage; never inferred from backend routing.
+    pub(crate) lineage: Option<SessionLineage>,
     /// The model the frontend asked for, `provider/model` routing included.
     pub(crate) requested_model: Option<String>,
     /// The model that served, after the routing rewrite.
@@ -557,7 +559,7 @@ fn measurement_row(
         fast: capture.speed().map(|speed| speed == "fast"),
         binding_id: Some(ctx.binding_id.clone()),
         policy_routing: None,
-        lineage: None,
+        lineage: ctx.lineage.clone(),
     }
 }
 
@@ -682,7 +684,7 @@ fn error_row(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         policy_routing: None,
-        lineage: None,
+        lineage: ctx.lineage.clone(),
     }
 }
 
@@ -1339,7 +1341,7 @@ pub(crate) fn record_responses_measurement(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         policy_routing: None,
-        lineage: None,
+        lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);
 
@@ -1500,7 +1502,7 @@ pub(crate) fn record_codex_error(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         policy_routing: None,
-        lineage: None,
+        lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);
     tracing::info!(

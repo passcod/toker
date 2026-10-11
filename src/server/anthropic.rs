@@ -431,6 +431,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // Cloned, not moved: the gate decision below still reads the
             // session (allowances lookup, blocked row).
             session_id: session_id.clone(),
+            lineage: None,
             requested_model: model,
             effective_model,
             backend: backend.clone(),

@@ -46,6 +46,7 @@ use crate::server::proxy::{
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_responses_measurement};
+use crate::store::SessionLineage;
 use crate::translate::{self, TranslateError};
 
 /// Everything the branch needs from a translated frontend pipeline,
@@ -143,6 +144,14 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .and_then(Value::as_str)
         .map(str::to_owned);
     let request_session = body_session.clone().or_else(|| header_session.clone());
+    let lineage = (super::frontend_of(&parts.extensions) == Some("codex")
+        && request_session == header_session)
+        .then(|| {
+            header_session
+                .as_deref()
+                .and_then(SessionLineage::codex_guardian)
+        })
+        .flatten();
     let requested_model = canonical
         .as_ref()
         .and_then(|result| result.as_ref().ok())
@@ -208,6 +217,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         started,
         path: "/v1/responses",
         session_id: request_session.clone(),
+        lineage: lineage.clone(),
         requested_model: requested_model.clone(),
         effective_model: effective_model.clone(),
         backend: backend.clone(),
