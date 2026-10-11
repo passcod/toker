@@ -2931,6 +2931,129 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_lane_pin_has_one_winner() {
+        let dir = test_dir("lane-pin-race");
+        let db = dir.join("toker.db");
+        let setup = Store::open(&db).unwrap();
+        let revision_id = revision(&setup, "race", None);
+        let lane = unpinned_lane("session|race");
+        setup.upsert_lane(&lane).unwrap();
+        drop(setup);
+
+        let first = Store::open(&db).unwrap();
+        let second = Store::open(&db).unwrap();
+        let first_snapshot = first.load_lane(&lane.key).unwrap().unwrap();
+        let second_snapshot = second.load_lane(&lane.key).unwrap().unwrap();
+        let pin = LanePin {
+            policy_revision_id: revision_id,
+            policy_route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            baseline_model: "base".to_owned(),
+            effective_model: "effective".to_owned(),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let key = lane.key.clone();
+        let first_pin = pin.clone();
+        let first_thread = std::thread::spawn(move || {
+            first_barrier.wait();
+            first
+                .compare_and_swap_lane_pin(
+                    &key,
+                    first_snapshot.pin_generation,
+                    first_snapshot.pin.as_ref(),
+                    Some(&first_pin),
+                )
+                .unwrap()
+        });
+        let second_barrier = barrier;
+        let key = lane.key.clone();
+        let second_pin = pin.clone();
+        let second_thread = std::thread::spawn(move || {
+            second_barrier.wait();
+            second
+                .compare_and_swap_lane_pin(
+                    &key,
+                    second_snapshot.pin_generation,
+                    second_snapshot.pin.as_ref(),
+                    Some(&second_pin),
+                )
+                .unwrap()
+        });
+        let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, LanePinCasResult::Updated { generation: 1 }))
+                .count(),
+            1,
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == LanePinCasResult::Conflict)
+                .count(),
+            1,
+        );
+        let loaded = Store::open(&db)
+            .unwrap()
+            .load_lane(&lane.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.pin_generation, 1);
+        assert_eq!(loaded.pin, Some(pin));
+    }
+
+    #[test]
+    fn stale_old_revision_completion_cannot_restore_its_pin() {
+        let store = mem_store();
+        let old_revision = revision(&store, "old", None);
+        let new_revision = revision(&store, "new", Some(old_revision));
+        let lane = unpinned_lane("session|activation");
+        store.upsert_lane(&lane).unwrap();
+        let pin = |revision, route: &str, fingerprint: &str| LanePin {
+            policy_revision_id: revision,
+            policy_route_id: RouteId::new(route).unwrap(),
+            route_fingerprint: fingerprint.parse::<RouteFingerprint>().unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            baseline_model: "base".to_owned(),
+            effective_model: "effective".to_owned(),
+        };
+        let old_pin = pin(old_revision, "old-route", &"33".repeat(32));
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 0, None, Some(&old_pin))
+                .unwrap(),
+            LanePinCasResult::Updated { generation: 1 },
+        );
+        let stale = store.load_lane(&lane.key).unwrap().unwrap();
+        let new_pin = pin(new_revision, "new-route", &"44".repeat(32));
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 1, Some(&old_pin), Some(&new_pin))
+                .unwrap(),
+            LanePinCasResult::Updated { generation: 2 },
+        );
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(
+                    &lane.key,
+                    stale.pin_generation,
+                    stale.pin.as_ref(),
+                    Some(&old_pin),
+                )
+                .unwrap(),
+            LanePinCasResult::Conflict,
+        );
+        let loaded = store.load_lane(&lane.key).unwrap().unwrap();
+        assert_eq!(loaded.pin_generation, 2);
+        assert_eq!(loaded.pin, Some(new_pin));
+    }
+
+    #[test]
     fn routing_reads_work_read_only_and_writes_fail_through_sqlite() {
         let dir = test_dir("routing-read-only");
         let db = dir.join("toker.db");
