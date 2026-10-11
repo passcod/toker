@@ -4,7 +4,9 @@
 //! the adapter's unattributable rows; authored policy must use a future
 //! binding-scoped implementation instead.
 
-use crate::middleware::models::{ModelStore, days_of};
+use std::sync::Arc;
+
+use crate::middleware::models::{ModelStore, active_days_of, days_of};
 use crate::store::ModelEntry;
 
 use super::BindingId;
@@ -14,15 +16,32 @@ use super::BindingId;
 pub struct LearnedEvidence {
     distinct_days: Vec<String>,
     max_prompt: Option<u64>,
+    explicitly_promoted: bool,
 }
 
 impl LearnedEvidence {
+    pub fn new(
+        distinct_days: Vec<String>,
+        max_prompt: Option<u64>,
+        explicitly_promoted: bool,
+    ) -> Self {
+        Self {
+            distinct_days,
+            max_prompt,
+            explicitly_promoted,
+        }
+    }
+
     pub fn distinct_days(&self) -> &[String] {
         &self.distinct_days
     }
 
     pub fn max_prompt(&self) -> Option<u64> {
         self.max_prompt
+    }
+
+    pub fn explicitly_promoted(&self) -> bool {
+        self.explicitly_promoted
     }
 }
 
@@ -43,20 +62,25 @@ pub trait LearningView {
     ) -> Result<Option<LearnedEvidence>, Self::Error>;
 
     fn known_models(&self, binding_id: &BindingId) -> Result<Vec<String>, Self::Error>;
+
+    /// Number of distinct days carrying any evidence in this binding's
+    /// learning pool. Revision-one's adapter intentionally returns the legacy
+    /// table-wide pool because those rows cannot be attributed to bindings.
+    fn active_days(&self, binding_id: &BindingId) -> Result<usize, Self::Error>;
 }
 
 /// Temporary revision-one adapter over the unattributable legacy model table.
-pub struct LegacyLearningView<'a> {
-    store: &'a ModelStore,
+pub struct LegacyLearningView {
+    store: Arc<ModelStore>,
 }
 
-impl<'a> LegacyLearningView<'a> {
-    pub fn new(store: &'a ModelStore) -> Self {
+impl LegacyLearningView {
+    pub fn new(store: Arc<ModelStore>) -> Self {
         Self { store }
     }
 }
 
-impl LearningView for LegacyLearningView<'_> {
+impl LearningView for LegacyLearningView {
     type Error = crate::store::Error;
 
     fn recently_sent(
@@ -78,29 +102,9 @@ impl LearningView for LegacyLearningView<'_> {
     fn known_models(&self, _binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
         self.store.known_models()
     }
-}
 
-impl LearningView for ModelStore {
-    type Error = crate::store::Error;
-
-    fn recently_sent(
-        &self,
-        _binding_id: &BindingId,
-        model_id: &str,
-    ) -> Result<Option<i64>, Self::Error> {
-        Ok(self.last_served(model_id))
-    }
-
-    fn learned(
-        &self,
-        _binding_id: &BindingId,
-        model_id: &str,
-    ) -> Result<Option<LearnedEvidence>, Self::Error> {
-        Ok(self.learned_entry(model_id)?.map(evidence))
-    }
-
-    fn known_models(&self, _binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
-        ModelStore::known_models(self)
+    fn active_days(&self, _binding_id: &BindingId) -> Result<usize, Self::Error> {
+        Ok(active_days_of(&self.store.learned_entries()?))
     }
 }
 
@@ -108,6 +112,9 @@ fn evidence(entry: ModelEntry) -> LearnedEvidence {
     LearnedEvidence {
         distinct_days: days_of(&entry),
         max_prompt: entry.max_prompt.and_then(|value| u64::try_from(value).ok()),
+        // Legacy grants are encoded by adding ordinary days, so the legacy
+        // table cannot distinguish an explicit grant from observations.
+        explicitly_promoted: false,
     }
 }
 
@@ -201,7 +208,7 @@ mod tests {
             })
             .unwrap();
         let models = ModelStore::seeded(store, &[row("claude-sonnet-5", 9_000)], Some(5_000));
-        let view = LegacyLearningView::new(&models);
+        let view = LegacyLearningView::new(Arc::new(models));
         let first = binding("anthropic_sub.anthropic_messages");
         let second = binding("anthropic_api.anthropic_messages");
 
@@ -223,7 +230,7 @@ mod tests {
     fn reads_do_not_create_unknown_learning() {
         let store = Arc::new(Store::open(":memory:").unwrap());
         let models = ModelStore::seeded(store, &[], None);
-        let view = LegacyLearningView::new(&models);
+        let view = LegacyLearningView::new(Arc::new(models));
         let binding = binding("openrouter.openrouter_messages");
         assert_eq!(view.recently_sent(&binding, "unknown-model").unwrap(), None);
         assert_eq!(view.learned(&binding, "unknown-model").unwrap(), None);

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
-use super::fetched::FetchedCatalogs;
+use super::fetched::{FetchedCatalogs, ModelChronology};
 use crate::policy::BindingId;
 use crate::routing::{BackendBinding, ProtocolId, RouteRegistry};
 
@@ -17,6 +17,7 @@ pub struct BackendOffer {
     pub backend_model_id: String,
     pub binding: BackendBinding,
     pub context_window: Option<u64>,
+    pub chronology: Option<ModelChronology>,
     pub fetched_at_ms: i64,
     pub raw: Value,
 }
@@ -87,6 +88,7 @@ pub fn inventory(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> OfferI
                     backend_model_id: model.id.clone(),
                     binding: binding.clone(),
                     context_window: model.context_window,
+                    chronology: model.chronology,
                     fetched_at_ms: catalog.fetched_at_ms,
                     raw: model.raw.clone(),
                 });
@@ -105,6 +107,7 @@ pub struct ModelOffer {
     pub routed_model_id: String,
     pub binding: BackendBinding,
     pub context_window: Option<u64>,
+    pub chronology: Option<ModelChronology>,
     pub fetched_at_ms: i64,
     pub raw: Value,
 }
@@ -160,6 +163,7 @@ fn projected(
         routed_model_id,
         binding: offer.binding.clone(),
         context_window: offer.context_window,
+        chronology: offer.chronology,
         fetched_at_ms: offer.fetched_at_ms,
         raw: offer.raw.clone(),
     })
@@ -233,6 +237,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "vendor/model".to_owned(),
                     context_window: Some(123_456),
+                    chronology: ModelChronology::from_unix_seconds(7),
                     raw: json!({"id": "vendor/model", "created": 7}),
                 }],
             },

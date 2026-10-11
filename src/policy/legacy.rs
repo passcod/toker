@@ -119,7 +119,7 @@ impl<'a> LegacyBuilder<'a> {
                 id: upgrade_id(binding)?,
                 classifier_id,
                 enabled: self.config.gates.force_newest,
-                minimum_learning: MinimumLearning::DistinctDays { days: 0 },
+                minimum_learning: MinimumLearning::RevisionOneAdaptive,
                 allow_manual_promotion: true,
                 inventory_sources: vec![InventorySource::Learned, InventorySource::Served],
                 lane_transition: LaneTransitionPolicy::MoveWhenCold,
@@ -880,6 +880,7 @@ mod tests {
                     .map(|id| FetchedModel {
                         id: id.to_owned(),
                         context_window: Some(100),
+                        chronology: None,
                         raw: json!({"id": id}),
                     })
                     .collect(),

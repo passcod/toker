@@ -542,6 +542,7 @@ fn openrouter_catalog(entries: Vec<(&str, serde_json::Value)>) -> toker::catalog
             .map(|(id, raw)| toker::catalog::FetchedModel {
                 id: id.to_owned(),
                 context_window: Some(200_000),
+                chronology: None,
                 raw,
             })
             .collect(),

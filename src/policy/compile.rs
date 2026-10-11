@@ -548,6 +548,16 @@ impl<'a> Compiler<'a> {
                 );
                 continue;
             }
+            if item.minimum_learning == super::MinimumLearning::RevisionOneAdaptive
+                && self.origin != PolicyOrigin::GeneratedRevisionOne
+            {
+                self.error(
+                    "legacy-adaptive-learning-forbidden",
+                    base.clone().field(f("minimum_learning")),
+                    item.id.as_stable_id(),
+                );
+                continue;
+            }
             out.insert(
                 item.id.clone(),
                 CompiledUpgradePolicy {
@@ -1477,8 +1487,7 @@ impl<'a> Compiler<'a> {
             && (!required.system_in_messages || actual.system_in_messages)
             && (!required.thinking_replay || actual.thinking_replay)
             && (!required.images || actual.images)
-            // Every currently canonical binding was verified with tools.
-            && (!required.tools || binding.canonical_backend().is_some())
+            && (!required.tools || actual.tools)
     }
 
     fn route_exists(&self, frontend: ProtocolId, binding: &BackendBinding) -> bool {

@@ -47,9 +47,11 @@ pub(crate) fn select<'a>(
 
     match selector.ordering() {
         SelectorOrdering::CatalogueChronology => offers.sort_by(|(left, _), (right, _)| {
+            // Known provider chronology always outranks missing chronology.
+            // Fetch time is catalogue freshness, not model age.
             right
-                .fetched_at_ms
-                .cmp(&left.fetched_at_ms)
+                .chronology
+                .cmp(&left.chronology)
                 .then_with(|| left.backend_model_id.cmp(&right.backend_model_id))
         }),
         SelectorOrdering::Explicit { model_ids } => {
@@ -62,6 +64,10 @@ pub(crate) fn select<'a>(
             offers.sort_by_key(|(offer, _)| positions[offer.backend_model_id.as_str()]);
         }
         SelectorOrdering::ClassifiedVersion { .. } => {
+            // A classified-version selector selects only offers for which its
+            // matcher, templates, and parser all succeeded. Unclassified ids
+            // are not an older version and cannot win by lexical accident.
+            offers.retain(|(_, version)| version.is_some());
             offers.sort_by(|(left, left_version), (right, right_version)| {
                 right_version
                     .partial_cmp(left_version)

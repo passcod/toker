@@ -2061,6 +2061,7 @@ mod tests {
                     FetchedModel {
                         id: "z-ai/glm-5.3".to_owned(),
                         context_window: Some(200_000),
+                        chronology: None,
                         raw: json!({"id": "z-ai/glm-5.3", "context_length": 200_000}),
                     },
                     // A claude-named entry claiming a WRONG window: the
@@ -2068,6 +2069,7 @@ mod tests {
                     FetchedModel {
                         id: "claude-opus-5".to_owned(),
                         context_window: Some(123_456),
+                        chronology: None,
                         raw: json!({"id": "claude-opus-5"}),
                     },
                 ],
@@ -2080,6 +2082,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "gpt-6-terra".to_owned(),
                     context_window: Some(400_000),
+                    chronology: None,
                     raw: json!({"slug": "gpt-6-terra", "max_context_window": 400_000}),
                 }],
             },
@@ -2091,6 +2094,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "claude-opus-6".to_owned(),
                     context_window: Some(1_000_000),
+                    chronology: None,
                     raw: json!({"id": "claude-opus-6", "max_input_tokens": 1_000_000}),
                 }],
             },

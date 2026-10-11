@@ -93,6 +93,8 @@ pub struct Capabilities {
     pub thinking_replay: bool,
     /// Image content blocks.
     pub images: bool,
+    /// Tool declarations and tool call/result turns.
+    pub tools: bool,
 }
 
 impl Capabilities {
@@ -104,6 +106,7 @@ impl Capabilities {
         system_in_messages: true,
         thinking_replay: true,
         images: true,
+        tools: true,
     };
 
     /// OpenRouter's live Chat Completions binding. The request and response
@@ -114,6 +117,7 @@ impl Capabilities {
         system_in_messages: true,
         thinking_replay: false,
         images: true,
+        tools: true,
     };
 
     /// The Codex subscription Responses binding's live-verified capabilities.
@@ -122,6 +126,7 @@ impl Capabilities {
         system_in_messages: false,
         thinking_replay: false,
         images: true,
+        tools: true,
     };
 
     /// The streamed Responses subset verified against OpenRouter: tools,
@@ -132,6 +137,7 @@ impl Capabilities {
         system_in_messages: false,
         thinking_replay: false,
         images: false,
+        tools: true,
     };
 }
 

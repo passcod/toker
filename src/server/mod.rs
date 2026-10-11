@@ -87,7 +87,8 @@ use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
-    LaneFacts, LegacyOutcome, PolicyShadow, ProfileId, RequestClass, RequestFacts, ShadowObserver,
+    LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
+    RequestFacts, ShadowObserver,
     TracingObserver,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
@@ -215,7 +216,7 @@ pub struct Server {
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
     /// In-memory revision-one resolver used only to compare decisions made by
     /// the still-authoritative legacy path.
-    pub(crate) policy_shadow: Option<Arc<PolicyShadow<ModelStore>>>,
+    pub(crate) policy_shadow: Option<Arc<PolicyShadow<LegacyLearningView>>>,
 }
 
 impl Server {
@@ -377,7 +378,7 @@ impl Server {
                 Arc::new(policy),
                 Arc::new(inventory),
                 Arc::new(availability_for(&registry, &initial_catalogs)),
-                models.clone(),
+                Arc::new(LegacyLearningView::new(models.clone())),
                 shadow_observer.clone(),
             ))),
             Err(error) => {
@@ -1161,6 +1162,7 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
                             system_in_messages: false,
                             thinking_replay: false,
                             images: false,
+                            tools: false,
                         },
                         |canonical| canonical.capabilities(),
                     ),

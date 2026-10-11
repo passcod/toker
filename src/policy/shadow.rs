@@ -449,6 +449,7 @@ mod tests {
             backend_model_id: "model-a".to_owned(),
             binding: binding.clone(),
             context_window: None,
+            chronology: None,
             fetched_at_ms: 10,
             raw: serde_json::json!({}),
         }]));

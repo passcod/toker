@@ -116,6 +116,27 @@ pub fn parse_for(source: &str) -> Option<Parse> {
     }
 }
 
+/// Provider-verified chronology for one model, normalised for ordering.
+///
+/// This is never inferred from an id, response position, or fetch time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModelChronology {
+    unix_ms: i64,
+}
+
+impl ModelChronology {
+    pub const fn from_unix_seconds(seconds: i64) -> Option<Self> {
+        match seconds.checked_mul(1_000) {
+            Some(unix_ms) => Some(Self { unix_ms }),
+            None => None,
+        }
+    }
+
+    pub const fn unix_ms(self) -> i64 {
+        self.unix_ms
+    }
+}
+
 /// One model as a provider's listing named it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchedModel {
@@ -128,6 +149,9 @@ pub struct FetchedModel {
     /// a positive number (an anthropic presence-only entry included) —
     /// never a fabricated window.
     pub context_window: Option<u64>,
+    /// Creation chronology only when the provider's documented field parses
+    /// in its verified type and format.
+    pub chronology: Option<ModelChronology>,
     /// The whole provider entry, verbatim: the "other interesting
     /// stuff" (openrouter's pricing and supported_parameters, codex's
     /// reasoning levels and truncation policy) preserved for later
@@ -529,6 +553,7 @@ pub fn parse_openrouter(response: &Value, fetched_at_ms: i64) -> anyhow::Result<
             Some(FetchedModel {
                 id: id.to_owned(),
                 context_window: window_at(entry, "context_length"),
+                chronology: integer_chronology(entry, "created"),
                 raw: entry.clone(),
             })
         })
@@ -553,6 +578,7 @@ pub fn parse_openai(response: &Value, fetched_at_ms: i64) -> anyhow::Result<Fetc
             (!id.is_empty()).then(|| FetchedModel {
                 id: id.to_owned(),
                 context_window: None,
+                chronology: integer_chronology(entry, "created"),
                 raw: entry.clone(),
             })
         })
@@ -586,6 +612,7 @@ pub fn parse_codex(response: &Value, fetched_at_ms: i64) -> anyhow::Result<Fetch
                 id: id.to_owned(),
                 context_window: window_at(entry, "max_context_window")
                     .or_else(|| window_at(entry, "context_window")),
+                chronology: None,
                 raw: entry.clone(),
             })
         })
@@ -615,6 +642,7 @@ pub fn parse_anthropic(response: &Value, fetched_at_ms: i64) -> anyhow::Result<F
             Some(FetchedModel {
                 id: id.to_owned(),
                 context_window: window_at(entry, "max_input_tokens"),
+                chronology: anthropic_chronology(entry),
                 raw: entry.clone(),
             })
         })
@@ -630,6 +658,24 @@ pub fn parse_anthropic(response: &Value, fetched_at_ms: i64) -> anyhow::Result<F
 /// and string numbers are all absent — never a fabricated window.
 fn window_at(entry: &Value, key: &str) -> Option<u64> {
     entry.get(key).and_then(Value::as_u64).filter(|&v| v > 0)
+}
+
+fn integer_chronology(entry: &Value, key: &str) -> Option<ModelChronology> {
+    ModelChronology::from_unix_seconds(entry.get(key)?.as_i64()?)
+}
+
+fn anthropic_chronology(entry: &Value) -> Option<ModelChronology> {
+    let text = entry.get("created_at")?.as_str()?;
+    // Anthropic documents an RFC 3339 timestamp. Requiring the canonical UTC
+    // suffix keeps this parser narrower than accepting arbitrary civil-time
+    // spellings from an unverified future response shape.
+    if !text.ends_with('Z') {
+        return None;
+    }
+    let timestamp = text.parse::<jiff::Timestamp>().ok()?;
+    Some(ModelChronology {
+        unix_ms: timestamp.as_millisecond(),
+    })
 }
 
 /// One price field of a `pricing` object, parsed: openrouter writes
@@ -1089,6 +1135,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "z-ai/glm-5.3".to_owned(),
                     context_window: Some(200_000),
+                    chronology: None,
                     raw: json!({"id": "z-ai/glm-5.3"}),
                 }],
             },
@@ -1100,6 +1147,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "gpt-6-terra".to_owned(),
                     context_window: Some(200_000),
+                    chronology: None,
                     raw: json!({"slug": "gpt-6-terra"}),
                 }],
             },
@@ -1111,6 +1159,7 @@ mod tests {
                 models: vec![FetchedModel {
                     id: "claude-opus-4-5-20251101".to_owned(),
                     context_window: Some(200_000),
+                    chronology: None,
                     raw: json!({"id": "claude-opus-4-5-20251101"}),
                 }],
             },

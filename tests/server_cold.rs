@@ -930,6 +930,7 @@ async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet()
         models: vec![toker::catalog::FetchedModel {
             id: "free/claude-sonnet".to_owned(),
             context_window: None,
+            chronology: None,
             raw: json!({
                 "id": "free/claude-sonnet",
                 "pricing": {

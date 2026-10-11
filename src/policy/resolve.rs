@@ -189,6 +189,7 @@ pub enum SkipReason {
     PreflightFallbackDisabled,
     BilledBoundaryDenied,
     WarmCacheTransitionDenied,
+    WarmLaneTransitionDenied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +251,8 @@ struct SelectedRoute<'a> {
     exact: Option<(&'a BindingId, &'a str)>,
     parameters: BTreeMap<StableId, String>,
     provenance: RouteProvenance,
+    lane_transition: Option<LaneTransitionPolicy>,
+    cache_transition: Option<CacheTransitionPolicy>,
 }
 
 /// Resolve one request without mutation, I/O, clock reads, or persistence.
@@ -272,6 +275,8 @@ pub fn resolve<L: LearningView>(
             None,
             RouteProvenance::Compaction,
         )?;
+        selected.lane_transition = Some(compaction.lane_transition());
+        selected.cache_transition = Some(compaction.cache_transition());
     }
 
     let mut trace = vec![TraceEvent::Lookup(selected.provenance.clone())];
@@ -352,6 +357,24 @@ pub fn resolve<L: LearningView>(
             continue;
         }
         let baseline = baseline.ok_or(ResolveFailure::InvalidTemplate)?;
+        if facts.class == RequestClass::Compaction
+            && lane.is_some_and(|lane| !lane.cold)
+            && (selected.cache_transition != Some(CacheTransitionPolicy::AllowCacheLoss)
+                || selected.lane_transition != Some(LaneTransitionPolicy::AllowImmediate))
+        {
+            if let Some(last) = trace.last_mut()
+                && let TraceEvent::Candidate(evidence) = last
+            {
+                evidence.result = Err(if selected.cache_transition
+                    != Some(CacheTransitionPolicy::AllowCacheLoss)
+                {
+                    SkipReason::WarmCacheTransitionDenied
+                } else {
+                    SkipReason::WarmLaneTransitionDenied
+                });
+            }
+            return Err(ResolveFailure::RouteUnavailable { trace });
+        }
         let upgraded = choose_upgrade(
             policy, inventory, learning, lane, facts, candidate, &baseline,
         )?;
@@ -374,6 +397,18 @@ pub fn resolve<L: LearningView>(
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
         let provider = live.map_or_else(String::new, |live| live.provider.clone());
+        let mut lane_policy = selected
+            .lane_transition
+            .map_or(route.lane_transition(), |policy| {
+                stricter_transition(route.lane_transition(), policy)
+            });
+        if upgraded.is_some()
+            && let Some(upgrade) = candidate
+                .upgrade_policy_id()
+                .and_then(|id| policy.upgrade(id))
+        {
+            lane_policy = stricter_transition(lane_policy, upgrade.policy().lane_transition);
+        }
         return Ok(AttemptPlan {
             policy_fingerprint: policy.fingerprint().clone(),
             policy_revision: None,
@@ -389,7 +424,7 @@ pub fn resolve<L: LearningView>(
             aliased_model: aliased,
             effective_model: effective,
             compaction: facts.class == RequestClass::Compaction,
-            transition: transition(route.lane_transition(), lane),
+            transition: transition(lane_policy, lane),
             trace,
         });
     }
@@ -497,6 +532,8 @@ fn from_presentation<'a>(
             exact: Some((binding_id, model_id)),
             parameters: BTreeMap::new(),
             provenance,
+            lane_transition: None,
+            cache_transition: None,
         }),
     }
 }
@@ -535,6 +572,8 @@ fn from_reference<'a>(
         exact: None,
         parameters,
         provenance,
+        lane_transition: None,
+        cache_transition: None,
     })
 }
 
@@ -671,6 +710,7 @@ fn common_denial(live: &BindingAvailability, required: CapabilityFlags) -> Optio
         || (required.system_in_messages && !actual.system_in_messages)
         || (required.thinking_replay && !actual.thinking_replay)
         || (required.images && !actual.images)
+        || (required.tools && !actual.tools)
     {
         return Some(SkipReason::MissingRequiredCapability);
     }
@@ -706,7 +746,10 @@ fn edge_denial(
     }
     if matches!(
         (from.map(|v| v.cost_class), to.map(|v| v.cost_class)),
-        (Some(CostClass::Subscription), Some(CostClass::Billed))
+        (
+            Some(CostClass::Subscription),
+            Some(CostClass::Billed | CostClass::Unknown)
+        )
     ) && edge.billed_boundary == BoundaryConsent::Deny
     {
         return Some(SkipReason::BilledBoundaryDenied);
@@ -719,6 +762,18 @@ fn edge_denial(
         return Some(SkipReason::WarmCacheTransitionDenied);
     }
     None
+}
+
+fn stricter_transition(
+    left: LaneTransitionPolicy,
+    right: LaneTransitionPolicy,
+) -> LaneTransitionPolicy {
+    use LaneTransitionPolicy::{AllowImmediate, MoveWhenCold, PreservePinned};
+    match (left, right) {
+        (PreservePinned, _) | (_, PreservePinned) => PreservePinned,
+        (MoveWhenCold, _) | (_, MoveWhenCold) => MoveWhenCold,
+        (AllowImmediate, AllowImmediate) => AllowImmediate,
+    }
 }
 
 fn transition(policy: LaneTransitionPolicy, lane: Option<&LaneFacts>) -> TransitionDecision {
@@ -867,7 +922,20 @@ fn learning_minimum<L: LearningView>(
             .learned(binding, model)
             .map_err(|_| ResolveFailure::LearningUnavailable)?
             .is_some_and(|evidence| evidence.distinct_days().len() >= usize::from(days))),
-        MinimumLearning::ExplicitPromotion => Ok(false),
+        MinimumLearning::ExplicitPromotion => Ok(learning
+            .learned(binding, model)
+            .map_err(|_| ResolveFailure::LearningUnavailable)?
+            .is_some_and(|evidence| evidence.explicitly_promoted())),
+        MinimumLearning::RevisionOneAdaptive => {
+            let active_days = learning
+                .active_days(binding)
+                .map_err(|_| ResolveFailure::LearningUnavailable)?;
+            let needed = crate::middleware::models::requirement(active_days);
+            Ok(learning
+                .learned(binding, model)
+                .map_err(|_| ResolveFailure::LearningUnavailable)?
+                .is_some_and(|evidence| evidence.distinct_days().len() as f64 > needed))
+        }
     }
 }
 
@@ -966,6 +1034,9 @@ impl LearningView for NoLearning {
     }
     fn known_models(&self, _: &BindingId) -> Result<Vec<String>, Self::Error> {
         Ok(vec![])
+    }
+    fn active_days(&self, _: &BindingId) -> Result<usize, Self::Error> {
+        Ok(0)
     }
 }
 

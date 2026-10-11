@@ -218,6 +218,7 @@ impl RouteSemantics {
 
         let mut aliases = BTreeMap::new();
         let mut upgrade_ids = HashSet::new();
+        let mut classifier_ids = HashSet::new();
         for candidate in route.chain.candidates() {
             if let Some(alias) = &candidate.alias_policy {
                 aliases.insert(candidate.id.clone(), alias.clone());
@@ -225,10 +226,15 @@ impl RouteSemantics {
             if let Some(upgrade_id) = &candidate.upgrade_policy_id {
                 upgrade_ids.insert(upgrade_id.clone());
             }
+            if let super::document::CandidateModel::OfferSelector { selector } = &candidate.model
+                && let super::document::SelectorOrdering::ClassifiedVersion { classifier_id } =
+                    &selector.ordering
+            {
+                classifier_ids.insert(classifier_id.clone());
+            }
         }
 
         let mut upgrades = Vec::new();
-        let mut classifier_ids = HashSet::new();
         for id in upgrade_ids {
             let policy = document
                 .upgrades

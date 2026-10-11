@@ -784,6 +784,12 @@ impl ModelStore {
             .collect())
     }
 
+    /// Snapshot all legacy learned entries for revision-one policy evidence.
+    /// Authored routing policy must use a binding-scoped learning source.
+    pub(crate) fn learned_entries(&self) -> crate::store::Result<Vec<ModelEntry>> {
+        self.store.load_models()
+    }
+
     /// The models-merge semantics
     /// (`mergeSeen(into, from, {only: true})` — the control endpoint's one power):
     /// **only adds** days and maxPrompt for a model **already served**,
