@@ -371,13 +371,13 @@ pub fn resolve<L: LearningView>(
             if let Some(last) = trace.last_mut()
                 && let TraceEvent::Candidate(evidence) = last
             {
-                evidence.result = Err(if selected.cache_transition
-                    != Some(CacheTransitionPolicy::AllowCacheLoss)
-                {
-                    SkipReason::WarmCacheTransitionDenied
-                } else {
-                    SkipReason::WarmLaneTransitionDenied
-                });
+                evidence.result = Err(
+                    if selected.cache_transition != Some(CacheTransitionPolicy::AllowCacheLoss) {
+                        SkipReason::WarmCacheTransitionDenied
+                    } else {
+                        SkipReason::WarmLaneTransitionDenied
+                    },
+                );
             }
             return Err(ResolveFailure::RouteUnavailable { trace });
         }
@@ -538,13 +538,7 @@ fn from_presentation<'a>(
             model_id,
         } => Ok(SelectedRoute {
             route: None,
-            exact: Some((
-                binding_id,
-                model_id,
-                route_id,
-                fingerprint,
-                candidate_id,
-            )),
+            exact: Some((binding_id, model_id, route_id, fingerprint, candidate_id)),
             parameters: BTreeMap::new(),
             provenance,
             lane_transition: None,

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::catalog::offers::OfferInventory;
 use crate::routing::{BackendBinding, Capabilities, ProtocolId, RouteRegistry};
 
+use super::canonical::generated_route_fingerprint;
 use super::{
     AdapterMetadata, AliasPolicy, ArgumentBinding, BindingId, BoundaryConsent,
     CacheTransitionPolicy, Candidate, CandidateEdge, CandidateId, CandidateModel, CaptureSchema,
@@ -23,7 +24,6 @@ use super::{
     StableId, Template, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec,
     policy_fingerprint, route_fingerprint,
 };
-use super::canonical::generated_route_fingerprint;
 
 /// Whether compilation is allowed to consume revision-one legacy learning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1204,9 +1204,7 @@ impl<'a> Compiler<'a> {
                             let Some(label) = template.render(&values, &empty_captures).ok() else {
                                 self.error(
                                     "invalid-template",
-                                    base.clone()
-                                        .field(f("source"))
-                                        .field(f("label_template")),
+                                    base.clone().field(f("source")).field(f("label_template")),
                                     item.id.as_stable_id(),
                                 );
                                 break;
@@ -1276,22 +1274,18 @@ impl<'a> Compiler<'a> {
             .expect("hash-derived generated route id");
         let candidate_id = CandidateId::new(format!("candidate-{suffix}"))
             .expect("hash-derived generated candidate id");
-        let fingerprint = match generated_route_fingerprint(
-            &route_id,
-            &candidate_id,
-            &binding_id,
-            &model_id,
-        ) {
-            Ok(fingerprint) => fingerprint,
-            Err(_) => {
-                self.error(
-                    "route-semantics-invalid",
-                    path.clone().field(f("source")),
-                    item.id.as_stable_id(),
-                );
-                return None;
-            }
-        };
+        let fingerprint =
+            match generated_route_fingerprint(&route_id, &candidate_id, &binding_id, &model_id) {
+                Ok(fingerprint) => fingerprint,
+                Err(_) => {
+                    self.error(
+                        "route-semantics-invalid",
+                        path.clone().field(f("source")),
+                        item.id.as_stable_id(),
+                    );
+                    return None;
+                }
+            };
         Some(CompiledPresentation {
             id: item.id.clone(),
             slug,

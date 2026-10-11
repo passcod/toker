@@ -5,6 +5,7 @@
 //! therefore never delay or change authoritative traffic.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 
@@ -138,6 +139,7 @@ enum ShadowJob {
 struct ShadowRuntime {
     sender: Mutex<Option<mpsc::SyncSender<ShadowJob>>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+    dropped: AtomicU64,
 }
 
 impl Drop for ShadowRuntime {
@@ -192,6 +194,7 @@ where
             runtime: Arc::new(ShadowRuntime {
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
+                dropped: AtomicU64::new(0),
             }),
             _learning: std::marker::PhantomData,
         }
@@ -239,14 +242,31 @@ where
         });
     }
 
+    /// Number of observations dropped because the bounded worker queue was
+    /// full or disconnected. Reading this counter never touches the queue.
+    pub fn dropped_observations(&self) -> u64 {
+        self.runtime.dropped.load(Ordering::Relaxed)
+    }
+
     fn enqueue(&self, job: ShadowJob) {
         let sender = self
             .runtime
             .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(sender) = sender.as_ref() {
-            let _ = sender.try_send(job);
+        if let Some(sender) = sender.as_ref()
+            && sender.try_send(job).is_err()
+        {
+            let dropped = self.runtime.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Power-of-two reporting stays bounded under sustained pressure.
+            // This path does no queue I/O and carries no request content.
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    code = "policy-shadow-observation-dropped",
+                    dropped,
+                    "policy shadow observations dropped"
+                );
+            }
         }
     }
 
@@ -571,6 +591,7 @@ mod tests {
         let runtime = Arc::new(ShadowRuntime {
             sender: Mutex::new(Some(sender)),
             worker: Mutex::new(None),
+            dropped: AtomicU64::new(0),
         });
         let shadow: PolicyShadow<NoLearning> =
             PolicyShadow::with_runtime(policy, inventory, availability, runtime);
@@ -581,6 +602,7 @@ mod tests {
             shadow: None,
         });
         assert_eq!(receiver.try_recv().unwrap().code(), "occupied");
+        assert_eq!(shadow.dropped_observations(), 1);
         drop(receiver);
         shadow.observe_record(ShadowRecord {
             comparison: ShadowComparison::Mismatch,
@@ -588,6 +610,7 @@ mod tests {
             legacy: None,
             shadow: None,
         });
+        assert_eq!(shadow.dropped_observations(), 2);
     }
 
     #[test]

@@ -88,8 +88,7 @@ use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
     LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
-    RequestFacts, ShadowObserver,
-    TracingObserver,
+    RequestFacts, ShadowObserver, TracingObserver,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};

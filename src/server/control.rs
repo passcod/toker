@@ -144,6 +144,10 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         // change after it asks for a shutdown.
         "instance": &*server.instance,
         "started_ms": server.started_ms,
+        "policy_shadow_dropped": server
+            .policy_shadow
+            .as_ref()
+            .map_or(0, |shadow| shadow.dropped_observations()),
         "version": env!("CARGO_PKG_VERSION"),
     });
     Json(body).into_response()

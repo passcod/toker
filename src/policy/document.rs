@@ -987,7 +987,9 @@ impl UpgradePolicy {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MinimumLearning {
     None,
-    DistinctDays { days: u16 },
+    DistinctDays {
+        days: u16,
+    },
     ExplicitPromotion,
     /// The revision-one election bar: strictly more than
     /// `min(7, active_days / 2)` distinct days.
