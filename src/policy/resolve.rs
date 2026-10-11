@@ -602,7 +602,22 @@ fn candidate_evidence(
                 facts.required_capabilities,
             ),
         )
-        .or_else(|| model_availability(candidate.binding_id(), model, live.catalogue, inventory))
+        .or_else(|| match candidate.model() {
+            // A fresh listing can disprove a policy-owned exact offer. Models
+            // supplied by a compatibility default or template remain
+            // provider-owned strings, as they are on the legacy route: an
+            // incomplete catalogue must not turn the listing into an
+            // upstream allowlist.
+            CompiledCandidateModel::Exact(_) => {
+                model_availability(candidate.binding_id(), model, live.catalogue, inventory)
+            }
+            CompiledCandidateModel::OfferSelector(_) if model.is_none() => {
+                Some(SkipReason::SelectorUnresolved)
+            }
+            CompiledCandidateModel::RequestedModel
+            | CompiledCandidateModel::Template(_)
+            | CompiledCandidateModel::OfferSelector(_) => None,
+        })
     } else {
         Some(SkipReason::BindingUnknown)
     };
@@ -1193,6 +1208,29 @@ mod tests {
             plan.provenance,
             RouteProvenance::ProtocolRewrite(_)
         ));
+    }
+
+    #[test]
+    fn fresh_catalogue_does_not_reject_a_compatibility_default_model() {
+        let requested = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        let policy = compile(
+            document(route(requested, vec![])),
+            &OfferInventory::default(),
+        );
+        let plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, true),
+            &facts("provider-owned-model"),
+        )
+        .unwrap();
+        assert_eq!(plan.effective_model, "provider-owned-model");
     }
 
     #[test]
