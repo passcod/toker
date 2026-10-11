@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::ir::canonical::CanonicalRequest;
-use crate::middleware::model_map::ModelMap;
+use crate::middleware::model_map::{MapTarget, ModelMap};
 use crate::providers::Provider;
 use crate::routing::{BackendBinding, ModelTarget};
 
@@ -46,12 +46,13 @@ impl InferenceRequest {
     ) -> InferenceAttempt {
         let mut canonical = self.canonical();
         canonical.model.clone_from(&baseline_model);
-        crate::middleware::canonical::map_model(&mut canonical, model_map);
+        let mapped = crate::middleware::canonical::map_model(&mut canonical, model_map);
         let effective_model = canonical.model.clone();
         InferenceAttempt {
             target,
             requested_model: self.requested_model.clone(),
             effective_model,
+            mapped,
             canonical,
         }
     }
@@ -65,19 +66,24 @@ impl InferenceRequest {
         effective_model: Option<String>,
         canonical: CanonicalRequest,
     ) -> InferenceAttempt {
-        self.prepared_from(target, effective_model, canonical)
+        self.prepare_legacy_transformed_with_map(target, effective_model, canonical, None)
     }
 
-    fn prepared_from(
+    pub(crate) fn prepare_legacy_transformed_with_map(
         &self,
         target: ModelTarget,
-        effective_model: Option<String>,
-        canonical: CanonicalRequest,
+        baseline_model: Option<String>,
+        mut canonical: CanonicalRequest,
+        model_map: Option<&ModelMap>,
     ) -> InferenceAttempt {
+        canonical.model.clone_from(&baseline_model);
+        let mapped = crate::middleware::canonical::map_model(&mut canonical, model_map);
+        let effective_model = canonical.model.clone();
         InferenceAttempt {
             target,
             requested_model: self.requested_model.clone(),
             effective_model,
+            mapped,
             canonical,
         }
     }
@@ -87,6 +93,7 @@ pub(crate) struct InferenceAttempt {
     target: ModelTarget,
     requested_model: Option<String>,
     effective_model: Option<String>,
+    mapped: Option<MapTarget>,
     canonical: CanonicalRequest,
 }
 
@@ -105,6 +112,10 @@ impl InferenceAttempt {
 
     pub(crate) fn effective_model(&self) -> Option<&str> {
         self.effective_model.as_deref()
+    }
+
+    pub(crate) fn mapped(&self) -> Option<&MapTarget> {
+        self.mapped.as_ref()
     }
 
     /// Clone this candidate's private canonical IR for one backend renderer.

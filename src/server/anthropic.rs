@@ -1077,35 +1077,48 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // the served-model mark — the mark must see what is actually sent.
     if let Some(map) = backend.model_map() {
         let canonical_rewrite = (path == "/v1/messages")
-            .then_some(canonical.as_mut())
-            .flatten()
-            .and_then(|canonical| {
-                let before = canonical.model.clone()?;
-                let matched = crate::middleware::canonical::map_model(canonical, Some(map))?;
+            .then_some((inference_baseline.as_ref(), canonical.as_ref()))
+            .and_then(|(inference, canonical)| {
+                let inference = inference?;
+                let before = canonical?.model.clone()?;
+                let attempt = inference.prepare_legacy_transformed_with_map(
+                    target.clone(),
+                    Some(before.clone()),
+                    canonical?.clone(),
+                    Some(map),
+                );
+                let matched = attempt.mapped()?.clone();
+                let effective = attempt.effective_model()?.to_owned();
+                let prepared = attempt.canonical();
                 let rendered = translate::render_anthropic(
-                    canonical,
+                    &prepared,
                     crate::routing::DialectId::AnthropicMessages,
                 )
                 .ok()?;
                 let body = serde_json::to_vec(&rendered.value).ok()?;
-                let effective = matched.target;
-                Some(model_map::MappedRewrite {
-                    changed: body != forward,
-                    body,
-                    mapped: true,
-                    pre_map_model: Some(before.clone()),
-                    effective_model: Some(effective.clone()),
-                    models: vec![model_map::MappedPosition {
-                        request_index: None,
-                        pre_map_model: before,
-                        effective_model: effective,
-                        matched: true,
-                        selector: Some(matched.selector),
-                    }],
-                })
+                Some((
+                    prepared,
+                    model_map::MappedRewrite {
+                        changed: body != forward,
+                        body,
+                        mapped: true,
+                        pre_map_model: Some(before.clone()),
+                        effective_model: Some(effective.clone()),
+                        models: vec![model_map::MappedPosition {
+                            request_index: None,
+                            pre_map_model: before,
+                            effective_model: effective,
+                            matched: true,
+                            selector: Some(matched.selector),
+                        }],
+                    },
+                ))
             });
         let rewrite = if path == "/v1/messages" {
-            canonical_rewrite
+            canonical_rewrite.map(|(prepared, rewrite)| {
+                canonical = Some(prepared);
+                rewrite
+            })
         } else {
             // Count-token and batch bodies are administrative and keep their
             // lexical mapper. Invalid inference bodies get a local error.
