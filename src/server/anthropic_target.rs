@@ -16,9 +16,8 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::ir::canonical::CanonEvent;
-use crate::ir::canonical::CanonicalRequest;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
-use crate::routing::{ModelTarget, ProtocolId};
+use crate::routing::ProtocolId;
 use crate::translate::{
     self, AnthropicResponseStream, OpenAiChatRenderer, OpenAiResponsesRenderer,
 };
@@ -63,38 +62,31 @@ impl FrontendWire {
     }
 }
 
-pub(crate) struct AnthropicInput {
-    pub(crate) canonical: CanonicalRequest,
-    pub(crate) limit_field: Option<Value>,
-}
-
 pub(crate) async fn turn(
     server: Server,
     parts: Parts,
-    input: AnthropicInput,
-    target: ModelTarget,
+    mut attempt: super::inference::InferenceAttempt,
+    limit_field: Option<Value>,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     frontend: FrontendWire,
 ) -> Response {
-    let AnthropicInput {
-        mut canonical,
-        limit_field,
-    } = input;
-    let model = target.effective_model().unwrap_or_default().to_owned();
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt
+        .requested_model()
+        .unwrap_or(&effective_model)
+        .to_owned();
     let stream = match frontend {
-        FrontendWire::Chat => canonical.stream == Some(true),
-        FrontendWire::Responses => canonical.stream != Some(false),
+        FrontendWire::Chat => attempt.stream() == Some(true),
+        FrontendWire::Responses => attempt.stream() != Some(false),
     };
-    canonical.model = Some(model.clone());
-    canonical.stream = Some(stream);
 
     // Responses makes this limit optional; Messages requires one. Prefer
     // the caller's positive bound. Otherwise use the model's own declared
     // maximum from the fetched Anthropic catalogue, never a guessed limit.
     let limit = match limit_field.as_ref() {
         Some(Value::Number(number)) => number.as_u64().filter(|limit| *limit > 0),
-        None | Some(Value::Null) => declared_output_limit(&server, &model),
+        None | Some(Value::Null) => declared_output_limit(&server, &effective_model),
         Some(_) => None,
     };
     let Some(limit) = limit else {
@@ -104,12 +96,9 @@ pub(crate) async fn turn(
             frontend,
         );
     };
-    canonical.sampling.max_tokens = Some(limit);
-    canonical
-        .extensions
-        .retain(|extension| extension.wire_path() != "$.max_output_tokens");
+    attempt.prepare_messages_transport(stream, limit);
 
-    let rendered = match translate::render_anthropic(&canonical, target.binding().dialect()) {
+    let rendered = match attempt.render_json() {
         Ok(rendered) => rendered,
         Err(error) => return invalid_request(&error.to_string(), stream, frontend),
     };
@@ -125,7 +114,7 @@ pub(crate) async fn turn(
             return upstream_failure(ErrorWire::Openai, "toker could not render the request");
         }
     };
-    let backend = target.provider();
+    let backend = attempt.backend().clone();
     if !backend.foreign_auth_available() {
         return frontend_error_response(
             frontend.codex_wire(),
@@ -135,7 +124,9 @@ pub(crate) async fn turn(
             stream,
         );
     }
-    server.note_binding_sent(target.binding().id(), Some(&model));
+    let binding_id = attempt.binding().id().clone();
+    drop(attempt);
+    server.note_binding_sent(&binding_id, Some(&effective_model));
     let upstream = match send_upstream_to(
         &server,
         backend.as_ref(),
@@ -150,7 +141,15 @@ pub(crate) async fn turn(
         Ok(upstream) => upstream,
         Err(error) => return transport_failure(ErrorWire::Openai, &error),
     };
-    forward(upstream, record, in_flight, &model, frontend, stream).await
+    forward(
+        upstream,
+        record,
+        in_flight,
+        &response_model,
+        frontend,
+        stream,
+    )
+    .await
 }
 
 fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {

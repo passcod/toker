@@ -785,6 +785,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert!(response_text.contains("event: response.created"));
     assert!(response_text.contains("event: response.output_text.delta"));
     assert!(response_text.contains("event: response.completed"));
+    assert!(response_text.contains(r#""model":"codex_sub/gpt-5.6-sol""#));
     assert!(response_text.contains(r#""id":"rs_1""#));
     assert!(response_text.contains(r#""encrypted_content":"opaque-encrypted-reasoning""#));
 
@@ -957,6 +958,7 @@ async fn responses_to_anthropic_api_render_json_and_replace_foreign_auth() {
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("Responses JSON");
+    assert_eq!(body["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(body["output"][0]["content"][0]["text"], "hello");
     assert_eq!(body["usage"]["input_tokens"], 7);
 
@@ -1007,6 +1009,10 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.expect("Responses SSE");
         assert!(body.contains(expected), "{body}");
+        assert!(
+            body.contains(&format!(r#""model":"anthropic_api/{model}""#)),
+            "{body}"
+        );
         assert!(body.contains("response.output_item.done"), "{body}");
     }
     assert_eq!(
@@ -1144,6 +1150,7 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .expect("chat request answers");
     assert_eq!(complete.status(), StatusCode::OK);
     let body: Value = complete.json().await.unwrap();
+    assert_eq!(body["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
 
     let (sub_addr, sub_store) = spawn_toker(subscription_responses_config(
@@ -1165,6 +1172,7 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .expect("chat stream answers");
     assert_eq!(streaming.status(), StatusCode::OK);
     let sse = streaming.text().await.unwrap();
+    assert!(sse.contains(r#""model":"anthropic_sub/stream""#), "{sse}");
     assert!(sse.contains("tool_calls"), "{sse}");
     assert!(sse.contains("[DONE]"), "{sse}");
 
@@ -1240,6 +1248,10 @@ async fn openrouter_responses_streams_tools_and_records_attested_cost() {
         .send().await.expect("router answers");
     assert_eq!(response.status(), StatusCode::OK);
     let sse = response.text().await.unwrap();
+    assert!(
+        sse.contains(r#""model":"openrouter/openai/gpt-4.1-mini""#),
+        "{sse}"
+    );
     assert!(sse.contains("response.output_item.done"), "{sse}");
     assert!(sse.contains("response.completed"), "{sse}");
 
@@ -1285,6 +1297,7 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
     let status = complete.status();
     let body: Value = complete.json().await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "openrouter/short");
     assert_eq!(body["status"], "incomplete");
     assert_eq!(wait_for_rows(&store, 1).await[0].cost_usd, Some(0.0000336));
 
@@ -1477,6 +1490,7 @@ async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("chat SSE");
     assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains(r#""model":"codex_sub/gpt-5.6-sol""#));
     assert!(body.contains("\"tool_calls\""));
     assert!(body.contains("data: [DONE]"));
 
@@ -1581,6 +1595,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
         sse.contains("event: message_start"),
         "no message_start:\n{sse}"
     );
+    assert!(sse.contains(r#""model":"codex_sub/claude-opus-5""#));
     assert!(sse.contains("event: content_block_delta"));
     assert!(
         sse.contains(r#""type":"tool_use""#),

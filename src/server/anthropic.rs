@@ -1254,18 +1254,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         if path == "/v1/messages" {
             return codex::turn(codex::CodexTurn {
                 server,
-                backend: backend.clone(),
-                canonical: canonical
+                attempt: inference_attempt
                     .take()
                     .map(Ok)
                     .or_else(|| canonical_error.take().map(Err)),
-                gate_shape,
                 record,
                 in_flight,
                 session_id,
                 thread_id: None,
                 request_id: None,
-                served_model,
                 client_wants_json,
                 frontend_wire: codex::CodexFrontendWire::Anthropic,
             })

@@ -9,8 +9,8 @@
 //! Every other pipeline stage ran before this branch: the release
 //! marker, the quota gate (anthropic_sub-only, never here), the cold
 //! gate, the compaction retarget, force-newest, and the model routing
-//! map — so [`CodexTurn::served_model`] is the final effective model,
-//! the one the codex request carries.
+//! map — so the prepared attempt carries the final effective model used by
+//! the codex request.
 //!
 //! Recording: a measurement row on a completed turn (usage from
 //! [`crate::providers::codex::TurnCapture`], the usage object verbatim
@@ -20,7 +20,6 @@
 //! on EVERY response — the "not just accounted ones" rule.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -32,10 +31,9 @@ use serde_json::Value;
 
 use super::Server;
 use crate::ir::AnthropicShape;
-use crate::ir::canonical::{CanonicalRequest, ResponseProjection};
+use crate::ir::canonical::ResponseProjection;
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
-use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
 use crate::routing::{BackendAdapterId, ProtocolId};
 use crate::server::InFlightGuard;
@@ -53,12 +51,8 @@ use crate::translate::{self, TranslateError};
 /// moved in.
 pub(crate) struct CodexTurn {
     pub(crate) server: Server,
-    /// The routed backend (`codex_sub`), for endpoint + meter parsing.
-    pub(crate) backend: Arc<dyn Provider>,
-    /// The parsed, middleware-transformed request.
-    pub(crate) canonical: Option<Result<CanonicalRequest, TranslateError>>,
-    /// The request's own shape, pre-transform (the row's shape fields).
-    pub(crate) gate_shape: Option<AnthropicShape>,
+    /// The prepared candidate, or the frontend parse failure that prevented one.
+    pub(crate) attempt: Option<Result<super::inference::InferenceAttempt, TranslateError>>,
     /// The record context, when the pipeline built one.
     pub(crate) record: Option<AnthropicRecordCtx>,
     /// The in-flight guard: rides the response stream when streaming,
@@ -71,8 +65,6 @@ pub(crate) struct CodexTurn {
     /// these; other frontends leave them absent and the binding derives them.
     pub(crate) thread_id: Option<String>,
     pub(crate) request_id: Option<String>,
-    /// The final effective model (routing, retarget, force-newest, map).
-    pub(crate) served_model: Option<String>,
     /// Whether the frontend expects one complete JSON response rather than SSE.
     pub(crate) client_wants_json: bool,
     pub(crate) frontend_wire: CodexFrontendWire,
@@ -172,28 +164,32 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     };
     let backend = target.provider().clone();
     let effective_model = target.effective_model().map(str::to_owned);
-    let canonical = canonical.map(|result| {
+    let attempt = canonical.map(|result| {
         result.map(|canonical| {
-            let inference =
-                super::inference::InferenceRequest::new(requested_model.clone(), canonical);
-            inference
+            super::inference::InferenceRequest::new(requested_model.clone(), canonical)
                 .prepare(target.clone(), effective_model.clone())
-                .canonical()
         })
     });
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
-    if let Some(Ok(canonical_request)) = canonical.as_ref() {
-        let shape = AnthropicShape::from_canonical_responses(
-            canonical_request,
-            original.len() as u64,
-            parsed
-                .as_ref()
-                .and_then(|request| request.get("input"))
-                .and_then(Value::as_array)
-                .map(|input| input.len() as u64),
-        );
+    let prepared_shape = attempt
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|attempt| {
+            let canonical = attempt.canonical();
+            let shape = AnthropicShape::from_canonical_responses(
+                &canonical,
+                original.len() as u64,
+                parsed
+                    .as_ref()
+                    .and_then(|request| request.get("input"))
+                    .and_then(Value::as_array)
+                    .map(|input| input.len() as u64),
+            );
+            (canonical, shape)
+        });
+    if let Some((canonical, shape)) = prepared_shape.as_ref() {
         let lane_reference =
             lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()));
         let facts = server.shadow_facts(
@@ -204,7 +200,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             crate::middleware::force_newest::prompt_bound(original.len() as u64),
             shape.req_messages,
             shape.req_tools,
-            super::anthropic::shadow_capabilities(canonical_request),
+            super::anthropic::shadow_capabilities(canonical),
             None,
             crate::policy::RequestClass::Inference,
         );
@@ -221,7 +217,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         }
     }
 
-    let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
+    let record = parsed.as_ref().map(|_| AnthropicRecordCtx {
         server: server.clone(),
         started,
         path: "/v1/responses",
@@ -232,19 +228,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         backend: backend.clone(),
         binding_id: target.binding().id().clone(),
         betas: None,
-        shape: canonical
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .map(|canonical| {
-                AnthropicShape::from_canonical_responses(
-                    canonical,
-                    original.len() as u64,
-                    request
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .map(|input| input.len() as u64),
-                )
-            }),
+        shape: prepared_shape.map(|(_, shape)| shape),
         ping,
         downgraded_from: None,
         downgraded_to: None,
@@ -263,7 +247,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
     {
-        let Some(Ok(canonical)) = canonical else {
+        let Some(Ok(attempt)) = attempt else {
             return frontend_error_response(
                 CodexFrontendWire::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
@@ -275,13 +259,10 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         return super::anthropic_target::turn(
             server,
             parts,
-            super::anthropic_target::AnthropicInput {
-                canonical,
-                limit_field: parsed
-                    .as_ref()
-                    .and_then(|request| request.get("max_output_tokens").cloned()),
-            },
-            target,
+            attempt,
+            parsed
+                .as_ref()
+                .and_then(|request| request.get("max_output_tokens").cloned()),
             record,
             in_flight,
             super::anthropic_target::FrontendWire::Responses,
@@ -294,7 +275,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenRouterResponses)
     {
-        let Some(Ok(canonical)) = canonical else {
+        let Some(Ok(attempt)) = attempt else {
             return frontend_error_response(
                 CodexFrontendWire::OpenAiResponses,
                 StatusCode::BAD_REQUEST,
@@ -306,11 +287,10 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         return super::openrouter_responses::turn(
             server,
             parts,
-            canonical,
+            attempt,
             parsed
                 .as_ref()
                 .is_some_and(|request| request.get("prompt_cache_key").is_some()),
-            target,
             record,
             in_flight,
         )
@@ -319,15 +299,12 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
 
     turn(CodexTurn {
         server,
-        backend,
-        canonical,
-        gate_shape: None,
+        attempt,
         record,
         in_flight,
         session_id: request_session,
         thread_id,
         request_id,
-        served_model: effective_model,
         client_wants_json,
         frontend_wire: CodexFrontendWire::OpenAiResponses,
     })
@@ -338,25 +315,17 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
 pub(crate) async fn turn(args: CodexTurn) -> Response {
     let CodexTurn {
         server,
-        backend,
-        canonical,
-        gate_shape,
+        attempt,
         mut record,
         in_flight,
         session_id,
         thread_id,
         request_id,
-        served_model,
         client_wants_json,
         frontend_wire,
     } = args;
 
-    // A shape with no messages is untranslatable chat-wise (count_tokens
-    // and batches never reach this branch — the pipeline intercepts
-    // them with a typed error before here).
-    let _ = gate_shape;
-
-    let Some(canonical) = canonical else {
+    let Some(attempt) = attempt else {
         // An untranslatable body on a translated route: the honest
         // answer names the problem; nothing reached the upstream, and
         // there is no row (no measurement, no provider response).
@@ -368,13 +337,25 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             !client_wants_json,
         );
     };
-    let response_projection = canonical
-        .as_ref()
-        .ok()
-        .map(ResponseProjection::for_request)
-        .unwrap_or_default();
-
-    let model = served_model.clone().unwrap_or_default();
+    let attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return translation_error_response(
+                &error,
+                record.as_ref(),
+                frontend_wire,
+                client_wants_json,
+            );
+        }
+    };
+    let backend = attempt.backend().clone();
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt
+        .requested_model()
+        .unwrap_or(&effective_model)
+        .to_owned();
+    let canonical = attempt.canonical();
+    let response_projection = ResponseProjection::for_request(&canonical);
     let prompt_cache_key = session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -383,30 +364,14 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
 
     // The translation itself — pure; a typed failure never reaches the
     // upstream and answers in the frontend's error shape.
-    let rendering = canonical.and_then(|mut canonical| {
-        canonical.model = Some(model.clone());
-        translate::render_codex(&canonical, &prompt_cache_key)
-    });
-    let rendered = match rendering {
+    let rendered = match translate::render_codex(&canonical, &prompt_cache_key) {
         Ok(rendered) => rendered,
         Err(error) => {
-            let (status, message) = translate_failure(&error);
-            if let Some(ctx) = record.as_ref() {
-                record_codex_error(
-                    ctx,
-                    status.as_u16(),
-                    "invalid_request_error",
-                    &message,
-                    None,
-                    frontend_wire.protocol(),
-                );
-            }
-            return frontend_error_response(
+            return translation_error_response(
+                &error,
+                record.as_ref(),
                 frontend_wire,
-                status,
-                "invalid_request_error",
-                &message,
-                !client_wants_json,
+                client_wants_json,
             );
         }
     };
@@ -452,7 +417,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
 
     let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
     if let Some(ctx) = record.as_ref() {
-        server.note_binding_sent(&ctx.binding_id, served_model.as_deref());
+        server.note_binding_sent(&ctx.binding_id, Some(&effective_model));
     }
     let url = backend.endpoint("/responses");
     let upstream = match server
@@ -515,7 +480,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         aggregated_turn(
             record,
             in_flight,
-            model,
+            response_model,
             upstream,
             meter_snapshot,
             frontend_wire,
@@ -526,7 +491,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         streamed_turn(
             record,
             in_flight,
-            model,
+            response_model,
             upstream,
             meter_snapshot,
             frontend_wire,
@@ -794,10 +759,10 @@ impl StreamState {
     /// One upstream event through both observers: the frontend renderer
     /// emits the client's events, the capture latches the ledger's.
     fn observe(&mut self, event: &ResponseEvent) {
+        self.capture.observe(event);
         for emitted in self.frontend.feed(event, self.response_projection) {
             self.pending.push_back(sse_bytes(&emitted));
         }
-        self.capture.observe(event);
     }
 
     /// The upstream failed mid-turn: no row (no usage arrived), the
@@ -892,6 +857,32 @@ fn parse_upstream_error(body: &[u8]) -> ResponseError {
             None
         })
         .unwrap_or_default()
+}
+
+fn translation_error_response(
+    error: &TranslateError,
+    record: Option<&AnthropicRecordCtx>,
+    frontend_wire: CodexFrontendWire,
+    client_wants_json: bool,
+) -> Response {
+    let (status, message) = translate_failure(error);
+    if let Some(ctx) = record {
+        record_codex_error(
+            ctx,
+            status.as_u16(),
+            "invalid_request_error",
+            &message,
+            None,
+            frontend_wire.protocol(),
+        );
+    }
+    frontend_error_response(
+        frontend_wire,
+        status,
+        "invalid_request_error",
+        &message,
+        !client_wants_json,
+    )
 }
 
 /// A translation failure → the HTTP status and message the client sees.

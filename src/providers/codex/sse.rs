@@ -150,9 +150,13 @@ fn event_of(raw: SseEvent) -> Option<ResponseEvent> {
             usage: value
                 .pointer("/response/usage")
                 .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
+            model: response_model(&value),
         }),
         "response.failed" => {
-            error_of(&value, "/response/error").map(|error| ResponseEvent::Failed { error })
+            error_of(&value, "/response/error").map(|error| ResponseEvent::Failed {
+                error,
+                model: response_model(&value),
+            })
         }
         "error" => error_of(&value, "/error").map(|error| ResponseEvent::Error { error }),
         _ => Some(ResponseEvent::Unknown {
@@ -190,6 +194,13 @@ fn object_of<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
     value.get(field).filter(|field| field.is_object())
 }
 
+fn response_model(value: &Value) -> Option<String> {
+    value
+        .pointer("/response/model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// The error payload at `pointer`, typed.
 fn error_of(value: &Value, pointer: &str) -> Option<ResponseError> {
     let error = value.pointer(pointer)?;
@@ -204,9 +215,8 @@ pub struct TurnCapture {
     /// The response id, from `response.created` and confirmed by
     /// `response.completed` when it repeats one.
     response_id: Option<String>,
-    /// The model slug the response named at `response.created` — the
-    /// identity the upstream actually engaged (the routing unit's
-    /// `model`/`raw_model` columns).
+    /// The model slug a response object named — the identity the upstream
+    /// actually engaged (the routing unit's `model`/`raw_model` columns).
     model: Option<String>,
     /// The items that completed (`output_item.done` only — where the
     /// function-call arguments arrive whole).
@@ -261,14 +271,32 @@ impl TurnCapture {
                 if response.id.is_some() {
                     self.response_id.clone_from(&response.id);
                 }
+                if self.model.is_none() {
+                    self.model.clone_from(&response.model);
+                }
                 self.usage.clone_from(&response.usage);
                 self.end_turn = response.end_turn;
             }
-            ResponseEvent::Incomplete { reason, usage } => {
+            ResponseEvent::Incomplete {
+                reason,
+                usage,
+                model,
+            } => {
+                if self.model.is_none() {
+                    self.model.clone_from(model);
+                }
                 self.incomplete_reason = reason.clone();
                 self.usage.clone_from(usage);
             }
-            ResponseEvent::Failed { error } | ResponseEvent::Error { error } => {
+            ResponseEvent::Failed { error, model } => {
+                if self.model.is_none() {
+                    self.model.clone_from(model);
+                }
+                if self.error.is_none() {
+                    self.error = Some(error.clone());
+                }
+            }
+            ResponseEvent::Error { error } => {
                 if self.error.is_none() {
                     self.error = Some(error.clone());
                 }
@@ -544,6 +572,65 @@ mod tests {
     }
 
     #[test]
+    fn terminal_response_models_fill_only_missing_reported_identity() {
+        let terminal_only = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","model":"terminal-model"}}
+
+"#;
+        let mut capture = TurnCapture::new();
+        for event in run(&[terminal_only]) {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.model(), Some("terminal-model"));
+
+        let created_then_terminal = br#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_2","model":"created-model"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_2","model":"terminal-model"}}
+
+"#;
+        let mut capture = TurnCapture::new();
+        for event in run(&[created_then_terminal]) {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.model(), Some("created-model"));
+    }
+
+    #[test]
+    fn terminal_error_models_are_captured_without_synthesis() {
+        let incomplete = br#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"model":"incomplete-model"}}
+
+"#;
+        let mut capture = TurnCapture::new();
+        for event in run(&[incomplete]) {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.model(), Some("incomplete-model"));
+
+        let failed = br#"event: response.failed
+data: {"type":"response.failed","response":{"model":"failed-model","error":{"message":"failed"}}}
+
+"#;
+        let mut capture = TurnCapture::new();
+        for event in run(&[failed]) {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.model(), Some("failed-model"));
+
+        let absent = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_3"}}
+
+"#;
+        let mut capture = TurnCapture::new();
+        for event in run(&[absent]) {
+            capture.observe(&event);
+        }
+        assert_eq!(capture.model(), None);
+    }
+
+    #[test]
     fn the_incomplete_fixture_ends_the_turn_with_its_reason() {
         // The CRLF fixture: both dialects parse identically.
         let bytes = fixture("02_incomplete_crlf.sse");
@@ -581,7 +668,7 @@ mod tests {
 
         // response.failed: the terminal error, with its rate-limit reset.
         match &events[2] {
-            ResponseEvent::Failed { error } => {
+            ResponseEvent::Failed { error, .. } => {
                 assert_eq!(error.kind.as_deref(), Some("invalid_request_error"));
                 assert_eq!(error.code.as_deref(), Some("rate_limit_exceeded"));
                 assert_eq!(error.resets_at, Some(1_800_000_900));

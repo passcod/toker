@@ -724,7 +724,7 @@ impl CanonStream {
                     usage: response.usage.as_ref().map(canonical_usage),
                 });
             }
-            ResponseEvent::Incomplete { reason, usage } => {
+            ResponseEvent::Incomplete { reason, usage, .. } => {
                 out.push(CanonEvent::TurnEnded {
                     stop_reason: match reason.as_deref() {
                         // The only reason vocabulary this wire's
@@ -736,7 +736,7 @@ impl CanonStream {
                     usage: usage.as_ref().map(canonical_usage),
                 });
             }
-            ResponseEvent::Failed { error } => {
+            ResponseEvent::Failed { error, .. } => {
                 out.push(CanonEvent::TurnFailed {
                     error: canon_error_from_response(error),
                 });
@@ -2103,6 +2103,7 @@ mod tests {
                         }))
                         .expect("usage parses"),
                     ),
+                    model: None,
                     end_turn: Some(false),
                 },
             }),
@@ -2199,6 +2200,7 @@ mod tests {
             stream.feed(&ResponseEvent::Incomplete {
                 reason: Some("content_filter".to_owned()),
                 usage: None,
+                model: None,
             }),
             vec![CanonEvent::TurnEnded {
                 stop_reason: CanonStopReason::Refusal,
@@ -2222,6 +2224,7 @@ mod tests {
                 stream.feed(&ResponseEvent::Incomplete {
                     reason: reason.map(str::to_owned),
                     usage: None,
+                    model: None,
                 }),
                 vec![CanonEvent::TurnEnded {
                     stop_reason: expected,

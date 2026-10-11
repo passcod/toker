@@ -11,10 +11,9 @@ use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::ir::canonical::CanonicalRequest;
 use crate::observe::{SseEvent, SseSplitter};
 use crate::providers::codex::{ResponseError, ResponsesSse, TurnCapture};
-use crate::routing::{ModelTarget, ProtocolId};
+use crate::routing::ProtocolId;
 use crate::translate::{self, OpenAiResponsesRenderer};
 
 use super::InFlightGuard;
@@ -31,15 +30,18 @@ use super::record_anthropic::{
 pub(crate) async fn turn(
     server: Server,
     parts: Parts,
-    mut canonical: CanonicalRequest,
+    attempt: super::inference::InferenceAttempt,
     had_prompt_cache_key: bool,
-    target: ModelTarget,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
 ) -> Response {
-    let model = target.effective_model().unwrap_or_default().to_owned();
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt
+        .requested_model()
+        .unwrap_or(&effective_model)
+        .to_owned();
+    let canonical = attempt.canonical();
     let wants_stream = canonical.stream != Some(false);
-    canonical.model = Some(model.clone());
     let rendered = match translate::openrouter_responses_backend::render_openrouter_responses(
         &canonical,
         had_prompt_cache_key,
@@ -55,10 +57,10 @@ pub(crate) async fn turn(
     let body = Bytes::from(
         serde_json::to_vec(&rendered.value).expect("a rendered Responses request serialises"),
     );
-    server.note_binding_sent(target.binding().id(), Some(&model));
+    server.note_binding_sent(attempt.binding().id(), Some(&effective_model));
     let upstream = match send_upstream_to(
         &server,
-        target.provider().as_ref(),
+        attempt.backend().as_ref(),
         &parts,
         body,
         &[],
@@ -119,13 +121,13 @@ pub(crate) async fn turn(
             header::CONTENT_TYPE,
             "text/event-stream".parse().expect("static content type"),
         );
-        let body = Body::from_stream(stream_events(upstream, record, in_flight, model));
+        let body = Body::from_stream(stream_events(upstream, record, in_flight, response_model));
         let mut response = Response::new(body);
         *response.status_mut() = status;
         *response.headers_mut() = outbound;
         response
     } else {
-        complete(upstream, record, in_flight, &model).await
+        complete(upstream, record, in_flight, &response_model).await
     }
 }
 

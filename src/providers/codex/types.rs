@@ -378,9 +378,13 @@ pub enum ResponseEvent {
     Incomplete {
         reason: Option<String>,
         usage: Option<Usage>,
+        model: Option<String>,
     },
     /// `response.failed` — `response.error`.
-    Failed { error: ResponseError },
+    Failed {
+        error: ResponseError,
+        model: Option<String>,
+    },
     /// A top-level `error` event — `error`.
     Error { error: ResponseError },
     /// Any other kind, verbatim.
@@ -424,6 +428,7 @@ impl ResponseEvent {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompletedResponse {
     pub id: Option<String>,
+    pub model: Option<String>,
     pub usage: Option<Usage>,
     pub end_turn: Option<bool>,
 }
@@ -807,13 +812,15 @@ mod tests {
         assert!(
             ResponseEvent::Incomplete {
                 reason: None,
-                usage: None
+                usage: None,
+                model: None,
             }
             .ends_turn()
         );
         assert!(
             ResponseEvent::Failed {
-                error: ResponseError::default()
+                error: ResponseError::default(),
+                model: None,
             }
             .ends_turn()
         );

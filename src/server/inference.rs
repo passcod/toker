@@ -108,8 +108,20 @@ impl InferenceAttempt {
         crate::middleware::canonical::strip_message_effort(&mut self.canonical, source)
     }
 
+    pub(crate) fn stream(&self) -> Option<bool> {
+        self.canonical.stream
+    }
+
+    pub(crate) fn prepare_messages_transport(&mut self, stream: bool, max_tokens: u64) {
+        self.canonical.stream = Some(stream);
+        self.canonical.sampling.max_tokens = Some(max_tokens);
+        self.canonical
+            .extensions
+            .retain(|extension| extension.wire_path() != "$.max_output_tokens");
+    }
+
     pub(crate) fn render_json(&self) -> Result<Rendered<serde_json::Value>, TranslateError> {
-        let canonical = self.canonical();
+        let canonical = &self.canonical;
         match self
             .binding()
             .canonical_backend()
@@ -117,12 +129,12 @@ impl InferenceAttempt {
         {
             Some(BackendAdapterId::OpenAiChatCompletions) => {
                 crate::translate::openai_chat_backend::render_openai_chat(
-                    &canonical,
+                    canonical,
                     self.binding().dialect(),
                 )
             }
             Some(BackendAdapterId::AnthropicMessages) => {
-                crate::translate::render_anthropic(&canonical, self.binding().dialect())
+                crate::translate::render_anthropic(canonical, self.binding().dialect())
             }
             _ => Err(TranslateError::Malformed {
                 reason: format!("{} has no JSON attempt renderer", self.binding().id()),

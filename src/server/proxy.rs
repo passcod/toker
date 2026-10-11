@@ -380,15 +380,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         return super::anthropic_target::turn(
             server,
             parts,
-            super::anthropic_target::AnthropicInput {
-                canonical,
-                limit_field: value
-                    .get("max_completion_tokens")
-                    .filter(|value| !value.is_null())
-                    .or_else(|| value.get("max_tokens"))
-                    .cloned(),
-            },
-            target,
+            attempt,
+            value
+                .get("max_completion_tokens")
+                .filter(|value| !value.is_null())
+                .or_else(|| value.get("max_tokens"))
+                .cloned(),
             record,
             in_flight,
             super::anthropic_target::FrontendWire::Chat,
@@ -404,15 +401,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         let record = record.map(|ctx| chat_cross_record(ctx, backend.clone()));
         return super::codex::turn(super::codex::CodexTurn {
             server,
-            backend,
-            canonical: Some(Ok(canonical)),
-            gate_shape: None,
+            attempt: Some(Ok(attempt)),
             record,
             in_flight,
             session_id,
             thread_id: None,
             request_id: None,
-            served_model: gate_model,
             client_wants_json: !stream_requested,
             frontend_wire: super::codex::CodexFrontendWire::OpenAiChat,
         })
