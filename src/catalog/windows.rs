@@ -282,10 +282,6 @@ impl DeclaredWindow {
         })
     }
 
-    pub fn default_tokens(self) -> u64 {
-        self.default_tokens
-    }
-
     pub fn max_tokens(self) -> u64 {
         self.max_tokens
     }
@@ -295,7 +291,7 @@ impl DeclaredWindow {
     /// and a default above the maximum all read as absent (a dropped
     /// declaration costs a ceiling; a fabricated one would be a lie).
     pub fn from_json(value: &Value) -> Option<DeclaredWindow> {
-        serde_json::from_value(value.clone()).ok()
+        Self::deserialize(value).ok()
     }
 }
 
