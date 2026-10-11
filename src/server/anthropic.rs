@@ -1395,12 +1395,7 @@ fn observe_messages_shadow(
     ) else {
         return;
     };
-    let lane = server.shadow_lane(
-        lane,
-        server.config.gates.cold_min_tokens,
-        cold_idle_ms(&server.config.gates),
-        facts.now_ms,
-    );
+    let lane = server.shadow_lane(lane, Some(target.binding()), facts.now_ms);
     server.observe_policy_shadow(facts, lane, legacy);
 }
 

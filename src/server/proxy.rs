@@ -343,12 +343,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         gate_model.clone(),
         false,
     ) {
-        let lane = server.shadow_lane(
-            cold_lane.as_ref(),
-            server.config.gates.cold_min_tokens,
-            Some(lanes::OPENAI_LANE_TTL_MS),
-            facts.now_ms,
-        );
+        let lane = server.shadow_lane(cold_lane.as_ref(), Some(target.binding()), facts.now_ms);
         server.observe_policy_shadow(facts, lane, legacy);
     }
 

@@ -139,7 +139,7 @@ impl AvailabilitySnapshot {
 /// Read-only lane facts needed for cache-safe resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneFacts {
-    pub cold: bool,
+    pub temperature: super::CacheTemperature,
     pub pinned: Option<ProvisionalPin>,
     pub forced_from: Option<String>,
     pub forced_to: Option<String>,
@@ -364,7 +364,7 @@ pub fn resolve<L: LearningView>(
         }
         let baseline = baseline.ok_or(ResolveFailure::InvalidTemplate)?;
         if facts.class == RequestClass::Compaction
-            && lane.is_some_and(|lane| !lane.cold)
+            && lane.is_some_and(|lane| lane.temperature != super::CacheTemperature::Cold)
             && (selected.cache_transition != Some(CacheTransitionPolicy::AllowCacheLoss)
                 || selected.lane_transition != Some(LaneTransitionPolicy::AllowImmediate))
         {
@@ -763,7 +763,7 @@ fn edge_denial(
     {
         return Some(SkipReason::BilledBoundaryDenied);
     }
-    if lane.is_some_and(|lane| !lane.cold)
+    if lane.is_some_and(|lane| lane.temperature != super::CacheTemperature::Cold)
         && edge.cache_transition != CacheTransitionPolicy::AllowCacheLoss
         && from.and_then(|v| v.cache_domain.as_deref())
             != to.and_then(|v| v.cache_domain.as_deref())
@@ -788,7 +788,9 @@ fn stricter_transition(
 fn transition(policy: LaneTransitionPolicy, lane: Option<&LaneFacts>) -> TransitionDecision {
     match policy {
         LaneTransitionPolicy::PreservePinned => TransitionDecision::Preserve,
-        LaneTransitionPolicy::MoveWhenCold if lane.is_some_and(|lane| lane.cold) => {
+        LaneTransitionPolicy::MoveWhenCold
+            if lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold) =>
+        {
             TransitionDecision::Move
         }
         LaneTransitionPolicy::MoveWhenCold => TransitionDecision::MoveWhenCold,
@@ -829,7 +831,7 @@ fn choose_upgrade<L: LearningView>(
         .ok_or(ResolveFailure::InvalidTemplate)?;
 
     if let Some(lane) = lane
-        && !lane.cold
+        && lane.temperature != super::CacheTemperature::Cold
         && lane.forced_from.as_deref() == Some(baseline)
         && let Some(to) = lane.forced_to.as_ref()
     {
@@ -854,7 +856,7 @@ fn choose_upgrade<L: LearningView>(
                         })
             })
         },
-        |lane| lane.cold,
+        |lane| lane.temperature == super::CacheTemperature::Cold,
     );
     if !eligible {
         return Ok(None);

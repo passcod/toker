@@ -573,13 +573,12 @@ impl Server {
     pub(crate) fn shadow_lane(
         &self,
         lane: Option<&crate::store::Lane>,
-        min_tokens: u64,
-        min_idle_ms: Option<i64>,
+        binding: Option<&crate::routing::BackendBinding>,
         now: i64,
     ) -> Option<LaneFacts> {
         let lane = lane?;
         Some(LaneFacts {
-            cold: crate::middleware::cold::lane_is_cold(Some(lane), min_tokens, min_idle_ms, now),
+            temperature: cache_temperature(lane, binding, now),
             pinned: None,
             forced_from: lane.forced_from.clone(),
             forced_to: lane.forced_to.clone(),
@@ -1231,6 +1230,36 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
     AvailabilitySnapshot::new(bindings)
 }
 
+fn cache_temperature(
+    lane: &crate::store::Lane,
+    binding: Option<&crate::routing::BackendBinding>,
+    now_ms: i64,
+) -> crate::policy::CacheTemperature {
+    use crate::policy::CacheTemperature;
+
+    let Some(binding) = binding else {
+        return CacheTemperature::Unknown;
+    };
+    if lane
+        .pin
+        .as_ref()
+        .is_none_or(|pin| pin.binding_id != *binding.id())
+    {
+        return CacheTemperature::Unknown;
+    }
+    let Some(domain) = binding.cache_domain() else {
+        return CacheTemperature::Unknown;
+    };
+    let idle_ms = now_ms.saturating_sub(lane.updated_ms);
+    if now_ms < lane.updated_ms {
+        CacheTemperature::Unknown
+    } else if idle_ms >= domain.ttl_ms() {
+        CacheTemperature::Cold
+    } else {
+        CacheTemperature::Warm
+    }
+}
+
 fn legacy_route_source(facts: &RequestFacts, target: &ModelTarget) -> String {
     if let Some(requested) = facts.requested_model.as_deref() {
         if requested
@@ -1756,6 +1785,73 @@ api_key = "ak-literal-test"
             seen.lock().unwrap()
         );
         assert_eq!(server.catalog_borrowed_at.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_temperature_requires_matching_verified_binding_evidence() {
+        use crate::policy::CacheTemperature;
+        use crate::store::{Lane, LanePin};
+
+        let dir = crate::setup::test_dir("cache-temperature");
+        let server = server(&dir);
+        let binding = server
+            .registry
+            .bindings()
+            .find(|binding| binding.id_str() == "openrouter.openrouter_chat_completions")
+            .unwrap();
+        let now = 20 * 60 * 1000;
+        let mut lane = Lane {
+            key: "lane".to_owned(),
+            session_id: Some("session".to_owned()),
+            tools_hash: Some("tools".to_owned()),
+            updated_ms: now - 5 * 60 * 1000,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        };
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), now),
+            CacheTemperature::Unknown,
+            "an unattributed legacy lane cannot borrow a binding TTL"
+        );
+        lane.pin = Some(LanePin {
+            policy_revision_id: 1,
+            policy_route_id: crate::policy::RouteId::new("route").unwrap(),
+            route_fingerprint: "11".repeat(32).parse().unwrap(),
+            candidate_id: crate::policy::CandidateId::new("candidate").unwrap(),
+            binding_id: binding.id().clone(),
+            baseline_model: "model".to_owned(),
+            effective_model: "model".to_owned(),
+        });
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), now),
+            CacheTemperature::Warm
+        );
+        lane.updated_ms = now - 10 * 60 * 1000;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), now),
+            CacheTemperature::Cold
+        );
+        lane.updated_ms = now + 1;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(binding), now),
+            CacheTemperature::Unknown
+        );
+        let no_ttl = server
+            .registry
+            .bindings()
+            .find(|binding| binding.id_str() == "anthropic_sub.anthropic_messages")
+            .unwrap();
+        lane.pin.as_mut().unwrap().binding_id = no_ttl.id().clone();
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Unknown
+        );
     }
 
     /// The mark before sending names what toker sent; the response may name
