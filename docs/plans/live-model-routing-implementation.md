@@ -308,15 +308,23 @@ Add the following in the next append-only schema migration.
 
 One immutable row per activation:
 
-- `revision_id INTEGER PRIMARY KEY`;
+- `revision_id INTEGER PRIMARY KEY AUTOINCREMENT`;
 - `created_ms INTEGER NOT NULL`;
 - `activated_ms INTEGER NOT NULL`;
 - `description TEXT`;
-- `activation_scope TEXT NOT NULL`;
+- `activation_scope TEXT NOT NULL` (`new_lanes`, `new_and_cold_lanes`, or
+  `immediate`);
+- `forced_cache_transition INTEGER NOT NULL` (`0` or `1`);
 - `source TEXT NOT NULL` (`legacy`, `draft`, or `reactivation`);
-- `parent_revision_id INTEGER`;
+- `parent_revision_id INTEGER`, referring to an existing immutable revision;
 - `document_json TEXT NOT NULL`;
-- `fingerprint TEXT NOT NULL`.
+- `fingerprint TEXT NOT NULL`, exactly 64 lowercase hexadecimal characters and
+  unique.
+
+Add indexes on `activated_ms` and `parent_revision_id`. Revisions are inserted
+only by the activation transaction; no update or delete Store API exists. The
+canonical document's own format version remains inside `document_json` and is
+validated before insertion and after loading.
 
 The document is stored as canonical JSON because it is loaded, validated, and
 activated as one unit. Child policy records are not independently mutable, so
@@ -333,96 +341,154 @@ but excludes display text and current inventory winners.
 
 ### `routing_policy_state`
 
-A singleton row contains:
+A singleton row uses `id INTEGER PRIMARY KEY CHECK (id = 1)` and contains:
 
-- active revision id;
-- draft generation, starting at zero and increasing on every mutation;
-- draft base revision id;
-- nullable draft canonical JSON;
-- draft update timestamp;
-- legacy-import timestamp.
+- `active_revision_id INTEGER`, nullable until the atomic cutover;
+- `draft_generation INTEGER NOT NULL DEFAULT 0`;
+- `draft_base_revision_id INTEGER`;
+- `draft_document_json TEXT`;
+- `draft_fingerprint TEXT`;
+- `draft_updated_ms INTEGER`;
+- `legacy_imported_ms INTEGER`.
 
-Store methods perform compare-and-swap draft writes and activation
-transactions. Reactivating an old revision copies its document into a new
-revision row; the active pointer never moves backwards to an old row.
-Activation resets the draft base to the new revision, retains the activated
-document as the next editable draft, and advances its generation. A successful
-writer can therefore continue editing without reconstructing the policy.
+The migration inserts row `id = 1` with no active revision and no draft. Its
+presence is not an ownership marker: database ownership begins only when
+`active_revision_id` is non-null. This storage changeset may create and exercise
+drafts and revisions, but it MUST leave that field null and MUST NOT make normal
+startup read policy from SQLite.
+
+A draft is absent only when all four draft fields are null. Otherwise base
+revision, canonical JSON, fingerprint, and update timestamp are all non-null and
+validated together. A compare-and-swap draft write updates the document,
+fingerprint, timestamp, and `draft_generation = draft_generation + 1` only when
+the caller's expected generation matches; zero changed rows is a typed conflict.
+
+Activation uses one `IMMEDIATE` transaction to re-read the expected draft
+generation, load and validate the complete draft, insert the immutable revision,
+update the active pointer and publication desired rows, retain the activated
+canonical document as the next draft, set its base to the new revision, and
+advance the generation. Reactivation performs the same transaction after copying
+an old document into a new revision; the active pointer never moves backwards.
+The transaction is specified here for the later cutover but is not called in
+this non-authoritative storage changeset.
 
 ### `routing_publications`
 
-One row per frontend scope and adapter contains desired revision, applied
-revision, desired and applied inventory generation, state (`pending`,
-`applied`, `failed`, or `unsupported`), a stable detail code, and update
-timestamp. Free-form external error bodies are not stored. Tracking inventory
-generation lets a selector publish a newly discovered winner without creating
-a fictional policy revision.
+One row per frontend scope and adapter is keyed by
+`(scope_key TEXT, adapter TEXT)`. `scope_key` is the canonical string
+`profile:<profile>:<protocol>` or `protocol:<protocol>`; no nullable key column
+participates in identity. Each row contains:
+
+- `desired_revision_id INTEGER NOT NULL`;
+- `applied_revision_id INTEGER`;
+- `desired_inventory_generation INTEGER NOT NULL`;
+- `applied_inventory_generation INTEGER`;
+- `state TEXT NOT NULL` (`pending`, `applied`, `failed`, or `unsupported`);
+- `detail_code TEXT` containing a stable identifier only;
+- `updated_ms INTEGER NOT NULL`.
+
+A result update is compare-and-swap on scope, adapter, desired revision, and
+desired inventory generation, so a late reconciler cannot mark newer desired
+state applied. `applied` requires both applied fields to equal the desired pair;
+`pending`, `failed`, and `unsupported` may retain the last applied pair.
+Free-form external errors are never stored. Add indexes on desired revision and
+state.
+Tracking inventory generation lets a selector publish a newly discovered winner
+without creating a fictional policy revision.
 
 ### Binding-scoped learning
 
-Add `learned_models_by_binding`, keyed by `(binding_id, model_id)`, with the
-same days, maximum prompt, and context declaration facts as the existing
-`models` table. New observations and promotions write only this table.
+Add `learned_models_by_binding`, keyed by `(binding_id TEXT, model_id TEXT)`,
+with:
+
+- `days_json TEXT` containing a canonical sorted set of local-day strings;
+- `max_prompt INTEGER`;
+- `context_window_json TEXT`;
+- `explicitly_promoted INTEGER NOT NULL DEFAULT 0`;
+- `updated_ms INTEGER NOT NULL`.
+
+A merge unions days, takes the maximum prompt, replaces a context declaration
+only with caller-supplied verified evidence, ORs explicit promotion, and
+advances `updated_ms`. Absence remains null rather than zero. Add an index on
+`model_id`
+for the CLI's ambiguity check. New observations and promotions write only this
+table once the binding-aware writer changeset lands.
 
 Keep the existing `models` table as the revision-one legacy learning source.
 This preserves historical promotions whose provider attribution cannot be
-reconstructed. At startup, replay attributable ledger observations into the
-binding-scoped table without copying unassignable grants. Generated revision
-one upgrade policies explicitly consult the legacy table as well; any policy
-created or edited through the routing surface does not.
+reconstructed. Replay is a separate idempotent Store operation, not part of the
+schema migration: rows with an attributable ledger `provider` and route binding
+are merged into the binding table, while unassignable grants are not copied.
+Generated revision-one upgrade policies explicitly consult the legacy table as
+well; authored policies never do.
 
 ### Lane pins
 
-Extend `lanes` with nullable:
+Extend `lanes` with:
 
-- policy revision id;
-- route id and route fingerprint;
-- candidate id;
-- binding id;
-- baseline model;
-- effective model.
+- `pin_generation INTEGER NOT NULL DEFAULT 0`;
+- nullable `policy_revision_id`, `policy_route_id`, `route_fingerprint`,
+  `candidate_id`, `binding_id`, `baseline_model`, and `effective_model`.
 
-Old rows are seeded or conservatively preserved during cutover rather than
-being treated as new merely because they lack policy columns. A pin moves on a
-permitted activation transition or successful fallback, never merely because
-catalogue or health state changed. Pin writes use compare-and-swap: the first
-successful concurrent request to pin an unpinned lane wins, and an old-revision
-completion cannot restore an old pin after an activation transition.
+A lane is unpinned only when all seven pin fields are null. A pin is valid only
+when all seven are non-null, the fingerprint is exact lowercase SHA-256, and its
+revision exists. Add indexes on policy revision and binding. Ordinary lane
+upserts preserve every pin field and generation; they never copy null pin values
+over a concurrent pin.
+
+`compare_and_swap_lane_pin` receives the expected generation and expected prior
+pin identity. It updates all pin fields atomically and increments the generation
+only when both expectations match. First-pin uses generation zero plus all-null
+prior fields, so one concurrent completion wins. Activation/fallback uses the
+loaded generation and complete prior identity, so a stale old-revision
+completion cannot restore an old pin. A zero-row update is a typed conflict, not
+an implicit retry.
+
+Old rows remain unpinned in this migration. Seeding or conservative preservation
+is an explicit cutover transaction after equivalence review, not migration
+backfill; missing evidence never makes a warm lane new.
 
 ### Ledger provenance
 
-Extend `requests` with nullable:
+Extend `requests` with nullable `policy_revision_id`, `presentation_id`,
+`rewrite_id`, `policy_route_id`, `route_fingerprint`, `candidate_id`,
+`baseline_model`, `attempt_group_id`, `attempt_index`, `fallback_reason`, and
+`routing_trace`, plus nullable content-free `parent_session_id`, `child_role`,
+and `relation_source`.
 
-- policy revision id;
-- presentation id;
-- rewrite id;
-- policy route id;
-- route fingerprint;
-- candidate id;
-- baseline model;
-- attempt group id and attempt index;
-- fallback reason;
-- routing trace JSON.
-
-Also add nullable content-free session lineage fields:
-
-- parent session id;
-- child role;
-- relation source.
+`routing_trace` is a JSON-text column and is added to `JSON_TEXT_COLUMNS`; every
+trace is validated as content-free typed provenance before insertion. Add
+indexes on policy revision, attempt group plus index, and parent session. The
+migration does not backfill old rows: null means the row predates or did not use
+policy routing, never revision zero or attempt zero.
 
 The existing session id remains the raw wire identity used by lanes and prompt
 caches. Parent aggregation is a read-model concern and never rewrites it.
+Lineage fields are either all null or all non-null. The store accepts only the
+verified relation source/role pairs defined by the frontend parser, rejects a
+parent equal to the raw child id, and walks existing parent links under the
+store's serialized connection to reject cycles before insertion. A missing
+parent row is allowed. Ledger import preserves already validated fields but does
+not invent lineage from historical shape or timing.
 
 Every upstream attempt gets its own ledger row and cost semantics. Attempt
-groups use an opaque unique id and zero-based indices for actual sends. The
-trace contains only ids, classifications, availability states, and reason codes.
-Preflight skips ride on the first attempted row or the local terminal row; a
-preflight-only `route-unavailable` row has a group id and no attempt index.
-Logical-request views group by `attempt_group_id`, while cost, meters, errors,
-quota fitting, and model learning consume the relevant attempt evidence. The
-same-candidate `thinking: disabled` negotiation retry is an attempt in the same
-group. The existing requested and effective model columns retain their current
-meanings.
+groups use a lowercase 32-hex random identifier generated once per logical
+request. Actual sends use contiguous zero-based indices; `attempt_index` is null
+only for a preflight-only terminal row, which still has a group id. A partial
+unique index on `(attempt_group_id, attempt_index)` where the index is non-null
+prevents duplicate send identities.
+
+The trace contains only ids, classifications, availability states, and reason
+codes. Preflight skips ride on the first attempted row or local terminal row.
+Logical-request views group rows with a non-null `attempt_group_id`; rows
+without one remain independent legacy logical requests. Request counts count
+groups plus
+legacy rows, token/cost/meter totals sum actual attempt rows, and the group's
+final client outcome comes from its greatest attempt index or preflight terminal
+row. Quota fitting and model learning consume only the provider evidence on each
+actual attempt, never a group-level synthetic total. The same-candidate
+`thinking: disabled` negotiation retry is an attempt in the same group. The
+existing requested and effective model columns retain their current meanings.
 `raw_model` remains the provider-reported wire identity. Operational views
 labelled `reported` read that field and show absence as `-`; the normalised
 `model` fallback remains available only to internal served-model and learning
@@ -794,12 +860,20 @@ Unexplained differences block cutover.
 ### 6. Policy persistence and binding-scoped state
 
 Only after the document and resolver contracts pass shadow review, add the
-policy, publication, binding-learning, lane-pin, lineage, and
-ledger-provenance schema in one reviewed append-only migration. Specify all
-keys, indexes, null meanings, JSON columns, compare-and-swap and activation
-transactions, attempt-group read semantics, and startup recovery first. Add
-transactional store methods, but do not write the ownership marker or steer
-traffic yet.
+policy, publication, binding-learning, lane-pin, lineage, and ledger-provenance
+schema in one reviewed append-only migration, exactly as specified above. Add
+round-trip and transaction tests against both a fresh database and a fixture
+migrated from the immediately preceding schema version. Update every complete
+`RequestRow`/`Lane` constructor, insert/select projection, import/export path,
+`JSON_TEXT_COLUMNS`, and read-only Store query in the same changeset.
+
+Add draft/revision/publication, binding-learning, and lane-pin compare-and-swap
+Store APIs, but leave `routing_policy_state.active_revision_id` null. Do not
+call activation, write the ownership marker, load normal runtime policy from
+SQLite,
+or steer traffic in this changeset. A database opened read-only exposes the new
+read APIs and predictably rejects writes through SQLite's existing read-only
+error path.
 
 Move new observations, recently-sent state, family elections, context fit, and
 promotion onto binding ids and compiled classifiers. Preserve the legacy table
