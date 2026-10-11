@@ -178,11 +178,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .canonical_backend()
         .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenAiChatCompletions)
     {
-        let rendered = translate::openai_chat_backend::render_openai_chat(
-            &canonical,
-            attempt.binding().dialect(),
-        );
-        let rendered = match rendered {
+        let rendered = match attempt.render_json() {
             Ok(rendered) => rendered,
             Err(error) => return compatibility_error(&error.to_string()),
         };

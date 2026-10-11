@@ -10,7 +10,8 @@ use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold::RetargetOutcome;
 use crate::middleware::model_map::{MapTarget, ModelMap};
 use crate::providers::Provider;
-use crate::routing::{BackendBinding, ModelTarget};
+use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
+use crate::translate::{Rendered, TranslateError};
 
 #[derive(Clone)]
 pub(crate) struct InferenceRequest {
@@ -107,6 +108,25 @@ impl InferenceAttempt {
         crate::middleware::canonical::strip_message_effort(&mut self.canonical, source)
     }
 
+    pub(crate) fn render_json(&self) -> Result<Rendered<serde_json::Value>, TranslateError> {
+        let canonical = self.canonical();
+        match self
+            .binding()
+            .canonical_backend()
+            .map(|backend| backend.adapter())
+        {
+            Some(BackendAdapterId::OpenAiChatCompletions) => {
+                crate::translate::openai_chat_backend::render_openai_chat(
+                    &canonical,
+                    self.binding().dialect(),
+                )
+            }
+            _ => Err(TranslateError::Malformed {
+                reason: format!("{} has no JSON attempt renderer", self.binding().id()),
+            }),
+        }
+    }
+
     /// Clone this candidate's private canonical IR for one backend renderer.
     pub(crate) fn canonical(&self) -> CanonicalRequest {
         let mut canonical = self.canonical.clone();
@@ -160,6 +180,8 @@ mod tests {
         let second = attempt.canonical();
         assert_eq!(second.model.as_deref(), Some("invented-model"));
         assert_eq!(second.system.len(), 1);
+        let rendered = attempt.render_json().expect("chat rendering");
+        assert_eq!(rendered.value["model"], "invented-model");
     }
 
     #[test]
