@@ -1213,10 +1213,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()
                 .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
-                Some((prepared, Bytes::from(bytes)))
+                Some(Bytes::from(bytes))
             });
-        if let Some((prepared, stripped)) = canonical_stripped {
-            canonical = Some(prepared);
+        if let Some(stripped) = canonical_stripped {
             forward = stripped;
             tracing::info!("stripped mid-conversation effort for {model}");
         }
@@ -1234,147 +1233,61 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.models.note_served(served_model.as_deref(), now_ms());
     }
 
-    // ── the codex branch: translate instead of byte-forward ──
-    //
-    // The codex backend speaks the Responses dialect, not Anthropic's:
-    // a request routed here goes through the translation unit (both
-    // directions), never byte-forwarded. count_tokens and batches have
-    // no codex equivalent (the CLI defines none) — those paths answer
-    // with a typed anthropic error instead of forwarding JSON the
-    // backend would only reject.
-    let response_projection = canonical
-        .as_ref()
-        .map(ResponseProjection::for_request)
-        .unwrap_or_default();
-    if target
-        .binding()
-        .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
-    {
-        if path == "/v1/messages" {
-            return codex::turn(codex::CodexTurn {
-                server,
-                attempt: inference_attempt
-                    .take()
-                    .map(Ok)
-                    .or_else(|| canonical_error.take().map(Err)),
-                record,
-                in_flight,
-                session_id,
-                thread_id: None,
-                request_id: None,
-                client_wants_json,
-                frontend_wire: codex::CodexFrontendWire::Anthropic,
-            })
-            .await;
+    // Administrative paths retain their protocol-owned forwarding behavior.
+    if path != "/v1/messages" {
+        if target
+            .binding()
+            .canonical_backend()
+            .is_some_and(|binding| binding.adapter() == BackendAdapterId::CodexResponses)
+        {
+            return codex::anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "this backend does not support count_tokens or batch requests",
+                false,
+            );
         }
-        // count_tokens and batches have no codex equivalent (the codex
-        // client defines none): a typed anthropic error, never a
-        // byte-forward of JSON the backend would only reject. No row —
-        // the status is toker's own (the 502 rule: a proxy-generated
-        // status is never a fabricated provider measurement). These
-        // paths are JSON-only by definition (no stream flag exists on
-        // them), so the error renders as the JSON object.
-        return codex::anthropic_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "this backend does not support count_tokens or batch requests",
-            false,
-        );
-    }
-
-    // A stale anthropic models catalogue refreshes on this request's
-    // own bearer when toker holds no key (spawned; never waited on).
-    server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
-
-    // Native Messages bindings render the same canonical request that all
-    // inference middleware mutated. Administrative paths keep their wire.
-    if path == "/v1/messages" {
-        let rendered = inference_attempt
-            .as_ref()
-            .ok_or_else(|| {
-                canonical_error
-                    .take()
-                    .unwrap_or_else(|| translate::TranslateError::Malformed {
-                        reason: "Messages inference body is not canonical".to_owned(),
-                    })
-            })
-            .and_then(super::inference::InferenceAttempt::render_json);
-        let rendered = match rendered {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                let stream = serde_json::from_slice::<serde_json::Value>(&forward)
-                    .ok()
-                    .and_then(|body| body.get("stream").and_then(serde_json::Value::as_bool))
-                    .unwrap_or(false);
-                return codex::anthropic_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &format!("the request could not be translated: {error}"),
-                    stream,
-                );
-            }
-        };
-        forward = match serde_json::to_vec(&rendered.value) {
-            Ok(body) => Bytes::from(body),
-            Err(error) => {
-                tracing::error!(%error, "canonical Messages request serialisation failed");
-                return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
-            }
-        };
-    }
-
-    // 6. Upstream; 7.-9. in the response paths. Session headers pass
-    // through (see the module docs), so the strip list is
-    // empty; `x-toker-*` is stripped unconditionally either way.
-    let sent = forward.clone();
-    if path == "/v1/messages" {
-        server.note_binding_sent(target.binding().id(), served_model.as_deref());
-    }
-    match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
-        Ok(upstream) => {
-            let upstream = if path == "/v1/messages" {
-                match retry_thinking_off(
-                    &server,
-                    backend.as_ref(),
-                    &parts,
-                    sent,
-                    upstream,
-                    &mut record,
-                )
-                .await
-                {
-                    Ok(upstream) => upstream,
-                    Err(response) => return *response,
-                }
-            } else {
-                upstream
-            };
-            if path == "/v1/messages" {
-                forward_canonical_messages(
-                    server,
-                    backend,
-                    upstream,
-                    record,
-                    in_flight,
-                    served_model.as_deref().unwrap_or_default(),
-                    response_projection,
-                )
-                .await
-            } else {
+        server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
+        return match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
+            Ok(upstream) => {
                 forward_legacy_response(server, backend, upstream, record, in_flight).await
             }
-        }
-        Err(error) => {
-            // No upstream response: nothing measured, and the error row is
-            // provider-response-shaped (status/type/retry-after), so this
-            // surfaces as 502 unledgered and logged — never a fabricated
-            // provider status. The guard drops here too: the exchange is
-            // over, however it ended.
-            tracing::warn!(%error, "upstream request failed");
-            transport_failure(ErrorWire::Anthropic, &error)
-        }
+            Err(error) => {
+                tracing::warn!(%error, "upstream request failed");
+                transport_failure(ErrorWire::Anthropic, &error)
+            }
+        };
     }
+
+    let adapter = target
+        .binding()
+        .canonical_backend()
+        .map(|backend| backend.adapter());
+    if adapter == Some(BackendAdapterId::AnthropicMessages) {
+        server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
+    }
+    let attempt = inference_attempt
+        .take()
+        .map(Ok)
+        .or_else(|| canonical_error.take().map(Err))
+        .unwrap_or_else(|| {
+            Err(translate::TranslateError::Malformed {
+                reason: "Messages inference body is not canonical".to_owned(),
+            })
+        });
+    super::inference::coordinate_messages(
+        server,
+        adapter,
+        attempt,
+        super::inference::MessagesAttemptInput {
+            parts,
+            record,
+            in_flight,
+            session_id,
+            client_wants_json,
+        },
+    )
+    .await
 }
 
 fn observe_batch_shadow(
@@ -1552,7 +1465,7 @@ fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
 ///
 /// Once only: a second refusal is forwarded and recorded like any error.
 /// The refused response's meters still feed the gate.
-async fn retry_thinking_off(
+pub(crate) async fn retry_thinking_off(
     server: &Server,
     backend: &dyn Provider,
     parts: &axum::http::request::Parts,
@@ -1791,7 +1704,7 @@ fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
 /// A native Messages binding's universal-canonical response path. The
 /// provider bytes feed accounting before interpretation; only the client wire
 /// is rendered from canonical events or a canonical complete turn.
-async fn forward_canonical_messages(
+pub(crate) async fn forward_canonical_messages(
     server: Server,
     backend: Arc<dyn Provider>,
     upstream: reqwest::Response,

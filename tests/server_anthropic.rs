@@ -776,6 +776,7 @@ async fn sse_messages_cross_canonical_adapters_and_ledger() {
 
     let bytes = response.bytes().await.expect("sse bytes");
     let rendered = String::from_utf8(bytes.to_vec()).expect("rendered SSE is UTF-8");
+    assert!(rendered.contains(r#""model":"claude-opus-5""#));
     assert!(rendered.contains("Kia ora — tēnā koe 🌿"));
     assert!(rendered.contains(r#""stop_reason":"end_turn""#));
     assert!(rendered.contains(r#""input_tokens":2"#));
@@ -916,6 +917,7 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body bytes");
     let rendered: Value = serde_json::from_slice(&bytes).expect("canonical response JSON");
+    assert_eq!(rendered["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(
         rendered["content"],
         json!([{"type": "text", "text": "Done."}])
@@ -1799,6 +1801,29 @@ async fn non_json_messages_are_rejected_locally_without_a_row() {
 
     assert_no_rows(&store).await;
     assert_eq!(store.load_meters("anthropic_sub").expect("meters"), None);
+}
+
+#[tokio::test]
+async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": "not an array",
+        "stream": true,
+    }))
+    .unwrap();
+
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let error: Value = response.json().await.expect("typed compatibility error");
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(mock.captured().is_empty());
+    assert_no_rows(&store).await;
 }
 
 #[tokio::test]

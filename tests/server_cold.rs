@@ -790,7 +790,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_response_model(&bytes, "claude-sonnet-5");
+    assert_response_model(&bytes, "claude-opus-5");
 
     // The upstream body is the transform's bytes, asserted exactly: the
     // model changed, every cache_control went, and the mid-conversation
@@ -957,7 +957,7 @@ async fn a_writes_free_model_exempts_the_anthropic_gate_and_records_cold_quiet()
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.bytes().await.expect("body");
-    assert_response_model(&bytes, "free/claude-sonnet");
+    assert_response_model(&bytes, "claude-opus-5");
     let captured = mock.captured();
     assert_eq!(captured.len(), 1);
     let sent: Value = serde_json::from_slice(&captured[0]).expect("the forwarded body");

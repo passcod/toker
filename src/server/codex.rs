@@ -49,29 +49,6 @@ use crate::server::record_anthropic::{record_codex_error, record_responses_measu
 use crate::store::SessionLineage;
 use crate::translate::{self, TranslateError};
 
-/// Everything the branch needs from a translated frontend pipeline,
-/// moved in.
-pub(crate) struct CodexTurn {
-    pub(crate) server: Server,
-    /// The prepared candidate, or the frontend parse failure that prevented one.
-    pub(crate) attempt: Option<Result<super::inference::InferenceAttempt, TranslateError>>,
-    /// The record context, when the pipeline built one.
-    pub(crate) record: Option<AnthropicRecordCtx>,
-    /// The in-flight guard: rides the response stream when streaming,
-    /// drops at return otherwise — a request being served holds the
-    /// machine awake, and no early return may leak the count.
-    pub(crate) in_flight: Option<InFlightGuard>,
-    /// Session identity — the prompt-cache key when present.
-    pub(crate) session_id: Option<String>,
-    /// Provider-binding request identities. Native Responses clients supply
-    /// these; other frontends leave them absent and the binding derives them.
-    pub(crate) thread_id: Option<String>,
-    pub(crate) request_id: Option<String>,
-    /// Whether the frontend expects one complete JSON response rather than SSE.
-    pub(crate) client_wants_json: bool,
-    pub(crate) frontend_wire: CodexFrontendWire,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFrontendWire {
     Anthropic,
@@ -422,50 +399,6 @@ pub(crate) async fn prepare(
         client_wants_json,
         frontend_wire,
     })
-}
-
-/// One turn: prepare locally, mark the actual target, send, translate back.
-pub(crate) async fn turn(args: CodexTurn) -> Response {
-    let CodexTurn {
-        server,
-        attempt,
-        record,
-        in_flight,
-        session_id,
-        thread_id,
-        request_id,
-        client_wants_json,
-        frontend_wire,
-    } = args;
-    let Some(attempt) = attempt else {
-        return frontend_error_response(
-            frontend_wire,
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "the request body could not be parsed for translation to this backend",
-            !client_wants_json,
-        );
-    };
-    let ready = match prepare(
-        &server,
-        AttemptInput {
-            attempt,
-            record,
-            in_flight,
-            session_id,
-            thread_id,
-            request_id,
-            client_wants_json,
-            frontend_wire,
-        },
-    )
-    .await
-    {
-        Ok(ready) => ready,
-        Err(response) => return *response,
-    };
-    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready.execute(server).await
 }
 
 async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Response) -> Response {
