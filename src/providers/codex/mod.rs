@@ -521,7 +521,14 @@ impl Provider for CodexSub {
         let Some(auth) = self.auth() else {
             return super::CredentialAvailability::KnownMissingOrExpired;
         };
-        if auth.needs_refresh(now_unix_seconds) {
+        if auth.access_token().is_none()
+            || auth
+                .expires_at()
+                .is_some_and(|expires_at| expires_at <= now_unix_seconds)
+                && auth.refresh_token().is_none()
+        {
+            super::CredentialAvailability::KnownMissingOrExpired
+        } else if auth.needs_refresh(now_unix_seconds) {
             super::CredentialAvailability::Refreshable
         } else {
             super::CredentialAvailability::Held
@@ -609,6 +616,33 @@ mod tests {
             slashed.endpoint("/responses").as_str(),
             "http://localhost:9/backend-api/codex/responses",
             "a trailing slash on the base never doubles up"
+        );
+    }
+
+    #[test]
+    fn credential_evidence_distinguishes_missing_held_and_refreshable() {
+        let missing = provider(std::path::Path::new("/nonexistent/auth.json"));
+        assert_eq!(
+            missing.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiResponses, 0),
+            crate::providers::CredentialAvailability::KnownMissingOrExpired
+        );
+
+        let fresh = auth_file("credential-evidence-fresh", None);
+        let held = provider(&fresh);
+        assert_eq!(
+            held.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiResponses, 0),
+            crate::providers::CredentialAvailability::Held
+        );
+
+        let expiring = auth_file("credential-evidence-refresh", Some(100));
+        let refreshable = provider(&expiring);
+        assert_eq!(
+            refreshable.credential_availability(
+                &HeaderMap::new(),
+                ProtocolId::OpenAiResponses,
+                100,
+            ),
+            crate::providers::CredentialAvailability::Refreshable
         );
     }
 
