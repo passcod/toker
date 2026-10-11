@@ -44,8 +44,7 @@ pub use pinning::{PinPersistence, persist_transition};
 pub use resolve::{
     AttemptPlan, AvailabilitySnapshot, BindingAvailability, CandidateEvidence,
     CatalogueAvailability, Evidence, LaneFacts, NoLearning, ProvisionalPin, RequestClass,
-    RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, TransitionDecision,
-    resolve,
+    RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, resolve,
 };
 pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
 pub use shadow::{

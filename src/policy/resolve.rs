@@ -168,13 +168,6 @@ pub enum RouteProvenance {
     Compaction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransitionDecision {
-    Preserve,
-    MoveWhenCold,
-    Move,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
     Disabled,
@@ -227,7 +220,7 @@ pub struct AttemptPlan {
     pub aliased_model: Option<String>,
     pub effective_model: String,
     pub compaction: bool,
-    pub transition: TransitionDecision,
+    pub lane_transition: LaneTransitionPolicy,
     pub trace: Vec<TraceEvent>,
 }
 
@@ -310,7 +303,7 @@ pub fn resolve<L: LearningView>(
             aliased_model: None,
             effective_model: model.to_owned(),
             compaction: facts.class == RequestClass::Compaction,
-            transition: TransitionDecision::Preserve,
+            lane_transition: LaneTransitionPolicy::PreservePinned,
             trace,
         });
     }
@@ -431,7 +424,7 @@ pub fn resolve<L: LearningView>(
             aliased_model: aliased,
             effective_model: effective,
             compaction: facts.class == RequestClass::Compaction,
-            transition: transition(lane_policy, lane),
+            lane_transition: lane_policy,
             trace,
         });
     }
@@ -783,19 +776,6 @@ fn stricter_transition(
         (PreservePinned, _) | (_, PreservePinned) => PreservePinned,
         (MoveWhenCold, _) | (_, MoveWhenCold) => MoveWhenCold,
         (AllowImmediate, AllowImmediate) => AllowImmediate,
-    }
-}
-
-fn transition(policy: LaneTransitionPolicy, lane: Option<&LaneFacts>) -> TransitionDecision {
-    match policy {
-        LaneTransitionPolicy::PreservePinned => TransitionDecision::Preserve,
-        LaneTransitionPolicy::MoveWhenCold
-            if lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold) =>
-        {
-            TransitionDecision::Move
-        }
-        LaneTransitionPolicy::MoveWhenCold => TransitionDecision::MoveWhenCold,
-        LaneTransitionPolicy::AllowImmediate => TransitionDecision::Move,
     }
 }
 
