@@ -845,7 +845,13 @@ fn choose_upgrade<L: LearningView>(
                     || learning
                         .recently_sent(candidate.binding_id(), baseline)
                         .ok()
-                        .is_some_and(|last| idle_for_ttl(last, None, facts.now_ms))
+                        .is_some_and(|recency| match recency {
+                            super::RecencyEvidence::Unknown => false,
+                            super::RecencyEvidence::Covered {
+                                last_sent,
+                                covered_since,
+                            } => idle_for_ttl(last_sent, covered_since, facts.now_ms),
+                        })
             })
         },
         |lane| lane.cold,
@@ -1031,8 +1037,8 @@ pub struct NoLearning;
 impl LearningView for NoLearning {
     type Error = Infallible;
 
-    fn recently_sent(&self, _: &BindingId, _: &str) -> Result<Option<i64>, Self::Error> {
-        Ok(None)
+    fn recently_sent(&self, _: &BindingId, _: &str) -> Result<super::RecencyEvidence, Self::Error> {
+        Ok(super::RecencyEvidence::Unknown)
     }
     fn learned(
         &self,
@@ -1055,9 +1061,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::catalog::offers::OfferInventory;
+    use crate::catalog::offers::{BackendOffer, OfferInventory};
     use crate::policy::*;
     use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, RouteRegistry};
+    use crate::store::Store;
 
     fn id<T: std::str::FromStr>(value: &str) -> T
     where
@@ -1145,6 +1152,54 @@ mod tests {
         .unwrap()
     }
 
+    fn upgrade_inventory() -> OfferInventory {
+        OfferInventory::from_offers(["claude-opus-4-8", "claude-opus-5"].map(|model| {
+            BackendOffer {
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                provider: "anthropic_sub".to_owned(),
+                backend_model_id: model.to_owned(),
+                binding: ANTHROPIC_SUB_MESSAGES.clone(),
+                context_window: Some(1_000_000),
+                chronology: None,
+                fetched_at_ms: 1,
+                raw: serde_json::Value::Null,
+            }
+        }))
+    }
+
+    fn upgrade_document() -> PolicyDocument {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        first.upgrade_policy_id = Some(id("upgrade"));
+        let mut document = document(route(first, vec![]));
+        document.classifiers.push(FamilyClassifier {
+            id: id("classifier"),
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            model_matcher: MatcherSpec::Regex(
+                r"^claude-(?P<family>[a-z]+)-(?P<version>[0-9-]+)$".to_owned(),
+            ),
+            family_template: "${family}".to_owned(),
+            version_template: "${version}".to_owned(),
+            version_parser: VersionParserSpec::LegacyNumericTuple {
+                separator: "-".to_owned(),
+            },
+        });
+        document.upgrades.push(UpgradePolicy {
+            id: id("upgrade"),
+            classifier_id: id("classifier"),
+            enabled: true,
+            minimum_learning: MinimumLearning::None,
+            allow_manual_promotion: false,
+            inventory_sources: vec![InventorySource::Catalogue],
+            lane_transition: LaneTransitionPolicy::MoveWhenCold,
+            allow_revision_one_legacy_learning: false,
+        });
+        document
+    }
+
     fn availability(configured: bool, fresh: bool) -> AvailabilitySnapshot {
         AvailabilitySnapshot::new(BTreeMap::from([
             (
@@ -1198,6 +1253,51 @@ mod tests {
             class: RequestClass::Inference,
             now_ms: 100,
         }
+    }
+
+    #[test]
+    fn unknown_recency_cannot_prove_an_unknown_lane_cold() {
+        let inventory = upgrade_inventory();
+        let policy = compile(upgrade_document(), &inventory);
+        let mut request = facts("claude-opus-4-8");
+        request.message_count = Some(NEW_CONVERSATION_MESSAGES + 1);
+        request.now_ms = 4_000_000;
+
+        let plan = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(plan.effective_model, "claude-opus-4-8");
+        assert_eq!(plan.upgraded_model, None);
+    }
+
+    #[test]
+    fn binding_learning_without_recency_cannot_prove_an_unknown_lane_cold() {
+        let inventory = upgrade_inventory();
+        let policy = compile(upgrade_document(), &inventory);
+        let learning = BindingLearningView::new(Arc::new(Store::open(":memory:").unwrap()));
+        let mut request = facts("claude-opus-4-8");
+        request.message_count = Some(NEW_CONVERSATION_MESSAGES + 1);
+        request.now_ms = 4_000_000;
+
+        let plan = resolve(
+            &policy,
+            &inventory,
+            &learning,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(plan.effective_model, "claude-opus-4-8");
+        assert_eq!(plan.upgraded_model, None);
     }
 
     #[test]

@@ -673,8 +673,18 @@ impl ModelStore {
     /// When `model` was last sent upstream, when this process or its seed
     /// knows. The identity is normalised first.
     pub fn last_served(&self, model: &str) -> Option<i64> {
+        self.last_served_record(model)?.0
+    }
+
+    /// The last-served observation together with the record's coverage.
+    ///
+    /// The outer `None` means the record could not be read, not that the model
+    /// is absent. Callers that use absence as evidence must preserve that
+    /// distinction.
+    pub fn last_served_record(&self, model: &str) -> Option<(Option<i64>, Option<i64>)> {
         let id = model_identity(model)?;
-        self.served_on.lock().ok()?.get(&id).copied()
+        let last_served = self.served_on.lock().ok()?.get(&id).copied();
+        Some((last_served, self.covered_since))
     }
 
     /// How far back the served map vouches: `None` = the whole ledger was
@@ -1234,6 +1244,17 @@ mod tests {
             Some(5_000),
             "a cut tail vouches only from its first row"
         );
+    }
+
+    #[test]
+    fn poisoned_recently_served_map_is_not_covered_absence() {
+        let models = models();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = models.served_on.lock().unwrap();
+            panic!("poison recently-served map");
+        });
+
+        assert_eq!(models.last_served_record("claude-opus-5"), None);
     }
 
     #[test]

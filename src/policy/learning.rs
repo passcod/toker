@@ -45,6 +45,19 @@ impl LearnedEvidence {
     }
 }
 
+/// Recency evidence and the span over which absence is meaningful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecencyEvidence {
+    /// This view has no recency record for the requested binding.
+    Unknown,
+    /// `last_sent` was observed within a record that reaches back to
+    /// `covered_since`. `None` coverage means the whole ledger was read.
+    Covered {
+        last_sent: Option<i64>,
+        covered_since: Option<i64>,
+    },
+}
+
 /// Content-free read interface used by the eventual resolver.
 pub trait LearningView {
     type Error;
@@ -53,7 +66,7 @@ pub trait LearningView {
         &self,
         binding_id: &BindingId,
         model_id: &str,
-    ) -> Result<Option<i64>, Self::Error>;
+    ) -> Result<RecencyEvidence, Self::Error>;
 
     fn learned(
         &self,
@@ -83,8 +96,8 @@ impl LegacyLearningView {
 /// Binding-local learning over the non-authoritative routing state tables.
 ///
 /// Recently-sent evidence has a separate write path and is not persisted in
-/// this storage slice, so this view reports it as absent rather than borrowing
-/// the unattributable legacy map.
+/// this storage slice, so this view reports that evidence as unknown rather
+/// than borrowing the unattributable legacy map.
 pub struct BindingLearningView {
     store: Arc<Store>,
 }
@@ -102,8 +115,8 @@ impl LearningView for BindingLearningView {
         &self,
         _binding_id: &BindingId,
         _model_id: &str,
-    ) -> Result<Option<i64>, Self::Error> {
-        Ok(None)
+    ) -> Result<RecencyEvidence, Self::Error> {
+        Ok(RecencyEvidence::Unknown)
     }
 
     fn learned(
@@ -142,8 +155,14 @@ impl LearningView for LegacyLearningView {
         &self,
         _binding_id: &BindingId,
         model_id: &str,
-    ) -> Result<Option<i64>, Self::Error> {
-        Ok(self.store.last_served(model_id))
+    ) -> Result<RecencyEvidence, Self::Error> {
+        Ok(self.store.last_served_record(model_id).map_or(
+            RecencyEvidence::Unknown,
+            |(last_sent, covered_since)| RecencyEvidence::Covered {
+                last_sent,
+                covered_since,
+            },
+        ))
     }
 
     fn learned(
@@ -291,11 +310,17 @@ mod tests {
 
         assert_eq!(
             view.recently_sent(&first, "claude-sonnet-5").unwrap(),
-            Some(9_000)
+            RecencyEvidence::Covered {
+                last_sent: Some(9_000),
+                covered_since: Some(5_000),
+            }
         );
         assert_eq!(
             view.recently_sent(&second, "claude-sonnet-5").unwrap(),
-            Some(9_000)
+            RecencyEvidence::Covered {
+                last_sent: Some(9_000),
+                covered_since: Some(5_000),
+            }
         );
         let learned = view.learned(&first, "claude-sonnet-5").unwrap().unwrap();
         assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
@@ -309,7 +334,13 @@ mod tests {
         let models = ModelStore::seeded(store, &[], None);
         let view = LegacyLearningView::new(Arc::new(models));
         let binding = binding("openrouter.openrouter_messages");
-        assert_eq!(view.recently_sent(&binding, "unknown-model").unwrap(), None);
+        assert_eq!(
+            view.recently_sent(&binding, "unknown-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: None,
+                covered_since: None,
+            }
+        );
         assert_eq!(view.learned(&binding, "unknown-model").unwrap(), None);
         assert!(view.known_models(&binding).unwrap().is_empty());
     }
@@ -364,6 +395,9 @@ mod tests {
         assert_eq!(view.known_models(&second).unwrap(), ["other"]);
         assert_eq!(view.active_days(&first).unwrap(), 2);
         assert_eq!(view.active_days(&second).unwrap(), 1);
-        assert_eq!(view.recently_sent(&first, "shared-name").unwrap(), None);
+        assert_eq!(
+            view.recently_sent(&first, "shared-name").unwrap(),
+            RecencyEvidence::Unknown
+        );
     }
 }
