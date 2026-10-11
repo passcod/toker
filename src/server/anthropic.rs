@@ -1293,9 +1293,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Native Messages bindings render the same canonical request that all
     // inference middleware mutated. Administrative paths keep their wire.
     if path == "/v1/messages" {
-        let dialect = Some(target.binding().dialect());
-        let rendered = canonical
-            .take()
+        let rendered = inference_attempt
+            .as_ref()
             .ok_or_else(|| {
                 canonical_error
                     .take()
@@ -1303,15 +1302,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         reason: "Messages inference body is not canonical".to_owned(),
                     })
             })
-            .and_then(|mut canonical| {
-                canonical.model.clone_from(&served_model);
-                let Some(dialect) = dialect else {
-                    return Err(translate::TranslateError::Malformed {
-                        reason: format!("{} has no Messages binding", backend.id()),
-                    });
-                };
-                translate::render_anthropic(&canonical, dialect)
-            });
+            .and_then(super::inference::InferenceAttempt::render_json);
         let rendered = match rendered {
             Ok(rendered) => rendered,
             Err(error) => {

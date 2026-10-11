@@ -121,6 +121,9 @@ impl InferenceAttempt {
                     self.binding().dialect(),
                 )
             }
+            Some(BackendAdapterId::AnthropicMessages) => {
+                crate::translate::render_anthropic(&canonical, self.binding().dialect())
+            }
             _ => Err(TranslateError::Malformed {
                 reason: format!("{} has no JSON attempt renderer", self.binding().id()),
             }),
