@@ -794,7 +794,10 @@ mod tests {
                 "claude-3-7-sonnet-20250219",
             ] {
                 let expected = crate::middleware::models::family_of(model).expect("legacy family");
-                let classified = classifier.classify(model).expect("compiled family");
+                let classified = classifier
+                    .classify(model)
+                    .expect("classification succeeds")
+                    .expect("compiled family");
                 assert_eq!(classified.family, expected.name, "{model}");
                 assert_eq!(
                     classified.version,
@@ -814,7 +817,10 @@ mod tests {
                 );
             }
             assert!(
-                classifier.classify("claude-opus-4-9-20261225").is_none(),
+                classifier
+                    .classify("claude-opus-4-9-20261225")
+                    .expect("classification succeeds")
+                    .is_none(),
                 "unpublished snapshots stay unclassified",
             );
         }

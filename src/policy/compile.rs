@@ -18,11 +18,11 @@ use super::{
     CacheTransitionPolicy, Candidate, CandidateEdge, CandidateId, CandidateModel, CaptureSchema,
     ClassifierId, CompactionPolicy, CompiledMatcher, CostClass, Diagnostic, DiagnosticCode,
     DiagnosticField, DiagnosticPath, FailureClass, FamilyClassifier, FrontendProtocol,
-    FrontendScope, LaneTransitionPolicy, MatcherSpec, ParsedVersion, PolicyFingerprint,
-    PresentationId, PresentationSource, REQUESTED_MODEL_PARAMETER, RewriteId, Route,
-    RouteFingerprint, RouteId, RouteReference, RouteSemantics, SelectorOrdering, Severity,
-    StableId, Template, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec,
-    policy_fingerprint, route_fingerprint,
+    FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec, ParsedVersion,
+    PolicyFingerprint, PresentationId, PresentationSource, REQUESTED_MODEL_PARAMETER, RewriteId,
+    Route, RouteFingerprint, RouteId, RouteReference, RouteSemantics, SelectorOrdering, Severity,
+    StableId, Template, TemplateError, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument,
+    VersionParserSpec, policy_fingerprint, route_fingerprint,
 };
 
 /// Whether compilation is allowed to consume revision-one legacy learning.
@@ -327,6 +327,14 @@ impl CompiledRewrite {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClassificationError {
+    #[error(transparent)]
+    Matcher(#[from] MatcherError),
+    #[error(transparent)]
+    Template(#[from] TemplateError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedModel {
     pub family: String,
@@ -364,28 +372,37 @@ impl CompiledClassifier {
         &self.parser
     }
 
-    pub fn classify(&self, model: &str) -> Option<ClassifiedModel> {
+    pub fn classify(&self, model: &str) -> Result<Option<ClassifiedModel>, ClassificationError> {
         if self.legacy_family {
-            let family = crate::middleware::models::family_of(model)?;
+            let Some(family) = crate::middleware::models::family_of(model) else {
+                return Ok(None);
+            };
             let version = family
                 .version
                 .iter()
                 .map(u64::to_string)
                 .collect::<Vec<_>>()
                 .join("-");
-            return Some(ClassifiedModel {
-                family: family.name,
-                version: self.parser.parse(&version).ok()?,
-            });
+            return Ok(self
+                .parser
+                .parse(&version)
+                .ok()
+                .map(|version| ClassifiedModel {
+                    family: family.name,
+                    version,
+                }));
         }
-        let captures = self.matcher.captures(model).ok()??;
+        let Some(captures) = self.matcher.captures(model)? else {
+            return Ok(None);
+        };
         let empty = BTreeMap::new();
-        let family = self.family_template.render(&empty, &captures).ok()?;
-        let version = self.version_template.render(&empty, &captures).ok()?;
-        Some(ClassifiedModel {
-            family,
-            version: self.parser.parse(&version).ok()?,
-        })
+        let family = self.family_template.render(&empty, &captures)?;
+        let version = self.version_template.render(&empty, &captures)?;
+        Ok(self
+            .parser
+            .parse(&version)
+            .ok()
+            .map(|version| ClassifiedModel { family, version }))
     }
 }
 

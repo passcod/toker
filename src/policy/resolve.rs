@@ -609,7 +609,8 @@ fn materialize_candidate(
             |classifier_id, offer| {
                 policy
                     .classifier(classifier_id)
-                    .and_then(|classifier| classifier.classify(&offer.backend_model_id))
+                    .and_then(|classifier| classifier.classify(&offer.backend_model_id).ok())
+                    .flatten()
                     .map(|classified| classified.version)
             },
         )
@@ -859,7 +860,10 @@ fn choose_upgrade<L: LearningView>(
         return Ok(None);
     }
 
-    let Some(baseline_class) = classifier.classify(baseline) else {
+    let Some(baseline_class) = classifier
+        .classify(baseline)
+        .map_err(|_| ResolveFailure::InvalidTemplate)?
+    else {
         return Ok(None);
     };
     let mut models = BTreeSet::new();
@@ -884,7 +888,10 @@ fn choose_upgrade<L: LearningView>(
     }
     let mut best: Option<(String, ParsedVersion)> = None;
     for model in models {
-        let Some(classified) = classifier.classify(&model) else {
+        let Some(classified) = classifier
+            .classify(&model)
+            .map_err(|_| ResolveFailure::InvalidTemplate)?
+        else {
             continue;
         };
         if classified.family != baseline_class.family

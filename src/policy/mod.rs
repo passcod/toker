@@ -21,10 +21,10 @@ pub use canonical::{
     RouteSemantics, decode_policy, policy_bytes, policy_fingerprint, route_fingerprint,
 };
 pub use compile::{
-    ClassifiedModel, Compilation, CompiledAliasRule, CompiledCandidate, CompiledCandidateModel,
-    CompiledClassifier, CompiledCompaction, CompiledPolicy, CompiledPresentation, CompiledRewrite,
-    CompiledRoute, CompiledRouteReference, CompiledSelector, CompiledUpgradePolicy, PolicyOrigin,
-    PresentationRoute, compile,
+    ClassificationError, ClassifiedModel, Compilation, CompiledAliasRule, CompiledCandidate,
+    CompiledCandidateModel, CompiledClassifier, CompiledCompaction, CompiledPolicy,
+    CompiledPresentation, CompiledRewrite, CompiledRoute, CompiledRouteReference, CompiledSelector,
+    CompiledUpgradePolicy, PolicyOrigin, PresentationRoute, compile,
 };
 pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Severity,

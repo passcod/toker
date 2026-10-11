@@ -494,7 +494,8 @@ pub fn promote_run(
         .filter_map(|upgrade| {
             let classifier = policy.classifier(&upgrade.policy().classifier_id)?;
             (classifier.binding_id() == &binding)
-                .then(|| classifier.classify(model))
+                .then(|| classifier.classify(model).ok())
+                .flatten()
                 .flatten()
         });
     let classified = applicable
