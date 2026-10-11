@@ -888,6 +888,7 @@ mod tests {
                 family_template: "${1}".to_owned(),
                 version_template: "${1}".to_owned(),
                 version_parser: VersionParserSpec::Semver,
+                legacy_hyphenated: false,
             }],
             upgrades: vec![UpgradePolicy {
                 id: UpgradePolicyId::new("upgrade").unwrap(),

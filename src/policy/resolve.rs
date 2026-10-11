@@ -15,11 +15,11 @@ use crate::routing::Capabilities;
 
 use super::{
     ArgumentBinding, BindingId, BoundaryConsent, CacheTransitionPolicy, CandidateEdge, CandidateId,
-    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledClassifier, CompiledPolicy,
-    CompiledRoute, CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol,
-    FrontendScope, InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures,
-    MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute,
-    ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
+    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledPolicy, CompiledRoute,
+    CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol, FrontendScope,
+    InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures, MinimumLearning,
+    ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute, ProfileId,
+    REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -609,9 +609,8 @@ fn materialize_candidate(
             |classifier_id, offer| {
                 policy
                     .classifier(classifier_id)
-                    .and_then(|classifier| classify(classifier, &offer.backend_model_id).ok())
-                    .flatten()
-                    .map(|(_, version)| version)
+                    .and_then(|classifier| classifier.classify(&offer.backend_model_id))
+                    .map(|classified| classified.version)
             },
         )
         .map(|offer| offer.backend_model_id.clone())),
@@ -860,8 +859,7 @@ fn choose_upgrade<L: LearningView>(
         return Ok(None);
     }
 
-    let baseline_class = classify(classifier, baseline)?;
-    let Some((family, baseline_version)) = baseline_class else {
+    let Some(baseline_class) = classifier.classify(baseline) else {
         return Ok(None);
     };
     let mut models = BTreeSet::new();
@@ -886,18 +884,20 @@ fn choose_upgrade<L: LearningView>(
     }
     let mut best: Option<(String, ParsedVersion)> = None;
     for model in models {
-        let Some((model_family, version)) = classify(classifier, &model)? else {
+        let Some(classified) = classifier.classify(&model) else {
             continue;
         };
-        if model_family != family
-            || version
-                .partial_cmp(&baseline_version)
+        if classified.family != baseline_class.family
+            || classified
+                .version
+                .partial_cmp(&baseline_class.version)
                 .is_none_or(|order| !order.is_gt())
         {
             continue;
         }
         if !learning_minimum(
             upgrade.minimum_learning,
+            upgrade.allow_manual_promotion,
             learning,
             candidate.binding_id(),
             &model,
@@ -914,12 +914,13 @@ fn choose_upgrade<L: LearningView>(
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, current)| {
-            version
+            classified
+                .version
                 .partial_cmp(current)
                 .is_some_and(|order| order.is_gt())
         });
         if replace {
-            best = Some((model, version));
+            best = Some((model, classified.version));
         }
     }
     Ok(best.map(|(model, _)| model))
@@ -927,29 +928,38 @@ fn choose_upgrade<L: LearningView>(
 
 fn learning_minimum<L: LearningView>(
     minimum: MinimumLearning,
+    allow_manual_promotion: bool,
     learning: &L,
     binding: &BindingId,
     model: &str,
 ) -> Result<bool, ResolveFailure> {
+    if minimum == MinimumLearning::None {
+        return Ok(true);
+    }
+    let evidence = learning
+        .learned(binding, model)
+        .map_err(|_| ResolveFailure::LearningUnavailable)?;
+    if allow_manual_promotion
+        && evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.explicitly_promoted())
+    {
+        return Ok(true);
+    }
     match minimum {
         MinimumLearning::None => Ok(true),
-        MinimumLearning::DistinctDays { days } => Ok(learning
-            .learned(binding, model)
-            .map_err(|_| ResolveFailure::LearningUnavailable)?
-            .is_some_and(|evidence| evidence.distinct_days().len() >= usize::from(days))),
-        MinimumLearning::ExplicitPromotion => Ok(learning
-            .learned(binding, model)
-            .map_err(|_| ResolveFailure::LearningUnavailable)?
-            .is_some_and(|evidence| evidence.explicitly_promoted())),
+        MinimumLearning::DistinctDays { days } => Ok(
+            evidence.is_some_and(|evidence| evidence.distinct_days().len() >= usize::from(days))
+        ),
+        MinimumLearning::ExplicitPromotion => {
+            Ok(evidence.is_some_and(|evidence| evidence.explicitly_promoted()))
+        }
         MinimumLearning::RevisionOneAdaptive => {
             let active_days = learning
                 .active_days(binding)
                 .map_err(|_| ResolveFailure::LearningUnavailable)?;
             let needed = crate::middleware::models::requirement(active_days);
-            Ok(learning
-                .learned(binding, model)
-                .map_err(|_| ResolveFailure::LearningUnavailable)?
-                .is_some_and(|evidence| evidence.distinct_days().len() as f64 > needed))
+            Ok(evidence.is_some_and(|evidence| evidence.distinct_days().len() as f64 > needed))
         }
     }
 }
@@ -977,33 +987,6 @@ fn fits_context<L: LearningView>(
                 .or_else(|| evidence.max_prompt())
         })
         .is_some_and(|max| prompt <= max))
-}
-
-fn classify(
-    classifier: &CompiledClassifier,
-    model: &str,
-) -> Result<Option<(String, ParsedVersion)>, ResolveFailure> {
-    let Some(captures) = classifier
-        .matcher()
-        .captures(model)
-        .map_err(|_| ResolveFailure::InvalidTemplate)?
-    else {
-        return Ok(None);
-    };
-    let empty = BTreeMap::new();
-    let family = classifier
-        .family_template()
-        .render(&empty, &captures)
-        .map_err(|_| ResolveFailure::InvalidTemplate)?;
-    let version = classifier
-        .version_template()
-        .render(&empty, &captures)
-        .map_err(|_| ResolveFailure::InvalidTemplate)?;
-    let version = classifier
-        .parser()
-        .parse(&version)
-        .map_err(|_| ResolveFailure::InvalidTemplate)?;
-    Ok(Some((family, version)))
 }
 
 fn apply_alias(
@@ -1192,6 +1175,7 @@ mod tests {
             version_parser: VersionParserSpec::LegacyNumericTuple {
                 separator: "-".to_owned(),
             },
+            legacy_hyphenated: false,
         });
         document.upgrades.push(UpgradePolicy {
             id: id("upgrade"),
@@ -1304,6 +1288,45 @@ mod tests {
 
         assert_eq!(plan.effective_model, "claude-opus-4-8");
         assert_eq!(plan.upgraded_model, None);
+    }
+
+    #[test]
+    fn manual_promotion_satisfies_a_distinct_day_minimum_only_when_allowed() {
+        let binding = ANTHROPIC_SUB_MESSAGES.id().clone();
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        store
+            .merge_binding_learning(&crate::store::BindingLearningUpdate {
+                binding_id: binding.clone(),
+                model_id: "claude-opus-5".to_owned(),
+                days: Default::default(),
+                max_prompt: Some(100),
+                context_window: None,
+                explicitly_promoted: true,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let learning = BindingLearningView::new(store);
+
+        assert!(
+            learning_minimum(
+                MinimumLearning::DistinctDays { days: 2 },
+                true,
+                &learning,
+                &binding,
+                "claude-opus-5",
+            )
+            .unwrap()
+        );
+        assert!(
+            !learning_minimum(
+                MinimumLearning::DistinctDays { days: 2 },
+                false,
+                &learning,
+                &binding,
+                "claude-opus-5",
+            )
+            .unwrap()
+        );
     }
 
     #[test]

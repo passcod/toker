@@ -105,8 +105,12 @@ impl<'a> LegacyBuilder<'a> {
                 // The generated classifier intentionally reproduces the
                 // legacy family split only for known hyphenated ids. An
                 // unpublished eight-digit Claude snapshot is excluded.
+                // Compilation replaces this generated classifier with the
+                // exact revision-one family split, including numeric-prefix
+                // names and published-alias folding. The matcher remains the
+                // bounded authored shape carried by the canonical document.
                 model_matcher: MatcherSpec::Regex(
-                    r"^(?:claude-)?(?P<family>[a-z][a-z-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+                    r"^(?:claude-)?(?P<family>[a-z0-9][a-z0-9-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
                         .to_owned(),
                 ),
                 family_template: "${family}".to_owned(),
@@ -114,6 +118,7 @@ impl<'a> LegacyBuilder<'a> {
                 version_parser: VersionParserSpec::LegacyNumericTuple {
                     separator: "-".to_owned(),
                 },
+                legacy_hyphenated: true,
             });
             self.policy.upgrades.push(UpgradePolicy {
                 id: upgrade_id(binding)?,
@@ -775,10 +780,42 @@ mod tests {
                         && upgrade.allow_revision_one_legacy_learning)
             );
             let compilation = compile(&config, &topology, &OfferInventory::default()).unwrap();
+            let policy = compilation
+                .policy()
+                .unwrap_or_else(|| panic!("{:?}", compilation.diagnostics()));
+            let classifier = policy
+                .upgrades()
+                .next()
+                .and_then(|upgrade| policy.classifier(&upgrade.policy().classifier_id))
+                .expect("generated classifier");
+            for model in [
+                "claude-opus-4-10",
+                "claude-3-7-sonnet",
+                "claude-3-7-sonnet-20250219",
+            ] {
+                let expected = crate::middleware::models::family_of(model).expect("legacy family");
+                let classified = classifier.classify(model).expect("compiled family");
+                assert_eq!(classified.family, expected.name, "{model}");
+                assert_eq!(
+                    classified.version,
+                    VersionParserSpec::LegacyNumericTuple {
+                        separator: "-".to_owned(),
+                    }
+                    .parse(
+                        &expected
+                            .version
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join("-")
+                    )
+                    .unwrap(),
+                    "{model}"
+                );
+            }
             assert!(
-                compilation.policy().is_some(),
-                "{:?}",
-                compilation.diagnostics()
+                classifier.classify("claude-opus-4-9-20261225").is_none(),
+                "unpublished snapshots stay unclassified",
             );
         }
     }

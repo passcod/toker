@@ -923,6 +923,10 @@ pub struct FamilyClassifier {
     pub family_template: String,
     pub version_template: String,
     pub version_parser: VersionParserSpec,
+    /// Generated revision-one compatibility for legacy ids whose family and
+    /// numeric version segments may be interleaved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_hyphenated: bool,
 }
 
 impl Identified for FamilyClassifier {
@@ -1024,6 +1028,10 @@ impl CompactionPolicy {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn check_collection<T>(items: &[T], path: &str) -> Result<(), DocumentError> {

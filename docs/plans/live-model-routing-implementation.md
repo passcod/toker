@@ -98,7 +98,11 @@ mix parser kinds. Missing, malformed, or overflowing captures leave an offer
 unclassified.
 
 No built-in name heuristic runs after policy compilation. Revision one carries
-explicit classifiers generated from the legacy behavior.
+explicit classifiers generated from the legacy behavior. Its generated
+classifier may declare `legacy_hyphenated = true`, a revision-one-only strategy
+that preserves the old split where numeric version segments can precede the
+family name (for example `claude-3-7-sonnet`) and published snapshot aliases
+fold before classification. Authored policies cannot select this strategy.
 
 ### Availability and cost
 

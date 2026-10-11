@@ -103,6 +103,10 @@ impl CompiledPolicy {
         self.upgrades.get(id)
     }
 
+    pub fn upgrades(&self) -> impl Iterator<Item = &CompiledUpgradePolicy> {
+        self.upgrades.values()
+    }
+
     pub fn compaction(&self) -> Option<&CompiledCompaction> {
         self.compaction.as_ref()
     }
@@ -323,6 +327,12 @@ impl CompiledRewrite {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedModel {
+    pub family: String,
+    pub version: ParsedVersion,
+}
+
 #[derive(Debug)]
 pub struct CompiledClassifier {
     id: ClassifierId,
@@ -331,6 +341,7 @@ pub struct CompiledClassifier {
     family_template: Template,
     version_template: Template,
     parser: VersionParserSpec,
+    legacy_family: bool,
 }
 
 impl CompiledClassifier {
@@ -351,6 +362,30 @@ impl CompiledClassifier {
     }
     pub fn parser(&self) -> &VersionParserSpec {
         &self.parser
+    }
+
+    pub fn classify(&self, model: &str) -> Option<ClassifiedModel> {
+        if self.legacy_family {
+            let family = crate::middleware::models::family_of(model)?;
+            let version = family
+                .version
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join("-");
+            return Some(ClassifiedModel {
+                family: family.name,
+                version: self.parser.parse(&version).ok()?,
+            });
+        }
+        let captures = self.matcher.captures(model).ok()??;
+        let empty = BTreeMap::new();
+        let family = self.family_template.render(&empty, &captures).ok()?;
+        let version = self.version_template.render(&empty, &captures).ok()?;
+        Some(ClassifiedModel {
+            family,
+            version: self.parser.parse(&version).ok()?,
+        })
     }
 }
 
@@ -499,6 +534,14 @@ impl<'a> Compiler<'a> {
         let mut out = BTreeMap::new();
         for (index, item) in items.iter().enumerate() {
             let base = path("classifiers", index);
+            if item.legacy_hyphenated && self.origin != PolicyOrigin::GeneratedRevisionOne {
+                self.error(
+                    "legacy-classifier-forbidden",
+                    base.clone().field(f("legacy_hyphenated")),
+                    item.id.as_stable_id(),
+                );
+                continue;
+            }
             let Some(_) = self.binding(
                 &item.binding_id,
                 base.clone().field(f("binding_id")),
@@ -542,6 +585,7 @@ impl<'a> Compiler<'a> {
                     family_template,
                     version_template,
                     parser: item.version_parser.clone(),
+                    legacy_family: item.legacy_hyphenated,
                 },
             );
         }
@@ -1975,6 +2019,18 @@ mod tests {
                 .contains(&"missing-classifier")
         );
 
+        let mut forbidden_classifier = document();
+        let mut generated_only = classifier(&ANTHROPIC_SUB_MESSAGES);
+        generated_only.legacy_hyphenated = true;
+        forbidden_classifier.classifiers.push(generated_only);
+        assert!(
+            codes(&compile_document(
+                forbidden_classifier,
+                PolicyOrigin::Authored
+            ))
+            .contains(&"legacy-classifier-forbidden")
+        );
+
         let mut legacy = document();
         legacy.classifiers.push(classifier(&ANTHROPIC_SUB_MESSAGES));
         legacy.upgrades.push(UpgradePolicy {
@@ -2009,6 +2065,7 @@ mod tests {
                 components: 1,
                 separator: "-".to_owned(),
             },
+            legacy_hyphenated: false,
         }
     }
 
