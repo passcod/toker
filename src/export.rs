@@ -112,7 +112,13 @@ pub fn kind_arg(text: &str) -> Result<KindFilter, String> {
 #[cfg(test)]
 mod tests {
     use super::{is_broken_pipe, kind_arg, parse_instant, write_jsonl};
-    use crate::store::{CostKind, KindFilter, RequestFilter, RequestRow, RowKind, Store};
+    use crate::policy::{
+        BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, StableId,
+    };
+    use crate::store::{
+        AttemptGroupId, ChildRole, CostKind, KindFilter, RelationSource, RequestFilter, RequestRow,
+        RowKind, SessionLineage, Store, StoredRoutingTrace, StoredRoutingTraceEvent,
+    };
     use serde_json::{Value, json};
 
     /// 2026-10-05T00:00:00Z.
@@ -257,19 +263,29 @@ mod tests {
             betas: Some(r#"["claude-code-20250219"]"#.to_owned()),
             geo: Some("us".to_owned()),
             fast: Some(false),
-            policy_revision_id: None,
-            presentation_id: None,
-            rewrite_id: None,
-            policy_route_id: None,
-            route_fingerprint: None,
-            candidate_id: None,
-            binding_id: None,
-            baseline_model: None,
-            attempt_group_id: None,
-            attempt_index: None,
-            fallback_reason: None,
-            routing_trace: None,
-            lineage: None,
+            policy_revision_id: Some(1),
+            presentation_id: Some(PresentationId::new("presented").unwrap()),
+            rewrite_id: Some(RewriteId::new("rewrite").unwrap()),
+            policy_route_id: Some(RouteId::new("route").unwrap()),
+            route_fingerprint: Some("11".repeat(32).parse::<RouteFingerprint>().unwrap()),
+            candidate_id: Some(CandidateId::new("candidate").unwrap()),
+            binding_id: Some(BindingId::new("openrouter.openrouter_messages").unwrap()),
+            baseline_model: Some("claude-opus-5".to_owned()),
+            attempt_group_id: Some(
+                AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
+            ),
+            attempt_index: Some(0),
+            fallback_reason: Some(StableId::new("initial").unwrap()),
+            routing_trace: Some(StoredRoutingTrace {
+                events: vec![StoredRoutingTraceEvent::Transition {
+                    reason: StableId::new("initial").unwrap(),
+                }],
+            }),
+            lineage: Some(SessionLineage {
+                parent_session_id: "parent-session".to_owned(),
+                child_role: ChildRole::Guardian,
+                relation_source: RelationSource::CodexGuardian,
+            }),
         }
     }
 

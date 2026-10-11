@@ -36,10 +36,10 @@ pub use ledger::{
     StoredLadders, StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
 };
 pub use state::{
-    Allowance, BindingLearning, BindingLearningUpdate, DraftCasResult, Lane, LanePin,
-    LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
-    PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
-    PublicationState, RoutingPolicyState, RoutingPublication,
+    Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
+    LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
+    PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationCasResult,
+    PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -110,6 +110,7 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(path)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         // Returns the effective mode ("wal", or "memory" on :memory:).
         conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
@@ -151,6 +152,7 @@ impl Store {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
         if version < 1 {
@@ -501,6 +503,15 @@ impl Store {
         state::merge_binding_learning(&*self.conn()?, update)
     }
 
+    /// Idempotently merge learning from ledger rows whose binding attribution
+    /// and provider-reported model are both explicit.
+    pub fn replay_attributable_binding_learning(
+        &self,
+        local_time_zone: &jiff::tz::TimeZone,
+    ) -> Result<BindingLearningReplay> {
+        state::replay_attributable_binding_learning(&mut *self.conn()?, local_time_zone)
+    }
+
     pub fn load_binding_learning(
         &self,
         binding_id: &crate::policy::BindingId,
@@ -662,12 +673,19 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, CostKind, DisplayRow, Error, Lane, MetersSnapshot, ModelEntry, PingAction,
-        PingRecord, RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
+        Allowance, AttemptGroupId, BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult,
+        Error, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision,
+        PingAction, PingRecord, PolicyRevisionSource, PublicationCasResult, PublicationKey,
+        PublicationState, RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
     };
     use crate::ir::Release;
+    use crate::policy::{
+        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, PolicyDocument,
+        RouteFingerprint, RouteId,
+    };
     use rusqlite::Connection;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     /// A fresh private in-memory store per test.
     fn mem_store() -> Store {
@@ -685,6 +703,56 @@ mod tests {
         let conn = store.conn.lock().expect("lock");
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .expect("read user_version")
+    }
+
+    fn policy(description: &str) -> crate::policy::ValidatedPolicyDocument {
+        PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: Some(description.to_owned()),
+            defaults: vec![],
+            presentations: vec![],
+            routes: vec![],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
+        }
+        .validate()
+        .expect("valid policy")
+    }
+
+    fn revision(store: &Store, description: &str, parent_revision_id: Option<i64>) -> i64 {
+        let document = policy(description);
+        store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 100,
+                activated_ms: 101,
+                description: Some(description),
+                activation_scope: ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                parent_revision_id,
+                document: &document,
+            })
+            .expect("insert revision")
+            .revision_id
+    }
+
+    fn unpinned_lane(key: &str) -> Lane {
+        Lane {
+            key: key.to_owned(),
+            session_id: Some("session".to_owned()),
+            tools_hash: Some("tools".to_owned()),
+            updated_ms: 1,
+            prompt_tokens: Some(10),
+            ttl: Some(300_000),
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        }
     }
 
     /// A row with every field set, covering every column's Some path.
@@ -2410,6 +2478,288 @@ mod tests {
     }
 
     #[test]
+    fn routing_state_starts_non_authoritative_and_revisions_round_trip() {
+        let store = mem_store();
+        let state = store.load_routing_policy_state().expect("state");
+        assert_eq!(state.active_revision_id, None);
+        assert_eq!(state.draft_generation, 0);
+        assert_eq!(state.draft, None);
+        assert_eq!(state.legacy_imported_ms, None);
+
+        let id = revision(&store, "first", None);
+        let loaded = store
+            .load_policy_revision(id)
+            .expect("load")
+            .expect("revision");
+        assert_eq!(loaded.description.as_deref(), Some("first"));
+        assert_eq!(loaded.activation_scope, ActivationScope::NewLanes);
+        assert_eq!(loaded.source, PolicyRevisionSource::Draft);
+        assert_eq!(loaded.document, policy("first"));
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            None
+        );
+
+        let child = revision(&store, "child", Some(id));
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 2);
+        assert_eq!(
+            store
+                .load_policy_revision(child)
+                .unwrap()
+                .unwrap()
+                .parent_revision_id,
+            Some(id)
+        );
+        let missing_parent = store.insert_policy_revision(&NewPolicyRevision {
+            created_ms: 1,
+            activated_ms: 1,
+            description: None,
+            activation_scope: ActivationScope::Immediate,
+            forced_cache_transition: true,
+            source: PolicyRevisionSource::Reactivation,
+            parent_revision_id: Some(999_999),
+            document: &policy("missing-parent"),
+        });
+        assert!(matches!(missing_parent, Err(Error::Sqlite(_))));
+    }
+
+    #[test]
+    fn policy_draft_cas_updates_conflicts_and_clears() {
+        let store = mem_store();
+        let base = revision(&store, "base", None);
+        let first = policy("draft one");
+        assert!(matches!(
+            store
+                .compare_and_swap_policy_draft(0, base, &first, 200)
+                .unwrap(),
+            DraftCasResult::Updated {
+                generation: 1,
+                draft: Some(_)
+            }
+        ));
+        let second = policy("draft two");
+        let stale = store
+            .compare_and_swap_policy_draft(0, base, &second, 201)
+            .unwrap();
+        assert!(
+            matches!(stale, DraftCasResult::Conflict { current } if current.draft_generation == 1)
+        );
+        let state = store.load_routing_policy_state().unwrap();
+        assert_eq!(state.active_revision_id, None);
+        assert_eq!(state.draft.as_ref().unwrap().document, first);
+        assert!(matches!(
+            store.clear_policy_draft(1).unwrap(),
+            DraftCasResult::Updated {
+                generation: 2,
+                draft: None
+            }
+        ));
+        assert_eq!(store.load_routing_policy_state().unwrap().draft, None);
+    }
+
+    #[test]
+    fn publication_results_are_cas_guarded_and_state_checked() {
+        let store = mem_store();
+        let first = revision(&store, "first", None);
+        let second = revision(&store, "second", Some(first));
+        let key =
+            PublicationKey::new("profile:claude:anthropic_messages", "claude_settings").unwrap();
+        store.set_publication_desired(&key, first, 4, 100).unwrap();
+        assert_eq!(
+            store.load_publication(&key).unwrap().unwrap().state,
+            PublicationState::Pending
+        );
+        assert_eq!(
+            store
+                .compare_and_swap_publication_result(
+                    &key,
+                    first,
+                    4,
+                    PublicationState::Applied,
+                    Some(first),
+                    Some(4),
+                    None,
+                    101,
+                )
+                .unwrap(),
+            PublicationCasResult::Updated,
+        );
+        store.set_publication_desired(&key, second, 5, 102).unwrap();
+        let stale = store
+            .compare_and_swap_publication_result(
+                &key,
+                first,
+                4,
+                PublicationState::Failed,
+                Some(first),
+                Some(4),
+                Some("write_failed"),
+                103,
+            )
+            .unwrap();
+        assert!(
+            matches!(stale, PublicationCasResult::Conflict { current: Some(row) }
+            if row.desired_revision_id == second && row.state == PublicationState::Pending)
+        );
+        let invalid = store.compare_and_swap_publication_result(
+            &key,
+            second,
+            5,
+            PublicationState::Applied,
+            Some(first),
+            Some(4),
+            None,
+            104,
+        );
+        assert!(matches!(invalid, Err(Error::InvalidRoutingState(_))));
+    }
+
+    #[test]
+    fn binding_learning_merge_unions_maxes_replaces_and_promotes() {
+        let store = mem_store();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let update =
+            |days: &[&str], max_prompt, context_window, explicitly_promoted, updated_ms| {
+                BindingLearningUpdate {
+                    binding_id: binding.clone(),
+                    model_id: "model-x".to_owned(),
+                    days: days
+                        .iter()
+                        .map(|day| (*day).to_owned())
+                        .collect::<BTreeSet<_>>(),
+                    max_prompt,
+                    context_window,
+                    explicitly_promoted,
+                    updated_ms,
+                }
+            };
+        store
+            .merge_binding_learning(&update(
+                &["2026-10-02"],
+                Some(100),
+                Some(json!({"kind":"declared","tokens":200})),
+                false,
+                20,
+            ))
+            .unwrap();
+        let merged = store
+            .merge_binding_learning(&update(&["2026-10-01"], Some(50), None, true, 10))
+            .unwrap();
+        assert_eq!(
+            merged.days.into_iter().collect::<Vec<_>>(),
+            ["2026-10-01", "2026-10-02"]
+        );
+        assert_eq!(merged.max_prompt, Some(100));
+        assert_eq!(
+            merged.context_window,
+            Some(json!({"kind":"declared","tokens":200}))
+        );
+        assert!(merged.explicitly_promoted);
+        assert_eq!(merged.updated_ms, 20);
+        let replaced = store
+            .merge_binding_learning(&update(
+                &[],
+                None,
+                Some(json!({"kind":"exact","tokens":300})),
+                false,
+                30,
+            ))
+            .unwrap();
+        assert_eq!(
+            replaced.context_window,
+            Some(json!({"kind":"exact","tokens":300}))
+        );
+        assert_eq!(
+            store.load_binding_learnings(&binding).unwrap(),
+            vec![replaced]
+        );
+    }
+
+    #[test]
+    fn lane_pin_cas_and_ordinary_upsert_preserve_pin_identity() {
+        let store = mem_store();
+        let revision_id = revision(&store, "pin", None);
+        let lane = unpinned_lane("session|tools");
+        store.upsert_lane(&lane).unwrap();
+        let pin = LanePin {
+            policy_revision_id: revision_id,
+            policy_route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            baseline_model: "base".to_owned(),
+            effective_model: "effective".to_owned(),
+        };
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 0, None, Some(&pin))
+                .unwrap(),
+            LanePinCasResult::Updated { generation: 1 },
+        );
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 0, None, Some(&pin))
+                .unwrap(),
+            LanePinCasResult::Conflict,
+        );
+        let mut ordinary = lane.clone();
+        ordinary.updated_ms = 99;
+        store.upsert_lane(&ordinary).unwrap();
+        let loaded = store.load_lane(&lane.key).unwrap().unwrap();
+        assert_eq!(loaded.updated_ms, 99);
+        assert_eq!(loaded.pin_generation, 1);
+        assert_eq!(loaded.pin.as_ref(), Some(&pin));
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 1, None, None)
+                .unwrap(),
+            LanePinCasResult::Conflict,
+        );
+        assert_eq!(
+            store
+                .compare_and_swap_lane_pin(&lane.key, 1, Some(&pin), None)
+                .unwrap(),
+            LanePinCasResult::Updated { generation: 2 },
+        );
+    }
+
+    #[test]
+    fn routing_reads_work_read_only_and_writes_fail_through_sqlite() {
+        let dir = test_dir("routing-read-only");
+        let db = dir.join("toker.db");
+        let store = Store::open(&db).unwrap();
+        let id = revision(&store, "read only", None);
+        drop(store);
+        let store = Store::open_read_only(&db).unwrap();
+        assert_eq!(
+            store
+                .load_policy_revision(id)
+                .unwrap()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("read only")
+        );
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            None
+        );
+        let write = store.set_publication_desired(
+            &PublicationKey::new("protocol:anthropic_messages", "claude_settings").unwrap(),
+            id,
+            0,
+            1,
+        );
+        assert!(matches!(write, Err(Error::Sqlite(_))));
+    }
+
+    #[test]
     fn migration_v2_upgrades_a_v1_database_in_place() {
         let dir = test_dir("v1-upgrade");
         let db = dir.join("toker.db");
@@ -2529,5 +2879,177 @@ mod tests {
                 .is_some()
         );
         assert!(reopened.load_meters("codex_sub").expect("load").is_some());
+    }
+    #[test]
+    fn migration_v8_hardens_attempt_sequences_and_policy_references() {
+        fn raw_insert(
+            conn: &Connection,
+            ts: i64,
+            group: Option<&str>,
+            index: Option<i64>,
+            revision: Option<i64>,
+        ) -> rusqlite::Result<usize> {
+            conn.execute(
+                "INSERT INTO requests
+                 (ts_ms, attempt_group_id, attempt_index, policy_revision_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![ts, group, index, revision],
+            )
+        }
+
+        let exercise = |store: &Store| {
+            let revision_id = revision(store, "attempts", None);
+            let conn = store.conn.lock().unwrap();
+            let preflight = "00000000000000000000000000000001";
+            raw_insert(&conn, 1, Some(preflight), None, None).unwrap();
+            assert!(raw_insert(&conn, 2, Some(preflight), None, None).is_err());
+            assert!(raw_insert(&conn, 3, Some(preflight), Some(0), None).is_err());
+
+            let mixed = "00000000000000000000000000000002";
+            raw_insert(&conn, 4, Some(mixed), Some(0), None).unwrap();
+            assert!(raw_insert(&conn, 5, Some(mixed), None, None).is_err());
+
+            let first_gap = "00000000000000000000000000000003";
+            assert!(raw_insert(&conn, 6, Some(first_gap), Some(1), None).is_err());
+
+            let gap = "00000000000000000000000000000004";
+            raw_insert(&conn, 7, Some(gap), Some(0), None).unwrap();
+            assert!(raw_insert(&conn, 8, Some(gap), Some(2), None).is_err());
+            raw_insert(&conn, 9, Some(gap), Some(1), None).unwrap();
+
+            assert!(raw_insert(&conn, 10, None, None, Some(999_999)).is_err());
+            raw_insert(&conn, 11, None, None, Some(revision_id)).unwrap();
+        };
+
+        let fresh = mem_store();
+        exercise(&fresh);
+
+        let dir = test_dir("v7-upgrade");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            for script in &schema::MIGRATIONS[..7] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+        let migrated = Store::open(&db).unwrap();
+        assert_eq!(user_version(&migrated), 8);
+        exercise(&migrated);
+    }
+
+    #[test]
+    fn migration_v6_to_head_preserves_old_null_defaults() {
+        let dir = test_dir("v6-upgrade");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..6] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute("INSERT INTO requests (ts_ms) VALUES (123)", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO lanes
+                 (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+                  noticed_at, forced_from, forced_to)
+                 VALUES ('old|tools', 'old', 'tools', 123, 7, NULL, NULL, NULL, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), 8);
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            None
+        );
+        let lane = store.load_lane("old|tools").unwrap().unwrap();
+        assert_eq!(lane.pin_generation, 0);
+        assert_eq!(lane.pin, None);
+        let row = store.requests_since(0, 10).unwrap().pop().unwrap();
+        assert_eq!(row.policy_revision_id, None);
+        assert_eq!(row.attempt_group_id, None);
+        assert_eq!(row.routing_trace, None);
+        assert_eq!(row.lineage, None);
+    }
+
+    #[test]
+    fn request_attempt_provenance_round_trips_and_sequence_is_enforced() {
+        let store = mem_store();
+        let revision_id = revision(&store, "request", None);
+        let group = AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap();
+        let mut first = bare_row(1);
+        first.policy_revision_id = Some(revision_id);
+        first.attempt_group_id = Some(group.clone());
+        first.attempt_index = Some(0);
+        store.record_request(&first).unwrap();
+        let mut second = first.clone();
+        second.ts_ms = 2;
+        second.attempt_index = Some(1);
+        store.record_request(&second).unwrap();
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows[0].attempt_group_id.as_ref(), Some(&group));
+        assert_eq!(rows[0].attempt_index, Some(0));
+        assert_eq!(rows[0].policy_revision_id, Some(revision_id));
+        assert_eq!(rows[1].attempt_index, Some(1));
+
+        let mut gap = first.clone();
+        gap.ts_ms = 3;
+        gap.attempt_index = Some(3);
+        assert!(matches!(store.record_request(&gap), Err(Error::Sqlite(_))));
+    }
+    #[test]
+    fn attributable_learning_replay_is_idempotent_and_skips_ambiguous_history() {
+        let store = mem_store();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let mut attributable = bare_row(1_760_000_000_000);
+        attributable.provider = Some("openrouter".to_owned());
+        attributable.raw_model = Some("Model-X".to_owned());
+        attributable.binding_id = Some(binding.clone());
+        attributable.input = Some(40);
+        attributable.cache_read = Some(60);
+        store.record_request(&attributable).unwrap();
+
+        let mut ambiguous = attributable.clone();
+        ambiguous.ts_ms += 1;
+        ambiguous.raw_model = Some("model-ambiguous".to_owned());
+        ambiguous.binding_id = None;
+        store.record_request(&ambiguous).unwrap();
+
+        let first = store
+            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
+            .unwrap();
+        assert_eq!(first.attributable_rows, 1);
+        assert_eq!(first.merged_models, 1);
+        let learned = store
+            .load_binding_learning(&binding, "model-x")
+            .unwrap()
+            .unwrap();
+        assert_eq!(learned.max_prompt, Some(100));
+        assert_eq!(
+            store
+                .load_binding_learning(&binding, "model-ambiguous")
+                .unwrap(),
+            None,
+        );
+        let second = store
+            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            store
+                .load_binding_learning(&binding, "model-x")
+                .unwrap()
+                .unwrap(),
+            learned,
+        );
     }
 }

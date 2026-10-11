@@ -247,6 +247,13 @@ pub struct BindingLearningUpdate {
     pub updated_ms: i64,
 }
 
+/// Summary of one idempotent replay from attributable request rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingLearningReplay {
+    pub attributable_rows: u64,
+    pub merged_models: u64,
+}
+
 /// One learned-model row: days served and max prompt observed for an exact
 /// model identity, plus its hand-verified context-window catalogue entry
 /// (plan: Model catalogues).
@@ -488,8 +495,7 @@ pub(super) fn compare_and_swap_lane_pin(
     if current.pin_generation != expected_generation || current.pin.as_ref() != expected_pin {
         return Ok(LanePinCasResult::Conflict);
     }
-    let (revision, route, fingerprint, candidate, binding, baseline, effective) =
-        pin_parts(new_pin);
+    let new = StoredPinParts::from(new_pin);
     let changed = conn.execute(
         "UPDATE lanes SET pin_generation = pin_generation + 1,
              policy_revision_id = ?1, policy_route_id = ?2, route_fingerprint = ?3,
@@ -501,13 +507,13 @@ pub(super) fn compare_and_swap_lane_pin(
            AND binding_id IS ?14 AND baseline_model IS ?15
            AND effective_model IS ?16",
         rusqlite::params![
-            revision,
-            route,
-            fingerprint,
-            candidate,
-            binding,
-            baseline,
-            effective,
+            new.revision,
+            new.route,
+            new.fingerprint,
+            new.candidate,
+            new.binding,
+            new.baseline,
+            new.effective,
             key,
             expected_generation,
             expected_pin.map(|p| p.policy_revision_id),
@@ -528,28 +534,38 @@ pub(super) fn compare_and_swap_lane_pin(
     }
 }
 
-fn pin_parts(
-    pin: Option<&LanePin>,
-) -> (
-    Option<i64>,
-    Option<&str>,
-    Option<String>,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-) {
-    match pin {
-        Some(pin) => (
-            Some(pin.policy_revision_id),
-            Some(pin.policy_route_id.as_str()),
-            Some(pin.route_fingerprint.to_string()),
-            Some(pin.candidate_id.as_str()),
-            Some(pin.binding_id.as_str()),
-            Some(&pin.baseline_model),
-            Some(&pin.effective_model),
-        ),
-        None => (None, None, None, None, None, None, None),
+struct StoredPinParts<'a> {
+    revision: Option<i64>,
+    route: Option<&'a str>,
+    fingerprint: Option<String>,
+    candidate: Option<&'a str>,
+    binding: Option<&'a str>,
+    baseline: Option<&'a str>,
+    effective: Option<&'a str>,
+}
+
+impl<'a> From<Option<&'a LanePin>> for StoredPinParts<'a> {
+    fn from(pin: Option<&'a LanePin>) -> Self {
+        match pin {
+            Some(pin) => Self {
+                revision: Some(pin.policy_revision_id),
+                route: Some(pin.policy_route_id.as_str()),
+                fingerprint: Some(pin.route_fingerprint.to_string()),
+                candidate: Some(pin.candidate_id.as_str()),
+                binding: Some(pin.binding_id.as_str()),
+                baseline: Some(&pin.baseline_model),
+                effective: Some(&pin.effective_model),
+            },
+            None => Self {
+                revision: None,
+                route: None,
+                fingerprint: None,
+                candidate: None,
+                binding: None,
+                baseline: None,
+                effective: None,
+            },
+        }
     }
 }
 
@@ -787,6 +803,11 @@ pub(super) fn clear_policy_draft(
     conn: &Connection,
     expected_generation: i64,
 ) -> Result<DraftCasResult> {
+    if expected_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative draft generation".into(),
+        ));
+    }
     let changed = conn.execute(
         "UPDATE routing_policy_state SET draft_generation = draft_generation + 1,
              draft_base_revision_id = NULL, draft_document_json = NULL,
@@ -807,12 +828,20 @@ pub(super) fn clear_policy_draft(
 }
 
 fn validate_scope_key(value: &str) -> Result<()> {
+    fn protocol(value: &str) -> bool {
+        matches!(
+            value,
+            "anthropic_messages" | "openai_chat" | "openai_responses"
+        )
+    }
     let valid = if let Some(rest) = value.strip_prefix("protocol:") {
-        !rest.is_empty() && !rest.contains(':')
+        protocol(rest)
     } else if let Some(rest) = value.strip_prefix("profile:") {
         let mut parts = rest.split(':');
-        parts.next().is_some_and(|v| !v.is_empty())
-            && parts.next().is_some_and(|v| !v.is_empty())
+        parts
+            .next()
+            .is_some_and(|profile| crate::policy::ProfileId::new(profile.to_owned()).is_ok())
+            && parts.next().is_some_and(protocol)
             && parts.next().is_none()
     } else {
         false
@@ -1074,6 +1103,75 @@ pub(super) fn merge_binding_learning(
         context_window,
         explicitly_promoted,
         updated_ms,
+    })
+}
+
+/// Replay only rows that already carry an exact binding and provider-reported
+/// model identity. Provider-only and legacy model rows remain unattributable
+/// and are deliberately ignored rather than copied into every possible binding.
+pub(super) fn replay_attributable_binding_learning(
+    conn: &mut Connection,
+    local_time_zone: &jiff::tz::TimeZone,
+) -> Result<BindingLearningReplay> {
+    let observations = rows_of(
+        conn,
+        "SELECT binding_id, raw_model, ts_ms,
+                COALESCE(input, 0) + COALESCE(cache_read, 0)
+                    + COALESCE(cache_write_total, 0) AS held
+         FROM requests
+         WHERE kind IS NULL AND binding_id IS NOT NULL AND raw_model IS NOT NULL
+         ORDER BY id",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>("binding_id")?,
+                row.get::<_, String>("raw_model")?,
+                row.get::<_, i64>("ts_ms")?,
+                row.get::<_, i64>("held")?,
+            ))
+        },
+    )?;
+    let attributable_rows = observations.len() as u64;
+    let mut merged: std::collections::BTreeMap<(BindingId, String), (BTreeSet<String>, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for (binding, model, ts_ms, held) in observations {
+        let binding: BindingId = parse_id("requests.binding_id", binding)?;
+        let Some(model) = crate::catalog::windows::model_identity(&model) else {
+            continue;
+        };
+        let Ok(timestamp) = jiff::Timestamp::from_millisecond(ts_ms) else {
+            continue;
+        };
+        let day = timestamp
+            .to_zoned(local_time_zone.clone())
+            .date()
+            .to_string();
+        let entry = merged
+            .entry((binding, model))
+            .or_insert_with(|| (BTreeSet::new(), 0, ts_ms));
+        entry.0.insert(day);
+        entry.1 = entry.1.max(held);
+        entry.2 = entry.2.max(ts_ms);
+    }
+    let tx = conn.transaction()?;
+    for ((binding_id, model_id), (days, max_prompt, updated_ms)) in &merged {
+        merge_binding_learning(
+            &tx,
+            &BindingLearningUpdate {
+                binding_id: binding_id.clone(),
+                model_id: model_id.clone(),
+                days: days.clone(),
+                max_prompt: Some(*max_prompt),
+                context_window: None,
+                explicitly_promoted: false,
+                updated_ms: *updated_ms,
+            },
+        )?;
+    }
+    tx.commit()?;
+    Ok(BindingLearningReplay {
+        attributable_rows,
+        merged_models: merged.len() as u64,
     })
 }
 

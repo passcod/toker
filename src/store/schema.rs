@@ -473,6 +473,54 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'cyclic request lineage');
     END;
     "#,
+    // v8 — harden attempt identity and policy provenance constraints that
+    // cannot be expressed by ALTER TABLE. Store writes are serialised on one
+    // connection, so predecessor checks deterministically enforce contiguous
+    // zero-origin attempt indices.
+    r#"
+    CREATE UNIQUE INDEX requests_preflight_identity_idx
+        ON requests (attempt_group_id)
+        WHERE attempt_group_id IS NOT NULL AND attempt_index IS NULL;
+
+    CREATE TRIGGER requests_attempt_sequence_check
+    BEFORE INSERT ON requests
+    WHEN NEW.attempt_group_id IS NOT NULL AND (
+        (NEW.attempt_index IS NULL AND EXISTS (
+            SELECT 1 FROM requests
+            WHERE attempt_group_id = NEW.attempt_group_id
+              AND attempt_index IS NOT NULL
+        ))
+        OR
+        (NEW.attempt_index IS NOT NULL AND EXISTS (
+            SELECT 1 FROM requests
+            WHERE attempt_group_id = NEW.attempt_group_id
+              AND attempt_index IS NULL
+        ))
+        OR
+        (NEW.attempt_index = 0 AND EXISTS (
+            SELECT 1 FROM requests
+            WHERE attempt_group_id = NEW.attempt_group_id
+              AND attempt_index IS NOT NULL
+        ))
+        OR
+        (NEW.attempt_index > 0 AND NOT EXISTS (
+            SELECT 1 FROM requests
+            WHERE attempt_group_id = NEW.attempt_group_id
+              AND attempt_index = NEW.attempt_index - 1
+        ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid request attempt sequence');
+    END;
+
+    CREATE TRIGGER requests_policy_revision_check
+    BEFORE INSERT ON requests
+    WHEN NEW.policy_revision_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM routing_policy_revisions
+        WHERE revision_id = NEW.policy_revision_id
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid request policy revision');
+    END;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.
