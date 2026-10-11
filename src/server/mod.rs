@@ -150,6 +150,10 @@ pub struct Server {
     /// family election) with its in-memory recently-served map, seeded
     /// from the ledger tail at startup.
     pub(crate) models: Arc<ModelStore>,
+    /// Binding-attributed observations and recently-sent targets. This is
+    /// non-authoritative policy evidence; revision-one routing continues to
+    /// read [`Self::models`].
+    pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
     /// The fetched models catalogues (one per source: openrouter's
     /// public listing, anthropic's presence list, the codex backend's
     /// own models endpoint — see [`crate::catalog::fetched`]), projected
@@ -365,6 +369,10 @@ impl Server {
             (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
         lanes::reseed(&store, &seed)?;
         let models = Arc::new(ModelStore::seeded(store.clone(), &seed, covered));
+        let binding_learning = Arc::new(crate::policy::BindingLearningView::seeded(
+            store.clone(),
+            &seed,
+        ));
         let initial_catalogs = FetchedCatalogs::default();
         let inventory = offers::inventory(&registry, &initial_catalogs);
         let policy_shadow = match crate::policy::legacy::compile(&config, &registry, &inventory)
@@ -392,6 +400,7 @@ impl Server {
             registry,
             codex_turn,
             models,
+            binding_learning,
             catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
             catalog_dir: Arc::default(),
             catalog_borrowed_at: Arc::default(),
@@ -405,6 +414,39 @@ impl Server {
             quota_events: Arc::default(),
             policy_shadow,
         })
+    }
+
+    /// Mark one selected binding and effective target immediately before an
+    /// actual inference transport starts. This state is deliberately separate
+    /// from the authoritative legacy model store.
+    pub(crate) fn note_binding_sent(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        effective_model: Option<&str>,
+    ) {
+        self.binding_learning
+            .note_sent(binding_id, effective_model, now_ms());
+    }
+
+    /// Merge a completed provider-reported observation. Store errors are
+    /// visible in logs and never escape into traffic handling.
+    pub(crate) fn note_binding_observed(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        reported_model: Option<&str>,
+        at_ms: i64,
+        prompt: Option<u64>,
+    ) {
+        let Some(reported_model) = reported_model else {
+            return;
+        };
+        let tz = jiff::tz::TimeZone::system();
+        if let Err(error) =
+            self.binding_learning
+                .note_observed(binding_id, reported_model, at_ms, prompt, &tz)
+        {
+            tracing::error!(%error, "binding model observation update failed");
+        }
     }
 
     /// Announce what one response's meter snapshot says about its
@@ -1742,7 +1784,8 @@ api_key = "ak-literal-test"
             br#"{"type":"message","model":"claude-sonnet-5","usage":{"input_tokens":3,"output_tokens":1}}"#,
         );
         assert_eq!(server.models.last_served("claude-sonnet-5"), None);
-        record_anthropic_measurement(&ctx, observer.finish().as_ref(), None, 200);
+        let (reported_model, capture) = observer.finish_parts();
+        record_anthropic_measurement(&ctx, capture.as_ref(), reported_model.as_deref(), None, 200);
         let rows = server.store.requests_since(0, 10).expect("ledger rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].binding_id, Some(ctx.binding_id.clone()));

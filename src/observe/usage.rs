@@ -179,15 +179,21 @@ impl UsageObserver {
         }
     }
 
-    /// Finish the response: the capture, or `None` when nothing
-    /// usage-bearing was seen (a client hangup or an all-keepalive
-    /// stream records no row).
+    /// Finish accounting observation: the capture, or `None` when nothing
+    /// usage-bearing was seen (a client hangup or an all-keepalive stream
+    /// records no row).
     pub fn finish(self) -> Option<UsageCapture> {
-        if self.saw_usage {
-            Some(self.capture)
-        } else {
-            None
-        }
+        self.finish_parts().1
+    }
+
+    /// Finish while retaining a provider-reported model even when no usage
+    /// object arrived. The identity is content-free and lets a protocol-
+    /// complete response contribute binding-local day evidence without
+    /// fabricating a ledger measurement or prompt ceiling.
+    pub fn finish_parts(self) -> (Option<String>, Option<UsageCapture>) {
+        let model = self.capture.model.clone();
+        let capture = self.saw_usage.then_some(self.capture);
+        (model, capture)
     }
 
     /// The shared latch path over one JSON document's text (an event's

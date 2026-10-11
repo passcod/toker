@@ -971,6 +971,29 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
     assert_eq!(row.ttl_split_known, Some(true));
     assert_eq!(row.betas, None, "no anthropic-beta header on this request");
     assert_eq!(row.rate_limits, Some(expected_rate_limits("0.4127")));
+    let learned = store
+        .load_binding_learning(
+            &"anthropic_api.anthropic_messages"
+                .parse()
+                .expect("binding id"),
+            "claude-sonnet-5",
+        )
+        .expect("binding learning")
+        .expect("completed provider response learns under its binding");
+    assert_eq!(learned.max_prompt, Some(509));
+    assert_eq!(learned.days.len(), 1);
+    assert_eq!(
+        store
+            .load_binding_learning(
+                &"anthropic_sub.anthropic_messages"
+                    .parse()
+                    .expect("binding id"),
+                "claude-sonnet-5",
+            )
+            .expect("other binding learning"),
+        None,
+        "the same model name is isolated across bindings",
+    );
 
     // The api is not a meter source: meters_state stays untouched.
     assert_eq!(
@@ -1291,6 +1314,18 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
     assert_eq!(row.usage_presence, None);
     assert_eq!(row.input, None);
     assert_eq!(row.usage_raw, None);
+    assert_eq!(
+        store
+            .load_binding_learning(
+                &"anthropic_sub.anthropic_messages"
+                    .parse()
+                    .expect("binding id"),
+                "err-401",
+            )
+            .expect("binding learning"),
+        None,
+        "a provider error proves a send but is not a completed observation",
+    );
 
     // …but the meters_state table took the response's snapshot anyway
     // (feed from every response, not just accounted ones).

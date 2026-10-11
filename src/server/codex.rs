@@ -432,6 +432,9 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     };
 
     let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
+    if let Some(ctx) = record.as_ref() {
+        server.note_binding_sent(&ctx.binding_id, served_model.as_deref());
+    }
     let url = backend.endpoint("/responses");
     let upstream = match server
         .http

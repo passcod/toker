@@ -1193,7 +1193,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the served-model mark, BEFORE the request goes ──
+    // ── the legacy served-model mark, BEFORE the request goes ──
     //
     // Not after: a lane deciding while this one is still in flight must see
     // the final effective model as in use. The response may later name a
@@ -1311,6 +1311,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // through (see the module docs), so the strip list is
     // empty; `x-toker-*` is stripped unconditionally either way.
     let sent = forward.clone();
+    if path == "/v1/messages" {
+        server.note_binding_sent(target.binding().id(), served_model.as_deref());
+    }
     match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
         Ok(upstream) => {
             let upstream = if path == "/v1/messages" {
@@ -1562,6 +1565,7 @@ async fn retry_thinking_off(
     tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     if let Some(ctx) = record {
         ctx.thinking_rewritten = true;
+        server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }
     send_upstream(server, backend, parts, retry, &[])
         .await
@@ -1871,8 +1875,14 @@ async fn forward_canonical_messages(
     if let Some(ctx) = record.as_ref() {
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
-        let capture = observer.finish();
-        record_anthropic_measurement(ctx, capture.as_ref(), rate_limits.as_ref(), status.as_u16());
+        let (reported_model, capture) = observer.finish_parts();
+        record_anthropic_measurement(
+            ctx,
+            capture.as_ref(),
+            reported_model.as_deref(),
+            rate_limits.as_ref(),
+            status.as_u16(),
+        );
     }
     response_projection.apply(&mut turn);
     let body = translate::anthropic_frontend::anthropic_from_canonical(model, &turn);
@@ -1973,10 +1983,11 @@ impl CanonicalMessagesStream {
 
     fn finish_recording(&mut self) {
         if let Some(ctx) = self.ctx.take() {
-            let capture = std::mem::take(&mut self.observer).finish();
+            let (reported_model, capture) = std::mem::take(&mut self.observer).finish_parts();
             record_anthropic_measurement(
                 &ctx,
                 capture.as_ref(),
+                reported_model.as_deref(),
                 self.rate_limits.as_ref(),
                 self.status,
             );
@@ -2129,10 +2140,11 @@ async fn forward_legacy_response(
     }
     let mut observer = AnthropicObserver::new();
     observer.observe_json(&buffered.bytes);
-    let capture = observer.finish();
+    let (reported_model, capture) = observer.finish_parts();
     record_anthropic_measurement(
         &ctx,
         capture.as_ref(),
+        reported_model.as_deref(),
         rate_limits.as_ref(),
         status.as_u16(),
     );
@@ -2236,11 +2248,12 @@ impl Stream for AnthropicObservedStream {
                             observer.observe_event(&event);
                         }
                     }));
-                    let capture = std::mem::take(observer).finish();
+                    let (reported_model, capture) = std::mem::take(observer).finish_parts();
                     let rate_limits = this.rate_limits.take();
                     record_anthropic_measurement(
                         &ctx,
                         capture.as_ref(),
+                        reported_model.as_deref(),
                         rate_limits.as_ref(),
                         this.status,
                     );

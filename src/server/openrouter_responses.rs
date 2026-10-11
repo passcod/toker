@@ -55,6 +55,7 @@ pub(crate) async fn turn(
     let body = Bytes::from(
         serde_json::to_vec(&rendered.value).expect("a rendered Responses request serialises"),
     );
+    server.note_binding_sent(target.binding().id(), Some(&model));
     let upstream = match send_upstream_to(
         &server,
         target.provider().as_ref(),
@@ -195,17 +196,24 @@ async fn complete(
             "upstream Responses turn ended prematurely",
         );
     }
-    if let Some(ctx) = record.as_ref()
-        && capture.usage().is_some()
-    {
-        record_responses_measurement(
-            ctx,
-            &capture,
-            None,
-            200,
-            "openai_responses",
-            provider.as_deref(),
-        );
+    if let Some(ctx) = record.as_ref() {
+        if capture.usage().is_some() {
+            record_responses_measurement(
+                ctx,
+                &capture,
+                None,
+                200,
+                "openai_responses",
+                provider.as_deref(),
+            );
+        } else {
+            ctx.server.note_binding_observed(
+                &ctx.binding_id,
+                capture.model(),
+                super::record::now_ms(),
+                None,
+            );
+        }
     }
     let turn = translate::codex_backend::canonical_turn_from_capture(&capture);
     let value = translate::openai_responses_from_canonical(model, &turn);
@@ -335,6 +343,13 @@ impl StreamState {
                     200,
                     "openai_responses",
                     self.provider.as_deref(),
+                );
+            } else {
+                ctx.server.note_binding_observed(
+                    &ctx.binding_id,
+                    self.capture.model(),
+                    super::record::now_ms(),
+                    None,
                 );
             }
         }

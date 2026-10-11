@@ -4,7 +4,8 @@
 //! the adapter's unattributable rows; authored policy must use a future
 //! binding-scoped implementation instead.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use crate::middleware::models::{ModelStore, active_days_of, days_of};
 use crate::store::{BindingLearning, ModelEntry, Store};
@@ -51,7 +52,9 @@ pub enum RecencyEvidence {
     /// This view has no recency record for the requested binding.
     Unknown,
     /// `last_sent` was observed within a record that reaches back to
-    /// `covered_since`. `None` coverage means the whole ledger was read.
+    /// `covered_since`. `None` coverage means the whole relevant record was
+    /// read; binding-attributed recency normally carries that binding's first
+    /// attributable send instead.
     Covered {
         last_sent: Option<i64>,
         covered_since: Option<i64>,
@@ -93,19 +96,116 @@ impl LegacyLearningView {
     }
 }
 
-/// Binding-local learning over the non-authoritative routing state tables.
+/// Binding-local observation and recency, separate from revision-one's
+/// unattributable [`ModelStore`].
 ///
-/// Recently-sent evidence has a separate write path and is not persisted in
-/// this storage slice, so this view reports that evidence as unknown rather
-/// than borrowing the unattributable legacy map.
+/// The recently-sent map is keyed by the selected binding and exact effective
+/// target. It is marked immediately before an inference send. Durable learning
+/// is merged only after a completed response names its raw provider model.
 pub struct BindingLearningView {
     store: Arc<Store>,
+    recency: Mutex<BindingRecency>,
+}
+
+#[derive(Default)]
+struct BindingRecency {
+    sent_on: BTreeMap<(BindingId, String), i64>,
+    /// Earliest attributable send known for each binding. Unattributed ledger
+    /// history cannot prove a binding-local absence before this point.
+    covered_since: BTreeMap<BindingId, i64>,
+}
+
+impl BindingRecency {
+    fn note_sent(&mut self, binding_id: &BindingId, model_id: String, at_ms: i64) {
+        self.covered_since
+            .entry(binding_id.clone())
+            .and_modify(|since| *since = (*since).min(at_ms))
+            .or_insert(at_ms);
+        self.sent_on
+            .entry((binding_id.clone(), model_id))
+            .and_modify(|sent_at| *sent_at = (*sent_at).max(at_ms))
+            .or_insert(at_ms);
+    }
 }
 
 impl BindingLearningView {
+    /// Build an unseeded view. Runtime construction should use [`Self::seeded`]
+    /// so absence retains its ledger coverage.
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store }
+        Self::seeded(store, &[])
     }
+
+    /// Seed recency only from attributable inference rows. A row without both
+    /// `binding_id` and `effective_model` proves nothing for this view.
+    pub fn seeded(store: Arc<Store>, rows: &[crate::store::RequestRow]) -> Self {
+        let mut recency = BindingRecency::default();
+        for row in rows {
+            // Error rows currently include both provider responses and local
+            // pre-transport failures, so they cannot prove a send after a
+            // restart. Runtime pre-send marks still cover actual sends.
+            if row.kind.is_some() {
+                continue;
+            }
+            let (Some(binding_id), Some(model_id)) =
+                (row.binding_id.as_ref(), row.effective_model.as_deref())
+            else {
+                continue;
+            };
+            let Some(model_id) = exact_effective_model(Some(model_id)) else {
+                continue;
+            };
+            recency.note_sent(binding_id, model_id, row.ts_ms);
+        }
+        Self {
+            store,
+            recency: Mutex::new(recency),
+        }
+    }
+
+    /// Remember an actual inference send before transport starts.
+    pub fn note_sent(&self, binding_id: &BindingId, model_id: Option<&str>, at_ms: i64) {
+        let Some(model_id) = exact_effective_model(model_id) else {
+            return;
+        };
+        if let Ok(mut recency) = self.recency.lock() {
+            recency.note_sent(binding_id, model_id, at_ms);
+        }
+    }
+
+    /// Merge one completed provider-reported observation into durable,
+    /// binding-local learning. Missing response models are rejected by type:
+    /// callers cannot invoke this method without naming one.
+    pub fn note_observed(
+        &self,
+        binding_id: &BindingId,
+        reported_model: &str,
+        at_ms: i64,
+        prompt: Option<u64>,
+        tz: &jiff::tz::TimeZone,
+    ) -> crate::store::Result<()> {
+        let Some(model_id) = crate::catalog::windows::model_identity(reported_model) else {
+            return Ok(());
+        };
+        let Some(day) = crate::middleware::models::local_day(at_ms, tz) else {
+            return Ok(());
+        };
+        self.store
+            .merge_binding_learning(&crate::store::BindingLearningUpdate {
+                binding_id: binding_id.clone(),
+                model_id,
+                days: BTreeSet::from([day]),
+                max_prompt: prompt.map(|prompt| i64::try_from(prompt).unwrap_or(i64::MAX)),
+                context_window: None,
+                explicitly_promoted: false,
+                updated_ms: at_ms,
+            })?;
+        Ok(())
+    }
+}
+
+fn exact_effective_model(model: Option<&str>) -> Option<String> {
+    let model = model?;
+    (!model.is_empty()).then(|| model.to_owned())
 }
 
 impl LearningView for BindingLearningView {
@@ -113,10 +213,26 @@ impl LearningView for BindingLearningView {
 
     fn recently_sent(
         &self,
-        _binding_id: &BindingId,
-        _model_id: &str,
+        binding_id: &BindingId,
+        model_id: &str,
     ) -> Result<RecencyEvidence, Self::Error> {
-        Ok(RecencyEvidence::Unknown)
+        let Some(model_id) = exact_effective_model(Some(model_id)) else {
+            return Ok(RecencyEvidence::Unknown);
+        };
+        let recency = match self.recency.lock() {
+            Ok(recency) => recency,
+            Err(_) => return Ok(RecencyEvidence::Unknown),
+        };
+        let Some(covered_since) = recency.covered_since.get(binding_id).copied() else {
+            return Ok(RecencyEvidence::Unknown);
+        };
+        Ok(RecencyEvidence::Covered {
+            last_sent: recency
+                .sent_on
+                .get(&(binding_id.clone(), model_id))
+                .copied(),
+            covered_since: Some(covered_since),
+        })
     }
 
     fn learned(
@@ -383,7 +499,7 @@ mod tests {
                 updated_ms: 11,
             })
             .unwrap();
-        let view = BindingLearningView::new(store);
+        let view = BindingLearningView::seeded(store, &[]);
 
         let learned = view.learned(&first, "shared-name").unwrap().unwrap();
         assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
@@ -399,5 +515,186 @@ mod tests {
             view.recently_sent(&first, "shared-name").unwrap(),
             RecencyEvidence::Unknown
         );
+    }
+
+    #[test]
+    fn binding_recency_seeds_only_attributable_effective_targets() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let first = binding("anthropic_sub.anthropic_messages");
+        let second = binding("anthropic_api.anthropic_messages");
+        let mut first_row = row("provider-reported-is-not-the-send-target", 9_000);
+        first_row.binding_id = Some(first.clone());
+        first_row.effective_model = Some("same-model".to_owned());
+        let mut second_row = row("other-provider-report", 10_000);
+        second_row.binding_id = Some(second.clone());
+        second_row.effective_model = Some("same-model".to_owned());
+        let mut error_row = row("not-reported", 13_000);
+        error_row.kind = Some(crate::store::RowKind::Error);
+        error_row.binding_id = Some(first.clone());
+        error_row.effective_model = Some("errored-effective".to_owned());
+        let missing_binding = row("same-model", 11_000);
+        let mut missing_effective = row("same-model", 12_000);
+        missing_effective.binding_id = Some(first.clone());
+
+        let view = BindingLearningView::seeded(
+            store,
+            &[
+                first_row,
+                second_row,
+                error_row,
+                missing_binding,
+                missing_effective,
+            ],
+        );
+
+        assert_eq!(
+            view.recently_sent(&first, "same-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(9_000),
+                covered_since: Some(9_000),
+            }
+        );
+        assert_eq!(
+            view.recently_sent(&second, "same-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(10_000),
+                covered_since: Some(10_000),
+            }
+        );
+        assert_eq!(
+            view.recently_sent(&first, "provider-reported-is-not-the-send-target")
+                .unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: None,
+                covered_since: Some(9_000),
+            }
+        );
+        assert_eq!(
+            view.recently_sent(&first, "errored-effective").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: None,
+                covered_since: Some(9_000),
+            },
+            "an error row cannot distinguish a provider response from a local failure",
+        );
+    }
+
+    #[test]
+    fn unattributed_history_cannot_establish_another_effective_target_cold() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let binding = binding("anthropic_api.anthropic_messages");
+        let old_unattributed = row("old-model", 1_000);
+        let mut first_attributed = row("reported", 10_000);
+        first_attributed.binding_id = Some(binding.clone());
+        first_attributed.effective_model = Some("recent-model".to_owned());
+        let view = BindingLearningView::seeded(store, &[old_unattributed, first_attributed]);
+
+        assert_eq!(
+            view.recently_sent(&binding, "another-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: None,
+                covered_since: Some(10_000),
+            },
+            "coverage starts at this binding's first attributable send",
+        );
+    }
+
+    #[test]
+    fn note_sent_is_binding_local_and_visible_before_completion() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let first = binding("anthropic_sub.anthropic_messages");
+        let second = binding("anthropic_api.anthropic_messages");
+        let view = BindingLearningView::seeded(store, &[]);
+
+        view.note_sent(&first, Some("same-model"), 20_000);
+
+        assert_eq!(
+            view.recently_sent(&first, "same-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(20_000),
+                covered_since: Some(20_000),
+            }
+        );
+        assert_eq!(
+            view.recently_sent(&second, "same-model").unwrap(),
+            RecencyEvidence::Unknown
+        );
+        assert_eq!(view.learned(&first, "same-model").unwrap(), None);
+    }
+
+    #[test]
+    fn exact_effective_aliases_are_separate_cache_identities() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let binding = binding("anthropic_api.anthropic_messages");
+        let view = BindingLearningView::seeded(store, &[]);
+
+        view.note_sent(&binding, Some("claude-haiku-4-5-20251001"), 30_000);
+        view.note_sent(&binding, Some("Claude-Haiku-4-5"), 31_000);
+        view.note_sent(&binding, Some("vendor/[claude-haiku-4-5]"), 32_000);
+        view.note_sent(&binding, Some(" spaced-model "), 33_000);
+
+        assert_eq!(
+            view.recently_sent(&binding, "claude-haiku-4-5-20251001")
+                .unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(30_000),
+                covered_since: Some(30_000),
+            }
+        );
+        for (model, sent_at) in [
+            ("Claude-Haiku-4-5", 31_000),
+            ("vendor/[claude-haiku-4-5]", 32_000),
+            (" spaced-model ", 33_000),
+        ] {
+            assert_eq!(
+                view.recently_sent(&binding, model).unwrap(),
+                RecencyEvidence::Covered {
+                    last_sent: Some(sent_at),
+                    covered_since: Some(30_000),
+                }
+            );
+        }
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001 ",
+            "claude-haiku-4-5",
+            "spaced-model",
+        ] {
+            assert_eq!(
+                view.recently_sent(&binding, model).unwrap(),
+                RecencyEvidence::Covered {
+                    last_sent: None,
+                    covered_since: Some(30_000),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn completed_reported_models_merge_only_under_the_selected_binding() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let first = binding("anthropic_sub.anthropic_messages");
+        let second = binding("anthropic_api.anthropic_messages");
+        let view = BindingLearningView::seeded(store, &[]);
+        let tz = jiff::tz::TimeZone::UTC;
+
+        view.note_observed(&first, "same-model", 1_769_954_400_000, Some(100), &tz)
+            .unwrap();
+        view.note_observed(&first, "same-model", 1_769_958_000_000, Some(150), &tz)
+            .unwrap();
+        view.note_observed(&second, "same-model", 1_770_044_400_000, Some(70), &tz)
+            .unwrap();
+        view.note_observed(&first, "day-only-model", 1_770_044_400_000, None, &tz)
+            .unwrap();
+
+        let first_learned = view.learned(&first, "same-model").unwrap().unwrap();
+        assert_eq!(first_learned.distinct_days(), ["2026-02-01"]);
+        assert_eq!(first_learned.max_prompt(), Some(150));
+        let second_learned = view.learned(&second, "same-model").unwrap().unwrap();
+        assert_eq!(second_learned.distinct_days(), ["2026-02-02"]);
+        assert_eq!(second_learned.max_prompt(), Some(70));
+        let day_only = view.learned(&first, "day-only-model").unwrap().unwrap();
+        assert_eq!(day_only.distinct_days(), ["2026-02-02"]);
+        assert_eq!(day_only.max_prompt(), None);
     }
 }

@@ -421,6 +421,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     }
 
     // 7. Upstream; 8.-10. in forward_upstream.
+    server.note_binding_sent(target.binding().id(), gate_model.as_deref());
     match send_upstream(
         &server,
         backend.as_ref(),
@@ -699,8 +700,13 @@ async fn forward_chat_canonical(
     if let Some(ctx) = record.as_ref() {
         let mut observer = UsageObserver::new();
         observer.observe_json(&buffered.bytes);
-        let capture = observer.finish();
-        record_measurement(ctx, capture.as_ref(), status.as_u16());
+        let (reported_model, capture) = observer.finish_parts();
+        record_measurement(
+            ctx,
+            capture.as_ref(),
+            reported_model.as_deref(),
+            status.as_u16(),
+        );
     }
     json_response(status, &upstream_headers, &body)
 }
@@ -797,8 +803,13 @@ impl CanonicalChatStream {
 
     fn finish_recording(&mut self) {
         if let Some(ctx) = self.ctx.take() {
-            let capture = std::mem::take(&mut self.observer).finish();
-            record_measurement(&ctx, capture.as_ref(), self.status);
+            let (reported_model, capture) = std::mem::take(&mut self.observer).finish_parts();
+            record_measurement(
+                &ctx,
+                capture.as_ref(),
+                reported_model.as_deref(),
+                self.status,
+            );
         }
         drop(self.in_flight.take());
     }

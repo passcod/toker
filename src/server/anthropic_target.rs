@@ -135,6 +135,7 @@ pub(crate) async fn turn(
             stream,
         );
     }
+    server.note_binding_sent(target.binding().id(), Some(&model));
     let upstream = match send_upstream_to(
         &server,
         backend.as_ref(),
@@ -258,8 +259,14 @@ async fn forward(
     if let Some(ctx) = record.as_ref() {
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
-        let capture = observer.finish();
-        record_anthropic_measurement(ctx, capture.as_ref(), None, status.as_u16());
+        let (reported_model, capture) = observer.finish_parts();
+        record_anthropic_measurement(
+            ctx,
+            capture.as_ref(),
+            reported_model.as_deref(),
+            None,
+            status.as_u16(),
+        );
     }
     json_response(status, &headers, &frontend.render_complete(model, &turn))
 }
@@ -357,8 +364,15 @@ fn stream_events(
             }
             if state.ended {
                 if let Some(ctx) = state.record.take().filter(|_| state.succeeded) {
-                    let capture = std::mem::take(&mut state.observer).finish();
-                    record_anthropic_measurement(&ctx, capture.as_ref(), None, 200);
+                    let (reported_model, capture) =
+                        std::mem::take(&mut state.observer).finish_parts();
+                    record_anthropic_measurement(
+                        &ctx,
+                        capture.as_ref(),
+                        reported_model.as_deref(),
+                        None,
+                        200,
+                    );
                 }
                 drop(state.in_flight.take());
                 return None;

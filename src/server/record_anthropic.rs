@@ -131,6 +131,7 @@ pub(crate) struct AnthropicRecordCtx {
 pub(crate) fn record_anthropic_measurement(
     ctx: &AnthropicRecordCtx,
     capture: Option<&AnthropicCapture>,
+    reported_model: Option<&str>,
     rate_limits: Option<&Value>,
     status: u16,
 ) {
@@ -166,9 +167,13 @@ pub(crate) fn record_anthropic_measurement(
         }
         _ => false,
     };
+    if !ledgered {
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, reported_model, ts_ms, None);
+    }
 
-    let model = capture
-        .and_then(AnthropicCapture::model)
+    let model = reported_model
+        .or_else(|| capture.and_then(AnthropicCapture::model))
         .or(ctx.effective_model.as_deref());
     tracing::info!(
         "POST {} → {} ledgered={} model={} provider={} ({:.1}s)",
@@ -313,6 +318,9 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
     let held = capture.input().unwrap_or(0)
         + capture.cache_read().unwrap_or(0)
         + capture.cache_write_total().unwrap_or(0);
+    let presence = capture.presence();
+    let held_observed =
+        (presence.input || presence.cache_read || presence.cache_write_total).then_some(held);
 
     // A model is "seen" when a response named it. Days
     // are local calendar days; the system zone is the server's, read once
@@ -322,6 +330,8 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
         if let Err(error) = ctx.server.models.note_seen(model, ts_ms, held, &tz) {
             tracing::error!(%error, "learned model update failed");
         }
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, Some(model), ts_ms, held_observed);
     }
 
     // The lane keyed by session × tools-hash, moved
@@ -1408,6 +1418,9 @@ pub(crate) fn record_responses_measurement(
     let held = held_input.unwrap_or(0)
         + i64::try_from(cached.unwrap_or(0)).unwrap_or(i64::MAX)
         + i64::try_from(written.unwrap_or(0)).unwrap_or(i64::MAX);
+    // Legacy learning retains its effective-model fallback. The binding-local
+    // component deliberately does not: only a provider-reported raw model is
+    // an observation.
     let model = capture
         .model()
         .map(str::to_owned)
@@ -1422,6 +1435,12 @@ pub(crate) fn record_responses_measurement(
             tracing::error!(%error, "learned model update failed");
         }
     }
+    ctx.server.note_binding_observed(
+        &ctx.binding_id,
+        capture.model(),
+        ts_ms,
+        usage.map(|_| u64::try_from(held).unwrap_or(u64::MAX)),
+    );
     let compaction = ctx
         .shape
         .as_ref()

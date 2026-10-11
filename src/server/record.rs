@@ -120,12 +120,17 @@ pub(crate) fn i64_of(value: u64) -> i64 {
 /// Record a completed usage-path response: the measurement row (when usage
 /// was observed — a completed stream with nothing usage-bearing records no
 /// row, like a hung-up one). `status` is the upstream status the client saw.
-pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>, status: u16) {
+pub(crate) fn record_measurement(
+    ctx: &RecordCtx,
+    capture: Option<&UsageCapture>,
+    reported_model: Option<&str>,
+    status: u16,
+) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of(ctx.backend.id());
 
-    let model = capture.and_then(UsageCapture::model);
+    let model = reported_model.or_else(|| capture.and_then(UsageCapture::model));
     if let Some(capture) = capture {
         insert(
             ctx,
@@ -144,6 +149,16 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             .unwrap_or(0)
             .saturating_add(buckets.cache_read.unwrap_or(0))
             .saturating_add(buckets.cache_write_total.unwrap_or(0));
+        let held_observed = (buckets.input.is_some()
+            || buckets.cache_read.is_some()
+            || buckets.cache_write_total.is_some())
+        .then_some(held);
+        ctx.server.note_binding_observed(
+            &ctx.binding_id,
+            model,
+            ts_ms,
+            held_observed.and_then(|held| u64::try_from(held).ok()),
+        );
         if ctx.backend.id() == "openrouter"
             && let Err(error) = lanes::note_lane_response(
                 &ctx.server.store,
@@ -163,6 +178,9 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
         {
             tracing::error!(%error, "lane table update failed");
         }
+    } else {
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, model, ts_ms, None);
     }
 
     tracing::info!(

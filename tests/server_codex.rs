@@ -387,6 +387,17 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
 "#),
         );
     }
+    if value["model"] == "model-only" {
+        return raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_model_only\",\"model\":\"reported-model-only\"}}\n\n\
+                  data: {\"type\":\"response.completed\",\"response\":{\"id\":\"gen_model_only\",\"end_turn\":true}}\n\n\
+                  data: [DONE]\n\n",
+            ),
+        );
+    }
     if value["model"] == "cut" {
         return raw_response(
             StatusCode::OK,

@@ -360,11 +360,17 @@ impl AnthropicObserver {
     /// usage-bearing or error-bearing was seen (a client hangup or an
     /// all-keepalive stream records no row).
     pub fn finish(self) -> Option<AnthropicCapture> {
+        self.finish_parts().1
+    }
+
+    /// Finish while retaining a provider-reported model even when every usage
+    /// bucket was absent. The identity remains usable as completed binding-
+    /// local day evidence without creating an accounting row.
+    pub fn finish_parts(self) -> (Option<String>, Option<AnthropicCapture>) {
+        let model = self.model.clone();
         let has_usage = self.start_usage.is_some() || self.delta_usage.is_some();
-        if !has_usage && self.error.is_none() {
-            return None;
-        }
-        Some(self.fold())
+        let capture = (has_usage || self.error.is_some()).then(|| self.fold());
+        (model, capture)
     }
 
     /// The shared latch path over one JSON document's text.
