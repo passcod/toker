@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
@@ -34,8 +34,10 @@ use crate::ir::AnthropicShape;
 use crate::ir::canonical::ResponseProjection;
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
+use crate::policy::BindingId;
+use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
-use crate::routing::{BackendAdapterId, ProtocolId};
+use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, plain_status, session_id,
@@ -242,79 +244,95 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         translation_report: None,
     });
 
-    if target
+    let Some(attempt) = attempt else {
+        return super::inference::invalid_responses_body(client_wants_json);
+    };
+    let adapter = target
         .binding()
         .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
-    {
-        let Some(Ok(attempt)) = attempt else {
-            return frontend_error_response(
-                CodexFrontendWire::OpenAiResponses,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "the request body could not be parsed for translation to this backend",
-                !client_wants_json,
-            );
-        };
-        return super::anthropic_target::turn(
-            server,
+        .map(|backend| backend.adapter());
+    super::inference::coordinate_responses(
+        server,
+        adapter,
+        attempt,
+        super::inference::ResponsesAttemptInput {
             parts,
-            attempt,
-            parsed
+            max_output_tokens: parsed
                 .as_ref()
                 .and_then(|request| request.get("max_output_tokens").cloned()),
-            record,
-            in_flight,
-            super::anthropic_target::FrontendWire::Responses,
-        )
-        .await;
-    }
-
-    if target
-        .binding()
-        .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenRouterResponses)
-    {
-        let Some(Ok(attempt)) = attempt else {
-            return frontend_error_response(
-                CodexFrontendWire::OpenAiResponses,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "the request body could not be parsed for translation to this backend",
-                !client_wants_json,
-            );
-        };
-        return super::openrouter_responses::turn(
-            server,
-            parts,
-            attempt,
-            parsed
+            had_prompt_cache_key: parsed
                 .as_ref()
                 .is_some_and(|request| request.get("prompt_cache_key").is_some()),
             record,
             in_flight,
-        )
-        .await;
-    }
-
-    turn(CodexTurn {
-        server,
-        attempt,
-        record,
-        in_flight,
-        session_id: request_session,
-        thread_id,
-        request_id,
-        client_wants_json,
-        frontend_wire: CodexFrontendWire::OpenAiResponses,
-    })
+            session_id: request_session,
+            thread_id,
+            request_id,
+            client_wants_json,
+        },
+    )
     .await
 }
 
-/// One turn: translate, send, translate back, record.
-pub(crate) async fn turn(args: CodexTurn) -> Response {
-    let CodexTurn {
-        server,
+pub(crate) struct ReadyAttempt {
+    backend: std::sync::Arc<dyn Provider>,
+    binding_id: BindingId,
+    effective_model: String,
+    response_model: String,
+    response_projection: ResponseProjection,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    client_wants_json: bool,
+    frontend_wire: CodexFrontendWire,
+}
+
+impl ReadyAttempt {
+    pub(crate) fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
+    pub(crate) fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    pub(crate) async fn execute(mut self, server: Server) -> Response {
+        let url = self.backend.endpoint("/responses");
+        let upstream = match server
+            .http
+            .post(url)
+            .headers(std::mem::take(&mut self.headers))
+            .body(std::mem::take(&mut self.body))
+            .send()
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(%error, "codex upstream request failed");
+                return transport_failure(self.frontend_wire.error_wire(), &error);
+            }
+        };
+        forward(self, server, upstream).await
+    }
+}
+
+pub(crate) struct AttemptInput {
+    pub(crate) attempt: Result<super::inference::InferenceAttempt, TranslateError>,
+    pub(crate) record: Option<AnthropicRecordCtx>,
+    pub(crate) in_flight: Option<InFlightGuard>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) client_wants_json: bool,
+    pub(crate) frontend_wire: CodexFrontendWire,
+}
+
+pub(crate) async fn prepare(
+    server: &Server,
+    input: AttemptInput,
+) -> Result<ReadyAttempt, Box<Response>> {
+    let AttemptInput {
         attempt,
         mut record,
         in_flight,
@@ -323,12 +341,103 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         request_id,
         client_wants_json,
         frontend_wire,
-    } = args;
+    } = input;
+    let attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(Box::new(translation_error_response(
+                &error,
+                record.as_ref(),
+                frontend_wire,
+                client_wants_json,
+            )));
+        }
+    };
+    let backend = attempt.backend().clone();
+    let binding_id = attempt.binding().id().clone();
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt
+        .requested_model()
+        .unwrap_or(&effective_model)
+        .to_owned();
+    let canonical = attempt.canonical();
+    let response_projection = ResponseProjection::for_request(&canonical);
+    let prompt_cache_key = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let thread_id = thread_id.unwrap_or_else(|| prompt_cache_key.clone());
+    let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    let rendered = translate::render_codex(&canonical, &prompt_cache_key).map_err(|error| {
+        Box::new(translation_error_response(
+            &error,
+            record.as_ref(),
+            frontend_wire,
+            client_wants_json,
+        ))
+    })?;
+    if !rendered.report.is_empty()
+        && let Some(ctx) = record.as_mut()
+    {
+        ctx.translation_report = Some(rendered.report);
+    }
+    let body = serde_json::to_vec(&rendered.value).map_err(|error| {
+        tracing::error!(%error, "codex request serialisation failed");
+        Box::new(plain_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "translation failed\n",
+        ))
+    })?;
+
+    // Refreshing is local preparation. A failure does not start an attempt and
+    // must therefore precede the coordinator's sent-target observation.
+    let now = now_ms() / 1000;
+    let Some(codex) = server.codex_turn.clone() else {
+        return Err(Box::new(match frontend_wire {
+            CodexFrontendWire::Anthropic => super::anthropic_not_configured(),
+            CodexFrontendWire::OpenAiChat => super::openai_not_configured(),
+            CodexFrontendWire::OpenAiResponses => super::responses_not_configured(),
+        }));
+    };
+    let auth = codex
+        .auth_for_turn(&server.http, now)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "codex auth refresh failed");
+            Box::new(upstream_failure(
+                frontend_wire.error_wire(),
+                "toker upstream error: the codex login could not be refreshed",
+            ))
+        })?;
+    let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
+
+    Ok(ReadyAttempt {
+        backend,
+        binding_id,
+        effective_model,
+        response_model,
+        response_projection,
+        headers,
+        body,
+        record,
+        in_flight,
+        client_wants_json,
+        frontend_wire,
+    })
+}
+
+/// One turn: prepare locally, mark the actual target, send, translate back.
+pub(crate) async fn turn(args: CodexTurn) -> Response {
+    let CodexTurn {
+        server,
+        attempt,
+        record,
+        in_flight,
+        session_id,
+        thread_id,
+        request_id,
+        client_wants_json,
+        frontend_wire,
+    } = args;
     let Some(attempt) = attempt else {
-        // An untranslatable body on a translated route: the honest
-        // answer names the problem; nothing reached the upstream, and
-        // there is no row (no measurement, no provider response).
         return frontend_error_response(
             frontend_wire,
             StatusCode::BAD_REQUEST,
@@ -337,104 +446,39 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
             !client_wants_json,
         );
     };
-    let attempt = match attempt {
-        Ok(attempt) => attempt,
-        Err(error) => {
-            return translation_error_response(
-                &error,
-                record.as_ref(),
-                frontend_wire,
-                client_wants_json,
-            );
-        }
-    };
-    let backend = attempt.backend().clone();
-    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
-    let canonical = attempt.canonical();
-    let response_projection = ResponseProjection::for_request(&canonical);
-    let prompt_cache_key = session_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let thread_id = thread_id.unwrap_or_else(|| prompt_cache_key.clone());
-    let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    // The translation itself — pure; a typed failure never reaches the
-    // upstream and answers in the frontend's error shape.
-    let rendered = match translate::render_codex(&canonical, &prompt_cache_key) {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            return translation_error_response(
-                &error,
-                record.as_ref(),
-                frontend_wire,
-                client_wants_json,
-            );
-        }
-    };
-    if !rendered.report.is_empty()
-        && let Some(ctx) = record.as_mut()
+    let ready = match prepare(
+        &server,
+        AttemptInput {
+            attempt,
+            record,
+            in_flight,
+            session_id,
+            thread_id,
+            request_id,
+            client_wants_json,
+            frontend_wire,
+        },
+    )
+    .await
     {
-        ctx.translation_report = Some(rendered.report);
-    }
-    let request = rendered.value;
-    let body = match serde_json::to_vec(&request) {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::error!(%error, "codex request serialisation failed");
-            return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
-        }
+        Ok(ready) => ready,
+        Err(response) => return *response,
     };
+    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+    ready.execute(server).await
+}
 
-    // Auth for this turn (refreshing first when the login says so). A
-    // refresh failure is a toker-side failure: no upstream response, no
-    // row, 502 — the same shape the byte-forward paths give.
-    let now = now_ms() / 1000;
-    // Only the codex backend routes here, and it exists only when its
-    // block does; the check keeps a broken invariant a typed answer.
-    let Some(codex) = server.codex_turn.clone() else {
-        return match frontend_wire {
-            CodexFrontendWire::Anthropic => super::anthropic_not_configured(),
-            CodexFrontendWire::OpenAiChat => super::openai_not_configured(),
-            CodexFrontendWire::OpenAiResponses => super::responses_not_configured(),
-        };
-    };
-    let auth = match codex.auth_for_turn(&server.http, now).await {
-        Ok(auth) => auth,
-        Err(error) => {
-            tracing::warn!(%error, "codex auth refresh failed");
-            // A fixed message, not the error's: it names local paths, and
-            // the log line above already has the detail.
-            return upstream_failure(
-                frontend_wire.error_wire(),
-                "toker upstream error: the codex login could not be refreshed",
-            );
-        }
-    };
-
-    let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
-    if let Some(ctx) = record.as_ref() {
-        server.note_binding_sent(&ctx.binding_id, Some(&effective_model));
-    }
-    let url = backend.endpoint("/responses");
-    let upstream = match server
-        .http
-        .post(url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            tracing::warn!(%error, "codex upstream request failed");
-            return transport_failure(frontend_wire.error_wire(), &error);
-        }
-    };
-
+async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Response) -> Response {
+    let ReadyAttempt {
+        backend,
+        response_model,
+        response_projection,
+        record,
+        in_flight,
+        client_wants_json,
+        frontend_wire,
+        ..
+    } = ready;
     let status = upstream.status();
     let meter_snapshot = backend.meters(upstream.headers());
     if let Some(snapshot) = &meter_snapshot {
@@ -449,9 +493,6 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
     }
 
     if !status.is_success() {
-        // A provider error, translated: the client sees its protocol's
-        // error naming the mapped type; the row records the real
-        // upstream status with the same mapping.
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
             return truncated_body(frontend_wire.error_wire());
         };

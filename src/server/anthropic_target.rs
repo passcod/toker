@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -17,6 +18,8 @@ use serde_json::Value;
 
 use crate::ir::canonical::CanonEvent;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
+use crate::policy::BindingId;
+use crate::providers::Provider;
 use crate::routing::ProtocolId;
 use crate::translate::{
     self, AnthropicResponseStream, OpenAiChatRenderer, OpenAiResponsesRenderer,
@@ -62,15 +65,64 @@ impl FrontendWire {
     }
 }
 
-pub(crate) async fn turn(
-    server: Server,
+pub(crate) struct ReadyAttempt {
+    parts: Parts,
+    backend: Arc<dyn Provider>,
+    binding_id: BindingId,
+    effective_model: String,
+    response_model: String,
+    body: Bytes,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    frontend: FrontendWire,
+    stream: bool,
+}
+
+impl ReadyAttempt {
+    pub(crate) fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
+    pub(crate) fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    pub(crate) async fn execute(self, server: Server) -> Response {
+        let upstream = match send_upstream_to(
+            &server,
+            self.backend.as_ref(),
+            &self.parts,
+            self.body,
+            &server.config.session_header_names,
+            self.frontend.protocol(),
+            "/v1/messages",
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => return transport_failure(ErrorWire::Openai, &error),
+        };
+        forward(
+            upstream,
+            self.record,
+            self.in_flight,
+            &self.response_model,
+            self.frontend,
+            self.stream,
+        )
+        .await
+    }
+}
+
+pub(crate) fn prepare(
+    server: &Server,
     parts: Parts,
     mut attempt: super::inference::InferenceAttempt,
     limit_field: Option<Value>,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     frontend: FrontendWire,
-) -> Response {
+) -> Result<ReadyAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt
         .requested_model()
@@ -86,70 +138,82 @@ pub(crate) async fn turn(
     // maximum from the fetched Anthropic catalogue, never a guessed limit.
     let limit = match limit_field.as_ref() {
         Some(Value::Number(number)) => number.as_u64().filter(|limit| *limit > 0),
-        None | Some(Value::Null) => declared_output_limit(&server, &effective_model),
+        None | Some(Value::Null) => declared_output_limit(server, &effective_model),
         Some(_) => None,
     };
     let Some(limit) = limit else {
-        return invalid_request(
+        return Err(Box::new(invalid_request(
             "an output token limit is required: supply a positive max_output_tokens/max_tokens or fetch an Anthropic catalogue with max_tokens",
             stream,
             frontend,
-        );
+        )));
     };
     attempt.prepare_messages_transport(stream, limit);
 
-    let rendered = match attempt.render_json() {
-        Ok(rendered) => rendered,
-        Err(error) => return invalid_request(&error.to_string(), stream, frontend),
-    };
+    let rendered = attempt
+        .render_json()
+        .map_err(|error| Box::new(invalid_request(&error.to_string(), stream, frontend)))?;
     if !rendered.report.is_empty()
         && let Some(ctx) = record.as_mut()
     {
         ctx.translation_report = Some(rendered.report);
     }
-    let body = match serde_json::to_vec(&rendered.value) {
-        Ok(body) => Bytes::from(body),
-        Err(error) => {
+    let body = serde_json::to_vec(&rendered.value)
+        .map(Bytes::from)
+        .map_err(|error| {
             tracing::error!(%error, "Messages backend serialisation failed");
-            return upstream_failure(ErrorWire::Openai, "toker could not render the request");
-        }
-    };
+            Box::new(upstream_failure(
+                ErrorWire::Openai,
+                "toker could not render the request",
+            ))
+        })?;
     let backend = attempt.backend().clone();
     if !backend.foreign_auth_available() {
-        return frontend_error_response(
+        return Err(Box::new(frontend_error_response(
             frontend.codex_wire(),
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "the selected backend has no usable subscription credential",
             stream,
-        );
+        )));
     }
-    let binding_id = attempt.binding().id().clone();
-    drop(attempt);
-    server.note_binding_sent(&binding_id, Some(&effective_model));
-    let upstream = match send_upstream_to(
-        &server,
-        backend.as_ref(),
-        &parts,
+    Ok(ReadyAttempt {
+        parts,
+        backend,
+        binding_id: attempt.binding().id().clone(),
+        effective_model,
+        response_model,
         body,
-        &server.config.session_header_names,
-        frontend.protocol(),
-        "/v1/messages",
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => return transport_failure(ErrorWire::Openai, &error),
-    };
-    forward(
-        upstream,
         record,
         in_flight,
-        &response_model,
         frontend,
         stream,
-    )
-    .await
+    })
+}
+
+pub(crate) async fn turn(
+    server: Server,
+    parts: Parts,
+    attempt: super::inference::InferenceAttempt,
+    limit_field: Option<Value>,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    frontend: FrontendWire,
+) -> Response {
+    let ready = match prepare(
+        &server,
+        parts,
+        attempt,
+        limit_field,
+        record,
+        in_flight,
+        frontend,
+    ) {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+    ready.execute(server).await
 }
 
 fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {

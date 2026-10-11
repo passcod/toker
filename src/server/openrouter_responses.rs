@@ -3,6 +3,7 @@
 //! directions. A JSON frontend response aggregates the verified SSE wire.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -12,6 +13,8 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::observe::{SseEvent, SseSplitter};
+use crate::policy::BindingId;
+use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponsesSse, TurnCapture};
 use crate::routing::ProtocolId;
 use crate::translate::{self, OpenAiResponsesRenderer};
@@ -27,14 +30,60 @@ use super::record_anthropic::{
     AnthropicRecordCtx, record_codex_error, record_responses_measurement,
 };
 
-pub(crate) async fn turn(
-    server: Server,
+pub(crate) struct ReadyAttempt {
+    parts: Parts,
+    backend: Arc<dyn Provider>,
+    binding_id: BindingId,
+    effective_model: String,
+    response_model: String,
+    body: Bytes,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    wants_stream: bool,
+}
+
+impl ReadyAttempt {
+    pub(crate) fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
+    pub(crate) fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    pub(crate) async fn execute(self, server: Server) -> Response {
+        let upstream = match send_upstream_to(
+            &server,
+            self.backend.as_ref(),
+            &self.parts,
+            self.body,
+            &[],
+            ProtocolId::OpenAiResponses,
+            "/v1/responses",
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => return transport_failure(ErrorWire::Openai, &error),
+        };
+        forward(
+            upstream,
+            self.record,
+            self.in_flight,
+            self.response_model,
+            self.wants_stream,
+        )
+        .await
+    }
+}
+
+pub(crate) fn prepare(
     parts: Parts,
     attempt: super::inference::InferenceAttempt,
     had_prompt_cache_key: bool,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
-) -> Response {
+) -> Result<ReadyAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt
         .requested_model()
@@ -42,13 +91,11 @@ pub(crate) async fn turn(
         .to_owned();
     let canonical = attempt.canonical();
     let wants_stream = canonical.stream != Some(false);
-    let rendered = match translate::openrouter_responses_backend::render_openrouter_responses(
+    let rendered = translate::openrouter_responses_backend::render_openrouter_responses(
         &canonical,
         had_prompt_cache_key,
-    ) {
-        Ok(rendered) => rendered,
-        Err(error) => return invalid_request(&error.to_string(), wants_stream),
-    };
+    )
+    .map_err(|error| Box::new(invalid_request(&error.to_string(), wants_stream)))?;
     if !rendered.report.is_empty()
         && let Some(ctx) = record.as_mut()
     {
@@ -57,21 +104,26 @@ pub(crate) async fn turn(
     let body = Bytes::from(
         serde_json::to_vec(&rendered.value).expect("a rendered Responses request serialises"),
     );
-    server.note_binding_sent(attempt.binding().id(), Some(&effective_model));
-    let upstream = match send_upstream_to(
-        &server,
-        attempt.backend().as_ref(),
-        &parts,
+    Ok(ReadyAttempt {
+        parts,
+        backend: attempt.backend().clone(),
+        binding_id: attempt.binding().id().clone(),
+        effective_model,
+        response_model,
         body,
-        &[],
-        ProtocolId::OpenAiResponses,
-        "/v1/responses",
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => return transport_failure(ErrorWire::Openai, &error),
-    };
+        record,
+        in_flight,
+        wants_stream,
+    })
+}
+
+async fn forward(
+    upstream: reqwest::Response,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    response_model: String,
+    wants_stream: bool,
+) -> Response {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     if is_compressed(&headers) {

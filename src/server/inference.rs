@@ -6,12 +6,20 @@
 
 use std::sync::Arc;
 
+use axum::http::request::Parts;
+use axum::response::Response;
+use serde_json::Value;
+
 use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold::RetargetOutcome;
 use crate::middleware::model_map::{MapTarget, ModelMap};
 use crate::providers::Provider;
 use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
 use crate::translate::{Rendered, TranslateError};
+
+use super::codex::{CodexFrontendWire, frontend_error_response};
+use super::record_anthropic::AnthropicRecordCtx;
+use super::{InFlightGuard, Server};
 
 #[derive(Clone)]
 pub(crate) struct InferenceRequest {
@@ -55,6 +63,18 @@ pub(crate) struct InferenceAttempt {
     effective_model: Option<String>,
     mapped: Option<MapTarget>,
     canonical: CanonicalRequest,
+}
+
+pub(crate) struct ResponsesAttemptInput {
+    pub(crate) parts: Parts,
+    pub(crate) max_output_tokens: Option<Value>,
+    pub(crate) had_prompt_cache_key: bool,
+    pub(crate) record: Option<AnthropicRecordCtx>,
+    pub(crate) in_flight: Option<InFlightGuard>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) client_wants_json: bool,
 }
 
 impl InferenceAttempt {
@@ -148,6 +168,121 @@ impl InferenceAttempt {
         canonical.model.clone_from(&self.effective_model);
         canonical
     }
+}
+
+enum ReadyResponsesAttempt {
+    Anthropic(super::anthropic_target::ReadyAttempt),
+    OpenRouter(super::openrouter_responses::ReadyAttempt),
+    Codex(super::codex::ReadyAttempt),
+}
+
+impl ReadyResponsesAttempt {
+    fn binding_id(&self) -> &crate::policy::BindingId {
+        match self {
+            Self::Anthropic(ready) => ready.binding_id(),
+            Self::OpenRouter(ready) => ready.binding_id(),
+            Self::Codex(ready) => ready.binding_id(),
+        }
+    }
+
+    fn effective_model(&self) -> &str {
+        match self {
+            Self::Anthropic(ready) => ready.effective_model(),
+            Self::OpenRouter(ready) => ready.effective_model(),
+            Self::Codex(ready) => ready.effective_model(),
+        }
+    }
+
+    async fn execute(self, server: Server) -> Response {
+        match self {
+            Self::Anthropic(ready) => ready.execute(server).await,
+            Self::OpenRouter(ready) => ready.execute(server).await,
+            Self::Codex(ready) => ready.execute(server).await,
+        }
+    }
+}
+
+pub(crate) async fn coordinate_responses(
+    server: Server,
+    adapter: Option<BackendAdapterId>,
+    attempt: Result<InferenceAttempt, TranslateError>,
+    input: ResponsesAttemptInput,
+) -> Response {
+    let ResponsesAttemptInput {
+        parts,
+        max_output_tokens,
+        had_prompt_cache_key,
+        record,
+        in_flight,
+        session_id,
+        thread_id,
+        request_id,
+        client_wants_json,
+    } = input;
+    let prepared = match adapter {
+        Some(BackendAdapterId::AnthropicMessages) => {
+            let attempt = match attempt {
+                Ok(attempt) => attempt,
+                Err(_) => return invalid_responses_body(client_wants_json),
+            };
+            super::anthropic_target::prepare(
+                &server,
+                parts,
+                attempt,
+                max_output_tokens,
+                record,
+                in_flight,
+                super::anthropic_target::FrontendWire::Responses,
+            )
+            .map(ReadyResponsesAttempt::Anthropic)
+        }
+        Some(BackendAdapterId::OpenRouterResponses) => {
+            let attempt = match attempt {
+                Ok(attempt) => attempt,
+                Err(_) => return invalid_responses_body(client_wants_json),
+            };
+            super::openrouter_responses::prepare(
+                parts,
+                attempt,
+                had_prompt_cache_key,
+                record,
+                in_flight,
+            )
+            .map(ReadyResponsesAttempt::OpenRouter)
+        }
+        Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
+            &server,
+            super::codex::AttemptInput {
+                attempt,
+                record,
+                in_flight,
+                session_id,
+                thread_id,
+                request_id,
+                client_wants_json,
+                frontend_wire: CodexFrontendWire::OpenAiResponses,
+            },
+        )
+        .await
+        .map(ReadyResponsesAttempt::Codex),
+        _ => Err(Box::new(super::responses_not_configured())),
+    };
+    let ready = match prepared {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+    ready.execute(server).await
+}
+
+pub(crate) fn invalid_responses_body(client_wants_json: bool) -> Response {
+    frontend_error_response(
+        CodexFrontendWire::OpenAiResponses,
+        axum::http::StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        "the request body could not be parsed for translation to this backend",
+        !client_wants_json,
+    )
 }
 
 #[cfg(test)]
