@@ -12,8 +12,8 @@ use crate::routing::RouteRegistry;
 use crate::store::{PolicyRevisionSource, Store};
 
 use super::{
-    AvailabilitySnapshot, BindingId, CandidateId, CompiledPolicy, FailureClass, PolicyOrigin,
-    RouteId,
+    ActivationScope, AvailabilitySnapshot, BindingId, CandidateId, CompiledPolicy, FailureClass,
+    PolicyOrigin, RouteId,
 };
 
 const REVISION_CACHE_CAPACITY: usize = 32;
@@ -22,6 +22,8 @@ const REVISION_CACHE_CAPACITY: usize = 32;
 #[derive(Clone)]
 pub struct PolicySnapshot {
     revision_id: Option<i64>,
+    activation_scope: Option<ActivationScope>,
+    forced_cache_transition: bool,
     policy: Arc<CompiledPolicy>,
     inventory: Arc<OfferInventory>,
     availability: Arc<AvailabilitySnapshot>,
@@ -40,6 +42,14 @@ pub(crate) struct PolicyEvidence {
 impl PolicySnapshot {
     pub fn revision_id(&self) -> Option<i64> {
         self.revision_id
+    }
+
+    pub fn activation_scope(&self) -> Option<ActivationScope> {
+        self.activation_scope
+    }
+
+    pub fn forced_cache_transition(&self) -> bool {
+        self.forced_cache_transition
     }
 
     pub fn policy(&self) -> &Arc<CompiledPolicy> {
@@ -91,21 +101,28 @@ struct OpenCircuit {
     credential_generation: u64,
 }
 
+#[derive(Clone)]
+struct CachedRevision {
+    policy: Arc<CompiledPolicy>,
+    activation_scope: ActivationScope,
+    forced_cache_transition: bool,
+}
+
 #[derive(Default)]
 struct RevisionCache {
-    policies: HashMap<i64, Arc<CompiledPolicy>>,
+    policies: HashMap<i64, CachedRevision>,
     recency: VecDeque<i64>,
 }
 
 impl RevisionCache {
-    fn get(&mut self, revision_id: i64) -> Option<Arc<CompiledPolicy>> {
-        let policy = self.policies.get(&revision_id)?.clone();
+    fn get(&mut self, revision_id: i64) -> Option<CachedRevision> {
+        let revision = self.policies.get(&revision_id)?.clone();
         self.touch(revision_id);
-        Some(policy)
+        Some(revision)
     }
 
-    fn insert(&mut self, revision_id: i64, policy: Arc<CompiledPolicy>) {
-        self.policies.insert(revision_id, policy);
+    fn insert(&mut self, revision_id: i64, revision: CachedRevision) {
+        self.policies.insert(revision_id, revision);
         self.touch(revision_id);
         while self.policies.len() > REVISION_CACHE_CAPACITY {
             if let Some(evicted) = self.recency.pop_front() {
@@ -175,6 +192,8 @@ impl PolicyRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Some(Arc::new(PolicySnapshot {
             revision_id: None,
+            activation_scope: None,
+            forced_cache_transition: false,
             policy: state.candidate.clone()?,
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
@@ -216,6 +235,8 @@ impl PolicyRuntime {
         state.availability = availability.clone();
         let snapshot = Arc::new(PolicySnapshot {
             revision_id: None,
+            activation_scope: None,
+            forced_cache_transition: false,
             policy,
             inventory,
             availability,
@@ -271,41 +292,45 @@ impl PolicyRuntime {
             .mutation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let policy = if let Some(policy) = self
+        let revision = if let Some(revision) = self
             .revisions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(revision_id)
         {
-            policy
+            revision
         } else {
-            let revision = self
+            let stored = self
                 .store
                 .load_policy_revision(revision_id)?
                 .ok_or(PolicyRuntimeError::MissingRevision(revision_id))?;
-            let origin = if revision.source == PolicyRevisionSource::Legacy {
+            let origin = if stored.source == PolicyRevisionSource::Legacy {
                 PolicyOrigin::GeneratedRevisionOne
             } else {
                 PolicyOrigin::Authored
             };
-            let policy = super::compile(
-                revision.document,
-                &self.topology,
-                &evidence.inventory,
-                origin,
-            )
-            .into_policy()
-            .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
-            let policy = Arc::new(policy);
+            let activation_scope = stored.activation_scope;
+            let forced_cache_transition = stored.forced_cache_transition;
+            let policy =
+                super::compile(stored.document, &self.topology, &evidence.inventory, origin)
+                    .into_policy()
+                    .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
+            let revision = CachedRevision {
+                policy: Arc::new(policy),
+                activation_scope,
+                forced_cache_transition,
+            };
             self.revisions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(revision_id, policy.clone());
-            policy
+                .insert(revision_id, revision.clone());
+            revision
         };
         Ok(Arc::new(PolicySnapshot {
             revision_id: Some(revision_id),
-            policy,
+            activation_scope: Some(revision.activation_scope),
+            forced_cache_transition: revision.forced_cache_transition,
+            policy: revision.policy,
             inventory: evidence.inventory.clone(),
             availability: evidence.availability.clone(),
             inventory_generation: evidence.inventory_generation,
@@ -503,6 +528,8 @@ mod tests {
         let first = runtime.capture_revision(revision.revision_id).unwrap();
         let second = runtime.capture_revision(revision.revision_id).unwrap();
         assert_eq!(first.revision_id(), Some(revision.revision_id));
+        assert_eq!(first.activation_scope(), Some(ActivationScope::NewLanes));
+        assert!(!first.forced_cache_transition());
         assert!(Arc::ptr_eq(first.policy(), second.policy()));
         assert!(matches!(
             runtime.capture_revision(revision.revision_id + 1),
