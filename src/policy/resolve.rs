@@ -379,6 +379,9 @@ pub fn resolve<L: LearningView>(
         prior_live = live;
         let evidence = candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
         trace.push(TraceEvent::Candidate(evidence.clone()));
+        if evidence.result == Err(SkipReason::SelectorUnresolved) {
+            break;
+        }
         if evidence.result.is_err() {
             continue;
         }
@@ -1586,6 +1589,62 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn unresolved_selector_does_not_authorize_preflight_fallback() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::OfferSelector {
+                selector: CandidateSelector {
+                    include: vec![],
+                    exclude: vec![],
+                    ordering: SelectorOrdering::Explicit { model_ids: vec![] },
+                },
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "fallback".to_owned(),
+            },
+        );
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap_err();
+        let ResolveFailure::RouteUnavailable { trace } = failure else {
+            panic!()
+        };
+        assert_eq!(trace.len(), 2, "the fallback candidate is never considered");
+        assert!(matches!(
+            &trace[1],
+            TraceEvent::Candidate(evidence)
+                if evidence.result == Err(SkipReason::SelectorUnresolved)
+        ));
     }
 
     #[test]
