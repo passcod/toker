@@ -38,8 +38,8 @@ pub use ledger::{
 pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
     LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
-    PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationCasResult,
-    PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
+    PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter,
+    PublicationCasResult, PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -673,15 +673,18 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, AttemptGroupId, BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult,
-        Error, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision,
-        PingAction, PingRecord, PolicyRevisionSource, PublicationCasResult, PublicationKey,
-        PublicationState, RequestRow, RowKind, SessionCostGroup, Store, is_api_measurement,
+        Allowance, AttemptGroupId, BindingLearningUpdate, ChildRole, CostKind, DisplayRow,
+        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
+        NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PublicationAdapter,
+        PublicationCasResult, PublicationKey, PublicationState, RelationSource, RequestRow,
+        RowKind, SessionCostGroup, SessionLineage, Store, StoredRoutingTrace,
+        StoredRoutingTraceEvent, is_api_measurement,
     };
     use crate::ir::Release;
     use crate::policy::{
-        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, PolicyDocument,
-        RouteFingerprint, RouteId,
+        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, FrontendProtocol,
+        FrontendScope, PolicyDocument, PresentationId, ProfileId, RewriteId, RouteFingerprint,
+        RouteId, StableId,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -736,6 +739,36 @@ mod tests {
             })
             .expect("insert revision")
             .revision_id
+    }
+
+    fn provenanced_row(revision_id: i64) -> RequestRow {
+        let mut row = bare_row(1_800_000_000_000);
+        row.session_id = Some("guardian:parent-session".to_owned());
+        row.policy_revision_id = Some(revision_id);
+        row.presentation_id = Some(PresentationId::new("presented").unwrap());
+        row.rewrite_id = Some(RewriteId::new("rewrite").unwrap());
+        row.policy_route_id = Some(RouteId::new("route").unwrap());
+        row.route_fingerprint = Some("22".repeat(32).parse().unwrap());
+        row.candidate_id = Some(CandidateId::new("candidate").unwrap());
+        row.binding_id = Some(BindingId::new("codex_sub.codex_responses").unwrap());
+        row.baseline_model = Some("baseline".to_owned());
+        row.attempt_group_id =
+            Some(AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap());
+        row.attempt_index = Some(0);
+        row.fallback_reason = Some(StableId::new("initial").unwrap());
+        row.routing_trace = Some(StoredRoutingTrace {
+            events: vec![StoredRoutingTraceEvent::Candidate {
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                state: StableId::new("available").unwrap(),
+                reason: None,
+            }],
+        });
+        row.lineage = Some(SessionLineage {
+            parent_session_id: "parent-session".to_owned(),
+            child_role: ChildRole::Guardian,
+            relation_source: RelationSource::CodexGuardian,
+        });
+        row
     }
 
     fn unpinned_lane(key: &str) -> Lane {
@@ -2561,12 +2594,51 @@ mod tests {
     }
 
     #[test]
+    fn publication_scope_keys_reject_noncanonical_stored_values() {
+        let store = mem_store();
+        let revision_id = revision(&store, "publication scope", None);
+        for scope in [
+            "protocol:ANTHROPIC_MESSAGES",
+            "protocol:unknown",
+            "profile:Claude:anthropic_messages",
+            "profile:claude:anthropic",
+        ] {
+            {
+                let conn = store.conn.lock().unwrap();
+                conn.execute(
+                    "INSERT INTO routing_publications
+                     (scope_key, adapter, desired_revision_id,
+                      desired_inventory_generation, state, updated_ms)
+                     VALUES (?1, 'claude_settings', ?2, 0, 'pending', 1)",
+                    rusqlite::params![scope, revision_id],
+                )
+                .unwrap();
+            }
+            assert!(matches!(
+                store.load_publications(),
+                Err(Error::InvalidRoutingState(_))
+            ));
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM routing_publications", [])
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn publication_results_are_cas_guarded_and_state_checked() {
         let store = mem_store();
         let first = revision(&store, "first", None);
         let second = revision(&store, "second", Some(first));
-        let key =
-            PublicationKey::new("profile:claude:anthropic_messages", "claude_settings").unwrap();
+        let key = PublicationKey::new(
+            FrontendScope::Profile {
+                profile: ProfileId::new("claude").unwrap(),
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
         store.set_publication_desired(&key, first, 4, 100).unwrap();
         assert_eq!(
             store.load_publication(&key).unwrap().unwrap().state,
@@ -2751,7 +2823,12 @@ mod tests {
             None
         );
         let write = store.set_publication_desired(
-            &PublicationKey::new("protocol:anthropic_messages", "claude_settings").unwrap(),
+            &PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::AnthropicMessages,
+                },
+                PublicationAdapter::new("claude_settings").unwrap(),
+            ),
             id,
             0,
             1,
@@ -2979,6 +3056,51 @@ mod tests {
         assert_eq!(row.attempt_group_id, None);
         assert_eq!(row.routing_trace, None);
         assert_eq!(row.lineage, None);
+    }
+
+    #[test]
+    fn complete_request_provenance_and_lineage_round_trip() {
+        let store = mem_store();
+        let revision_id = revision(&store, "provenance", None);
+        let row = provenanced_row(revision_id);
+        store.record_request(&row).unwrap();
+        let mut loaded = store.requests_since(0, 10).unwrap().pop().unwrap();
+        loaded.id = None;
+        assert_eq!(loaded, row);
+    }
+
+    #[test]
+    fn lineage_accepts_missing_parents_and_rejects_self_and_cycles() {
+        let store = mem_store();
+        let revision_id = revision(&store, "lineage", None);
+        let mut child = provenanced_row(revision_id);
+        child.attempt_group_id = None;
+        child.attempt_index = None;
+        store.record_request(&child).unwrap();
+
+        let mut parent = bare_row(child.ts_ms + 1);
+        parent.session_id = Some("parent-session".to_owned());
+        parent.lineage = Some(SessionLineage {
+            parent_session_id: child.session_id.clone().unwrap(),
+            child_role: ChildRole::Guardian,
+            relation_source: RelationSource::CodexGuardian,
+        });
+        assert!(matches!(
+            store.record_request(&parent),
+            Err(Error::Sqlite(_))
+        ));
+
+        let mut self_parent = bare_row(child.ts_ms + 2);
+        self_parent.session_id = Some("same".to_owned());
+        self_parent.lineage = Some(SessionLineage {
+            parent_session_id: "same".to_owned(),
+            child_role: ChildRole::Guardian,
+            relation_source: RelationSource::CodexGuardian,
+        });
+        assert!(matches!(
+            store.record_request(&self_parent),
+            Err(Error::InvalidRoutingState(_))
+        ));
     }
 
     #[test]

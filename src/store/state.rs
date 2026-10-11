@@ -186,22 +186,42 @@ impl PublicationState {
     }
 }
 
-/// Canonical publication identity. Its components use policy identifier rules.
+/// Publication adapter identity, validated with the stable policy-id grammar.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublicationAdapter(crate::policy::StableId);
+
+impl PublicationAdapter {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        crate::policy::StableId::new(value.into())
+            .map(Self)
+            .map_err(|error| {
+                Error::InvalidRoutingState(format!("invalid publication adapter: {error}"))
+            })
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+/// Typed frontend scope plus publication adapter identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationKey {
-    pub scope_key: String,
-    pub adapter: String,
+    scope: crate::policy::FrontendScope,
+    adapter: PublicationAdapter,
 }
 
 impl PublicationKey {
-    pub fn new(scope_key: impl Into<String>, adapter: impl Into<String>) -> Result<Self> {
-        let scope_key = scope_key.into();
-        validate_scope_key(&scope_key)?;
-        let adapter = adapter.into();
-        crate::policy::StableId::new(adapter.clone()).map_err(|error| {
-            Error::InvalidRoutingState(format!("invalid publication adapter: {error}"))
-        })?;
-        Ok(Self { scope_key, adapter })
+    pub fn new(scope: crate::policy::FrontendScope, adapter: PublicationAdapter) -> Self {
+        Self { scope, adapter }
+    }
+
+    pub fn scope(&self) -> &crate::policy::FrontendScope {
+        &self.scope
+    }
+
+    pub fn adapter(&self) -> &PublicationAdapter {
+        &self.adapter
     }
 }
 
@@ -827,32 +847,56 @@ pub(super) fn clear_policy_draft(
     }
 }
 
-fn validate_scope_key(value: &str) -> Result<()> {
-    fn protocol(value: &str) -> bool {
-        matches!(
-            value,
-            "anthropic_messages" | "openai_chat" | "openai_responses"
-        )
+fn frontend_protocol_name(protocol: crate::policy::FrontendProtocol) -> &'static str {
+    match protocol {
+        crate::policy::FrontendProtocol::AnthropicMessages => "anthropic_messages",
+        crate::policy::FrontendProtocol::OpenaiChat => "openai_chat",
+        crate::policy::FrontendProtocol::OpenaiResponses => "openai_responses",
     }
-    let valid = if let Some(rest) = value.strip_prefix("protocol:") {
-        protocol(rest)
-    } else if let Some(rest) = value.strip_prefix("profile:") {
+}
+
+fn encode_publication_scope(scope: &crate::policy::FrontendScope) -> String {
+    match scope {
+        crate::policy::FrontendScope::Profile { profile, protocol } => {
+            format!(
+                "profile:{}:{}",
+                profile.as_str(),
+                frontend_protocol_name(*protocol)
+            )
+        }
+        crate::policy::FrontendScope::Protocol { protocol } => {
+            format!("protocol:{}", frontend_protocol_name(*protocol))
+        }
+    }
+}
+
+fn parse_frontend_protocol(value: &str) -> Option<crate::policy::FrontendProtocol> {
+    match value {
+        "anthropic_messages" => Some(crate::policy::FrontendProtocol::AnthropicMessages),
+        "openai_chat" => Some(crate::policy::FrontendProtocol::OpenaiChat),
+        "openai_responses" => Some(crate::policy::FrontendProtocol::OpenaiResponses),
+        _ => None,
+    }
+}
+
+fn decode_publication_scope(value: &str) -> Result<crate::policy::FrontendScope> {
+    if let Some(protocol) = value.strip_prefix("protocol:")
+        && let Some(protocol) = parse_frontend_protocol(protocol)
+    {
+        return Ok(crate::policy::FrontendScope::Protocol { protocol });
+    }
+    if let Some(rest) = value.strip_prefix("profile:") {
         let mut parts = rest.split(':');
-        parts
-            .next()
-            .is_some_and(|profile| crate::policy::ProfileId::new(profile.to_owned()).is_ok())
-            && parts.next().is_some_and(protocol)
-            && parts.next().is_none()
-    } else {
-        false
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidRoutingState(format!(
-            "invalid publication scope key {value:?}"
-        )))
+        if let (Some(profile), Some(protocol), None) = (parts.next(), parts.next(), parts.next())
+            && let Some(protocol) = parse_frontend_protocol(protocol)
+            && let Ok(profile) = crate::policy::ProfileId::new(profile.to_owned())
+        {
+            return Ok(crate::policy::FrontendScope::Profile { profile, protocol });
+        }
     }
+    Err(Error::InvalidRoutingState(format!(
+        "invalid publication scope key {value:?}"
+    )))
 }
 
 fn validate_detail_code(value: Option<&str>) -> Result<()> {
@@ -876,6 +920,7 @@ pub(super) fn set_publication_desired(
             "negative inventory generation".into(),
         ));
     }
+    let scope_key = encode_publication_scope(&key.scope);
     conn.execute(
         "INSERT INTO routing_publications
          (scope_key, adapter, desired_revision_id, desired_inventory_generation, state, updated_ms)
@@ -885,8 +930,8 @@ pub(super) fn set_publication_desired(
            desired_inventory_generation = excluded.desired_inventory_generation,
            state = 'pending', detail_code = NULL, updated_ms = excluded.updated_ms",
         rusqlite::params![
-            key.scope_key,
-            key.adapter,
+            scope_key,
+            key.adapter.as_str(),
             desired_revision_id,
             desired_inventory_generation,
             updated_ms
@@ -899,13 +944,14 @@ pub(super) fn load_publication(
     conn: &Connection,
     key: &PublicationKey,
 ) -> Result<Option<RoutingPublication>> {
+    let scope_key = encode_publication_scope(&key.scope);
     row_of(
         conn,
         "SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
                 desired_inventory_generation, applied_inventory_generation,
                 state, detail_code, updated_ms
          FROM routing_publications WHERE scope_key = ?1 AND adapter = ?2",
-        [&key.scope_key, &key.adapter],
+        [scope_key.as_str(), key.adapter.as_str()],
         read_publication,
     )
 }
@@ -923,10 +969,9 @@ pub(super) fn load_publications(conn: &Connection) -> Result<Vec<RoutingPublicat
 }
 
 fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
-    let key = PublicationKey::new(
-        row.get::<_, String>("scope_key")?,
-        row.get::<_, String>("adapter")?,
-    )?;
+    let scope = decode_publication_scope(&row.get::<_, String>("scope_key")?)?;
+    let adapter = PublicationAdapter::new(row.get::<_, String>("adapter")?)?;
+    let key = PublicationKey::new(scope, adapter);
     let state = parse_required(
         "routing_publications.state",
         row.get("state")?,
@@ -984,6 +1029,7 @@ pub(super) fn compare_and_swap_publication_result(
             "applied result must match expected desired identity".into(),
         ));
     }
+    let scope_key = encode_publication_scope(&key.scope);
     let changed = conn.execute(
         "UPDATE routing_publications SET state = ?1, applied_revision_id = ?2,
              applied_inventory_generation = ?3, detail_code = ?4, updated_ms = ?5
@@ -995,8 +1041,8 @@ pub(super) fn compare_and_swap_publication_result(
             applied_inventory_generation,
             detail_code,
             updated_ms,
-            key.scope_key,
-            key.adapter,
+            scope_key,
+            key.adapter.as_str(),
             expected_revision_id,
             expected_inventory_generation
         ],
