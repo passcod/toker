@@ -43,6 +43,7 @@ use crate::ir::Shape;
 use crate::middleware::awake;
 use crate::middleware::lanes;
 use crate::observe::UsageCapture;
+use crate::policy::BindingId;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
 
@@ -55,6 +56,9 @@ pub(crate) struct RecordCtx {
     pub(crate) server: Server,
     /// The selected backend owns route identity and cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
+    /// The exact legacy-selected backend binding. This identifies the wire
+    /// dialect without implying a policy revision or candidate selection.
+    pub(crate) binding_id: BindingId,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -781,7 +785,7 @@ fn measurement_row(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,
@@ -870,7 +874,7 @@ fn error_row(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,

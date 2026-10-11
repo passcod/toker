@@ -434,6 +434,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             requested_model: model,
             effective_model,
             backend: backend.clone(),
+            binding_id: target.binding().id().clone(),
             betas,
             shape: shape.clone(),
             ping,

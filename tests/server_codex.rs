@@ -819,6 +819,10 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(row.frontend.as_deref(), Some("openai_responses"));
     assert_eq!(row.route.as_deref(), Some("openai_responses:codex_sub"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
+    assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("codex_sub.codex_responses")
+    );
     assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
     assert_eq!(
         row.requested_model.as_deref(),
@@ -936,6 +940,10 @@ async fn responses_to_anthropic_api_render_json_and_replace_foreign_auth() {
         Some("openai_responses:anthropic_api")
     );
     assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
 }
 
 #[tokio::test]
@@ -1134,13 +1142,18 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         requests[1].headers.get(header::AUTHORIZATION).unwrap(),
         "Bearer held-token"
     );
+    let api_row = wait_for_rows(&store, 1).await.remove(0);
+    assert_eq!(api_row.route.as_deref(), Some("openai_chat:anthropic_api"));
     assert_eq!(
-        wait_for_rows(&store, 1).await[0].route.as_deref(),
-        Some("openai_chat:anthropic_api")
+        api_row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages"),
+        "Chat→Anthropic retains the selected Messages binding"
     );
+    let sub_row = wait_for_rows(&sub_store, 1).await.remove(0);
+    assert_eq!(sub_row.route.as_deref(), Some("openai_chat:anthropic_sub"));
     assert_eq!(
-        wait_for_rows(&sub_store, 1).await[0].route.as_deref(),
-        Some("openai_chat:anthropic_sub")
+        sub_row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_sub.anthropic_messages")
     );
 }
 
@@ -1207,6 +1220,10 @@ async fn openrouter_responses_streams_tools_and_records_attested_cost() {
     assert_eq!(
         rows[0].route.as_deref(),
         Some("openai_responses:openrouter")
+    );
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_responses")
     );
     assert_eq!(rows[0].cost_usd, Some(0.0000336));
     assert_eq!(rows[0].cost_kind, Some(toker::store::CostKind::Billed));
@@ -1370,6 +1387,10 @@ async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
     assert_eq!(rows[0].frontend.as_deref(), Some("openai_chat"));
     assert_eq!(rows[0].route.as_deref(), Some("openai_chat:codex_sub"));
     assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("codex_sub.codex_responses")
+    );
     assert_eq!(rows[0].session_id.as_deref(), Some("chat-codex-session"));
 }
 

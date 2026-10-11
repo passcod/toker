@@ -211,6 +211,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         requested_model: requested_model.clone(),
         effective_model: effective_model.clone(),
         backend: backend.clone(),
+        binding_id: target.binding().id().clone(),
         betas: None,
         shape: canonical
             .as_ref()

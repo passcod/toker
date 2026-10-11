@@ -1710,6 +1710,10 @@ api_key = "ak-literal-test"
         use crate::server::record_anthropic::{AnthropicRecordCtx, record_anthropic_measurement};
         let dir = crate::setup::test_dir("served-mark");
         let server = server(&dir);
+        let target = server
+            .registry
+            .resolve(ProtocolId::AnthropicMessages, None)
+            .expect("enabled");
         let ctx = AnthropicRecordCtx {
             server: server.clone(),
             started: std::time::Instant::now(),
@@ -1717,12 +1721,8 @@ api_key = "ak-literal-test"
             session_id: None,
             requested_model: Some("claude-opus-5".to_owned()),
             effective_model: Some("claude-opus-5".to_owned()),
-            backend: server
-                .registry
-                .resolve(ProtocolId::AnthropicMessages, None)
-                .expect("enabled")
-                .provider()
-                .clone(),
+            backend: target.provider().clone(),
+            binding_id: target.binding().id().clone(),
             betas: None,
             shape: None,
             ping: false,
@@ -1743,6 +1743,21 @@ api_key = "ak-literal-test"
         );
         assert_eq!(server.models.last_served("claude-sonnet-5"), None);
         record_anthropic_measurement(&ctx, observer.finish().as_ref(), None, 200);
+        let rows = server.store.requests_since(0, 10).expect("ledger rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].binding_id, Some(ctx.binding_id.clone()));
+        assert_eq!(rows[0].policy_revision_id, None);
+        assert_eq!(rows[0].presentation_id, None);
+        assert_eq!(rows[0].rewrite_id, None);
+        assert_eq!(rows[0].policy_route_id, None);
+        assert_eq!(rows[0].route_fingerprint, None);
+        assert_eq!(rows[0].candidate_id, None);
+        assert_eq!(rows[0].baseline_model, None);
+        assert_eq!(rows[0].attempt_group_id, None);
+        assert_eq!(rows[0].attempt_index, None);
+        assert_eq!(rows[0].fallback_reason, None);
+        assert_eq!(rows[0].routing_trace, None);
+        assert_eq!(rows[0].lineage, None);
         assert!(
             server.models.last_served("claude-sonnet-5").is_some(),
             "the served identity is marked from the response"

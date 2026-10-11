@@ -942,6 +942,10 @@ async fn non_streaming_messages_ledger_with_estimated_cost_for_the_api_backend()
     assert_eq!(row.provider.as_deref(), Some("anthropic_api"));
     assert_eq!(row.route.as_deref(), Some("anthropic:anthropic_api"));
     assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
+    assert_eq!(
         row.requested_model.as_deref(),
         Some("anthropic_api/claude-sonnet-5")
     );
@@ -1082,6 +1086,10 @@ async fn the_openrouter_prefix_routes_anthropic_messages_to_openrouter() {
     let row = &rows[0];
     assert_eq!(row.provider.as_deref(), Some("openrouter"));
     assert_eq!(row.route.as_deref(), Some("anthropic:openrouter"));
+    assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_messages")
+    );
     assert_eq!(
         row.requested_model.as_deref(),
         Some("openrouter/moonshotai/kimi-k3")
@@ -1270,6 +1278,10 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
     assert_eq!(row.requested_model.as_deref(), Some("err-401"));
     assert_eq!(row.effective_model.as_deref(), Some("err-401"));
     assert_eq!(row.session_id.as_deref(), Some("ccses-42"));
+    assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_sub.anthropic_messages")
+    );
     // Never priced, no usage — but the response's own meters stay on
     // the row, as the predecessor's did: a failure's meters are the only
     // evidence of throttling the ledger gets.

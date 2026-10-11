@@ -52,6 +52,7 @@ use crate::middleware::lanes;
 use crate::middleware::quota::{Grant, Meter, group};
 use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
+use crate::policy::BindingId;
 use crate::providers::Provider;
 use crate::store::{CostKind, RequestRow, RowKind};
 use crate::translate::TranslationReport;
@@ -76,6 +77,9 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) effective_model: Option<String>,
     /// The selected backend — provider column, route, cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
+    /// The exact legacy-selected backend binding. This identifies the wire
+    /// dialect without implying a policy revision or candidate selection.
+    pub(crate) binding_id: BindingId,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
     /// the header was absent.
     pub(crate) betas: Option<Value>,
@@ -547,7 +551,7 @@ fn measurement_row(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,
@@ -682,7 +686,7 @@ fn error_row(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,
@@ -1379,7 +1383,7 @@ pub(crate) fn record_responses_measurement(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,
@@ -1541,7 +1545,7 @@ pub(crate) fn record_codex_error(
         policy_route_id: None,
         route_fingerprint: None,
         candidate_id: None,
-        binding_id: None,
+        binding_id: Some(ctx.binding_id.clone()),
         baseline_model: None,
         attempt_group_id: None,
         attempt_index: None,

@@ -603,6 +603,21 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
     assert_eq!(row.provider.as_deref(), Some("openai_api"));
     assert_eq!(row.route.as_deref(), Some("openai_chat:openai_api"));
     assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openai_api.openai_chat_completions")
+    );
+    assert_eq!(row.policy_revision_id, None);
+    assert_eq!(row.presentation_id, None);
+    assert_eq!(row.rewrite_id, None);
+    assert_eq!(row.policy_route_id, None);
+    assert_eq!(row.route_fingerprint, None);
+    assert_eq!(row.candidate_id, None);
+    assert_eq!(row.baseline_model, None);
+    assert_eq!(row.attempt_group_id, None);
+    assert_eq!(row.attempt_index, None);
+    assert_eq!(row.fallback_reason, None);
+    assert_eq!(row.routing_trace, None);
+    assert_eq!(
         row.requested_model.as_deref(),
         Some("openai_api/gpt-6.1-sol")
     );
@@ -888,6 +903,10 @@ async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
     assert_eq!(row.requested_model.as_deref(), Some("err-401"));
     assert_eq!(row.effective_model.as_deref(), Some("err-401"));
     assert_eq!(row.session_id.as_deref(), Some("ses-test-1"));
+    assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_chat_completions")
+    );
 }
 
 #[tokio::test]
