@@ -174,13 +174,15 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     let effective_model = target.effective_model().map(str::to_owned);
     let canonical = canonical.map(|result| {
         result.map(|canonical| {
-            super::inference::InferenceAttempt::new(
-                target.clone(),
-                requested_model.clone(),
-                effective_model.clone(),
-                canonical,
-            )
-            .canonical()
+            let inference =
+                super::inference::InferenceRequest::new(requested_model.clone(), canonical);
+            inference
+                .prepare(
+                    target.clone(),
+                    effective_model.clone(),
+                    inference.canonical(),
+                )
+                .canonical()
         })
     });
     let client_wants_json = parsed

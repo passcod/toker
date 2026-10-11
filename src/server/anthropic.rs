@@ -249,6 +249,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Inference middleware keeps one canonical request across the gates and
     // rewrites. Administrative bodies continue through the lexical IR.
     let mut canonical: Option<CanonicalRequest> = None;
+    let mut inference_baseline: Option<super::inference::InferenceRequest> = None;
     let mut canonical_error: Option<translate::TranslateError> = None;
     // The request's own shape, kept past the record context (which takes
     // a clone): the cold gate and the retarget read it, and the row's
@@ -878,6 +879,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
+    // The common coordinator baseline is after request-global gates and before
+    // every candidate-local model, compaction, mapping, or capability transform.
+    if path == "/v1/messages"
+        && let Some(request) = canonical.as_ref()
+    {
+        inference_baseline = Some(super::inference::InferenceRequest::new(
+            client_model.clone(),
+            request.clone(),
+        ));
+    }
+
     // ── the compaction retarget ──
     //
     // A cold compaction, rewritten onto a cheaper model with its cache
@@ -1206,20 +1218,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.models.note_served(served_model.as_deref(), now_ms());
     }
 
-    // Freeze the post-gate, post-routing semantics before any backend adapter
-    // receives them. Even the current single authoritative attempt gets a
-    // fresh clone, so later fallback cannot inherit mutations from attempt one.
+    // Give the selected backend a private clone of the transformed request.
+    // The request-global baseline is captured after gates below; subsequent
+    // coordinator work will replay candidate-local transforms from that clone.
     if path == "/v1/messages"
+        && let Some(inference) = inference_baseline.as_ref()
         && let Some(request) = canonical.take()
     {
         canonical = Some(
-            super::inference::InferenceAttempt::new(
-                target.clone(),
-                client_model.clone(),
-                served_model.clone(),
-                request,
-            )
-            .canonical(),
+            inference
+                .prepare(target.clone(), served_model.clone(), request)
+                .canonical(),
         );
     }
 

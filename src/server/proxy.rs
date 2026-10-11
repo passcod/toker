@@ -143,13 +143,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         Ok(target) => target,
         Err(_) => return super::openai_not_configured(),
     };
+    let inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let gate_model = target.effective_model().map(str::to_owned);
-    let attempt = super::inference::InferenceAttempt::new(
-        target.clone(),
-        model.clone(),
-        gate_model.clone(),
-        canonical,
-    );
+    let attempt = inference.prepare(target.clone(), gate_model.clone(), inference.canonical());
     let gate_model = attempt.effective_model().map(str::to_owned);
     let canonical = attempt.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
