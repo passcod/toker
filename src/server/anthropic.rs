@@ -249,7 +249,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Inference middleware keeps one canonical request across the gates and
     // rewrites. Administrative bodies continue through the lexical IR.
     let mut canonical: Option<CanonicalRequest> = None;
-    let mut inference_baseline: Option<super::inference::InferenceRequest> = None;
+    let mut inference_attempt: Option<super::inference::InferenceAttempt> = None;
     let mut canonical_error: Option<translate::TranslateError> = None;
     // The request's own shape, kept past the record context (which takes
     // a clone): the cold gate and the retarget read it, and the row's
@@ -884,10 +884,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     if path == "/v1/messages"
         && let Some(request) = canonical.as_ref()
     {
-        inference_baseline = Some(super::inference::InferenceRequest::new(
-            client_model.clone(),
-            request.clone(),
-        ));
+        let inference =
+            super::inference::InferenceRequest::new(client_model.clone(), request.clone());
+        inference_attempt = Some(inference.prepare(target.clone(), served_model.clone()));
     }
 
     // ── the compaction retarget ──
@@ -933,12 +932,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()
                 .flatten();
-            let retargeted = inference_baseline.as_ref().and_then(|inference| {
-                let (attempt, outcome) = inference.prepare_compaction(
-                    target.clone(),
-                    compaction_target.as_deref(),
-                    backend.model_map(),
-                )?;
+            let retargeted = inference_attempt.as_mut().and_then(|attempt| {
+                let outcome =
+                    attempt.apply_compaction(compaction_target.as_deref(), backend.model_map())?;
                 let prepared = attempt.canonical();
                 let rendered = translate::render_anthropic(
                     &prepared,
@@ -1044,23 +1040,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             &server.models,
         );
         if let ForceDecision::Move(forced) = decision {
-            let canonical_rewrite = inference_baseline.as_ref().zip(canonical.clone()).and_then(
-                |(inference, canonical)| {
-                    let attempt = inference.prepare_legacy_transformed(
-                        target.clone(),
-                        Some(forced.to.clone()),
-                        canonical,
-                    );
-                    let prepared = attempt.canonical();
-                    let body = translate::render_anthropic(
-                        &prepared,
-                        crate::routing::DialectId::AnthropicMessages,
-                    )
-                    .ok()
-                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
-                    Some((prepared, body))
-                },
-            );
+            let canonical_rewrite = inference_attempt.as_mut().and_then(|attempt| {
+                attempt.set_model(Some(forced.to.clone()));
+                let prepared = attempt.canonical();
+                let body = translate::render_anthropic(
+                    &prepared,
+                    crate::routing::DialectId::AnthropicMessages,
+                )
+                .ok()
+                .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
+                Some((prepared, body))
+            });
             if let Some((prepared, body)) = canonical_rewrite {
                 canonical = Some(prepared);
                 forward = Bytes::from(body);
@@ -1090,16 +1080,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // the served-model mark — the mark must see what is actually sent.
     if let Some(map) = backend.model_map() {
         let canonical_rewrite = (path == "/v1/messages")
-            .then_some((inference_baseline.as_ref(), canonical.as_ref()))
-            .and_then(|(inference, canonical)| {
-                let inference = inference?;
-                let before = canonical?.model.clone()?;
-                let attempt = inference.prepare_legacy_transformed_with_map(
-                    target.clone(),
-                    Some(before.clone()),
-                    canonical?.clone(),
-                    Some(map),
-                );
+            .then_some(inference_attempt.as_mut())
+            .flatten()
+            .and_then(|attempt| {
+                let before = attempt.effective_model()?.to_owned();
+                attempt.apply_model_map(Some(map));
                 let matched = attempt.mapped()?.clone();
                 let effective = attempt.effective_model()?.to_owned();
                 let prepared = attempt.canonical();
@@ -1217,16 +1202,21 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let canonical_stripped = serde_json::from_slice::<serde_json::Value>(&forward)
             .ok()
             .and_then(|body| {
-                let canonical = canonical.as_mut()?;
-                if !crate::middleware::canonical::strip_message_effort(canonical, &body) {
+                let attempt = inference_attempt.as_mut()?;
+                if !attempt.strip_message_effort(&body) {
                     return None;
                 }
-                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
-                    .ok()
-                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
-                    .map(Bytes::from)
+                let prepared = attempt.canonical();
+                let bytes = translate::render_anthropic(
+                    &prepared,
+                    crate::routing::DialectId::AnthropicMessages,
+                )
+                .ok()
+                .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
+                Some((prepared, Bytes::from(bytes)))
             });
-        if let Some(stripped) = canonical_stripped {
+        if let Some((prepared, stripped)) = canonical_stripped {
+            canonical = Some(prepared);
             forward = stripped;
             tracing::info!("stripped mid-conversation effort for {model}");
         }
@@ -1242,20 +1232,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // in-memory map. Gated to the exact `/v1/messages` path.
     if path == "/v1/messages" {
         server.models.note_served(served_model.as_deref(), now_ms());
-    }
-
-    // Give the selected backend a private clone of the transformed request.
-    // The request-global baseline is captured after gates below; subsequent
-    // coordinator work will replay candidate-local transforms from that clone.
-    if path == "/v1/messages"
-        && let Some(inference) = inference_baseline.as_ref()
-        && let Some(request) = canonical.take()
-    {
-        canonical = Some(
-            inference
-                .prepare_legacy_transformed(target.clone(), served_model.clone(), request)
-                .canonical(),
-        );
     }
 
     // ── the codex branch: translate instead of byte-forward ──

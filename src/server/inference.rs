@@ -46,49 +46,6 @@ impl InferenceRequest {
             canonical,
         }
     }
-
-    pub(crate) fn prepare_compaction(
-        &self,
-        target: ModelTarget,
-        compaction_model: Option<&str>,
-        model_map: Option<&ModelMap>,
-    ) -> Option<(InferenceAttempt, RetargetOutcome)> {
-        let baseline_model = self.canonical.model.clone();
-        let mut attempt = self.prepare(target, baseline_model);
-        let outcome = attempt.apply_compaction(compaction_model, model_map)?;
-        Some((attempt, outcome))
-    }
-
-    /// Temporary bridge for Messages while its remaining candidate-local
-    /// transforms are moved behind `prepare`. The method name prevents a
-    /// transformed request from masquerading as the immutable baseline.
-    pub(crate) fn prepare_legacy_transformed(
-        &self,
-        target: ModelTarget,
-        effective_model: Option<String>,
-        canonical: CanonicalRequest,
-    ) -> InferenceAttempt {
-        self.prepare_legacy_transformed_with_map(target, effective_model, canonical, None)
-    }
-
-    pub(crate) fn prepare_legacy_transformed_with_map(
-        &self,
-        target: ModelTarget,
-        baseline_model: Option<String>,
-        mut canonical: CanonicalRequest,
-        model_map: Option<&ModelMap>,
-    ) -> InferenceAttempt {
-        canonical.model.clone_from(&baseline_model);
-        let mut attempt = InferenceAttempt {
-            target,
-            requested_model: self.requested_model.clone(),
-            effective_model: baseline_model,
-            mapped: None,
-            canonical,
-        };
-        attempt.apply_model_map(model_map);
-        attempt
-    }
 }
 
 pub(crate) struct InferenceAttempt {
@@ -135,9 +92,19 @@ impl InferenceAttempt {
         Some(outcome)
     }
 
+    pub(crate) fn set_model(&mut self, model: Option<String>) {
+        self.canonical.model.clone_from(&model);
+        self.effective_model = model;
+        self.mapped = None;
+    }
+
     pub(crate) fn apply_model_map(&mut self, model_map: Option<&ModelMap>) {
         self.mapped = crate::middleware::canonical::map_model(&mut self.canonical, model_map);
         self.effective_model.clone_from(&self.canonical.model);
+    }
+
+    pub(crate) fn strip_message_effort(&mut self, source: &serde_json::Value) -> bool {
+        crate::middleware::canonical::strip_message_effort(&mut self.canonical, source)
     }
 
     /// Clone this candidate's private canonical IR for one backend renderer.
@@ -219,8 +186,9 @@ mod tests {
         });
         let request =
             InferenceRequest::new(Some("openrouter/claude-opus-4-1".to_owned()), canonical);
-        let (attempt, outcome) = request
-            .prepare_compaction(target, Some("claude-haiku-3-5"), None)
+        let mut attempt = request.prepare(target, Some("claude-opus-4-1".to_owned()));
+        let outcome = attempt
+            .apply_compaction(Some("claude-haiku-3-5"), None)
             .expect("retargeted");
 
         assert_eq!(outcome.from.as_deref(), Some("claude-opus-4-1"));
