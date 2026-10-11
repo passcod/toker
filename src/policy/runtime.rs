@@ -175,6 +175,19 @@ impl PolicyRuntime {
         }))
     }
 
+    /// Capture the immutable revision named by a lane pin, or the current
+    /// candidate snapshot for an unpinned/absent lane. This selection is
+    /// observational until policy routing becomes authoritative.
+    pub fn capture_for_lane(
+        &self,
+        lane: Option<&crate::store::Lane>,
+    ) -> Result<Option<Arc<PolicySnapshot>>, PolicyRuntimeError> {
+        match lane.and_then(|lane| lane.pin.as_ref()) {
+            Some(pin) => self.capture_revision(pin.policy_revision_id).map(Some),
+            None => Ok(self.capture()),
+        }
+    }
+
     pub fn replace_candidate(
         &self,
         policy: Arc<CompiledPolicy>,
@@ -470,6 +483,58 @@ mod tests {
             runtime.capture_revision(revision.revision_id + 1),
             Err(PolicyRuntimeError::MissingRevision(_))
         ));
+    }
+
+    #[test]
+    fn pinned_lane_captures_its_stored_revision() {
+        let (store, runtime) = runtime();
+        let document = document("pinned");
+        let revision = store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some("pinned"),
+                activation_scope: ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .unwrap();
+        let lane = crate::store::Lane {
+            key: "lane".to_owned(),
+            session_id: None,
+            tools_hash: None,
+            updated_ms: 0,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 1,
+            pin: Some(crate::store::LanePin {
+                policy_revision_id: revision.revision_id,
+                policy_route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "11".repeat(32).parse().unwrap(),
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                baseline_model: "base".to_owned(),
+                effective_model: "effective".to_owned(),
+            }),
+        };
+        let captured = runtime.capture_for_lane(Some(&lane)).unwrap().unwrap();
+        assert_eq!(captured.revision_id(), Some(revision.revision_id));
+        let reused = runtime.capture_for_lane(Some(&lane)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(captured.policy(), reused.policy()));
+        assert_eq!(
+            runtime
+                .capture_for_lane(None)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            None
+        );
     }
 
     #[test]
