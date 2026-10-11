@@ -217,6 +217,262 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE allowances ADD COLUMN release TEXT NOT NULL DEFAULT 'overage';
     "#,
+    // v7 — non-authoritative live-routing storage. The singleton active
+    // pointer starts NULL and this migration never changes it. Policy runtime
+    // does not read these tables until the later atomic-cutover changeset.
+    r#"
+    CREATE TABLE routing_policy_revisions (
+        revision_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ms               INTEGER NOT NULL,
+        activated_ms             INTEGER NOT NULL,
+        description              TEXT,
+        activation_scope         TEXT NOT NULL CHECK (
+            activation_scope IN ('new_lanes', 'new_and_cold_lanes', 'immediate')
+        ),
+        forced_cache_transition  INTEGER NOT NULL CHECK (
+            forced_cache_transition IN (0, 1)
+        ),
+        source                   TEXT NOT NULL CHECK (
+            source IN ('legacy', 'draft', 'reactivation')
+        ),
+        parent_revision_id       INTEGER REFERENCES routing_policy_revisions(revision_id),
+        document_json            TEXT NOT NULL CHECK (json_valid(document_json)),
+        fingerprint              TEXT NOT NULL UNIQUE CHECK (
+            length(fingerprint) = 64
+            AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    CREATE INDEX routing_policy_revisions_activated_idx
+        ON routing_policy_revisions (activated_ms);
+    CREATE INDEX routing_policy_revisions_parent_idx
+        ON routing_policy_revisions (parent_revision_id);
+
+    CREATE TABLE routing_policy_state (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        active_revision_id       INTEGER REFERENCES routing_policy_revisions(revision_id),
+        draft_generation         INTEGER NOT NULL DEFAULT 0 CHECK (draft_generation >= 0),
+        draft_base_revision_id   INTEGER REFERENCES routing_policy_revisions(revision_id),
+        draft_document_json      TEXT CHECK (
+            draft_document_json IS NULL OR json_valid(draft_document_json)
+        ),
+        draft_fingerprint        TEXT CHECK (
+            draft_fingerprint IS NULL OR (
+                length(draft_fingerprint) = 64
+                AND draft_fingerprint NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        draft_updated_ms         INTEGER,
+        legacy_imported_ms       INTEGER,
+        CHECK (
+            (draft_base_revision_id IS NULL
+             AND draft_document_json IS NULL
+             AND draft_fingerprint IS NULL
+             AND draft_updated_ms IS NULL)
+            OR
+            (draft_base_revision_id IS NOT NULL
+             AND draft_document_json IS NOT NULL
+             AND draft_fingerprint IS NOT NULL
+             AND draft_updated_ms IS NOT NULL)
+        )
+    );
+    INSERT INTO routing_policy_state (id) VALUES (1);
+
+    CREATE TABLE routing_publications (
+        scope_key                    TEXT NOT NULL,
+        adapter                      TEXT NOT NULL,
+        desired_revision_id          INTEGER NOT NULL
+            REFERENCES routing_policy_revisions(revision_id),
+        applied_revision_id          INTEGER
+            REFERENCES routing_policy_revisions(revision_id),
+        desired_inventory_generation INTEGER NOT NULL CHECK (
+            desired_inventory_generation >= 0
+        ),
+        applied_inventory_generation INTEGER CHECK (
+            applied_inventory_generation >= 0
+        ),
+        state                        TEXT NOT NULL CHECK (
+            state IN ('pending', 'applied', 'failed', 'unsupported')
+        ),
+        detail_code                  TEXT,
+        updated_ms                   INTEGER NOT NULL,
+        PRIMARY KEY (scope_key, adapter),
+        CHECK (
+            (applied_revision_id IS NULL
+             AND applied_inventory_generation IS NULL)
+            OR
+            (applied_revision_id IS NOT NULL
+             AND applied_inventory_generation IS NOT NULL)
+        ),
+        CHECK (
+            state != 'applied'
+            OR (applied_revision_id = desired_revision_id
+                AND applied_inventory_generation = desired_inventory_generation)
+        )
+    );
+    CREATE INDEX routing_publications_desired_revision_idx
+        ON routing_publications (desired_revision_id);
+    CREATE INDEX routing_publications_state_idx
+        ON routing_publications (state);
+
+    CREATE TABLE learned_models_by_binding (
+        binding_id          TEXT NOT NULL,
+        model_id            TEXT NOT NULL,
+        days_json           TEXT CHECK (days_json IS NULL OR json_valid(days_json)),
+        max_prompt          INTEGER,
+        context_window_json TEXT CHECK (
+            context_window_json IS NULL OR json_valid(context_window_json)
+        ),
+        explicitly_promoted INTEGER NOT NULL DEFAULT 0 CHECK (
+            explicitly_promoted IN (0, 1)
+        ),
+        updated_ms          INTEGER NOT NULL,
+        PRIMARY KEY (binding_id, model_id)
+    );
+    CREATE INDEX learned_models_by_binding_model_idx
+        ON learned_models_by_binding (model_id);
+
+    ALTER TABLE lanes ADD COLUMN pin_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (pin_generation >= 0);
+    ALTER TABLE lanes ADD COLUMN policy_revision_id INTEGER;
+    ALTER TABLE lanes ADD COLUMN policy_route_id TEXT;
+    ALTER TABLE lanes ADD COLUMN route_fingerprint TEXT CHECK (
+        route_fingerprint IS NULL OR (
+            length(route_fingerprint) = 64
+            AND route_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    ALTER TABLE lanes ADD COLUMN candidate_id TEXT;
+    ALTER TABLE lanes ADD COLUMN binding_id TEXT;
+    ALTER TABLE lanes ADD COLUMN baseline_model TEXT;
+    ALTER TABLE lanes ADD COLUMN effective_model TEXT;
+    CREATE INDEX lanes_policy_revision_idx ON lanes (policy_revision_id);
+    CREATE INDEX lanes_binding_idx ON lanes (binding_id);
+    CREATE TRIGGER lanes_pin_insert_check
+    BEFORE INSERT ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+    CREATE TRIGGER lanes_pin_update_check
+    BEFORE UPDATE OF policy_revision_id, policy_route_id, route_fingerprint,
+                     candidate_id, binding_id, baseline_model, effective_model
+    ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+
+    ALTER TABLE requests ADD COLUMN policy_revision_id INTEGER;
+    ALTER TABLE requests ADD COLUMN presentation_id TEXT;
+    ALTER TABLE requests ADD COLUMN rewrite_id TEXT;
+    ALTER TABLE requests ADD COLUMN policy_route_id TEXT;
+    ALTER TABLE requests ADD COLUMN route_fingerprint TEXT CHECK (
+        route_fingerprint IS NULL OR (
+            length(route_fingerprint) = 64
+            AND route_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    ALTER TABLE requests ADD COLUMN candidate_id TEXT;
+    ALTER TABLE requests ADD COLUMN binding_id TEXT;
+    ALTER TABLE requests ADD COLUMN baseline_model TEXT;
+    ALTER TABLE requests ADD COLUMN attempt_group_id TEXT CHECK (
+        attempt_group_id IS NULL OR (
+            length(attempt_group_id) = 32
+            AND attempt_group_id NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    ALTER TABLE requests ADD COLUMN attempt_index INTEGER CHECK (
+        attempt_index IS NULL OR attempt_index >= 0
+    );
+    ALTER TABLE requests ADD COLUMN fallback_reason TEXT;
+    ALTER TABLE requests ADD COLUMN routing_trace TEXT CHECK (
+        routing_trace IS NULL OR json_valid(routing_trace)
+    );
+    ALTER TABLE requests ADD COLUMN parent_session_id TEXT;
+    ALTER TABLE requests ADD COLUMN child_role TEXT;
+    ALTER TABLE requests ADD COLUMN relation_source TEXT;
+    CREATE INDEX requests_policy_revision_idx
+        ON requests (policy_revision_id);
+    CREATE INDEX requests_attempt_group_idx
+        ON requests (attempt_group_id, attempt_index);
+    CREATE UNIQUE INDEX requests_attempt_identity_idx
+        ON requests (attempt_group_id, attempt_index)
+        WHERE attempt_index IS NOT NULL;
+    CREATE INDEX requests_parent_session_idx
+        ON requests (parent_session_id);
+
+    CREATE TRIGGER requests_provenance_insert_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.attempt_index IS NOT NULL AND NEW.attempt_group_id IS NULL)
+      OR NOT (
+          (NEW.parent_session_id IS NULL
+           AND NEW.child_role IS NULL
+           AND NEW.relation_source IS NULL)
+          OR
+          (NEW.parent_session_id IS NOT NULL
+           AND NEW.child_role = 'guardian'
+           AND NEW.relation_source = 'codex_guardian'
+           AND NEW.session_id IS NOT NULL
+           AND NEW.parent_session_id != NEW.session_id)
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request provenance');
+    END;
+    CREATE TRIGGER requests_lineage_cycle_check
+    BEFORE INSERT ON requests
+    WHEN NEW.parent_session_id IS NOT NULL AND EXISTS (
+        WITH RECURSIVE ancestors(session_id) AS (
+            SELECT NEW.parent_session_id
+            UNION
+            SELECT r.parent_session_id
+            FROM requests AS r
+            JOIN ancestors AS a ON r.session_id = a.session_id
+            WHERE r.parent_session_id IS NOT NULL
+        )
+        SELECT 1 FROM ancestors WHERE session_id = NEW.session_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'cyclic request lineage');
+    END;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.
