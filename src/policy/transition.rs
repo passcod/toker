@@ -124,6 +124,7 @@ pub enum TransitionDenied {
     LaneNotCold,
     CacheNotCold,
     WarmCacheLoss,
+    InvalidCauseIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,11 +222,17 @@ pub fn decide_transition(
             }
         }
         TransitionCause::Upgrade { lane } => {
+            if !same_candidate_baseline(current, &prospective) {
+                return TransitionDecision::Denied(TransitionDenied::InvalidCauseIdentity);
+            }
             if let Err(reason) = lane_allows(lane, *temperature) {
                 return TransitionDecision::Denied(reason);
             }
         }
         TransitionCause::Fallback { cache } => {
+            if !same_revision_route(current, &prospective) {
+                return TransitionDecision::Denied(TransitionDenied::InvalidCauseIdentity);
+            }
             if let Err(reason) = cache_allows(cache, cache_changes, *temperature) {
                 return TransitionDecision::Denied(reason);
             }
@@ -250,6 +257,19 @@ pub fn decide_transition(
         new_pin: prospective,
         source: source_of(cause),
     }
+}
+
+fn same_revision_route(current: &PinIdentity, prospective: &PinIdentity) -> bool {
+    current.policy_revision_id == prospective.policy_revision_id
+        && current.policy_route_id == prospective.policy_route_id
+        && current.route_fingerprint == prospective.route_fingerprint
+}
+
+fn same_candidate_baseline(current: &PinIdentity, prospective: &PinIdentity) -> bool {
+    same_revision_route(current, prospective)
+        && current.candidate_id == prospective.candidate_id
+        && current.binding_id == prospective.binding_id
+        && current.baseline_model == prospective.baseline_model
 }
 
 fn lane_allows(
@@ -526,9 +546,44 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_cannot_authorize_a_candidate_or_backend_change() {
+        let current = pin(1, "openrouter.openrouter_chat_completions", "old");
+        let mut next = current.clone();
+        next.candidate_id = CandidateId::new("other").unwrap();
+        next.binding_id = BindingId::new("anthropic_api.anthropic_messages").unwrap();
+        next.effective_model = "new".to_owned();
+        assert_eq!(
+            decide_transition(
+                &lane(Some(current), CacheTemperature::Cold),
+                next,
+                TransitionCause::Upgrade {
+                    lane: LaneTransitionPolicy::AllowImmediate,
+                },
+            ),
+            TransitionDecision::Denied(TransitionDenied::InvalidCauseIdentity)
+        );
+    }
+
+    #[test]
+    fn fallback_stays_within_the_captured_revision_and_route() {
+        let current = pin(1, "openrouter.openrouter_chat_completions", "old");
+        let next = pin(2, "anthropic_api.anthropic_messages", "new");
+        assert_eq!(
+            decide_transition(
+                &lane(Some(current), CacheTemperature::Cold),
+                next,
+                TransitionCause::Fallback {
+                    cache: CacheTransitionPolicy::AllowCacheLoss,
+                },
+            ),
+            TransitionDecision::Denied(TransitionDenied::InvalidCauseIdentity)
+        );
+    }
+
+    #[test]
     fn fallback_cache_consent_is_only_needed_when_cache_identity_changes() {
         let current = pin(1, "openrouter.openrouter_chat_completions", "same");
-        let mut same_cache = pin(1, "openrouter.openrouter_chat_completions", "same");
+        let mut same_cache = current.clone();
         same_cache.candidate_id = CandidateId::new("fallback").unwrap();
         assert!(matches!(
             decide_transition(
@@ -540,7 +595,10 @@ mod tests {
             ),
             TransitionDecision::Replace { .. }
         ));
-        let crossed = pin(1, "anthropic_api.anthropic_messages", "other");
+        let mut crossed = current.clone();
+        crossed.candidate_id = CandidateId::new("fallback").unwrap();
+        crossed.binding_id = BindingId::new("anthropic_api.anthropic_messages").unwrap();
+        crossed.effective_model = "other".to_owned();
         assert_eq!(
             decide_transition(
                 &lane(Some(current.clone()), CacheTemperature::Warm),
