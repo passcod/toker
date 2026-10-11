@@ -36,24 +36,13 @@ impl InferenceRequest {
         target: ModelTarget,
         baseline_model: Option<String>,
     ) -> InferenceAttempt {
-        self.prepare_with_map(target, baseline_model, None)
-    }
-
-    pub(crate) fn prepare_with_map(
-        &self,
-        target: ModelTarget,
-        baseline_model: Option<String>,
-        model_map: Option<&ModelMap>,
-    ) -> InferenceAttempt {
         let mut canonical = self.canonical();
         canonical.model.clone_from(&baseline_model);
-        let mapped = crate::middleware::canonical::map_model(&mut canonical, model_map);
-        let effective_model = canonical.model.clone();
         InferenceAttempt {
             target,
             requested_model: self.requested_model.clone(),
-            effective_model,
-            mapped,
+            effective_model: baseline_model,
+            mapped: None,
             canonical,
         }
     }
@@ -64,24 +53,10 @@ impl InferenceRequest {
         compaction_model: Option<&str>,
         model_map: Option<&ModelMap>,
     ) -> Option<(InferenceAttempt, RetargetOutcome)> {
-        let mut canonical = self.canonical();
-        let outcome = crate::middleware::canonical::retarget_compaction(
-            &mut canonical,
-            compaction_model,
-            true,
-            model_map,
-        )?;
-        let effective_model = canonical.model.clone();
-        Some((
-            InferenceAttempt {
-                target,
-                requested_model: self.requested_model.clone(),
-                effective_model,
-                mapped: None,
-                canonical,
-            },
-            outcome,
-        ))
+        let baseline_model = self.canonical.model.clone();
+        let mut attempt = self.prepare(target, baseline_model);
+        let outcome = attempt.apply_compaction(compaction_model, model_map)?;
+        Some((attempt, outcome))
     }
 
     /// Temporary bridge for Messages while its remaining candidate-local
@@ -104,15 +79,15 @@ impl InferenceRequest {
         model_map: Option<&ModelMap>,
     ) -> InferenceAttempt {
         canonical.model.clone_from(&baseline_model);
-        let mapped = crate::middleware::canonical::map_model(&mut canonical, model_map);
-        let effective_model = canonical.model.clone();
-        InferenceAttempt {
+        let mut attempt = InferenceAttempt {
             target,
             requested_model: self.requested_model.clone(),
-            effective_model,
-            mapped,
+            effective_model: baseline_model,
+            mapped: None,
             canonical,
-        }
+        };
+        attempt.apply_model_map(model_map);
+        attempt
     }
 }
 
@@ -143,6 +118,26 @@ impl InferenceAttempt {
 
     pub(crate) fn mapped(&self) -> Option<&MapTarget> {
         self.mapped.as_ref()
+    }
+
+    pub(crate) fn apply_compaction(
+        &mut self,
+        compaction_model: Option<&str>,
+        model_map: Option<&ModelMap>,
+    ) -> Option<RetargetOutcome> {
+        let outcome = crate::middleware::canonical::retarget_compaction(
+            &mut self.canonical,
+            compaction_model,
+            true,
+            model_map,
+        )?;
+        self.effective_model.clone_from(&self.canonical.model);
+        Some(outcome)
+    }
+
+    pub(crate) fn apply_model_map(&mut self, model_map: Option<&ModelMap>) {
+        self.mapped = crate::middleware::canonical::map_model(&mut self.canonical, model_map);
+        self.effective_model.clone_from(&self.canonical.model);
     }
 
     /// Clone this candidate's private canonical IR for one backend renderer.
@@ -260,8 +255,8 @@ mod tests {
         let map = parse_model_map(r#"{"model:asked-model":"served-model"}"#)
             .unwrap()
             .unwrap();
-        let mapped =
-            request.prepare_with_map(target.clone(), Some("asked-model".to_owned()), Some(&map));
+        let mut mapped = request.prepare(target.clone(), Some("asked-model".to_owned()));
+        mapped.apply_model_map(Some(&map));
         let plain = request.prepare(target, Some("asked-model".to_owned()));
 
         assert_eq!(mapped.effective_model(), Some("served-model"));
