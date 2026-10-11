@@ -318,10 +318,13 @@ One immutable row per activation:
 - `source TEXT NOT NULL` (`legacy`, `draft`, or `reactivation`);
 - `parent_revision_id INTEGER`, referring to an existing immutable revision;
 - `document_json TEXT NOT NULL`;
-- `fingerprint TEXT NOT NULL`, exactly 64 lowercase hexadecimal characters and
-  unique.
+- `fingerprint TEXT NOT NULL`, exactly 64 lowercase hexadecimal characters.
 
-Add indexes on `activated_ms` and `parent_revision_id`. Revisions are inserted
+Add indexes on `activated_ms`, `parent_revision_id`, and `fingerprint`.
+The fingerprint is an indexed content identity, not a revision identity: a
+reactivation inserts a distinct child revision carrying the same canonical
+policy and fingerprint.
+Revisions are inserted
 only by the activation transaction; no update or delete Store API exists. The
 canonical document's own format version remains inside `document_json` and is
 validated before insertion and after loading.
@@ -477,6 +480,9 @@ request. Actual sends use contiguous zero-based indices; `attempt_index` is null
 only for a preflight-only terminal row, which still has a group id. A partial
 unique index on `(attempt_group_id, attempt_index)` where the index is non-null
 prevents duplicate send identities.
+Schema v7 had no normal writer for these attempt fields; if a raw v7 fixture
+contains malformed non-null attempt provenance, the hardening migration aborts
+atomically for repair rather than mutating insert-only history.
 
 The trace contains only ids, classifications, availability states, and reason
 codes. Preflight skips ride on the first attempted row or local terminal row.

@@ -521,6 +521,191 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request policy revision');
     END;
     "#,
+    // v9 — permit reactivation to create a distinct immutable revision with
+    // the same canonical document fingerprint. Rebuild the parent and both
+    // tables with declared foreign keys together; lane/request references are
+    // enforced by triggers and need no table rebuild.
+    r#"
+    PRAGMA defer_foreign_keys = ON;
+
+    DROP TRIGGER lanes_pin_insert_check;
+    DROP TRIGGER lanes_pin_update_check;
+    DROP TRIGGER requests_policy_revision_check;
+
+    CREATE TABLE routing_policy_revisions_new (
+        revision_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_ms               INTEGER NOT NULL,
+        activated_ms             INTEGER NOT NULL,
+        description              TEXT,
+        activation_scope         TEXT NOT NULL CHECK (
+            activation_scope IN ('new_lanes', 'new_and_cold_lanes', 'immediate')
+        ),
+        forced_cache_transition  INTEGER NOT NULL CHECK (
+            forced_cache_transition IN (0, 1)
+        ),
+        source                   TEXT NOT NULL CHECK (
+            source IN ('legacy', 'draft', 'reactivation')
+        ),
+        parent_revision_id       INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        document_json            TEXT NOT NULL CHECK (json_valid(document_json)),
+        fingerprint              TEXT NOT NULL CHECK (
+            length(fingerprint) = 64
+            AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    );
+    INSERT INTO routing_policy_revisions_new
+        (revision_id, created_ms, activated_ms, description, activation_scope,
+         forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+    SELECT revision_id, created_ms, activated_ms, description, activation_scope,
+           forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+    FROM routing_policy_revisions;
+
+    CREATE TABLE routing_policy_state_new (
+        id                       INTEGER PRIMARY KEY CHECK (id = 1),
+        active_revision_id       INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        draft_generation         INTEGER NOT NULL DEFAULT 0 CHECK (draft_generation >= 0),
+        draft_base_revision_id   INTEGER REFERENCES routing_policy_revisions_new(revision_id),
+        draft_document_json      TEXT CHECK (
+            draft_document_json IS NULL OR json_valid(draft_document_json)
+        ),
+        draft_fingerprint        TEXT CHECK (
+            draft_fingerprint IS NULL OR (
+                length(draft_fingerprint) = 64
+                AND draft_fingerprint NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        draft_updated_ms         INTEGER,
+        legacy_imported_ms       INTEGER,
+        CHECK (
+            (draft_base_revision_id IS NULL
+             AND draft_document_json IS NULL
+             AND draft_fingerprint IS NULL
+             AND draft_updated_ms IS NULL)
+            OR
+            (draft_base_revision_id IS NOT NULL
+             AND draft_document_json IS NOT NULL
+             AND draft_fingerprint IS NOT NULL
+             AND draft_updated_ms IS NOT NULL)
+        )
+    );
+    INSERT INTO routing_policy_state_new
+    SELECT * FROM routing_policy_state;
+
+    CREATE TABLE routing_publications_new (
+        scope_key                    TEXT NOT NULL,
+        adapter                      TEXT NOT NULL,
+        desired_revision_id          INTEGER NOT NULL
+            REFERENCES routing_policy_revisions_new(revision_id),
+        applied_revision_id          INTEGER
+            REFERENCES routing_policy_revisions_new(revision_id),
+        desired_inventory_generation INTEGER NOT NULL CHECK (
+            desired_inventory_generation >= 0
+        ),
+        applied_inventory_generation INTEGER CHECK (
+            applied_inventory_generation >= 0
+        ),
+        state                        TEXT NOT NULL CHECK (
+            state IN ('pending', 'applied', 'failed', 'unsupported')
+        ),
+        detail_code                  TEXT,
+        updated_ms                   INTEGER NOT NULL,
+        PRIMARY KEY (scope_key, adapter),
+        CHECK (
+            (applied_revision_id IS NULL
+             AND applied_inventory_generation IS NULL)
+            OR
+            (applied_revision_id IS NOT NULL
+             AND applied_inventory_generation IS NOT NULL)
+        ),
+        CHECK (
+            state != 'applied'
+            OR (applied_revision_id = desired_revision_id
+                AND applied_inventory_generation = desired_inventory_generation)
+        )
+    );
+    INSERT INTO routing_publications_new
+    SELECT * FROM routing_publications;
+
+    DROP TABLE routing_policy_state;
+    DROP TABLE routing_publications;
+    DROP TABLE routing_policy_revisions;
+    ALTER TABLE routing_policy_revisions_new RENAME TO routing_policy_revisions;
+    ALTER TABLE routing_policy_state_new RENAME TO routing_policy_state;
+    ALTER TABLE routing_publications_new RENAME TO routing_publications;
+
+    CREATE INDEX routing_policy_revisions_activated_idx
+        ON routing_policy_revisions (activated_ms);
+    CREATE INDEX routing_policy_revisions_parent_idx
+        ON routing_policy_revisions (parent_revision_id);
+    CREATE INDEX routing_policy_revisions_fingerprint_idx
+        ON routing_policy_revisions (fingerprint);
+    CREATE INDEX routing_publications_desired_revision_idx
+        ON routing_publications (desired_revision_id);
+    CREATE INDEX routing_publications_state_idx
+        ON routing_publications (state);
+
+    CREATE TRIGGER lanes_pin_insert_check
+    BEFORE INSERT ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+    CREATE TRIGGER lanes_pin_update_check
+    BEFORE UPDATE OF policy_revision_id, policy_route_id, route_fingerprint,
+                     candidate_id, binding_id, baseline_model, effective_model
+    ON lanes
+    WHEN NOT (
+        (NEW.policy_revision_id IS NULL
+         AND NEW.policy_route_id IS NULL
+         AND NEW.route_fingerprint IS NULL
+         AND NEW.candidate_id IS NULL
+         AND NEW.binding_id IS NULL
+         AND NEW.baseline_model IS NULL
+         AND NEW.effective_model IS NULL)
+        OR
+        (NEW.policy_revision_id IS NOT NULL
+         AND NEW.policy_route_id IS NOT NULL
+         AND NEW.route_fingerprint IS NOT NULL
+         AND NEW.candidate_id IS NOT NULL
+         AND NEW.binding_id IS NOT NULL
+         AND NEW.baseline_model IS NOT NULL
+         AND NEW.effective_model IS NOT NULL
+         AND EXISTS (
+             SELECT 1 FROM routing_policy_revisions
+             WHERE revision_id = NEW.policy_revision_id
+         ))
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid lane pin');
+    END;
+
+    CREATE TRIGGER requests_policy_revision_check
+    BEFORE INSERT ON requests
+    WHEN NEW.policy_revision_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM routing_policy_revisions
+        WHERE revision_id = NEW.policy_revision_id
+    ) BEGIN
+        SELECT RAISE(ABORT, 'invalid request policy revision');
+    END;
+    "#,
 ];
 
 /// Apply pending migrations in order. A fresh database runs every entry.
@@ -529,6 +714,11 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
     for (index, script) in MIGRATIONS.iter().enumerate() {
         let version = index as i64 + 1;
         if version > current {
+            // v7 had no normal writer for attempt provenance. If raw fixtures
+            // populated non-NULL attempt fields in a shape v8 cannot constrain,
+            // v8 aborts atomically for explicit repair rather than rewriting
+            // insert-only request history.
+            //
             // The script and its user_version bump commit together, so a
             // crash mid-migration leaves the database at the prior version.
             let tx = conn.transaction()?;

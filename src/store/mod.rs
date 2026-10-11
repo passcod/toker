@@ -500,7 +500,7 @@ impl Store {
         &self,
         update: &BindingLearningUpdate,
     ) -> Result<BindingLearning> {
-        state::merge_binding_learning(&*self.conn()?, update)
+        state::merge_binding_learning(&mut *self.conn()?, update)
     }
 
     /// Idempotently merge learning from ledger rows whose binding attribution
@@ -3033,7 +3033,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 7).unwrap();
         }
         let migrated = Store::open(&db).unwrap();
-        assert_eq!(user_version(&migrated), 8);
+        assert_eq!(user_version(&migrated), schema::MIGRATIONS.len() as i64);
         exercise(&migrated);
     }
 
@@ -3060,7 +3060,7 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&db).unwrap();
-        assert_eq!(user_version(&store), 8);
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
         assert_eq!(
             store
                 .load_routing_policy_state()
@@ -3193,5 +3193,360 @@ mod tests {
                 .unwrap(),
             learned,
         );
+    }
+    #[test]
+    fn replay_preserves_unknown_prompt_and_sums_partial_buckets() {
+        let store = mem_store();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let mut unknown = bare_row(1_760_000_000_000);
+        unknown.raw_model = Some("unknown-prompt".to_owned());
+        unknown.binding_id = Some(binding.clone());
+        store.record_request(&unknown).unwrap();
+        let mut partial = bare_row(1_760_086_400_000);
+        partial.raw_model = Some("partial-prompt".to_owned());
+        partial.binding_id = Some(binding.clone());
+        partial.input = Some(40);
+        partial.cache_write_total = Some(2);
+        store.record_request(&partial).unwrap();
+
+        store
+            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
+            .unwrap();
+        let unknown = store
+            .load_binding_learning(&binding, "unknown-prompt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unknown.max_prompt, None);
+        assert_eq!(unknown.days.len(), 1, "the day is evidence without a bound");
+        let partial = store
+            .load_binding_learning(&binding, "partial-prompt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.max_prompt, Some(42));
+    }
+
+    #[test]
+    fn replay_bad_attributable_rows_name_the_row_and_roll_back() {
+        fn assert_bad(row: RequestRow, expected: &str) {
+            let store = mem_store();
+            let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+            store
+                .merge_binding_learning(&BindingLearningUpdate {
+                    binding_id: binding.clone(),
+                    model_id: "existing".to_owned(),
+                    days: ["2026-10-01".to_owned()].into_iter().collect(),
+                    max_prompt: Some(10),
+                    context_window: None,
+                    explicitly_promoted: false,
+                    updated_ms: 1,
+                })
+                .unwrap();
+            store.record_request(&row).unwrap();
+            let error = store
+                .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("request row 1"), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                store.load_binding_learnings(&binding).unwrap().len(),
+                1,
+                "failed replay rolls back every merge",
+            );
+        }
+
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let mut blank = bare_row(1_760_000_000_000);
+        blank.binding_id = Some(binding.clone());
+        blank.raw_model = Some("   ".to_owned());
+        assert_bad(blank, "blank raw_model");
+
+        let mut timestamp = bare_row(i64::MAX);
+        timestamp.binding_id = Some(binding.clone());
+        timestamp.raw_model = Some("model".to_owned());
+        assert_bad(timestamp, "unrepresentable ts_ms");
+
+        let mut overflow = bare_row(1_760_000_000_000);
+        overflow.binding_id = Some(binding);
+        overflow.raw_model = Some("model".to_owned());
+        overflow.input = Some(i64::MAX);
+        overflow.cache_read = Some(1);
+        assert_bad(overflow, "overflow i64");
+    }
+
+    #[test]
+    fn binding_learning_merge_is_atomic_across_store_connections() {
+        let dir = test_dir("learning-atomic");
+        let db = dir.join("toker.db");
+        let first = Store::open(&db).unwrap();
+        let second = Store::open(&db).unwrap();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_binding = binding.clone();
+        let first_barrier = barrier.clone();
+        let first_merge = std::thread::spawn(move || {
+            first_barrier.wait();
+            first.merge_binding_learning(&BindingLearningUpdate {
+                binding_id: first_binding,
+                model_id: "model".to_owned(),
+                days: ["2026-10-01".to_owned()].into_iter().collect(),
+                max_prompt: Some(100),
+                context_window: Some(json!({"default": 100, "max": 200})),
+                explicitly_promoted: true,
+                updated_ms: 20,
+            })
+        });
+        let second_binding = binding.clone();
+        let second_merge = std::thread::spawn(move || {
+            barrier.wait();
+            second.merge_binding_learning(&BindingLearningUpdate {
+                binding_id: second_binding,
+                model_id: "model".to_owned(),
+                days: ["2026-10-02".to_owned()].into_iter().collect(),
+                max_prompt: Some(50),
+                context_window: None,
+                explicitly_promoted: false,
+                updated_ms: 10,
+            })
+        });
+        first_merge.join().unwrap().unwrap();
+        second_merge.join().unwrap().unwrap();
+        let reader = Store::open(&db).unwrap();
+        let merged = reader
+            .load_binding_learning(&binding, "model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged.days.into_iter().collect::<Vec<_>>(),
+            ["2026-10-01", "2026-10-02"]
+        );
+        assert_eq!(merged.max_prompt, Some(100));
+        assert_eq!(
+            merged.context_window,
+            Some(json!({"default": 100, "max": 200}))
+        );
+        assert!(merged.explicitly_promoted);
+        assert_eq!(merged.updated_ms, 20);
+    }
+
+    #[test]
+    fn reactivation_revision_may_reuse_its_parents_fingerprint() {
+        let store = mem_store();
+        let document = policy("same content");
+        let parent = store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some("parent"),
+                activation_scope: ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .unwrap();
+        let child = store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 3,
+                activated_ms: 4,
+                description: Some("reactivated"),
+                activation_scope: ActivationScope::Immediate,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Reactivation,
+                parent_revision_id: Some(parent.revision_id),
+                document: &document,
+            })
+            .unwrap();
+        assert_ne!(child.revision_id, parent.revision_id);
+        assert_eq!(child.parent_revision_id, Some(parent.revision_id));
+        assert_eq!(child.fingerprint, parent.fingerprint);
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            None
+        );
+    }
+    #[test]
+    fn migration_v8_refuses_v7_attempt_history_that_cannot_satisfy_new_constraints() {
+        let dir = test_dir("v7-malformed-attempts");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..7] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7).unwrap();
+            let group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            conn.execute(
+                "INSERT INTO requests (ts_ms, attempt_group_id, attempt_index)
+                 VALUES (1, ?1, NULL), (2, ?1, NULL)",
+                [group],
+            )
+            .unwrap();
+        }
+        let error = match Store::open(&db) {
+            Ok(_) => panic!("malformed v7 history must block v8 migration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("UNIQUE constraint failed"), "{error}");
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7, "failed v8 migration rolls back atomically");
+    }
+
+    #[test]
+    fn migration_v9_preserves_all_revision_references_and_foreign_keys() {
+        let dir = test_dir("v8-revision-rebuild");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let document = policy("same document");
+        let json = String::from_utf8(crate::policy::policy_bytes(&document).unwrap()).unwrap();
+        let fingerprint = crate::policy::policy_fingerprint(&document)
+            .unwrap()
+            .to_string();
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            for script in &schema::MIGRATIONS[..8] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+            conn.execute(
+                "INSERT INTO routing_policy_revisions
+                 (revision_id, created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+                 VALUES (1, 1, 2, 'parent', 'new_lanes', 0, 'draft', NULL, ?1, ?2)",
+                rusqlite::params![json, fingerprint],
+            )
+            .unwrap();
+            let child_json =
+                String::from_utf8(crate::policy::policy_bytes(&policy("child")).unwrap()).unwrap();
+            let child_fingerprint = crate::policy::policy_fingerprint(&policy("child"))
+                .unwrap()
+                .to_string();
+            conn.execute(
+                "INSERT INTO routing_policy_revisions
+                 (revision_id, created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+                 VALUES (2, 3, 4, 'child', 'immediate', 0, 'draft', 1, ?1, ?2)",
+                rusqlite::params![child_json, child_fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE routing_policy_state SET draft_generation=1, draft_base_revision_id=2,
+                 draft_document_json=?1, draft_fingerprint=?2, draft_updated_ms=5 WHERE id=1",
+                rusqlite::params![child_json, child_fingerprint],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO routing_publications
+                 (scope_key, adapter, desired_revision_id, applied_revision_id,
+                  desired_inventory_generation, applied_inventory_generation, state, updated_ms)
+                 VALUES ('protocol:anthropic_messages','claude_settings',2,1,2,1,'pending',6)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO lanes
+                 (key, updated_ms, pin_generation, policy_revision_id, policy_route_id,
+                  route_fingerprint, candidate_id, binding_id, baseline_model, effective_model)
+                 VALUES ('lane',7,1,1,'route',?1,'candidate',
+                         'openrouter.openrouter_messages','base','effective')",
+                ["11".repeat(32)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO requests (ts_ms, policy_revision_id) VALUES (8,2)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        assert_eq!(
+            store
+                .load_policy_revision(2)
+                .unwrap()
+                .unwrap()
+                .parent_revision_id,
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .draft
+                .unwrap()
+                .base_revision_id,
+            2
+        );
+        let publication = store.load_publications().unwrap().pop().unwrap();
+        assert_eq!(publication.desired_revision_id, 2);
+        assert_eq!(publication.applied_revision_id, Some(1));
+        assert_eq!(
+            store
+                .load_lane("lane")
+                .unwrap()
+                .unwrap()
+                .pin
+                .unwrap()
+                .policy_revision_id,
+            1
+        );
+        assert_eq!(
+            store.requests_since(0, 10).unwrap()[0].policy_revision_id,
+            Some(2)
+        );
+        let reactivated = store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 9,
+                activated_ms: 10,
+                description: Some("reactivation"),
+                activation_scope: ActivationScope::Immediate,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Reactivation,
+                parent_revision_id: Some(1),
+                document: &document,
+            })
+            .unwrap();
+        assert_eq!(reactivated.fingerprint.to_string(), fingerprint);
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            None
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM routing_policy_revisions WHERE fingerprint=?1",
+                [&fingerprint],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        for table in ["routing_policy_state", "routing_publications"] {
+            let target: String = conn
+                .query_row(
+                    &format!("SELECT \"table\" FROM pragma_foreign_key_list('{table}') LIMIT 1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(target, "routing_policy_revisions");
+        }
     }
 }

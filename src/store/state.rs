@@ -21,7 +21,7 @@ use crate::policy::{
 use serde_json::Value;
 
 use super::{Error, Result, row_of, rows_of};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 /// One lane row: `key` is the composite `"sessionId|toolsHash"` (plan: Lane
 /// tracking + sleep lock). `ping` lanes never hold the sleep lock.
@@ -1081,10 +1081,20 @@ fn valid_local_day(day: &str) -> bool {
 }
 
 pub(super) fn merge_binding_learning(
-    conn: &Connection,
+    conn: &mut Connection,
     update: &BindingLearningUpdate,
 ) -> Result<BindingLearning> {
     validate_learning(update)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let merged = merge_binding_learning_in_transaction(&tx, update)?;
+    tx.commit()?;
+    Ok(merged)
+}
+
+fn merge_binding_learning_in_transaction(
+    conn: &Connection,
+    update: &BindingLearningUpdate,
+) -> Result<BindingLearning> {
     let existing = load_binding_learning(conn, &update.binding_id, &update.model_id)?;
     let mut days = existing
         .as_ref()
@@ -1152,54 +1162,106 @@ pub(super) fn replay_attributable_binding_learning(
     conn: &mut Connection,
     local_time_zone: &jiff::tz::TimeZone,
 ) -> Result<BindingLearningReplay> {
+    struct Observation {
+        row_id: i64,
+        binding: String,
+        model: String,
+        ts_ms: i64,
+        buckets: [Option<i64>; 3],
+    }
+
+    struct Accumulated {
+        days: BTreeSet<String>,
+        max_prompt: Option<i64>,
+        updated_ms: i64,
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let observations = rows_of(
-        conn,
-        "SELECT binding_id, raw_model, ts_ms,
-                COALESCE(input, 0) + COALESCE(cache_read, 0)
-                    + COALESCE(cache_write_total, 0) AS held
+        &tx,
+        "SELECT id, binding_id, raw_model, ts_ms, input, cache_read, cache_write_total
          FROM requests
          WHERE kind IS NULL AND binding_id IS NOT NULL AND raw_model IS NOT NULL
          ORDER BY id",
         [],
         |row| {
-            Ok((
-                row.get::<_, String>("binding_id")?,
-                row.get::<_, String>("raw_model")?,
-                row.get::<_, i64>("ts_ms")?,
-                row.get::<_, i64>("held")?,
-            ))
+            Ok(Observation {
+                row_id: row.get("id")?,
+                binding: row.get("binding_id")?,
+                model: row.get("raw_model")?,
+                ts_ms: row.get("ts_ms")?,
+                buckets: [
+                    row.get("input")?,
+                    row.get("cache_read")?,
+                    row.get("cache_write_total")?,
+                ],
+            })
         },
     )?;
     let attributable_rows = observations.len() as u64;
-    let mut merged: std::collections::BTreeMap<(BindingId, String), (BTreeSet<String>, i64, i64)> =
+    let mut merged: std::collections::BTreeMap<(BindingId, String), Accumulated> =
         std::collections::BTreeMap::new();
-    for (binding, model, ts_ms, held) in observations {
-        let binding: BindingId = parse_id("requests.binding_id", binding)?;
-        let Some(model) = crate::catalog::windows::model_identity(&model) else {
-            continue;
-        };
-        let Some(day) = local_day(ts_ms, local_time_zone) else {
-            continue;
+    for observation in observations {
+        let binding: BindingId = observation.binding.parse().map_err(|error| {
+            Error::InvalidRoutingState(format!(
+                "request row {} has invalid binding_id {:?}: {error}",
+                observation.row_id, observation.binding
+            ))
+        })?;
+        let model =
+            crate::catalog::windows::model_identity(&observation.model).ok_or_else(|| {
+                Error::InvalidRoutingState(format!(
+                    "request row {} has blank raw_model",
+                    observation.row_id
+                ))
+            })?;
+        let day = local_day(observation.ts_ms, local_time_zone).ok_or_else(|| {
+            Error::InvalidRoutingState(format!(
+                "request row {} has unrepresentable ts_ms {}",
+                observation.row_id, observation.ts_ms
+            ))
+        })?;
+        let held = if observation.buckets.iter().all(Option::is_none) {
+            None
+        } else {
+            Some(
+                observation
+                    .buckets
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0_i64, i64::checked_add)
+                    .ok_or_else(|| {
+                        Error::InvalidRoutingState(format!(
+                            "request row {} token buckets overflow i64",
+                            observation.row_id
+                        ))
+                    })?,
+            )
         };
         let entry = merged
             .entry((binding, model))
-            .or_insert_with(|| (BTreeSet::new(), 0, ts_ms));
-        entry.0.insert(day);
-        entry.1 = entry.1.max(held);
-        entry.2 = entry.2.max(ts_ms);
+            .or_insert_with(|| Accumulated {
+                days: BTreeSet::new(),
+                max_prompt: None,
+                updated_ms: observation.ts_ms,
+            });
+        entry.days.insert(day);
+        if let Some(held) = held {
+            entry.max_prompt = Some(entry.max_prompt.map_or(held, |prior| prior.max(held)));
+        }
+        entry.updated_ms = entry.updated_ms.max(observation.ts_ms);
     }
-    let tx = conn.transaction()?;
-    for ((binding_id, model_id), (days, max_prompt, updated_ms)) in &merged {
-        merge_binding_learning(
+    for ((binding_id, model_id), accumulated) in &merged {
+        merge_binding_learning_in_transaction(
             &tx,
             &BindingLearningUpdate {
                 binding_id: binding_id.clone(),
                 model_id: model_id.clone(),
-                days: days.clone(),
-                max_prompt: Some(*max_prompt),
+                days: accumulated.days.clone(),
+                max_prompt: accumulated.max_prompt,
                 context_window: None,
                 explicitly_promoted: false,
-                updated_ms: *updated_ms,
+                updated_ms: accumulated.updated_ms,
             },
         )?;
     }
