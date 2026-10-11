@@ -4,6 +4,7 @@
 //! bounded worker. Queue pressure, resolution failures, and observer panics can
 //! therefore never delay or change authoritative traffic.
 
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -115,7 +116,7 @@ impl ShadowObserver for CollectingObserver {
 }
 
 pub struct PolicyShadow<L> {
-    snapshot: Arc<RwLock<Arc<ShadowSnapshot>>>,
+    snapshot: Arc<RwLock<Option<Arc<ShadowSnapshot>>>>,
     runtime: Arc<ShadowRuntime>,
     _learning: std::marker::PhantomData<fn() -> L>,
 }
@@ -186,11 +187,11 @@ where
             .spawn(move || worker_loop(receiver, learning, observer))
             .expect("policy shadow worker thread");
         Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(ShadowSnapshot {
+            snapshot: Arc::new(RwLock::new(Some(Arc::new(ShadowSnapshot {
                 policy,
                 inventory,
                 availability,
-            }))),
+            })))),
             runtime: Arc::new(ShadowRuntime {
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
@@ -209,19 +210,40 @@ where
         *self
             .snapshot
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(ShadowSnapshot {
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(ShadowSnapshot {
             policy,
             inventory,
             availability,
-        });
+        }));
     }
 
-    pub fn policy(&self) -> Arc<CompiledPolicy> {
-        self.snapshot
+    /// Disable observations until a complete replacement snapshot is ready.
+    pub fn clear_snapshot(&self) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// Return the inherited publication from one immutable policy snapshot.
+    pub fn publication_slugs(
+        &self,
+        profile: Option<&super::ProfileId>,
+        protocol: super::FrontendProtocol,
+    ) -> Option<BTreeSet<String>> {
+        let snapshot = self
+            .snapshot
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .policy
-            .clone()
+            .clone()?;
+        Some(
+            snapshot
+                .policy
+                .publication_slugs(profile, protocol)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
     }
 
     pub fn observe_record(&self, record: ShadowRecord) {
@@ -229,11 +251,14 @@ where
     }
 
     pub fn observe(&self, facts: RequestFacts, lane: Option<LaneFacts>, legacy: LegacyOutcome) {
-        let snapshot = self
+        let Some(snapshot) = self
             .snapshot
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+            .clone()
+        else {
+            return;
+        };
         self.enqueue(ShadowJob::Resolve {
             snapshot,
             facts,
@@ -278,11 +303,11 @@ where
         runtime: Arc<ShadowRuntime>,
     ) -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(Arc::new(ShadowSnapshot {
+            snapshot: Arc::new(RwLock::new(Some(Arc::new(ShadowSnapshot {
                 policy,
                 inventory,
                 availability,
-            }))),
+            })))),
             runtime,
             _learning: std::marker::PhantomData,
         }

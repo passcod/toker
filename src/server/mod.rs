@@ -492,30 +492,19 @@ impl Server {
         let Some(shadow) = &self.policy_shadow else {
             return;
         };
-        let scope = profile
-            .and_then(|profile| ProfileId::new(profile).ok())
-            .map_or_else(
-                || crate::policy::FrontendScope::Protocol {
-                    protocol: protocol.into(),
-                },
-                |profile| crate::policy::FrontendScope::Profile {
-                    profile,
-                    protocol: protocol.into(),
-                },
-            );
+        let profile = profile.and_then(|profile| ProfileId::new(profile).ok());
         let legacy: std::collections::BTreeSet<_> = legacy_models.into_iter().collect();
-        let compiled: std::collections::BTreeSet<_> = shadow
-            .policy()
-            .presentations(&scope)
-            .map(|(slug, _)| slug.to_owned())
-            .collect();
+        let Some(compiled) = shadow.publication_slugs(profile.as_ref(), protocol.into()) else {
+            return;
+        };
+        let matched = legacy == compiled;
         let record = crate::policy::ShadowRecord {
-            comparison: if legacy == compiled {
+            comparison: if matched {
                 crate::policy::ShadowComparison::Match
             } else {
                 crate::policy::ShadowComparison::Mismatch
             },
-            code: if legacy == compiled {
+            code: if matched {
                 "policy-shadow-publication-match"
             } else {
                 "policy-shadow-publication-mismatch"
@@ -920,16 +909,27 @@ impl Server {
         let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
             .ok()
             .and_then(|compilation| compilation.into_policy().ok());
-        *self
+        let mut catalogs = self
             .catalogs
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
-        if let (Some(shadow), Some(policy)) = (&self.policy_shadow, policy) {
-            shadow.replace_snapshot(
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(availability),
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *catalogs = next;
+        if let Some(shadow) = &self.policy_shadow {
+            // Model-list readers retain this catalogue guard through their
+            // comparison, so they can observe only the old pair or new pair.
+            if let Some(policy) = policy {
+                shadow.replace_snapshot(
+                    Arc::new(policy),
+                    Arc::new(inventory),
+                    Arc::new(availability),
+                );
+            } else {
+                tracing::warn!(
+                    code = "policy-shadow-refresh-disabled",
+                    "policy shadow disabled for catalogue generation"
+                );
+                shadow.clear_snapshot();
+            }
         }
     }
 

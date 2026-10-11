@@ -431,8 +431,30 @@ async fn spawn_toker_cataloged(
     source: &'static str,
     catalog: toker::catalog::FetchedCatalog,
 ) -> (SocketAddr, Arc<Store>) {
+    spawn_toker_cataloged_with_observer(
+        config,
+        source,
+        catalog,
+        Arc::new(CollectingObserver::default()),
+    )
+    .await
+}
+
+async fn spawn_toker_cataloged_with_observer(
+    config: Config,
+    source: &'static str,
+    catalog: toker::catalog::FetchedCatalog,
+    observer: Arc<dyn ShadowObserver>,
+) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let server = Server::with_shadow_observer(
+        config,
+        store.clone(),
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        Arc::new(toker::secrets::MemoryStore::new()),
+        observer,
+    )
+    .expect("build server");
     server.install_catalog(source, catalog);
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -1013,7 +1035,9 @@ async fn known_chat_profile_projects_routable_models_locally() {
         ]
     });
     let catalog = toker::catalog::fetched::parse_openrouter(&listing, 1).expect("catalog");
-    let (addr, store) = spawn_toker_cataloged(config, "openrouter", catalog).await;
+    let observer = Arc::new(CollectingObserver::default());
+    let (addr, store) =
+        spawn_toker_cataloged_with_observer(config, "openrouter", catalog, observer.clone()).await;
 
     let response = client()
         .get(toker_url(addr, "/f/opencode/v1/models"))
@@ -1045,6 +1069,22 @@ async fn known_chat_profile_projects_routable_models_locally() {
         "discovery never reaches upstream"
     );
     assert_eq!(store.count_requests().expect("count"), 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while observer.records().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication observation");
+    assert_eq!(
+        observer.records(),
+        vec![ShadowRecord {
+            comparison: ShadowComparison::Match,
+            code: "policy-shadow-publication-match",
+            legacy: None,
+            shadow: None,
+        }]
+    );
 }
 
 #[tokio::test]

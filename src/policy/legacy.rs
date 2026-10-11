@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Context;
 
-use crate::catalog::offers::OfferInventory;
+use crate::catalog::offers::{self, OfferInventory};
 use crate::config::Config;
 use crate::middleware::model_map::ModelMap;
 use crate::picker::{PickerRule, default_rules};
@@ -27,12 +27,12 @@ const LEGACY_FAMILY_CLASSIFIER: &str = "legacy-family";
 const LEGACY_UPGRADE_POLICY: &str = "legacy-force-newest";
 const REQUESTED_ROUTE_PARAMETER: &str = REQUESTED_MODEL_PARAMETER;
 
-/// Build the complete raw revision-one document from resolved config.
+/// Build the inventory-independent revision-one routing document from config.
 pub fn document(config: &Config, topology: &RouteRegistry) -> anyhow::Result<PolicyDocument> {
     LegacyBuilder::new(config, topology).build()
 }
 
-/// Build and intrinsically validate the generated revision-one document.
+/// Build and validate the inventory-independent revision-one routing document.
 pub fn validated(
     config: &Config,
     topology: &RouteRegistry,
@@ -48,12 +48,23 @@ pub fn compile(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> anyhow::Result<Compilation> {
-    Ok(super::compile(
+    let mut compilation = super::compile(
         validated(config, topology)?,
         topology,
         inventory,
         PolicyOrigin::GeneratedRevisionOne,
-    ))
+    );
+    if let Some(policy) = compilation.policy_mut() {
+        for protocol in [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses] {
+            policy.add_generated_publication(
+                protocol.into(),
+                offers::for_frontend_inventory(topology, inventory, protocol)
+                    .into_iter()
+                    .map(|offer| offer.routed_model_id),
+            );
+        }
+    }
+    Ok(compilation)
 }
 
 struct LegacyBuilder<'a> {
@@ -901,6 +912,86 @@ mod tests {
                 .unwrap()
                 .policy()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn chat_publication_matches_the_shared_legacy_projection() {
+        let config = load_config(
+            "default_backend_openai_chat = \"openrouter\"\n\
+             [providers.openrouter]\n[providers.openai_api]\n",
+        );
+        let topology = topology(&config);
+        let mut catalogs = FetchedCatalogs::default();
+        for source in ["openrouter", "openai"] {
+            catalogs.set(
+                source,
+                FetchedCatalog {
+                    fetched_at_ms: 7,
+                    models: ["shared", "specific"]
+                        .into_iter()
+                        .map(|id| FetchedModel {
+                            id: format!("{source}-{id}"),
+                            context_window: Some(100),
+                            chronology: None,
+                            raw: json!({"id": id}),
+                        })
+                        .collect(),
+                },
+            );
+        }
+        let inventory = offers::inventory(&topology, &catalogs);
+        let legacy: std::collections::BTreeSet<_> =
+            offers::for_frontend_inventory(&topology, &inventory, ProtocolId::OpenAiChat)
+                .into_iter()
+                .map(|offer| offer.routed_model_id)
+                .collect();
+        let compilation = compile(&config, &topology, &inventory).unwrap();
+        let policy = compilation.policy().expect("compiled");
+        let compiled: std::collections::BTreeSet<_> = policy
+            .publication_slugs(None, FrontendProtocol::OpenaiChat)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(compiled, legacy);
+        let scope = FrontendScope::Protocol {
+            protocol: FrontendProtocol::OpenaiChat,
+        };
+        assert!(
+            compiled
+                .iter()
+                .all(|slug| policy.presentation(&scope, slug).is_none()),
+            "inventory publication must not become request-routing presentations"
+        );
+    }
+
+    #[test]
+    fn generated_publication_is_not_limited_by_authored_document_bounds() {
+        let config = load_config("[providers.openrouter]\n");
+        let topology = topology(&config);
+        let mut catalogs = FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: 7,
+                models: (0..600)
+                    .map(|index| FetchedModel {
+                        id: format!("invented/model-{index}"),
+                        context_window: None,
+                        chronology: None,
+                        raw: json!({"id": index}),
+                    })
+                    .collect(),
+            },
+        );
+        let inventory = offers::inventory(&topology, &catalogs);
+        let compilation = compile(&config, &topology, &inventory).unwrap();
+        let policy = compilation.policy().expect("compiled");
+        assert_eq!(
+            policy
+                .publication_slugs(None, FrontendProtocol::OpenaiChat)
+                .len(),
+            1_200
         );
     }
 

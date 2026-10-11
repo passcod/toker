@@ -19,10 +19,10 @@ use super::{
     ClassifierId, CompactionPolicy, CompiledMatcher, CostClass, Diagnostic, DiagnosticCode,
     DiagnosticField, DiagnosticPath, FailureClass, FamilyClassifier, FrontendProtocol,
     FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec, ParsedVersion,
-    PolicyFingerprint, PresentationId, PresentationSource, REQUESTED_MODEL_PARAMETER, RewriteId,
-    Route, RouteFingerprint, RouteId, RouteReference, RouteSemantics, SelectorOrdering, Severity,
-    StableId, Template, TemplateError, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument,
-    VersionParserSpec, policy_fingerprint, route_fingerprint,
+    PolicyFingerprint, PresentationId, PresentationSource, ProfileId, REQUESTED_MODEL_PARAMETER,
+    RewriteId, Route, RouteFingerprint, RouteId, RouteReference, RouteSemantics, SelectorOrdering,
+    Severity, StableId, Template, TemplateError, UpgradePolicy, UpgradePolicyId,
+    ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint, route_fingerprint,
 };
 
 /// Whether compilation is allowed to consume revision-one legacy learning.
@@ -54,6 +54,10 @@ impl Compilation {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
+
+    pub(crate) fn policy_mut(&mut self) -> Option<&mut CompiledPolicy> {
+        self.policy.as_mut()
+    }
 }
 
 /// A closed, immutable policy ready for an eventual resolver.
@@ -62,6 +66,7 @@ pub struct CompiledPolicy {
     fingerprint: PolicyFingerprint,
     routes: BTreeMap<RouteId, CompiledRoute>,
     presentations: BTreeMap<ScopeKey, BTreeMap<String, CompiledPresentation>>,
+    publication: BTreeMap<ScopeKey, BTreeSet<String>>,
     rewrites: BTreeMap<ScopeKey, Vec<CompiledRewrite>>,
     defaults: BTreeMap<ScopeKey, CompiledRouteReference>,
     classifiers: BTreeMap<ClassifierId, CompiledClassifier>,
@@ -123,6 +128,51 @@ impl CompiledPolicy {
                     .iter()
                     .map(|(slug, presentation)| (slug.as_str(), presentation))
             })
+    }
+
+    /// Expand the publication visible to one frontend. Protocol-scoped rows
+    /// are inherited, while an exact profile row with the same slug replaces
+    /// the inherited row, matching resolver scope precedence.
+    pub fn publication_slugs(
+        &self,
+        profile: Option<&ProfileId>,
+        protocol: FrontendProtocol,
+    ) -> BTreeSet<&str> {
+        let protocol_key = ScopeKey {
+            profile: None,
+            protocol,
+        };
+        let mut expanded = self
+            .publication
+            .get(&protocol_key)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if let Some(profile) = profile {
+            let profile_key = ScopeKey {
+                profile: Some(profile.to_string()),
+                protocol,
+            };
+            if let Some(items) = self.publication.get(&profile_key) {
+                expanded.extend(items.iter().map(String::as_str));
+            }
+        }
+        expanded
+    }
+
+    pub(crate) fn add_generated_publication(
+        &mut self,
+        protocol: FrontendProtocol,
+        slugs: impl IntoIterator<Item = String>,
+    ) {
+        self.publication
+            .entry(ScopeKey {
+                profile: None,
+                protocol,
+            })
+            .or_default()
+            .extend(slugs);
     }
 }
 
@@ -521,6 +571,10 @@ impl<'a> Compiler<'a> {
         let defaults = self.compile_defaults(&route_positions, &routes);
         let rewrites = self.compile_rewrites(&route_positions, &routes);
         let presentations = self.compile_presentations(&route_positions, &routes, &classifiers);
+        let publication = presentations
+            .iter()
+            .map(|(scope, items)| (scope.clone(), items.keys().cloned().collect()))
+            .collect();
         let compaction = self.compile_compaction(&route_positions, &routes);
 
         if self.failed {
@@ -536,6 +590,7 @@ impl<'a> Compiler<'a> {
                 fingerprint,
                 routes,
                 presentations,
+                publication,
                 rewrites,
                 defaults,
                 classifiers,
@@ -1926,6 +1981,36 @@ mod tests {
         assert_eq!(
             codes(&compilation),
             ["binding-unconfigured", "offer-unknown"]
+        );
+    }
+
+    #[test]
+    fn publication_inherits_protocol_rows_and_deduplicates_profile_collisions() {
+        let mut document = document();
+        let mut inherited = document.presentations[0].clone();
+        inherited.id = PresentationId::new("inherited").unwrap();
+        inherited.slug = "shared".to_owned();
+        let mut profile = inherited.clone();
+        profile.id = PresentationId::new("profile").unwrap();
+        profile.scope = FrontendScope::Profile {
+            profile: ProfileId::new("opencode").unwrap(),
+            protocol: FrontendProtocol::AnthropicMessages,
+        };
+        let mut profile_only = profile.clone();
+        profile_only.id = PresentationId::new("profile-only").unwrap();
+        profile_only.slug = "profile-only".to_owned();
+        document.presentations = vec![inherited, profile, profile_only];
+
+        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let policy = compilation.policy().expect("compiled policy");
+        let profile = ProfileId::new("opencode").unwrap();
+        assert_eq!(
+            policy.publication_slugs(Some(&profile), FrontendProtocol::AnthropicMessages),
+            BTreeSet::from(["profile-only", "shared"])
+        );
+        assert_eq!(
+            policy.publication_slugs(None, FrontendProtocol::AnthropicMessages),
+            BTreeSet::from(["shared"])
         );
     }
 

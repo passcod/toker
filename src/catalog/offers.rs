@@ -120,7 +120,17 @@ pub fn for_frontend(
     catalogs: &FetchedCatalogs,
     frontend: ProtocolId,
 ) -> Vec<ModelOffer> {
-    let inventory = inventory(registry, catalogs);
+    for_frontend_inventory(registry, &inventory(registry, catalogs), frontend)
+}
+
+/// Project one already-captured canonical inventory into the legacy frontend
+/// aliases. This is the shared source for both the authoritative model-list
+/// response and revision-one policy publication.
+pub fn for_frontend_inventory(
+    registry: &RouteRegistry,
+    inventory: &OfferInventory,
+    frontend: ProtocolId,
+) -> Vec<ModelOffer> {
     let mut offers = Vec::new();
     for offer in inventory.iter() {
         let routed = format!("{}/{}", offer.provider, offer.backend_model_id);

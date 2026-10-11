@@ -33,6 +33,7 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
 use toker::middleware::model_map;
+use toker::policy::{CollectingObserver, ShadowComparison, ShadowRecord};
 use toker::server::Server;
 use toker::store::{RequestRow, RowKind, Store};
 
@@ -627,10 +628,20 @@ async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     (addr, store)
 }
 
-async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
+async fn spawn_toker_cataloged(
+    fixture: TestConfig,
+) -> (SocketAddr, Arc<Store>, Arc<CollectingObserver>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let observer = Arc::new(CollectingObserver::default());
+    let server = Server::with_shadow_observer(
+        config,
+        store.clone(),
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        Arc::new(toker::secrets::MemoryStore::new()),
+        observer.clone(),
+    )
+    .expect("build server");
     let raw = json!({
         "models": [{
             "slug": "gpt-5.6-sol",
@@ -651,7 +662,7 @@ async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) 
         let _dir = dir;
         axum::serve(listener, app).await.expect("toker serves");
     });
-    (addr, store)
+    (addr, store, observer)
 }
 
 /// A claude-shaped streaming Messages request for `model`, with a system
@@ -694,7 +705,8 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, _store) = spawn_toker_cataloged(test_config("models", upstream, false)).await;
+    let (addr, _store, observer) =
+        spawn_toker_cataloged(test_config("models", upstream, false)).await;
 
     let response = client()
         .get(format!("http://{addr}/f/codex/v1/models"))
@@ -708,6 +720,22 @@ async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     assert_eq!(body["models"][1]["slug"], "gpt-5.6-sol");
     assert_eq!(body["models"][0]["max_context_window"], 872000);
     assert!(mock.requests.lock().unwrap().is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while observer.records().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication observation");
+    assert_eq!(
+        observer.records(),
+        vec![ShadowRecord {
+            comparison: ShadowComparison::Match,
+            code: "policy-shadow-publication-match",
+            legacy: None,
+            shadow: None,
+        }]
+    );
 }
 
 #[tokio::test]
