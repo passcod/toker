@@ -591,7 +591,13 @@ impl RouteRegistry {
     }
 
     pub fn binding_is_configured(&self, binding: &BackendBinding) -> bool {
-        self.provider_is_configured(binding.provider())
+        self.providers
+            .get(binding.provider())
+            .is_some_and(|provider| {
+                provider.bindings().iter().any(|implemented| {
+                    implemented == binding && implemented.canonical_backend().is_some()
+                })
+            })
     }
 
     /// Resolve a frontend model spelling to its provider, backend binding, and
@@ -687,6 +693,7 @@ mod tests {
     }
 
     const MESSAGES: &[BackendBinding] = &[ANTHROPIC_SUB_MESSAGES];
+    const OPENROUTER_MESSAGES_ONLY: &[BackendBinding] = &[OPENROUTER_MESSAGES];
     const OPENROUTER: &[BackendBinding] = &[OPENROUTER_CHAT, OPENROUTER_MESSAGES];
 
     #[test]
@@ -743,6 +750,20 @@ mod tests {
         let canonical = ready.canonical_backend().expect("adapter is verified");
         assert_eq!(canonical.adapter(), BackendAdapterId::CodexResponses);
         assert_eq!(canonical.capabilities(), Capabilities::CODEX);
+    }
+
+    #[test]
+    fn configured_provider_must_expose_the_exact_verified_binding() {
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider {
+            id: "openrouter",
+            bindings: OPENROUTER_MESSAGES_ONLY,
+        });
+        let registry = RouteRegistry::new([provider], []);
+        assert!(registry.binding_is_configured(&OPENROUTER_MESSAGES));
+        assert!(
+            !registry.binding_is_configured(&OPENROUTER_CHAT),
+            "provider id alone does not verify another declared binding"
+        );
     }
 
     #[test]
