@@ -314,7 +314,8 @@ fn worker_loop<L: LearningView>(
                     &availability,
                     &facts,
                 ) {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        plan.policy_revision = snapshot.revision_id();
                         let shadow = ShadowOutcome::from_plan(&facts, &plan);
                         let comparison = if legacy == shadow {
                             ShadowComparison::Match

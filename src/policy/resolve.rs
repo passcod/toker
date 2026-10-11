@@ -207,7 +207,7 @@ pub enum TraceEvent {
 pub struct AttemptPlan {
     pub policy_fingerprint: PolicyFingerprint,
     /// Legacy in-memory policy has no persisted revision yet.
-    pub policy_revision: Option<u64>,
+    pub policy_revision: Option<i64>,
     pub route_id: Option<RouteId>,
     pub route_fingerprint: Option<RouteFingerprint>,
     pub provenance: RouteProvenance,
@@ -222,6 +222,20 @@ pub struct AttemptPlan {
     pub compaction: bool,
     pub lane_transition: LaneTransitionPolicy,
     pub trace: Vec<TraceEvent>,
+}
+
+impl AttemptPlan {
+    pub fn pin_identity(&self) -> Option<super::PinIdentity> {
+        Some(super::PinIdentity {
+            policy_revision_id: self.policy_revision?,
+            policy_route_id: self.route_id.clone()?,
+            route_fingerprint: self.route_fingerprint.clone()?,
+            candidate_id: self.candidate_id.clone()?,
+            binding_id: self.binding_id.clone(),
+            baseline_model: self.baseline_model.clone(),
+            effective_model: self.effective_model.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -1714,6 +1728,38 @@ mod tests {
         assert_eq!(first.baseline_model, "claude-opus-5");
         assert_eq!(first.aliased_model.as_deref(), Some("mapped-opus-5"));
         assert_eq!(first.effective_model, "mapped-opus-5");
+    }
+
+    #[test]
+    fn a_plan_builds_a_complete_pin_only_with_a_stored_revision() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        let policy = compile(document(route(first, vec![])), &OfferInventory::default());
+        let mut plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap();
+        assert_eq!(plan.pin_identity(), None);
+        plan.policy_revision = Some(7);
+        let pin = plan.pin_identity().expect("complete pin");
+        assert_eq!(pin.policy_revision_id, 7);
+        assert_eq!(pin.policy_route_id, plan.route_id.clone().unwrap());
+        assert_eq!(
+            pin.route_fingerprint,
+            plan.route_fingerprint.clone().unwrap()
+        );
+        assert_eq!(pin.candidate_id, plan.candidate_id.clone().unwrap());
+        assert_eq!(pin.binding_id, plan.binding_id);
+        assert_eq!(pin.baseline_model, plan.baseline_model);
+        assert_eq!(pin.effective_model, plan.effective_model);
     }
 
     #[test]
