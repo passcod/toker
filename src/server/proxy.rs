@@ -145,7 +145,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     };
     let inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let gate_model = target.effective_model().map(str::to_owned);
-    let attempt = inference.prepare(target.clone(), gate_model.clone(), inference.canonical());
+    let attempt = inference.prepare(target.clone(), gate_model.clone());
     let gate_model = attempt.effective_model().map(str::to_owned);
     let canonical = attempt.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);

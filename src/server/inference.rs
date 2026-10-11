@@ -33,6 +33,26 @@ impl InferenceRequest {
         &self,
         target: ModelTarget,
         effective_model: Option<String>,
+    ) -> InferenceAttempt {
+        self.prepared_from(target, effective_model, self.canonical())
+    }
+
+    /// Temporary bridge for Messages while its existing candidate-local
+    /// transforms are moved behind `prepare`. The method name prevents a
+    /// transformed request from masquerading as the immutable baseline.
+    pub(crate) fn prepare_legacy_transformed(
+        &self,
+        target: ModelTarget,
+        effective_model: Option<String>,
+        canonical: CanonicalRequest,
+    ) -> InferenceAttempt {
+        self.prepared_from(target, effective_model, canonical)
+    }
+
+    fn prepared_from(
+        &self,
+        target: ModelTarget,
+        effective_model: Option<String>,
         canonical: CanonicalRequest,
     ) -> InferenceAttempt {
         InferenceAttempt {
@@ -111,11 +131,7 @@ mod tests {
         let mut first = request.canonical();
         first.model = Some("mutated-by-first-candidate".to_owned());
         first.system.clear();
-        let attempt = request.prepare(
-            target,
-            Some("invented-model".to_owned()),
-            request.canonical(),
-        );
+        let attempt = request.prepare(target, Some("invented-model".to_owned()));
 
         assert_eq!(attempt.backend().id(), "openrouter");
         assert_eq!(attempt.binding().provider(), "openrouter");

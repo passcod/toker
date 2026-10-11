@@ -177,11 +177,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             let inference =
                 super::inference::InferenceRequest::new(requested_model.clone(), canonical);
             inference
-                .prepare(
-                    target.clone(),
-                    effective_model.clone(),
-                    inference.canonical(),
-                )
+                .prepare(target.clone(), effective_model.clone())
                 .canonical()
         })
     });

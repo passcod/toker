@@ -1227,7 +1227,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     {
         canonical = Some(
             inference
-                .prepare(target.clone(), served_model.clone(), request)
+                .prepare_legacy_transformed(target.clone(), served_model.clone(), request)
                 .canonical(),
         );
     }
