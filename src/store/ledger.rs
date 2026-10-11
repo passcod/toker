@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::policy::{
     BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, StableId,
+    TraceEvent,
 };
 
 use super::{Error, Result, rows_of};
@@ -41,6 +42,8 @@ pub enum RowKind {
     Awake,
     /// Non-2xx on a usage path; `status`/`error_type`/`retry_after_ms` set, never priced.
     Error,
+    /// Every policy candidate failed preflight, so no upstream send occurred.
+    RouteUnavailable,
     /// Re-serialisation drifted from the request bytes (invariant 5); `drift_digest` set.
     FidelityDrift,
     /// A session's allowances were deleted from the TUI: its gate applies again.
@@ -58,6 +61,7 @@ impl RowKind {
             Self::ColdRecap => "cold-recap",
             Self::Awake => "awake",
             Self::Error => "error",
+            Self::RouteUnavailable => "route-unavailable",
             Self::FidelityDrift => "fidelity-drift",
             Self::Revoked => "revoked",
         }
@@ -73,6 +77,7 @@ impl RowKind {
             "cold-recap" => Some(Self::ColdRecap),
             "awake" => Some(Self::Awake),
             "error" => Some(Self::Error),
+            "route-unavailable" => Some(Self::RouteUnavailable),
             "fidelity-drift" => Some(Self::FidelityDrift),
             "revoked" => Some(Self::Revoked),
             _ => None,
@@ -207,28 +212,287 @@ pub struct SessionLineage {
     pub relation_source: RelationSource,
 }
 
-/// Stable content-free trace event. Values are identifiers or closed reason
-/// codes; no prompt, completion, tool argument, or provider body can enter it.
+pub const ROUTING_TRACE_VERSION: u8 = 1;
+pub const MAX_ROUTING_TRACE_EVENTS: usize = 128;
+pub const MAX_ROUTING_TRACE_BYTES: usize = 64 * 1024;
+pub const MAX_ROUTING_TRACE_MODEL_BYTES: usize = 1_024;
+
+/// Versioned, bounded, content-free routing provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredRoutingTrace {
+    pub version: u8,
     pub events: Vec<StoredRoutingTraceEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredLookupSource {
+    ProfilePresentation,
+    ProtocolPresentation,
+    ProfileRewrite,
+    ProtocolRewrite,
+    ProfileDefault,
+    ProtocolDefault,
+    Compaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredCandidateState {
+    Available,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredSkipReason {
+    Disabled,
+    BindingUnknown,
+    ProviderUnconfigured,
+    BindingDisabled,
+    CredentialUnavailable,
+    MissingRequiredCapability,
+    BindingAffinity,
+    ModelMissingFromFreshCatalogue,
+    ModelUnknown,
+    SelectorUnresolved,
+    PreflightFallbackDisabled,
+    BilledBoundaryDenied,
+    WarmCacheTransitionDenied,
+    WarmLaneTransitionDenied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StoredRoutingTraceEvent {
     Lookup {
-        source: StableId,
+        source: StoredLookupSource,
+        presentation_id: Option<PresentationId>,
+        rewrite_id: Option<RewriteId>,
     },
     Candidate {
         candidate_id: CandidateId,
-        state: StableId,
-        reason: Option<StableId>,
+        binding_id: BindingId,
+        model: Option<String>,
+        state: StoredCandidateState,
+        reason: Option<StoredSkipReason>,
     },
-    Transition {
-        reason: StableId,
+    Upgrade {
+        from: String,
+        to: String,
     },
+    Alias {
+        from: String,
+        to: String,
+    },
+}
+
+impl StoredRoutingTrace {
+    pub fn from_resolver(events: &[TraceEvent]) -> Result<Self> {
+        if events.len() > MAX_ROUTING_TRACE_EVENTS {
+            return Err(Error::InvalidRoutingState(
+                "routing trace has too many events".into(),
+            ));
+        }
+        let events = events
+            .iter()
+            .map(StoredRoutingTraceEvent::from_resolver)
+            .collect::<Result<Vec<_>>>()?;
+        let trace = Self {
+            version: ROUTING_TRACE_VERSION,
+            events,
+        };
+        trace.validate()?;
+        Ok(trace)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.version != ROUTING_TRACE_VERSION {
+            return Err(Error::InvalidRoutingState(
+                "unsupported routing trace version".into(),
+            ));
+        }
+        if self.events.len() > MAX_ROUTING_TRACE_EVENTS {
+            return Err(Error::InvalidRoutingState(
+                "routing trace has too many events".into(),
+            ));
+        }
+        for event in &self.events {
+            event.validate()?;
+        }
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_ROUTING_TRACE_BYTES {
+            return Err(Error::InvalidRoutingState(
+                "routing trace exceeds its byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl StoredRoutingTraceEvent {
+    fn from_resolver(event: &TraceEvent) -> Result<Self> {
+        use crate::policy::{RouteProvenance, SkipReason};
+        Ok(match event {
+            TraceEvent::Lookup(provenance) => {
+                let (source, presentation_id, rewrite_id) = match provenance {
+                    RouteProvenance::ProfilePresentation(id) => (
+                        StoredLookupSource::ProfilePresentation,
+                        Some(id.clone()),
+                        None,
+                    ),
+                    RouteProvenance::ProtocolPresentation(id) => (
+                        StoredLookupSource::ProtocolPresentation,
+                        Some(id.clone()),
+                        None,
+                    ),
+                    RouteProvenance::ProfileRewrite(id) => {
+                        (StoredLookupSource::ProfileRewrite, None, Some(id.clone()))
+                    }
+                    RouteProvenance::ProtocolRewrite(id) => {
+                        (StoredLookupSource::ProtocolRewrite, None, Some(id.clone()))
+                    }
+                    RouteProvenance::ProfileDefault => {
+                        (StoredLookupSource::ProfileDefault, None, None)
+                    }
+                    RouteProvenance::ProtocolDefault => {
+                        (StoredLookupSource::ProtocolDefault, None, None)
+                    }
+                    RouteProvenance::Compaction => (StoredLookupSource::Compaction, None, None),
+                };
+                Self::Lookup {
+                    source,
+                    presentation_id,
+                    rewrite_id,
+                }
+            }
+            TraceEvent::Candidate(evidence) => {
+                let (state, reason) = match &evidence.result {
+                    Ok(()) => (StoredCandidateState::Available, None),
+                    Err(reason) => (
+                        StoredCandidateState::Skipped,
+                        Some(match reason {
+                            SkipReason::Disabled => StoredSkipReason::Disabled,
+                            SkipReason::BindingUnknown => StoredSkipReason::BindingUnknown,
+                            SkipReason::ProviderUnconfigured => {
+                                StoredSkipReason::ProviderUnconfigured
+                            }
+                            SkipReason::BindingDisabled => StoredSkipReason::BindingDisabled,
+                            SkipReason::CredentialUnavailable => {
+                                StoredSkipReason::CredentialUnavailable
+                            }
+                            SkipReason::MissingRequiredCapability => {
+                                StoredSkipReason::MissingRequiredCapability
+                            }
+                            SkipReason::BindingAffinity => StoredSkipReason::BindingAffinity,
+                            SkipReason::ModelMissingFromFreshCatalogue => {
+                                StoredSkipReason::ModelMissingFromFreshCatalogue
+                            }
+                            SkipReason::ModelUnknown => StoredSkipReason::ModelUnknown,
+                            SkipReason::SelectorUnresolved => StoredSkipReason::SelectorUnresolved,
+                            SkipReason::PreflightFallbackDisabled => {
+                                StoredSkipReason::PreflightFallbackDisabled
+                            }
+                            SkipReason::BilledBoundaryDenied => {
+                                StoredSkipReason::BilledBoundaryDenied
+                            }
+                            SkipReason::WarmCacheTransitionDenied => {
+                                StoredSkipReason::WarmCacheTransitionDenied
+                            }
+                            SkipReason::WarmLaneTransitionDenied => {
+                                StoredSkipReason::WarmLaneTransitionDenied
+                            }
+                        }),
+                    ),
+                };
+                Self::Candidate {
+                    candidate_id: evidence.candidate_id.clone(),
+                    binding_id: evidence.binding_id.clone(),
+                    model: evidence.model.clone(),
+                    state,
+                    reason,
+                }
+            }
+            TraceEvent::Upgrade { from, to } => Self::Upgrade {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            TraceEvent::Alias { from, to } => Self::Alias {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let bounded = |value: &str| {
+            if value.len() > MAX_ROUTING_TRACE_MODEL_BYTES {
+                Err(Error::InvalidRoutingState(
+                    "routing trace model identity exceeds its byte limit".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Self::Lookup {
+                source,
+                presentation_id,
+                rewrite_id,
+            } => {
+                let valid = match source {
+                    StoredLookupSource::ProfilePresentation
+                    | StoredLookupSource::ProtocolPresentation => {
+                        presentation_id.is_some() && rewrite_id.is_none()
+                    }
+                    StoredLookupSource::ProfileRewrite | StoredLookupSource::ProtocolRewrite => {
+                        presentation_id.is_none() && rewrite_id.is_some()
+                    }
+                    StoredLookupSource::ProfileDefault
+                    | StoredLookupSource::ProtocolDefault
+                    | StoredLookupSource::Compaction => {
+                        presentation_id.is_none() && rewrite_id.is_none()
+                    }
+                };
+                if !valid {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace lookup identity is inconsistent".into(),
+                    ));
+                }
+            }
+            Self::Candidate {
+                model,
+                state,
+                reason,
+                ..
+            } => {
+                if model.as_deref().is_some_and(str::is_empty) {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace model identity is empty".into(),
+                    ));
+                }
+                if let Some(model) = model {
+                    bounded(model)?;
+                }
+                if (*state == StoredCandidateState::Available) != reason.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace candidate state is inconsistent".into(),
+                    ));
+                }
+            }
+            Self::Upgrade { from, to } | Self::Alias { from, to } => {
+                if from.is_empty() || to.is_empty() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace transition model is empty".into(),
+                    ));
+                }
+                bounded(from)?;
+                bounded(to)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One `requests` row: the complete column list as a single struct. Field
@@ -436,7 +700,10 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let model_mappings = super::opt_json_to_text(&row.model_mappings)?;
     let extra = super::opt_json_to_text(&row.extra)?;
     let routing_trace = match &row.routing_trace {
-        Some(trace) => Some(serde_json::to_string(trace)?),
+        Some(trace) => {
+            trace.validate()?;
+            Some(serde_json::to_string(trace)?)
+        }
         None => None,
     };
     validate_request_provenance(row)?;
@@ -1547,7 +1814,11 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
             row.get("fallback_reason")?,
         )?,
         routing_trace: match row.get::<_, Option<String>>("routing_trace")? {
-            Some(json) => Some(serde_json::from_str(&json)?),
+            Some(json) => {
+                let trace: StoredRoutingTrace = serde_json::from_str(&json)?;
+                trace.validate()?;
+                Some(trace)
+            }
             None => None,
         },
         lineage: read_lineage(row)?,

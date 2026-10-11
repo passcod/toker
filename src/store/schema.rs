@@ -13,7 +13,7 @@
 //! (`ALTER TABLE …`, or the copy-into-a-new-table pattern for column
 //! reshaping), so old databases keep matching the old entries.
 
-use super::Result;
+use super::{Error, Result};
 use rusqlite::Connection;
 
 /// The append-only migration list. `PRAGMA user_version` counts entries
@@ -706,7 +706,63 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request policy revision');
     END;
     "#,
+    // v10 — make a preflight-only terminal explicit and bound the versioned
+    // content-free trace envelope. No normal v9 writer emits either shape;
+    // malformed raw fixtures block the migration for repair rather than being
+    // rewritten in this insert-only ledger.
+    r#"
+    CREATE TRIGGER requests_terminal_trace_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.attempt_group_id IS NOT NULL AND NEW.attempt_index IS NULL AND (
+              NEW.kind != 'route-unavailable' OR NEW.routing_trace IS NULL
+          ))
+       OR NEW.kind = 'route-unavailable' AND (
+              NEW.attempt_group_id IS NULL OR NEW.attempt_index IS NOT NULL
+              OR NEW.routing_trace IS NULL
+          )
+       OR NEW.routing_trace IS NOT NULL AND (
+              length(CAST(NEW.routing_trace AS BLOB)) > 65536
+              OR json_type(NEW.routing_trace) != 'object'
+              OR json_extract(NEW.routing_trace, '$.version') != 1
+              OR json_type(NEW.routing_trace, '$.events') != 'array'
+              OR json_array_length(NEW.routing_trace, '$.events') > 128
+          )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request routing terminal or trace');
+    END;
+    "#,
 ];
+
+fn validate_v10_history(conn: &Connection) -> Result<()> {
+    let invalid: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM requests
+             WHERE (attempt_group_id IS NOT NULL AND attempt_index IS NULL AND (
+                        kind != 'route-unavailable' OR routing_trace IS NULL
+                    ))
+                OR kind = 'route-unavailable' AND (
+                        attempt_group_id IS NULL OR attempt_index IS NOT NULL
+                        OR routing_trace IS NULL
+                    )
+                OR routing_trace IS NOT NULL AND (
+                        length(CAST(routing_trace AS BLOB)) > 65536
+                        OR json_type(routing_trace) != 'object'
+                        OR json_extract(routing_trace, '$.version') != 1
+                        OR json_type(routing_trace, '$.events') != 'array'
+                        OR json_array_length(routing_trace, '$.events') > 128
+                    )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid {
+        Err(Error::InvalidRoutingState(
+            "invalid stored routing terminal or trace".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Apply pending migrations in order. A fresh database runs every entry.
 pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
@@ -722,6 +778,9 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
             // The script and its user_version bump commit together, so a
             // crash mid-migration leaves the database at the prior version.
             let tx = conn.transaction()?;
+            if version == 10 {
+                validate_v10_history(&tx)?;
+            }
             tx.execute_batch(script)?;
             tx.pragma_update(None, "user_version", version)?;
             tx.commit()?;

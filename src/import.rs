@@ -593,7 +593,13 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
     let ts_ms = parse_ts_ms(&row.ts)?;
     let kind = match row.kind.as_deref() {
         None => None,
-        Some(k) => Some(RowKind::parse(k).ok_or_else(|| format!("unknown kind {k:?}"))?),
+        Some(k) => {
+            let kind = RowKind::parse(k).ok_or_else(|| format!("unknown kind {k:?}"))?;
+            if kind == RowKind::RouteUnavailable {
+                return Err("route-unavailable is not representable in predecessor rows".into());
+            }
+            Some(kind)
+        }
     };
 
     // The source format names a provider only on compat-upstream rows;

@@ -103,7 +103,8 @@ pub fn kind_arg(text: &str) -> Result<KindFilter, String> {
         other => RowKind::parse(other).map(KindFilter::Is).ok_or_else(|| {
             format!(
                 "unknown kind {other:?} (expected all, measurement, proxy, blocked, \
-                 released, cold, cold-quiet, awake, error, or fidelity-drift)"
+                 released, cold, cold-quiet, cold-recap, awake, error, route-unavailable, \
+                 fidelity-drift, or revoked)"
             )
         }),
     }
@@ -309,8 +310,10 @@ mod tests {
             attempt_index: Some(0),
             fallback_reason: Some(StableId::new("initial").unwrap()),
             routing_trace: Some(StoredRoutingTrace {
-                events: vec![StoredRoutingTraceEvent::Transition {
-                    reason: StableId::new("initial").unwrap(),
+                version: 1,
+                events: vec![StoredRoutingTraceEvent::Upgrade {
+                    from: "claude-opus-4".to_owned(),
+                    to: "claude-opus-5".to_owned(),
                 }],
             }),
             lineage: Some(SessionLineage {

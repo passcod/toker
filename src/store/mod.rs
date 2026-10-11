@@ -31,9 +31,10 @@ mod state;
 
 pub use ledger::{
     AttemptGroupId, ChildRole, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow,
-    LocalisationRow, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS, RebuildRow, RelationSource,
-    RequestFilter, RequestRow, RowKind, SessionCostGroup, SessionLineage, SessionSummary,
-    StoredLadders, StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
+    LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS,
+    RebuildRow, RelationSource, RequestFilter, RequestRow, RowKind, SessionCostGroup,
+    SessionLineage, SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource,
+    StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
 };
 pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
@@ -687,18 +688,19 @@ mod tests {
     use super::schema;
     use super::{
         Allowance, AttemptGroupId, BindingLearningUpdate, ChildRole, CostKind, DisplayRow,
-        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
-        NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PublicationAdapter,
-        PublicationCasResult, PublicationKey, PublicationState, RelationSource, RequestRow,
-        RowKind, SessionCostGroup, SessionLineage, Store, StoredRoutingTrace,
-        StoredRoutingTraceEvent, is_api_measurement,
+        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
+        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
+        PolicyRevisionSource, PublicationAdapter, PublicationCasResult, PublicationKey,
+        PublicationState, RelationSource, RequestRow, RowKind, SessionCostGroup, SessionLineage,
+        Store, StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
+        is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
     use crate::policy::{
-        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, FrontendProtocol,
-        FrontendScope, PolicyDocument, PresentationId, ProfileId, RewriteId, RouteFingerprint,
-        RouteId, StableId,
+        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateEvidence, CandidateId,
+        FrontendProtocol, FrontendScope, PolicyDocument, PresentationId, ProfileId, RewriteId,
+        RouteFingerprint, RouteId, RouteProvenance, SkipReason, StableId, TraceEvent,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -771,9 +773,12 @@ mod tests {
         row.attempt_index = Some(0);
         row.fallback_reason = Some(StableId::new("initial").unwrap());
         row.routing_trace = Some(StoredRoutingTrace {
+            version: 1,
             events: vec![StoredRoutingTraceEvent::Candidate {
                 candidate_id: CandidateId::new("candidate").unwrap(),
-                state: StableId::new("available").unwrap(),
+                binding_id: BindingId::new("codex_sub.codex_responses").unwrap(),
+                model: Some("baseline".to_owned()),
+                state: StoredCandidateState::Available,
                 reason: None,
             }],
         });
@@ -1080,6 +1085,7 @@ mod tests {
             RowKind::ColdRecap,
             RowKind::Awake,
             RowKind::Error,
+            RowKind::RouteUnavailable,
             RowKind::FidelityDrift,
             RowKind::Revoked,
         ];
@@ -1092,6 +1098,14 @@ mod tests {
         for (i, kind) in kinds.iter().enumerate() {
             let mut row = bare_row(1_000 + i as i64);
             row.kind = Some(*kind);
+            if *kind == RowKind::RouteUnavailable {
+                row.attempt_group_id =
+                    Some(AttemptGroupId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap());
+                row.routing_trace = Some(StoredRoutingTrace {
+                    version: 1,
+                    events: vec![],
+                });
+            }
             store.record_request(&row).expect("record");
         }
         let rows = store.requests_since(0, kinds.len() as u64).expect("read");
@@ -3084,11 +3098,19 @@ mod tests {
             index: Option<i64>,
             revision: Option<i64>,
         ) -> rusqlite::Result<usize> {
+            let terminal = group.is_some() && index.is_none();
             conn.execute(
                 "INSERT INTO requests
-                 (ts_ms, attempt_group_id, attempt_index, policy_revision_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![ts, group, index, revision],
+                 (ts_ms, kind, attempt_group_id, attempt_index, policy_revision_id, routing_trace)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    ts,
+                    terminal.then_some("route-unavailable"),
+                    group,
+                    index,
+                    revision,
+                    terminal.then_some(r#"{"version":1,"events":[]}"#),
+                ],
             )
         }
 
@@ -3177,6 +3199,53 @@ mod tests {
     }
 
     #[test]
+    fn resolver_trace_conversion_is_exhaustive_versioned_and_bounded() {
+        let candidate = CandidateEvidence {
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            model: Some("model".to_owned()),
+            result: Err(SkipReason::CredentialUnavailable),
+        };
+        let trace = StoredRoutingTrace::from_resolver(&[
+            TraceEvent::Lookup(RouteProvenance::ProfilePresentation(
+                PresentationId::new("presented").unwrap(),
+            )),
+            TraceEvent::Candidate(candidate),
+            TraceEvent::Upgrade {
+                from: "old".to_owned(),
+                to: "new".to_owned(),
+            },
+            TraceEvent::Alias {
+                from: "new".to_owned(),
+                to: "effective".to_owned(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(trace.version, 1);
+        assert_eq!(trace.events.len(), 4);
+        assert!(
+            StoredRoutingTrace::from_resolver(&vec![
+                TraceEvent::Lookup(
+                    RouteProvenance::ProfileDefault
+                );
+                MAX_ROUTING_TRACE_EVENTS + 1
+            ])
+            .is_err()
+        );
+        let malformed = serde_json::from_value::<StoredRoutingTrace>(json!({
+            "version": 2,
+            "events": []
+        }))
+        .unwrap();
+        let mut row = bare_row(1);
+        row.routing_trace = Some(malformed);
+        assert!(matches!(
+            mem_store().record_request(&row),
+            Err(Error::InvalidRoutingState(_))
+        ));
+    }
+
+    #[test]
     fn complete_request_provenance_and_lineage_round_trip() {
         let store = mem_store();
         let revision_id = revision(&store, "provenance", None);
@@ -3245,6 +3314,32 @@ mod tests {
         gap.ts_ms = 3;
         gap.attempt_index = Some(3);
         assert!(matches!(store.record_request(&gap), Err(Error::Sqlite(_))));
+
+        let terminal_group = AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
+        let mut terminal = bare_row(4);
+        terminal.kind = Some(RowKind::RouteUnavailable);
+        terminal.attempt_group_id = Some(terminal_group);
+        terminal.routing_trace = Some(StoredRoutingTrace {
+            version: 1,
+            events: vec![],
+        });
+        store.record_request(&terminal).unwrap();
+        let mut wrong_kind = terminal.clone();
+        wrong_kind.ts_ms = 5;
+        wrong_kind.kind = Some(RowKind::Error);
+        wrong_kind.attempt_group_id =
+            Some(AttemptGroupId::new("11111111111111111111111111111111").unwrap());
+        assert!(matches!(
+            store.record_request(&wrong_kind),
+            Err(Error::Sqlite(_))
+        ));
+        let mut missing_group = terminal;
+        missing_group.ts_ms = 6;
+        missing_group.attempt_group_id = None;
+        assert!(matches!(
+            store.record_request(&missing_group),
+            Err(Error::Sqlite(_))
+        ));
     }
     #[test]
     fn attributable_learning_replay_is_idempotent_and_skips_ambiguous_history() {
@@ -3492,6 +3587,37 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7, "failed v8 migration rolls back atomically");
+    }
+
+    #[test]
+    fn migration_v10_rejects_malformed_v9_terminal_history_atomically() {
+        let dir = test_dir("v9-malformed-terminal");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..9] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+            conn.execute(
+                "INSERT INTO requests (ts_ms, kind, attempt_group_id, routing_trace)
+                 VALUES (1, 'error', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         '{\"version\":1,\"events\":[]}')",
+                [],
+            )
+            .unwrap();
+        }
+        let error = match Store::open(&db) {
+            Ok(_) => panic!("malformed v9 terminal history must block v10 migration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid stored routing terminal"), "{error}");
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9, "failed v10 migration rolls back atomically");
     }
 
     #[test]

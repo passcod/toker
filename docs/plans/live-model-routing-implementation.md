@@ -488,8 +488,12 @@ Schema v7 had no normal writer for these attempt fields; if a raw v7 fixture
 contains malformed non-null attempt provenance, the hardening migration aborts
 atomically for repair rather than mutating insert-only history.
 
-The trace contains only ids, classifications, availability states, and reason
-codes. Preflight skips ride on the first attempted row or local terminal row.
+The trace is a versioned JSON object (`version = 1`) containing at most 128
+events and 64 KiB of canonical encoded JSON. Model identities within events are
+at most 1,024 bytes. It contains only ids, classifications, availability states,
+and closed reason codes; unknown versions, event variants, states, and reasons
+are rejected on both insert and read. Preflight skips ride on the first
+attempted row or local terminal row.
 Logical-request views group rows with a non-null `attempt_group_id`; rows
 without one remain independent legacy logical requests. Request counts count
 groups plus
