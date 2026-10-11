@@ -126,8 +126,8 @@ mod tests {
     /// 2026-10-05T00:00:00Z.
     const T0: i64 = 1_791_158_400_000;
 
-    fn store_with_revision() -> Store {
-        let store = Store::open(":memory:").expect("open");
+    fn store_with_revision(path: impl AsRef<std::path::Path>) -> Store {
+        let store = Store::open(path).expect("open");
         let document = PolicyDocument {
             format_version: CURRENT_FORMAT_VERSION,
             description: None,
@@ -324,7 +324,7 @@ mod tests {
     /// The fixture: a full measurement, a bare one, a blocked row, an
     /// error row on another session, inserted out of time order.
     fn fixture() -> Store {
-        let store = store_with_revision();
+        let store = store_with_revision(":memory:");
         let mut blocked = bare(T0 + 2_000);
         blocked.kind = Some(RowKind::Blocked);
         blocked.session_id = Some("5a1e0c2d-0000-4000-8000-000000000001".to_owned());
@@ -365,32 +365,7 @@ mod tests {
         // fixture sets it.
         let dir = crate::test_support::tempdir("toker-export-cols-");
         let path = dir.join("toker.db");
-        let store = Store::open(&path).expect("open");
-        let document = PolicyDocument {
-            format_version: CURRENT_FORMAT_VERSION,
-            description: None,
-            defaults: vec![],
-            presentations: vec![],
-            routes: vec![],
-            rewrites: vec![],
-            classifiers: vec![],
-            upgrades: vec![],
-            compaction: None,
-        }
-        .validate()
-        .unwrap();
-        store
-            .insert_policy_revision(&NewPolicyRevision {
-                created_ms: T0,
-                activated_ms: T0,
-                description: None,
-                activation_scope: ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: PolicyRevisionSource::Draft,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .unwrap();
+        let store = store_with_revision(&path);
         store.record_request(&full(T0)).expect("full");
         let row = lines(&export(&store, &RequestFilter::default())).remove(0);
         let keys: Vec<&str> = row
@@ -435,7 +410,7 @@ mod tests {
 
     #[test]
     fn json_text_columns_nest_and_usage_raw_stays_on_one_line() {
-        let store = store_with_revision();
+        let store = store_with_revision(":memory:");
         store.record_request(&full(T0)).expect("full");
         let text = export(&store, &RequestFilter::default());
         assert_eq!(

@@ -13,9 +13,10 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use crate::ir::Release;
+use crate::middleware::models::local_day;
 use crate::policy::{
     ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
-    RouteId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
+    RouteId, StableId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
 };
 use serde_json::Value;
 
@@ -233,7 +234,7 @@ pub struct RoutingPublication {
     pub desired_inventory_generation: i64,
     pub applied_inventory_generation: Option<i64>,
     pub state: PublicationState,
-    pub detail_code: Option<String>,
+    pub detail_code: Option<StableId>,
     pub updated_ms: i64,
 }
 
@@ -730,7 +731,7 @@ fn read_policy_revision(row: &rusqlite::Row<'_>) -> Result<PolicyRevision> {
 }
 
 pub(super) fn load_routing_policy_state(conn: &Connection) -> Result<RoutingPolicyState> {
-    let mut states = rows_of(
+    row_of(
         conn,
         "SELECT active_revision_id, draft_generation, draft_base_revision_id,
                 draft_document_json, draft_fingerprint, draft_updated_ms, legacy_imported_ms
@@ -765,8 +766,8 @@ pub(super) fn load_routing_policy_state(conn: &Connection) -> Result<RoutingPoli
                 legacy_imported_ms: row.get("legacy_imported_ms")?,
             })
         },
-    )?;
-    states.pop().ok_or_else(|| {
+    )?
+    .ok_or_else(|| {
         Error::InvalidRoutingState("routing_policy_state singleton row is missing".into())
     })
 }
@@ -899,15 +900,6 @@ fn decode_publication_scope(value: &str) -> Result<crate::policy::FrontendScope>
     )))
 }
 
-fn validate_detail_code(value: Option<&str>) -> Result<()> {
-    if let Some(value) = value {
-        crate::policy::StableId::new(value.to_owned()).map_err(|error| {
-            Error::InvalidRoutingState(format!("invalid publication detail code: {error}"))
-        })?;
-    }
-    Ok(())
-}
-
 pub(super) fn set_publication_desired(
     conn: &Connection,
     key: &PublicationKey,
@@ -981,8 +973,10 @@ fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
     let applied_revision_id = row.get("applied_revision_id")?;
     let desired_inventory_generation = row.get("desired_inventory_generation")?;
     let applied_inventory_generation = row.get("applied_inventory_generation")?;
-    let detail_code: Option<String> = row.get("detail_code")?;
-    validate_detail_code(detail_code.as_deref())?;
+    let detail_code = row
+        .get::<_, Option<String>>("detail_code")?
+        .map(|value| parse_id("routing_publications.detail_code", value))
+        .transpose()?;
     if state == PublicationState::Applied
         && (applied_revision_id != Some(desired_revision_id)
             || applied_inventory_generation != Some(desired_inventory_generation))
@@ -1012,10 +1006,9 @@ pub(super) fn compare_and_swap_publication_result(
     state: PublicationState,
     applied_revision_id: Option<i64>,
     applied_inventory_generation: Option<i64>,
-    detail_code: Option<&str>,
+    detail_code: Option<&StableId>,
     updated_ms: i64,
 ) -> Result<PublicationCasResult> {
-    validate_detail_code(detail_code)?;
     if applied_revision_id.is_some() != applied_inventory_generation.is_some() {
         return Err(Error::InvalidRoutingState(
             "applied publication identity must be all NULL or all present".into(),
@@ -1039,7 +1032,7 @@ pub(super) fn compare_and_swap_publication_result(
             state.as_str(),
             applied_revision_id,
             applied_inventory_generation,
-            detail_code,
+            detail_code.map(StableId::as_str),
             updated_ms,
             scope_key,
             key.adapter.as_str(),
@@ -1185,13 +1178,9 @@ pub(super) fn replay_attributable_binding_learning(
         let Some(model) = crate::catalog::windows::model_identity(&model) else {
             continue;
         };
-        let Ok(timestamp) = jiff::Timestamp::from_millisecond(ts_ms) else {
+        let Some(day) = local_day(ts_ms, local_time_zone) else {
             continue;
         };
-        let day = timestamp
-            .to_zoned(local_time_zone.clone())
-            .date()
-            .to_string();
         let entry = merged
             .entry((binding, model))
             .or_insert_with(|| (BTreeSet::new(), 0, ts_ms));

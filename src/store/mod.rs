@@ -480,7 +480,7 @@ impl Store {
         state_value: PublicationState,
         applied_revision_id: Option<i64>,
         applied_inventory_generation: Option<i64>,
-        detail_code: Option<&str>,
+        detail_code: Option<&crate::policy::StableId>,
         updated_ms: i64,
     ) -> Result<PublicationCasResult> {
         state::compare_and_swap_publication_result(
@@ -2660,6 +2660,7 @@ mod tests {
             PublicationCasResult::Updated,
         );
         store.set_publication_desired(&key, second, 5, 102).unwrap();
+        let write_failed = StableId::new("write_failed").unwrap();
         let stale = store
             .compare_and_swap_publication_result(
                 &key,
@@ -2668,7 +2669,7 @@ mod tests {
                 PublicationState::Failed,
                 Some(first),
                 Some(4),
-                Some("write_failed"),
+                Some(&write_failed),
                 103,
             )
             .unwrap();
@@ -2687,6 +2688,25 @@ mod tests {
             104,
         );
         assert!(matches!(invalid, Err(Error::InvalidRoutingState(_))));
+        assert_eq!(
+            store
+                .compare_and_swap_publication_result(
+                    &key,
+                    second,
+                    5,
+                    PublicationState::Failed,
+                    Some(first),
+                    Some(4),
+                    Some(&write_failed),
+                    105,
+                )
+                .unwrap(),
+            PublicationCasResult::Updated,
+        );
+        assert_eq!(
+            store.load_publication(&key).unwrap().unwrap().detail_code,
+            Some(write_failed)
+        );
     }
 
     #[test]
