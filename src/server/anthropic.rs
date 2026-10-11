@@ -1044,13 +1044,25 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             &server.models,
         );
         if let ForceDecision::Move(forced) = decision {
-            let canonical_rewrite = canonical.as_mut().and_then(|canonical| {
-                canonical.model = Some(forced.to.clone());
-                translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)
+            let canonical_rewrite = inference_baseline.as_ref().zip(canonical.clone()).and_then(
+                |(inference, canonical)| {
+                    let attempt = inference.prepare_legacy_transformed(
+                        target.clone(),
+                        Some(forced.to.clone()),
+                        canonical,
+                    );
+                    let prepared = attempt.canonical();
+                    let body = translate::render_anthropic(
+                        &prepared,
+                        crate::routing::DialectId::AnthropicMessages,
+                    )
                     .ok()
-                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())
-            });
-            if let Some(body) = canonical_rewrite {
+                    .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
+                    Some((prepared, body))
+                },
+            );
+            if let Some((prepared, body)) = canonical_rewrite {
+                canonical = Some(prepared);
                 forward = Bytes::from(body);
             }
             if let Some(ctx) = record.as_mut() {
