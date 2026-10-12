@@ -608,8 +608,8 @@ impl Server {
         compaction: bool,
     ) -> Option<LaneFacts> {
         let lane = lane?;
-        let temperature = if compaction
-            && !crate::middleware::cold::lane_is_cold(
+        let compaction_cold = compaction
+            && crate::middleware::cold::lane_is_cold(
                 Some(lane),
                 self.config.gates.cold_min_tokens,
                 self.config
@@ -617,7 +617,16 @@ impl Server {
                     .cold_idle_min
                     .map(|minutes| (minutes * 60_000.0) as i64),
                 now,
-            ) {
+            );
+        let temperature = if compaction_cold {
+            // This is the authoritative legacy proof used by the compaction
+            // transform itself. Once the lane's recorded TTL has expired, no
+            // binding-local cache remains to preserve; a policy pin is not
+            // needed to make that positive cold fact safe.
+            crate::policy::CacheTemperature::Cold
+        } else if compaction {
+            // The legacy predicate can disprove eligibility without proving
+            // which binding owns a still-live cache.
             crate::policy::CacheTemperature::Unknown
         } else {
             cache_temperature(lane, binding, now)
@@ -1864,6 +1873,62 @@ api_key = "ak-literal-test"
             seen.lock().unwrap()
         );
         assert_eq!(server.catalog_borrowed_at.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn compaction_shadow_uses_positive_legacy_cold_proof_without_a_pin() {
+        use crate::policy::CacheTemperature;
+        use crate::store::Lane;
+
+        let dir = crate::setup::test_dir("compaction-shadow-cold");
+        let server = server(&dir);
+        let binding = server
+            .registry
+            .bindings()
+            .find(|binding| binding.id_str() == "anthropic_sub.anthropic_messages")
+            .unwrap();
+        let now = 4_000_000;
+        let mut lane = Lane {
+            key: "lane".to_owned(),
+            session_id: Some("session".to_owned()),
+            tools_hash: Some("tools".to_owned()),
+            updated_ms: 0,
+            prompt_tokens: Some(200_000),
+            ttl: Some(3_600_000),
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        };
+
+        assert_eq!(
+            server
+                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .unwrap()
+                .temperature,
+            CacheTemperature::Cold
+        );
+        lane.updated_ms = now - 1_000;
+        assert_eq!(
+            server
+                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .unwrap()
+                .temperature,
+            CacheTemperature::Unknown,
+            "a positive warm identity still needs a matching policy pin"
+        );
+        lane.prompt_tokens = Some(1);
+        lane.updated_ms = 0;
+        assert_eq!(
+            server
+                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .unwrap()
+                .temperature,
+            CacheTemperature::Unknown,
+            "an idle lane below the compaction token floor is ineligible"
+        );
     }
 
     #[test]
