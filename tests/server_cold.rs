@@ -40,6 +40,7 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, GatesConfig, OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
+use toker::policy::{CollectingObserver, ShadowComparison};
 use toker::server::Server;
 use toker::store::{Lane, ModelEntry, RequestRow, RowKind, Store};
 use toker::translate::from_anthropic;
@@ -217,8 +218,21 @@ fn test_config(upstream: reqwest::Url) -> Config {
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
+    let (addr, store, _) = spawn_toker_observed(config).await;
+    (addr, store)
+}
+
+async fn spawn_toker_observed(config: Config) -> (SocketAddr, Arc<Store>, Arc<CollectingObserver>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let observer = Arc::new(CollectingObserver::default());
+    let server = Server::with_shadow_observer(
+        config,
+        store.clone(),
+        Box::new(toker::middleware::awake::ProcessSpawner),
+        Arc::new(toker::secrets::MemoryStore::new()),
+        observer.clone(),
+    )
+    .expect("build server");
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -227,7 +241,7 @@ async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("toker serves");
     });
-    (addr, store)
+    (addr, store, observer)
 }
 
 /// [`spawn_toker`], with one fetched catalogue installed before serving —
@@ -263,6 +277,7 @@ async fn post_messages(addr: SocketAddr, body: &[u8]) -> reqwest::Response {
         .header("x-claude-code-session-id", "ccses-42")
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer test-subscription-token")
         .body(body.to_vec())
         .send()
         .await
@@ -270,6 +285,16 @@ async fn post_messages(addr: SocketAddr, body: &[u8]) -> reqwest::Response {
 }
 
 /// Poll the ledger until it holds at least `count` rows.
+async fn wait_for_shadow(observer: &CollectingObserver) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while observer.records().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shadow observation");
+}
+
 async fn wait_for_rows(store: &Store, count: usize) -> Vec<RequestRow> {
     for _ in 0..200 {
         let rows = store.requests_since(0, 1000).expect("read rows");
@@ -781,7 +806,7 @@ async fn an_on_track_outlook_withholds_the_notice_and_records_cold_quiet() {
 #[tokio::test]
 async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream)).await;
+    let (addr, store, observer) = spawn_toker_observed(test_config(upstream)).await;
 
     let body = compaction_body();
     poison_cold_lane(&store, &body, 2 * 3_600_000);
@@ -846,6 +871,14 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
         "no quiet row either"
     );
     assert_no_more_rows(&store, 1).await;
+    wait_for_shadow(&observer).await;
+    assert_eq!(observer.records().len(), 1);
+    assert_eq!(
+        observer.records()[0].comparison,
+        ShadowComparison::Match,
+        "{:?}",
+        observer.records()[0]
+    );
 }
 
 /// A cold compaction routed to openrouter is not retargeted: the target
