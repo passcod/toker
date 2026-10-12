@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::observe::{SseEvent, SseSplitter};
 use crate::policy::FailureClass;
-use crate::providers::codex::ResponseError;
+use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse};
 
 use super::proxy::{Buffered, PRECOMMIT_BODY_CAP, buffer_up_to};
 
@@ -225,6 +225,95 @@ pub(crate) async fn precommit_sse(
             ));
         }
     }
+}
+
+pub(crate) async fn precommit_responses(
+    response: reqwest::Response,
+) -> Result<PrecommitOutcome<reqwest::Response>, reqwest::Error> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if super::proxy::is_compressed(&headers) {
+        return Ok(PrecommitOutcome::Accepted {
+            response,
+            evidence: CommitEvidence::NonStreamingComplete,
+        });
+    }
+    if !status.is_success() {
+        let buffered = buffer_up_to(response, PRECOMMIT_BODY_CAP).await?;
+        let complete = buffered.rest.is_none();
+        let failure = complete.then(|| {
+            let body = serde_json::from_slice::<Value>(&buffered.bytes).unwrap_or(Value::Null);
+            let error: ResponseError =
+                serde_json::from_value(body.get("error").cloned().unwrap_or(body))
+                    .unwrap_or_default();
+            classify_responses_error(Some(status), &error, false)
+        });
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
+        return Ok(match failure {
+            Some(failure) => PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => PrecommitOutcome::Accepted {
+                response,
+                evidence: CommitEvidence::ByteCapReached,
+            },
+        });
+    }
+    if super::proxy::is_event_stream(&headers) {
+        let (buffered, event, evidence) = precommit_sse(response).await?;
+        let parsed = event.as_ref().and_then(|event| {
+            let mut parser = ResponsesSse::new();
+            parser.feed(&sse_event_bytes(event)).into_iter().next()
+        });
+        let failure = parsed.as_ref().and_then(|event| match event {
+            ResponseEvent::Failed { error, .. } | ResponseEvent::Error { error } => {
+                Some(classify_responses_error(None, error, true))
+            }
+            _ => None,
+        });
+        if failure.is_none()
+            && evidence != CommitEvidence::ByteCapReached
+            && (event.is_none() || parsed.is_none())
+        {
+            return Ok(protocol_failure(status));
+        }
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
+        return Ok(match failure {
+            Some(failure) => PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => PrecommitOutcome::Accepted {
+                response,
+                evidence: if parsed.is_some() {
+                    CommitEvidence::CanonicalEvent
+                } else {
+                    evidence
+                },
+            },
+        });
+    }
+    Ok(PrecommitOutcome::Accepted {
+        response,
+        evidence: CommitEvidence::NonStreamingComplete,
+    })
+}
+
+fn sse_event_bytes(event: &SseEvent) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(name) = &event.event {
+        bytes.extend_from_slice(b"event: ");
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(b'\n');
+    }
+    for line in &event.data_lines {
+        bytes.extend_from_slice(b"data: ");
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.push(b'\n');
+    bytes
 }
 
 pub(crate) async fn precommit_openai_chat(
@@ -553,6 +642,68 @@ mod tests {
                 (outcome, expected) => panic!("unexpected {outcome:?} for {expected:?}"),
             };
             assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_precommit_classifies_first_events_without_changing_bytes() {
+        for (frame, expected) in [
+            (
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+                Ok(CommitEvidence::CanonicalEvent),
+            ),
+            (
+                "event: response.extension\ndata: {\"type\":\"response.extension\"}\n\n",
+                Ok(CommitEvidence::CanonicalEvent),
+            ),
+            (
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\"}}}\n\n",
+                Err(FailureClass::Overload),
+            ),
+        ] {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::copy_from_slice(frame.as_bytes()),
+            )]);
+            let outcome = precommit_responses(streaming_response(body)).await.unwrap();
+            let response = match (outcome, expected) {
+                (PrecommitOutcome::Accepted { response, evidence }, Ok(expected_evidence)) => {
+                    assert_eq!(evidence, expected_evidence);
+                    response
+                }
+                (
+                    PrecommitOutcome::Failure {
+                        failure,
+                        response: Some(response),
+                    },
+                    Err(expected_class),
+                ) => {
+                    assert_eq!(failure.class, Some(expected_class));
+                    assert_eq!(failure.mechanism, FailureMechanism::InBandEvent);
+                    response
+                }
+                (outcome, expected) => panic!("unexpected {outcome:?} for {expected:?}"),
+            };
+            assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_precommit_rejects_invalid_or_absent_first_events() {
+        for bytes in [
+            &b""[..],
+            &b": keepalive\n\n"[..],
+            &b"data: {not json}\n\n"[..],
+        ] {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::copy_from_slice(bytes),
+            )]);
+            let outcome = precommit_responses(streaming_response(body)).await.unwrap();
+            let PrecommitOutcome::Failure { failure, response } = outcome else {
+                panic!("invalid first event was accepted: {outcome:?}");
+            };
+            assert_eq!(failure.class, None);
+            assert_eq!(failure.mechanism, FailureMechanism::ResponseProtocol);
+            assert!(response.is_none());
         }
     }
 

@@ -73,6 +73,29 @@ impl ReadyAttempt {
             Ok(upstream) => upstream,
             Err(error) => return transport_failure(ErrorWire::Openai, &error),
         };
+        let upstream = match super::attempt::precommit_responses(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
+            | Ok(super::attempt::PrecommitOutcome::Failure {
+                response: Some(response),
+                ..
+            }) => response,
+            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                return upstream_failure(
+                    ErrorWire::Openai,
+                    "toker could not interpret the upstream response before commitment",
+                );
+            }
+            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
+                return upstream_failure(
+                    ErrorWire::Openai,
+                    "toker upstream request was cancelled before response commitment",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                return truncated_body(ErrorWire::Openai);
+            }
+        };
         forward(
             upstream,
             self.record,

@@ -333,6 +333,29 @@ impl ReadyAttempt {
                 return transport_failure(self.frontend_wire.error_wire(), &error);
             }
         };
+        let upstream = match super::attempt::precommit_responses(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
+            | Ok(super::attempt::PrecommitOutcome::Failure {
+                response: Some(response),
+                ..
+            }) => response,
+            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                return upstream_failure(
+                    self.frontend_wire.error_wire(),
+                    "toker could not interpret the upstream response before commitment",
+                );
+            }
+            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
+                return upstream_failure(
+                    self.frontend_wire.error_wire(),
+                    "toker upstream request was cancelled before response commitment",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                return truncated_body(self.frontend_wire.error_wire());
+            }
+        };
         forward(self, server, upstream).await
     }
 }
