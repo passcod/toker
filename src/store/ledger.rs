@@ -282,6 +282,7 @@ pub enum StoredSkipReason {
     ModelMissingFromFreshCatalogue,
     ModelUnknown,
     SelectorUnresolved,
+    HealthCircuitOpen,
     PreflightFallbackDisabled,
     BilledBoundaryDenied,
     WarmCacheTransitionDenied,
@@ -416,6 +417,7 @@ impl StoredRoutingTraceEvent {
                             }
                             SkipReason::ModelUnknown => StoredSkipReason::ModelUnknown,
                             SkipReason::SelectorUnresolved => StoredSkipReason::SelectorUnresolved,
+                            SkipReason::HealthCircuitOpen => StoredSkipReason::HealthCircuitOpen,
                             SkipReason::PreflightFallbackDisabled => {
                                 StoredSkipReason::PreflightFallbackDisabled
                             }

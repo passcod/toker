@@ -84,7 +84,7 @@ struct RuntimeState {
     credential_generations: Arc<BTreeMap<BindingId, u64>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HealthCircuitKey {
     pub policy_revision_id: i64,
     pub route_id: RouteId,
@@ -351,6 +351,40 @@ impl PolicyRuntime {
         }
     }
 
+    pub(crate) fn capture_shadow(
+        &self,
+        pinned_revision: Option<i64>,
+        now_ms: i64,
+    ) -> Option<(Arc<PolicySnapshot>, PolicyEvidence, super::CircuitSnapshot)> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let policy = state.candidate.clone()?;
+        let evidence = PolicyEvidence {
+            inventory: state.inventory.clone(),
+            availability: state.availability.clone(),
+            inventory_generation: state.inventory_generation,
+            credential_generations: state.credential_generations.clone(),
+        };
+        let snapshot = Arc::new(PolicySnapshot {
+            revision_id: None,
+            activation_scope: None,
+            forced_cache_transition: false,
+            policy,
+            inventory: evidence.inventory.clone(),
+            availability: evidence.availability.clone(),
+            inventory_generation: evidence.inventory_generation,
+            credential_generations: evidence.credential_generations.clone(),
+        });
+        let circuits = self.open_circuits_with_evidence(pinned_revision, &evidence, now_ms);
+        Some((snapshot, evidence, circuits))
+    }
+
     pub fn bump_credential_generation(&self, binding_id: &BindingId) -> u64 {
         let _mutation = self
             .mutation
@@ -375,6 +409,10 @@ impl PolicyRuntime {
     }
 
     pub fn open_circuit(&self, snapshot: &PolicySnapshot, key: HealthCircuitKey, until_ms: i64) {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.circuits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -401,16 +439,78 @@ impl PolicyRuntime {
         let Some(circuit) = circuits.get(key) else {
             return false;
         };
-        let open = circuit.until_ms > now_ms
-            && circuit.inventory_generation == snapshot.inventory_generation
-            && circuit.credential_generation == snapshot.credential_generation(&key.binding_id);
-        if !open {
+        if circuit.until_ms <= now_ms {
             circuits.remove(key);
+            return false;
         }
-        open
+        circuit.inventory_generation == snapshot.inventory_generation
+            && circuit.credential_generation == snapshot.credential_generation(&key.binding_id)
+    }
+
+    pub fn open_circuits(&self, snapshot: &PolicySnapshot, now_ms: i64) -> super::CircuitSnapshot {
+        self.open_circuits_for(
+            snapshot.revision_id,
+            snapshot.inventory_generation,
+            &snapshot.credential_generations,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn open_circuits_with_evidence(
+        &self,
+        revision_id: Option<i64>,
+        evidence: &PolicyEvidence,
+        now_ms: i64,
+    ) -> super::CircuitSnapshot {
+        self.open_circuits_for(
+            revision_id,
+            evidence.inventory_generation,
+            &evidence.credential_generations,
+            now_ms,
+        )
+    }
+
+    fn open_circuits_for(
+        &self,
+        revision_id: Option<i64>,
+        inventory_generation: u64,
+        credential_generations: &BTreeMap<BindingId, u64>,
+        now_ms: i64,
+    ) -> super::CircuitSnapshot {
+        let Some(revision_id) = revision_id else {
+            return super::CircuitSnapshot::new();
+        };
+        let mut circuits = self
+            .circuits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        circuits.retain(|_, circuit| circuit.until_ms > now_ms);
+        circuits
+            .iter()
+            .filter(|(key, circuit)| {
+                key.policy_revision_id == revision_id
+                    && circuit.inventory_generation == inventory_generation
+                    && circuit.credential_generation
+                        == credential_generations
+                            .get(&key.binding_id)
+                            .copied()
+                            .unwrap_or_default()
+            })
+            .map(|(key, _)| super::OpenCircuitTarget {
+                route_id: key.route_id.clone(),
+                candidate_id: key.candidate_id.clone(),
+                binding_id: key.binding_id.clone(),
+                model_id: key.model_id.clone(),
+                failure: key.failure,
+            })
+            .collect()
     }
 
     pub fn clear_circuit(&self, key: &HealthCircuitKey) {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.circuits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -473,6 +573,33 @@ mod tests {
             Arc::new(AvailabilitySnapshot::default()),
         );
         (store, runtime)
+    }
+
+    fn revision(store: &Store, description: &'static str) -> i64 {
+        store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some(description),
+                activation_scope: ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                parent_revision_id: None,
+                document: &document(description),
+            })
+            .unwrap()
+            .revision_id
+    }
+
+    fn circuit_key(revision_id: i64, binding_id: BindingId) -> HealthCircuitKey {
+        HealthCircuitKey {
+            policy_revision_id: revision_id,
+            route_id: RouteId::new("route").unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id,
+            model_id: "invented-model".to_owned(),
+            failure: FailureClass::Overload,
+        }
     }
 
     #[test]
@@ -594,14 +721,7 @@ mod tests {
         let (_store, runtime) = runtime();
         let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
         let other = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
-        let key = HealthCircuitKey {
-            policy_revision_id: 1,
-            route_id: RouteId::new("route").unwrap(),
-            candidate_id: CandidateId::new("candidate").unwrap(),
-            binding_id: binding.clone(),
-            model_id: "invented-model".to_owned(),
-            failure: FailureClass::Overload,
-        };
+        let key = circuit_key(1, binding.clone());
         let other_key = HealthCircuitKey {
             binding_id: other,
             ..key.clone()
@@ -620,5 +740,53 @@ mod tests {
             Arc::new(AvailabilitySnapshot::default()),
         );
         assert!(!runtime.circuit_is_open(&runtime.capture().unwrap(), &other_key, 10));
+    }
+
+    #[test]
+    fn immutable_circuit_views_filter_revision_expiry_and_exact_keys() {
+        let (store, runtime) = runtime();
+        let revision_id = revision(&store, "circuits");
+        let other_revision_id = revision(&store, "other-circuits");
+        let snapshot = runtime.capture_revision(revision_id).unwrap();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let key = circuit_key(revision_id, binding.clone());
+        let other_revision = circuit_key(other_revision_id, binding.clone());
+        let other_failure = HealthCircuitKey {
+            failure: FailureClass::ServerError,
+            ..key.clone()
+        };
+        let expired = HealthCircuitKey {
+            model_id: "expired".to_owned(),
+            ..key.clone()
+        };
+        runtime.open_circuit(&snapshot, key.clone(), 100);
+        runtime.open_circuit(&snapshot, other_revision, 100);
+        runtime.open_circuit(&snapshot, other_failure, 100);
+        runtime.open_circuit(&snapshot, expired, 10);
+
+        let view = runtime.open_circuits(&snapshot, 10);
+        assert_eq!(view.len(), 2);
+        assert!(view.contains(&super::super::OpenCircuitTarget {
+            route_id: key.route_id,
+            candidate_id: key.candidate_id,
+            binding_id: binding,
+            model_id: key.model_id,
+            failure: FailureClass::Overload,
+        }));
+    }
+
+    #[test]
+    fn stale_queries_cannot_remove_newer_generation_circuits() {
+        let (store, runtime) = runtime();
+        let revision_id = revision(&store, "generation");
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let stale = runtime.capture_revision(revision_id).unwrap();
+        runtime.bump_credential_generation(&binding);
+        let current = runtime.capture_revision(revision_id).unwrap();
+        let key = circuit_key(revision_id, binding);
+        runtime.open_circuit(&current, key, 100);
+
+        assert!(runtime.open_circuits(&stale, 10).is_empty());
+        assert_eq!(runtime.open_circuits(&current, 10).len(), 1);
     }
 }

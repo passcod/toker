@@ -101,6 +101,17 @@ pub struct AvailabilitySnapshot {
 
 pub type CredentialSnapshot = BTreeMap<BindingId, Evidence<&'static str>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OpenCircuitTarget {
+    pub route_id: RouteId,
+    pub candidate_id: CandidateId,
+    pub binding_id: BindingId,
+    pub model_id: String,
+    pub failure: super::FailureClass,
+}
+
+pub type CircuitSnapshot = std::collections::BTreeSet<OpenCircuitTarget>;
+
 impl AvailabilitySnapshot {
     pub fn new(bindings: BTreeMap<BindingId, BindingAvailability>) -> Self {
         Self { bindings }
@@ -192,6 +203,7 @@ pub enum SkipReason {
     ModelMissingFromFreshCatalogue,
     ModelUnknown,
     SelectorUnresolved,
+    HealthCircuitOpen,
     PreflightFallbackDisabled,
     BilledBoundaryDenied,
     WarmCacheTransitionDenied,
@@ -290,6 +302,26 @@ pub fn resolve<L: LearningView>(
     availability: &AvailabilitySnapshot,
     facts: &RequestFacts,
 ) -> Result<AttemptPlan, ResolveFailure> {
+    resolve_with_circuits(
+        policy,
+        inventory,
+        learning,
+        lane,
+        availability,
+        &CircuitSnapshot::new(),
+        facts,
+    )
+}
+
+pub fn resolve_with_circuits<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+) -> Result<AttemptPlan, ResolveFailure> {
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
         && let Some(compaction) = policy.compaction()
@@ -308,7 +340,10 @@ pub fn resolve<L: LearningView>(
     let mut trace = vec![TraceEvent::Lookup(selected.provenance.clone())];
     if let Some((binding_id, model, route_id, fingerprint, candidate_id)) = selected.exact {
         let live = availability.get(binding_id);
-        let evidence = exact_evidence(binding_id, model, live, inventory, facts);
+        let mut evidence = exact_evidence(candidate_id, binding_id, model, live, inventory, facts);
+        if target_has_open_circuit(circuits, route_id, candidate_id, binding_id, model) {
+            evidence.result = Err(SkipReason::HealthCircuitOpen);
+        }
         trace.push(TraceEvent::Candidate(evidence.clone()));
         if evidence.result.is_err() {
             return Err(ResolveFailure::RouteUnavailable { trace });
@@ -378,6 +413,7 @@ pub fn resolve<L: LearningView>(
         let live = availability.get(candidate.binding_id());
         prior_live = live;
         let evidence = candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
+        let candidate_trace_index = trace.len();
         trace.push(TraceEvent::Candidate(evidence.clone()));
         if evidence.result == Err(SkipReason::SelectorUnresolved) {
             break;
@@ -425,6 +461,20 @@ pub fn resolve<L: LearningView>(
             .clone()
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
+        if target_has_open_circuit(
+            circuits,
+            route.id(),
+            candidate.id(),
+            candidate.binding_id(),
+            &effective,
+        ) {
+            let TraceEvent::Candidate(evidence) = &mut trace[candidate_trace_index] else {
+                unreachable!("the recorded candidate event keeps its index")
+            };
+            evidence.model = Some(effective);
+            evidence.result = Err(SkipReason::HealthCircuitOpen);
+            continue;
+        }
         let provider = live.map_or_else(String::new, |live| live.provider.clone());
         let mut lane_policy = selected
             .lane_transition
@@ -700,7 +750,23 @@ fn candidate_evidence(
     }
 }
 
+fn target_has_open_circuit(
+    circuits: &CircuitSnapshot,
+    route_id: &RouteId,
+    candidate_id: &CandidateId,
+    binding_id: &BindingId,
+    model_id: &str,
+) -> bool {
+    circuits.iter().any(|circuit| {
+        circuit.route_id == *route_id
+            && circuit.candidate_id == *candidate_id
+            && circuit.binding_id == *binding_id
+            && circuit.model_id == model_id
+    })
+}
+
 fn exact_evidence(
+    candidate_id: &CandidateId,
     binding: &BindingId,
     model: &str,
     live: Option<&BindingAvailability>,
@@ -720,7 +786,7 @@ fn exact_evidence(
         Some(SkipReason::BindingUnknown)
     };
     CandidateEvidence {
-        candidate_id: CandidateId::new("presentation-exact").expect("static id"),
+        candidate_id: candidate_id.clone(),
         binding_id: binding.clone(),
         model: Some(model.to_owned()),
         result: reason.map_or(Ok(()), Err),
@@ -1264,6 +1330,21 @@ mod tests {
         }
     }
 
+    fn open_circuit(
+        route_id: &RouteId,
+        candidate_id: &CandidateId,
+        binding_id: &BindingId,
+        model_id: &str,
+    ) -> OpenCircuitTarget {
+        OpenCircuitTarget {
+            route_id: route_id.clone(),
+            candidate_id: candidate_id.clone(),
+            binding_id: binding_id.clone(),
+            model_id: model_id.to_owned(),
+            failure: FailureClass::Overload,
+        }
+    }
+
     #[test]
     fn unknown_recency_cannot_prove_an_unknown_lane_cold() {
         let inventory = upgrade_inventory();
@@ -1589,6 +1670,235 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn an_open_circuit_skips_only_its_exact_candidate_target() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let edge = CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge,
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let route = policy.route(&id("route")).unwrap();
+        let first = &route.candidates()[0];
+        let circuit = open_circuit(route.id(), first.id(), first.binding_id(), "one");
+        let selected = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &CircuitSnapshot::from([circuit.clone()]),
+            &facts("asked"),
+        )
+        .unwrap();
+        assert_eq!(selected.candidate_id, Some(id("second")));
+        assert!(matches!(
+            &selected.trace[1],
+            TraceEvent::Candidate(evidence)
+                if evidence.candidate_id == *first.id()
+                    && evidence.model.as_deref() == Some("one")
+                    && evidence.result == Err(SkipReason::HealthCircuitOpen)
+        ));
+
+        let near_misses = [
+            OpenCircuitTarget {
+                route_id: id("other-route"),
+                ..circuit.clone()
+            },
+            OpenCircuitTarget {
+                candidate_id: id("other-candidate"),
+                ..circuit.clone()
+            },
+            OpenCircuitTarget {
+                binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                ..circuit.clone()
+            },
+            OpenCircuitTarget {
+                model_id: "other-model".to_owned(),
+                ..circuit
+            },
+        ];
+        for near_miss in near_misses {
+            let selected = resolve_with_circuits(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                None,
+                &availability(true, false),
+                &CircuitSnapshot::from([near_miss]),
+                &facts("asked"),
+            )
+            .unwrap();
+            assert_eq!(selected.candidate_id, Some(id("first")));
+        }
+    }
+
+    #[test]
+    fn open_circuits_match_the_concrete_upgraded_and_aliased_models() {
+        let inventory = upgrade_inventory();
+        let policy = compile(upgrade_document(), &inventory);
+        let compiled_route = policy.route(&id("route")).unwrap();
+        let compiled_candidate = &compiled_route.candidates()[0];
+        let failure = resolve_with_circuits(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &CircuitSnapshot::from([open_circuit(
+                compiled_route.id(),
+                compiled_candidate.id(),
+                compiled_candidate.binding_id(),
+                "claude-opus-5",
+            )]),
+            &facts("claude-opus-4-8"),
+        )
+        .unwrap_err();
+        let ResolveFailure::RouteUnavailable { trace } = failure else {
+            panic!()
+        };
+        assert!(matches!(
+            &trace[1],
+            TraceEvent::Candidate(evidence)
+                if evidence.model.as_deref() == Some("claude-opus-5")
+                    && evidence.result == Err(SkipReason::HealthCircuitOpen)
+        ));
+        assert!(matches!(&trace[2], TraceEvent::Upgrade { to, .. } if to == "claude-opus-5"));
+
+        let mut aliased = candidate(
+            "aliased",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        aliased.alias_policy = Some(AliasPolicy {
+            rules: vec![AliasRule {
+                matcher: MatcherSpec::Exact("source".to_owned()),
+                exclude: vec![],
+                replacement: "destination".to_owned(),
+            }],
+        });
+        let policy = compile(document(route(aliased, vec![])), &OfferInventory::default());
+        let route = policy.route(&id("route")).unwrap();
+        let candidate = &route.candidates()[0];
+        let failure = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &CircuitSnapshot::from([open_circuit(
+                route.id(),
+                candidate.id(),
+                candidate.binding_id(),
+                "destination",
+            )]),
+            &facts("source"),
+        )
+        .unwrap_err();
+        let ResolveFailure::RouteUnavailable { trace } = failure else {
+            panic!()
+        };
+        assert!(matches!(
+            &trace[1],
+            TraceEvent::Candidate(evidence)
+                if evidence.model.as_deref() == Some("destination")
+                    && evidence.result == Err(SkipReason::HealthCircuitOpen)
+        ));
+        assert!(matches!(&trace[2], TraceEvent::Alias { to, .. } if to == "destination"));
+    }
+
+    #[test]
+    fn exact_presentations_observe_the_same_circuit_key() {
+        let inventory = OfferInventory::from_offers([BackendOffer {
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            provider: "anthropic_sub".to_owned(),
+            backend_model_id: "exact-model".to_owned(),
+            binding: ANTHROPIC_SUB_MESSAGES.clone(),
+            context_window: None,
+            chronology: None,
+            fetched_at_ms: 1,
+            raw: serde_json::Value::Null,
+        }]);
+        let mut document = document(route(
+            candidate(
+                "unused",
+                &ANTHROPIC_SUB_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        ));
+        document.presentations.push(Presentation {
+            id: id("exact"),
+            scope: scope(Some("claude")),
+            slug: "friendly".to_owned(),
+            label: None,
+            description: None,
+            enabled: true,
+            shadow_native: false,
+            source: PresentationSource::ExactOffer {
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                model_id: "exact-model".to_owned(),
+            },
+            metadata: None,
+        });
+        let policy = compile(document, &inventory);
+        let presentation = policy
+            .presentation(&scope(Some("claude")), "friendly")
+            .unwrap();
+        let PresentationRoute::Exact {
+            route_id,
+            candidate_id,
+            binding_id,
+            model_id,
+            ..
+        } = presentation.route()
+        else {
+            panic!()
+        };
+        let failure = resolve_with_circuits(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &CircuitSnapshot::from([open_circuit(route_id, candidate_id, binding_id, model_id)]),
+            &facts("friendly"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace }
+                if matches!(&trace[1], TraceEvent::Candidate(evidence)
+                    if evidence.candidate_id == *candidate_id
+                        && evidence.result == Err(SkipReason::HealthCircuitOpen))
+        ));
     }
 
     #[test]

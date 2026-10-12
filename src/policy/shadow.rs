@@ -12,7 +12,7 @@ use std::thread;
 
 use super::{
     AttemptPlan, LaneFacts, LearningView, PolicyRuntime, PolicySnapshot, RequestFacts,
-    ResolveFailure, RouteProvenance, resolve,
+    ResolveFailure, RouteProvenance,
 };
 const SHADOW_QUEUE_CAPACITY: usize = 64;
 
@@ -128,6 +128,7 @@ struct ResolveJob {
     snapshot: Arc<PolicySnapshot>,
     pinned_revision: Option<i64>,
     evidence: super::runtime::PolicyEvidence,
+    circuits: super::CircuitSnapshot,
     facts: RequestFacts,
     credentials: super::CredentialSnapshot,
     lane: Option<LaneFacts>,
@@ -221,17 +222,21 @@ where
         lane: Option<LaneFacts>,
         legacy: LegacyOutcome,
     ) {
-        let Some(snapshot) = self.policy_runtime.capture() else {
-            return;
-        };
         let pinned_revision = lane
             .as_ref()
             .and_then(|lane| lane.pinned.as_ref())
             .and_then(|pin| pin.policy_revision_id);
+        let Some((snapshot, evidence, circuits)) = self
+            .policy_runtime
+            .capture_shadow(pinned_revision, facts.now_ms)
+        else {
+            return;
+        };
         self.enqueue(ShadowJob::Resolve(Box::new(ResolveJob {
             snapshot,
             pinned_revision,
-            evidence: self.policy_runtime.capture_evidence(),
+            evidence,
+            circuits,
             facts,
             credentials,
             lane,
@@ -291,6 +296,7 @@ fn worker_loop<L: LearningView>(
                     snapshot,
                     pinned_revision,
                     evidence,
+                    circuits,
                     facts,
                     credentials,
                     mut lane,
@@ -319,12 +325,13 @@ fn worker_loop<L: LearningView>(
                     .availability()
                     .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
                     .with_credentials(&credentials);
-                match resolve(
+                match super::resolve::resolve_with_circuits(
                     snapshot.policy(),
                     snapshot.inventory(),
                     learning.as_ref(),
                     lane.as_ref(),
                     &availability,
+                    &circuits,
                     &facts,
                 ) {
                     Ok(mut plan) => {
@@ -598,6 +605,67 @@ mod tests {
         panicking.observe(facts(), Default::default(), None, outcome("model-a"));
         panicking.observe(facts(), Default::default(), None, outcome("model-a"));
         drop(panicking);
+    }
+
+    #[test]
+    fn queued_resolution_keeps_the_circuit_view_from_enqueue_time() {
+        let (policy, inventory, availability) = fixture();
+        let policy_runtime = runtime(policy.clone(), inventory.clone(), availability.clone());
+        let snapshot = policy_runtime.capture().unwrap();
+        let revision_id = 7;
+        let key = super::super::HealthCircuitKey {
+            policy_revision_id: revision_id,
+            route_id: RouteId::new("route").unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            model_id: "model-a".to_owned(),
+            failure: FailureClass::Overload,
+        };
+        let lane = LaneFacts {
+            temperature: CacheTemperature::Unknown,
+            pinned: Some(ProvisionalPin {
+                policy_revision_id: Some(revision_id),
+                policy_fingerprint: Some(policy.fingerprint().clone()),
+                route_fingerprint: policy
+                    .route(&RouteId::new("route").unwrap())
+                    .unwrap()
+                    .fingerprint()
+                    .clone(),
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                baseline_model: "model-a".to_owned(),
+                effective_model: "model-a".to_owned(),
+            }),
+            forced_from: None,
+            forced_to: None,
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let shadow_runtime = Arc::new(ShadowRuntime {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(None),
+            dropped: AtomicU64::new(0),
+        });
+        let shadow: PolicyShadow<NoLearning> =
+            PolicyShadow::with_runtime(policy_runtime.clone(), shadow_runtime);
+
+        shadow.observe(
+            facts(),
+            Default::default(),
+            Some(lane.clone()),
+            outcome("model-a"),
+        );
+        policy_runtime.open_circuit(&snapshot, key.clone(), 100);
+        let ShadowJob::Resolve(before_open) = receiver.try_recv().unwrap() else {
+            panic!()
+        };
+        assert!(before_open.circuits.is_empty());
+
+        shadow.observe(facts(), Default::default(), Some(lane), outcome("model-a"));
+        policy_runtime.clear_circuit(&key);
+        let ShadowJob::Resolve(before_clear) = receiver.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(before_clear.circuits.len(), 1);
     }
 
     #[test]

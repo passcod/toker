@@ -694,7 +694,7 @@ mod tests {
         PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, PublicationAdapter,
         PublicationCasResult, PublicationKey, PublicationState, RequestLookupProvenance,
         RequestRow, RowKind, SessionCostGroup, SessionLineage, Store, StoredCandidateState,
-        StoredRoutingTrace, StoredRoutingTraceEvent, is_api_measurement,
+        StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -3344,6 +3344,24 @@ mod tests {
         .unwrap();
         assert_eq!(trace.version, 1);
         assert_eq!(trace.events.len(), 4);
+        let open = StoredRoutingTrace::from_resolver(&[
+            TraceEvent::Lookup(RouteProvenance::ProtocolDefault),
+            TraceEvent::Candidate(CandidateEvidence {
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                model: Some("effective".to_owned()),
+                result: Err(SkipReason::HealthCircuitOpen),
+            }),
+        ])
+        .unwrap();
+        assert!(matches!(
+            &open.events[1],
+            StoredRoutingTraceEvent::Candidate {
+                state: StoredCandidateState::Skipped,
+                reason: Some(StoredSkipReason::HealthCircuitOpen),
+                ..
+            }
+        ));
         assert!(
             StoredRoutingTrace::from_resolver(&vec![
                 TraceEvent::Lookup(
