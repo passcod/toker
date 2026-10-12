@@ -134,9 +134,18 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
+    let Some(requested_model) = requested_model.filter(|model| !model.is_empty()) else {
+        return frontend_error_response(
+            CodexFrontendWire::OpenAiResponses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "model is missing, empty, or not a string",
+            false,
+        );
+    };
     let target = match server
         .registry
-        .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
+        .resolve(ProtocolId::OpenAiResponses, Some(requested_model.as_str()))
     {
         Ok(target) => target,
         Err(_) => return super::responses_not_configured(),
@@ -177,7 +186,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         let facts = server.shadow_facts(
             ProtocolId::OpenAiResponses,
             shadow_profile.as_deref(),
-            requested_model.clone(),
+            Some(requested_model.clone()),
             lane_reference.clone(),
             crate::middleware::force_newest::prompt_bound(original.len() as u64),
             shape.req_messages,
@@ -210,7 +219,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         path: "/v1/responses",
         session_id: request_session.clone(),
         lineage: lineage.clone(),
-        requested_model: requested_model.clone(),
+        requested_model: Some(requested_model.clone()),
         effective_model: effective_model.clone(),
         backend: backend.clone(),
         binding_id: target.binding().id().clone(),
@@ -341,10 +350,7 @@ pub(crate) async fn prepare(
     let backend = attempt.backend().clone();
     let binding_id = attempt.binding().id().clone();
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let canonical = attempt.canonical();
     let response_projection = ResponseProjection::for_request(&canonical);
     let prompt_cache_key = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());

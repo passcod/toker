@@ -24,12 +24,12 @@ use super::{InFlightGuard, Server};
 
 #[derive(Clone)]
 pub(crate) struct InferenceRequest {
-    requested_model: Option<String>,
+    requested_model: String,
     canonical: Arc<CanonicalRequest>,
 }
 
 impl InferenceRequest {
-    pub(crate) fn new(requested_model: Option<String>, canonical: CanonicalRequest) -> Self {
+    pub(crate) fn new(requested_model: String, canonical: CanonicalRequest) -> Self {
         Self {
             requested_model,
             canonical: Arc::new(canonical),
@@ -60,7 +60,7 @@ impl InferenceRequest {
 
 pub(crate) struct InferenceAttempt {
     target: ModelTarget,
-    requested_model: Option<String>,
+    requested_model: String,
     effective_model: Option<String>,
     mapped: Option<MapTarget>,
     canonical: CanonicalRequest,
@@ -104,8 +104,8 @@ impl InferenceAttempt {
         self.target.binding()
     }
 
-    pub(crate) fn requested_model(&self) -> Option<&str> {
-        self.requested_model.as_deref()
+    pub(crate) fn requested_model(&self) -> &str {
+        &self.requested_model
     }
 
     pub(crate) fn effective_model(&self) -> Option<&str> {
@@ -345,10 +345,7 @@ fn prepare_messages(
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyMessagesAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
     let rendered = attempt.render_json().map_err(|error| {
@@ -394,10 +391,7 @@ fn prepare_chat(
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyChatAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let rendered = attempt
         .render_json()
         .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;
@@ -656,7 +650,7 @@ mod tests {
             .push(crate::ir::canonical::CanonSystemPart::text(
                 "private fixture",
             ));
-        let request = InferenceRequest::new(Some("openrouter/invented-model".to_owned()), original);
+        let request = InferenceRequest::new("openrouter/invented-model".to_owned(), original);
 
         let mut first = request.canonical();
         first.model = Some("mutated-by-first-candidate".to_owned());
@@ -665,7 +659,7 @@ mod tests {
 
         assert_eq!(attempt.backend().id(), "openrouter");
         assert_eq!(attempt.binding().provider(), "openrouter");
-        assert_eq!(attempt.requested_model(), Some("openrouter/invented-model"));
+        assert_eq!(attempt.requested_model(), "openrouter/invented-model");
         assert_eq!(attempt.effective_model(), Some("invented-model"));
         let second = attempt.canonical();
         assert_eq!(second.model.as_deref(), Some("invented-model"));
@@ -696,8 +690,7 @@ mod tests {
             blocks: vec![crate::ir::canonical::CanonBlock::Text("prompt".to_owned())],
             extensions: vec![],
         });
-        let request =
-            InferenceRequest::new(Some("openrouter/claude-opus-4-1".to_owned()), canonical);
+        let request = InferenceRequest::new("openrouter/claude-opus-4-1".to_owned(), canonical);
         let mut attempt = request.prepare(target, Some("claude-opus-4-1".to_owned()));
         let outcome = attempt
             .apply_compaction(Some("claude-haiku-3-5"), None)
@@ -726,7 +719,7 @@ mod tests {
             .resolve(ProtocolId::OpenAiChat, Some("openrouter/asked-model"))
             .unwrap();
         let request = InferenceRequest::new(
-            Some("openrouter/asked-model".to_owned()),
+            "openrouter/asked-model".to_owned(),
             CanonicalRequest {
                 model: Some("openrouter/asked-model".to_owned()),
                 ..CanonicalRequest::default()

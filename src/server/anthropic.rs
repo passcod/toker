@@ -290,6 +290,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             || ir.anthropic().wants_json_response(),
             |request| request.stream != Some(true),
         );
+        if path == "/v1/messages" && client_model.as_deref().is_none_or(str::is_empty) {
+            return super::codex::anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "model is missing, empty, or not a string",
+                false,
+            );
+        }
         if path == "/v1/messages/batches" {
             observe_batch_shadow(&server, &parts, ir.value(), original.len() as u64);
         }
@@ -887,8 +895,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     if path == "/v1/messages"
         && let Some(request) = canonical.as_ref()
     {
-        let inference =
-            super::inference::InferenceRequest::new(client_model.clone(), request.clone());
+        let inference = super::inference::InferenceRequest::new(
+            client_model
+                .clone()
+                .expect("inference model validated before gates"),
+            request.clone(),
+        );
         inference_attempt = Some(inference.prepare(target.clone(), served_model.clone()));
     }
 

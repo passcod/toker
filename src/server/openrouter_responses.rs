@@ -85,10 +85,7 @@ pub(crate) fn prepare(
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let canonical = attempt.canonical();
     let wants_stream = canonical.stream != Some(false);
     let rendered = translate::openrouter_responses_backend::render_openrouter_responses(

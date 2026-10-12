@@ -124,10 +124,7 @@ pub(crate) fn prepare(
     frontend: FrontendWire,
 ) -> Result<ReadyAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
-    let response_model = attempt
-        .requested_model()
-        .unwrap_or(&effective_model)
-        .to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let stream = match frontend {
         FrontendWire::Chat => attempt.stream() == Some(true),
         FrontendWire::Responses => attempt.stream() != Some(false),

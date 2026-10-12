@@ -1819,6 +1819,24 @@ async fn thinking_disabled_filters_codex_reasoning_from_both_response_shapes() {
 }
 
 #[tokio::test]
+async fn missing_responses_model_is_rejected_locally_without_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("missing-model", upstream, true)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({"input": "Hi"}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("typed local error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(store.requests_since(0, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("malformed", upstream, true)).await;

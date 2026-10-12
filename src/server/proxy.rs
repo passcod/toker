@@ -134,10 +134,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         Ok(canonical) => canonical,
         Err(error) => return compatibility_error(&error.to_string()),
     };
-    let model = canonical.model.clone();
+    let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
+        return compatibility_error("model is missing, empty, or not a string");
+    };
     let target = match server
         .registry
-        .resolve(ProtocolId::OpenAiChat, model.as_deref())
+        .resolve(ProtocolId::OpenAiChat, Some(model.as_str()))
     {
         Ok(target) => target,
         Err(_) => return super::openai_not_configured(),
@@ -166,7 +168,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         started,
         session_id: session_id.clone(),
         ping,
-        requested_model: attempt.requested_model().map(str::to_owned),
+        requested_model: Some(attempt.requested_model().to_owned()),
         effective_model: gate_model.clone(),
         shape: Some(shape),
         system_messages,
@@ -334,7 +336,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let facts = server.shadow_facts(
         ProtocolId::OpenAiChat,
         shadow_profile.as_deref(),
-        model.clone(),
+        Some(model.clone()),
         cold_lane_key.clone(),
         force_newest::prompt_bound(original.len() as u64),
         gate_shape.as_ref().and_then(|shape| shape.req_messages),

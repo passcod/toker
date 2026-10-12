@@ -509,6 +509,18 @@ fn chat_body(model: &str, stream: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+#[tokio::test]
+async fn missing_chat_model_is_rejected_before_routing_and_recording() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let response = post_chat(addr, br#"{"messages":[{"role":"user","content":"Hi"}]}"#).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("typed local error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(store.requests_since(0, 10).unwrap().is_empty());
+}
+
 fn assert_complete_chat(body: &[u8], model: &str) {
     let value: Value = serde_json::from_slice(body).expect("canonical Chat response JSON");
     assert_eq!(value["model"], model);

@@ -1273,13 +1273,9 @@ pub(crate) fn record_responses_measurement(
         route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
-        // The response's own slug is authoritative (the routing unit's
-        // `model` capture); the effective model — map and all — is the
-        // fallback when the response did not name itself.
-        model: capture
-            .model()
-            .map(str::to_owned)
-            .or_else(|| ctx.effective_model.clone()),
+        // Missing provider-reported identity remains absent; the attempted
+        // target already has its own effective_model column.
+        model: capture.model().map(str::to_owned),
         raw_model: capture.model().map(str::to_owned),
         requested_model: ctx.requested_model.clone(),
         effective_model: ctx.effective_model.clone(),
