@@ -26,6 +26,7 @@ pub struct ShadowOutcome {
     pub route_source: String,
     pub baseline_model: String,
     pub upgraded_model: Option<String>,
+    pub retargeted_model: Option<String>,
     pub aliased_model: Option<String>,
     pub effective_model: String,
     pub compaction: bool,
@@ -44,6 +45,7 @@ impl ShadowOutcome {
             route_source: provenance_code(&plan.provenance),
             baseline_model: plan.baseline_model.clone(),
             upgraded_model: plan.upgraded_model.clone(),
+            retargeted_model: plan.retargeted_model.clone(),
             aliased_model: plan.aliased_model.clone(),
             effective_model: plan.effective_model.clone(),
             compaction: plan.compaction,
@@ -535,6 +537,7 @@ mod tests {
             required_capabilities: Default::default(),
             binding_affinity: None,
             class: RequestClass::Inference,
+            legacy_compaction: None,
             now_ms: 10,
         }
     }
@@ -549,6 +552,7 @@ mod tests {
             route_source: "protocol-default".to_owned(),
             baseline_model: model.to_owned(),
             upgraded_model: None,
+            retargeted_model: None,
             aliased_model: None,
             effective_model: model.to_owned(),
             compaction: false,

@@ -177,6 +177,7 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         default.effective_model().map(str::to_owned),
         None,
         None,
+        None,
         default.effective_model().map(str::to_owned),
         false,
     ) {
@@ -290,6 +291,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut served_model: Option<String> = None;
     let mut shadow_baseline: Option<String> = None;
     let mut shadow_upgraded: Option<String> = None;
+    let mut shadow_retargeted: Option<String> = None;
     let mut shadow_compaction_applied = false;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
@@ -571,6 +573,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 None,
                 shadow_baseline.clone(),
                 shadow_upgraded.clone(),
+                shadow_retargeted.clone(),
                 served_model.clone(),
                 shadow_compaction_applied,
             );
@@ -732,6 +735,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     cold_lane.as_ref(),
                     shadow_baseline.clone(),
                     shadow_upgraded.clone(),
+                    shadow_retargeted.clone(),
                     served_model.clone(),
                     shadow_compaction_applied,
                 );
@@ -889,6 +893,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         cold_lane.as_ref(),
                         shadow_baseline.clone(),
                         shadow_upgraded.clone(),
+                        shadow_retargeted.clone(),
                         served_model.clone(),
                         shadow_compaction_applied,
                     );
@@ -991,6 +996,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.system_merged = (outcome.merged > 0).then_some(true);
                 }
                 shadow_compaction_applied = true;
+                shadow_retargeted = (outcome.to != outcome.from)
+                    .then(|| outcome.to.clone())
+                    .flatten();
                 served_model = outcome.to.clone();
                 tracing::info!(
                     "compact: {} · {} breakpoint(s) dropped · {} system message(s) merged",
@@ -1210,6 +1218,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         cold_lane.as_ref(),
         shadow_baseline.clone(),
         shadow_upgraded.clone(),
+        shadow_retargeted.clone(),
         served_model.clone(),
         shadow_compaction_applied,
     );
@@ -1360,6 +1369,7 @@ fn observe_batch_shadow(
             &target,
             baseline.clone(),
             None,
+            None,
             (effective != baseline).then(|| effective.clone()).flatten(),
             effective,
             false,
@@ -1388,6 +1398,7 @@ fn observe_messages_shadow(
     lane: Option<&crate::store::Lane>,
     baseline: Option<String>,
     upgraded: Option<String>,
+    retargeted: Option<String>,
     served: Option<String>,
     compaction_applied: bool,
 ) {
@@ -1404,7 +1415,12 @@ fn observe_messages_shadow(
                 |pin| pin.binding_id.clone(),
             )
         });
-    let facts = server.shadow_facts(
+    let class = if shape.is_some_and(AnthropicShape::is_compaction) {
+        crate::policy::RequestClass::Compaction
+    } else {
+        crate::policy::RequestClass::Inference
+    };
+    let mut facts = server.shadow_facts(
         ProtocolId::AnthropicMessages,
         profile,
         requested_model,
@@ -1414,13 +1430,27 @@ fn observe_messages_shadow(
         shape.map_or(0, |shape| shape.req_tools),
         required_capabilities,
         binding_affinity,
-        if shape.is_some_and(AnthropicShape::is_compaction) {
-            crate::policy::RequestClass::Compaction
-        } else {
-            crate::policy::RequestClass::Inference
-        },
+        class,
     );
-    let aliased = (served != upgraded && served.as_ref() != Some(&baseline))
+    if class == crate::policy::RequestClass::Compaction {
+        facts.legacy_compaction = Some(crate::policy::LegacyCompactionFacts {
+            lane_cold: cold::lane_is_cold(
+                lane,
+                server.config.gates.cold_min_tokens,
+                cold_idle_ms(&server.config.gates),
+                facts.now_ms,
+            ),
+            prompt_tokens: lane
+                .and_then(|lane| lane.prompt_tokens)
+                .and_then(|prompt| u64::try_from(prompt).ok())
+                .unwrap_or_default(),
+        });
+    }
+    let before_alias = retargeted
+        .as_ref()
+        .or(upgraded.as_ref())
+        .unwrap_or(&baseline);
+    let aliased = (served.as_ref() != Some(before_alias))
         .then(|| served.clone())
         .flatten();
     let Some(legacy) = server.legacy_shadow_outcome(
@@ -1428,6 +1458,7 @@ fn observe_messages_shadow(
         target,
         Some(baseline),
         upgraded,
+        retargeted,
         aliased,
         served,
         compaction_applied,

@@ -15,11 +15,11 @@ use crate::routing::Capabilities;
 
 use super::{
     ArgumentBinding, BindingId, BoundaryConsent, CacheTransitionPolicy, CandidateEdge, CandidateId,
-    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledPolicy, CompiledRoute,
-    CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol, FrontendScope,
-    InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures, MinimumLearning,
-    ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute, ProfileId,
-    REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
+    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledCompaction, CompiledPolicy,
+    CompiledRoute, CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol,
+    FrontendScope, InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures,
+    MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute,
+    ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -29,6 +29,12 @@ pub enum RequestClass {
     #[default]
     Inference,
     Compaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyCompactionFacts {
+    pub lane_cold: bool,
+    pub prompt_tokens: u64,
 }
 
 /// Content-free facts derived by a frontend adapter.
@@ -45,6 +51,9 @@ pub struct RequestFacts {
     pub required_capabilities: CapabilityFlags,
     pub binding_affinity: Option<BindingId>,
     pub class: RequestClass,
+    /// Exact revision-one compaction evidence, separate from generic cache
+    /// temperature so it cannot authorize unrelated transitions.
+    pub legacy_compaction: Option<LegacyCompactionFacts>,
     /// The caller owns the clock. The resolver never reads one.
     pub now_ms: i64,
 }
@@ -241,6 +250,7 @@ pub struct AttemptPlan {
     pub requested_model: Option<String>,
     pub baseline_model: String,
     pub upgraded_model: Option<String>,
+    pub retargeted_model: Option<String>,
     pub aliased_model: Option<String>,
     pub effective_model: String,
     pub compaction: bool,
@@ -325,17 +335,12 @@ pub fn resolve_with_circuits<L: LearningView>(
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
         && lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold)
-        && let Some(compaction) = policy.compaction()
+        && let Some((target, lane_transition, cache_transition)) =
+            policy.compaction().and_then(CompiledCompaction::route)
     {
-        selected = from_reference(
-            policy,
-            compaction.target(),
-            facts,
-            None,
-            RouteProvenance::Compaction,
-        )?;
-        selected.lane_transition = Some(compaction.lane_transition());
-        selected.cache_transition = Some(compaction.cache_transition());
+        selected = from_reference(policy, target, facts, None, RouteProvenance::Compaction)?;
+        selected.lane_transition = Some(lane_transition);
+        selected.cache_transition = Some(cache_transition);
     }
 
     let mut trace = vec![TraceEvent::Lookup(selected.provenance.clone())];
@@ -362,6 +367,7 @@ pub fn resolve_with_circuits<L: LearningView>(
             requested_model: facts.requested_model.clone(),
             baseline_model: model.to_owned(),
             upgraded_model: None,
+            retargeted_model: None,
             aliased_model: None,
             effective_model: model.to_owned(),
             compaction: selected.provenance == RouteProvenance::Compaction,
@@ -452,7 +458,17 @@ pub fn resolve_with_circuits<L: LearningView>(
                 to: to.to_owned(),
             });
         }
-        let before_alias = upgraded.as_deref().unwrap_or(&baseline);
+        let before_compaction = upgraded.as_deref().unwrap_or(&baseline);
+        let retargeted = choose_revision_one_compaction(
+            policy,
+            inventory,
+            learning,
+            facts,
+            candidate,
+            &selected.parameters,
+            before_compaction,
+        )?;
+        let before_alias = retargeted.as_deref().unwrap_or(before_compaction);
         let aliased = apply_alias(candidate, before_alias, &selected.parameters)?;
         if let Some(to) = aliased.as_deref() {
             trace.push(TraceEvent::Alias {
@@ -462,6 +478,7 @@ pub fn resolve_with_circuits<L: LearningView>(
         }
         let effective = aliased
             .clone()
+            .or_else(|| retargeted.clone())
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
         if index > start
@@ -519,9 +536,15 @@ pub fn resolve_with_circuits<L: LearningView>(
             requested_model: facts.requested_model.clone(),
             baseline_model: baseline,
             upgraded_model: upgraded,
+            retargeted_model: retargeted,
             aliased_model: aliased,
             effective_model: effective,
-            compaction: selected.provenance == RouteProvenance::Compaction,
+            compaction: selected.provenance == RouteProvenance::Compaction
+                || (facts.legacy_compaction.is_some_and(|facts| facts.lane_cold)
+                    && policy
+                        .compaction()
+                        .and_then(CompiledCompaction::revision_one_legacy)
+                        .is_some_and(|(_, bindings)| bindings.contains(candidate.binding_id()))),
             lane_transition: lane_policy,
             trace,
         });
@@ -1057,6 +1080,100 @@ fn choose_upgrade<L: LearningView>(
     Ok(best.map(|(model, _)| model))
 }
 
+fn choose_revision_one_compaction<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    facts: &RequestFacts,
+    candidate: &CompiledCandidate,
+    parameters: &BTreeMap<StableId, String>,
+    source: &str,
+) -> Result<Option<String>, ResolveFailure> {
+    let Some(compaction_facts) = facts.legacy_compaction.filter(|facts| facts.lane_cold) else {
+        return Ok(None);
+    };
+    let Some((spec, eligible_bindings)) = policy
+        .compaction()
+        .and_then(CompiledCompaction::revision_one_legacy)
+    else {
+        return Ok(None);
+    };
+    if facts.class != RequestClass::Compaction
+        || !eligible_bindings.contains(candidate.binding_id())
+    {
+        return Ok(None);
+    }
+
+    let family = crate::middleware::models::family_of(spec);
+    let target = match family {
+        Some(family) if family.version.is_empty() => {
+            let mut best: Option<String> = None;
+            for model in learning
+                .known_models(candidate.binding_id())
+                .map_err(|_| ResolveFailure::LearningUnavailable)?
+            {
+                if crate::middleware::models::family_of(&model)
+                    .is_none_or(|candidate_family| candidate_family.name != family.name)
+                    || !learning_minimum(
+                        MinimumLearning::RevisionOneAdaptive,
+                        false,
+                        learning,
+                        candidate.binding_id(),
+                        &model,
+                    )?
+                {
+                    continue;
+                }
+                let mapped =
+                    apply_alias(candidate, &model, parameters)?.unwrap_or_else(|| model.clone());
+                if crate::catalog::pricing::price(&mapped, false, None).is_none() {
+                    continue;
+                }
+                if best
+                    .as_deref()
+                    .is_none_or(|current| crate::middleware::models::newer_than(&model, current))
+                {
+                    best = Some(model);
+                }
+            }
+            best
+        }
+        Some(_) => crate::catalog::model_identity(spec),
+        None => None,
+    };
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let mapped_target =
+        apply_alias(candidate, &target, parameters)?.unwrap_or_else(|| target.clone());
+    let fits = if let Some(window) = inventory
+        .get(candidate.binding_id(), &mapped_target)
+        .and_then(|offer| offer.context_window)
+    {
+        compaction_facts.prompt_tokens <= window
+    } else {
+        learning
+            .learned(candidate.binding_id(), &target)
+            .map_err(|_| ResolveFailure::LearningUnavailable)?
+            .and_then(|evidence| evidence.max_prompt())
+            .is_some_and(|max| compaction_facts.prompt_tokens <= max)
+    };
+    if !fits {
+        return Ok(None);
+    }
+
+    let mapped_source =
+        apply_alias(candidate, source, parameters)?.unwrap_or_else(|| source.to_owned());
+    let target_price =
+        crate::catalog::pricing::price(&mapped_target, false, None).map(|price| price.rates.input);
+    let source_price =
+        crate::catalog::pricing::price(&mapped_source, false, None).map(|price| price.rates.input);
+    Ok(
+        matches!((target_price, source_price), (Some(target), Some(source)) if target < source)
+            .then_some(target),
+    )
+}
+
 fn learning_minimum<L: LearningView>(
     minimum: MinimumLearning,
     allow_manual_promotion: bool,
@@ -1177,6 +1294,7 @@ impl LearningView for NoLearning {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::convert::Infallible;
     use std::sync::Arc;
 
     use super::*;
@@ -1258,18 +1376,21 @@ mod tests {
     }
 
     fn compile(document: PolicyDocument, inventory: &OfferInventory) -> CompiledPolicy {
+        compile_origin(document, inventory, PolicyOrigin::Authored)
+    }
+
+    fn compile_origin(
+        document: PolicyDocument,
+        inventory: &OfferInventory,
+        origin: PolicyOrigin,
+    ) -> CompiledPolicy {
         let topology = RouteRegistry::new(
             std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
             std::iter::empty::<(crate::routing::ProtocolId, String)>(),
         );
-        crate::policy::compile(
-            document.validate().unwrap(),
-            &topology,
-            inventory,
-            PolicyOrigin::Authored,
-        )
-        .into_policy()
-        .unwrap()
+        crate::policy::compile(document.validate().unwrap(), &topology, inventory, origin)
+            .into_policy()
+            .unwrap()
     }
 
     fn upgrade_inventory() -> OfferInventory {
@@ -1358,6 +1479,45 @@ mod tests {
         ]))
     }
 
+    #[derive(Default)]
+    struct TestLearning {
+        models: BTreeMap<String, LearnedEvidence>,
+        active_days: usize,
+    }
+
+    impl LearningView for TestLearning {
+        type Error = Infallible;
+
+        fn recently_sent(&self, _: &BindingId, _: &str) -> Result<RecencyEvidence, Self::Error> {
+            Ok(RecencyEvidence::Unknown)
+        }
+
+        fn learned(
+            &self,
+            _: &BindingId,
+            model: &str,
+        ) -> Result<Option<LearnedEvidence>, Self::Error> {
+            Ok(self.models.get(model).cloned())
+        }
+
+        fn known_models(&self, _: &BindingId) -> Result<Vec<String>, Self::Error> {
+            Ok(self.models.keys().cloned().collect())
+        }
+
+        fn active_days(&self, _: &BindingId) -> Result<usize, Self::Error> {
+            Ok(self.active_days)
+        }
+    }
+
+    fn learned(days: usize, max_prompt: u64) -> LearnedEvidence {
+        LearnedEvidence::new(
+            (0..days).map(|day| format!("2026-10-{day:02}")).collect(),
+            Some(max_prompt),
+            None,
+            false,
+        )
+    }
+
     fn facts(model: &str) -> RequestFacts {
         RequestFacts {
             profile: Some(id("claude")),
@@ -1370,6 +1530,7 @@ mod tests {
             required_capabilities: Default::default(),
             binding_affinity: None,
             class: RequestClass::Inference,
+            legacy_compaction: None,
             now_ms: 100,
         }
     }
@@ -2666,6 +2827,92 @@ mod tests {
     }
 
     #[test]
+    fn revision_one_compaction_overlays_the_selected_binding_and_legacy_guards() {
+        let mut document = document(route(
+            candidate(
+                "first",
+                &ANTHROPIC_SUB_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        ));
+        document.compaction = Some(CompactionPolicy {
+            target: CompactionTarget::RevisionOneLegacy {
+                model_spec: "sonnet".to_owned(),
+                eligible_bindings: vec![ANTHROPIC_SUB_MESSAGES.id().clone()],
+            },
+            lane_transition: LaneTransitionPolicy::MoveWhenCold,
+            cache_transition: CacheTransitionPolicy::AllowWhenCold,
+        });
+        let policy = compile_origin(
+            document,
+            &OfferInventory::default(),
+            PolicyOrigin::GeneratedRevisionOne,
+        );
+        let learning = TestLearning {
+            models: BTreeMap::from([
+                ("claude-sonnet-5".to_owned(), learned(8, 500_000)),
+                ("claude-sonnet-5-5".to_owned(), learned(1, 500_000)),
+            ]),
+            active_days: 8,
+        };
+        let mut request = facts("claude-opus-5");
+        request.class = RequestClass::Compaction;
+        request.legacy_compaction = Some(LegacyCompactionFacts {
+            lane_cold: true,
+            prompt_tokens: 200_000,
+        });
+        let plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &learning,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(plan.binding_id, *ANTHROPIC_SUB_MESSAGES.id());
+        assert_eq!(plan.provenance, RouteProvenance::ProtocolDefault);
+        assert_eq!(plan.baseline_model, "claude-opus-5");
+        assert_eq!(plan.retargeted_model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(plan.effective_model, "claude-sonnet-5");
+        assert!(plan.compaction);
+
+        let mut warm = request.clone();
+        warm.legacy_compaction.as_mut().unwrap().lane_cold = false;
+        let plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &learning,
+            None,
+            &availability(true, false),
+            &warm,
+        )
+        .unwrap();
+        assert_eq!(plan.retargeted_model, None);
+        assert!(!plan.compaction);
+
+        let too_large = TestLearning {
+            models: BTreeMap::from([("claude-sonnet-5".to_owned(), learned(8, 100_000))]),
+            active_days: 8,
+        };
+        let plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &too_large,
+            None,
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(plan.retargeted_model, None);
+        assert!(
+            plan.compaction,
+            "cold same-model transform remains licensed"
+        );
+    }
+
+    #[test]
     fn compaction_uses_the_explicit_route() {
         let first = candidate(
             "first",
@@ -2692,10 +2939,10 @@ mod tests {
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
         });
         doc.compaction = Some(CompactionPolicy {
-            target: RouteReference {
+            target: CompactionTarget::Route(RouteReference {
                 route_id: id("compact-route"),
                 parameters: BTreeMap::new(),
-            },
+            }),
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
             cache_transition: CacheTransitionPolicy::AllowWhenCold,
         });

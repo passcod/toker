@@ -15,8 +15,8 @@ use crate::routing::{BackendBinding, ProtocolId, RouteRegistry};
 
 use super::{
     AdapterMetadata, AliasPolicy, AliasRule, ArgumentBinding, CURRENT_FORMAT_VERSION,
-    CacheTransitionPolicy, Candidate, CandidateId, CandidateModel, CandidateSelector,
-    CompactionPolicy, Compilation, DefaultRoute, FamilyClassifier, FrontendProtocol, FrontendScope,
+    CacheTransitionPolicy, Candidate, CandidateId, CandidateModel, CompactionPolicy,
+    CompactionTarget, Compilation, DefaultRoute, FamilyClassifier, FrontendProtocol, FrontendScope,
     InventorySource, LaneTransitionPolicy, MatcherSpec, MinimumLearning, OfferSelector,
     PolicyDocument, PolicyOrigin, Presentation, PresentationId, PresentationSource, ProfileId,
     REQUESTED_MODEL_PARAMETER, RewriteId, RewriteRule, Route, RouteChain, RouteId, RouteReference,
@@ -344,65 +344,18 @@ impl<'a> LegacyBuilder<'a> {
         if spec.is_empty() || spec == "off" {
             return Ok(());
         }
-        let Some(provider) = self.config.default_backend_anthropic.as_deref() else {
-            return Ok(());
-        };
-        let Some(binding) =
-            binding_for(self.topology, ProtocolId::AnthropicMessages, Some(provider))
-        else {
-            return Ok(());
-        };
-        let route_id = RouteId::new("legacy-compaction")?;
-        let family = crate::middleware::models::family_of(spec);
-        let (model, upgrade_policy_id) = match family {
-            Some(family) if family.version.is_empty() => (
-                CandidateModel::OfferSelector {
-                    selector: CandidateSelector {
-                        include: vec![MatcherSpec::Regex(format!(
-                            r"^(?:claude-)?{}-[0-9]+(?:-[0-9]+)*$",
-                            regex::escape(&family.name)
-                        ))],
-                        exclude: vec![],
-                        ordering: SelectorOrdering::ClassifiedVersion {
-                            classifier_id: classifier_id(binding)?,
-                        },
-                    },
-                },
-                Some(upgrade_id(binding)?),
-            ),
-            _ => (
-                CandidateModel::Exact {
-                    model_id: spec.to_owned(),
-                },
-                None,
-            ),
-        };
-        self.policy.routes.push(Route {
-            id: route_id.clone(),
-            display_name: "Legacy cold compaction".to_owned(),
-            description: None,
-            parameters: vec![],
-            chain: RouteChain {
-                first: Candidate {
-                    id: CandidateId::new("legacy-compaction-target")?,
-                    binding_id: binding.id().clone(),
-                    model,
-                    upgrade_policy_id,
-                    alias_policy: model_map_for(self.topology, provider)
-                        .map(alias_policy)
-                        .transpose()?,
-                    required_capabilities: Default::default(),
-                    enabled: true,
-                    health_circuits: vec![],
-                },
-                steps: vec![],
-            },
-            lane_transition: LaneTransitionPolicy::MoveWhenCold,
-        });
+        let eligible_bindings = self
+            .topology
+            .routes()
+            .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
+            .map(|route| route.binding())
+            .filter(|binding| binding.provider() != "openrouter")
+            .map(|binding| binding.id().clone())
+            .collect();
         self.policy.compaction = Some(CompactionPolicy {
-            target: RouteReference {
-                route_id,
-                parameters: BTreeMap::new(),
+            target: CompactionTarget::RevisionOneLegacy {
+                model_spec: spec.to_owned(),
+                eligible_bindings,
             },
             lane_transition: LaneTransitionPolicy::MoveWhenCold,
             cache_transition: CacheTransitionPolicy::AllowWhenCold,
@@ -843,31 +796,50 @@ mod tests {
     #[test]
     fn compact_target_handles_none_off_family_and_exact() {
         let cases = [
-            (None, true, true),
-            (Some("off"), false, false),
-            (Some("sonnet"), true, true),
-            (Some("claude-sonnet-5"), true, false),
+            (None, Some("sonnet")),
+            (Some("off"), None),
+            (Some("sonnet"), Some("sonnet")),
+            (Some("claude-sonnet-5"), Some("claude-sonnet-5")),
         ];
-        for (spec, expected, selector) in cases {
+        for (spec, expected) in cases {
             let compact = spec
                 .map(|value| format!("compact_model = \"{value}\"\n"))
                 .unwrap_or_default();
-            let config = load_config(&format!("[providers.anthropic_sub]\n[gates]\n{compact}"));
+            let config = load_config(&format!(
+                "[providers.anthropic_sub]\n[providers.openrouter]\n[gates]\n{compact}"
+            ));
             let topology = topology(&config);
             let document = document(&config, &topology).unwrap();
-            assert_eq!(document.compaction.is_some(), expected, "{spec:?}");
-            if expected {
-                let route = document
-                    .routes
-                    .iter()
-                    .find(|route| route.id.as_str() == "legacy-compaction")
-                    .unwrap();
-                assert_eq!(
-                    matches!(
-                        route.chain.first.model,
-                        CandidateModel::OfferSelector { .. }
-                    ),
-                    selector
+            assert_eq!(
+                document.compaction.is_some(),
+                expected.is_some(),
+                "{spec:?}"
+            );
+            if let Some(expected) = expected {
+                let CompactionTarget::RevisionOneLegacy {
+                    model_spec,
+                    eligible_bindings,
+                } = &document.compaction.as_ref().unwrap().target
+                else {
+                    panic!("generated compaction is a legacy overlay")
+                };
+                assert_eq!(model_spec, expected);
+                assert!(
+                    eligible_bindings
+                        .iter()
+                        .any(|binding| { binding.as_str() == "anthropic_sub.anthropic_messages" })
+                );
+                assert!(
+                    eligible_bindings
+                        .iter()
+                        .all(|binding| { binding.as_str() != "openrouter.openrouter_messages" })
+                );
+                assert!(
+                    document
+                        .routes
+                        .iter()
+                        .all(|route| route.id.as_str() != "legacy-compaction"),
+                    "compaction preserves the ordinarily selected route"
                 );
             }
         }

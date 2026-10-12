@@ -351,6 +351,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         gate_model.clone(),
         None,
         None,
+        None,
         gate_model.clone(),
         false,
     ) {

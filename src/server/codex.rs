@@ -216,6 +216,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 effective_model.clone(),
                 None,
                 None,
+                None,
                 effective_model.clone(),
                 false,
             ) {

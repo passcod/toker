@@ -16,13 +16,14 @@ use super::canonical::generated_route_fingerprint;
 use super::{
     AdapterMetadata, AliasPolicy, ArgumentBinding, BindingId, BoundaryConsent,
     CacheTransitionPolicy, Candidate, CandidateEdge, CandidateId, CandidateModel, CaptureSchema,
-    ClassifierId, CompactionPolicy, CompiledMatcher, CostClass, Diagnostic, DiagnosticCode,
-    DiagnosticField, DiagnosticPath, FailureClass, FamilyClassifier, FrontendProtocol,
-    FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec, ParsedVersion,
-    PolicyFingerprint, PresentationId, PresentationSource, ProfileId, REQUESTED_MODEL_PARAMETER,
-    RewriteId, Route, RouteFingerprint, RouteId, RouteReference, RouteSemantics, SelectorOrdering,
-    Severity, StableId, Template, TemplateError, UpgradePolicy, UpgradePolicyId,
-    ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint, route_fingerprint,
+    ClassifierId, CompactionPolicy, CompactionTarget, CompiledMatcher, CostClass, Diagnostic,
+    DiagnosticCode, DiagnosticField, DiagnosticPath, FailureClass, FamilyClassifier,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec,
+    ParsedVersion, PolicyFingerprint, PresentationId, PresentationSource, ProfileId,
+    REQUESTED_MODEL_PARAMETER, RewriteId, Route, RouteFingerprint, RouteId, RouteReference,
+    RouteSemantics, SelectorOrdering, Severity, StableId, Template, TemplateError, UpgradePolicy,
+    UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint,
+    route_fingerprint,
 };
 
 /// Whether compilation is allowed to consume revision-one legacy learning.
@@ -472,21 +473,44 @@ impl CompiledUpgradePolicy {
 }
 
 #[derive(Debug)]
-pub struct CompiledCompaction {
-    target: CompiledRouteReference,
-    lane_transition: LaneTransitionPolicy,
-    cache_transition: CacheTransitionPolicy,
+pub enum CompiledCompaction {
+    Route {
+        target: CompiledRouteReference,
+        lane_transition: LaneTransitionPolicy,
+        cache_transition: CacheTransitionPolicy,
+    },
+    RevisionOneLegacy {
+        model_spec: String,
+        eligible_bindings: BTreeSet<BindingId>,
+    },
 }
 
 impl CompiledCompaction {
-    pub fn target(&self) -> &CompiledRouteReference {
-        &self.target
+    pub fn route(
+        &self,
+    ) -> Option<(
+        &CompiledRouteReference,
+        LaneTransitionPolicy,
+        CacheTransitionPolicy,
+    )> {
+        match self {
+            Self::Route {
+                target,
+                lane_transition,
+                cache_transition,
+            } => Some((target, *lane_transition, *cache_transition)),
+            Self::RevisionOneLegacy { .. } => None,
+        }
     }
-    pub fn lane_transition(&self) -> LaneTransitionPolicy {
-        self.lane_transition
-    }
-    pub fn cache_transition(&self) -> CacheTransitionPolicy {
-        self.cache_transition
+
+    pub fn revision_one_legacy(&self) -> Option<(&str, &BTreeSet<BindingId>)> {
+        match self {
+            Self::RevisionOneLegacy {
+                model_spec,
+                eligible_bindings,
+            } => Some((model_spec, eligible_bindings)),
+            Self::Route { .. } => None,
+        }
     }
 }
 
@@ -1465,18 +1489,55 @@ impl<'a> Compiler<'a> {
     ) -> Option<CompiledCompaction> {
         let item: CompactionPolicy = self.document.document().compaction.clone()?;
         let base = DiagnosticPath::root().field(f("compaction"));
-        let target = self.route_reference(
-            &item.target,
-            None,
-            &base.clone().field(f("target")),
-            routes,
-            compiled_routes,
-        )?;
-        Some(CompiledCompaction {
-            target,
-            lane_transition: item.lane_transition,
-            cache_transition: item.cache_transition,
-        })
+        match item.target {
+            CompactionTarget::Route(target) => {
+                let target = self.route_reference(
+                    &target,
+                    None,
+                    &base.clone().field(f("target")),
+                    routes,
+                    compiled_routes,
+                )?;
+                Some(CompiledCompaction::Route {
+                    target,
+                    lane_transition: item.lane_transition,
+                    cache_transition: item.cache_transition,
+                })
+            }
+            CompactionTarget::RevisionOneLegacy {
+                model_spec,
+                eligible_bindings,
+            } => {
+                if self.origin != PolicyOrigin::GeneratedRevisionOne {
+                    self.error(
+                        "legacy-compaction-forbidden",
+                        base.clone().field(f("target_kind")),
+                        &StableId::new("compaction").expect("static id"),
+                    );
+                    return None;
+                }
+                let mut bindings = BTreeSet::new();
+                for (index, binding_id) in eligible_bindings.into_iter().enumerate() {
+                    if self
+                        .binding(
+                            &binding_id,
+                            base.clone()
+                                .field(f("eligible_bindings"))
+                                .index(index)
+                                .expect("validated collection bound"),
+                            &StableId::new("compaction").expect("static id"),
+                        )
+                        .is_some()
+                    {
+                        bindings.insert(binding_id);
+                    }
+                }
+                Some(CompiledCompaction::RevisionOneLegacy {
+                    model_spec,
+                    eligible_bindings: bindings,
+                })
+            }
+        }
     }
 
     fn route_reference(

@@ -28,7 +28,7 @@ pub const MAX_MATCHER_BYTES: usize = 1_024;
 pub const MAX_TEMPLATE_BYTES: usize = 1_024;
 
 pub const MINIMUM_FORMAT_VERSION: u32 = 1;
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 pub const REQUESTED_MODEL_PARAMETER: &str = "requested_model";
 
 /// A stable policy identity with a deliberately narrow spelling.
@@ -295,6 +295,19 @@ impl PolicyDocument {
             return Err(DocumentError::FeatureRequiresFormat {
                 path: "/routes/*/chain/*/required_capabilities".to_owned(),
                 required: 2,
+            });
+        }
+        if self.format_version < 3
+            && self.compaction.as_ref().is_some_and(|compaction| {
+                matches!(
+                    compaction.target,
+                    CompactionTarget::RevisionOneLegacy { .. }
+                )
+            })
+        {
+            return Err(DocumentError::FeatureRequiresFormat {
+                path: "/compaction/target".to_owned(),
+                required: 3,
             });
         }
         check_optional_description(&self.description, "/description")?;
@@ -1052,15 +1065,88 @@ pub enum InventorySource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionPolicy {
-    pub target: RouteReference,
+    pub target: CompactionTarget,
     pub lane_transition: LaneTransitionPolicy,
     pub cache_transition: CacheTransitionPolicy,
 }
 
 impl CompactionPolicy {
     fn validate(&self, path: &str) -> Result<(), DocumentError> {
-        self.target.validate(&field(path, "target"))
+        match &self.target {
+            CompactionTarget::Route(target) => target.validate(&field(path, "target")),
+            CompactionTarget::RevisionOneLegacy {
+                model_spec,
+                eligible_bindings,
+            } => {
+                check_string(model_spec, &field(path, "model_spec"))?;
+                check_collection(eligible_bindings, &field(path, "eligible_bindings"))
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionTarget {
+    Route(RouteReference),
+    /// Revision-one compatibility overlay. Authored policy cannot select it.
+    RevisionOneLegacy {
+        model_spec: String,
+        eligible_bindings: Vec<BindingId>,
+    },
+}
+
+impl Serialize for CompactionTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Route(target) => target.serialize(serializer),
+            Self::RevisionOneLegacy {
+                model_spec,
+                eligible_bindings,
+            } => RevisionOneCompactionTarget {
+                kind: RevisionOneCompactionKind::RevisionOneLegacy,
+                model_spec: model_spec.clone(),
+                eligible_bindings: eligible_bindings.clone(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("kind").is_some() {
+            let legacy: RevisionOneCompactionTarget =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            return Ok(Self::RevisionOneLegacy {
+                model_spec: legacy.model_spec,
+                eligible_bindings: legacy.eligible_bindings,
+            });
+        }
+        serde_json::from_value(value)
+            .map(Self::Route)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionOneCompactionTarget {
+    kind: RevisionOneCompactionKind,
+    model_spec: String,
+    eligible_bindings: Vec<BindingId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RevisionOneCompactionKind {
+    RevisionOneLegacy,
 }
 
 fn default_true() -> bool {

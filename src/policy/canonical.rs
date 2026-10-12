@@ -18,10 +18,12 @@ use super::document::{
 
 const POLICY_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.document.v1\0";
 const POLICY_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.document.v2\0";
+const POLICY_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.document.v3\0";
 // Route semantics evolve independently from the document format. Change this
 // domain whenever the closed projection below changes meaning or shape.
 const ROUTE_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.route-semantics.v1\0";
 const ROUTE_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.route-semantics.v2\0";
+const ROUTE_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.route-semantics.v3\0";
 
 /// Limits applied before a document enters the runtime compiler.
 ///
@@ -73,11 +75,19 @@ pub fn decode_policy(
     JsonBoundsParser::new(text, limits).parse()?;
     let lexical: Value = serde_json::from_str(text)
         .map_err(|error| CanonicalError::TypedDocument(error.to_string()))?;
-    if lexical.get("format_version").and_then(Value::as_u64) == Some(1)
-        && uses_v2_capability_fields(&lexical)
-    {
+    let format_version = lexical.get("format_version").and_then(Value::as_u64);
+    if format_version == Some(1) && uses_v2_capability_fields(&lexical) {
         return Err(CanonicalError::InvalidDocument(
             "tool-choice capability fields require policy format version 2".to_owned(),
+        ));
+    }
+    if format_version.is_some_and(|version| version < 3)
+        && lexical
+            .pointer("/compaction/target/kind")
+            .is_some_and(|kind| kind == "revision_one_legacy")
+    {
+        return Err(CanonicalError::InvalidDocument(
+            "revision-one compaction target requires policy format version 3".to_owned(),
         ));
     }
     // Deserialize from the original token stream, not through `Value`:
@@ -226,6 +236,7 @@ pub fn policy_fingerprint(
     let domain = match document.document().format_version {
         1 => POLICY_FINGERPRINT_DOMAIN_V1,
         2 => POLICY_FINGERPRINT_DOMAIN_V2,
+        3 => POLICY_FINGERPRINT_DOMAIN_V3,
         version => return Err(CanonicalError::UnsupportedFormat(version)),
     };
     Ok(PolicyFingerprint(hash(domain, &policy_bytes(document)?)))
@@ -437,6 +448,7 @@ fn route_domain(format_version: u32) -> Result<&'static [u8], CanonicalError> {
     match format_version {
         1 => Ok(ROUTE_FINGERPRINT_DOMAIN_V1),
         2 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
+        3 => Ok(ROUTE_FINGERPRINT_DOMAIN_V3),
         version => Err(CanonicalError::UnsupportedFormat(version)),
     }
 }
@@ -890,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_format_domains_preserve_v1_and_separate_v2() {
+    fn policy_format_domains_preserve_prior_versions_and_separate_v3() {
         let mut v1 = full_document(route("display", None));
         v1.format_version = 1;
         let v1 = v1.validate().unwrap();
@@ -899,11 +911,28 @@ mod tests {
             .and_then(|semantics| route_fingerprint(&semantics))
             .unwrap();
 
-        let v2 = full_document(route("display", None)).validate().unwrap();
+        let mut v2 = full_document(route("display", None));
+        v2.format_version = 2;
+        v2.routes[0]
+            .chain
+            .first
+            .required_capabilities
+            .tool_choice_named = true;
+        let v2 = v2.validate().unwrap();
         assert_ne!(v1_policy, policy_fingerprint(&v2).unwrap());
+        let v2_route = RouteSemantics::from_document(&v2, &RouteId::new("route").unwrap())
+            .and_then(|semantics| route_fingerprint(&semantics))
+            .unwrap();
+        assert_ne!(v1_route, v2_route);
+
+        let v3 = full_document(route("display", None)).validate().unwrap();
         assert_ne!(
-            v1_route,
-            RouteSemantics::from_document(&v2, &RouteId::new("route").unwrap())
+            policy_fingerprint(&v2).unwrap(),
+            policy_fingerprint(&v3).unwrap()
+        );
+        assert_ne!(
+            v2_route,
+            RouteSemantics::from_document(&v3, &RouteId::new("route").unwrap())
                 .and_then(|semantics| route_fingerprint(&semantics))
                 .unwrap()
         );
@@ -942,6 +971,20 @@ mod tests {
         assert!(matches!(
             decode_policy(&old_reader_input, CanonicalLimits::default()),
             Err(CanonicalError::InvalidDocument(_))
+        ));
+
+        let mut invalid_v2 = v2.into_document();
+        invalid_v2.compaction = Some(crate::policy::CompactionPolicy {
+            target: crate::policy::CompactionTarget::RevisionOneLegacy {
+                model_spec: "sonnet".to_owned(),
+                eligible_bindings: vec![BindingId::new("provider.dialect").unwrap()],
+            },
+            lane_transition: LaneTransitionPolicy::MoveWhenCold,
+            cache_transition: CacheTransitionPolicy::AllowWhenCold,
+        });
+        assert!(matches!(
+            invalid_v2.validate(),
+            Err(crate::policy::DocumentError::FeatureRequiresFormat { required: 3, .. })
         ));
     }
 

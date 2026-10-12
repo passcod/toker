@@ -596,6 +596,7 @@ impl Server {
             required_capabilities,
             binding_affinity,
             class,
+            legacy_compaction: None,
             now_ms: now_ms(),
         }
     }
@@ -656,6 +657,7 @@ impl Server {
         target: &ModelTarget,
         baseline_model: Option<String>,
         upgraded_model: Option<String>,
+        retargeted_model: Option<String>,
         aliased_model: Option<String>,
         effective_model: Option<String>,
         compaction: bool,
@@ -672,6 +674,7 @@ impl Server {
             route_source,
             baseline_model,
             upgraded_model,
+            retargeted_model,
             aliased_model,
             effective_model: effective_model
                 .or_else(|| target.effective_model().map(str::to_owned))
