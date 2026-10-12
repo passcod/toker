@@ -2044,13 +2044,26 @@ impl CanonicalMessagesStream {
             self.translate_event(event);
         }
         if !self.frontend.turn_ended() {
-            self.ctx.take();
+            self.record_stream_error("response_protocol");
             self.failure = Some(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "upstream Messages stream closed before the turn ended",
             ));
         }
         self.upstream_done = true;
+    }
+
+    fn record_stream_error(&mut self, error_type: &str) {
+        if let Some(ctx) = self.ctx.take() {
+            record_anthropic_error(
+                &ctx,
+                self.status,
+                Some(error_type.to_owned()),
+                None,
+                None,
+                self.rate_limits.as_ref(),
+            );
+        }
     }
 
     fn finish_recording(&mut self) {
@@ -2097,7 +2110,7 @@ impl Stream for CanonicalMessagesStream {
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     tracing::warn!(%error, "upstream canonical Messages stream failed");
-                    this.ctx.take();
+                    this.record_stream_error("ambiguous_transport");
                     drop(this.in_flight.take());
                     this.upstream_done = true;
                     return std::task::Poll::Ready(Some(Err(std::io::Error::other(error))));
@@ -2111,6 +2124,7 @@ impl Stream for CanonicalMessagesStream {
 impl Drop for CanonicalMessagesStream {
     fn drop(&mut self) {
         self.abort.abort();
+        self.record_stream_error("client_cancelled");
     }
 }
 

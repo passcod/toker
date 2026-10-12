@@ -748,6 +748,12 @@ impl CanonicalChatStream {
         self.upstream_done = true;
     }
 
+    fn record_stream_error(&mut self, error_type: &str) {
+        if let Some(ctx) = self.ctx.take() {
+            record_error(&ctx, self.status, Some(error_type.to_owned()), None);
+        }
+    }
+
     fn finish_recording(&mut self) {
         if let Some(ctx) = self.ctx.take() {
             let (reported_model, capture) = std::mem::take(&mut self.observer).finish_parts();
@@ -787,7 +793,7 @@ impl Stream for CanonicalChatStream {
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     tracing::warn!(%error, "upstream canonical chat stream failed");
-                    this.ctx.take();
+                    this.record_stream_error("ambiguous_transport");
                     drop(this.in_flight.take());
                     return std::task::Poll::Ready(Some(Err(error)));
                 }
@@ -800,6 +806,7 @@ impl Stream for CanonicalChatStream {
 impl Drop for CanonicalChatStream {
     fn drop(&mut self) {
         self.abort.abort();
+        self.record_stream_error("client_cancelled");
     }
 }
 

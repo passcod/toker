@@ -1927,7 +1927,7 @@ async fn malformed_complete_messages_responses_are_rejected_and_unledgered() {
 }
 
 #[tokio::test]
-async fn client_hangup_aborts_the_upstream_and_records_no_row() {
+async fn client_hangup_aborts_upstream_and_records_cancellation() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1955,9 +1955,10 @@ async fn client_hangup_aborts_the_upstream_and_records_no_row() {
         "client hangup aborted the upstream request"
     );
 
-    // A hung-up stream records no row (plan: Server core).
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(store.count_requests().expect("count"), 0);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("client_cancelled"));
+    assert!(rows[0].attempt.is_some());
 }
 
 /// Read a response body to its end: `Err` when the transfer was
@@ -1971,7 +1972,7 @@ async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest
 }
 
 #[tokio::test]
-async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_no_row() {
+async fn an_upstream_failure_mid_stream_aborts_and_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1987,7 +1988,10 @@ async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_n
         "the client sees a transport error, not a clean end: {read:?}"
     );
 
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert!(rows[0].attempt.is_some());
 }
 
 #[tokio::test]
@@ -2051,7 +2055,7 @@ async fn a_stalled_upstream_stream_aborts_after_the_idle_timeout() {
         .expect("the idle timeout ends the stall");
     assert!(rest.is_err(), "a stall is an abort, not a clean end");
 
-    // The upstream request is released too, and nothing is recorded.
+    // The upstream request is released and its failed attempt is recorded.
     for _ in 0..100 {
         if mock.upstream_dropped.load(Ordering::SeqCst) {
             break;
@@ -2062,7 +2066,9 @@ async fn a_stalled_upstream_stream_aborts_after_the_idle_timeout() {
         mock.upstream_dropped.load(Ordering::SeqCst),
         "the stalled upstream request was dropped"
     );
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
 }
 
 #[tokio::test]
