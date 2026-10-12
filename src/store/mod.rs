@@ -536,6 +536,10 @@ impl Store {
         state::load_binding_learnings_for_model(&*self.conn()?, model_id)
     }
 
+    pub fn load_all_binding_learnings(&self) -> Result<Vec<BindingLearning>> {
+        state::load_all_binding_learnings(&*self.conn()?)
+    }
+
     pub fn load_binding_learnings(
         &self,
         binding_id: &crate::policy::BindingId,

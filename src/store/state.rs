@@ -1323,6 +1323,17 @@ pub(super) fn load_binding_learnings_for_model(
     )
 }
 
+pub(super) fn load_all_binding_learnings(conn: &Connection) -> Result<Vec<BindingLearning>> {
+    rows_of(
+        conn,
+        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
+                explicitly_promoted, updated_ms
+         FROM learned_models_by_binding ORDER BY binding_id, model_id",
+        [],
+        read_binding_learning,
+    )
+}
+
 pub(super) fn load_binding_learnings(
     conn: &Connection,
     binding_id: &BindingId,

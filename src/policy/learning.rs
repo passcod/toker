@@ -74,11 +74,13 @@ impl LearningView for LearningSnapshot {
         binding_id: &BindingId,
         model_id: &str,
     ) -> Result<RecencyEvidence, Self::Error> {
+        let legacy_model =
+            crate::catalog::model_identity(model_id).unwrap_or_else(|| model_id.to_owned());
         let scope = if self.covered_since.contains_key(&Some(binding_id.clone())) {
             Some(binding_id.clone())
         } else if self.covered_since.contains_key(&None) {
             return Ok(RecencyEvidence::Covered {
-                last_sent: self.recent.get(&(None, model_id.to_owned())).copied(),
+                last_sent: self.recent.get(&(None, legacy_model)).copied(),
                 covered_since: self.covered_since.get(&None).copied().flatten(),
             });
         } else {
@@ -98,10 +100,12 @@ impl LearningView for LearningSnapshot {
         binding_id: &BindingId,
         model_id: &str,
     ) -> Result<Option<LearnedEvidence>, Self::Error> {
+        let legacy_model =
+            crate::catalog::model_identity(model_id).unwrap_or_else(|| model_id.to_owned());
         Ok(self
             .learned
             .get(&(Some(binding_id.clone()), model_id.to_owned()))
-            .or_else(|| self.learned.get(&(None, model_id.to_owned())))
+            .or_else(|| self.learned.get(&(None, legacy_model)))
             .cloned())
     }
 
@@ -463,22 +467,21 @@ fn binding_snapshot(view: &BindingLearningView) -> crate::store::Result<Learning
         .map(|(binding, since)| (Some(binding.clone()), Some(*since)))
         .collect();
     let mut learned = BTreeMap::new();
-    let mut active_days = BTreeMap::new();
-    for binding in recency.covered_since.keys() {
-        let entries = view.store.load_binding_learnings(binding)?;
-        let days = entries
-            .iter()
-            .flat_map(|entry| entry.days.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .len();
-        active_days.insert(Some(binding.clone()), days);
-        for entry in entries {
-            learned.insert(
-                (Some(binding.clone()), entry.model_id.clone()),
-                binding_evidence(entry),
-            );
-        }
+    let mut days_by_binding = BTreeMap::<BindingId, BTreeSet<String>>::new();
+    for entry in view.store.load_all_binding_learnings()? {
+        days_by_binding
+            .entry(entry.binding_id.clone())
+            .or_default()
+            .extend(entry.days.iter().cloned());
+        learned.insert(
+            (Some(entry.binding_id.clone()), entry.model_id.clone()),
+            binding_evidence(entry),
+        );
     }
+    let active_days = days_by_binding
+        .into_iter()
+        .map(|(binding, days)| (Some(binding), days.len()))
+        .collect();
     Ok(LearningSnapshot {
         learned,
         recent,
@@ -623,6 +626,17 @@ mod tests {
         assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
         assert_eq!(learned.max_prompt(), Some(123_456));
         assert_eq!(view.known_models(&second).unwrap(), ["claude-sonnet-5"]);
+        let snapshot = view.snapshot();
+        assert_eq!(
+            snapshot
+                .recently_sent(&first, "Claude-Sonnet-5[1m]")
+                .unwrap(),
+            view.recently_sent(&first, "Claude-Sonnet-5[1m]").unwrap()
+        );
+        assert_eq!(
+            snapshot.learned(&first, "Claude-Sonnet-5[1m]").unwrap(),
+            view.learned(&first, "Claude-Sonnet-5[1m]").unwrap()
+        );
     }
 
     #[test]
@@ -693,6 +707,11 @@ mod tests {
         assert_eq!(view.known_models(&second).unwrap(), ["other"]);
         assert_eq!(view.active_days(&first).unwrap(), 2);
         assert_eq!(view.active_days(&second).unwrap(), 1);
+        let snapshot = view.snapshot();
+        assert_eq!(snapshot.known_models(&first).unwrap(), ["shared-name"]);
+        assert_eq!(snapshot.known_models(&second).unwrap(), ["other"]);
+        assert_eq!(snapshot.active_days(&first).unwrap(), 2);
+        assert_eq!(snapshot.active_days(&second).unwrap(), 1);
         assert_eq!(
             view.recently_sent(&first, "shared-name").unwrap(),
             RecencyEvidence::Unknown
