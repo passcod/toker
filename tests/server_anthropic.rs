@@ -1372,18 +1372,27 @@ async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
             captured[0].headers.get("x-claude-code-session-id"),
         );
 
-        // One row, for the attempt that answered, marked as rewritten.
-        let rows = wait_for_rows(&store, 1).await;
-        let row = &rows[0];
-        assert_eq!(row.status, None, "a measurement row");
+        let rows = wait_for_rows(&store, 2).await;
+        let first = &rows[0];
+        let second = &rows[1];
+        assert_eq!(first.status, Some(400), "the refusal is its own row");
+        assert_eq!(second.status, None, "the retry is the measurement row");
+        let first_attempt = first.attempt.as_ref().expect("first attempt provenance");
+        let second_attempt = second.attempt.as_ref().expect("retry provenance");
+        assert_eq!(first_attempt.attempt_index.get(), 0);
+        assert_eq!(first_attempt.reason, toker::store::AttemptReason::Initial);
+        assert_eq!(second_attempt.attempt_index.get(), 1);
         assert_eq!(
-            row.extra
-                .as_ref()
-                .and_then(|extra| extra.get("thinkingRewrite"))
-                .and_then(Value::as_str),
-            Some("between_tools")
+            second_attempt.reason,
+            toker::store::AttemptReason::ThinkingNegotiation
         );
-        assert_no_more_rows(&store, 1).await;
+        assert_eq!(
+            first_attempt.attempt_group_id,
+            second_attempt.attempt_group_id
+        );
+        assert_eq!(first.binding_id, second.binding_id);
+        assert!(first.policy_routing.is_none() && second.policy_routing.is_none());
+        assert_no_more_rows(&store, 2).await;
     }
 }
 
@@ -1438,16 +1447,18 @@ async fn the_thinking_retry_happens_once() {
     );
     assert_eq!(mock.captured().len(), 2, "never a third attempt");
 
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows[0].status, Some(400));
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(rows.iter().all(|row| row.status == Some(400)));
+    let first = rows[0].attempt.as_ref().expect("first attempt");
+    let second = rows[1].attempt.as_ref().expect("retry attempt");
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(first.reason, toker::store::AttemptReason::Initial);
+    assert_eq!(second.attempt_index.get(), 1);
     assert_eq!(
-        rows[0]
-            .extra
-            .as_ref()
-            .and_then(|extra| extra.get("thinkingRewrite"))
-            .and_then(Value::as_str),
-        Some("between_tools")
+        second.reason,
+        toker::store::AttemptReason::ThinkingNegotiation
     );
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
 }
 
 #[tokio::test]

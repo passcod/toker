@@ -54,7 +54,7 @@ use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{CostKind, RequestRow, RowKind, SessionLineage};
+use crate::store::{AttemptProvenance, CostKind, RequestRow, RowKind, SessionLineage};
 use crate::translate::TranslationReport;
 
 use super::Server;
@@ -82,6 +82,9 @@ pub(crate) struct AnthropicRecordCtx {
     /// The exact legacy-selected backend binding. This identifies the wire
     /// dialect without implying a policy revision or candidate selection.
     pub(crate) binding_id: BindingId,
+    /// The actual upstream send this response completes. Legacy routing owns
+    /// no policy revision, but every send still has group/index/reason identity.
+    pub(crate) attempt: Option<AttemptProvenance>,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
     /// the header was absent.
     pub(crate) betas: Option<Value>,
@@ -114,11 +117,6 @@ pub(crate) struct AnthropicRecordCtx {
     /// The frontend's name from its `/f/<frontend>` prefix, recorded in
     /// `extra` ([`with_frontend`]).
     pub(crate) frontend: Option<String>,
-    /// The upstream refused this request's `thinking: disabled` and it was
-    /// sent again as `between_tools` (the server's thinking retry), so the
-    /// row describes the second attempt. Recorded in `extra` as
-    /// `thinkingRewrite`; the refused first attempt has no row of its own.
-    pub(crate) thinking_rewritten: bool,
     /// Content-free semantic omissions made by canonical rendering.
     pub(crate) translation_report: Option<TranslationReport>,
 }
@@ -259,10 +257,7 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 /// served, which a host-side alias or an upstream substitution can make
 /// differ from what was sent — and recency must follow the served
 /// identity. In-memory and infallible, so it cannot cost the row.
-fn insert(ctx: &AnthropicRecordCtx, mut row: RequestRow) {
-    if ctx.thinking_rewritten {
-        mark_thinking_rewrite(&mut row);
-    }
+fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
@@ -270,19 +265,6 @@ fn insert(ctx: &AnthropicRecordCtx, mut row: RequestRow) {
     ctx.server
         .models
         .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
-}
-
-/// Mark a row whose request went out the second time with `thinking`
-/// rewritten to `between_tools`, the same way [`with_frontend`] adds its
-/// key: into an object `extra`, or as a new one.
-fn mark_thinking_rewrite(row: &mut RequestRow) {
-    match &mut row.extra {
-        Some(Value::Object(extra)) => {
-            extra.insert("thinkingRewrite".to_owned(), json!("between_tools"));
-        }
-        Some(_) => {}
-        None => row.extra = Some(json!({ "thinkingRewrite": "between_tools" })),
-    }
 }
 
 /// Whether the capture carries any usage metric at all. Only responses
@@ -558,7 +540,7 @@ fn measurement_row(
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     }
@@ -684,7 +666,7 @@ fn error_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     }
@@ -1343,7 +1325,7 @@ pub(crate) fn record_responses_measurement(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     };
@@ -1505,7 +1487,7 @@ pub(crate) fn record_codex_error(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     };

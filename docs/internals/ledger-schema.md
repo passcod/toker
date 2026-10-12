@@ -71,11 +71,12 @@ regression.
 - `extra.compactMarker` says where a compaction wording sat when one appeared in
   the last four messages, matched or not: `fromEnd`, `role`, `trailing` (the
   roles after it), `lineStart`, `toolResult`. Absent before 2026-10-06.
-- `extra.thinkingRewrite` is `"between_tools"` on the row of a request the
-  upstream refused for its `thinking: disabled` and toker sent again with
-  `between_tools` (see [routing.md](routing.md)). The refused attempt has no
-  row of its own, so this key is how many refusals there were. Absent before
-  2026-10-09, when the refusal was recorded as an ordinary error row instead.
+- A `thinking: disabled` refusal and its `between_tools` retry are separate
+  rows in one attempt group (see [routing.md](routing.md)): index zero is the
+  400 with reason `initial`, and index one has reason `thinking_negotiation`.
+  Historical rows from 2026-10-09 through 2026-10-13 recorded only the retry
+  and carried `extra.thinkingRewrite = "between_tools"`; they are not
+  backfilled because the refused attempt's complete evidence is unavailable.
 - `summarising` on toker's own rows was never set from the cutover until
   2026-10-06 (a trailing system message hid the prompt; see
   [compaction.md](compaction.md)), so a compaction count by that flag over that

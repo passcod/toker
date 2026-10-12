@@ -844,6 +844,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         effective_model: ctx.effective_model,
         backend,
         binding_id: ctx.binding_id,
+        attempt: None,
         betas: None,
         shape,
         ping: ctx.ping,
@@ -855,7 +856,6 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         forced_to: None,
         model_mappings: None,
         frontend: ctx.frontend,
-        thinking_rewritten: false,
         translation_report: None,
     }
 }

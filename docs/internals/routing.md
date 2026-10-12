@@ -273,8 +273,8 @@ is the only evidence. The cost is one extra round trip per call during a
 burst; the 400 arrives before any stream begins, so the client sees only the
 retry's answer. The canonical request renderer preserves both explicit modes;
 the retry changes only that semantic value in the already-rendered Messages
-body. The refusal's meters still feed the gate, and the retried
-row carries `extra.thinkingRewrite` (see
+body. The refusal's meters still feed the gate, and both sends get separate
+ledger rows in one attempt group (see
 [ledger-schema.md](ledger-schema.md)).
 
 This keys on the upstream's answer, not on the backend or the model, so it

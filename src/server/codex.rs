@@ -242,6 +242,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         effective_model: effective_model.clone(),
         backend: backend.clone(),
         binding_id: target.binding().id().clone(),
+        attempt: None,
         betas: None,
         shape: prepared_shape.map(|(_, shape)| shape),
         ping,
@@ -253,7 +254,6 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         forced_to: None,
         model_mappings: None,
         frontend,
-        thinking_rewritten: false,
         translation_report: None,
     });
 

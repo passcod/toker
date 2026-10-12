@@ -2135,6 +2135,7 @@ api_key = "ak-literal-test"
             effective_model: Some("claude-opus-5".to_owned()),
             backend: target.provider().clone(),
             binding_id: target.binding().id().clone(),
+            attempt: None,
             betas: None,
             shape: None,
             ping: false,
@@ -2146,7 +2147,6 @@ api_key = "ak-literal-test"
             forced_to: None,
             model_mappings: None,
             frontend: None,
-            thinking_rewritten: false,
             translation_report: None,
         };
         let mut observer = crate::observe::AnthropicObserver::new();

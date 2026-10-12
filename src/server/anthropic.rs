@@ -79,7 +79,9 @@ use crate::middleware::quota::{
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, ModelTarget, ProtocolId};
-use crate::store::{Allowance, MetersSnapshot};
+use crate::store::{
+    Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, MetersSnapshot,
+};
 use crate::translate;
 
 use super::InFlightGuard;
@@ -456,6 +458,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             effective_model,
             backend: backend.clone(),
             binding_id: target.binding().id().clone(),
+            attempt: None,
             betas,
             shape: shape.clone(),
             ping,
@@ -466,7 +469,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forced_from: None,
             forced_to: None,
             model_mappings: None,
-            thinking_rewritten: false,
             translation_report: None,
         });
         gate_shape = shape;
@@ -1608,10 +1610,28 @@ pub(crate) async fn retry_thinking_off(
             },
         }));
     }
-    note_meters(server, backend, &headers);
     tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     if let Some(ctx) = record {
-        ctx.thinking_rewritten = true;
+        let (error_type, error_message) = error_pair(&buffered.bytes);
+        let rate_limits = parse_rate_limits(&headers);
+        record_anthropic_error(
+            ctx,
+            status.as_u16(),
+            error_type,
+            error_message,
+            retry_after_ms(&headers),
+            rate_limits.as_ref(),
+        );
+        let group = ctx
+            .attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_group_id.clone())
+            .unwrap_or_else(AttemptGroupId::fresh);
+        ctx.attempt = Some(AttemptProvenance {
+            attempt_group_id: group,
+            attempt_index: AttemptIndex::try_from(1).expect("one retry index is valid"),
+            reason: AttemptReason::ThinkingNegotiation,
+        });
         server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }
     send_upstream(server, backend, parts, retry, &[])
