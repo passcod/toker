@@ -354,6 +354,29 @@ impl ReadyChatAttempt {
                 return super::proxy::transport_failure(super::proxy::ErrorWire::Openai, &error);
             }
         };
+        let upstream = match super::attempt::precommit_openai_chat(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
+            | Ok(super::attempt::PrecommitOutcome::Failure {
+                response: Some(response),
+                ..
+            }) => response,
+            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                return super::proxy::upstream_failure(
+                    super::proxy::ErrorWire::Openai,
+                    "toker could not interpret the upstream response before commitment",
+                );
+            }
+            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
+                return super::proxy::upstream_failure(
+                    super::proxy::ErrorWire::Openai,
+                    "toker upstream request was cancelled before response commitment",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                return super::proxy::truncated_body(super::proxy::ErrorWire::Openai);
+            }
+        };
         super::proxy::forward_chat_canonical(
             upstream,
             self.record,

@@ -157,6 +157,15 @@ pub(crate) fn classify_responses_error(
     }
 }
 
+fn classify_openai_event(body: &Value) -> Option<AttemptFailure> {
+    body.get("error").map(|_| {
+        let mut failure = classify_openai_error(StatusCode::OK, body);
+        failure.mechanism = FailureMechanism::InBandEvent;
+        failure.status = None;
+        failure
+    })
+}
+
 fn value_code(value: &Value) -> Option<&str> {
     value.as_str()
 }
@@ -218,6 +227,90 @@ pub(crate) async fn precommit_sse(
     }
 }
 
+pub(crate) async fn precommit_openai_chat(
+    response: reqwest::Response,
+) -> Result<PrecommitOutcome<reqwest::Response>, reqwest::Error> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if super::proxy::is_compressed(&headers) {
+        return Ok(PrecommitOutcome::Accepted {
+            response,
+            evidence: CommitEvidence::NonStreamingComplete,
+        });
+    }
+    if !status.is_success() {
+        let buffered = buffer_up_to(response, PRECOMMIT_BODY_CAP).await?;
+        let complete = buffered.rest.is_none();
+        let failure = complete.then(|| {
+            let body = serde_json::from_slice::<Value>(&buffered.bytes).unwrap_or(Value::Null);
+            classify_openai_error(status, &body)
+        });
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
+        return Ok(match failure {
+            Some(failure) => PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => PrecommitOutcome::Accepted {
+                response,
+                evidence: CommitEvidence::ByteCapReached,
+            },
+        });
+    }
+    if super::proxy::is_event_stream(&headers) {
+        let (buffered, event, evidence) = precommit_sse(response).await?;
+        let parsed = event
+            .as_ref()
+            .map(|event| serde_json::from_str::<Value>(&event.data()));
+        let failure = parsed
+            .as_ref()
+            .and_then(|parsed| parsed.as_ref().ok())
+            .and_then(classify_openai_event);
+        let canonical = failure.is_none()
+            && event.as_ref().is_some_and(|event| {
+                !crate::translate::openai_chat_backend::OpenAiChatResponseStream::new()
+                    .feed_sse(event)
+                    .is_empty()
+            });
+        if failure.is_none()
+            && evidence != CommitEvidence::ByteCapReached
+            && (event.is_none() || parsed.as_ref().is_some_and(Result::is_err))
+        {
+            return Ok(protocol_failure(status));
+        }
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
+        return Ok(match failure {
+            Some(failure) => PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => PrecommitOutcome::Accepted {
+                response,
+                evidence: if canonical {
+                    CommitEvidence::CanonicalEvent
+                } else {
+                    evidence
+                },
+            },
+        });
+    }
+    Ok(PrecommitOutcome::Accepted {
+        response,
+        evidence: CommitEvidence::NonStreamingComplete,
+    })
+}
+
+fn protocol_failure<T>(status: StatusCode) -> PrecommitOutcome<T> {
+    PrecommitOutcome::Failure {
+        failure: AttemptFailure {
+            class: None,
+            mechanism: FailureMechanism::ResponseProtocol,
+            status: Some(status.as_u16()),
+        },
+        response: None,
+    }
+}
+
 pub(crate) async fn precommit_anthropic(
     response: reqwest::Response,
 ) -> Result<PrecommitOutcome<reqwest::Response>, reqwest::Error> {
@@ -267,14 +360,7 @@ pub(crate) async fn precommit_anthropic(
             && evidence != CommitEvidence::ByteCapReached
             && (event.is_none() || parsed.as_ref().is_some_and(Result::is_err))
         {
-            return Ok(PrecommitOutcome::Failure {
-                failure: AttemptFailure {
-                    class: None,
-                    mechanism: FailureMechanism::ResponseProtocol,
-                    status: Some(status.as_u16()),
-                },
-                response: None,
-            });
+            return Ok(protocol_failure(status));
         }
         let response = super::proxy::rebuilt_response(status, headers, buffered);
         return Ok(match failure {
@@ -467,6 +553,72 @@ mod tests {
                 (outcome, expected) => panic!("unexpected {outcome:?} for {expected:?}"),
             };
             assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_precommit_classifies_first_events_without_changing_bytes() {
+        for (frame, expected) in [
+            (
+                "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                Ok(CommitEvidence::CanonicalEvent),
+            ),
+            (
+                "data: {\"type\":\"extension\"}\n\n",
+                Ok(CommitEvidence::CanonicalEvent),
+            ),
+            (
+                "data: {\"error\":{\"type\":\"rate_limit_error\"}}\n\n",
+                Err(FailureClass::RateLimit),
+            ),
+        ] {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::copy_from_slice(frame.as_bytes()),
+            )]);
+            let outcome = precommit_openai_chat(streaming_response(body))
+                .await
+                .unwrap();
+            let response = match (outcome, expected) {
+                (PrecommitOutcome::Accepted { response, evidence }, Ok(expected_evidence)) => {
+                    assert_eq!(evidence, expected_evidence);
+                    response
+                }
+                (
+                    PrecommitOutcome::Failure {
+                        failure,
+                        response: Some(response),
+                    },
+                    Err(expected_class),
+                ) => {
+                    assert_eq!(failure.class, Some(expected_class));
+                    assert_eq!(failure.mechanism, FailureMechanism::InBandEvent);
+                    response
+                }
+                (outcome, expected) => panic!("unexpected {outcome:?} for {expected:?}"),
+            };
+            assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_precommit_rejects_invalid_or_absent_first_events() {
+        for bytes in [
+            &b""[..],
+            &b": keepalive\n\n"[..],
+            &b"data: {not json}\n\n"[..],
+        ] {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::copy_from_slice(bytes),
+            )]);
+            let outcome = precommit_openai_chat(streaming_response(body))
+                .await
+                .unwrap();
+            let PrecommitOutcome::Failure { failure, response } = outcome else {
+                panic!("invalid first event was accepted: {outcome:?}");
+            };
+            assert_eq!(failure.class, None);
+            assert_eq!(failure.mechanism, FailureMechanism::ResponseProtocol);
+            assert!(response.is_none());
         }
     }
 
