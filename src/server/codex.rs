@@ -225,7 +225,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                     facts.now_ms,
                 );
                 let shadow_lane =
-                    server.shadow_lane(lane.as_ref(), Some(target.binding()), facts.now_ms);
+                    server.shadow_lane(lane.as_ref(), Some(target.binding()), facts.now_ms, false);
                 server.observe_policy_shadow(facts, credentials, shadow_lane, legacy);
             }
         }

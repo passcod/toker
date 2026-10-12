@@ -1425,7 +1425,12 @@ fn observe_messages_shadow(
     ) else {
         return;
     };
-    let lane = server.shadow_lane(lane, Some(target.binding()), facts.now_ms);
+    let lane = server.shadow_lane(
+        lane,
+        Some(target.binding()),
+        facts.now_ms,
+        facts.class == crate::policy::RequestClass::Compaction,
+    );
     let credentials =
         server.shadow_credentials(headers, ProtocolId::AnthropicMessages, facts.now_ms);
     server.observe_policy_shadow(facts, credentials, lane, legacy);

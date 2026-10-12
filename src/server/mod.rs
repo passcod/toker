@@ -605,10 +605,25 @@ impl Server {
         lane: Option<&crate::store::Lane>,
         binding: Option<&crate::routing::BackendBinding>,
         now: i64,
+        compaction: bool,
     ) -> Option<LaneFacts> {
         let lane = lane?;
+        let temperature = if compaction
+            && !crate::middleware::cold::lane_is_cold(
+                Some(lane),
+                self.config.gates.cold_min_tokens,
+                self.config
+                    .gates
+                    .cold_idle_min
+                    .map(|minutes| (minutes * 60_000.0) as i64),
+                now,
+            ) {
+            crate::policy::CacheTemperature::Unknown
+        } else {
+            cache_temperature(lane, binding, now)
+        };
         Some(LaneFacts {
-            temperature: cache_temperature(lane, binding, now),
+            temperature,
             pinned: lane.pin.as_ref().map(|pin| crate::policy::ProvisionalPin {
                 policy_revision_id: Some(pin.policy_revision_id),
                 // The shadow worker fills this after loading the pin's
