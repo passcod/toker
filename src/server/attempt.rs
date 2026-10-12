@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::observe::{SseEvent, SseSplitter};
 use crate::policy::FailureClass;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse};
+use crate::store::{AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason};
 
 use super::proxy::{Buffered, PRECOMMIT_BODY_CAP, buffer_up_to};
 
@@ -59,6 +60,14 @@ pub(crate) enum PrecommitOutcome<T> {
         response: Option<T>,
     },
     Cancelled,
+}
+
+pub(crate) fn initial_provenance() -> AttemptProvenance {
+    AttemptProvenance {
+        attempt_group_id: AttemptGroupId::fresh(),
+        attempt_index: AttemptIndex::zero(),
+        reason: AttemptReason::Initial,
+    }
 }
 
 /// Classify a complete Anthropic-native error without inspecting message text.

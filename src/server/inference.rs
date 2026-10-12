@@ -211,11 +211,7 @@ impl ReadyMessagesAttempt {
 
     async fn execute(mut self, server: Server) -> Response {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(crate::store::AttemptProvenance {
-                attempt_group_id: crate::store::AttemptGroupId::fresh(),
-                attempt_index: crate::store::AttemptIndex::zero(),
-                reason: crate::store::AttemptReason::Initial,
-            });
+            ctx.attempt = Some(super::attempt::initial_provenance());
         }
         let sent = self.body.clone();
         let upstream = match super::proxy::send_upstream(
@@ -333,11 +329,7 @@ impl ReadyChatAttempt {
 
     async fn execute(mut self, server: Server) -> Response {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(crate::store::AttemptProvenance {
-                attempt_group_id: crate::store::AttemptGroupId::fresh(),
-                attempt_index: crate::store::AttemptIndex::zero(),
-                reason: crate::store::AttemptReason::Initial,
-            });
+            ctx.attempt = Some(super::attempt::initial_provenance());
         }
         let upstream = match super::proxy::send_upstream(
             &server,
