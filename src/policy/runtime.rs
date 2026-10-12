@@ -4,7 +4,7 @@
 //! grant routing authority: handlers still decide whether a captured policy is
 //! observational or authoritative.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::offers::OfferInventory;
@@ -28,6 +28,7 @@ pub struct PolicySnapshot {
     inventory: Arc<OfferInventory>,
     availability: Arc<AvailabilitySnapshot>,
     inventory_generation: u64,
+    catalogue_generations: Arc<BTreeMap<BindingId, u64>>,
     credential_generations: Arc<BTreeMap<BindingId, u64>>,
 }
 
@@ -36,6 +37,7 @@ pub(crate) struct PolicyEvidence {
     inventory: Arc<OfferInventory>,
     availability: Arc<AvailabilitySnapshot>,
     inventory_generation: u64,
+    catalogue_generations: Arc<BTreeMap<BindingId, u64>>,
     credential_generations: Arc<BTreeMap<BindingId, u64>>,
 }
 
@@ -68,6 +70,13 @@ impl PolicySnapshot {
         self.inventory_generation
     }
 
+    pub fn catalogue_generation(&self, binding_id: &BindingId) -> u64 {
+        self.catalogue_generations
+            .get(binding_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub fn credential_generation(&self, binding_id: &BindingId) -> u64 {
         self.credential_generations
             .get(binding_id)
@@ -81,6 +90,7 @@ struct RuntimeState {
     inventory: Arc<OfferInventory>,
     availability: Arc<AvailabilitySnapshot>,
     inventory_generation: u64,
+    catalogue_generations: Arc<BTreeMap<BindingId, u64>>,
     credential_generations: Arc<BTreeMap<BindingId, u64>>,
 }
 
@@ -97,7 +107,7 @@ pub struct HealthCircuitKey {
 #[derive(Debug, Clone, Copy)]
 struct OpenCircuit {
     until_ms: i64,
-    inventory_generation: u64,
+    catalogue_generation: u64,
     credential_generation: u64,
 }
 
@@ -160,6 +170,35 @@ pub struct PolicyRuntime {
     mutation: Mutex<()>,
 }
 
+fn bump_generations(
+    generations: &mut Arc<BTreeMap<BindingId, u64>>,
+    changed: &BTreeSet<BindingId>,
+) {
+    if changed.is_empty() {
+        return;
+    }
+    let mut next = (**generations).clone();
+    for binding_id in changed {
+        next.entry(binding_id.clone())
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+    }
+    *generations = Arc::new(next);
+}
+
+fn clear_binding_circuits(
+    circuits: &Mutex<HashMap<HealthCircuitKey, OpenCircuit>>,
+    changed: &BTreeSet<BindingId>,
+) {
+    if changed.is_empty() {
+        return;
+    }
+    circuits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|key, _| !changed.contains(&key.binding_id));
+}
+
 impl PolicyRuntime {
     pub fn new(
         store: Arc<Store>,
@@ -168,6 +207,7 @@ impl PolicyRuntime {
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
     ) -> Self {
+        let catalogue_generations = Arc::new(BTreeMap::new());
         let credential_generations = Arc::new(BTreeMap::new());
         Self {
             store,
@@ -177,6 +217,7 @@ impl PolicyRuntime {
                 inventory,
                 availability,
                 inventory_generation: 0,
+                catalogue_generations,
                 credential_generations,
             }),
             revisions: Mutex::new(RevisionCache::default()),
@@ -198,6 +239,7 @@ impl PolicyRuntime {
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
             inventory_generation: state.inventory_generation,
+            catalogue_generations: state.catalogue_generations.clone(),
             credential_generations: state.credential_generations.clone(),
         }))
     }
@@ -220,6 +262,7 @@ impl PolicyRuntime {
         policy: Arc<CompiledPolicy>,
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
+        changed_catalogue_bindings: &BTreeSet<BindingId>,
     ) -> Arc<PolicySnapshot> {
         let _mutation = self
             .mutation
@@ -230,6 +273,7 @@ impl PolicyRuntime {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.inventory_generation = state.inventory_generation.saturating_add(1);
+        bump_generations(&mut state.catalogue_generations, changed_catalogue_bindings);
         state.candidate = Some(policy.clone());
         state.inventory = inventory.clone();
         state.availability = availability.clone();
@@ -241,12 +285,10 @@ impl PolicyRuntime {
             inventory,
             availability,
             inventory_generation: state.inventory_generation,
+            catalogue_generations: state.catalogue_generations.clone(),
             credential_generations: state.credential_generations.clone(),
         });
-        self.circuits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        clear_binding_circuits(&self.circuits, changed_catalogue_bindings);
         snapshot
     }
 
@@ -254,6 +296,7 @@ impl PolicyRuntime {
         &self,
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
+        changed_catalogue_bindings: &BTreeSet<BindingId>,
     ) {
         let _mutation = self
             .mutation
@@ -264,13 +307,11 @@ impl PolicyRuntime {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.inventory_generation = state.inventory_generation.saturating_add(1);
+        bump_generations(&mut state.catalogue_generations, changed_catalogue_bindings);
         state.inventory = inventory;
         state.availability = availability;
         state.candidate = None;
-        self.circuits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        clear_binding_circuits(&self.circuits, changed_catalogue_bindings);
     }
 
     /// Capture a stored revision against the current immutable live evidence.
@@ -334,6 +375,7 @@ impl PolicyRuntime {
             inventory: evidence.inventory.clone(),
             availability: evidence.availability.clone(),
             inventory_generation: evidence.inventory_generation,
+            catalogue_generations: evidence.catalogue_generations.clone(),
             credential_generations: evidence.credential_generations.clone(),
         }))
     }
@@ -347,6 +389,7 @@ impl PolicyRuntime {
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
             inventory_generation: state.inventory_generation,
+            catalogue_generations: state.catalogue_generations.clone(),
             credential_generations: state.credential_generations.clone(),
         }
     }
@@ -369,6 +412,7 @@ impl PolicyRuntime {
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
             inventory_generation: state.inventory_generation,
+            catalogue_generations: state.catalogue_generations.clone(),
             credential_generations: state.credential_generations.clone(),
         };
         let snapshot = Arc::new(PolicySnapshot {
@@ -379,6 +423,7 @@ impl PolicyRuntime {
             inventory: evidence.inventory.clone(),
             availability: evidence.availability.clone(),
             inventory_generation: evidence.inventory_generation,
+            catalogue_generations: evidence.catalogue_generations.clone(),
             credential_generations: evidence.credential_generations.clone(),
         });
         let circuits = self.open_circuits_with_evidence(pinned_revision, &evidence, now_ms);
@@ -420,7 +465,7 @@ impl PolicyRuntime {
                 key.clone(),
                 OpenCircuit {
                     until_ms,
-                    inventory_generation: snapshot.inventory_generation,
+                    catalogue_generation: snapshot.catalogue_generation(&key.binding_id),
                     credential_generation: snapshot.credential_generation(&key.binding_id),
                 },
             );
@@ -443,14 +488,14 @@ impl PolicyRuntime {
             circuits.remove(key);
             return false;
         }
-        circuit.inventory_generation == snapshot.inventory_generation
+        circuit.catalogue_generation == snapshot.catalogue_generation(&key.binding_id)
             && circuit.credential_generation == snapshot.credential_generation(&key.binding_id)
     }
 
     pub fn open_circuits(&self, snapshot: &PolicySnapshot, now_ms: i64) -> super::CircuitSnapshot {
         self.open_circuits_for(
             snapshot.revision_id,
-            snapshot.inventory_generation,
+            &snapshot.catalogue_generations,
             &snapshot.credential_generations,
             now_ms,
         )
@@ -464,7 +509,7 @@ impl PolicyRuntime {
     ) -> super::CircuitSnapshot {
         self.open_circuits_for(
             revision_id,
-            evidence.inventory_generation,
+            &evidence.catalogue_generations,
             &evidence.credential_generations,
             now_ms,
         )
@@ -473,7 +518,7 @@ impl PolicyRuntime {
     fn open_circuits_for(
         &self,
         revision_id: Option<i64>,
-        inventory_generation: u64,
+        catalogue_generations: &BTreeMap<BindingId, u64>,
         credential_generations: &BTreeMap<BindingId, u64>,
         now_ms: i64,
     ) -> super::CircuitSnapshot {
@@ -489,7 +534,11 @@ impl PolicyRuntime {
             .iter()
             .filter(|(key, circuit)| {
                 key.policy_revision_id == revision_id
-                    && circuit.inventory_generation == inventory_generation
+                    && circuit.catalogue_generation
+                        == catalogue_generations
+                            .get(&key.binding_id)
+                            .copied()
+                            .unwrap_or_default()
                     && circuit.credential_generation
                         == credential_generations
                             .get(&key.binding_id)
@@ -611,6 +660,7 @@ mod tests {
             compiled("replacement"),
             Arc::new(OfferInventory::default()),
             Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::new(),
         );
         assert_eq!(second.inventory_generation(), 1);
         assert_eq!(first.inventory_generation(), 0);
@@ -624,6 +674,7 @@ mod tests {
         runtime.replace_evidence_and_clear_candidate(
             Arc::new(OfferInventory::default()),
             Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::new(),
         );
         assert!(runtime.capture().is_none());
         assert_eq!(
@@ -723,23 +774,54 @@ mod tests {
         let other = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
         let key = circuit_key(1, binding.clone());
         let other_key = HealthCircuitKey {
-            binding_id: other,
+            binding_id: other.clone(),
             ..key.clone()
         };
         let first = runtime.capture().unwrap();
         runtime.open_circuit(&first, key.clone(), 100);
         runtime.open_circuit(&first, other_key.clone(), 100);
-        assert!(runtime.circuit_is_open(&first, &key, 10));
-        runtime.bump_credential_generation(&binding);
-        let second = runtime.capture().unwrap();
-        assert!(!runtime.circuit_is_open(&second, &key, 10));
-        assert!(runtime.circuit_is_open(&second, &other_key, 10));
-        runtime.replace_candidate(
+        let second = runtime.replace_candidate(
             compiled("new inventory"),
             Arc::new(OfferInventory::default()),
             Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::from([binding.clone()]),
         );
-        assert!(!runtime.circuit_is_open(&runtime.capture().unwrap(), &other_key, 10));
+        assert_eq!(first.catalogue_generation(&binding), 0);
+        assert_eq!(second.catalogue_generation(&binding), 1);
+        assert_eq!(second.catalogue_generation(&other), 0);
+        assert!(!runtime.circuit_is_open(&second, &key, 10));
+        assert!(runtime.circuit_is_open(&second, &other_key, 10));
+
+        runtime.bump_credential_generation(&other);
+        let third = runtime.capture().unwrap();
+        assert!(!runtime.circuit_is_open(&third, &other_key, 10));
+    }
+
+    #[test]
+    fn failed_candidate_refresh_invalidates_only_changed_catalogue_bindings() {
+        let (store, runtime) = runtime();
+        let revision_id = revision(&store, "failed-refresh");
+        let changed = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let unchanged = BindingId::new("anthropic_sub.anthropic_messages").unwrap();
+        let changed_key = circuit_key(revision_id, changed.clone());
+        let unchanged_key = HealthCircuitKey {
+            binding_id: unchanged.clone(),
+            ..changed_key.clone()
+        };
+        let first = runtime.capture_revision(revision_id).unwrap();
+        runtime.open_circuit(&first, changed_key.clone(), 100);
+        runtime.open_circuit(&first, unchanged_key.clone(), 100);
+        runtime.replace_evidence_and_clear_candidate(
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::from([changed.clone()]),
+        );
+        let second = runtime.capture_revision(revision_id).unwrap();
+
+        assert_eq!(second.catalogue_generation(&changed), 1);
+        assert_eq!(second.catalogue_generation(&unchanged), 0);
+        assert!(!runtime.circuit_is_open(&second, &changed_key, 10));
+        assert!(runtime.circuit_is_open(&second, &unchanged_key, 10));
     }
 
     #[test]
@@ -780,13 +862,28 @@ mod tests {
         let (store, runtime) = runtime();
         let revision_id = revision(&store, "generation");
         let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-        let stale = runtime.capture_revision(revision_id).unwrap();
+        let before_credentials = runtime.capture_revision(revision_id).unwrap();
         runtime.bump_credential_generation(&binding);
-        let current = runtime.capture_revision(revision_id).unwrap();
-        let key = circuit_key(revision_id, binding);
-        runtime.open_circuit(&current, key, 100);
+        let current_credentials = runtime.capture_revision(revision_id).unwrap();
+        let credential_key = circuit_key(revision_id, binding.clone());
+        runtime.open_circuit(&current_credentials, credential_key, 100);
+        assert!(runtime.open_circuits(&before_credentials, 10).is_empty());
+        assert_eq!(runtime.open_circuits(&current_credentials, 10).len(), 1);
 
-        assert!(runtime.open_circuits(&stale, 10).is_empty());
-        assert_eq!(runtime.open_circuits(&current, 10).len(), 1);
+        let before_catalogue = current_credentials;
+        runtime.replace_candidate(
+            compiled("catalogue-generation"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::from([binding.clone()]),
+        );
+        let current_catalogue = runtime.capture_revision(revision_id).unwrap();
+        let catalogue_key = HealthCircuitKey {
+            model_id: "new-generation".to_owned(),
+            ..circuit_key(revision_id, binding)
+        };
+        runtime.open_circuit(&current_catalogue, catalogue_key, 100);
+        assert!(runtime.open_circuits(&before_catalogue, 10).is_empty());
+        assert_eq!(runtime.open_circuits(&current_catalogue, 10).len(), 1);
     }
 }

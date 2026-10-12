@@ -717,7 +717,12 @@ mod tests {
         );
         shadow.observe(facts(), Default::default(), None, outcome("model-a"));
         wait_for(&observer, 1);
-        policy_runtime.replace_candidate(policy, Arc::new(OfferInventory::default()), availability);
+        policy_runtime.replace_candidate(
+            policy,
+            Arc::new(OfferInventory::default()),
+            availability,
+            &BTreeSet::from([ANTHROPIC_SUB_MESSAGES.id().clone()]),
+        );
         shadow.observe(facts(), Default::default(), None, outcome("model-a"));
         let records = wait_for(&observer, 2);
         assert_eq!(records[1].comparison, ShadowComparison::InternalError);

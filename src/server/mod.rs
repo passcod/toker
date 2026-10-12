@@ -964,6 +964,8 @@ impl Server {
             .catalogs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed_catalogue_bindings =
+            changed_catalogue_bindings(&self.registry, &catalogs, &next);
         *catalogs = next;
         if let Some(runtime) = &self.policy_runtime {
             // Model-list readers retain this catalogue guard through their
@@ -973,6 +975,7 @@ impl Server {
                     Arc::new(policy),
                     Arc::new(inventory),
                     Arc::new(availability),
+                    &changed_catalogue_bindings,
                 );
             } else {
                 tracing::warn!(
@@ -982,6 +985,7 @@ impl Server {
                 runtime.replace_evidence_and_clear_candidate(
                     Arc::new(inventory),
                     Arc::new(availability),
+                    &changed_catalogue_bindings,
                 );
             }
         }
@@ -1216,6 +1220,32 @@ impl Server {
             }
         });
     }
+}
+
+fn changed_catalogue_bindings(
+    registry: &RouteRegistry,
+    previous: &FetchedCatalogs,
+    next: &FetchedCatalogs,
+) -> std::collections::BTreeSet<crate::policy::BindingId> {
+    registry
+        .bindings()
+        .filter(|binding| {
+            let Some(source) = FetchedCatalogs::source_of(binding.provider()) else {
+                return false;
+            };
+            effective_catalogue(previous, source) != effective_catalogue(next, source)
+        })
+        .map(|binding| binding.id().clone())
+        .collect()
+}
+
+fn effective_catalogue<'a>(
+    catalogs: &'a FetchedCatalogs,
+    source: &str,
+) -> Option<&'a FetchedCatalog> {
+    catalogs
+        .get(source)
+        .filter(|catalog| !catalog.models.is_empty())
 }
 
 fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> AvailabilitySnapshot {
@@ -1895,6 +1925,84 @@ api_key = "ak-literal-test"
         );
     }
 
+    fn one_model_catalogue(fetched_at_ms: i64) -> crate::catalog::FetchedCatalog {
+        crate::catalog::FetchedCatalog {
+            fetched_at_ms,
+            models: vec![crate::catalog::FetchedModel {
+                id: "model".to_owned(),
+                context_window: None,
+                chronology: None,
+                raw: serde_json::Value::Null,
+            }],
+        }
+    }
+
+    #[test]
+    fn catalogue_changes_fan_out_only_to_bindings_for_that_source() {
+        let dir = crate::setup::test_dir("catalogue-binding-generations");
+        let server = server(&dir);
+        let empty = crate::catalog::FetchedCatalogs::default();
+        let mut openrouter = crate::catalog::FetchedCatalogs::default();
+        openrouter.set("openrouter", one_model_catalogue(10));
+        let changed = super::changed_catalogue_bindings(&server.registry, &empty, &openrouter);
+        assert_eq!(
+            changed,
+            server
+                .registry
+                .bindings()
+                .filter(|binding| binding.provider() == "openrouter")
+                .map(|binding| binding.id().clone())
+                .collect()
+        );
+
+        let mut anthropic = openrouter.clone();
+        anthropic.set("anthropic", one_model_catalogue(10));
+        let changed = super::changed_catalogue_bindings(&server.registry, &openrouter, &anthropic);
+        assert_eq!(
+            changed,
+            server
+                .registry
+                .bindings()
+                .filter(|binding| matches!(binding.provider(), "anthropic_sub" | "anthropic_api"))
+                .map(|binding| binding.id().clone())
+                .collect()
+        );
+    }
+
+    #[test]
+    fn empty_catalogues_are_equivalent_to_absence_for_generations() {
+        let dir = crate::setup::test_dir("catalogue-empty-generations");
+        let server = server(&dir);
+        let missing = crate::catalog::FetchedCatalogs::default();
+        let mut empty = crate::catalog::FetchedCatalogs::default();
+        empty.set(
+            "openrouter",
+            crate::catalog::FetchedCatalog {
+                fetched_at_ms: 10,
+                models: vec![],
+            },
+        );
+        let mut newer_empty = crate::catalog::FetchedCatalogs::default();
+        newer_empty.set(
+            "openrouter",
+            crate::catalog::FetchedCatalog {
+                fetched_at_ms: 20,
+                models: vec![],
+            },
+        );
+        assert!(super::changed_catalogue_bindings(&server.registry, &missing, &empty).is_empty());
+        assert!(
+            super::changed_catalogue_bindings(&server.registry, &empty, &newer_empty).is_empty()
+        );
+
+        let mut present = crate::catalog::FetchedCatalogs::default();
+        present.set("openrouter", one_model_catalogue(20));
+        assert!(!super::changed_catalogue_bindings(&server.registry, &empty, &present).is_empty());
+        assert!(
+            !super::changed_catalogue_bindings(&server.registry, &present, &missing).is_empty()
+        );
+    }
+
     #[test]
     fn empty_incident_catalogue_is_absent_but_nonempty_catalogue_is_fresh() {
         let dir = crate::setup::test_dir("catalogue-availability");
@@ -1917,18 +2025,7 @@ api_key = "ak-literal-test"
                 .catalogue,
             crate::policy::CatalogueAvailability::Absent
         );
-        catalogs.set(
-            "openrouter",
-            crate::catalog::FetchedCatalog {
-                fetched_at_ms: 20,
-                models: vec![crate::catalog::FetchedModel {
-                    id: "model".to_owned(),
-                    context_window: None,
-                    chronology: None,
-                    raw: serde_json::Value::Null,
-                }],
-            },
-        );
+        catalogs.set("openrouter", one_model_catalogue(20));
         assert_eq!(
             super::availability_for(&server.registry, &catalogs)
                 .get(&binding)
