@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::Response;
 use serde_json::Value;
@@ -226,6 +227,16 @@ impl ReadyMessagesAttempt {
             Ok(upstream) => upstream,
             Err(error) => {
                 tracing::warn!(%error, "upstream request failed");
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record_anthropic::record_anthropic_error(
+                        ctx,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        Some(super::attempt::transport_failure_type(&error).to_owned()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 return super::proxy::transport_failure(super::proxy::ErrorWire::Anthropic, &error);
             }
         };
@@ -343,6 +354,14 @@ impl ReadyChatAttempt {
             Ok(upstream) => upstream,
             Err(error) => {
                 tracing::warn!(%error, "upstream request failed");
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record::record_error(
+                        ctx,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        Some(super::attempt::transport_failure_type(&error).to_owned()),
+                        None,
+                    );
+                }
                 return super::proxy::transport_failure(super::proxy::ErrorWire::Openai, &error);
             }
         };

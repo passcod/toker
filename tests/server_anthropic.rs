@@ -2080,7 +2080,14 @@ async fn an_upstream_silent_before_its_headers_answers_502_after_the_idle_timeou
         "the transport's failure, named as toker's: {error}"
     );
 
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.status, Some(502));
+    assert_eq!(row.error_type.as_deref(), Some("ambiguous_transport"));
+    let attempt = row.attempt.as_ref().expect("attempt provenance");
+    assert_eq!(attempt.attempt_index.get(), 0);
+    assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
 }
 
 #[tokio::test]

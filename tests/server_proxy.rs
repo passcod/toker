@@ -1189,6 +1189,25 @@ async fn non_json_bodies_are_rejected_before_the_backend() {
 }
 
 #[tokio::test]
+async fn transport_before_headers_records_the_initial_attempt() {
+    let upstream: reqwest::Url = "http://127.0.0.1:9/v1".parse().unwrap();
+    let (addr, store) = spawn_toker(openai_test_config(upstream)).await;
+
+    let response = post_chat(addr, &chat_body("gpt-6.1-sol", false)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.status, Some(502));
+    assert_eq!(row.error_type.as_deref(), Some("transport_before_accept"));
+    let attempt = row.attempt.as_ref().expect("attempt provenance");
+    assert_eq!(attempt.attempt_index.get(), 0);
+    assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
+    assert!(row.policy_routing.is_none());
+}
+
+#[tokio::test]
 async fn unexpected_compression_is_rejected_and_unledgered() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;

@@ -67,7 +67,19 @@ impl ReadyAttempt {
         .await
         {
             Ok(upstream) => upstream,
-            Err(error) => return transport_failure(ErrorWire::Openai, &error),
+            Err(error) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        super::attempt::transport_failure_type(&error),
+                        "upstream transport failed before response headers",
+                        None,
+                        "openai_responses",
+                    );
+                }
+                return transport_failure(ErrorWire::Openai, &error);
+            }
         };
         let upstream = match super::attempt::precommit_responses(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })

@@ -326,6 +326,16 @@ impl ReadyAttempt {
             Ok(upstream) => upstream,
             Err(error) => {
                 tracing::warn!(%error, "codex upstream request failed");
+                if let Some(ctx) = self.record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        super::attempt::transport_failure_type(&error),
+                        "upstream transport failed before response headers",
+                        None,
+                        self.frontend_wire.protocol(),
+                    );
+                }
                 return transport_failure(self.frontend_wire.error_wire(), &error);
             }
         };

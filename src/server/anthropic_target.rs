@@ -103,7 +103,19 @@ impl ReadyAttempt {
         .await
         {
             Ok(upstream) => upstream,
-            Err(error) => return transport_failure(ErrorWire::Openai, &error),
+            Err(error) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    record_anthropic_error(
+                        ctx,
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        Some(super::attempt::transport_failure_type(&error).to_owned()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                return transport_failure(ErrorWire::Openai, &error);
+            }
         };
         let upstream = match super::attempt::precommit_anthropic(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
