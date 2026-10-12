@@ -1110,6 +1110,27 @@ pub(crate) fn truncated_body(wire: ErrorWire) -> Response {
 /// The response body for a buffered-then-maybe-overflowed response: the
 /// buffered prefix chained onto the remaining upstream stream, byte order
 /// preserved.
+pub(crate) fn rebuilt_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    buffered: Buffered,
+) -> reqwest::Response {
+    let body = match buffered.rest {
+        None => reqwest::Body::from(buffered.bytes),
+        Some(rest) => reqwest::Body::wrap_stream(
+            futures::stream::iter([Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes))])
+                .chain(futures::stream::iter(
+                    buffered.overflow.map(Ok::<_, reqwest::Error>),
+                ))
+                .chain(rest.bytes_stream()),
+        ),
+    };
+    let mut response = axum::http::Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    reqwest::Response::from(response)
+}
+
 pub(crate) fn buffered_body(buffered: Buffered) -> Body {
     match buffered.rest {
         Some(response) => {

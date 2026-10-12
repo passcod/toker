@@ -62,7 +62,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::future::{AbortHandle, Abortable};
 use futures::stream::Stream;
 
@@ -1598,7 +1597,7 @@ pub(crate) async fn retry_thinking_off(
             let body = serde_json::from_slice(&buffered.bytes).unwrap_or(serde_json::Value::Null);
             super::attempt::classify_anthropic_error(status, &body)
         });
-        let response = rebuilt_response(status, headers, buffered);
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
         return Ok(ThinkingRetry::Inspected(match failure {
             Some(failure) => super::attempt::PrecommitOutcome::Failure {
                 failure,
@@ -1656,30 +1655,6 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
         translate::render_anthropic(&canonical, crate::routing::DialectId::AnthropicMessages)
             .ok()?;
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
-}
-
-/// A response put back together after bounded inspection, so the normal
-/// forwarding path handles it as if it had never been read: the same status,
-/// headers, and bytes, with any unbuffered remainder chained on.
-pub(crate) fn rebuilt_response(
-    status: StatusCode,
-    headers: HeaderMap,
-    buffered: super::proxy::Buffered,
-) -> reqwest::Response {
-    let body = match buffered.rest {
-        None => reqwest::Body::from(buffered.bytes),
-        Some(rest) => reqwest::Body::wrap_stream(
-            futures::stream::iter([Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes))])
-                .chain(futures::stream::iter(
-                    buffered.overflow.map(Ok::<_, reqwest::Error>),
-                ))
-                .chain(rest.bytes_stream()),
-        ),
-    };
-    let mut response = axum::http::Response::new(body);
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    reqwest::Response::from(response)
 }
 
 /// Whether the rewrites that pick their target from the Anthropic model

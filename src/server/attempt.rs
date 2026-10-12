@@ -236,7 +236,7 @@ pub(crate) async fn precommit_anthropic(
             let body = serde_json::from_slice::<Value>(&buffered.bytes).unwrap_or(Value::Null);
             classify_anthropic_error(status, &body)
         });
-        let rebuilt = super::anthropic::rebuilt_response(status, headers, buffered);
+        let rebuilt = super::proxy::rebuilt_response(status, headers, buffered);
         return Ok(match failure {
             Some(failure) => PrecommitOutcome::Failure {
                 failure,
@@ -276,7 +276,7 @@ pub(crate) async fn precommit_anthropic(
                 response: None,
             });
         }
-        let response = super::anthropic::rebuilt_response(status, headers, buffered);
+        let response = super::proxy::rebuilt_response(status, headers, buffered);
         return Ok(match failure {
             Some(failure) => PrecommitOutcome::Failure {
                 failure,
