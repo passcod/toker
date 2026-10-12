@@ -3227,8 +3227,12 @@ mod tests {
             let terminal = group.is_some() && index.is_none();
             conn.execute(
                 "INSERT INTO requests
-                 (ts_ms, kind, attempt_group_id, attempt_index, policy_revision_id, routing_trace)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (ts_ms, kind, attempt_group_id, attempt_index, policy_revision_id,
+                  routing_trace, fallback_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         CASE WHEN ?4 IS NULL THEN NULL
+                              WHEN ?4 = 0 THEN 'initial'
+                              ELSE 'thinking_negotiation' END)",
                 rusqlite::params![
                     ts,
                     terminal.then_some("route-unavailable"),
