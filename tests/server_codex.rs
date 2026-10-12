@@ -1819,6 +1819,36 @@ async fn thinking_disabled_filters_codex_reasoning_from_both_response_shapes() {
 }
 
 #[tokio::test]
+async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("malformed", upstream, true)).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": "not an array",
+        "stream": true,
+    }))
+    .unwrap();
+
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let error: Value = response.json().await.expect("typed compatibility error");
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(store.requests_since(0, 100).expect("rows").is_empty());
+}
+
+#[tokio::test]
 async fn an_untranslatable_body_never_reaches_the_upstream() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("ut", upstream, true)).await;

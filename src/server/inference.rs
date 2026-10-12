@@ -435,6 +435,14 @@ pub(crate) async fn coordinate_messages(
         session_id,
         client_wants_json,
     } = input;
+    if let Err(error @ TranslateError::Malformed { .. }) = &attempt {
+        return super::codex::anthropic_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("the request could not be translated: {error}"),
+            false,
+        );
+    }
     let prepared = match adapter {
         Some(BackendAdapterId::AnthropicMessages) => {
             let attempt = match attempt {
