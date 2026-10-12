@@ -1432,14 +1432,33 @@ fn observe_messages_shadow(
 }
 
 pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
-    let blocks = request
+    fn block_requirements(block: &CanonBlock) -> (bool, bool) {
+        match block.semantic() {
+            CanonBlock::Image { .. } => (true, false),
+            CanonBlock::ToolUse { .. } => (false, true),
+            CanonBlock::ToolResult { content, .. } => {
+                let nested_image = match content {
+                    crate::ir::canonical::ToolResultContent::Blocks(blocks) => {
+                        blocks.iter().any(|block| block_requirements(block).0)
+                    }
+                    crate::ir::canonical::ToolResultContent::String(_) => false,
+                };
+                (nested_image, true)
+            }
+            CanonBlock::Annotated { .. } => unreachable!("semantic removes annotations"),
+            CanonBlock::Text(_)
+            | CanonBlock::Thinking { .. }
+            | CanonBlock::RedactedThinking { .. } => (false, false),
+        }
+    }
+    let (has_images, has_tool_history) = request
         .messages
         .iter()
         .flat_map(|message| message.blocks.iter())
-        .map(CanonBlock::semantic);
-    let has_images = blocks
-        .clone()
-        .any(|block| matches!(block, CanonBlock::Image { .. }));
+        .map(block_requirements)
+        .fold((false, false), |(images, tools), (image, tool)| {
+            (images || image, tools || tool)
+        });
     crate::policy::CapabilityFlags {
         // These flags are hard routing requirements, not a list of every
         // semantic field the request uses. Sampling and system roles have
@@ -1451,7 +1470,9 @@ pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::
         system_in_messages: false,
         thinking_replay: false,
         images: has_images,
-        tools: !request.tools.is_empty() || request.tool_choice != CanonToolChoice::Auto,
+        tools: has_tool_history
+            || !request.tools.is_empty()
+            || request.tool_choice != CanonToolChoice::Auto,
     }
 }
 
@@ -2281,6 +2302,43 @@ mod tests {
         assert!(!required.thinking_replay);
         assert!(required.images);
         assert!(required.tools);
+    }
+
+    #[test]
+    fn shadow_capabilities_include_tool_history_and_nested_images() {
+        use crate::ir::canonical::{
+            CanonBlock, CanonMessage, CanonRole, CanonicalRequest, ToolResultContent,
+        };
+        let request = CanonicalRequest {
+            messages: vec![CanonMessage {
+                role: CanonRole::User,
+                blocks: vec![CanonBlock::ToolResult {
+                    tool_use_id: "call".to_owned(),
+                    content: ToolResultContent::Blocks(vec![CanonBlock::Image {
+                        url: "https://example.invalid/image.png".to_owned(),
+                    }]),
+                }],
+                extensions: vec![],
+            }],
+            ..CanonicalRequest::default()
+        };
+        let required = shadow_capabilities(&request);
+        assert!(required.images);
+        assert!(required.tools);
+
+        let history = CanonicalRequest {
+            messages: vec![CanonMessage {
+                role: CanonRole::Assistant,
+                blocks: vec![CanonBlock::ToolUse {
+                    id: "call".to_owned(),
+                    name: "lookup".to_owned(),
+                    input: json!({}),
+                }],
+                extensions: vec![],
+            }],
+            ..CanonicalRequest::default()
+        };
+        assert!(shadow_capabilities(&history).tools);
     }
 
     #[test]
