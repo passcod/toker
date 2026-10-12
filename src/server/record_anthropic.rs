@@ -558,6 +558,7 @@ fn measurement_row(
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     }
@@ -683,6 +684,7 @@ fn error_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     }
@@ -856,6 +858,7 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -990,6 +993,7 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -1149,6 +1153,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -1338,6 +1343,7 @@ pub(crate) fn record_responses_measurement(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     };
@@ -1499,6 +1505,7 @@ pub(crate) fn record_codex_error(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: ctx.lineage.clone(),
     };

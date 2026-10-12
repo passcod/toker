@@ -338,6 +338,7 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -445,6 +446,7 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -572,6 +574,7 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
         geo: None,
         fast: None,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     };
@@ -768,6 +771,7 @@ fn measurement_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: None,
     }
@@ -847,6 +851,7 @@ fn error_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
+        attempt: None,
         policy_routing: None,
         lineage: None,
     }

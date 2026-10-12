@@ -952,6 +952,7 @@ pub(crate) mod testrows {
             geo: None,
             fast: None,
             binding_id: None,
+            attempt: None,
             policy_routing: None,
             lineage: None,
         }

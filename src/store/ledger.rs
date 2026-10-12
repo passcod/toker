@@ -577,6 +577,13 @@ impl TryFrom<i64> for AttemptIndex {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptProvenance {
+    pub attempt_group_id: AttemptGroupId,
+    pub attempt_index: AttemptIndex,
+    pub reason: AttemptReason,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptReason {
     Initial,
@@ -641,7 +648,6 @@ pub struct PolicyRouteProvenance {
     pub lookup: RequestLookupProvenance,
     pub route_id: RouteId,
     pub route_fingerprint: RouteFingerprint,
-    pub attempt_group_id: AttemptGroupId,
     pub trace: StoredRoutingTrace,
     pub outcome: PolicyRoutingOutcome,
 }
@@ -651,10 +657,10 @@ pub enum PolicyRoutingOutcome {
     Attempt {
         candidate_id: CandidateId,
         baseline_model: String,
-        attempt_index: AttemptIndex,
-        reason: AttemptReason,
     },
-    RouteUnavailable,
+    RouteUnavailable {
+        attempt_group_id: AttemptGroupId,
+    },
 }
 
 /// One `requests` row: the complete column list as a single struct. Field
@@ -806,6 +812,9 @@ pub struct RequestRow {
     /// policy provenance; a policy actual attempt must carry the selected
     /// binding while a preflight terminal must not.
     pub binding_id: Option<BindingId>,
+    /// One actual upstream send's identity, independent of whether policy or
+    /// the legacy router selected it. Preflight-only terminals have no attempt.
+    pub attempt: Option<AttemptProvenance>,
     /// Closed policy-routing provenance, absent on legacy/non-routing rows.
     pub policy_routing: Option<PolicyRouteProvenance>,
     pub lineage: Option<SessionLineage>,
@@ -819,9 +828,7 @@ struct FlatPolicyRouting<'a> {
     route_fingerprint: &'a RouteFingerprint,
     candidate_id: Option<&'a CandidateId>,
     baseline_model: Option<&'a str>,
-    attempt_group_id: &'a AttemptGroupId,
-    attempt_index: Option<i64>,
-    reason: Option<AttemptReason>,
+    terminal_group_id: Option<&'a AttemptGroupId>,
     trace: &'a StoredRoutingTrace,
 }
 
@@ -836,19 +843,14 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
             | RequestLookupProvenance::ProtocolDefault
             | RequestLookupProvenance::Compaction => (None, None),
         };
-        let (candidate_id, baseline_model, attempt_index, reason) = match &routing.outcome {
+        let (candidate_id, baseline_model, terminal_group_id) = match &routing.outcome {
             PolicyRoutingOutcome::Attempt {
                 candidate_id,
                 baseline_model,
-                attempt_index,
-                reason,
-            } => (
-                Some(candidate_id),
-                Some(baseline_model.as_str()),
-                Some(attempt_index.get()),
-                Some(*reason),
-            ),
-            PolicyRoutingOutcome::RouteUnavailable => (None, None, None, None),
+            } => (Some(candidate_id), Some(baseline_model.as_str()), None),
+            PolicyRoutingOutcome::RouteUnavailable { attempt_group_id } => {
+                (None, None, Some(attempt_group_id))
+            }
         };
         Self {
             policy_revision_id: routing.policy_revision_id,
@@ -858,9 +860,7 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
             route_fingerprint: &routing.route_fingerprint,
             candidate_id,
             baseline_model,
-            attempt_group_id: &routing.attempt_group_id,
-            attempt_index,
-            reason,
+            terminal_group_id,
             trace: &routing.trace,
         }
     }
@@ -905,7 +905,7 @@ fn validate_request_provenance(row: &RequestRow) -> Result<()> {
         }
         match &routing.outcome {
             PolicyRoutingOutcome::Attempt { baseline_model, .. } => {
-                if baseline_model.is_empty() || row.binding_id.is_none() {
+                if baseline_model.is_empty() || row.binding_id.is_none() || row.attempt.is_none() {
                     return Err(Error::InvalidRoutingState(
                         "invalid policy routing attempt".into(),
                     ));
@@ -916,8 +916,11 @@ fn validate_request_provenance(row: &RequestRow) -> Result<()> {
                     ));
                 }
             }
-            PolicyRoutingOutcome::RouteUnavailable => {
-                if row.kind != Some(RowKind::RouteUnavailable) || row.binding_id.is_some() {
+            PolicyRoutingOutcome::RouteUnavailable { .. } => {
+                if row.kind != Some(RowKind::RouteUnavailable)
+                    || row.binding_id.is_some()
+                    || row.attempt.is_some()
+                {
                     return Err(Error::InvalidRoutingState(
                         "invalid route-unavailable terminal".into(),
                     ));
@@ -928,6 +931,19 @@ fn validate_request_provenance(row: &RequestRow) -> Result<()> {
         return Err(Error::InvalidRoutingState(
             "route-unavailable requires policy routing provenance".into(),
         ));
+    }
+    if let Some(attempt) = &row.attempt {
+        if row.binding_id.is_none() {
+            return Err(Error::InvalidRoutingState(
+                "actual attempt requires a selected binding".into(),
+            ));
+        }
+        let index = attempt.attempt_index.get();
+        if (index == 0) != (attempt.reason == AttemptReason::Initial) {
+            return Err(Error::InvalidRoutingState(
+                "attempt index disagrees with its reason".into(),
+            ));
+        }
     }
     if let Some(lineage) = &row.lineage {
         if row
@@ -1073,9 +1089,9 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":candidate_id": flattened.as_ref().and_then(|routing| routing.candidate_id).map(CandidateId::as_str),
         ":binding_id": row.binding_id.as_ref().map(BindingId::as_str),
         ":baseline_model": flattened.as_ref().and_then(|routing| routing.baseline_model),
-        ":attempt_group_id": flattened.as_ref().map(|routing| routing.attempt_group_id.as_str()),
-        ":attempt_index": flattened.as_ref().and_then(|routing| routing.attempt_index),
-        ":fallback_reason": flattened.as_ref().and_then(|routing| routing.reason).map(AttemptReason::as_str),
+        ":attempt_group_id": row.attempt.as_ref().map(|attempt| attempt.attempt_group_id.as_str()).or_else(|| flattened.as_ref().and_then(|routing| routing.terminal_group_id).map(AttemptGroupId::as_str)),
+        ":attempt_index": row.attempt.as_ref().map(|attempt| attempt.attempt_index.get()),
+        ":fallback_reason": row.attempt.as_ref().map(|attempt| attempt.reason.as_str()),
         ":routing_trace": routing_trace,
         ":parent_session_id": row.lineage.as_ref().map(|value| value.parent_session_id.as_str()),
         ":child_role": row.lineage.as_ref().map(|value| value.child_role.as_str()),
@@ -1978,7 +1994,8 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         RowKind::parse,
     )?;
     let binding_id = parse_optional_id("requests.binding_id", row.get("binding_id")?)?;
-    let policy_routing = read_policy_routing(row, kind, binding_id.as_ref())?;
+    let attempt = read_attempt_provenance(row)?;
+    let policy_routing = read_policy_routing(row, kind, binding_id.as_ref(), attempt.as_ref())?;
     Ok(RequestRow {
         id: row.get("id")?,
         ts_ms: row.get("ts_ms")?,
@@ -2044,15 +2061,42 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         geo: row.get("geo")?,
         fast: row.get("fast")?,
         binding_id,
+        attempt,
         policy_routing,
         lineage: read_lineage(row)?,
     })
+}
+
+fn read_attempt_provenance(row: &rusqlite::Row<'_>) -> Result<Option<AttemptProvenance>> {
+    let group = parse_optional_id("requests.attempt_group_id", row.get("attempt_group_id")?)?;
+    let index: Option<i64> = row.get("attempt_index")?;
+    let reason = parse_stored(
+        "requests.fallback_reason",
+        row.get("fallback_reason")?,
+        AttemptReason::parse,
+    )?;
+    match (group, index, reason) {
+        (None, None, None) | (Some(_), None, None) => Ok(None),
+        (Some(attempt_group_id), Some(index), Some(reason)) => {
+            let attempt_index =
+                AttemptIndex::try_from(index).map_err(Error::InvalidRoutingState)?;
+            Ok(Some(AttemptProvenance {
+                attempt_group_id,
+                attempt_index,
+                reason,
+            }))
+        }
+        _ => Err(Error::InvalidRoutingState(
+            "stored attempt provenance is partial".into(),
+        )),
+    }
 }
 
 fn read_policy_routing(
     row: &rusqlite::Row<'_>,
     kind: Option<RowKind>,
     binding_id: Option<&BindingId>,
+    attempt: Option<&AttemptProvenance>,
 ) -> Result<Option<PolicyRouteProvenance>> {
     let revision: Option<i64> = row.get("policy_revision_id")?;
     let presentation: Option<PresentationId> =
@@ -2068,12 +2112,6 @@ fn read_policy_routing(
     let baseline: Option<String> = row.get("baseline_model")?;
     let group: Option<AttemptGroupId> =
         parse_optional_id("requests.attempt_group_id", row.get("attempt_group_id")?)?;
-    let index: Option<i64> = row.get("attempt_index")?;
-    let reason = parse_stored(
-        "requests.fallback_reason",
-        row.get("fallback_reason")?,
-        AttemptReason::parse,
-    )?;
     let trace = match row.get::<_, Option<String>>("routing_trace")? {
         Some(json) => {
             let trace: StoredRoutingTrace = serde_json::from_str(&json)?;
@@ -2090,9 +2128,6 @@ fn read_policy_routing(
         fingerprint.is_some(),
         candidate.is_some(),
         baseline.is_some(),
-        group.is_some(),
-        index.is_some(),
-        reason.is_some(),
         trace.is_some(),
     ];
     if values_present.iter().all(|present| !present) {
@@ -2145,40 +2180,32 @@ fn read_policy_routing(
             ));
         }
     };
-    let (
-        Some(policy_revision_id),
-        Some(route_id),
-        Some(route_fingerprint),
-        Some(attempt_group_id),
-        Some(trace),
-    ) = (revision, route, fingerprint, group, trace)
+    let (Some(policy_revision_id), Some(route_id), Some(route_fingerprint), Some(trace)) =
+        (revision, route, fingerprint, trace)
     else {
         return Err(Error::InvalidRoutingState(
             "stored policy routing provenance is partial".into(),
         ));
     };
     let outcome = if kind == Some(RowKind::RouteUnavailable) {
-        if candidate.is_some()
-            || baseline.is_some()
-            || index.is_some()
-            || reason.is_some()
-            || binding_id.is_some()
-        {
+        let Some(attempt_group_id) = group else {
+            return Err(Error::InvalidRoutingState(
+                "stored route-unavailable terminal has no group".into(),
+            ));
+        };
+        if candidate.is_some() || baseline.is_some() || binding_id.is_some() || attempt.is_some() {
             return Err(Error::InvalidRoutingState(
                 "stored route-unavailable terminal carries attempt fields".into(),
             ));
         }
-        PolicyRoutingOutcome::RouteUnavailable
+        PolicyRoutingOutcome::RouteUnavailable { attempt_group_id }
     } else {
-        let (Some(candidate_id), Some(baseline_model), Some(attempt_index), Some(reason)) =
-            (candidate, baseline, index, reason)
+        let (Some(candidate_id), Some(baseline_model), Some(_)) = (candidate, baseline, attempt)
         else {
             return Err(Error::InvalidRoutingState(
                 "stored policy routing attempt is partial".into(),
             ));
         };
-        let attempt_index =
-            AttemptIndex::try_from(attempt_index).map_err(Error::InvalidRoutingState)?;
         if binding_id.is_none() {
             return Err(Error::InvalidRoutingState(
                 "stored policy routing attempt is invalid".into(),
@@ -2187,8 +2214,6 @@ fn read_policy_routing(
         PolicyRoutingOutcome::Attempt {
             candidate_id,
             baseline_model,
-            attempt_index,
-            reason,
         }
     };
     Ok(Some(PolicyRouteProvenance {
@@ -2196,7 +2221,6 @@ fn read_policy_routing(
         lookup,
         route_id,
         route_fingerprint,
-        attempt_group_id,
         trace,
         outcome,
     }))

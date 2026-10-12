@@ -220,6 +220,7 @@ mod tests {
             geo: None,
             fast: None,
             binding_id: None,
+            attempt: None,
             policy_routing: None,
             lineage: None,
         }
@@ -288,6 +289,11 @@ mod tests {
             geo: Some("us".to_owned()),
             fast: Some(false),
             binding_id: Some(BindingId::new("openrouter.openrouter_messages").unwrap()),
+            attempt: Some(crate::store::AttemptProvenance {
+                attempt_group_id: AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
+                attempt_index: crate::store::AttemptIndex::zero(),
+                reason: AttemptReason::Initial,
+            }),
             policy_routing: Some(PolicyRouteProvenance {
                 policy_revision_id: 1,
                 lookup: RequestLookupProvenance::ProfilePresentation(
@@ -295,7 +301,6 @@ mod tests {
                 ),
                 route_id: RouteId::new("route").unwrap(),
                 route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
-                attempt_group_id: AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
                 trace: StoredRoutingTrace {
                     version: 2,
                     events: vec![
@@ -325,8 +330,6 @@ mod tests {
                 outcome: PolicyRoutingOutcome::Attempt {
                     candidate_id: CandidateId::new("candidate").unwrap(),
                     baseline_model: "claude-opus-5".to_owned(),
-                    attempt_index: crate::store::AttemptIndex::zero(),
-                    reason: AttemptReason::Initial,
                 },
             }),
             lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
@@ -385,7 +388,8 @@ mod tests {
         };
         routing.lookup =
             RequestLookupProvenance::ProfileRewrite(RewriteId::new("rewrite").unwrap());
-        routing.attempt_group_id = AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
+        rewrite.attempt.as_mut().unwrap().attempt_group_id =
+            AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
         routing.trace.events[0] = StoredRoutingTraceEvent::Lookup {
             source: crate::store::StoredLookupSource::ProfileRewrite,
             presentation_id: None,

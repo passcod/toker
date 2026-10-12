@@ -761,6 +761,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
         geo: row.geo.clone(),
         fast: row.fast,
         binding_id: None,
+        attempt: None,
         policy_routing: None,
         lineage: None,
     })
