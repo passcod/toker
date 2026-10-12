@@ -335,9 +335,12 @@ impl<'a> LegacyBuilder<'a> {
     }
 
     fn add_compaction(&mut self) -> anyhow::Result<()> {
-        let Some(spec) = self.config.gates.compact_model.as_deref() else {
-            return Ok(());
-        };
+        let spec = self
+            .config
+            .gates
+            .compact_model
+            .as_deref()
+            .unwrap_or("sonnet");
         if spec.is_empty() || spec == "off" {
             return Ok(());
         }
@@ -840,7 +843,7 @@ mod tests {
     #[test]
     fn compact_target_handles_none_off_family_and_exact() {
         let cases = [
-            (None, false, false),
+            (None, true, true),
             (Some("off"), false, false),
             (Some("sonnet"), true, true),
             (Some("claude-sonnet-5"), true, false),

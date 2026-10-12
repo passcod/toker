@@ -273,7 +273,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut served_model: Option<String> = None;
     let mut shadow_baseline: Option<String> = None;
     let mut shadow_upgraded: Option<String> = None;
-    let mut shadow_compaction = false;
+    let mut shadow_compaction_applied = false;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
@@ -563,7 +563,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 shadow_baseline.clone(),
                 shadow_upgraded.clone(),
                 served_model.clone(),
-                shadow_compaction,
+                shadow_compaction_applied,
             );
             return build_response(StatusCode::OK, headers, Body::from(body));
         }
@@ -724,7 +724,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     shadow_baseline.clone(),
                     shadow_upgraded.clone(),
                     served_model.clone(),
-                    shadow_compaction,
+                    shadow_compaction_applied,
                 );
                 return build_response(StatusCode::OK, headers, Body::from(body));
             }
@@ -881,7 +881,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         shadow_baseline.clone(),
                         shadow_upgraded.clone(),
                         served_model.clone(),
-                        shadow_compaction,
+                        shadow_compaction_applied,
                     );
                     return build_response(StatusCode::OK, headers, Body::from(body));
                 }
@@ -981,7 +981,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.cache_stripped = (outcome.stripped > 0).then_some(true);
                     ctx.system_merged = (outcome.merged > 0).then_some(true);
                 }
-                shadow_compaction = true;
+                shadow_compaction_applied = true;
                 served_model = outcome.to.clone();
                 tracing::info!(
                     "compact: {} · {} breakpoint(s) dropped · {} system message(s) merged",
@@ -1202,7 +1202,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         shadow_baseline.clone(),
         shadow_upgraded.clone(),
         served_model.clone(),
-        shadow_compaction,
+        shadow_compaction_applied,
     );
 
     // ── mid-conversation effort, for models that reject it ──
@@ -1380,7 +1380,7 @@ fn observe_messages_shadow(
     baseline: Option<String>,
     upgraded: Option<String>,
     served: Option<String>,
-    compaction: bool,
+    compaction_applied: bool,
 ) {
     let Some(baseline) = baseline else { return };
     let lane_reference = shape
@@ -1405,7 +1405,7 @@ fn observe_messages_shadow(
         shape.map_or(0, |shape| shape.req_tools),
         required_capabilities,
         binding_affinity,
-        if compaction {
+        if shape.is_some_and(AnthropicShape::is_compaction) {
             crate::policy::RequestClass::Compaction
         } else {
             crate::policy::RequestClass::Inference
@@ -1421,7 +1421,7 @@ fn observe_messages_shadow(
         upgraded,
         aliased,
         served,
-        compaction,
+        compaction_applied,
     ) else {
         return;
     };

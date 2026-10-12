@@ -324,6 +324,7 @@ pub fn resolve_with_circuits<L: LearningView>(
 ) -> Result<AttemptPlan, ResolveFailure> {
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
+        && lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold)
         && let Some(compaction) = policy.compaction()
     {
         selected = from_reference(
@@ -424,7 +425,7 @@ pub fn resolve_with_circuits<L: LearningView>(
             continue;
         }
         let baseline = baseline.ok_or(ResolveFailure::InvalidTemplate)?;
-        if facts.class == RequestClass::Compaction
+        if selected.provenance == RouteProvenance::Compaction
             && lane.is_some_and(|lane| lane.temperature != super::CacheTemperature::Cold)
             && (selected.cache_transition != Some(CacheTransitionPolicy::AllowCacheLoss)
                 || selected.lane_transition != Some(LaneTransitionPolicy::AllowImmediate))
@@ -2601,11 +2602,17 @@ mod tests {
         let policy = compile(doc, &OfferInventory::default());
         let mut request = facts("original");
         request.class = RequestClass::Compaction;
+        let cold = LaneFacts {
+            temperature: CacheTemperature::Cold,
+            pinned: None,
+            forced_from: None,
+            forced_to: None,
+        };
         let plan = resolve(
             &policy,
             &OfferInventory::default(),
             &NoLearning,
-            None,
+            Some(&cold),
             &availability(true, false),
             &request,
         )
@@ -2613,5 +2620,33 @@ mod tests {
         assert_eq!(plan.baseline_model, "compact-model");
         assert!(plan.compaction);
         assert_eq!(plan.provenance, RouteProvenance::Compaction);
+
+        for lane in [
+            None,
+            Some(LaneFacts {
+                temperature: CacheTemperature::Warm,
+                pinned: None,
+                forced_from: None,
+                forced_to: None,
+            }),
+            Some(LaneFacts {
+                temperature: CacheTemperature::Unknown,
+                pinned: None,
+                forced_from: None,
+                forced_to: None,
+            }),
+        ] {
+            let plan = resolve(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                lane.as_ref(),
+                &availability(true, false),
+                &request,
+            )
+            .unwrap();
+            assert_eq!(plan.baseline_model, "original");
+            assert_ne!(plan.provenance, RouteProvenance::Compaction);
+        }
     }
 }
