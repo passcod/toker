@@ -1807,6 +1807,31 @@ async fn missing_messages_model_is_rejected_locally_without_a_row() {
 }
 
 #[tokio::test]
+async fn missing_messages_model_is_rejected_before_default_route_lookup() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.default_backend_anthropic = None;
+    config.default_backend_openai_chat = None;
+    config.anthropic_sub = None;
+    config.anthropic_api = None;
+    config.openrouter = None;
+    config.codex_sub = None;
+    let (addr, store) = spawn_toker(config).await;
+    let body = serde_json::to_vec(&json!({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 10,
+    }))
+    .unwrap();
+
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("typed compatibility error");
+    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    assert!(mock.captured().is_empty());
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
 async fn non_json_messages_are_rejected_locally_without_a_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;

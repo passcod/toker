@@ -208,10 +208,6 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
 /// exact-path rule: only `"/v1/messages"` gates.
 async fn usage_path(server: Server, request: Request, path: &'static str) -> Response {
     let started = Instant::now();
-    let Ok(mut target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
-        return super::anthropic_not_configured();
-    };
-    let mut backend = target.provider().clone();
     let (parts, body) = request.into_parts();
     let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
 
@@ -238,6 +234,29 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             );
         }
     };
+
+    // This is a frontend contract, not a routing result. Validate it before
+    // consulting the configured default so an invalid request has the same
+    // answer even when no Messages backend exists.
+    if path == "/v1/messages"
+        && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&original)
+        && body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return super::codex::anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "model is missing, empty, or not a string",
+            false,
+        );
+    }
+
+    let Ok(mut target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
+        return super::anthropic_not_configured();
+    };
+    let mut backend = target.provider().clone();
 
     // A gated non-ping request is in flight
     // (count_tokens and batches are
