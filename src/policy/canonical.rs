@@ -16,10 +16,12 @@ use super::document::{
     RouteStep, StableId, UpgradePolicy, UpgradePolicyId, ValidatedPolicyDocument,
 };
 
-const POLICY_FINGERPRINT_DOMAIN: &[u8] = b"toker.policy.document.v1\0";
+const POLICY_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.document.v1\0";
+const POLICY_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.document.v2\0";
 // Route semantics evolve independently from the document format. Change this
 // domain whenever the closed projection below changes meaning or shape.
-const ROUTE_FINGERPRINT_DOMAIN: &[u8] = b"toker.policy.route-semantics.v1\0";
+const ROUTE_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.route-semantics.v1\0";
+const ROUTE_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.route-semantics.v2\0";
 
 /// Limits applied before a document enters the runtime compiler.
 ///
@@ -69,6 +71,15 @@ pub fn decode_policy(
     }
     let text = std::str::from_utf8(bytes).map_err(|_| CanonicalError::InvalidUtf8)?;
     JsonBoundsParser::new(text, limits).parse()?;
+    let lexical: Value = serde_json::from_str(text)
+        .map_err(|error| CanonicalError::TypedDocument(error.to_string()))?;
+    if lexical.get("format_version").and_then(Value::as_u64) == Some(1)
+        && uses_v2_capability_fields(&lexical)
+    {
+        return Err(CanonicalError::InvalidDocument(
+            "tool-choice capability fields require policy format version 2".to_owned(),
+        ));
+    }
     // Deserialize from the original token stream, not through `Value`:
     // arbitrary-precision `Value` uses a private sentinel map internally, and
     // replaying a user object through it would make that sentinel forgeable.
@@ -77,6 +88,33 @@ pub fn decode_policy(
     document
         .validate()
         .map_err(|error| CanonicalError::InvalidDocument(error.to_string()))
+}
+
+fn uses_v2_capability_fields(document: &Value) -> bool {
+    const V2_FIELDS: [&str; 4] = [
+        "tool_choice_none",
+        "tool_choice_named",
+        "tool_choice_unnamed",
+        "tool_choice_other",
+    ];
+    document
+        .get("routes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|route| route.get("chain"))
+        .flat_map(|chain| {
+            chain.get("first").into_iter().chain(
+                chain
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|step| step.get("candidate")),
+            )
+        })
+        .filter_map(|candidate| candidate.get("required_capabilities"))
+        .any(|required| V2_FIELDS.iter().any(|field| required.get(field).is_some()))
 }
 
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CanonicalError> {
@@ -185,16 +223,20 @@ pub fn policy_bytes(document: &ValidatedPolicyDocument) -> Result<Vec<u8>, Canon
 pub fn policy_fingerprint(
     document: &ValidatedPolicyDocument,
 ) -> Result<PolicyFingerprint, CanonicalError> {
-    Ok(PolicyFingerprint(hash(
-        POLICY_FINGERPRINT_DOMAIN,
-        &policy_bytes(document)?,
-    )))
+    let domain = match document.document().format_version {
+        1 => POLICY_FINGERPRINT_DOMAIN_V1,
+        2 => POLICY_FINGERPRINT_DOMAIN_V2,
+        version => return Err(CanonicalError::UnsupportedFormat(version)),
+    };
+    Ok(PolicyFingerprint(hash(domain, &policy_bytes(document)?)))
 }
 
 /// Closed, versioned projection of all semantics that can affect one route.
 /// Display fields and inventory-selected winners are absent by construction.
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteSemantics {
+    #[serde(skip)]
+    format_version: u32,
     route: SemanticRoute,
     aliases: BTreeMap<CandidateId, AliasPolicy>,
     upgrades: Vec<SemanticUpgrade>,
@@ -258,6 +300,7 @@ impl RouteSemantics {
         classifiers.sort_by(|left, right| left.id.cmp(&right.id));
 
         Ok(Self {
+            format_version: document.format_version,
             route: SemanticRoute::from(route),
             aliases,
             upgrades,
@@ -386,10 +429,16 @@ impl From<&UpgradePolicy> for SemanticUpgrade {
 }
 
 pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint, CanonicalError> {
-    Ok(RouteFingerprint(hash(
-        ROUTE_FINGERPRINT_DOMAIN,
-        &canonical_bytes(semantics)?,
-    )))
+    let domain = route_domain(semantics.format_version)?;
+    Ok(RouteFingerprint(hash(domain, &canonical_bytes(semantics)?)))
+}
+
+fn route_domain(format_version: u32) -> Result<&'static [u8], CanonicalError> {
+    match format_version {
+        1 => Ok(ROUTE_FINGERPRINT_DOMAIN_V1),
+        2 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
+        version => Err(CanonicalError::UnsupportedFormat(version)),
+    }
 }
 
 /// Fingerprint a compiler-generated one-candidate presentation route.
@@ -397,6 +446,7 @@ pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint,
 /// The binding, model, and stable generated identities close the complete
 /// semantics; presentation display metadata is deliberately absent.
 pub(crate) fn generated_route_fingerprint(
+    format_version: u32,
     route_id: &RouteId,
     candidate_id: &CandidateId,
     binding_id: &super::BindingId,
@@ -410,7 +460,7 @@ pub(crate) fn generated_route_fingerprint(
         model_id: &'a str,
     }
     Ok(RouteFingerprint(hash(
-        ROUTE_FINGERPRINT_DOMAIN,
+        route_domain(format_version)?,
         &canonical_bytes(&Generated {
             route_id,
             candidate_id,
@@ -647,6 +697,8 @@ pub enum CanonicalError {
     TypedDocument(String),
     #[error("invalid policy document: {0}")]
     InvalidDocument(String),
+    #[error("unsupported policy format version {0}")]
+    UnsupportedFormat(u32),
     #[error("missing route semantic dependency {0}")]
     MissingSemanticDependency(String),
     #[error("cannot serialise policy document: {0}")]
@@ -838,9 +890,73 @@ mod tests {
     }
 
     #[test]
+    fn policy_format_domains_preserve_v1_and_separate_v2() {
+        let mut v1 = full_document(route("display", None));
+        v1.format_version = 1;
+        let v1 = v1.validate().unwrap();
+        let v1_policy = policy_fingerprint(&v1).unwrap();
+        let v1_route = RouteSemantics::from_document(&v1, &RouteId::new("route").unwrap())
+            .and_then(|semantics| route_fingerprint(&semantics))
+            .unwrap();
+
+        let v2 = full_document(route("display", None)).validate().unwrap();
+        assert_ne!(v1_policy, policy_fingerprint(&v2).unwrap());
+        assert_ne!(
+            v1_route,
+            RouteSemantics::from_document(&v2, &RouteId::new("route").unwrap())
+                .and_then(|semantics| route_fingerprint(&semantics))
+                .unwrap()
+        );
+
+        let mut invalid_v1 = v1.into_document();
+        invalid_v1.routes[0]
+            .chain
+            .first
+            .required_capabilities
+            .tool_choice_none = true;
+        assert!(matches!(
+            invalid_v1.validate(),
+            Err(crate::policy::DocumentError::FeatureRequiresFormat { required: 2, .. })
+        ));
+
+        let old_reader_input = serde_json::to_vec(&serde_json::json!({
+            "format_version": 1,
+            "routes": [{
+                "id": "route",
+                "display_name": "route",
+                "parameters": [],
+                "chain": {
+                    "first": {
+                        "id": "candidate",
+                        "binding_id": "provider.dialect",
+                        "model": {"kind": "requested_model"},
+                        "required_capabilities": {"tool_choice_none": false},
+                        "enabled": true
+                    },
+                    "steps": []
+                },
+                "lane_transition": "preserve_pinned"
+            }]
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_policy(&old_reader_input, CanonicalLimits::default()),
+            Err(CanonicalError::InvalidDocument(_))
+        ));
+    }
+
+    #[test]
     fn every_route_semantic_class_changes_the_digest() {
         let base = full_document(route("display", None));
         let expected = digest(base.clone());
+
+        let mut capability_change = base.clone();
+        capability_change.routes[0]
+            .chain
+            .first
+            .required_capabilities
+            .tool_choice_named = true;
+        assert_ne!(expected, digest(capability_change));
 
         let mut route_change = base.clone();
         route_change.routes[0].lane_transition = LaneTransitionPolicy::AllowImmediate;

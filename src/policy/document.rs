@@ -27,7 +27,8 @@ pub const MAX_DESCRIPTION_BYTES: usize = 4_096;
 pub const MAX_MATCHER_BYTES: usize = 1_024;
 pub const MAX_TEMPLATE_BYTES: usize = 1_024;
 
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+pub const MINIMUM_FORMAT_VERSION: u32 = 1;
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 pub const REQUESTED_MODEL_PARAMETER: &str = "requested_model";
 
 /// A stable policy identity with a deliberately narrow spelling.
@@ -281,8 +282,20 @@ impl PolicyDocument {
     }
 
     fn validate_inner(&self) -> Result<(), DocumentError> {
-        if self.format_version != CURRENT_FORMAT_VERSION {
+        if !(MINIMUM_FORMAT_VERSION..=CURRENT_FORMAT_VERSION).contains(&self.format_version) {
             return Err(DocumentError::UnsupportedFormat(self.format_version));
+        }
+        if self.format_version < 2
+            && self
+                .routes
+                .iter()
+                .flat_map(|route| route.chain.candidates())
+                .any(|candidate| candidate.required_capabilities.uses_tool_choice_shape())
+        {
+            return Err(DocumentError::FeatureRequiresFormat {
+                path: "/routes/*/chain/*/required_capabilities".to_owned(),
+                required: 2,
+            });
         }
         check_optional_description(&self.description, "/description")?;
         check_collection(&self.defaults, "/defaults")?;
@@ -821,6 +834,15 @@ pub struct CapabilityFlags {
     pub tool_choice_other: bool,
 }
 
+impl CapabilityFlags {
+    fn uses_tool_choice_shape(self) -> bool {
+        self.tool_choice_none
+            || self.tool_choice_named
+            || self.tool_choice_unnamed
+            || self.tool_choice_other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateEdge {
@@ -1111,6 +1133,8 @@ fn keyed(path: &str, key: &str) -> String {
 pub enum DocumentError {
     #[error("unsupported policy format version {0}")]
     UnsupportedFormat(u32),
+    #[error("policy feature at {path} requires format version {required}")]
+    FeatureRequiresFormat { path: String, required: u32 },
     #[error("collection exceeds its limit at {0}")]
     CollectionTooLarge(String),
     #[error("string exceeds its limit at {0}")]

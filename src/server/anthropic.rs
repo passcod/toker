@@ -1484,9 +1484,7 @@ pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::
         system_in_messages: false,
         thinking_replay: false,
         images: has_images,
-        tools: has_tool_history
-            || !request.tools.is_empty()
-            || request.tool_choice != CanonToolChoice::Auto,
+        tools: has_tool_history || !request.tools.is_empty(),
         tool_choice_none: request.tool_choice == CanonToolChoice::None,
         tool_choice_named: matches!(request.tool_choice, CanonToolChoice::Tool { name: Some(_) }),
         tool_choice_unnamed: matches!(request.tool_choice, CanonToolChoice::Tool { name: None }),
@@ -2370,7 +2368,7 @@ mod tests {
             })
         };
         let none = required(CanonToolChoice::None);
-        assert!(none.tools);
+        assert!(!none.tools);
         assert!(none.tool_choice_none);
         assert!(!none.tool_choice_named);
         assert!(!none.tool_choice_unnamed);
@@ -2379,6 +2377,7 @@ mod tests {
         let named = required(CanonToolChoice::Tool {
             name: Some("lookup".to_owned()),
         });
+        assert!(!named.tools);
         assert!(named.tool_choice_named);
         assert!(!named.tool_choice_unnamed);
 
@@ -2392,7 +2391,7 @@ mod tests {
         assert!(other.tool_choice_other);
 
         let any = required(CanonToolChoice::Any);
-        assert!(any.tools);
+        assert!(!any.tools);
         assert!(!any.tool_choice_none);
         assert!(!any.tool_choice_named);
         assert!(!any.tool_choice_unnamed);

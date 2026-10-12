@@ -1400,18 +1400,23 @@ impl<'a> Compiler<'a> {
             .expect("hash-derived generated route id");
         let candidate_id = CandidateId::new(format!("candidate-{suffix}"))
             .expect("hash-derived generated candidate id");
-        let fingerprint =
-            match generated_route_fingerprint(&route_id, &candidate_id, &binding_id, &model_id) {
-                Ok(fingerprint) => fingerprint,
-                Err(_) => {
-                    self.error(
-                        "route-semantics-invalid",
-                        path.clone().field(f("source")),
-                        item.id.as_stable_id(),
-                    );
-                    return None;
-                }
-            };
+        let fingerprint = match generated_route_fingerprint(
+            self.document.document().format_version,
+            &route_id,
+            &candidate_id,
+            &binding_id,
+            &model_id,
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                self.error(
+                    "route-semantics-invalid",
+                    path.clone().field(f("source")),
+                    item.id.as_stable_id(),
+                );
+                return None;
+            }
+        };
         Some(CompiledPresentation {
             id: item.id.clone(),
             slug,

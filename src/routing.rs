@@ -132,7 +132,7 @@ impl Capabilities {
         tool_choice_none: CapabilityEvidence::Supported,
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
-        tool_choice_other: CapabilityEvidence::Supported,
+        tool_choice_other: CapabilityEvidence::Unknown,
     };
 
     pub const UNKNOWN: Capabilities = Capabilities {
@@ -159,7 +159,7 @@ impl Capabilities {
         tool_choice_none: CapabilityEvidence::Unsupported,
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Supported,
-        tool_choice_other: CapabilityEvidence::Supported,
+        tool_choice_other: CapabilityEvidence::Unknown,
     };
 
     /// OpenRouter's live Chat Completions binding. The request and response
@@ -174,7 +174,7 @@ impl Capabilities {
         tool_choice_none: CapabilityEvidence::Supported,
         tool_choice_named: CapabilityEvidence::Supported,
         tool_choice_unnamed: CapabilityEvidence::Unsupported,
-        tool_choice_other: CapabilityEvidence::Supported,
+        tool_choice_other: CapabilityEvidence::Unknown,
     };
 
     /// The Codex subscription Responses binding's live-verified capabilities.
@@ -815,6 +815,46 @@ mod tests {
         let canonical = ready.canonical_backend().expect("adapter is verified");
         assert_eq!(canonical.adapter(), BackendAdapterId::CodexResponses);
         assert_eq!(canonical.capabilities(), Capabilities::CODEX);
+    }
+
+    #[test]
+    fn tool_choice_capabilities_match_backend_renderers() {
+        use super::CapabilityEvidence::{Supported, Unknown, Unsupported};
+
+        let cases = [
+            (
+                BackendAdapterId::AnthropicMessages,
+                Capabilities::MESSAGES,
+                (Unsupported, Supported, Supported, Unknown),
+            ),
+            (
+                BackendAdapterId::OpenAiChatCompletions,
+                Capabilities::CHAT,
+                (Supported, Supported, Unsupported, Unknown),
+            ),
+            (
+                BackendAdapterId::CodexResponses,
+                Capabilities::CODEX,
+                (Supported, Unsupported, Unsupported, Unsupported),
+            ),
+            (
+                BackendAdapterId::OpenRouterResponses,
+                Capabilities::OPENROUTER_RESPONSES,
+                (Supported, Unsupported, Unsupported, Unsupported),
+            ),
+        ];
+        for (adapter, capabilities, expected) in cases {
+            assert_eq!(
+                (
+                    capabilities.tool_choice_none,
+                    capabilities.tool_choice_named,
+                    capabilities.tool_choice_unnamed,
+                    capabilities.tool_choice_other,
+                ),
+                expected,
+                "{adapter}"
+            );
+        }
     }
 
     #[test]
