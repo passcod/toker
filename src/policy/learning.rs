@@ -54,6 +54,79 @@ impl LearnedEvidence {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LearningSnapshot {
+    learned: BTreeMap<(Option<BindingId>, String), LearnedEvidence>,
+    recent: BTreeMap<(Option<BindingId>, String), i64>,
+    covered_since: BTreeMap<Option<BindingId>, Option<i64>>,
+    active_days: BTreeMap<Option<BindingId>, usize>,
+}
+
+impl LearningView for LearningSnapshot {
+    type Error = std::convert::Infallible;
+
+    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
+        Ok(self.clone())
+    }
+
+    fn recently_sent(
+        &self,
+        binding_id: &BindingId,
+        model_id: &str,
+    ) -> Result<RecencyEvidence, Self::Error> {
+        let scope = if self.covered_since.contains_key(&Some(binding_id.clone())) {
+            Some(binding_id.clone())
+        } else if self.covered_since.contains_key(&None) {
+            return Ok(RecencyEvidence::Covered {
+                last_sent: self.recent.get(&(None, model_id.to_owned())).copied(),
+                covered_since: self.covered_since.get(&None).copied().flatten(),
+            });
+        } else {
+            return Ok(RecencyEvidence::Unknown);
+        };
+        Ok(RecencyEvidence::Covered {
+            last_sent: self
+                .recent
+                .get(&(scope.clone(), model_id.to_owned()))
+                .copied(),
+            covered_since: self.covered_since.get(&scope).copied().flatten(),
+        })
+    }
+
+    fn learned(
+        &self,
+        binding_id: &BindingId,
+        model_id: &str,
+    ) -> Result<Option<LearnedEvidence>, Self::Error> {
+        Ok(self
+            .learned
+            .get(&(Some(binding_id.clone()), model_id.to_owned()))
+            .or_else(|| self.learned.get(&(None, model_id.to_owned())))
+            .cloned())
+    }
+
+    fn known_models(&self, binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
+        let scoped = self
+            .learned
+            .keys()
+            .filter_map(|(binding, model)| (binding.as_ref() == Some(binding_id)).then_some(model));
+        let legacy = self
+            .learned
+            .keys()
+            .filter_map(|(binding, model)| binding.is_none().then_some(model));
+        Ok(scoped.chain(legacy).cloned().collect())
+    }
+
+    fn active_days(&self, binding_id: &BindingId) -> Result<usize, Self::Error> {
+        Ok(self
+            .active_days
+            .get(&Some(binding_id.clone()))
+            .or_else(|| self.active_days.get(&None))
+            .copied()
+            .unwrap_or_default())
+    }
+}
+
 /// Recency evidence and the span over which absence is meaningful.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecencyEvidence {
@@ -72,6 +145,11 @@ pub enum RecencyEvidence {
 /// Content-free read interface used by the eventual resolver.
 pub trait LearningView {
     type Error;
+
+    /// Capture an owned immutable view for deferred resolution. Synchronous
+    /// callers may continue reading `self`; shadow workers must enqueue this
+    /// snapshot so later observations cannot change an in-flight decision.
+    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error>;
 
     fn recently_sent(
         &self,
@@ -227,6 +305,48 @@ fn exact_reported_model(model: &str) -> Option<String> {
 impl LearningView for BindingLearningView {
     type Error = crate::store::Error;
 
+    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
+        let recency = self
+            .recency
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recent = recency
+            .sent_on
+            .iter()
+            .map(|((binding, model), last_sent)| {
+                ((Some(binding.clone()), model.clone()), *last_sent)
+            })
+            .collect();
+        let covered_since = recency
+            .covered_since
+            .iter()
+            .map(|(binding, since)| (Some(binding.clone()), Some(*since)))
+            .collect();
+        let mut learned = BTreeMap::new();
+        let mut active_days = BTreeMap::new();
+        for binding in recency.covered_since.keys() {
+            let entries = self.store.load_binding_learnings(binding)?;
+            let days = entries
+                .iter()
+                .flat_map(|entry| entry.days.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .len();
+            active_days.insert(Some(binding.clone()), days);
+            for entry in entries {
+                learned.insert(
+                    (Some(binding.clone()), entry.model_id.clone()),
+                    binding_evidence(entry),
+                );
+            }
+        }
+        Ok(LearningSnapshot {
+            learned,
+            recent,
+            covered_since,
+            active_days,
+        })
+    }
+
     fn recently_sent(
         &self,
         binding_id: &BindingId,
@@ -282,6 +402,28 @@ impl LearningView for BindingLearningView {
 
 impl LearningView for LegacyLearningView {
     type Error = crate::store::Error;
+
+    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
+        let entries = self.store.learned_entries()?;
+        let active_days = active_days_of(&entries);
+        let learned = entries
+            .into_iter()
+            .map(|entry| ((None, entry.model_id.clone()), evidence(entry)))
+            .collect();
+        let covered_since = self.store.covered_since();
+        let recent = self
+            .store
+            .recently_served()
+            .into_iter()
+            .map(|(model, at)| ((None, model), at))
+            .collect();
+        Ok(LearningSnapshot {
+            learned,
+            recent,
+            covered_since: BTreeMap::from([(None, covered_since)]),
+            active_days: BTreeMap::from([(None, active_days)]),
+        })
+    }
 
     fn recently_sent(
         &self,
@@ -585,6 +727,23 @@ mod tests {
                 covered_since: Some(9_000),
             },
             "a possible provider send must remain warm after restart",
+        );
+        let snapshot = view.snapshot().unwrap();
+        assert_eq!(
+            snapshot.recently_sent(&first, "same-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(9_000),
+                covered_since: Some(9_000),
+            }
+        );
+        view.note_sent(&first, Some("same-model"), 20_000);
+        assert_eq!(
+            snapshot.recently_sent(&first, "same-model").unwrap(),
+            RecencyEvidence::Covered {
+                last_sent: Some(9_000),
+                covered_since: Some(9_000),
+            },
+            "owned snapshots cannot observe later sends"
         );
     }
 

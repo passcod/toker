@@ -117,8 +117,8 @@ impl ShadowObserver for CollectingObserver {
 
 pub struct PolicyShadow<L> {
     policy_runtime: Arc<PolicyRuntime>,
+    learning: Arc<L>,
     runtime: Arc<ShadowRuntime>,
-    _learning: std::marker::PhantomData<fn() -> L>,
 }
 
 enum ShadowJob {
@@ -131,6 +131,7 @@ struct ResolveJob {
     pinned_revision: Option<i64>,
     evidence: super::runtime::PolicyEvidence,
     circuits: super::CircuitSnapshot,
+    learning: super::LearningSnapshot,
     facts: RequestFacts,
     credentials: super::CredentialSnapshot,
     lane: Option<LaneFacts>,
@@ -164,8 +165,8 @@ impl<L> Clone for PolicyShadow<L> {
     fn clone(&self) -> Self {
         Self {
             policy_runtime: self.policy_runtime.clone(),
+            learning: self.learning.clone(),
             runtime: self.runtime.clone(),
-            _learning: std::marker::PhantomData,
         }
     }
 }
@@ -183,16 +184,16 @@ where
         let worker_runtime = policy_runtime.clone();
         let worker = thread::Builder::new()
             .name("toker-policy-shadow".to_owned())
-            .spawn(move || worker_loop(receiver, worker_runtime, learning, observer))
+            .spawn(move || worker_loop(receiver, worker_runtime, observer))
             .expect("policy shadow worker thread");
         Self {
             policy_runtime,
+            learning,
             runtime: Arc::new(ShadowRuntime {
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
                 dropped: AtomicU64::new(0),
             }),
-            _learning: std::marker::PhantomData,
         }
     }
 
@@ -234,11 +235,15 @@ where
         else {
             return;
         };
+        let Ok(learning) = self.learning.snapshot() else {
+            return;
+        };
         self.enqueue(ShadowJob::Resolve(Box::new(ResolveJob {
             snapshot,
             pinned_revision,
             evidence,
             circuits,
+            learning,
             facts,
             credentials,
             lane,
@@ -275,19 +280,22 @@ where
     }
 
     #[cfg(test)]
-    fn with_runtime(policy_runtime: Arc<PolicyRuntime>, runtime: Arc<ShadowRuntime>) -> Self {
+    fn with_runtime(
+        policy_runtime: Arc<PolicyRuntime>,
+        learning: Arc<L>,
+        runtime: Arc<ShadowRuntime>,
+    ) -> Self {
         Self {
             policy_runtime,
+            learning,
             runtime,
-            _learning: std::marker::PhantomData,
         }
     }
 }
 
-fn worker_loop<L: LearningView>(
+fn worker_loop(
     receiver: mpsc::Receiver<ShadowJob>,
     policy_runtime: Arc<PolicyRuntime>,
-    learning: Arc<L>,
     observer: Arc<dyn ShadowObserver>,
 ) {
     while let Ok(job) = receiver.recv() {
@@ -299,6 +307,7 @@ fn worker_loop<L: LearningView>(
                     pinned_revision,
                     evidence,
                     circuits,
+                    learning,
                     facts,
                     credentials,
                     mut lane,
@@ -330,7 +339,7 @@ fn worker_loop<L: LearningView>(
                 match super::resolve::resolve_with_circuits(
                     snapshot.policy(),
                     snapshot.inventory(),
-                    learning.as_ref(),
+                    &learning,
                     lane.as_ref(),
                     &availability,
                     &circuits,
@@ -648,8 +657,11 @@ mod tests {
             worker: Mutex::new(None),
             dropped: AtomicU64::new(0),
         });
-        let shadow: PolicyShadow<NoLearning> =
-            PolicyShadow::with_runtime(policy_runtime.clone(), shadow_runtime);
+        let shadow: PolicyShadow<NoLearning> = PolicyShadow::with_runtime(
+            policy_runtime.clone(),
+            Arc::new(NoLearning),
+            shadow_runtime,
+        );
 
         shadow.observe(
             facts(),
@@ -688,8 +700,11 @@ mod tests {
             worker: Mutex::new(None),
             dropped: AtomicU64::new(0),
         });
-        let shadow: PolicyShadow<NoLearning> =
-            PolicyShadow::with_runtime(runtime(policy, inventory, availability), shadow_runtime);
+        let shadow: PolicyShadow<NoLearning> = PolicyShadow::with_runtime(
+            runtime(policy, inventory, availability),
+            Arc::new(NoLearning),
+            shadow_runtime,
+        );
         shadow.observe_record(ShadowRecord {
             comparison: ShadowComparison::Mismatch,
             code: "dropped",

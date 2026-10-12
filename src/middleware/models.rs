@@ -694,6 +694,14 @@ impl ModelStore {
         self.covered_since
     }
 
+    /// Copy the content-free recently-sent map for an immutable policy snapshot.
+    pub(crate) fn recently_served(&self) -> BTreeMap<String, i64> {
+        self.served_on
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Record that `model` served a request of `prompt` tokens at `at_ms`
     /// ("a model is *seen* when a
     /// response named it").

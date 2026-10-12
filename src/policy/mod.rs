@@ -34,7 +34,8 @@ pub use diagnostic::{
 };
 pub use document::*;
 pub use learning::{
-    BindingLearningView, LearnedEvidence, LearningView, LegacyLearningView, RecencyEvidence,
+    BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, LegacyLearningView,
+    RecencyEvidence,
 };
 pub use matcher::{
     CaptureSchema, CompiledMatcher, MAX_MATCH_INPUT_BYTES, MAX_RENDERED_TEMPLATE_BYTES,
