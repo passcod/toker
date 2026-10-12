@@ -112,6 +112,14 @@ pub struct Capabilities {
     pub images: CapabilityEvidence,
     /// Tool declarations and tool call/result turns.
     pub tools: CapabilityEvidence,
+    /// A tool choice that forbids tool calls.
+    pub tool_choice_none: CapabilityEvidence,
+    /// A tool choice that forces one named tool.
+    pub tool_choice_named: CapabilityEvidence,
+    /// A forced-tool shape whose name is absent.
+    pub tool_choice_unnamed: CapabilityEvidence,
+    /// A frontend tool-choice kind outside the canonical known set.
+    pub tool_choice_other: CapabilityEvidence,
 }
 
 impl Capabilities {
@@ -121,6 +129,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Unsupported,
         images: CapabilityEvidence::Unknown,
         tools: CapabilityEvidence::Unknown,
+        tool_choice_none: CapabilityEvidence::Supported,
+        tool_choice_named: CapabilityEvidence::Supported,
+        tool_choice_unnamed: CapabilityEvidence::Unsupported,
+        tool_choice_other: CapabilityEvidence::Supported,
     };
 
     pub const UNKNOWN: Capabilities = Capabilities {
@@ -129,6 +141,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Unknown,
         images: CapabilityEvidence::Unknown,
         tools: CapabilityEvidence::Unknown,
+        tool_choice_none: CapabilityEvidence::Unknown,
+        tool_choice_named: CapabilityEvidence::Unknown,
+        tool_choice_unnamed: CapabilityEvidence::Unknown,
+        tool_choice_other: CapabilityEvidence::Unknown,
     };
 
     /// The Messages features verified on Anthropic and OpenRouter's Messages
@@ -140,6 +156,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Supported,
         images: CapabilityEvidence::Supported,
         tools: CapabilityEvidence::Supported,
+        tool_choice_none: CapabilityEvidence::Unsupported,
+        tool_choice_named: CapabilityEvidence::Supported,
+        tool_choice_unnamed: CapabilityEvidence::Supported,
+        tool_choice_other: CapabilityEvidence::Supported,
     };
 
     /// OpenRouter's live Chat Completions binding. The request and response
@@ -151,6 +171,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Unsupported,
         images: CapabilityEvidence::Supported,
         tools: CapabilityEvidence::Supported,
+        tool_choice_none: CapabilityEvidence::Supported,
+        tool_choice_named: CapabilityEvidence::Supported,
+        tool_choice_unnamed: CapabilityEvidence::Unsupported,
+        tool_choice_other: CapabilityEvidence::Supported,
     };
 
     /// The Codex subscription Responses binding's live-verified capabilities.
@@ -160,6 +184,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Unsupported,
         images: CapabilityEvidence::Supported,
         tools: CapabilityEvidence::Supported,
+        tool_choice_none: CapabilityEvidence::Supported,
+        tool_choice_named: CapabilityEvidence::Unsupported,
+        tool_choice_unnamed: CapabilityEvidence::Unsupported,
+        tool_choice_other: CapabilityEvidence::Unsupported,
     };
 
     /// The streamed Responses subset verified against OpenRouter. The adapter
@@ -171,6 +199,10 @@ impl Capabilities {
         thinking_replay: CapabilityEvidence::Unsupported,
         images: CapabilityEvidence::Unsupported,
         tools: CapabilityEvidence::Supported,
+        tool_choice_none: CapabilityEvidence::Supported,
+        tool_choice_named: CapabilityEvidence::Unsupported,
+        tool_choice_unnamed: CapabilityEvidence::Unsupported,
+        tool_choice_other: CapabilityEvidence::Unsupported,
     };
 }
 

@@ -1751,6 +1751,10 @@ impl<'a> Compiler<'a> {
             && (!required.thinking_replay || !actual.thinking_replay.is_unsupported())
             && (!required.images || !actual.images.is_unsupported())
             && (!required.tools || !actual.tools.is_unsupported())
+            && (!required.tool_choice_none || !actual.tool_choice_none.is_unsupported())
+            && (!required.tool_choice_named || !actual.tool_choice_named.is_unsupported())
+            && (!required.tool_choice_unnamed || !actual.tool_choice_unnamed.is_unsupported())
+            && (!required.tool_choice_other || !actual.tool_choice_other.is_unsupported())
     }
 
     fn route_exists(&self, frontend: ProtocolId, binding: &BackendBinding) -> bool {

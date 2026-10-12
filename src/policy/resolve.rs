@@ -830,6 +830,10 @@ fn common_denial(live: &BindingAvailability, required: CapabilityFlags) -> Optio
         || (required.thinking_replay && actual.thinking_replay.is_unsupported())
         || (required.images && actual.images.is_unsupported())
         || (required.tools && actual.tools.is_unsupported())
+        || (required.tool_choice_none && actual.tool_choice_none.is_unsupported())
+        || (required.tool_choice_named && actual.tool_choice_named.is_unsupported())
+        || (required.tool_choice_unnamed && actual.tool_choice_unnamed.is_unsupported())
+        || (required.tool_choice_other && actual.tool_choice_other.is_unsupported())
     {
         return Some(SkipReason::MissingRequiredCapability);
     }
@@ -919,6 +923,10 @@ fn merge_capabilities(left: CapabilityFlags, right: CapabilityFlags) -> Capabili
         thinking_replay: left.thinking_replay || right.thinking_replay,
         images: left.images || right.images,
         tools: left.tools || right.tools,
+        tool_choice_none: left.tool_choice_none || right.tool_choice_none,
+        tool_choice_named: left.tool_choice_named || right.tool_choice_named,
+        tool_choice_unnamed: left.tool_choice_unnamed || right.tool_choice_unnamed,
+        tool_choice_other: left.tool_choice_other || right.tool_choice_other,
     }
 }
 
@@ -2487,6 +2495,98 @@ mod tests {
             panic!()
         };
         assert!(trace.iter().any(|event| matches!(event, TraceEvent::Candidate(e) if e.result == Err(SkipReason::MissingRequiredCapability))));
+    }
+
+    #[test]
+    fn tool_choice_requirements_use_exact_verified_binding_evidence() {
+        let policy = compile(
+            document(route(
+                candidate(
+                    "first",
+                    &ANTHROPIC_SUB_MESSAGES,
+                    CandidateModel::RequestedModel,
+                ),
+                vec![],
+            )),
+            &OfferInventory::default(),
+        );
+        type Requirement = fn(&mut CapabilityFlags);
+        type Denial = fn(&mut Capabilities);
+        let cases: [(Requirement, Denial); 4] = [
+            (
+                |required| required.tool_choice_none = true,
+                |actual| {
+                    actual.tool_choice_none = crate::routing::CapabilityEvidence::Unsupported;
+                },
+            ),
+            (
+                |required| required.tool_choice_named = true,
+                |actual| {
+                    actual.tool_choice_named = crate::routing::CapabilityEvidence::Unsupported;
+                },
+            ),
+            (
+                |required| required.tool_choice_unnamed = true,
+                |actual| {
+                    actual.tool_choice_unnamed = crate::routing::CapabilityEvidence::Unsupported;
+                },
+            ),
+            (
+                |required| required.tool_choice_other = true,
+                |actual| {
+                    actual.tool_choice_other = crate::routing::CapabilityEvidence::Unsupported;
+                },
+            ),
+        ];
+
+        for (require, deny) in cases {
+            let mut request = facts("claude-opus-5");
+            require(&mut request.required_capabilities);
+            let mut live = availability(true, false);
+            deny(
+                &mut live
+                    .bindings
+                    .get_mut(ANTHROPIC_SUB_MESSAGES.id())
+                    .unwrap()
+                    .capabilities,
+            );
+            let failure = resolve(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                None,
+                &live,
+                &request,
+            )
+            .unwrap_err();
+            let ResolveFailure::RouteUnavailable { trace } = failure else {
+                panic!()
+            };
+            assert!(trace.iter().any(|event| matches!(
+                event,
+                TraceEvent::Candidate(e)
+                    if e.result == Err(SkipReason::MissingRequiredCapability)
+            )));
+
+            let actual = &mut live
+                .bindings
+                .get_mut(ANTHROPIC_SUB_MESSAGES.id())
+                .unwrap()
+                .capabilities;
+            *actual = Capabilities::UNKNOWN;
+            assert!(
+                resolve(
+                    &policy,
+                    &OfferInventory::default(),
+                    &NoLearning,
+                    None,
+                    &live,
+                    &request,
+                )
+                .is_ok(),
+                "unknown evidence remains viable"
+            );
+        }
     }
 
     #[test]

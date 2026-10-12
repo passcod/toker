@@ -238,12 +238,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // This is a frontend contract, not a routing result. Validate it before
     // consulting the configured default so an invalid request has the same
     // answer even when no Messages backend exists.
+    let parsed = IrRequest::parse(&original);
     if path == "/v1/messages"
-        && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&original)
-        && body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
+        && let Ok(ir) = &parsed
+        && ir.anthropic().model().is_none_or(str::is_empty)
     {
         return super::codex::anthropic_error_response(
             StatusCode::BAD_REQUEST,
@@ -297,7 +295,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
     let mut meters_snapshot: Option<serde_json::Value> = None;
-    if let Ok(mut ir) = IrRequest::parse(&original) {
+    if let Ok(mut ir) = parsed {
         let mut ingress_canonical = (path == "/v1/messages")
             .then(|| translate::from_anthropic(ir.value()).ok())
             .flatten();
@@ -309,14 +307,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             || ir.anthropic().wants_json_response(),
             |request| request.stream != Some(true),
         );
-        if path == "/v1/messages" && client_model.as_deref().is_none_or(str::is_empty) {
-            return super::codex::anthropic_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "model is missing, empty, or not a string",
-                false,
-            );
-        }
         if path == "/v1/messages/batches" {
             observe_batch_shadow(&server, &parts, ir.value(), original.len() as u64);
         }
@@ -1497,6 +1487,10 @@ pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::
         tools: has_tool_history
             || !request.tools.is_empty()
             || request.tool_choice != CanonToolChoice::Auto,
+        tool_choice_none: request.tool_choice == CanonToolChoice::None,
+        tool_choice_named: matches!(request.tool_choice, CanonToolChoice::Tool { name: Some(_) }),
+        tool_choice_unnamed: matches!(request.tool_choice, CanonToolChoice::Tool { name: None }),
+        tool_choice_other: matches!(request.tool_choice, CanonToolChoice::Other { .. }),
     }
 }
 
@@ -2363,6 +2357,46 @@ mod tests {
             ..CanonicalRequest::default()
         };
         assert!(shadow_capabilities(&history).tools);
+    }
+
+    #[test]
+    fn shadow_capabilities_distinguish_tool_choice_shapes() {
+        use crate::ir::canonical::{CanonToolChoice, CanonicalRequest};
+
+        let required = |tool_choice| {
+            shadow_capabilities(&CanonicalRequest {
+                tool_choice,
+                ..CanonicalRequest::default()
+            })
+        };
+        let none = required(CanonToolChoice::None);
+        assert!(none.tools);
+        assert!(none.tool_choice_none);
+        assert!(!none.tool_choice_named);
+        assert!(!none.tool_choice_unnamed);
+        assert!(!none.tool_choice_other);
+
+        let named = required(CanonToolChoice::Tool {
+            name: Some("lookup".to_owned()),
+        });
+        assert!(named.tool_choice_named);
+        assert!(!named.tool_choice_unnamed);
+
+        let unnamed = required(CanonToolChoice::Tool { name: None });
+        assert!(!unnamed.tool_choice_named);
+        assert!(unnamed.tool_choice_unnamed);
+
+        let other = required(CanonToolChoice::Other {
+            kind: "future".to_owned(),
+        });
+        assert!(other.tool_choice_other);
+
+        let any = required(CanonToolChoice::Any);
+        assert!(any.tools);
+        assert!(!any.tool_choice_none);
+        assert!(!any.tool_choice_named);
+        assert!(!any.tool_choice_unnamed);
+        assert!(!any.tool_choice_other);
     }
 
     #[test]

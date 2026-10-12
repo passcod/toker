@@ -811,6 +811,14 @@ pub struct CapabilityFlags {
     pub images: bool,
     #[serde(default)]
     pub tools: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_choice_none: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_choice_named: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_choice_unnamed: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_choice_other: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
