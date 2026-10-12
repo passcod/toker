@@ -1274,8 +1274,10 @@ pub(crate) fn record_responses_measurement(
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
         // Missing provider-reported identity remains absent; the attempted
-        // target already has its own effective_model column.
-        model: capture.model().map(str::to_owned),
+        // target already has its own effective_model column. Keep the exact
+        // wire identity beside the same normalised model identity used by
+        // native Messages rows.
+        model: capture.model().and_then(normalise_model_id),
         raw_model: capture.model().map(str::to_owned),
         requested_model: ctx.requested_model.clone(),
         effective_model: ctx.effective_model.clone(),

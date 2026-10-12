@@ -869,6 +869,8 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         Some("codex_sub/gpt-5.6-sol")
     );
     assert_eq!(row.effective_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(row.model.as_deref(), Some("gpt-5.2-codex"));
+    assert_eq!(row.raw_model.as_deref(), Some("gpt-5.2-codex"));
     assert_eq!(row.req_messages, Some(5));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
@@ -1651,6 +1653,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(row.frontend.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
     assert_eq!(row.model.as_deref(), Some("gpt-5.2-codex"));
+    assert_eq!(row.raw_model.as_deref(), Some("gpt-5.2-codex"));
     assert_eq!(
         row.requested_model.as_deref(),
         Some("codex_sub/claude-opus-5")
