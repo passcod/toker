@@ -325,7 +325,7 @@ mod tests {
                 outcome: PolicyRoutingOutcome::Attempt {
                     candidate_id: CandidateId::new("candidate").unwrap(),
                     baseline_model: "claude-opus-5".to_owned(),
-                    attempt_index: 0,
+                    attempt_index: crate::store::AttemptIndex::zero(),
                     reason: AttemptReason::Initial,
                 },
             }),

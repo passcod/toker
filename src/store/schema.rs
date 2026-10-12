@@ -757,6 +757,40 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request routing terminal or trace');
     END;
     "#,
+    // v12 — close attempt-reason and preflight-terminal shapes for raw SQL
+    // writers. The physical fallback_reason name is retained for compatibility;
+    // its closed Rust meaning is the reason this actual attempt exists.
+    r#"
+    CREATE TRIGGER requests_attempt_reason_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.attempt_group_id IS NULL AND (
+              NEW.attempt_index IS NOT NULL OR NEW.fallback_reason IS NOT NULL
+          ))
+       OR (NEW.attempt_index IS NOT NULL AND NEW.fallback_reason IS NULL)
+       OR (NEW.attempt_index IS NULL AND NEW.fallback_reason IS NOT NULL)
+       OR (NEW.attempt_index = 0 AND NEW.fallback_reason != 'initial')
+       OR (NEW.attempt_index > 0 AND NEW.fallback_reason = 'initial')
+       OR (NEW.fallback_reason IS NOT NULL AND NEW.fallback_reason NOT IN (
+              'initial', 'thinking_negotiation', 'authentication',
+              'model_not_found', 'rate_limit', 'provider_quota', 'overload',
+              'server_error', 'transport_before_accept', 'ambiguous_transport'
+          ))
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request attempt reason');
+    END;
+
+    CREATE TRIGGER requests_route_terminal_shape_check
+    BEFORE INSERT ON requests
+    WHEN NEW.kind = 'route-unavailable' AND (
+           NEW.candidate_id IS NOT NULL
+        OR NEW.binding_id IS NOT NULL
+        OR NEW.baseline_model IS NOT NULL
+        OR NEW.fallback_reason IS NOT NULL
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'route-unavailable carries send-only provenance');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {
@@ -790,6 +824,39 @@ fn validate_v10_history(conn: &Connection) -> Result<()> {
     }
 }
 
+fn validate_v12_history(conn: &Connection) -> Result<()> {
+    let invalid: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM requests
+             WHERE (attempt_group_id IS NULL AND (
+                        attempt_index IS NOT NULL OR fallback_reason IS NOT NULL
+                    ))
+                OR (attempt_index IS NOT NULL AND fallback_reason IS NULL)
+                OR (attempt_index IS NULL AND fallback_reason IS NOT NULL)
+                OR (attempt_index = 0 AND fallback_reason != 'initial')
+                OR (attempt_index > 0 AND fallback_reason = 'initial')
+                OR (fallback_reason IS NOT NULL AND fallback_reason NOT IN (
+                       'initial', 'thinking_negotiation', 'authentication',
+                       'model_not_found', 'rate_limit', 'provider_quota', 'overload',
+                       'server_error', 'transport_before_accept', 'ambiguous_transport'
+                   ))
+                OR kind = 'route-unavailable' AND (
+                       candidate_id IS NOT NULL OR binding_id IS NOT NULL
+                       OR baseline_model IS NOT NULL OR fallback_reason IS NOT NULL
+                   )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid {
+        Err(Error::InvalidRoutingState(
+            "invalid stored attempt reason or route terminal".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Apply pending migrations in order. A fresh database runs every entry.
 pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
     let mut current = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
@@ -806,6 +873,8 @@ pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
             let tx = conn.transaction()?;
             if version == 10 {
                 validate_v10_history(&tx)?;
+            } else if version == 12 {
+                validate_v12_history(&tx)?;
             }
             tx.execute_batch(script)?;
             tx.pragma_update(None, "user_version", version)?;

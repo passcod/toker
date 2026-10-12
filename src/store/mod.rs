@@ -30,12 +30,13 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    AttemptGroupId, AttemptReason, CostKind, DisplayRow, JSON_TEXT_COLUMNS, KindFilter,
-    LaneSystemRow, LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation,
-    OBSERVATION_BUCKET_MS, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource,
-    RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage,
-    SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource, StoredRoutingTrace,
-    StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+    AttemptGroupId, AttemptIndex, AttemptReason, CostKind, DisplayRow, JSON_TEXT_COLUMNS,
+    KindFilter, LaneSystemRow, LocalisationRow, MAX_ROUTING_TRACE_EVENTS, MeterRow,
+    ModelObservation, OBSERVATION_BUCKET_MS, PolicyRouteProvenance, PolicyRoutingOutcome,
+    RebuildRow, RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, RowKind,
+    SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState, StoredLadders,
+    StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
+    is_api_measurement,
 };
 pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
@@ -688,13 +689,14 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, AttemptGroupId, AttemptReason, BindingLearningUpdate, CostKind, DisplayRow,
-        DraftCasResult, Error, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
-        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
-        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, PublicationAdapter,
-        PublicationCasResult, PublicationKey, PublicationState, RequestLookupProvenance,
-        RequestRow, RowKind, SessionCostGroup, SessionLineage, Store, StoredCandidateState,
-        StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+        Allowance, AttemptGroupId, AttemptIndex, AttemptReason, BindingLearningUpdate, CostKind,
+        DisplayRow, DraftCasResult, Error, Lane, LanePin, LanePinCasResult,
+        MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
+        PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
+        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState,
+        RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
+        is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -791,7 +793,7 @@ mod tests {
             outcome: PolicyRoutingOutcome::Attempt {
                 candidate_id: CandidateId::new("candidate").unwrap(),
                 baseline_model: "baseline".to_owned(),
-                attempt_index: 0,
+                attempt_index: AttemptIndex::zero(),
                 reason: AttemptReason::Initial,
             },
         });
@@ -3476,7 +3478,7 @@ mod tests {
             outcome: PolicyRoutingOutcome::Attempt {
                 candidate_id: CandidateId::new("candidate").unwrap(),
                 baseline_model: "model".to_owned(),
-                attempt_index: 0,
+                attempt_index: AttemptIndex::zero(),
                 reason: AttemptReason::Initial,
             },
         });
@@ -3529,6 +3531,26 @@ mod tests {
     }
 
     #[test]
+    fn attempt_group_ids_and_indices_are_closed() {
+        let first = AttemptGroupId::fresh();
+        let second = AttemptGroupId::fresh();
+        assert_ne!(first, second);
+        for group in [&first, &second] {
+            assert_eq!(group.as_str().len(), 32);
+            assert!(
+                group
+                    .as_str()
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) })
+            );
+        }
+        let zero = AttemptIndex::zero();
+        assert_eq!(zero.get(), 0);
+        assert_eq!(zero.next().unwrap().get(), 1);
+        assert!(AttemptIndex::try_from(-1).is_err());
+    }
+
+    #[test]
     fn request_attempt_provenance_round_trips_and_sequence_is_enforced() {
         fn routing(revision_id: i64, group: AttemptGroupId, index: i64) -> PolicyRouteProvenance {
             PolicyRouteProvenance {
@@ -3548,8 +3570,12 @@ mod tests {
                 outcome: PolicyRoutingOutcome::Attempt {
                     candidate_id: CandidateId::new("candidate").unwrap(),
                     baseline_model: "model".to_owned(),
-                    attempt_index: index,
-                    reason: AttemptReason::Initial,
+                    attempt_index: AttemptIndex::try_from(index).unwrap(),
+                    reason: if index == 0 {
+                        AttemptReason::Initial
+                    } else {
+                        AttemptReason::ThinkingNegotiation
+                    },
                 },
             }
         }
@@ -3938,6 +3964,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(historical, r#"{"version":1,"events":[]}"#);
+    }
+
+    #[test]
+    fn migration_v12_closes_attempt_reason_and_terminal_shapes() {
+        let dir = test_dir("v11-attempt-reasons");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..11] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+            conn.execute("INSERT INTO requests (ts_ms) VALUES (1)", [])
+                .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), 12);
+        drop(store);
+        let conn = Connection::open(&db).unwrap();
+        let group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        conn.execute(
+            "INSERT INTO requests
+             (ts_ms, attempt_group_id, attempt_index, fallback_reason)
+             VALUES (2, ?1, 0, 'initial')",
+            [group],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO requests
+             (ts_ms, attempt_group_id, attempt_index, fallback_reason)
+             VALUES (3, ?1, 1, 'thinking_negotiation')",
+            [group],
+        )
+        .unwrap();
+        for sql in [
+            "INSERT INTO requests (ts_ms, attempt_group_id, attempt_index) VALUES (4, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 0)",
+            "INSERT INTO requests (ts_ms, attempt_group_id, attempt_index, fallback_reason) VALUES (5, 'cccccccccccccccccccccccccccccccc', 0, 'overload')",
+            "INSERT INTO requests (ts_ms, attempt_group_id, attempt_index, fallback_reason) VALUES (6, 'dddddddddddddddddddddddddddddddd', 0, 'invented')",
+        ] {
+            assert!(conn.execute(sql, []).is_err(), "accepted {sql}");
+        }
+    }
+
+    #[test]
+    fn migration_v12_rejects_malformed_v11_history_atomically() {
+        let dir = test_dir("v11-malformed-attempt-reason");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..11] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 11).unwrap();
+            conn.execute(
+                "INSERT INTO requests
+                 (ts_ms, attempt_group_id, attempt_index, fallback_reason)
+                 VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 0, 'overload')",
+                [],
+            )
+            .unwrap();
+        }
+        let error = match Store::open(&db) {
+            Ok(_) => panic!("malformed v11 history must block v12 migration"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid stored attempt reason"), "{error}");
+        let conn = Connection::open(&db).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
     }
 
     #[test]

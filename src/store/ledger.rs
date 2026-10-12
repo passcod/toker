@@ -140,6 +140,10 @@ pub fn is_api_measurement(kind: Option<RowKind>) -> bool {
 pub struct AttemptGroupId(String);
 
 impl AttemptGroupId {
+    pub fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
     pub fn new(value: impl Into<String>) -> std::result::Result<Self, String> {
         let value = value.into();
         if value.len() == 32
@@ -546,6 +550,33 @@ impl StoredRoutingTraceEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttemptIndex(i64);
+
+impl AttemptIndex {
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for AttemptIndex {
+    type Error = String;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        (value >= 0)
+            .then_some(Self(value))
+            .ok_or_else(|| "attempt index must be non-negative".to_owned())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptReason {
     Initial,
@@ -620,7 +651,7 @@ pub enum PolicyRoutingOutcome {
     Attempt {
         candidate_id: CandidateId,
         baseline_model: String,
-        attempt_index: i64,
+        attempt_index: AttemptIndex,
         reason: AttemptReason,
     },
     RouteUnavailable,
@@ -814,7 +845,7 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
             } => (
                 Some(candidate_id),
                 Some(baseline_model.as_str()),
-                Some(*attempt_index),
+                Some(attempt_index.get()),
                 Some(*reason),
             ),
             PolicyRoutingOutcome::RouteUnavailable => (None, None, None, None),
@@ -873,12 +904,8 @@ fn validate_request_provenance(row: &RequestRow) -> Result<()> {
             ));
         }
         match &routing.outcome {
-            PolicyRoutingOutcome::Attempt {
-                baseline_model,
-                attempt_index,
-                ..
-            } => {
-                if *attempt_index < 0 || baseline_model.is_empty() || row.binding_id.is_none() {
+            PolicyRoutingOutcome::Attempt { baseline_model, .. } => {
+                if baseline_model.is_empty() || row.binding_id.is_none() {
                     return Err(Error::InvalidRoutingState(
                         "invalid policy routing attempt".into(),
                     ));
@@ -2150,7 +2177,9 @@ fn read_policy_routing(
                 "stored policy routing attempt is partial".into(),
             ));
         };
-        if attempt_index < 0 || binding_id.is_none() {
+        let attempt_index =
+            AttemptIndex::try_from(attempt_index).map_err(Error::InvalidRoutingState)?;
+        if binding_id.is_none() {
             return Err(Error::InvalidRoutingState(
                 "stored policy routing attempt is invalid".into(),
             ));
