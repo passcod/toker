@@ -758,7 +758,7 @@ fn candidate_evidence(
             | CompiledCandidateModel::OfferSelector(_) => None,
         })
     } else {
-        Some(SkipReason::BindingUnknown)
+        None
     };
     CandidateEvidence {
         candidate_id: candidate.id().clone(),
@@ -802,7 +802,7 @@ fn exact_evidence(
         common_denial(live, facts.required_capabilities)
             .or_else(|| model_availability(binding, Some(model), live.catalogue, inventory))
     } else {
-        Some(SkipReason::BindingUnknown)
+        None
     };
     CandidateEvidence {
         candidate_id: candidate_id.clone(),
@@ -824,11 +824,11 @@ fn common_denial(live: &BindingAvailability, required: CapabilityFlags) -> Optio
         return Some(SkipReason::CredentialUnavailable);
     }
     let actual = live.capabilities;
-    if (required.sampling && !actual.sampling)
-        || (required.system_in_messages && !actual.system_in_messages)
-        || (required.thinking_replay && !actual.thinking_replay)
-        || (required.images && !actual.images)
-        || (required.tools && !actual.tools)
+    if (required.sampling && actual.sampling.is_unsupported())
+        || (required.system_in_messages && actual.system_in_messages.is_unsupported())
+        || (required.thinking_replay && actual.thinking_replay.is_unsupported())
+        || (required.images && actual.images.is_unsupported())
+        || (required.tools && actual.tools.is_unsupported())
     {
         return Some(SkipReason::MissingRequiredCapability);
     }
@@ -1961,6 +1961,54 @@ mod tests {
     }
 
     #[test]
+    fn missing_binding_evidence_remains_unknown_and_does_not_fallback() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let selected = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &AvailabilitySnapshot::default(),
+            &facts("asked"),
+        )
+        .unwrap();
+        assert_eq!(selected.candidate_id, Some(id("first")));
+        assert!(matches!(
+            &selected.trace[1],
+            TraceEvent::Candidate(evidence) if evidence.result.is_ok()
+        ));
+    }
+
+    #[test]
     fn disabled_candidate_is_positive_preflight_evidence() {
         let mut disabled = candidate(
             "disabled",
@@ -2418,13 +2466,13 @@ mod tests {
             .get_mut(ANTHROPIC_SUB_MESSAGES.id())
             .unwrap()
             .capabilities
-            .thinking_replay = false;
+            .thinking_replay = crate::routing::CapabilityEvidence::Unsupported;
         availability
             .bindings
             .get_mut(ANTHROPIC_API_MESSAGES.id())
             .unwrap()
             .capabilities
-            .thinking_replay = false;
+            .thinking_replay = crate::routing::CapabilityEvidence::Unsupported;
         let failure = resolve(
             &policy,
             &OfferInventory::default(),

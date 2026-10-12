@@ -1030,7 +1030,7 @@ mod tests {
         // backend refuses sampling outright (live-verified:
         // "Unsupported parameter: temperature").
         let caps = Capabilities::CODEX;
-        assert!(!caps.sampling);
+        assert!(caps.sampling.is_unsupported());
         let canonical = CanonicalRequest {
             model: Some(MODEL.to_owned()),
             sampling: SamplingSpec {
@@ -1120,7 +1120,7 @@ mod tests {
         // The capability declaration the drop enforces:
         // cross-provider reasoning is opaque — protocol-forced out.
         let caps = Capabilities::CODEX;
-        assert!(!caps.thinking_replay);
+        assert!(caps.thinking_replay.is_unsupported());
         let canonical = CanonicalRequest {
             model: Some(MODEL.to_owned()),
             messages: vec![message(
@@ -1332,7 +1332,7 @@ mod tests {
         // "System messages are not allowed"). The transform: merge
         // into the preceding user turn, role sequence unchanged.
         let caps = Capabilities::CODEX;
-        assert!(!caps.system_in_messages);
+        assert!(caps.system_in_messages.is_unsupported());
         let canonical = CanonicalRequest {
             messages: vec![
                 message(

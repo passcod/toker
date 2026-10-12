@@ -1746,11 +1746,11 @@ impl<'a> Compiler<'a> {
         };
         let actual: Capabilities = backend.capabilities();
         let required = candidate.required_capabilities;
-        (!required.sampling || actual.sampling)
-            && (!required.system_in_messages || actual.system_in_messages)
-            && (!required.thinking_replay || actual.thinking_replay)
-            && (!required.images || actual.images)
-            && (!required.tools || actual.tools)
+        (!required.sampling || !actual.sampling.is_unsupported())
+            && (!required.system_in_messages || !actual.system_in_messages.is_unsupported())
+            && (!required.thinking_replay || !actual.thinking_replay.is_unsupported())
+            && (!required.images || !actual.images.is_unsupported())
+            && (!required.tools || !actual.tools.is_unsupported())
     }
 
     fn route_exists(&self, frontend: ProtocolId, binding: &BackendBinding) -> bool {
@@ -2293,6 +2293,21 @@ mod tests {
         assert!(
             codes(&compile_document(capability, PolicyOrigin::Authored))
                 .contains(&"capability-unavailable")
+        );
+
+        let mut unknown_capability = document();
+        unknown_capability.routes[0].chain.first.binding_id = OPENAI_API_CHAT.id().clone();
+        unknown_capability.routes[0]
+            .chain
+            .first
+            .required_capabilities
+            .sampling = true;
+        assert!(
+            !codes(&compile_document(
+                unknown_capability,
+                PolicyOrigin::Authored
+            ))
+            .contains(&"capability-unavailable")
         );
 
         let mut defaults = document();

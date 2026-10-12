@@ -82,62 +82,87 @@ impl fmt::Display for DialectId {
     }
 }
 
-/// Semantics a backend binding has been live-verified to accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CapabilityEvidence {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilityEvidence {
+    pub const fn is_unsupported(self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+/// Evidence for semantics a backend binding may need to represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Capabilities {
     /// Sampling parameters (`temperature`, `top_p`, `max_tokens`, and stops).
-    pub sampling: bool,
+    pub sampling: CapabilityEvidence,
     /// System-role messages among the conversation's items.
-    pub system_in_messages: bool,
+    pub system_in_messages: CapabilityEvidence,
     /// Replaying another provider's reasoning blocks.
-    pub thinking_replay: bool,
+    pub thinking_replay: CapabilityEvidence,
     /// Image content blocks.
-    pub images: bool,
+    pub images: CapabilityEvidence,
     /// Tool declarations and tool call/result turns.
-    pub tools: bool,
+    pub tools: CapabilityEvidence,
 }
 
 impl Capabilities {
+    pub const UNKNOWN: Capabilities = Capabilities {
+        sampling: CapabilityEvidence::Unknown,
+        system_in_messages: CapabilityEvidence::Unknown,
+        thinking_replay: CapabilityEvidence::Unknown,
+        images: CapabilityEvidence::Unknown,
+        tools: CapabilityEvidence::Unknown,
+    };
+
     /// The Messages features verified on Anthropic and OpenRouter's Messages
     /// binding. Signed reasoning replay is additionally enforced by the
     /// adapter; an unsigned block is reported and omitted.
     pub const MESSAGES: Capabilities = Capabilities {
-        sampling: true,
-        system_in_messages: true,
-        thinking_replay: true,
-        images: true,
-        tools: true,
+        sampling: CapabilityEvidence::Supported,
+        system_in_messages: CapabilityEvidence::Supported,
+        thinking_replay: CapabilityEvidence::Supported,
+        images: CapabilityEvidence::Supported,
+        tools: CapabilityEvidence::Supported,
     };
 
     /// OpenRouter's live Chat Completions binding. The request and response
     /// corpus verifies sampling, in-band instruction roles, images, and tool
     /// calls. Provider reasoning payloads have no portable replay shape.
     pub const CHAT: Capabilities = Capabilities {
-        sampling: true,
-        system_in_messages: true,
-        thinking_replay: false,
-        images: true,
-        tools: true,
+        sampling: CapabilityEvidence::Supported,
+        system_in_messages: CapabilityEvidence::Supported,
+        thinking_replay: CapabilityEvidence::Unsupported,
+        images: CapabilityEvidence::Supported,
+        tools: CapabilityEvidence::Supported,
     };
 
     /// The Codex subscription Responses binding's live-verified capabilities.
     pub const CODEX: Capabilities = Capabilities {
-        sampling: false,
-        system_in_messages: false,
-        thinking_replay: false,
-        images: true,
-        tools: true,
+        sampling: CapabilityEvidence::Unsupported,
+        system_in_messages: CapabilityEvidence::Unsupported,
+        thinking_replay: CapabilityEvidence::Unsupported,
+        images: CapabilityEvidence::Supported,
+        tools: CapabilityEvidence::Supported,
     };
 
     /// The streamed Responses subset verified against OpenRouter: tools,
     /// usage, and caller output bounds. Other sampling knobs and replay of
     /// provider-owned reasoning remain unverified and are not claimed here.
     pub const OPENROUTER_RESPONSES: Capabilities = Capabilities {
-        sampling: false,
-        system_in_messages: false,
-        thinking_replay: false,
-        images: false,
-        tools: true,
+        sampling: CapabilityEvidence::Unknown,
+        system_in_messages: CapabilityEvidence::Unknown,
+        thinking_replay: CapabilityEvidence::Unknown,
+        images: CapabilityEvidence::Unknown,
+        tools: CapabilityEvidence::Supported,
     };
 }
 
@@ -359,7 +384,7 @@ pub const OPENAI_API_CHAT: BackendBinding = BackendBinding::canonical(
     CostClass::Billed,
     None,
     BackendAdapterId::OpenAiChatCompletions,
-    Capabilities::CHAT,
+    Capabilities::UNKNOWN,
 );
 
 pub const OPENROUTER_CHAT: BackendBinding = BackendBinding::canonical(
@@ -877,7 +902,7 @@ mod tests {
                 ProtocolId::OpenAiChat,
                 DialectId::OpenAiChatCompletions,
                 BackendAdapterId::OpenAiChatCompletions,
-                Capabilities::CHAT,
+                Capabilities::UNKNOWN,
                 None,
             ),
             (

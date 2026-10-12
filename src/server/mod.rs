@@ -1282,16 +1282,10 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
                         Evidence::Negative("provider-unconfigured")
                     },
                     catalogue,
-                    capabilities: canonical.map_or(
-                        crate::routing::Capabilities {
-                            sampling: false,
-                            system_in_messages: false,
-                            thinking_replay: false,
-                            images: false,
-                            tools: false,
-                        },
-                        |canonical| canonical.capabilities(),
-                    ),
+                    capabilities: canonical
+                        .map_or(crate::routing::Capabilities::UNKNOWN, |canonical| {
+                            canonical.capabilities()
+                        }),
                     cost_class: binding.cost_class(),
                 },
             )

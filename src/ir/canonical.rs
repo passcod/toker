@@ -847,36 +847,39 @@ mod tests {
     fn the_codex_capabilities_pin_the_live_verified_facts() {
         let caps = Capabilities::CODEX;
         assert!(
-            !caps.sampling,
+            caps.sampling.is_unsupported(),
             "refused live: \"Unsupported parameter: temperature\""
         );
         assert!(
-            !caps.system_in_messages,
+            caps.system_in_messages.is_unsupported(),
             "refused live: \"System messages are not allowed\""
         );
         assert!(
-            !caps.thinking_replay,
+            caps.thinking_replay.is_unsupported(),
             "protocol-forced: cross-provider reasoning is opaque"
         );
-        assert!(caps.images, "the backend takes input_image parts");
+        assert!(
+            caps.images.is_supported(),
+            "the backend takes input_image parts"
+        );
     }
 
     #[test]
     fn messages_capabilities_pin_the_verified_shared_wire() {
         let caps = Capabilities::MESSAGES;
-        assert!(caps.sampling);
-        assert!(caps.system_in_messages);
-        assert!(caps.thinking_replay);
-        assert!(caps.images);
+        assert!(caps.sampling.is_supported());
+        assert!(caps.system_in_messages.is_supported());
+        assert!(caps.thinking_replay.is_supported());
+        assert!(caps.images.is_supported());
     }
 
     #[test]
     fn chat_capabilities_pin_the_verified_openrouter_wire() {
         let caps = Capabilities::CHAT;
-        assert!(caps.sampling);
-        assert!(caps.system_in_messages);
-        assert!(!caps.thinking_replay);
-        assert!(caps.images);
+        assert!(caps.sampling.is_supported());
+        assert!(caps.system_in_messages.is_supported());
+        assert!(caps.thinking_replay.is_unsupported());
+        assert!(caps.images.is_supported());
     }
 
     /// The wire values are the parse's inverse: the exact shapes the
