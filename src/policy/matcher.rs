@@ -25,6 +25,12 @@ pub enum MatcherSpec {
     Exact(String),
     Glob(String),
     Regex(String),
+    /// Revision-one model-map matching after canonical identity folding.
+    #[serde(rename = "revision_one_model")]
+    RevisionOneModel(String),
+    /// Revision-one family matching through the legacy classifier.
+    #[serde(rename = "revision_one_family")]
+    RevisionOneFamily(String),
 }
 
 impl MatcherSpec {
@@ -45,12 +51,18 @@ impl MatcherSpec {
             Self::Regex(value) => Regex::new(value)
                 .map(CompiledMatcher::Regex)
                 .map_err(|error| MatcherError::InvalidRegex(error.to_string())),
+            Self::RevisionOneModel(value) => Ok(CompiledMatcher::RevisionOneModel(value.clone())),
+            Self::RevisionOneFamily(value) => Ok(CompiledMatcher::RevisionOneFamily(value.clone())),
         }
     }
 
     pub fn value(&self) -> &str {
         match self {
-            Self::Exact(value) | Self::Glob(value) | Self::Regex(value) => value,
+            Self::Exact(value)
+            | Self::Glob(value)
+            | Self::Regex(value)
+            | Self::RevisionOneModel(value)
+            | Self::RevisionOneFamily(value) => value,
         }
     }
 }
@@ -88,6 +100,8 @@ pub enum CompiledMatcher {
     Exact(String),
     Glob(GlobMatcher),
     Regex(Regex),
+    RevisionOneModel(String),
+    RevisionOneFamily(String),
 }
 
 impl CompiledMatcher {
@@ -134,6 +148,12 @@ impl CompiledMatcher {
                 }
                 Ok(Some(result))
             }
+            Self::RevisionOneModel(expected) => Ok(crate::catalog::model_identity(input)
+                .is_some_and(|identity| identity == *expected)
+                .then(|| MatcherCaptures::empty(input))),
+            Self::RevisionOneFamily(expected) => Ok(crate::middleware::models::family_of(input)
+                .is_some_and(|family| family.name == *expected)
+                .then(|| MatcherCaptures::empty(input))),
         }
     }
 

@@ -35,6 +35,8 @@ pub enum RequestClass {
 pub struct LegacyCompactionFacts {
     pub lane_cold: bool,
     pub prompt_tokens: u64,
+    /// Whether the authoritative all-or-nothing body transform succeeded.
+    pub transform_applied: bool,
 }
 
 /// Content-free facts derived by a frontend adapter.
@@ -540,7 +542,9 @@ pub fn resolve_with_circuits<L: LearningView>(
             aliased_model: aliased,
             effective_model: effective,
             compaction: selected.provenance == RouteProvenance::Compaction
-                || (facts.legacy_compaction.is_some_and(|facts| facts.lane_cold)
+                || (facts
+                    .legacy_compaction
+                    .is_some_and(|facts| facts.transform_applied)
                     && policy
                         .compaction()
                         .and_then(CompiledCompaction::revision_one_legacy)
@@ -977,6 +981,9 @@ fn choose_upgrade<L: LearningView>(
 
     if let Some(lane) = lane
         && lane.temperature != super::CacheTemperature::Cold
+        && !facts
+            .legacy_compaction
+            .is_some_and(|compaction| compaction.lane_cold)
         && lane.forced_from.as_deref() == Some(baseline)
         && let Some(to) = lane.forced_to.as_ref()
     {
@@ -1108,10 +1115,10 @@ fn choose_revision_one_compaction<L: LearningView>(
     let target = match family {
         Some(family) if family.version.is_empty() => {
             let mut best: Option<String> = None;
-            for model in learning
-                .known_models(candidate.binding_id())
-                .map_err(|_| ResolveFailure::LearningUnavailable)?
-            {
+            let Ok(models) = learning.known_models(candidate.binding_id()) else {
+                return Ok(None);
+            };
+            for model in models {
                 if crate::middleware::models::family_of(&model)
                     .is_none_or(|candidate_family| candidate_family.name != family.name)
                     || !learning_minimum(
@@ -1120,7 +1127,8 @@ fn choose_revision_one_compaction<L: LearningView>(
                         learning,
                         candidate.binding_id(),
                         &model,
-                    )?
+                    )
+                    .unwrap_or(false)
                 {
                     continue;
                 }
@@ -1154,7 +1162,8 @@ fn choose_revision_one_compaction<L: LearningView>(
     } else {
         learning
             .learned(candidate.binding_id(), &target)
-            .map_err(|_| ResolveFailure::LearningUnavailable)?
+            .ok()
+            .flatten()
             .and_then(|evidence| evidence.max_prompt())
             .is_some_and(|max| compaction_facts.prompt_tokens <= max)
     };
@@ -1260,7 +1269,7 @@ fn apply_alias(
         return rule
             .replacement()
             .render(parameters, &captures)
-            .map(Some)
+            .map(|replacement| (replacement != model).then_some(replacement))
             .map_err(|_| ResolveFailure::InvalidTemplate);
     }
     Ok(None)
@@ -1594,6 +1603,37 @@ mod tests {
 
         assert_eq!(plan.effective_model, "claude-opus-4-8");
         assert_eq!(plan.upgraded_model, None);
+    }
+
+    #[test]
+    fn legacy_cold_compaction_suppresses_sticky_upgrade_with_unknown_temperature() {
+        let inventory = upgrade_inventory();
+        let policy = compile(upgrade_document(), &inventory);
+        let mut request = facts("claude-opus-4-8");
+        request.class = RequestClass::Compaction;
+        request.legacy_compaction = Some(LegacyCompactionFacts {
+            lane_cold: true,
+            prompt_tokens: 100,
+            transform_applied: true,
+        });
+        let lane = LaneFacts {
+            temperature: CacheTemperature::Unknown,
+            pinned: None,
+            forced_from: Some("claude-opus-4-8".to_owned()),
+            forced_to: Some("claude-opus-5".to_owned()),
+        };
+
+        let plan = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            Some(&lane),
+            &availability(true, false),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(plan.upgraded_model, None);
+        assert_eq!(plan.effective_model, "claude-opus-4-8");
     }
 
     #[test]
@@ -2861,6 +2901,7 @@ mod tests {
         request.legacy_compaction = Some(LegacyCompactionFacts {
             lane_cold: true,
             prompt_tokens: 200_000,
+            transform_applied: true,
         });
         let plan = resolve(
             &policy,
@@ -2880,6 +2921,7 @@ mod tests {
 
         let mut warm = request.clone();
         warm.legacy_compaction.as_mut().unwrap().lane_cold = false;
+        warm.legacy_compaction.as_mut().unwrap().transform_applied = false;
         let plan = resolve(
             &policy,
             &OfferInventory::default(),

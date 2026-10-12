@@ -341,9 +341,6 @@ impl<'a> LegacyBuilder<'a> {
             .compact_model
             .as_deref()
             .unwrap_or("sonnet");
-        if spec.is_empty() || spec == "off" {
-            return Ok(());
-        }
         let eligible_bindings = self
             .topology
             .routes()
@@ -413,7 +410,7 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
     for (selector, target) in map.entries() {
         if let Some(model) = selector.strip_prefix("model:") {
             rules.push(AliasRule {
-                matcher: MatcherSpec::Exact(model.to_owned()),
+                matcher: MatcherSpec::RevisionOneModel(model.to_owned()),
                 exclude: vec![],
                 replacement: target.to_owned(),
             });
@@ -423,13 +420,8 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
         let Some(family) = selector.strip_prefix("family:") else {
             continue;
         };
-        // This explicit generated form is the policy equivalent of legacy
-        // family_of: optional claude- prefix and one or more numeric segments.
         rules.push(AliasRule {
-            matcher: MatcherSpec::Regex(format!(
-                r"^(?:claude-)?{}-[0-9]+(?:-[0-9]+)*$",
-                regex::escape(family)
-            )),
+            matcher: MatcherSpec::RevisionOneFamily(family.to_owned()),
             exclude: vec![],
             replacement: target.to_owned(),
         });
@@ -687,12 +679,21 @@ mod tests {
         .unwrap();
         let policy = alias_policy(&map).unwrap();
         assert_eq!(policy.rules.len(), 2);
-        assert!(
-            matches!(&policy.rules[0].matcher, MatcherSpec::Exact(value) if value == "claude-opus-4-5")
-        );
-        assert!(matches!(&policy.rules[1].matcher, MatcherSpec::Regex(_)));
+        assert!(matches!(
+            &policy.rules[0].matcher,
+            MatcherSpec::RevisionOneModel(value) if value == "claude-opus-4-5"
+        ));
+        assert!(matches!(
+            &policy.rules[1].matcher,
+            MatcherSpec::RevisionOneFamily(value) if value == "opus"
+        ));
         assert_eq!(policy.rules[0].replacement, "exact-target");
         assert_eq!(policy.rules[1].replacement, "family-target");
+        let exact = policy.rules[0].matcher.compile().unwrap();
+        assert!(exact.is_match("claude-opus-4-5-20251101").unwrap());
+        let family = policy.rules[1].matcher.compile().unwrap();
+        assert!(family.is_match("claude-3-7-opus").unwrap());
+        assert!(family.is_match("claude-opus-4-5-20251101").unwrap());
     }
 
     #[test]
@@ -796,10 +797,11 @@ mod tests {
     #[test]
     fn compact_target_handles_none_off_family_and_exact() {
         let cases = [
-            (None, Some("sonnet")),
-            (Some("off"), None),
-            (Some("sonnet"), Some("sonnet")),
-            (Some("claude-sonnet-5"), Some("claude-sonnet-5")),
+            (None, "sonnet"),
+            (Some("off"), "off"),
+            (Some(""), ""),
+            (Some("sonnet"), "sonnet"),
+            (Some("claude-sonnet-5"), "claude-sonnet-5"),
         ];
         for (spec, expected) in cases {
             let compact = spec
@@ -810,38 +812,31 @@ mod tests {
             ));
             let topology = topology(&config);
             let document = document(&config, &topology).unwrap();
-            assert_eq!(
-                document.compaction.is_some(),
-                expected.is_some(),
-                "{spec:?}"
+            let CompactionTarget::RevisionOneLegacy {
+                model_spec,
+                eligible_bindings,
+            } = &document.compaction.as_ref().unwrap().target
+            else {
+                panic!("generated compaction is a legacy overlay")
+            };
+            assert_eq!(model_spec, expected);
+            assert!(
+                eligible_bindings
+                    .iter()
+                    .any(|binding| { binding.as_str() == "anthropic_sub.anthropic_messages" })
             );
-            if let Some(expected) = expected {
-                let CompactionTarget::RevisionOneLegacy {
-                    model_spec,
-                    eligible_bindings,
-                } = &document.compaction.as_ref().unwrap().target
-                else {
-                    panic!("generated compaction is a legacy overlay")
-                };
-                assert_eq!(model_spec, expected);
-                assert!(
-                    eligible_bindings
-                        .iter()
-                        .any(|binding| { binding.as_str() == "anthropic_sub.anthropic_messages" })
-                );
-                assert!(
-                    eligible_bindings
-                        .iter()
-                        .all(|binding| { binding.as_str() != "openrouter.openrouter_messages" })
-                );
-                assert!(
-                    document
-                        .routes
-                        .iter()
-                        .all(|route| route.id.as_str() != "legacy-compaction"),
-                    "compaction preserves the ordinarily selected route"
-                );
-            }
+            assert!(
+                eligible_bindings
+                    .iter()
+                    .all(|binding| { binding.as_str() != "openrouter.openrouter_messages" })
+            );
+            assert!(
+                document
+                    .routes
+                    .iter()
+                    .all(|route| route.id.as_str() != "legacy-compaction"),
+                "compaction preserves the ordinarily selected route"
+            );
         }
     }
 

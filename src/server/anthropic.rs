@@ -1444,6 +1444,7 @@ fn observe_messages_shadow(
                 .and_then(|lane| lane.prompt_tokens)
                 .and_then(|prompt| u64::try_from(prompt).ok())
                 .unwrap_or_default(),
+            transform_applied: compaction_applied,
         });
     }
     let before_alias = retargeted

@@ -1765,6 +1765,14 @@ impl<'a> Compiler<'a> {
         path: DiagnosticPath,
         record: &StableId,
     ) -> Option<CompiledMatcher> {
+        if matches!(
+            spec,
+            MatcherSpec::RevisionOneModel(_) | MatcherSpec::RevisionOneFamily(_)
+        ) && self.origin != PolicyOrigin::GeneratedRevisionOne
+        {
+            self.error("legacy-matcher-forbidden", path, record);
+            return None;
+        }
         match spec.compile() {
             Ok(value) => Some(value),
             Err(_) => {
