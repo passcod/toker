@@ -87,7 +87,14 @@ impl ReadyAttempt {
         &self.effective_model
     }
 
-    pub(crate) async fn execute(self, server: Server) -> Response {
+    pub(crate) async fn execute(mut self, server: Server) -> Response {
+        if let Some(ctx) = self.record.as_mut() {
+            ctx.attempt = Some(crate::store::AttemptProvenance {
+                attempt_group_id: crate::store::AttemptGroupId::fresh(),
+                attempt_index: crate::store::AttemptIndex::zero(),
+                reason: crate::store::AttemptReason::Initial,
+            });
+        }
         let upstream = match send_upstream_to(
             &server,
             self.backend.as_ref(),

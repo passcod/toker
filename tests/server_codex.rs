@@ -864,6 +864,10 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
         Some("codex_sub.codex_responses")
     );
     assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
+    let attempt = row.attempt.as_ref().expect("initial attempt provenance");
+    assert_eq!(attempt.attempt_index.get(), 0);
+    assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
+    assert!(row.policy_routing.is_none());
     assert_eq!(
         row.requested_model.as_deref(),
         Some("codex_sub/gpt-5.6-sol")

@@ -45,7 +45,7 @@ use crate::middleware::lanes;
 use crate::observe::UsageCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{CostKind, RequestRow, RowKind};
+use crate::store::{AttemptProvenance, CostKind, RequestRow, RowKind};
 
 use super::Server;
 
@@ -59,6 +59,8 @@ pub(crate) struct RecordCtx {
     /// The exact legacy-selected backend binding. This identifies the wire
     /// dialect without implying a policy revision or candidate selection.
     pub(crate) binding_id: BindingId,
+    /// The actual upstream send this response completes.
+    pub(crate) attempt: Option<AttemptProvenance>,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -771,7 +773,7 @@ fn measurement_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: None,
     }
@@ -851,7 +853,7 @@ fn error_row(
         geo: None,
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
-        attempt: None,
+        attempt: ctx.attempt.clone(),
         policy_routing: None,
         lineage: None,
     }

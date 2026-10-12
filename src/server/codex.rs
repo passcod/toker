@@ -311,6 +311,13 @@ impl ReadyAttempt {
     }
 
     pub(crate) async fn execute(mut self, server: Server) -> Response {
+        if let Some(ctx) = self.record.as_mut() {
+            ctx.attempt = Some(crate::store::AttemptProvenance {
+                attempt_group_id: crate::store::AttemptGroupId::fresh(),
+                attempt_index: crate::store::AttemptIndex::zero(),
+                reason: crate::store::AttemptReason::Initial,
+            });
+        }
         let url = self.backend.endpoint("/responses");
         let upstream = match server
             .http

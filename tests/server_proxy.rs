@@ -641,6 +641,9 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
         Some("openai_api.openai_chat_completions")
     );
     assert_eq!(row.policy_routing, None);
+    let attempt = row.attempt.as_ref().expect("initial attempt provenance");
+    assert_eq!(attempt.attempt_index.get(), 0);
+    assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
     assert_eq!(
         row.requested_model.as_deref(),
         Some("openai_api/gpt-6.1-sol")
