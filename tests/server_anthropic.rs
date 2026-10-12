@@ -1377,6 +1377,13 @@ async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
         let second = &rows[1];
         assert_eq!(first.status, Some(400), "the refusal is its own row");
         assert_eq!(second.status, None, "the retry is the measurement row");
+        assert!(
+            first
+                .extra
+                .as_ref()
+                .is_none_or(|extra| extra.get("error_message").is_none()),
+            "the swallowed provider message is not persisted: {first:?}"
+        );
         let first_attempt = first.attempt.as_ref().expect("first attempt provenance");
         let second_attempt = second.attempt.as_ref().expect("retry provenance");
         assert_eq!(first_attempt.attempt_index.get(), 0);

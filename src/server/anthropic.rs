@@ -1621,13 +1621,13 @@ pub(crate) async fn retry_thinking_off(
     }
     tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
     if let Some(ctx) = record {
-        let (error_type, error_message) = error_pair(&buffered.bytes);
+        let (error_type, _) = error_pair(&buffered.bytes);
         let rate_limits = parse_rate_limits(&headers);
         record_anthropic_error(
             ctx,
             status.as_u16(),
             error_type,
-            error_message,
+            None,
             retry_after_ms(&headers),
             rate_limits.as_ref(),
         );
