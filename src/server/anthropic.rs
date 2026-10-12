@@ -1375,6 +1375,14 @@ fn observe_messages_shadow(
         .map(|shape| shape.tools_hash.as_str())
         .and_then(|tools| lanes::lane_key(session_id, Some(tools)));
     let required_capabilities = canonical.map(shadow_capabilities).unwrap_or_default();
+    let binding_affinity = canonical
+        .is_some_and(CanonicalRequest::requires_binding_affinity)
+        .then(|| {
+            lane.and_then(|lane| lane.pin.as_ref()).map_or_else(
+                || target.binding().id().clone(),
+                |pin| pin.binding_id.clone(),
+            )
+        });
     let facts = server.shadow_facts(
         ProtocolId::AnthropicMessages,
         profile,
@@ -1384,7 +1392,7 @@ fn observe_messages_shadow(
         shape.and_then(|shape| shape.req_messages),
         shape.map_or(0, |shape| shape.req_tools),
         required_capabilities,
-        None,
+        binding_affinity,
         if compaction {
             crate::policy::RequestClass::Compaction
         } else {

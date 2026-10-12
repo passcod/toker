@@ -322,6 +322,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     }
 
+    let binding_affinity = canonical.requires_binding_affinity().then(|| {
+        cold_lane
+            .as_ref()
+            .and_then(|lane| lane.pin.as_ref())
+            .map_or_else(
+                || target.binding().id().clone(),
+                |pin| pin.binding_id.clone(),
+            )
+    });
     let facts = server.shadow_facts(
         ProtocolId::OpenAiChat,
         shadow_profile.as_deref(),
@@ -331,7 +340,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         gate_shape.as_ref().and_then(|shape| shape.req_messages),
         gate_shape.as_ref().map_or(0, |shape| shape.req_tools),
         super::anthropic::shadow_capabilities(&canonical),
-        None,
+        binding_affinity,
         crate::policy::RequestClass::Inference,
     );
     if let Some(legacy) = server.legacy_shadow_outcome(

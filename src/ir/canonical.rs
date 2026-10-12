@@ -88,6 +88,37 @@ pub struct CanonicalRequest {
     pub extensions: Vec<CanonicalExtension>,
 }
 
+impl CanonicalRequest {
+    /// Whether this request carries opaque provider material that can replay
+    /// only on the binding that produced it. Values are never inspected.
+    pub fn requires_binding_affinity(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block.semantic(),
+                    CanonBlock::Thinking {
+                        signature: Some(_),
+                        ..
+                    } | CanonBlock::RedactedThinking { .. }
+                )
+            }) || message.extensions.iter().any(|extension| {
+                matches!(
+                    (
+                        extension.source(),
+                        extension.wire_name(),
+                        extension.wire_path(),
+                    ),
+                    (
+                        DialectId::OpenAiChatCompletions,
+                        Some("reasoning_details"),
+                        "$.messages[].reasoning_details",
+                    ) | (DialectId::CodexResponses, None, "$.input[].reasoning")
+                )
+            })
+        })
+    }
+}
+
 /// One top-level system prompt part.
 ///
 /// Anthropic permits either a string or an array of blocks here. A string and
@@ -838,6 +869,83 @@ mod tests {
         );
         assert!(turn.thinking.is_empty());
         assert!(turn.output_extensions.is_empty());
+    }
+
+    #[test]
+    fn opaque_replay_affinity_uses_only_typed_shape_markers() {
+        let request =
+            |block: Option<CanonBlock>, extensions: Vec<CanonicalExtension>| CanonicalRequest {
+                messages: vec![super::CanonMessage {
+                    role: super::CanonRole::Assistant,
+                    blocks: block.into_iter().collect(),
+                    extensions,
+                }],
+                ..CanonicalRequest::default()
+            };
+        assert!(
+            request(
+                Some(CanonBlock::Thinking {
+                    text: "summary".to_owned(),
+                    signature: Some("private-signature".to_owned()),
+                }),
+                vec![],
+            )
+            .requires_binding_affinity()
+        );
+        assert!(
+            request(
+                Some(CanonBlock::RedactedThinking {
+                    data: "private-ciphertext".to_owned(),
+                    provider_id: None,
+                }),
+                vec![],
+            )
+            .requires_binding_affinity()
+        );
+        assert!(
+            !request(
+                Some(CanonBlock::Thinking {
+                    text: "visible".to_owned(),
+                    signature: None,
+                }),
+                vec![],
+            )
+            .requires_binding_affinity()
+        );
+        assert!(
+            request(
+                None,
+                vec![CanonicalExtension::node_field(
+                    DialectId::OpenAiChatCompletions,
+                    "$.messages[].reasoning_details",
+                    "reasoning_details",
+                    json!([{"data": "private-chat-value"}]),
+                )],
+            )
+            .requires_binding_affinity()
+        );
+        assert!(
+            request(
+                None,
+                vec![CanonicalExtension::new(
+                    DialectId::CodexResponses,
+                    "$.input[].reasoning",
+                    json!({"encrypted_content": "private-responses-value"}),
+                )],
+            )
+            .requires_binding_affinity()
+        );
+        assert!(
+            !request(
+                None,
+                vec![CanonicalExtension::new(
+                    DialectId::CodexResponses,
+                    "$.reasoning.effort",
+                    json!("high"),
+                )],
+            )
+            .requires_binding_affinity()
+        );
     }
 
     /// The capabilities the corpus and the backend adapter's drops

@@ -171,6 +171,9 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     if let Some((canonical, shape)) = prepared_shape.as_ref() {
         let lane_reference =
             lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()));
+        let binding_affinity = canonical
+            .requires_binding_affinity()
+            .then(|| target.binding().id().clone());
         let facts = server.shadow_facts(
             ProtocolId::OpenAiResponses,
             shadow_profile.as_deref(),
@@ -180,7 +183,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             shape.req_messages,
             shape.req_tools,
             super::anthropic::shadow_capabilities(canonical),
-            None,
+            binding_affinity,
             crate::policy::RequestClass::Inference,
         );
         if let Some(legacy) = server.legacy_shadow_outcome(
