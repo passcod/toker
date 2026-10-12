@@ -180,36 +180,54 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     if let Some((canonical, shape)) = prepared_shape.as_ref() {
         let lane_reference =
             lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()));
-        let binding_affinity = canonical
-            .requires_binding_affinity()
-            .then(|| target.binding().id().clone());
-        let facts = server.shadow_facts(
-            ProtocolId::OpenAiResponses,
-            shadow_profile.as_deref(),
-            Some(requested_model.clone()),
-            lane_reference.clone(),
-            crate::middleware::force_newest::prompt_bound(original.len() as u64),
-            shape.req_messages,
-            shape.req_tools,
-            super::anthropic::shadow_capabilities(canonical),
-            binding_affinity,
-            crate::policy::RequestClass::Inference,
-        );
-        if let Some(legacy) = server.legacy_shadow_outcome(
-            &facts,
-            &target,
-            effective_model.clone(),
-            None,
-            None,
-            effective_model.clone(),
-            false,
-        ) {
-            let credentials = server.shadow_credentials(
-                &parts.headers,
+        let lane = lane_reference
+            .as_deref()
+            .and_then(|key| server.store.load_lane(key).ok().flatten());
+        let binding_affinity = if canonical.requires_binding_affinity() {
+            lane.as_ref()
+                .and_then(|lane| lane.pin.as_ref())
+                .map(|pin| pin.binding_id.clone())
+                .or_else(|| {
+                    (target.binding().id_str() == "codex_sub.codex_responses")
+                        .then(|| target.binding().id().clone())
+                })
+        } else {
+            None
+        };
+        if canonical.requires_binding_affinity() && binding_affinity.is_none() {
+            // Unknown ownership cannot mean unconstrained: omit this shadow
+            // observation rather than blessing a binding that drops ciphertext.
+        } else {
+            let facts = server.shadow_facts(
                 ProtocolId::OpenAiResponses,
-                facts.now_ms,
+                shadow_profile.as_deref(),
+                Some(requested_model.clone()),
+                lane_reference.clone(),
+                crate::middleware::force_newest::prompt_bound(original.len() as u64),
+                shape.req_messages,
+                shape.req_tools,
+                super::anthropic::shadow_capabilities(canonical),
+                binding_affinity,
+                crate::policy::RequestClass::Inference,
             );
-            server.observe_policy_shadow(facts, credentials, None, legacy);
+            if let Some(legacy) = server.legacy_shadow_outcome(
+                &facts,
+                &target,
+                effective_model.clone(),
+                None,
+                None,
+                effective_model.clone(),
+                false,
+            ) {
+                let credentials = server.shadow_credentials(
+                    &parts.headers,
+                    ProtocolId::OpenAiResponses,
+                    facts.now_ms,
+                );
+                let shadow_lane =
+                    server.shadow_lane(lane.as_ref(), Some(target.binding()), facts.now_ms);
+                server.observe_policy_shadow(facts, credentials, shadow_lane, legacy);
+            }
         }
     }
 
