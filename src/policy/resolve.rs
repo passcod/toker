@@ -212,6 +212,7 @@ pub enum SkipReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateEvidence {
     pub candidate_id: CandidateId,
+    pub crossed_from: Option<CandidateId>,
     pub binding_id: BindingId,
     pub model: Option<String>,
     pub result: Result<(), SkipReason>,
@@ -390,6 +391,7 @@ pub fn resolve_with_circuits<L: LearningView>(
             {
                 trace.push(TraceEvent::Candidate(CandidateEvidence {
                     candidate_id: candidate.id().clone(),
+                    crossed_from: None,
                     binding_id: candidate.binding_id().clone(),
                     model: None,
                     result: Err(reason.clone()),
@@ -408,7 +410,11 @@ pub fn resolve_with_circuits<L: LearningView>(
         let baseline = materialize_candidate(candidate, &selected.parameters, inventory, policy)?;
         let live = availability.get(candidate.binding_id());
         prior_live = live;
-        let evidence = candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
+        let mut evidence =
+            candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
+        if index > start {
+            evidence.crossed_from = Some(route.candidates()[index - 1].id().clone());
+        }
         let candidate_trace_index = trace.len();
         trace.push(TraceEvent::Candidate(evidence.clone()));
         if evidence.result == Err(SkipReason::SelectorUnresolved) {
@@ -468,6 +474,7 @@ pub fn resolve_with_circuits<L: LearningView>(
             let TraceEvent::Candidate(evidence) = &mut trace[candidate_trace_index] else {
                 unreachable!("the recorded candidate event keeps its index")
             };
+            evidence.crossed_from = None;
             evidence.model = Some(effective);
             evidence.result = Err(reason);
             break;
@@ -755,6 +762,7 @@ fn candidate_evidence(
     };
     CandidateEvidence {
         candidate_id: candidate.id().clone(),
+        crossed_from: None,
         binding_id: candidate.binding_id().clone(),
         model: model.map(str::to_owned),
         result: reason.map_or(Ok(()), Err),
@@ -798,6 +806,7 @@ fn exact_evidence(
     };
     CandidateEvidence {
         candidate_id: candidate_id.clone(),
+        crossed_from: None,
         binding_id: binding.clone(),
         model: Some(model.to_owned()),
         result: reason.map_or(Ok(()), Err),
@@ -1997,7 +2006,15 @@ mod tests {
         assert_eq!(selected.candidate_id, Some(id("fallback")));
         assert!(matches!(
             &selected.trace[1],
-            TraceEvent::Candidate(evidence) if evidence.result == Err(SkipReason::Disabled)
+            TraceEvent::Candidate(evidence)
+                if evidence.crossed_from.is_none()
+                    && evidence.result == Err(SkipReason::Disabled)
+        ));
+        assert!(matches!(
+            &selected.trace[2],
+            TraceEvent::Candidate(evidence)
+                if evidence.crossed_from.as_ref().is_some_and(|id| id.as_str() == "disabled")
+                    && evidence.result.is_ok()
         ));
 
         let policy = compile(
@@ -2298,9 +2315,12 @@ mod tests {
         assert!(matches!(
             failure,
             ResolveFailure::RouteUnavailable { trace }
-                if matches!(&trace[3], TraceEvent::Candidate(evidence)
-                    if evidence.model.as_deref() == Some("three")
-                        && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
+                if matches!(&trace[2], TraceEvent::Candidate(evidence)
+                    if evidence.crossed_from.as_ref().is_some_and(|id| id.as_str() == "first"))
+                    && matches!(&trace[3], TraceEvent::Candidate(evidence)
+                        if evidence.crossed_from.is_none()
+                            && evidence.model.as_deref() == Some("three")
+                            && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
         ));
     }
 
@@ -2354,7 +2374,13 @@ mod tests {
         let ResolveFailure::RouteUnavailable { trace } = failure else {
             panic!()
         };
-        assert!(trace.iter().any(|event| matches!(event, TraceEvent::Candidate(e) if e.result == Err(SkipReason::PreflightFallbackDisabled))));
+        assert!(
+            trace
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Candidate(e)
+            if e.crossed_from.is_none()
+                && e.result == Err(SkipReason::PreflightFallbackDisabled)))
+        );
 
         edge.preflight = FallbackPermission::Enabled;
         let policy = compile(

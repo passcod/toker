@@ -731,6 +731,32 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'invalid request routing terminal or trace');
     END;
     "#,
+    // v11 — routing trace v2 adds typed crossed-edge provenance while v1
+    // remains valid historical data. The Rust reader validates the closed event
+    // vocabulary and edge sequence; SQLite keeps enforcing the bounded envelope.
+    r#"
+    DROP TRIGGER requests_terminal_trace_check;
+    CREATE TRIGGER requests_terminal_trace_check
+    BEFORE INSERT ON requests
+    WHEN (NEW.attempt_group_id IS NOT NULL AND NEW.attempt_index IS NULL AND (
+              NEW.kind != 'route-unavailable' OR NEW.routing_trace IS NULL
+          ))
+       OR NEW.kind = 'route-unavailable' AND (
+              NEW.attempt_group_id IS NULL OR NEW.attempt_index IS NOT NULL
+              OR NEW.routing_trace IS NULL
+          )
+       OR NEW.routing_trace IS NOT NULL AND (
+              length(CAST(NEW.routing_trace AS BLOB)) > 65536
+              OR json_type(NEW.routing_trace) != 'object'
+              OR json_type(NEW.routing_trace, '$.version') IS NOT 'integer'
+              OR json_extract(NEW.routing_trace, '$.version') NOT IN (1, 2)
+              OR json_type(NEW.routing_trace, '$.events') IS NOT 'array'
+              OR json_array_length(NEW.routing_trace, '$.events') > 128
+          )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid request routing terminal or trace');
+    END;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

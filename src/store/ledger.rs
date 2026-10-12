@@ -237,7 +237,7 @@ impl SessionLineage {
     }
 }
 
-pub const ROUTING_TRACE_VERSION: u8 = 1;
+pub const ROUTING_TRACE_VERSION: u8 = 2;
 pub const MAX_ROUTING_TRACE_EVENTS: usize = 128;
 pub const MAX_ROUTING_TRACE_BYTES: usize = 64 * 1024;
 pub const MAX_ROUTING_TRACE_MODEL_BYTES: usize = 1_024;
@@ -299,6 +299,8 @@ pub enum StoredRoutingTraceEvent {
     },
     Candidate {
         candidate_id: CandidateId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crossed_from: Option<CandidateId>,
         binding_id: BindingId,
         model: Option<String>,
         state: StoredCandidateState,
@@ -333,8 +335,8 @@ impl StoredRoutingTrace {
         Ok(trace)
     }
 
-    fn validate(&self) -> Result<()> {
-        if self.version != ROUTING_TRACE_VERSION {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !matches!(self.version, 1 | ROUTING_TRACE_VERSION) {
             return Err(Error::InvalidRoutingState(
                 "unsupported routing trace version".into(),
             ));
@@ -344,8 +346,29 @@ impl StoredRoutingTrace {
                 "routing trace has too many events".into(),
             ));
         }
+        let mut previous_candidate = None;
         for event in &self.events {
             event.validate()?;
+            if let StoredRoutingTraceEvent::Candidate {
+                candidate_id,
+                crossed_from,
+                ..
+            } = event
+            {
+                if self.version == 1 && crossed_from.is_some() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace v1 carries crossed-edge evidence".into(),
+                    ));
+                }
+                if let Some(source) = crossed_from
+                    && (previous_candidate.as_ref() != Some(source) || source == candidate_id)
+                {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace crossed edge is inconsistent".into(),
+                    ));
+                }
+                previous_candidate = Some(candidate_id.clone());
+            }
         }
         let bytes = serde_json::to_vec(self)?;
         if bytes.len() > MAX_ROUTING_TRACE_BYTES {
@@ -435,6 +458,7 @@ impl StoredRoutingTraceEvent {
                 };
                 Self::Candidate {
                     candidate_id: evidence.candidate_id.clone(),
+                    crossed_from: evidence.crossed_from.clone(),
                     binding_id: evidence.binding_id.clone(),
                     model: evidence.model.clone(),
                     state,

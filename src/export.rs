@@ -120,8 +120,8 @@ mod tests {
     use crate::store::{
         AttemptGroupId, AttemptReason, CostKind, KindFilter, NewPolicyRevision,
         PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RequestFilter,
-        RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store, StoredRoutingTrace,
-        StoredRoutingTraceEvent,
+        RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store, StoredCandidateState,
+        StoredRoutingTrace, StoredRoutingTraceEvent,
     };
     use serde_json::{Value, json};
 
@@ -297,16 +297,28 @@ mod tests {
                 route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
                 attempt_group_id: AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
                 trace: StoredRoutingTrace {
-                    version: 1,
+                    version: 2,
                     events: vec![
                         StoredRoutingTraceEvent::Lookup {
                             source: crate::store::StoredLookupSource::ProfilePresentation,
                             presentation_id: Some(PresentationId::new("presented").unwrap()),
                             rewrite_id: None,
                         },
-                        StoredRoutingTraceEvent::Upgrade {
-                            from: "claude-opus-4".to_owned(),
-                            to: "claude-opus-5".to_owned(),
+                        StoredRoutingTraceEvent::Candidate {
+                            candidate_id: CandidateId::new("first").unwrap(),
+                            crossed_from: None,
+                            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                            model: Some("claude-opus-4".to_owned()),
+                            state: StoredCandidateState::Skipped,
+                            reason: Some(crate::store::StoredSkipReason::HealthCircuitOpen),
+                        },
+                        StoredRoutingTraceEvent::Candidate {
+                            candidate_id: CandidateId::new("candidate").unwrap(),
+                            crossed_from: Some(CandidateId::new("first").unwrap()),
+                            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                            model: Some("claude-opus-5".to_owned()),
+                            state: StoredCandidateState::Available,
+                            reason: None,
                         },
                     ],
                 },

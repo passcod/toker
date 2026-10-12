@@ -780,6 +780,7 @@ mod tests {
                     },
                     StoredRoutingTraceEvent::Candidate {
                         candidate_id: CandidateId::new("candidate").unwrap(),
+                        crossed_from: None,
                         binding_id: BindingId::new("codex_sub.codex_responses").unwrap(),
                         model: Some("baseline".to_owned()),
                         state: StoredCandidateState::Available,
@@ -3323,6 +3324,7 @@ mod tests {
     fn resolver_trace_conversion_is_exhaustive_versioned_and_bounded() {
         let candidate = CandidateEvidence {
             candidate_id: CandidateId::new("candidate").unwrap(),
+            crossed_from: None,
             binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
             model: Some("model".to_owned()),
             result: Err(SkipReason::CredentialUnavailable),
@@ -3342,12 +3344,38 @@ mod tests {
             },
         ])
         .unwrap();
-        assert_eq!(trace.version, 1);
+        assert_eq!(trace.version, 2);
         assert_eq!(trace.events.len(), 4);
+        let crossed = StoredRoutingTrace::from_resolver(&[
+            TraceEvent::Candidate(CandidateEvidence {
+                candidate_id: CandidateId::new("first").unwrap(),
+                crossed_from: None,
+                binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                model: Some("one".to_owned()),
+                result: Err(SkipReason::Disabled),
+            }),
+            TraceEvent::Candidate(CandidateEvidence {
+                candidate_id: CandidateId::new("second").unwrap(),
+                crossed_from: Some(CandidateId::new("first").unwrap()),
+                binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                model: Some("two".to_owned()),
+                result: Ok(()),
+            }),
+        ])
+        .unwrap();
+        assert!(matches!(
+            &crossed.events[1],
+            StoredRoutingTraceEvent::Candidate {
+                candidate_id,
+                crossed_from: Some(source),
+                ..
+            } if candidate_id.as_str() == "second" && source.as_str() == "first"
+        ));
         let open = StoredRoutingTrace::from_resolver(&[
             TraceEvent::Lookup(RouteProvenance::ProtocolDefault),
             TraceEvent::Candidate(CandidateEvidence {
                 candidate_id: CandidateId::new("candidate").unwrap(),
+                crossed_from: None,
                 binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
                 model: Some("effective".to_owned()),
                 result: Err(SkipReason::HealthCircuitOpen),
@@ -3371,8 +3399,66 @@ mod tests {
             ])
             .is_err()
         );
+        for malformed in [
+            serde_json::from_value::<StoredRoutingTrace>(json!({
+                "version": 1,
+                "events": [{
+                    "kind": "candidate",
+                    "candidate_id": "second",
+                    "crossed_from": "first",
+                    "binding_id": "openrouter.openrouter_messages",
+                    "model": "two",
+                    "state": "available",
+                    "reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<StoredRoutingTrace>(json!({
+                "version": 2,
+                "events": [{
+                    "kind": "candidate",
+                    "candidate_id": "second",
+                    "crossed_from": "first",
+                    "binding_id": "openrouter.openrouter_messages",
+                    "model": "two",
+                    "state": "available",
+                    "reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::from_value::<StoredRoutingTrace>(json!({
+                "version": 2,
+                "events": [
+                    {
+                        "kind": "candidate",
+                        "candidate_id": "first",
+                        "binding_id": "openrouter.openrouter_messages",
+                        "model": "one",
+                        "state": "skipped",
+                        "reason": "disabled"
+                    },
+                    {
+                        "kind": "candidate",
+                        "candidate_id": "second",
+                        "crossed_from": "wrong",
+                        "binding_id": "openrouter.openrouter_messages",
+                        "model": "two",
+                        "state": "available",
+                        "reason": null
+                    }
+                ]
+            }))
+            .unwrap(),
+            serde_json::from_value::<StoredRoutingTrace>(json!({
+                "version": 3,
+                "events": []
+            }))
+            .unwrap(),
+        ] {
+            assert!(malformed.validate().is_err());
+        }
         let malformed = serde_json::from_value::<StoredRoutingTrace>(json!({
-            "version": 2,
+            "version": 3,
             "events": []
         }))
         .unwrap();
@@ -3801,6 +3887,57 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 9, "failed v10 migration rolls back atomically");
+    }
+
+    #[test]
+    fn migration_v11_preserves_v1_traces_and_accepts_v2_only() {
+        let dir = test_dir("v10-routing-trace-v2");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..10] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 10).unwrap();
+            conn.execute(
+                "INSERT INTO requests (ts_ms, routing_trace) VALUES (1, ?1)",
+                [r#"{"version":1,"events":[]}"#],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        drop(store);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO requests (ts_ms, routing_trace) VALUES (2, ?1)",
+            [r#"{"version":2,"events":[]}"#],
+        )
+        .unwrap();
+        for invalid in [
+            r#"{"version":3,"events":[]}"#,
+            r#"{}"#,
+            r#"{"version":null,"events":[]}"#,
+            r#"{"version":2}"#,
+        ] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO requests (ts_ms, routing_trace) VALUES (3, ?1)",
+                    [invalid],
+                )
+                .is_err(),
+                "invalid trace envelope was accepted: {invalid}"
+            );
+        }
+        let historical: String = conn
+            .query_row(
+                "SELECT routing_trace FROM requests WHERE ts_ms=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(historical, r#"{"version":1,"events":[]}"#);
     }
 
     #[test]
