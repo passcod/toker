@@ -1294,7 +1294,7 @@ async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_n
 }
 
 #[tokio::test]
-async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
+async fn a_truncated_buffered_body_answers_502_and_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
@@ -1318,8 +1318,11 @@ async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
     assert!(error["error"]["message"].is_string());
     assert!(error.get("type").is_none(), "not the anthropic envelope");
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(store.count_requests().expect("count"), 0);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert!(rows[0].attempt.is_some());
 }
 
 #[tokio::test]

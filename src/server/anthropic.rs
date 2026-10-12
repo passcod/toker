@@ -1585,6 +1585,16 @@ pub(crate) async fn retry_thinking_off(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let Ok(buffered) = buffer_up_to(upstream, super::proxy::PRECOMMIT_BODY_CAP).await else {
+        if let Some(ctx) = record.as_ref() {
+            record_anthropic_error(
+                ctx,
+                status.as_u16(),
+                Some("ambiguous_transport".to_owned()),
+                None,
+                retry_after_ms(&headers),
+                parse_rate_limits(&headers).as_ref(),
+            );
+        }
         return Err(Box::new(truncated_body(ErrorWire::Anthropic)));
     };
     let wants_between_tools = buffered.rest.is_none()
@@ -1892,6 +1902,16 @@ pub(crate) async fn forward_canonical_messages(
     }
 
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        if let Some(ctx) = record.as_ref() {
+            record_anthropic_error(
+                ctx,
+                status.as_u16(),
+                Some("ambiguous_transport".to_owned()),
+                None,
+                None,
+                rate_limits.as_ref(),
+            );
+        }
         return truncated_body(ErrorWire::Anthropic);
     };
     if buffered.rest.is_some() {

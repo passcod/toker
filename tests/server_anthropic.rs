@@ -1984,7 +1984,7 @@ async fn an_upstream_failure_mid_stream_aborts_the_client_response_and_records_n
 }
 
 #[tokio::test]
-async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
+async fn a_truncated_buffered_body_answers_502_and_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -2007,7 +2007,17 @@ async fn a_truncated_buffered_body_answers_502_and_records_no_row() {
         assert!(error["error"]["message"].is_string(), "{model}");
     }
 
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 2).await;
+    assert!(
+        rows.iter().all(|row| row.kind == Some(RowKind::Error)),
+        "{rows:#?}"
+    );
+    assert_eq!(rows.len(), 2, "{rows:#?}");
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert_eq!(rows[1].error_type.as_deref(), Some("ambiguous_transport"));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[1].status, Some(401));
+    assert!(rows.iter().all(|row| row.attempt.is_some()));
 }
 
 #[tokio::test]

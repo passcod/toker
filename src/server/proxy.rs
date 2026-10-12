@@ -613,6 +613,14 @@ pub(crate) async fn forward_chat_canonical(
     }
 
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        if let Some(ctx) = record.as_ref() {
+            record_error(
+                ctx,
+                status.as_u16(),
+                Some("ambiguous_transport".to_owned()),
+                None,
+            );
+        }
         return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {

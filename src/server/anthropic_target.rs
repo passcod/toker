@@ -117,6 +117,7 @@ impl ReadyAttempt {
                 return transport_failure(ErrorWire::Openai, &error);
             }
         };
+        let response_status = upstream.status();
         let upstream = match super::attempt::precommit_anthropic(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
             | Ok(super::attempt::PrecommitOutcome::Failure {
@@ -124,6 +125,16 @@ impl ReadyAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    record_anthropic_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("response_protocol".to_owned()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 return upstream_failure(
                     ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
@@ -137,6 +148,16 @@ impl ReadyAttempt {
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream response failed before commitment");
+                if let Some(ctx) = self.record.as_ref() {
+                    record_anthropic_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("ambiguous_transport".to_owned()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 return truncated_body(ErrorWire::Openai);
             }
         };

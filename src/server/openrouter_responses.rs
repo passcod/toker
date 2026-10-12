@@ -81,6 +81,7 @@ impl ReadyAttempt {
                 return transport_failure(ErrorWire::Openai, &error);
             }
         };
+        let response_status = upstream.status();
         let upstream = match super::attempt::precommit_responses(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
             | Ok(super::attempt::PrecommitOutcome::Failure {
@@ -88,6 +89,16 @@ impl ReadyAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        response_status.as_u16(),
+                        "response_protocol",
+                        "upstream response could not be interpreted before commitment",
+                        None,
+                        "openai_responses",
+                    );
+                }
                 return upstream_failure(
                     ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
@@ -101,6 +112,16 @@ impl ReadyAttempt {
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream response failed before commitment");
+                if let Some(ctx) = self.record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        response_status.as_u16(),
+                        "ambiguous_transport",
+                        "upstream response body failed before commitment",
+                        None,
+                        "openai_responses",
+                    );
+                }
                 return truncated_body(ErrorWire::Openai);
             }
         };

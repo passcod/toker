@@ -256,33 +256,37 @@ impl ReadyMessagesAttempt {
         };
         let response = match retry {
             super::anthropic::ThinkingRetry::Original(upstream) => {
+                let status = upstream.status();
                 let rate_limits = parse_rate_limits(upstream.headers());
                 (
                     super::attempt::precommit_anthropic(upstream).await,
                     rate_limits,
+                    status,
                 )
             }
             super::anthropic::ThinkingRetry::Retried(upstream) => {
                 super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+                let status = upstream.status();
                 let rate_limits = parse_rate_limits(upstream.headers());
                 (
                     super::attempt::precommit_anthropic(upstream).await,
                     rate_limits,
+                    status,
                 )
             }
             super::anthropic::ThinkingRetry::Inspected(outcome) => {
-                let rate_limits = match &outcome {
+                let (rate_limits, status) = match &outcome {
                     super::attempt::PrecommitOutcome::Accepted { response, .. }
                     | super::attempt::PrecommitOutcome::Failure {
                         response: Some(response),
                         ..
-                    } => parse_rate_limits(response.headers()),
+                    } => (parse_rate_limits(response.headers()), response.status()),
                     _ => unreachable!("thinking inspection always retains its response"),
                 };
-                (Ok(outcome), rate_limits)
+                (Ok(outcome), rate_limits, status)
             }
         };
-        let (outcome, rate_limits) = response;
+        let (outcome, rate_limits, response_status) = response;
         let upstream = match outcome {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
             | Ok(super::attempt::PrecommitOutcome::Failure {
@@ -290,6 +294,16 @@ impl ReadyMessagesAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record_anthropic::record_anthropic_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("response_protocol".to_owned()),
+                        None,
+                        None,
+                        rate_limits.as_ref(),
+                    );
+                }
                 return super::proxy::upstream_failure(
                     super::proxy::ErrorWire::Anthropic,
                     "toker could not interpret the upstream response before commitment",
@@ -303,6 +317,16 @@ impl ReadyMessagesAttempt {
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream response failed before commitment");
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record_anthropic::record_anthropic_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("ambiguous_transport".to_owned()),
+                        None,
+                        None,
+                        rate_limits.as_ref(),
+                    );
+                }
                 return super::proxy::truncated_body(super::proxy::ErrorWire::Anthropic);
             }
         };
@@ -365,6 +389,7 @@ impl ReadyChatAttempt {
                 return super::proxy::transport_failure(super::proxy::ErrorWire::Openai, &error);
             }
         };
+        let response_status = upstream.status();
         let upstream = match super::attempt::precommit_openai_chat(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
             | Ok(super::attempt::PrecommitOutcome::Failure {
@@ -372,6 +397,14 @@ impl ReadyChatAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record::record_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("response_protocol".to_owned()),
+                        None,
+                    );
+                }
                 return super::proxy::upstream_failure(
                     super::proxy::ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
@@ -385,6 +418,14 @@ impl ReadyChatAttempt {
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream response failed before commitment");
+                if let Some(ctx) = self.record.as_ref() {
+                    super::record::record_error(
+                        ctx,
+                        response_status.as_u16(),
+                        Some("ambiguous_transport".to_owned()),
+                        None,
+                    );
+                }
                 return super::proxy::truncated_body(super::proxy::ErrorWire::Openai);
             }
         };
