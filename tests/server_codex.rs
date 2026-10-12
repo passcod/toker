@@ -411,7 +411,7 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
         );
     }
     let mut body = concat!(
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_test\",\"model\":\"OPENAI/GPT-4.1-MINI[1m]\",\"status\":\"in_progress\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"text\\\":\\\"hello\\\"}\"}\n\n",
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n",
@@ -422,7 +422,7 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
         "response.completed"
     };
     body.push_str(&format!(
-        "data: {{\"type\":\"{terminal}\",\"response\":{{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"provider\":\"Example Router\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"input_tokens\":60,\"output_tokens\":6,\"total_tokens\":66,\"cost\":0.0000336}}}}}}\n\n"
+        "data: {{\"type\":\"{terminal}\",\"response\":{{\"id\":\"gen_test\",\"model\":\"OPENAI/GPT-4.1-MINI[1m]\",\"provider\":\"Example Router\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"input_tokens\":60,\"output_tokens\":6,\"total_tokens\":66,\"cost\":0.0000336}}}}}}\n\n"
     ));
     body.push_str("data: [DONE]\n\n");
     raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body))
@@ -1277,6 +1277,11 @@ async fn openrouter_responses_streams_tools_and_records_attested_cost() {
     assert_eq!(
         rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
         Some("openrouter.openrouter_responses")
+    );
+    assert_eq!(rows[0].model.as_deref(), Some("openai/gpt-4.1-mini"));
+    assert_eq!(
+        rows[0].raw_model.as_deref(),
+        Some("OPENAI/GPT-4.1-MINI[1m]")
     );
     assert_eq!(rows[0].cost_usd, Some(0.0000336));
     assert_eq!(rows[0].cost_kind, Some(toker::store::CostKind::Billed));
