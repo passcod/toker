@@ -1648,6 +1648,16 @@ pub(crate) async fn retry_thinking_off(
         .map(ThinkingRetry::Retried)
         .map_err(|error| {
             tracing::warn!(%error, "upstream request failed");
+            if let Some(ctx) = record.as_ref() {
+                record_anthropic_error(
+                    ctx,
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    Some(super::attempt::transport_failure_type(&error).to_owned()),
+                    None,
+                    None,
+                    None,
+                );
+            }
             Box::new(transport_failure(ErrorWire::Anthropic, &error))
         })
 }
