@@ -1293,7 +1293,6 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
                         |canonical| canonical.capabilities(),
                     ),
                     cost_class: binding.cost_class(),
-                    cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
                 },
             )
         })

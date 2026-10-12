@@ -90,7 +90,6 @@ pub struct BindingAvailability {
     pub catalogue: CatalogueAvailability,
     pub capabilities: Capabilities,
     pub cost_class: CostClass,
-    pub cache_domain: Option<String>,
 }
 
 /// One consistently captured availability snapshot.
@@ -386,12 +385,9 @@ pub fn resolve_with_circuits<L: LearningView>(
     for (index, candidate) in route.candidates().iter().enumerate().skip(start) {
         if index > start {
             let edge = &route.edges()[index - 1];
-            if let Some(reason) = edge_denial(
-                edge,
-                prior_live,
-                availability.get(candidate.binding_id()),
-                lane,
-            ) {
+            if let Some(reason) =
+                edge_denial(edge, prior_live, availability.get(candidate.binding_id()))
+            {
                 trace.push(TraceEvent::Candidate(CandidateEvidence {
                     candidate_id: candidate.id().clone(),
                     binding_id: candidate.binding_id().clone(),
@@ -461,6 +457,21 @@ pub fn resolve_with_circuits<L: LearningView>(
             .clone()
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
+        if index > start
+            && let Some(reason) = cache_edge_denial(
+                &route.edges()[start..index],
+                candidate.binding_id(),
+                &effective,
+                lane,
+            )
+        {
+            let TraceEvent::Candidate(evidence) = &mut trace[candidate_trace_index] else {
+                unreachable!("the recorded candidate event keeps its index")
+            };
+            evidence.model = Some(effective);
+            evidence.result = Err(reason);
+            break;
+        }
         if target_has_open_circuit(
             circuits,
             route.id(),
@@ -837,7 +848,6 @@ fn edge_denial(
     edge: &CandidateEdge,
     from: Option<&BindingAvailability>,
     to: Option<&BindingAvailability>,
-    lane: Option<&LaneFacts>,
 ) -> Option<SkipReason> {
     if edge.preflight == FallbackPermission::Disabled {
         return Some(SkipReason::PreflightFallbackDisabled);
@@ -852,14 +862,32 @@ fn edge_denial(
     {
         return Some(SkipReason::BilledBoundaryDenied);
     }
-    if lane.is_some_and(|lane| lane.temperature != super::CacheTemperature::Cold)
-        && edge.cache_transition != CacheTransitionPolicy::AllowCacheLoss
-        && from.and_then(|v| v.cache_domain.as_deref())
-            != to.and_then(|v| v.cache_domain.as_deref())
-    {
-        return Some(SkipReason::WarmCacheTransitionDenied);
-    }
     None
+}
+
+fn cache_edge_denial(
+    edges: &[CandidateEdge],
+    binding_id: &BindingId,
+    effective_model: &str,
+    lane: Option<&LaneFacts>,
+) -> Option<SkipReason> {
+    let lane = lane?;
+    if lane.temperature == super::CacheTemperature::Cold {
+        return None;
+    }
+    let cache_changes = lane
+        .pinned
+        .as_ref()
+        .is_none_or(|pin| pin.binding_id != *binding_id || pin.effective_model != effective_model);
+    if cache_changes
+        && edges
+            .iter()
+            .any(|edge| edge.cache_transition != CacheTransitionPolicy::AllowCacheLoss)
+    {
+        Some(SkipReason::WarmCacheTransitionDenied)
+    } else {
+        None
+    }
 }
 
 fn stricter_transition(
@@ -1295,7 +1323,6 @@ mod tests {
                     },
                     capabilities: Capabilities::MESSAGES,
                     cost_class: CostClass::Subscription,
-                    cache_domain: Some("messages".to_owned()),
                 },
             ),
             (
@@ -1308,7 +1335,6 @@ mod tests {
                     catalogue: CatalogueAvailability::Absent,
                     capabilities: Capabilities::MESSAGES,
                     cost_class: CostClass::Billed,
-                    cache_domain: Some("api".to_owned()),
                 },
             ),
         ]))
@@ -1327,6 +1353,30 @@ mod tests {
             binding_affinity: None,
             class: RequestClass::Inference,
             now_ms: 100,
+        }
+    }
+
+    fn lane(
+        policy: &CompiledPolicy,
+        candidate_id: &str,
+        binding_id: &BindingId,
+        effective_model: &str,
+        temperature: CacheTemperature,
+    ) -> LaneFacts {
+        let route = policy.route(&id("route")).unwrap();
+        LaneFacts {
+            temperature,
+            pinned: Some(ProvisionalPin {
+                policy_revision_id: Some(1),
+                policy_fingerprint: Some(policy.fingerprint().clone()),
+                route_fingerprint: route.fingerprint().clone(),
+                candidate_id: id(candidate_id),
+                binding_id: binding_id.clone(),
+                baseline_model: effective_model.to_owned(),
+                effective_model: effective_model.to_owned(),
+            }),
+            forced_from: None,
+            forced_to: None,
         }
     }
 
@@ -2024,6 +2074,233 @@ mod tests {
             &trace[1],
             TraceEvent::Candidate(evidence)
                 if evidence.result == Err(SkipReason::SelectorUnresolved)
+        ));
+    }
+
+    #[test]
+    fn fallback_cache_consent_uses_the_final_binding_and_effective_model() {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        first.enabled = false;
+        let second = candidate(
+            "second",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Deny,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::PreserveWarm,
+                    },
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let warm = lane(
+            &policy,
+            "first",
+            ANTHROPIC_SUB_MESSAGES.id(),
+            "one",
+            CacheTemperature::Warm,
+        );
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            Some(&warm),
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace }
+                if matches!(&trace[2], TraceEvent::Candidate(evidence)
+                    if evidence.model.as_deref() == Some("two")
+                        && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
+        ));
+
+        let cold = lane(
+            &policy,
+            "first",
+            ANTHROPIC_SUB_MESSAGES.id(),
+            "one",
+            CacheTemperature::Cold,
+        );
+        assert_eq!(
+            resolve(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                Some(&cold),
+                &availability(true, false),
+                &facts("asked"),
+            )
+            .unwrap()
+            .effective_model,
+            "two"
+        );
+
+        let unknown = lane(
+            &policy,
+            "first",
+            ANTHROPIC_SUB_MESSAGES.id(),
+            "one",
+            CacheTemperature::Unknown,
+        );
+        assert!(matches!(
+            resolve(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                Some(&unknown),
+                &availability(true, false),
+                &facts("asked"),
+            ),
+            Err(ResolveFailure::RouteUnavailable { trace })
+                if matches!(&trace[2], TraceEvent::Candidate(evidence)
+                    if evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
+        ));
+    }
+
+    #[test]
+    fn fallback_without_a_pin_requires_explicit_cache_loss_consent() {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        first.enabled = false;
+        let second = candidate(
+            "second",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Deny,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::PreserveWarm,
+                    },
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let unpinned = LaneFacts {
+            temperature: CacheTemperature::Warm,
+            pinned: None,
+            forced_from: None,
+            forced_to: None,
+        };
+        assert!(matches!(
+            resolve(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                Some(&unpinned),
+                &availability(true, false),
+                &facts("asked"),
+            ),
+            Err(ResolveFailure::RouteUnavailable { trace })
+                if matches!(&trace[2], TraceEvent::Candidate(evidence)
+                    if evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
+        ));
+    }
+
+    #[test]
+    fn every_crossed_edge_must_allow_warm_cache_loss() {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        first.enabled = false;
+        let mut second = candidate(
+            "second",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        second.enabled = false;
+        let third = candidate(
+            "third",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "three".to_owned(),
+            },
+        );
+        let edge = |cache_transition| CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![
+                    RouteStep {
+                        edge: edge(CacheTransitionPolicy::PreserveWarm),
+                        candidate: second,
+                    },
+                    RouteStep {
+                        edge: edge(CacheTransitionPolicy::AllowCacheLoss),
+                        candidate: third,
+                    },
+                ],
+            )),
+            &OfferInventory::default(),
+        );
+        let warm = lane(
+            &policy,
+            "first",
+            ANTHROPIC_SUB_MESSAGES.id(),
+            "one",
+            CacheTemperature::Warm,
+        );
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            Some(&warm),
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace }
+                if matches!(&trace[3], TraceEvent::Candidate(evidence)
+                    if evidence.model.as_deref() == Some("three")
+                        && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
         ));
     }
 

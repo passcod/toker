@@ -517,7 +517,6 @@ mod tests {
                     catalogue: CatalogueAvailability::Fresh { fetched_at_ms: 10 },
                     capabilities: crate::routing::Capabilities::MESSAGES,
                     cost_class: CostClass::Subscription,
-                    cache_domain: binding.cache_domain().map(|domain| domain.id().to_owned()),
                 },
             )],
         )));
