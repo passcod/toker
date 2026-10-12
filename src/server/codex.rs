@@ -588,6 +588,16 @@ async fn aggregated_turn(
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "codex stream failed mid-turn");
+                if let Some(ctx) = record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        200,
+                        "ambiguous_transport",
+                        "upstream response body failed after commitment",
+                        None,
+                        frontend_wire.protocol(),
+                    );
+                }
                 return upstream_failure(
                     frontend_wire.error_wire(),
                     "toker upstream error: the stream failed before the turn ended",
@@ -829,11 +839,25 @@ impl StreamState {
         }
     }
 
-    /// The upstream failed mid-turn: no row (no usage arrived), the
-    /// in-flight hold released now, and the error queued for the client.
+    /// The upstream failed mid-turn: record the physical attempt, release the
+    /// in-flight hold now, and queue the error for the client.
     fn fail(&mut self, error: std::io::Error) {
         self.done = true;
-        self.record = None;
+        if let Some(ctx) = self.record.take() {
+            let error_type = if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                "response_protocol"
+            } else {
+                "ambiguous_transport"
+            };
+            record_codex_error(
+                &ctx,
+                200,
+                error_type,
+                "upstream Responses stream ended before completion",
+                None,
+                self.frontend_wire.protocol(),
+            );
+        }
         self.failure = Some(error);
         drop(self.in_flight.take());
     }
@@ -870,8 +894,22 @@ impl StreamState {
                 None,
             );
         }
-        // A stream that died without a terminator never reaches here
-        // ([`StreamState::fail`]), and a hung-up client produces no row.
+        self.record.take();
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.record.take() {
+            record_codex_error(
+                &ctx,
+                200,
+                "client_cancelled",
+                "client disconnected before the Responses turn completed",
+                None,
+                self.frontend_wire.protocol(),
+            );
+        }
     }
 }
 

@@ -484,7 +484,7 @@ fn stream_events(
                     if state.frontend.turn_ended() {
                         state.ended = true;
                     } else {
-                        state.record.take();
+                        state.record_failure("response_protocol");
                         state.ended = true;
                         return Some((
                             Err(std::io::Error::new(
@@ -496,7 +496,7 @@ fn stream_events(
                     }
                 }
                 Err(error) => {
-                    state.record.take();
+                    state.record_failure("ambiguous_transport");
                     state.ended = true;
                     return Some((Err(std::io::Error::other(error)), state));
                 }
@@ -506,6 +506,12 @@ fn stream_events(
 }
 
 impl StreamState {
+    fn record_failure(&mut self, error_type: &str) {
+        if let Some(ctx) = self.record.take() {
+            record_anthropic_error(&ctx, 200, Some(error_type.to_owned()), None, None, None);
+        }
+    }
+
     fn feed(&mut self, event: SseEvent) {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.observer.observe_event(&event);
@@ -519,6 +525,14 @@ impl StreamState {
             for emitted in self.frontend.feed(&canonical) {
                 self.pending.push_back(sse_bytes(&emitted));
             }
+        }
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if self.record.is_some() {
+            self.record_failure("client_cancelled");
         }
     }
 }

@@ -390,7 +390,7 @@ fn stream_events(
                     if state.frontend.turn_ended() {
                         state.ended = true;
                     } else {
-                        state.record.take();
+                        state.record_failure("response_protocol");
                         state.ended = true;
                         return Some((
                             Err(std::io::Error::new(
@@ -402,7 +402,7 @@ fn stream_events(
                     }
                 }
                 Err(error) => {
-                    state.record.take();
+                    state.record_failure("ambiguous_transport");
                     state.ended = true;
                     return Some((Err(std::io::Error::other(error)), state));
                 }
@@ -412,6 +412,19 @@ fn stream_events(
 }
 
 impl StreamState {
+    fn record_failure(&mut self, error_type: &str) {
+        if let Some(ctx) = self.record.take() {
+            record_codex_error(
+                &ctx,
+                200,
+                error_type,
+                "upstream Responses stream ended before completion",
+                None,
+                "openai_responses",
+            );
+        }
+    }
+
     fn feed(&mut self, chunk: &[u8]) {
         for event in self.evidence.feed(chunk) {
             note_provider(&event, &mut self.provider);
@@ -464,6 +477,14 @@ impl StreamState {
             }
         }
         drop(self.in_flight.take());
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if self.record.is_some() {
+            self.record_failure("client_cancelled");
+        }
     }
 }
 

@@ -1044,11 +1044,11 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         eof.bytes().await.is_err(),
         "a premature close aborts the response"
     );
-    assert_eq!(
-        wait_for_rows(&store, 1).await.len(),
-        1,
-        "truncated stream unledgered"
-    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows[1].attempt.is_some());
 }
 
 #[tokio::test]
@@ -2072,7 +2072,7 @@ async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest
 }
 
 #[tokio::test]
-async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_no_row() {
+async fn upstream_failure_mid_turn_aborts_and_records_each_attempt() {
     let (upstream, _mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("drop-mid", upstream, false)).await;
 
@@ -2097,6 +2097,10 @@ async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_n
         );
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(store.count_requests().expect("count"), 0, "no row");
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows.iter().all(|row| row.attempt.is_some()));
 }
