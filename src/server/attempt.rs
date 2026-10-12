@@ -45,8 +45,8 @@ pub(crate) enum CommitEvidence {
 }
 
 /// Result of one actual send before the coordinator returns a response head.
-/// Adapter-owned continuations will replace the accepted marker as streaming
-/// paths migrate behind this boundary.
+/// A classified provider failure retains its response for forwarding when no
+/// fallback is selected; a local response-protocol failure has no safe response.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum PrecommitOutcome<T> {
@@ -56,7 +56,7 @@ pub(crate) enum PrecommitOutcome<T> {
     },
     Failure {
         failure: AttemptFailure,
-        response: T,
+        response: Option<T>,
     },
     Cancelled,
 }
@@ -230,7 +230,7 @@ pub(crate) async fn precommit_anthropic(
         });
     }
     if !status.is_success() {
-        let buffered = buffer_up_to(response, super::proxy::MAX_ERROR_BODY).await?;
+        let buffered = buffer_up_to(response, PRECOMMIT_BODY_CAP).await?;
         let complete = buffered.rest.is_none();
         let failure = complete.then(|| {
             let body = serde_json::from_slice::<Value>(&buffered.bytes).unwrap_or(Value::Null);
@@ -240,7 +240,7 @@ pub(crate) async fn precommit_anthropic(
         return Ok(match failure {
             Some(failure) => PrecommitOutcome::Failure {
                 failure,
-                response: rebuilt,
+                response: Some(rebuilt),
             },
             None => PrecommitOutcome::Accepted {
                 response: rebuilt,
@@ -252,22 +252,44 @@ pub(crate) async fn precommit_anthropic(
         let (buffered, event, evidence) = precommit_sse(response).await?;
         let parsed = event
             .as_ref()
-            .and_then(|event| serde_json::from_str::<Value>(&event.data()).ok());
-        let failure = parsed.as_ref().and_then(classify_anthropic_event);
-        let evidence = if failure.is_none()
+            .map(|event| serde_json::from_str::<Value>(&event.data()));
+        let failure = parsed
+            .as_ref()
+            .and_then(|parsed| parsed.as_ref().ok())
+            .and_then(classify_anthropic_event);
+        let canonical = failure.is_none()
             && event.as_ref().is_some_and(|event| {
                 !crate::translate::AnthropicResponseStream::new()
                     .feed_sse(event)
                     .is_empty()
-            }) {
-            CommitEvidence::CanonicalEvent
-        } else {
-            evidence
-        };
+            });
+        if failure.is_none()
+            && evidence != CommitEvidence::ByteCapReached
+            && (event.is_none() || parsed.as_ref().is_some_and(Result::is_err))
+        {
+            return Ok(PrecommitOutcome::Failure {
+                failure: AttemptFailure {
+                    class: None,
+                    mechanism: FailureMechanism::ResponseProtocol,
+                    status: Some(status.as_u16()),
+                },
+                response: None,
+            });
+        }
         let response = super::anthropic::rebuilt_response(status, headers, buffered);
         return Ok(match failure {
-            Some(failure) => PrecommitOutcome::Failure { failure, response },
-            None => PrecommitOutcome::Accepted { response, evidence },
+            Some(failure) => PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => PrecommitOutcome::Accepted {
+                response,
+                evidence: if canonical {
+                    CommitEvidence::CanonicalEvent
+                } else {
+                    evidence
+                },
+            },
         });
     }
     Ok(PrecommitOutcome::Accepted {
@@ -431,7 +453,13 @@ mod tests {
                     assert_eq!(evidence, expected_evidence);
                     response
                 }
-                (PrecommitOutcome::Failure { failure, response }, Err(expected_class)) => {
+                (
+                    PrecommitOutcome::Failure {
+                        failure,
+                        response: Some(response),
+                    },
+                    Err(expected_class),
+                ) => {
                     assert_eq!(failure.class, Some(expected_class));
                     assert_eq!(failure.mechanism, FailureMechanism::InBandEvent);
                     response
@@ -439,6 +467,27 @@ mod tests {
                 (outcome, expected) => panic!("unexpected {outcome:?} for {expected:?}"),
             };
             assert_eq!(response.bytes().await.unwrap(), frame.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_precommit_rejects_invalid_or_absent_first_events() {
+        for bytes in [
+            &b""[..],
+            &b": keepalive\n\n"[..],
+            &b"data: {not json}\n\n"[..],
+            &b"data: {\"type\":\"message_start\""[..],
+        ] {
+            let body = futures::stream::iter([Ok::<_, std::io::Error>(
+                bytes::Bytes::copy_from_slice(bytes),
+            )]);
+            let outcome = precommit_anthropic(streaming_response(body)).await.unwrap();
+            let PrecommitOutcome::Failure { failure, response } = outcome else {
+                panic!("invalid first event was accepted: {outcome:?}");
+            };
+            assert_eq!(failure.class, None);
+            assert_eq!(failure.mechanism, FailureMechanism::ResponseProtocol);
+            assert!(response.is_none());
         }
     }
 

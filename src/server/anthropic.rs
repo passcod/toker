@@ -1530,7 +1530,7 @@ pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::
 /// a meter-source backend has meters to report (the sub; the API's RPM
 /// headers are not quota meters and must not overwrite the gate's
 /// snapshot).
-fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
+pub(crate) fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
     let Some(meters) = backend.meters(headers) else {
         return;
     };
@@ -1561,6 +1561,12 @@ fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
 ///
 /// Once only: a second refusal is forwarded and recorded like any error.
 /// The refused response's meters still feed the gate.
+pub(crate) enum ThinkingRetry {
+    Original(reqwest::Response),
+    Retried(reqwest::Response),
+    Inspected(super::attempt::PrecommitOutcome<reqwest::Response>),
+}
+
 pub(crate) async fn retry_thinking_off(
     server: &Server,
     backend: &dyn Provider,
@@ -1568,16 +1574,16 @@ pub(crate) async fn retry_thinking_off(
     sent: Bytes,
     upstream: reqwest::Response,
     record: &mut Option<AnthropicRecordCtx>,
-) -> Result<reqwest::Response, Box<Response>> {
+) -> Result<ThinkingRetry, Box<Response>> {
     if upstream.status() != StatusCode::BAD_REQUEST {
-        return Ok(upstream);
+        return Ok(ThinkingRetry::Original(upstream));
     }
     let Some(retry) = between_tools_body(&sent) else {
-        return Ok(upstream);
+        return Ok(ThinkingRetry::Original(upstream));
     };
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+    let Ok(buffered) = buffer_up_to(upstream, super::proxy::PRECOMMIT_BODY_CAP).await else {
         return Err(Box::new(truncated_body(ErrorWire::Anthropic)));
     };
     let wants_between_tools = buffered.rest.is_none()
@@ -1585,7 +1591,22 @@ pub(crate) async fn retry_thinking_off(
             .1
             .is_some_and(|message| message.contains("between_tools"));
     if !wants_between_tools {
-        return Ok(rebuilt_response(status, headers, buffered));
+        let complete = buffered.rest.is_none();
+        let failure = complete.then(|| {
+            let body = serde_json::from_slice(&buffered.bytes).unwrap_or(serde_json::Value::Null);
+            super::attempt::classify_anthropic_error(status, &body)
+        });
+        let response = rebuilt_response(status, headers, buffered);
+        return Ok(ThinkingRetry::Inspected(match failure {
+            Some(failure) => super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            },
+            None => super::attempt::PrecommitOutcome::Accepted {
+                response,
+                evidence: super::attempt::CommitEvidence::ByteCapReached,
+            },
+        }));
     }
     note_meters(server, backend, &headers);
     tracing::info!("upstream refused thinking: disabled; sending again as between_tools");
@@ -1595,6 +1616,7 @@ pub(crate) async fn retry_thinking_off(
     }
     send_upstream(server, backend, parts, retry, &[])
         .await
+        .map(ThinkingRetry::Retried)
         .map_err(|error| {
             tracing::warn!(%error, "upstream request failed");
             Box::new(transport_failure(ErrorWire::Anthropic, &error))
@@ -1799,23 +1821,20 @@ fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
     Some(serde_json::Value::Array(flags))
 }
 
-/// A native Messages binding's universal-canonical response path. The
-/// provider bytes feed accounting before interpretation; only the client wire
-/// is rendered from canonical events or a canonical complete turn.
+/// A native Messages binding's universal-canonical response path. The caller
+/// observes the response headers before bounded precommit body inspection; this
+/// path interprets provider bytes and renders only the client wire from
+/// canonical events or a canonical complete turn.
 pub(crate) async fn forward_canonical_messages(
-    server: Server,
-    backend: Arc<dyn Provider>,
     upstream: reqwest::Response,
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: &str,
     response_projection: ResponseProjection,
+    rate_limits: Option<serde_json::Value>,
 ) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
-
-    note_meters(&server, backend.as_ref(), &upstream_headers);
-    let rate_limits = parse_rate_limits(&upstream_headers);
 
     if is_compressed(&upstream_headers) {
         tracing::warn!("compressed canonical Messages response could not be interpreted");

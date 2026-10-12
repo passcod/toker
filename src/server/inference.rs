@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold::RetargetOutcome;
 use crate::middleware::model_map::{MapTarget, ModelMap};
-use crate::providers::Provider;
+use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
 use crate::translate::{Rendered, TranslateError};
 
@@ -226,7 +226,8 @@ impl ReadyMessagesAttempt {
                 return super::proxy::transport_failure(super::proxy::ErrorWire::Anthropic, &error);
             }
         };
-        let upstream = match super::anthropic::retry_thinking_off(
+        super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+        let retry = match super::anthropic::retry_thinking_off(
             &server,
             self.backend.as_ref(),
             &self.parts,
@@ -236,12 +237,50 @@ impl ReadyMessagesAttempt {
         )
         .await
         {
-            Ok(upstream) => upstream,
+            Ok(retry) => retry,
             Err(response) => return *response,
         };
-        let upstream = match super::attempt::precommit_anthropic(upstream).await {
+        let response = match retry {
+            super::anthropic::ThinkingRetry::Original(upstream) => {
+                let rate_limits = parse_rate_limits(upstream.headers());
+                (
+                    super::attempt::precommit_anthropic(upstream).await,
+                    rate_limits,
+                )
+            }
+            super::anthropic::ThinkingRetry::Retried(upstream) => {
+                super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+                let rate_limits = parse_rate_limits(upstream.headers());
+                (
+                    super::attempt::precommit_anthropic(upstream).await,
+                    rate_limits,
+                )
+            }
+            super::anthropic::ThinkingRetry::Inspected(outcome) => {
+                let rate_limits = match &outcome {
+                    super::attempt::PrecommitOutcome::Accepted { response, .. }
+                    | super::attempt::PrecommitOutcome::Failure {
+                        response: Some(response),
+                        ..
+                    } => parse_rate_limits(response.headers()),
+                    _ => unreachable!("thinking inspection always retains its response"),
+                };
+                (Ok(outcome), rate_limits)
+            }
+        };
+        let (outcome, rate_limits) = response;
+        let upstream = match outcome {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
-            | Ok(super::attempt::PrecommitOutcome::Failure { response, .. }) => response,
+            | Ok(super::attempt::PrecommitOutcome::Failure {
+                response: Some(response),
+                ..
+            }) => response,
+            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                return super::proxy::upstream_failure(
+                    super::proxy::ErrorWire::Anthropic,
+                    "toker could not interpret the upstream response before commitment",
+                );
+            }
             Ok(super::attempt::PrecommitOutcome::Cancelled) => {
                 return super::proxy::upstream_failure(
                     super::proxy::ErrorWire::Anthropic,
@@ -254,13 +293,12 @@ impl ReadyMessagesAttempt {
             }
         };
         super::anthropic::forward_canonical_messages(
-            server,
-            self.backend,
             upstream,
             self.record,
             self.in_flight,
             &self.response_model,
             self.response_projection,
+            rate_limits,
         )
         .await
     }
