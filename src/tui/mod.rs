@@ -542,7 +542,7 @@ fn read_window(
 ) -> anyhow::Result<DisplayWindow> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     let rows = store.display_rows_since(window_start(now_ms, window_mins), ROW_CAP)?;
-    let total = store.count_requests()?;
+    let total = store.count_logical_requests()?;
     // The header's freshness: the newest row of ANY kind in the whole
     // ledger, not the window's — an empty window must still say how
     // long ago the proxy last wrote anything.
@@ -1045,6 +1045,8 @@ pub(crate) mod testrows {
         DisplayRow {
             ts_ms,
             kind: None,
+            attempt_group_id: None,
+            attempt_index: None,
             session_id: None,
             tools_hash: None,
             model: None,
@@ -1108,6 +1110,8 @@ pub(crate) mod testrows {
             .map(|row| DisplayRow {
                 ts_ms: row.ts_ms,
                 kind: row.kind,
+                attempt_group_id: None,
+                attempt_index: None,
                 session_id: row.session_id.clone(),
                 tools_hash: row.tools_hash.clone(),
                 model: row.model.clone(),

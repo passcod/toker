@@ -142,7 +142,7 @@ pub fn status() -> anyhow::Result<()> {
         );
     }
 
-    let rows = store.count_requests()?;
+    let rows = store.count_logical_requests()?;
     println!("requests: {rows}");
     match store.requests_since(0, 1)?.pop() {
         Some(row) => println!("last request: {}", fmt_ts(row.ts_ms)),

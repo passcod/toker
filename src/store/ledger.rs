@@ -1369,6 +1369,9 @@ pub struct DisplayRow {
     pub ts_ms: i64,
     /// Proxy-written kind; `None` marks a real API measurement.
     pub kind: Option<RowKind>,
+    /// Attempt identity for logical request counts. Historical rows have neither.
+    pub attempt_group_id: Option<AttemptGroupId>,
+    pub attempt_index: Option<AttemptIndex>,
     /// Frontend-provided session identity, when known.
     pub session_id: Option<String>,
     /// The request's tool-set digest — with the session, the lane key.
@@ -1435,7 +1438,8 @@ pub(super) fn display_rows_since(
     rows_of(
         conn,
         "SELECT * FROM (
-            SELECT id, ts_ms, kind, session_id, tools_hash, model, provider,
+            SELECT id, ts_ms, kind, attempt_group_id, attempt_index,
+                   session_id, tools_hash, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
@@ -1463,6 +1467,15 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
             row.get::<_, Option<String>>("kind")?,
             RowKind::parse,
         )?,
+        attempt_group_id: parse_optional_id(
+            "requests.attempt_group_id",
+            row.get("attempt_group_id")?,
+        )?,
+        attempt_index: row
+            .get::<_, Option<i64>>("attempt_index")?
+            .map(AttemptIndex::try_from)
+            .transpose()
+            .map_err(Error::InvalidRoutingState)?,
         session_id: row.get("session_id")?,
         tools_hash: row.get("tools_hash")?,
         model: row.get("model")?,
@@ -1802,6 +1815,20 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// Logical requests: one per explicit attempt group, while ungrouped historical
+/// and proxy rows remain independent. Physical row counts stay available through
+/// [`count_requests`] for import checkpoints and bounded tail reads.
+pub(super) fn count_logical_requests(conn: &Connection) -> Result<i64> {
+    let count = conn.query_row(
+        "SELECT COUNT(DISTINCT attempt_group_id)
+              + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END)
+         FROM requests",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(count.unwrap_or(0))
+}
+
 /// One session's newest API measurement row (kind NULL), whole: the
 /// TUI's session detail reads the models a request asked for and was
 /// served on from it. `None` when the session has no measurement. The
@@ -1855,9 +1882,8 @@ pub struct SessionCostGroup {
 /// when no row was billed — a real zero sum reads back as `Some(0.0)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
-    /// The session's API-measurement rows (kind `None`) — proxy-written
-    /// kinds (a blocked gate, an error) are not requests the provider
-    /// measured.
+    /// The session's logical API measurements: explicit attempt groups count
+    /// once, while ungrouped historical measurement rows remain independent.
     pub requests: i64,
     /// Earliest/latest measurement timestamps; `None` when there are no
     /// rows.
@@ -1884,12 +1910,14 @@ pub struct SessionSummary {
     pub per_model: Vec<SessionCostGroup>,
 }
 
-/// The session's totals in one row: `COUNT`/`MIN`/`MAX` and the token /
-/// billed-cost sums over its measurement rows. `SUM` skips NULLs and
+/// The session's totals in one row: a logical request count, `MIN`/`MAX`,
+/// and token/billed-cost sums over every physical measurement attempt. `SUM`
+/// skips NULLs and
 /// yields NULL when no row carried the metric — exactly the absence ≠
 /// zero rule, so the sums need no post-processing.
 const SESSION_TOTALS_SQL: &str = concat!(
-    "SELECT COUNT(*) AS requests,",
+    "SELECT COALESCE(COUNT(DISTINCT attempt_group_id)",
+    " + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END), 0) AS requests,",
     " MIN(ts_ms) AS first_ts_ms, MAX(ts_ms) AS last_ts_ms,",
     " SUM(input) AS input, SUM(output) AS output,",
     " SUM(reasoning) AS reasoning, SUM(cache_read) AS cache_read,",

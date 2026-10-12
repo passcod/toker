@@ -434,6 +434,7 @@ pub(crate) fn aggregate(
     let mut errors = 0;
     let mut drift = 0;
     let mut window_requests = 0;
+    let mut counted_groups = std::collections::HashSet::new();
 
     // Per session, whether its newest decision row was a gate notice.
     // Only measurements, releases and notices decide: an error, a
@@ -468,8 +469,14 @@ pub(crate) fn aggregate(
         if !is_api_measurement(row.kind) {
             continue; // every panel below is measurements-only
         }
-        window_requests += 1;
-        buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
+        let counts_as_request = row
+            .attempt_group_id
+            .as_ref()
+            .is_none_or(|group| counted_groups.insert(group.clone()));
+        if counts_as_request {
+            window_requests += 1;
+            buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
+        }
 
         // TOKENS: every measurement row reports into the buckets it
         // carries and counts against the ones it does not.
@@ -526,7 +533,9 @@ pub(crate) fn aggregate(
             sessions.len() - 1
         });
         let session = &mut sessions[slot];
-        session.requests += 1;
+        if counts_as_request {
+            session.requests += 1;
+        }
         if let Some(output) = row.output {
             session.output_total = Some(session.output_total.unwrap_or(0) + output);
         }
@@ -534,7 +543,7 @@ pub(crate) fn aggregate(
         lanes[slot]
             .entry(row.tools_hash.clone())
             .or_default()
-            .add(row);
+            .add(row, counts_as_request);
 
         // Cost: billed sums, everything else stays explicit (above).
         match (row.cost_usd, row.cost_kind) {
@@ -678,8 +687,8 @@ struct LaneAgg {
 impl LaneAgg {
     /// Fold the next row in ts order: the last write is the latest
     /// row's value.
-    fn add(&mut self, row: &DisplayRow) {
-        self.requests += 1;
+    fn add(&mut self, row: &DisplayRow, counts_as_request: bool) {
+        self.requests += usize::from(counts_as_request);
         self.latest_ts_ms = row.ts_ms;
         self.held = [
             row.input,
@@ -849,6 +858,26 @@ mod tests {
     /// A measurement row a given number of minutes before `NOW`.
     fn mins_ago(mins: i64) -> i64 {
         NOW - mins * 60_000
+    }
+
+    #[test]
+    fn grouped_measurements_count_once_but_keep_attempt_usage() {
+        let group = crate::store::AttemptGroupId::new("feedfeedfeedfeedfeedfeedfeedfeed").unwrap();
+        let mut first = display_bare(mins_ago(2));
+        first.session_id = Some("ses-group".to_owned());
+        first.attempt_group_id = Some(group.clone());
+        first.attempt_index = Some(crate::store::AttemptIndex::zero());
+        first.input = Some(3);
+        let mut second = display_bare(mins_ago(1));
+        second.session_id = Some("ses-group".to_owned());
+        second.attempt_group_id = Some(group);
+        second.attempt_index = Some(crate::store::AttemptIndex::try_from(1).unwrap());
+        second.input = Some(5);
+
+        let snap = agg(&[first, second], 1);
+        assert_eq!(snap.window_requests, 1);
+        assert_eq!(snap.sessions[0].requests, 1);
+        assert_eq!(snap.tokens.fresh_input.value, 8);
     }
 
     #[test]

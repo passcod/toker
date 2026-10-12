@@ -342,6 +342,12 @@ impl Store {
         ledger::count_requests(&*self.conn()?)
     }
 
+    /// Total logical request count. Explicit attempt groups count once;
+    /// ungrouped historical and proxy rows each count independently.
+    pub fn count_logical_requests(&self) -> Result<i64> {
+        ledger::count_logical_requests(&*self.conn()?)
+    }
+
     /// The newest ledger row's timestamp, of any kind; `None` when the
     /// ledger is empty. The TUI header's freshness reads this rather
     /// than the display window, so a dead proxy still shows its age.
@@ -1448,6 +1454,8 @@ mod tests {
             DisplayRow {
                 ts_ms: row.ts_ms,
                 kind: None, // full_row is a measurement
+                attempt_group_id: None,
+                attempt_index: None,
                 session_id: Some("ses-abc".to_string()),
                 tools_hash: Some("sha256:tool5".to_string()),
                 model: Some("z-ai/glm-5.3".to_string()),
@@ -1476,6 +1484,8 @@ mod tests {
             DisplayRow {
                 ts_ms: 9_999,
                 kind: None,
+                attempt_group_id: None,
+                attempt_index: None,
                 session_id: None,
                 tools_hash: None,
                 model: None,
@@ -1860,6 +1870,31 @@ mod tests {
         row.cost_kind = Some(CostKind::Billed);
         row.extra = serving_provider.map(|provider| json!({"serving_provider": provider}));
         row
+    }
+
+    #[test]
+    fn session_summary_groups_attempts_but_sums_each_attempts_usage() {
+        let store = mem_store();
+        let group = AttemptGroupId::new("feedfeedfeedfeedfeedfeedfeedfeed").unwrap();
+        for (ts_ms, index, reason, input) in [
+            (1, 0, AttemptReason::Initial, 3),
+            (2, 1, AttemptReason::ThinkingNegotiation, 5),
+        ] {
+            let mut row = bare_row(ts_ms);
+            row.session_id = Some("ses-attempts".to_owned());
+            row.binding_id = Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap());
+            row.input = Some(input);
+            row.attempt = Some(AttemptProvenance {
+                attempt_group_id: group.clone(),
+                attempt_index: AttemptIndex::try_from(index).unwrap(),
+                reason,
+            });
+            store.record_request(&row).unwrap();
+        }
+
+        let summary = store.session_summary("ses-attempts").unwrap();
+        assert_eq!(summary.requests, 1);
+        assert_eq!(summary.input, Some(8));
     }
 
     #[test]
@@ -3563,6 +3598,30 @@ mod tests {
         assert_eq!(zero.get(), 0);
         assert_eq!(zero.next().unwrap().get(), 1);
         assert!(AttemptIndex::try_from(-1).is_err());
+    }
+
+    #[test]
+    fn logical_request_count_groups_attempts_and_keeps_legacy_rows_independent() {
+        let store = mem_store();
+        let group = AttemptGroupId::new("feedfeedfeedfeedfeedfeedfeedfeed").unwrap();
+        for (ts_ms, index, reason) in [
+            (1, 0, AttemptReason::Initial),
+            (2, 1, AttemptReason::ThinkingNegotiation),
+        ] {
+            let mut row = bare_row(ts_ms);
+            row.binding_id = Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap());
+            row.attempt = Some(AttemptProvenance {
+                attempt_group_id: group.clone(),
+                attempt_index: AttemptIndex::try_from(index).unwrap(),
+                reason,
+            });
+            store.record_request(&row).unwrap();
+        }
+        store.record_request(&bare_row(3)).unwrap();
+
+        assert_eq!(store.count_requests().unwrap(), 3);
+        assert_eq!(store.count_logical_requests().unwrap(), 2);
+        assert_eq!(mem_store().count_logical_requests().unwrap(), 0);
     }
 
     #[test]

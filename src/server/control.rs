@@ -54,7 +54,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
     if !control_token_ok(request.headers(), "status") {
         return forbidden();
     }
-    let rows = match server.store.count_requests() {
+    let rows = match server.store.count_logical_requests() {
         Ok(rows) => rows,
         Err(error) => return store_error(error),
     };
