@@ -679,7 +679,7 @@ mod tests {
         assert!(before_open.circuits.is_empty());
 
         shadow.observe(facts(), Default::default(), Some(lane), outcome("model-a"));
-        policy_runtime.clear_circuit(&key);
+        policy_runtime.clear_circuit(&snapshot, &key);
         let ShadowJob::Resolve(before_clear) = receiver.try_recv().unwrap() else {
             panic!()
         };

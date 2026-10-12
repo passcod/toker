@@ -458,17 +458,45 @@ impl PolicyRuntime {
             .mutation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let binding = &key.binding_id;
+        let catalogue_generation = snapshot.catalogue_generation(binding);
+        let credential_generation = snapshot.credential_generation(binding);
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state
+            .catalogue_generations
+            .get(binding)
+            .copied()
+            .unwrap_or_default()
+            != catalogue_generation
+            || state
+                .credential_generations
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+                != credential_generation
+        {
+            return;
+        }
+        drop(state);
         self.circuits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                key.clone(),
-                OpenCircuit {
-                    until_ms,
-                    catalogue_generation: snapshot.catalogue_generation(&key.binding_id),
-                    credential_generation: snapshot.credential_generation(&key.binding_id),
-                },
-            );
+            .entry(key)
+            .and_modify(|circuit| {
+                if circuit.catalogue_generation == catalogue_generation
+                    && circuit.credential_generation == credential_generation
+                {
+                    circuit.until_ms = circuit.until_ms.max(until_ms);
+                }
+            })
+            .or_insert(OpenCircuit {
+                until_ms,
+                catalogue_generation,
+                credential_generation,
+            });
     }
 
     pub fn circuit_is_open(
@@ -555,15 +583,49 @@ impl PolicyRuntime {
             .collect()
     }
 
-    pub fn clear_circuit(&self, key: &HealthCircuitKey) {
+    pub fn clear_circuit(&self, snapshot: &PolicySnapshot, key: &HealthCircuitKey) {
         let _mutation = self
             .mutation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let catalogue_generation = snapshot.catalogue_generation(&key.binding_id);
+        let credential_generation = snapshot.credential_generation(&key.binding_id);
         self.circuits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(key);
+            .retain(|candidate, circuit| {
+                candidate != key
+                    || circuit.catalogue_generation != catalogue_generation
+                    || circuit.credential_generation != credential_generation
+            });
+    }
+
+    pub fn clear_target_circuits(
+        &self,
+        snapshot: &PolicySnapshot,
+        route_id: &RouteId,
+        candidate_id: &CandidateId,
+        binding_id: &BindingId,
+        model_id: &str,
+    ) {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let catalogue_generation = snapshot.catalogue_generation(binding_id);
+        let credential_generation = snapshot.credential_generation(binding_id);
+        self.circuits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key, circuit| {
+                key.policy_revision_id != snapshot.revision_id.unwrap_or_default()
+                    || key.route_id != *route_id
+                    || key.candidate_id != *candidate_id
+                    || key.binding_id != *binding_id
+                    || key.model_id != model_id
+                    || circuit.catalogue_generation != catalogue_generation
+                    || circuit.credential_generation != credential_generation
+            });
     }
 }
 
@@ -866,7 +928,9 @@ mod tests {
         runtime.bump_credential_generation(&binding);
         let current_credentials = runtime.capture_revision(revision_id).unwrap();
         let credential_key = circuit_key(revision_id, binding.clone());
-        runtime.open_circuit(&current_credentials, credential_key, 100);
+        runtime.open_circuit(&current_credentials, credential_key.clone(), 100);
+        runtime.open_circuit(&before_credentials, credential_key.clone(), 200);
+        runtime.clear_circuit(&before_credentials, &credential_key);
         assert!(runtime.open_circuits(&before_credentials, 10).is_empty());
         assert_eq!(runtime.open_circuits(&current_credentials, 10).len(), 1);
 
@@ -885,5 +949,31 @@ mod tests {
         runtime.open_circuit(&current_catalogue, catalogue_key, 100);
         assert!(runtime.open_circuits(&before_catalogue, 10).is_empty());
         assert_eq!(runtime.open_circuits(&current_catalogue, 10).len(), 1);
+    }
+
+    #[test]
+    fn same_generation_failures_extend_and_success_clears_exact_target() {
+        let (store, runtime) = runtime();
+        let revision_id = revision(&store, "circuit-mutations");
+        let snapshot = runtime.capture_revision(revision_id).unwrap();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let key = circuit_key(revision_id, binding.clone());
+        let other = HealthCircuitKey {
+            model_id: "other-model".to_owned(),
+            ..key.clone()
+        };
+        runtime.open_circuit(&snapshot, key.clone(), 100);
+        runtime.open_circuit(&snapshot, key.clone(), 50);
+        runtime.open_circuit(&snapshot, other.clone(), 100);
+        assert!(runtime.circuit_is_open(&snapshot, &key, 75));
+        runtime.clear_target_circuits(
+            &snapshot,
+            &key.route_id,
+            &key.candidate_id,
+            &key.binding_id,
+            &key.model_id,
+        );
+        assert!(!runtime.circuit_is_open(&snapshot, &key, 75));
+        assert!(runtime.circuit_is_open(&snapshot, &other, 75));
     }
 }
