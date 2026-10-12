@@ -78,6 +78,9 @@ pub(crate) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_RESPONSE_BUFFER: usize = 64 * 1024 * 1024;
 /// Cap for buffered non-2xx bodies, which are small in practice.
 pub(crate) const MAX_ERROR_BODY: usize = 16 * 1024 * 1024;
+/// Maximum raw streaming prefix retained before the frontend head commits.
+#[allow(dead_code)]
+pub(crate) const PRECOMMIT_BODY_CAP: usize = 64 * 1024;
 
 /// `POST /v1/chat/completions` — the usage path.
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
@@ -968,6 +971,8 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
 /// caller can forward the remainder verbatim.
 pub(crate) struct Buffered {
     pub(crate) bytes: Vec<u8>,
+    /// Bytes from the chunk that crossed the cap. `rest` begins after these.
+    pub(crate) overflow: Option<Bytes>,
     pub(crate) rest: Option<reqwest::Response>,
 }
 
@@ -985,14 +990,23 @@ pub(crate) async fn buffer_up_to(
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if bytes.len() + chunk.len() > cap {
+                    let retained = cap.saturating_sub(bytes.len()).min(chunk.len());
+                    bytes.extend_from_slice(&chunk[..retained]);
                     return Ok(Buffered {
                         bytes,
+                        overflow: (retained < chunk.len()).then(|| chunk.slice(retained..)),
                         rest: Some(response),
                     });
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(Buffered { bytes, rest: None }),
+            Ok(None) => {
+                return Ok(Buffered {
+                    bytes,
+                    overflow: None,
+                    rest: None,
+                });
+            }
             Err(error) => {
                 tracing::warn!(%error, "upstream response body failed mid-transfer");
                 return Err(error);
@@ -1099,7 +1113,12 @@ pub(crate) fn buffered_body(buffered: Buffered) -> Body {
     match buffered.rest {
         Some(response) => {
             let prefix = Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes));
-            Body::from_stream(futures::stream::iter(vec![prefix]).chain(response.bytes_stream()))
+            let overflow = buffered.overflow.map(Ok::<_, reqwest::Error>);
+            Body::from_stream(
+                futures::stream::iter([prefix])
+                    .chain(futures::stream::iter(overflow))
+                    .chain(response.bytes_stream()),
+            )
         }
         None => Body::from(Bytes::from(buffered.bytes)),
     }
@@ -1126,7 +1145,7 @@ pub(crate) fn plain_status(status: StatusCode, message: &'static str) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorWire, transport_failure};
+    use super::{ErrorWire, buffer_up_to, buffered_body, transport_failure};
     use axum::http::{StatusCode, header};
 
     async fn error_of(response: axum::response::Response) -> serde_json::Value {
@@ -1139,6 +1158,21 @@ mod tests {
             .await
             .expect("a whole body");
         serde_json::from_slice(&body).expect("a JSON error")
+    }
+
+    #[tokio::test]
+    async fn capped_buffering_preserves_the_chunk_that_crossed_the_cap() {
+        let response = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .body(reqwest::Body::from("abcdefgh"))
+            .unwrap();
+        let buffered = buffer_up_to(reqwest::Response::from(response), 3)
+            .await
+            .unwrap();
+        assert_eq!(buffered.bytes, b"abc");
+        let body = buffered_body(buffered);
+        let bytes = axum::body::to_bytes(body, 16).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"abcdefgh");
     }
 
     #[tokio::test]

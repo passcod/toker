@@ -7,8 +7,11 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
+use crate::observe::SseSplitter;
 use crate::policy::FailureClass;
 use crate::providers::codex::ResponseError;
+
+use super::proxy::{Buffered, PRECOMMIT_BODY_CAP, buffer_up_to};
 
 /// How a failed attempt became observable to the coordinator.
 #[allow(dead_code)]
@@ -127,6 +130,26 @@ fn value_code(value: &Value) -> Option<&str> {
     value.as_str()
 }
 
+/// Retain a bounded streaming prefix until one complete non-keepalive SSE
+/// frame is available, or the byte cap forces commitment. The returned
+/// response remains positioned immediately after `bytes`.
+#[allow(dead_code)]
+pub(crate) async fn precommit_sse(
+    response: reqwest::Response,
+) -> Result<(Buffered, CommitEvidence), reqwest::Error> {
+    let buffered = buffer_up_to(response, PRECOMMIT_BODY_CAP).await?;
+    let mut splitter = SseSplitter::new();
+    let has_frame = !splitter.feed(&buffered.bytes).is_empty();
+    let evidence = if has_frame {
+        CommitEvidence::OtherValidFrame
+    } else if buffered.rest.is_some() {
+        CommitEvidence::ByteCapReached
+    } else {
+        CommitEvidence::NonStreamingComplete
+    };
+    Ok((buffered, evidence))
+}
+
 fn classify_symbolic(value: Option<&str>) -> Option<FailureClass> {
     match value?.to_ascii_lowercase().as_str() {
         "authentication_error" | "invalid_api_key" | "unauthorized" | "401" => {
@@ -199,6 +222,27 @@ mod tests {
         let in_band = classify_responses_error(None, &error, true);
         assert_eq!(in_band.class, Some(FailureClass::ServerError));
         assert_eq!(in_band.mechanism, FailureMechanism::InBandEvent);
+    }
+
+    #[tokio::test]
+    async fn streaming_precommit_waits_for_a_frame_or_the_fixed_cap() {
+        fn response(body: axum::body::Body) -> reqwest::Response {
+            let response = axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+                .unwrap();
+            reqwest::Response::from(response)
+        }
+
+        let body = axum::body::Body::from("event: message_start\ndata: {}\n\nrest");
+        let (buffered, evidence) = precommit_sse(response(body)).await.unwrap();
+        assert_eq!(evidence, CommitEvidence::OtherValidFrame);
+        assert!(buffered.rest.is_none());
+
+        let body = axum::body::Body::from(vec![b':'; PRECOMMIT_BODY_CAP + 1]);
+        let (buffered, evidence) = precommit_sse(response(body)).await.unwrap();
+        assert_eq!(evidence, CommitEvidence::ByteCapReached);
+        assert!(buffered.rest.is_some());
     }
 
     #[test]

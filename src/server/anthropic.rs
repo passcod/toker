@@ -1629,6 +1629,9 @@ fn rebuilt_response(
         None => reqwest::Body::from(buffered.bytes),
         Some(rest) => reqwest::Body::wrap_stream(
             futures::stream::iter([Ok::<_, reqwest::Error>(Bytes::from(buffered.bytes))])
+                .chain(futures::stream::iter(
+                    buffered.overflow.map(Ok::<_, reqwest::Error>),
+                ))
                 .chain(rest.bytes_stream()),
         ),
     };
