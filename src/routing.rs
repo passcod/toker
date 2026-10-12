@@ -115,6 +115,14 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    pub const OPENAI_CHAT: Capabilities = Capabilities {
+        sampling: CapabilityEvidence::Unknown,
+        system_in_messages: CapabilityEvidence::Unknown,
+        thinking_replay: CapabilityEvidence::Unsupported,
+        images: CapabilityEvidence::Unknown,
+        tools: CapabilityEvidence::Unknown,
+    };
+
     pub const UNKNOWN: Capabilities = Capabilities {
         sampling: CapabilityEvidence::Unknown,
         system_in_messages: CapabilityEvidence::Unknown,
@@ -154,14 +162,14 @@ impl Capabilities {
         tools: CapabilityEvidence::Supported,
     };
 
-    /// The streamed Responses subset verified against OpenRouter: tools,
-    /// usage, and caller output bounds. Other sampling knobs and replay of
-    /// provider-owned reasoning remain unverified and are not claimed here.
+    /// The streamed Responses subset verified against OpenRouter. The adapter
+    /// deterministically rejects/drops these hard semantics, so they are known
+    /// unsupported even where upstream support itself was not probed.
     pub const OPENROUTER_RESPONSES: Capabilities = Capabilities {
-        sampling: CapabilityEvidence::Unknown,
-        system_in_messages: CapabilityEvidence::Unknown,
-        thinking_replay: CapabilityEvidence::Unknown,
-        images: CapabilityEvidence::Unknown,
+        sampling: CapabilityEvidence::Unsupported,
+        system_in_messages: CapabilityEvidence::Unsupported,
+        thinking_replay: CapabilityEvidence::Unsupported,
+        images: CapabilityEvidence::Unsupported,
         tools: CapabilityEvidence::Supported,
     };
 }
@@ -384,7 +392,7 @@ pub const OPENAI_API_CHAT: BackendBinding = BackendBinding::canonical(
     CostClass::Billed,
     None,
     BackendAdapterId::OpenAiChatCompletions,
-    Capabilities::UNKNOWN,
+    Capabilities::OPENAI_CHAT,
 );
 
 pub const OPENROUTER_CHAT: BackendBinding = BackendBinding::canonical(
@@ -902,7 +910,7 @@ mod tests {
                 ProtocolId::OpenAiChat,
                 DialectId::OpenAiChatCompletions,
                 BackendAdapterId::OpenAiChatCompletions,
-                Capabilities::UNKNOWN,
+                Capabilities::OPENAI_CHAT,
                 None,
             ),
             (
