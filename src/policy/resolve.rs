@@ -1096,7 +1096,10 @@ fn choose_revision_one_compaction<L: LearningView>(
     parameters: &BTreeMap<StableId, String>,
     source: &str,
 ) -> Result<Option<String>, ResolveFailure> {
-    let Some(compaction_facts) = facts.legacy_compaction.filter(|facts| facts.lane_cold) else {
+    let Some(compaction_facts) = facts
+        .legacy_compaction
+        .filter(|facts| facts.lane_cold && facts.transform_applied)
+    else {
         return Ok(None);
     };
     let Some((spec, eligible_bindings)) = policy
@@ -2940,6 +2943,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.retargeted_model, None);
+        assert!(!plan.compaction);
+
+        let mut declined = request.clone();
+        declined
+            .legacy_compaction
+            .as_mut()
+            .unwrap()
+            .transform_applied = false;
+        let plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &learning,
+            None,
+            &availability(true, false),
+            &declined,
+        )
+        .unwrap();
+        assert_eq!(plan.retargeted_model, None);
+        assert_eq!(plan.effective_model, "claude-opus-5");
         assert!(!plan.compaction);
 
         let too_large = TestLearning {

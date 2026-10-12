@@ -23,7 +23,6 @@ const POLICY_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.document.v3\0";
 // domain whenever the closed projection below changes meaning or shape.
 const ROUTE_FINGERPRINT_DOMAIN_V1: &[u8] = b"toker.policy.route-semantics.v1\0";
 const ROUTE_FINGERPRINT_DOMAIN_V2: &[u8] = b"toker.policy.route-semantics.v2\0";
-const ROUTE_FINGERPRINT_DOMAIN_V3: &[u8] = b"toker.policy.route-semantics.v3\0";
 
 /// Limits applied before a document enters the runtime compiler.
 ///
@@ -447,8 +446,7 @@ pub fn route_fingerprint(semantics: &RouteSemantics) -> Result<RouteFingerprint,
 fn route_domain(format_version: u32) -> Result<&'static [u8], CanonicalError> {
     match format_version {
         1 => Ok(ROUTE_FINGERPRINT_DOMAIN_V1),
-        2 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
-        3 => Ok(ROUTE_FINGERPRINT_DOMAIN_V3),
+        2 | 3 => Ok(ROUTE_FINGERPRINT_DOMAIN_V2),
         version => Err(CanonicalError::UnsupportedFormat(version)),
     }
 }
@@ -925,16 +923,19 @@ mod tests {
             .unwrap();
         assert_ne!(v1_route, v2_route);
 
-        let v3 = full_document(route("display", None)).validate().unwrap();
+        let mut v3_document = v2.document().clone();
+        v3_document.format_version = 3;
+        let v3 = v3_document.validate().unwrap();
         assert_ne!(
             policy_fingerprint(&v2).unwrap(),
             policy_fingerprint(&v3).unwrap()
         );
-        assert_ne!(
+        assert_eq!(
             v2_route,
             RouteSemantics::from_document(&v3, &RouteId::new("route").unwrap())
                 .and_then(|semantics| route_fingerprint(&semantics))
-                .unwrap()
+                .unwrap(),
+            "document-global compaction vocabulary does not change route semantics"
         );
 
         let mut invalid_v1 = v1.into_document();
