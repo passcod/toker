@@ -1,7 +1,8 @@
 # Ledger schema
 
 The ledger is the `requests` table in the SQLite file at the config's `db_path`:
-insert-only, one row per request, written only by `Store::record_request`
+insert-only, one row per upstream attempt or proxy decision, written only by
+`Store::record_request`
 (`store/ledger.rs` has the row type, `RequestRow`, whose fields match the
 columns one to one). The state tables beside it (lanes, learned models,
 allowances, pings, meter snapshots, meta) are read-modify-write and are not part
@@ -14,6 +15,16 @@ Every column but `ts_ms` is nullable, and NULL means "not recorded", never zero.
 Fields were added over time, both in ctp and in toker, so **earlier rows lack
 later fields**: always handle NULL, and never treat a missing field as a
 negative value. `betas` NULL means "not captured", not "no betas".
+
+Actual upstream sends carry `attempt_group_id`, zero-based `attempt_index`, and
+`fallback_reason` (the physical compatibility name for the reason that attempt
+exists). Index zero is always `initial`; later indices name the transition, such
+as `thinking_negotiation`. Logical request counts group non-NULL group ids,
+while historical rows without one remain independent. Token, cost, meter, and
+error-attempt totals consume physical rows. Policy fields are independently
+nullable: a legacy-selected send has attempt provenance but no policy revision,
+route, candidate, or trace. A policy `route-unavailable` terminal has a group id
+but no index/reason because no send occurred.
 
 ## Row kinds
 
