@@ -65,8 +65,8 @@ pub struct LearningSnapshot {
 impl LearningView for LearningSnapshot {
     type Error = std::convert::Infallible;
 
-    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
-        Ok(self.clone())
+    fn snapshot(&self) -> LearningSnapshot {
+        self.clone()
     }
 
     fn recently_sent(
@@ -146,10 +146,16 @@ pub enum RecencyEvidence {
 pub trait LearningView {
     type Error;
 
-    /// Capture an owned immutable view for deferred resolution. Synchronous
-    /// callers may continue reading `self`; shadow workers must enqueue this
-    /// snapshot so later observations cannot change an in-flight decision.
-    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error>;
+    /// Clone the latest already-published content-free evidence. This method
+    /// must not perform I/O: request handlers use it before enqueueing shadow
+    /// work.
+    fn snapshot(&self) -> LearningSnapshot;
+
+    /// Refresh the published snapshot outside the request handler. Failure
+    /// leaves the previous conservative snapshot in place.
+    fn refresh_snapshot(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn recently_sent(
         &self,
@@ -191,6 +197,7 @@ impl LegacyLearningView {
 pub struct BindingLearningView {
     store: Arc<Store>,
     recency: Mutex<BindingRecency>,
+    published: std::sync::RwLock<LearningSnapshot>,
 }
 
 #[derive(Default)]
@@ -246,10 +253,18 @@ impl BindingLearningView {
             };
             recency.note_sent(binding_id, model_id, row.ts_ms);
         }
-        Self {
+        let mut view = Self {
             store,
             recency: Mutex::new(recency),
+            published: std::sync::RwLock::new(LearningSnapshot::default()),
+        };
+        if let Ok(snapshot) = binding_snapshot(&view) {
+            *view
+                .published
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
         }
+        view
     }
 
     /// Remember an actual inference send before transport starts.
@@ -305,46 +320,20 @@ fn exact_reported_model(model: &str) -> Option<String> {
 impl LearningView for BindingLearningView {
     type Error = crate::store::Error;
 
-    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
-        let recency = self
-            .recency
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let recent = recency
-            .sent_on
-            .iter()
-            .map(|((binding, model), last_sent)| {
-                ((Some(binding.clone()), model.clone()), *last_sent)
-            })
-            .collect();
-        let covered_since = recency
-            .covered_since
-            .iter()
-            .map(|(binding, since)| (Some(binding.clone()), Some(*since)))
-            .collect();
-        let mut learned = BTreeMap::new();
-        let mut active_days = BTreeMap::new();
-        for binding in recency.covered_since.keys() {
-            let entries = self.store.load_binding_learnings(binding)?;
-            let days = entries
-                .iter()
-                .flat_map(|entry| entry.days.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                .len();
-            active_days.insert(Some(binding.clone()), days);
-            for entry in entries {
-                learned.insert(
-                    (Some(binding.clone()), entry.model_id.clone()),
-                    binding_evidence(entry),
-                );
-            }
-        }
-        Ok(LearningSnapshot {
-            learned,
-            recent,
-            covered_since,
-            active_days,
-        })
+    fn snapshot(&self) -> LearningSnapshot {
+        self.published
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn refresh_snapshot(&self) -> Result<(), Self::Error> {
+        let snapshot = binding_snapshot(self)?;
+        *self
+            .published
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
+        Ok(())
     }
 
     fn recently_sent(
@@ -403,26 +392,8 @@ impl LearningView for BindingLearningView {
 impl LearningView for LegacyLearningView {
     type Error = crate::store::Error;
 
-    fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
-        let entries = self.store.learned_entries()?;
-        let active_days = active_days_of(&entries);
-        let learned = entries
-            .into_iter()
-            .map(|entry| ((None, entry.model_id.clone()), evidence(entry)))
-            .collect();
-        let covered_since = self.store.covered_since();
-        let recent = self
-            .store
-            .recently_served()
-            .into_iter()
-            .map(|(model, at)| ((None, model), at))
-            .collect();
-        Ok(LearningSnapshot {
-            learned,
-            recent,
-            covered_since: BTreeMap::from([(None, covered_since)]),
-            active_days: BTreeMap::from([(None, active_days)]),
-        })
+    fn snapshot(&self) -> LearningSnapshot {
+        legacy_snapshot(&self.store)
     }
 
     fn recently_sent(
@@ -454,6 +425,66 @@ impl LearningView for LegacyLearningView {
     fn active_days(&self, _binding_id: &BindingId) -> Result<usize, Self::Error> {
         Ok(active_days_of(&self.store.learned_entries()?))
     }
+}
+
+fn legacy_snapshot(store: &ModelStore) -> LearningSnapshot {
+    let entries = store.published_learning();
+    let active_days = active_days_of(&entries);
+    let learned = entries
+        .into_iter()
+        .map(|entry| ((None, entry.model_id.clone()), evidence(entry)))
+        .collect();
+    let recent = store
+        .recently_served()
+        .into_iter()
+        .map(|(model, at)| ((None, model), at))
+        .collect();
+    LearningSnapshot {
+        learned,
+        recent,
+        covered_since: BTreeMap::from([(None, store.covered_since())]),
+        active_days: BTreeMap::from([(None, active_days)]),
+    }
+}
+
+fn binding_snapshot(view: &BindingLearningView) -> crate::store::Result<LearningSnapshot> {
+    let recency = view
+        .recency
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let recent = recency
+        .sent_on
+        .iter()
+        .map(|((binding, model), last_sent)| ((Some(binding.clone()), model.clone()), *last_sent))
+        .collect();
+    let covered_since = recency
+        .covered_since
+        .iter()
+        .map(|(binding, since)| (Some(binding.clone()), Some(*since)))
+        .collect();
+    let mut learned = BTreeMap::new();
+    let mut active_days = BTreeMap::new();
+    for binding in recency.covered_since.keys() {
+        let entries = view.store.load_binding_learnings(binding)?;
+        let days = entries
+            .iter()
+            .flat_map(|entry| entry.days.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .len();
+        active_days.insert(Some(binding.clone()), days);
+        for entry in entries {
+            learned.insert(
+                (Some(binding.clone()), entry.model_id.clone()),
+                binding_evidence(entry),
+            );
+        }
+    }
+    Ok(LearningSnapshot {
+        learned,
+        recent,
+        covered_since,
+        active_days,
+    })
 }
 
 fn binding_evidence(entry: BindingLearning) -> LearnedEvidence {
@@ -728,7 +759,7 @@ mod tests {
             },
             "a possible provider send must remain warm after restart",
         );
-        let snapshot = view.snapshot().unwrap();
+        let snapshot = view.snapshot();
         assert_eq!(
             snapshot.recently_sent(&first, "same-model").unwrap(),
             RecencyEvidence::Covered {

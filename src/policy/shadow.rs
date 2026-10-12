@@ -182,9 +182,10 @@ where
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
         let worker_runtime = policy_runtime.clone();
+        let worker_learning = learning.clone();
         let worker = thread::Builder::new()
             .name("toker-policy-shadow".to_owned())
-            .spawn(move || worker_loop(receiver, worker_runtime, observer))
+            .spawn(move || worker_loop(receiver, worker_runtime, worker_learning, observer))
             .expect("policy shadow worker thread");
         Self {
             policy_runtime,
@@ -235,9 +236,7 @@ where
         else {
             return;
         };
-        let Ok(learning) = self.learning.snapshot() else {
-            return;
-        };
+        let learning = self.learning.snapshot();
         self.enqueue(ShadowJob::Resolve(Box::new(ResolveJob {
             snapshot,
             pinned_revision,
@@ -293,9 +292,10 @@ where
     }
 }
 
-fn worker_loop(
+fn worker_loop<L: LearningView>(
     receiver: mpsc::Receiver<ShadowJob>,
     policy_runtime: Arc<PolicyRuntime>,
+    learning_source: Arc<L>,
     observer: Arc<dyn ShadowObserver>,
 ) {
     while let Ok(job) = receiver.recv() {
@@ -375,6 +375,9 @@ fn worker_loop(
             shadow: None,
         });
         let _ = catch_unwind(AssertUnwindSafe(|| observer.observe(record)));
+        if learning_source.refresh_snapshot().is_err() {
+            tracing::warn!("policy shadow learning refresh failed");
+        }
     }
 }
 

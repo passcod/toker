@@ -1285,8 +1285,8 @@ pub struct NoLearning;
 impl LearningView for NoLearning {
     type Error = Infallible;
 
-    fn snapshot(&self) -> Result<super::LearningSnapshot, Self::Error> {
-        Ok(super::LearningSnapshot::default())
+    fn snapshot(&self) -> super::LearningSnapshot {
+        super::LearningSnapshot::default()
     }
 
     fn recently_sent(&self, _: &BindingId, _: &str) -> Result<super::RecencyEvidence, Self::Error> {
@@ -1504,8 +1504,8 @@ mod tests {
     impl LearningView for TestLearning {
         type Error = Infallible;
 
-        fn snapshot(&self) -> Result<LearningSnapshot, Self::Error> {
-            Ok(LearningSnapshot::default())
+        fn snapshot(&self) -> LearningSnapshot {
+            LearningSnapshot::default()
         }
 
         fn recently_sent(&self, _: &BindingId, _: &str) -> Result<RecencyEvidence, Self::Error> {
