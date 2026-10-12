@@ -374,6 +374,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_attempt_exports_without_policy_provenance() {
+        let store = store_with_revision(":memory:");
+        let mut row = bare(T0);
+        row.binding_id = Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap());
+        row.attempt = Some(crate::store::AttemptProvenance {
+            attempt_group_id: AttemptGroupId::new("feedfeedfeedfeedfeedfeedfeedfeed").unwrap(),
+            attempt_index: crate::store::AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        });
+        store.record_request(&row).unwrap();
+
+        let exported = lines(&export(&store, &RequestFilter::default()));
+        let object = exported[0].as_object().unwrap();
+        assert_eq!(
+            object["attempt_group_id"],
+            "feedfeedfeedfeedfeedfeedfeedfeed"
+        );
+        assert_eq!(object["attempt_index"], 0);
+        assert_eq!(object["fallback_reason"], "initial");
+        for key in [
+            "policy_revision_id",
+            "presentation_id",
+            "rewrite_id",
+            "policy_route_id",
+            "route_fingerprint",
+            "candidate_id",
+            "baseline_model",
+            "routing_trace",
+        ] {
+            assert!(!object.contains_key(key), "unexpected policy field {key}");
+        }
+    }
+
+    #[test]
     fn every_column_is_exported_under_its_own_name() {
         // A file ledger, so a second connection can ask SQLite for the
         // columns: a later migration's column fails here until the full
