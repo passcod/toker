@@ -239,6 +239,20 @@ impl ReadyMessagesAttempt {
             Ok(upstream) => upstream,
             Err(response) => return *response,
         };
+        let upstream = match super::attempt::precommit_anthropic(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
+            | Ok(super::attempt::PrecommitOutcome::Failure { response, .. }) => response,
+            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
+                return super::proxy::upstream_failure(
+                    super::proxy::ErrorWire::Anthropic,
+                    "toker upstream request was cancelled before response commitment",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                return super::proxy::truncated_body(super::proxy::ErrorWire::Anthropic);
+            }
+        };
         super::anthropic::forward_canonical_messages(
             server,
             self.backend,

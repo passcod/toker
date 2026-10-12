@@ -1616,11 +1616,10 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
 }
 
-/// A response put back together from what [`retry_thinking_off`] buffered
-/// to read its error, so [`forward_legacy_response`] handles it as if it had
-/// never been read: the same status, headers, and bytes, with any
-/// unbuffered remainder chained on.
-fn rebuilt_response(
+/// A response put back together after bounded inspection, so the normal
+/// forwarding path handles it as if it had never been read: the same status,
+/// headers, and bytes, with any unbuffered remainder chained on.
+pub(crate) fn rebuilt_response(
     status: StatusCode,
     headers: HeaderMap,
     buffered: super::proxy::Buffered,
