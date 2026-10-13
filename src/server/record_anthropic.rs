@@ -25,7 +25,7 @@
 //!   predecessor's did: a 429 carries no usage, and its meters are the
 //!   only evidence of throttling the ledger gets (an earlier port left
 //!   them off as "lean", which erased exactly that). The *blocked* rows
-//!   carry a stale copy instead — [`record_anthropic_blocked`] ports
+//!   carry a stale copy instead — [`record_quota_blocked`] ports
 //!   that, since the stale snapshot is the block's own provenance.
 //! - **`model` is the normalised identity, `raw_model` the wire form**
 //!   (the normalise/raw pair, as the predecessor named them).
@@ -724,10 +724,10 @@ pub(crate) fn record_anthropic_released(
     );
 }
 
-/// The inputs of one blocked row (see [`record_anthropic_blocked`]) —
+/// The inputs of one blocked row (see [`record_quota_blocked`]) —
 /// a struct because the pieces are exactly the row's own fields, and
 /// a nine-argument call site would be positional-number soup.
-pub(crate) struct BlockedRecord<'a> {
+pub(crate) struct QuotaBlockedRecord<'a> {
     /// The server (for the store).
     pub(crate) server: &'a Server,
     /// Request start, for `duration_ms`.
@@ -738,6 +738,8 @@ pub(crate) struct BlockedRecord<'a> {
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached (the gate's own).
     pub(crate) backend_id: &'a str,
+    /// The client protocol stopped by the gate.
+    pub(crate) frontend_protocol: &'static str,
     /// Which meter hit its limit.
     pub(crate) meter: Meter,
     /// When that meter's window resets, epoch seconds.
@@ -763,13 +765,14 @@ pub(crate) struct BlockedRecord<'a> {
 /// No model columns (the predecessor's blocked row carries none), no
 /// usage, never
 /// priced; a proxy-written row, excluded from API measurements by its kind.
-pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
-    let BlockedRecord {
+pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
+    let QuotaBlockedRecord {
         server,
         started,
         path,
         session_id,
         backend_id,
+        frontend_protocol,
         meter,
         resets_at,
         context_tokens,
@@ -781,9 +784,9 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::Blocked),
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol.to_owned()),
         provider: Some(backend_id.to_owned()),
-        route: Some(format!("anthropic:{backend_id}")),
+        route: Some(format!("{frontend_protocol}:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,

@@ -68,7 +68,7 @@ use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
     record_openai_cold, record_openai_cold_quiet, record_route_unavailable, retry_after_ms,
 };
-use super::record_anthropic::AnthropicRecordCtx;
+use super::record_anthropic::{AnthropicRecordCtx, QuotaBlockedRecord, record_quota_blocked};
 
 /// Request bodies are buffered for gating and canonical translation; 64 MiB
 /// is far beyond any chat body, so hitting the cap is a client bug worth a
@@ -273,6 +273,43 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         };
     let gate_model = attempt.effective_model().map(str::to_owned);
     let backend = attempt.backend().clone();
+    if let Some(block) = super::quota_gate::decide_block(
+        &server,
+        backend.id(),
+        session_id.as_deref(),
+        frontend.as_deref(),
+        super::quota_gate::load_meters(&server, backend.id()),
+    ) {
+        let body = cold::ColdBlocking::openai_turn(
+            &block.text,
+            Some(model.as_str()),
+            stream_requested,
+            facts.now_ms,
+        );
+        record_quota_blocked(QuotaBlockedRecord {
+            server: &server,
+            started,
+            path: "/v1/chat/completions",
+            session_id: session_id.as_deref(),
+            backend_id: backend.id(),
+            frontend_protocol: "openai_chat",
+            meter: block.meter,
+            resets_at: block.resets_at,
+            context_tokens: block.context_tokens,
+            stale_meters: block.stale_meters.as_ref(),
+            frontend: frontend.as_deref(),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            if stream_requested {
+                HeaderValue::from_static("text/event-stream")
+            } else {
+                HeaderValue::from_static("application/json")
+            },
+        );
+        return build_response(StatusCode::OK, headers, Body::from(body));
+    }
     let record = Some(RecordCtx {
         frontend: frontend.clone(),
         server: server.clone(),

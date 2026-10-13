@@ -72,14 +72,12 @@ use crate::ir::canonical::{CanonBlock, CanonToolChoice, CanonicalRequest, Respon
 use crate::middleware::cold;
 use crate::middleware::force_newest::{self, ForceDecision};
 use crate::middleware::lanes;
-use crate::middleware::quota::{
-    Blocking, GateDecision, Meters, Rendering, decide, grant_for, plan_room,
-};
+use crate::middleware::quota::{Blocking, Meters, Rendering, grant_for};
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, ModelTarget, ProtocolId};
 use crate::store::{
-    Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, MetersSnapshot,
+    AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, MetersSnapshot,
 };
 use crate::translate;
 
@@ -93,9 +91,9 @@ use super::proxy::{
 };
 use super::record::{now_ms, retry_after_ms};
 use super::record_anthropic::{
-    AnthropicRecordCtx, BlockedRecord, ColdRecord, error_pair, record_anthropic_blocked,
-    record_anthropic_cold, record_anthropic_cold_quiet, record_anthropic_cold_recap,
-    record_anthropic_error, record_anthropic_measurement, record_anthropic_released,
+    AnthropicRecordCtx, ColdRecord, QuotaBlockedRecord, error_pair, record_anthropic_cold,
+    record_anthropic_cold_quiet, record_anthropic_cold_recap, record_anthropic_error,
+    record_anthropic_measurement, record_anthropic_released, record_quota_blocked,
 };
 use crate::middleware::model_map;
 
@@ -354,18 +352,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // unconditional strip → the gate decision. A release is read
         // before the strip because the strip removes the very marker the
         // release is made of.
-        let gate_armed = path == "/v1/messages"
-            && server.config.gates.quota_enabled
-            && backend.id() == "anthropic_sub";
+        let gate_armed = path == "/v1/messages" && super::quota_gate::armed(&server, backend.id());
         if gate_armed {
-            meters_snapshot = server
-                .store
-                .load_meters("anthropic_sub")
-                .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "meter snapshot load failed");
-                    None
-                });
+            meters_snapshot = super::quota_gate::load_meters(&server, backend.id());
         }
         if path == "/v1/messages" {
             match translate::from_anthropic(ir.value()) {
@@ -482,64 +471,28 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // reads meters. It runs for unparseable bodies too (the decision is
     // on `gated` alone): a client that cannot parse an event stream still
     // gets the SSE turn, since `streamFalse` could not be read.
-    let gate_armed = path == "/v1/messages"
-        && server.config.gates.quota_enabled
-        && backend.id() == "anthropic_sub";
+    let gate_armed = path == "/v1/messages" && super::quota_gate::armed(&server, backend.id());
     if gate_armed {
         if meters_snapshot.is_none() {
             // The unparseable-body case: the release/strip section above
             // never ran, so the snapshot was never loaded.
-            meters_snapshot = server
-                .store
-                .load_meters("anthropic_sub")
-                .map(|snapshot| snapshot.map(|snapshot| snapshot.snapshot))
-                .unwrap_or_else(|error| {
-                    tracing::error!(%error, "meter snapshot load failed");
-                    None
-                });
+            meters_snapshot = super::quota_gate::load_meters(&server, backend.id());
         }
-        let allowances = allowances_for_session(&server, session_id.as_deref());
-        let decision = decide(
-            meters_snapshot.as_ref().map(Meters::over),
-            &allowances,
-            now_ms(),
-        );
-        if let GateDecision::Block { meter, resets_at } = decision {
+        if let Some(block) = super::quota_gate::decide_block(
+            &server,
+            backend.id(),
+            session_id.as_deref(),
+            frontend.as_deref(),
+            meters_snapshot,
+        ) {
             // Answer 200 with a synthetic assistant turn, never an error
-            // status — measured against a real client (see the module
-            // docs). The context size is the session's largest lane's, so
-            // the choice the block forces (resume this conversation when
-            // the quota resets, or start clean) can be made from the
-            // notice. A sessionless request, a store error, or a session
-            // the table has forgotten is `None`, and the notice drops the
-            // clause rather than guessing (absence ≠ zero, invariant 3) —
-            // a lost clause, never a lost answer.
-            let context_tokens = session_id.as_deref().and_then(|session| {
-                server
-                    .store
-                    .load_lanes()
-                    .ok()
-                    .and_then(|lanes| lanes::session_prompt(&lanes, session))
-            });
-            // The over marker is offered only while the blocked meter's
-            // plan has room for it.
-            let plan_left = meters_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| plan_room(Meters::over(snapshot), meter));
-            let text = Blocking::notice(
-                meter,
-                resets_at,
-                plan_left,
-                context_tokens,
-                &jiff::tz::TimeZone::system(),
-                server.config.notices.style_for(frontend.as_deref()),
-            );
+            // status — measured against a real client (see the module docs).
             let rendering = if client_wants_json {
                 Rendering::Json
             } else {
                 Rendering::Sse
             };
-            let body = Blocking::blocked_turn(&text, client_model.as_deref(), rendering);
+            let body = Blocking::blocked_turn(&block.text, client_model.as_deref(), rendering);
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,
@@ -548,19 +501,20 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     Rendering::Json => header::HeaderValue::from_static("application/json"),
                 },
             );
-            record_anthropic_blocked(BlockedRecord {
+            record_quota_blocked(QuotaBlockedRecord {
                 frontend: frontend.as_deref(),
                 server: &server,
                 started,
                 path,
                 session_id: session_id.as_deref(),
                 backend_id: backend.id(),
-                meter,
-                resets_at,
+                frontend_protocol: "anthropic",
+                meter: block.meter,
+                resets_at: block.resets_at,
                 // The same figure the notice states, or `None` where the
                 // lane table cannot say — "not recorded", never "empty".
-                context_tokens,
-                stale_meters: meters_snapshot.as_ref(),
+                context_tokens: block.context_tokens,
+                stale_meters: block.stale_meters.as_ref(),
             });
             observe_messages_shadow(
                 &server,
@@ -1688,24 +1642,6 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
 /// their `claude-*` targets into codex ids before the request leaves.
 fn picks_from_anthropic_catalogue(backend: &dyn Provider) -> bool {
     backend.id() != "openrouter"
-}
-
-/// The session's stored allowances, or none for a sessionless request
-/// (a sessionless lookup is undefined — the gate then sees no
-/// allowances). A store error
-/// loses the allowances, never the request (invariant 6): the gate
-/// treats it as "nothing held", the conservative reading.
-fn allowances_for_session(server: &Server, session_id: Option<&str>) -> Vec<Allowance> {
-    let Some(session) = session_id else {
-        return Vec::new();
-    };
-    server
-        .store
-        .load_session_allowances(session)
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, "allowances load failed");
-            Vec::new()
-        })
 }
 
 /// The cold gate's idle floor override, in ms

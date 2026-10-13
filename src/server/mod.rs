@@ -70,6 +70,7 @@ pub(crate) mod inference;
 pub(crate) mod openrouter_responses;
 pub(crate) mod proxy;
 pub(crate) mod quota_events;
+pub(crate) mod quota_gate;
 mod record;
 mod record_anthropic;
 

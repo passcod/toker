@@ -1207,6 +1207,59 @@ async fn foreign_subscription_route_without_credential_stops_locally() {
 }
 
 #[tokio::test]
+async fn chat_to_subscription_obeys_the_request_global_quota_gate() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = subscription_responses_config("chat-sub-gated", upstream, Some("held-token"));
+    fixture.config.gates.quota_enabled = true;
+    let (addr, store) = spawn_toker(fixture).await;
+    let reset = jiff::Timestamp::now().as_second() + 3600;
+    store
+        .save_meters(
+            "anthropic_sub",
+            &toker::store::MetersSnapshot {
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+                snapshot: json!({
+                    "util5h": 1.0,
+                    "reset5h": reset,
+                    "util7d": 0.2,
+                    "reset7d": reset + 3600,
+                    "overageInUse": false,
+                }),
+            },
+        )
+        .expect("save spent meters");
+
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-toker-session", "gated-chat")
+        .json(&json!({
+            "model":"anthropic_sub/claude-sonnet-5",
+            "messages":[{"role":"user","content":"hello"}],
+            "max_completion_tokens":128,
+            "stream":false,
+        }))
+        .send()
+        .await
+        .expect("local block answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("Chat block JSON");
+    assert_eq!(body["model"], "anthropic_sub/claude-sonnet-5");
+    assert_eq!(body["usage"]["total_tokens"], 0);
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("Stopped by"))
+    );
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let row = wait_for_rows(&store, 1).await.remove(0);
+    assert_eq!(row.kind, Some(RowKind::Blocked));
+    assert_eq!(row.frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(row.route.as_deref(), Some("openai_chat:anthropic_sub"));
+    assert_eq!(row.attempt, None);
+    assert_eq!(row.policy_routing, None);
+}
+
+#[tokio::test]
 async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(anthropic_responses_config("chat-api", upstream.clone())).await;

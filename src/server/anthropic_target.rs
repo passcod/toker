@@ -120,6 +120,7 @@ impl ReadyAttempt {
                 return transport_failure(ErrorWire::Openai, &error);
             }
         };
+        super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
         let response_status = upstream.status();
         let upstream = match super::attempt::precommit_anthropic(upstream).await {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
