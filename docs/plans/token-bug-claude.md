@@ -1,0 +1,1 @@
+Bug report: toker strips sk-ant-* bearers from claude, but sets a bearer value of "unused" in the settings.json, so all claude requests to openrouter fail. Workaround is setting a bearer that starts with sk-ant-, proper fix would be to strip all auth when toker is using its own.
