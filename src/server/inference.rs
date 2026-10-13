@@ -196,6 +196,7 @@ struct ReadyMessagesAttempt {
     effective_model: String,
     response_model: String,
     response_projection: crate::ir::canonical::ResponseProjection,
+    expected_stream: bool,
     body: bytes::Bytes,
     record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
@@ -336,6 +337,7 @@ impl ReadyMessagesAttempt {
             self.in_flight,
             &self.response_model,
             self.response_projection,
+            self.expected_stream,
             rate_limits,
         )
         .await
@@ -348,6 +350,7 @@ struct ReadyChatAttempt {
     binding_id: crate::policy::BindingId,
     effective_model: String,
     response_model: String,
+    expected_stream: bool,
     body: bytes::Bytes,
     record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,
@@ -434,6 +437,7 @@ impl ReadyChatAttempt {
             self.record,
             self.in_flight,
             &self.response_model,
+            self.expected_stream,
         )
         .await
     }
@@ -487,6 +491,7 @@ fn prepare_messages(
 ) -> Result<ReadyMessagesAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
+    let expected_stream = attempt.stream().unwrap_or(false);
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
     let rendered = attempt.render_json().map_err(|error| {
@@ -519,6 +524,7 @@ fn prepare_messages(
         effective_model,
         response_model,
         response_projection,
+        expected_stream,
         body,
         record,
         in_flight,
@@ -533,6 +539,7 @@ fn prepare_chat(
 ) -> Result<ReadyChatAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
+    let expected_stream = attempt.stream().unwrap_or(false);
     let rendered = attempt
         .render_json()
         .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;
@@ -551,6 +558,7 @@ fn prepare_chat(
         binding_id: attempt.binding().id().clone(),
         effective_model,
         response_model,
+        expected_stream,
         body,
         record,
         in_flight,

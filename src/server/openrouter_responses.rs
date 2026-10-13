@@ -198,7 +198,13 @@ async fn forward(
             record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "upstream error was too large");
         }
-        let error = parse_error(&buffered.bytes);
+        let Some(error) = parse_error(&buffered.bytes) else {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker could not interpret the upstream error response",
+            );
+        };
         let kind = translate::anthropic_error_type(&error);
         let message = error
             .message
@@ -270,9 +276,10 @@ fn record_terminal_failure(
     }
 }
 
-fn parse_error(bytes: &[u8]) -> ResponseError {
-    let value = serde_json::from_slice::<Value>(bytes).unwrap_or(Value::Null);
-    serde_json::from_value(value.get("error").cloned().unwrap_or(value)).unwrap_or_default()
+fn parse_error(bytes: &[u8]) -> Option<ResponseError> {
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let error = serde_json::from_value::<ResponseError>(value.get("error")?.clone()).ok()?;
+    (error.kind.is_some() || error.code.is_some()).then_some(error)
 }
 
 async fn complete(

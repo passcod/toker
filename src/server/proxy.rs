@@ -53,7 +53,7 @@ use futures::stream::{Stream, StreamExt};
 
 use crate::catalog::offers;
 use crate::ir::Shape;
-use crate::ir::canonical::CanonRole;
+use crate::ir::canonical::{CanonEvent, CanonRole};
 use crate::middleware::cold;
 use crate::middleware::force_newest;
 use crate::middleware::lanes;
@@ -558,6 +558,7 @@ pub(crate) async fn forward_chat_canonical(
     record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,
     model: &str,
+    expected_stream: bool,
 ) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
@@ -603,6 +604,26 @@ pub(crate) async fn forward_chat_canonical(
                 "toker could not interpret an oversized upstream error",
             );
         }
+        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+            .ok()
+            .and_then(|body| {
+                translate::openai_chat_backend::canonical_turn_from_openai_chat(&body).ok()
+            })
+            .map(|turn| translate::openai_chat_from_canonical(model, &turn));
+        let Some(rendered) = rendered else {
+            if let Some(ctx) = record.as_ref() {
+                record_error(
+                    ctx,
+                    status.as_u16(),
+                    Some("response_protocol".to_owned()),
+                    retry_after_ms(&upstream_headers),
+                );
+            }
+            return upstream_failure(
+                ErrorWire::Openai,
+                "toker could not interpret the upstream error response",
+            );
+        };
         if let Some(ctx) = record.as_ref() {
             record_error(
                 ctx,
@@ -611,22 +632,25 @@ pub(crate) async fn forward_chat_canonical(
                 retry_after_ms(&upstream_headers),
             );
         }
-        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
-            .ok()
-            .and_then(|body| {
-                translate::openai_chat_backend::canonical_turn_from_openai_chat(&body).ok()
-            })
-            .map(|turn| translate::openai_chat_from_canonical(model, &turn));
-        let Some(rendered) = rendered else {
-            return upstream_failure(
-                ErrorWire::Openai,
-                "toker could not interpret the upstream error response",
-            );
-        };
         return json_response(status, &upstream_headers, &rendered);
     }
 
-    if is_event_stream(&upstream_headers) {
+    if is_event_stream(&upstream_headers) != expected_stream {
+        if let Some(ctx) = record.as_ref() {
+            record_error(
+                ctx,
+                status.as_u16(),
+                Some("response_protocol".to_owned()),
+                None,
+            );
+        }
+        return upstream_failure(
+            ErrorWire::Openai,
+            "upstream Chat response used the wrong streaming mode",
+        );
+    }
+
+    if expected_stream {
         let stream = CanonicalChatStream::new(upstream, status.as_u16(), record, in_flight, model);
         let mut headers = response_headers(&upstream_headers, false);
         headers.insert(
@@ -772,6 +796,12 @@ impl CanonicalChatStream {
             self.observer.observe_event(&event);
         }));
         let canonical = self.backend.feed_sse(&event);
+        if let Some(CanonEvent::TurnFailed { error }) = canonical
+            .iter()
+            .find(|event| matches!(event, CanonEvent::TurnFailed { .. }))
+        {
+            self.record_stream_error(translate::anthropic_frontend::anthropic_error_type(error));
+        }
         for emitted in canonical.iter().flat_map(|event| self.frontend.feed(event)) {
             self.pending.push_back(sse_bytes(&emitted));
         }

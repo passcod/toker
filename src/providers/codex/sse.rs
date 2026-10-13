@@ -247,6 +247,9 @@ impl TurnCapture {
     /// Fold one typed event into the capture. Never fails, never gates a
     /// stream (invariant 6).
     pub fn observe(&mut self, event: &ResponseEvent) {
+        if self.ended {
+            return;
+        }
         match event {
             ResponseEvent::Created { response_id, model } => {
                 if self.response_id.is_none() {
@@ -686,6 +689,40 @@ data: {"type":"response.completed","response":{"id":"resp_3"}}
             "the FIRST error latches"
         );
         assert!(capture.turn_ended(), "response.failed is a final state");
+    }
+
+    #[test]
+    fn the_first_terminal_event_owns_the_capture() {
+        let completed_then_failed = run(&[br#"data: {"type":"response.completed","response":{"id":"first","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}
+
+\
+data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"late"}}}
+
+"#]);
+        let mut capture = TurnCapture::new();
+        for event in &completed_then_failed {
+            capture.observe(event);
+        }
+        assert_eq!(capture.response_id(), Some("first"));
+        assert!(capture.usage().is_some());
+        assert!(capture.error().is_none());
+
+        let failed_then_completed = run(&[br#"data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"first"}}}
+
+\
+data: {"type":"response.completed","response":{"id":"late","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}
+
+"#]);
+        let mut capture = TurnCapture::new();
+        for event in &failed_then_completed {
+            capture.observe(event);
+        }
+        assert_eq!(
+            capture.error().and_then(|error| error.message.as_deref()),
+            Some("first")
+        );
+        assert!(capture.usage().is_none());
+        assert_eq!(capture.response_id(), None);
     }
 
     #[test]

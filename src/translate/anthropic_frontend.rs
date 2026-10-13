@@ -943,6 +943,9 @@ impl AnthropicRenderer {
     /// produced, in anthropic event order. Never fails — an event
     /// with no anthropic shape produces nothing (invariant 6).
     pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
+        if self.ended {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         match event {
             CanonEvent::TurnStarted { turn_id } => {
@@ -2622,6 +2625,18 @@ mod tests {
             },
         });
         assert!(renderer.turn_ended());
+        assert!(
+            renderer
+                .feed(&CanonEvent::TurnFailed {
+                    error: CanonError {
+                        kind: CanonErrorKind::Api,
+                        message: "second terminal".to_owned(),
+                        resets_at: None,
+                    },
+                })
+                .is_empty(),
+            "nothing renders after the first terminal event"
+        );
     }
 
     #[test]

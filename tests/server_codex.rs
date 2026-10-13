@@ -205,6 +205,16 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
                 br#"{"error":{"type":"authentication_error","message":"bad token"}}"#,
             ),
         ),
+        "malformed-error" => raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(br#"{"unexpected":true}"#),
+        ),
+        "wrong-mode" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"id":"response_wrong_mode","status":"completed"}"#),
+        ),
         // The turn's opening events, then the connection dies (a reset
         // mid-turn) or closes cleanly before `response.completed`.
         "drop-mid" | "eof-mid" => {
@@ -384,6 +394,13 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
             StatusCode::BAD_REQUEST,
             "application/json",
             Bytes::from_static(br#"{"error":{"code":400,"message":"invalid model"}}"#),
+        );
+    }
+    if value["model"] == "malformed-error" {
+        return raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(br#"{"unexpected":true}"#),
         );
     }
     if value["model"] == "numeric-failed" {
@@ -1037,11 +1054,12 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         );
         assert!(body.contains("response.output_item.done"), "{body}");
     }
-    assert_eq!(
-        wait_for_rows(&store, 1).await.len(),
-        1,
-        "failed stream unledgered"
-    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].kind, None);
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].status, Some(200));
+    assert_eq!(rows[1].error_type.as_deref(), Some("overloaded_error"));
+    assert!(rows[1].attempt.is_some());
     assert_eq!(mock.requests.lock().unwrap().len(), 2);
 
     let eof = client()
@@ -1060,11 +1078,11 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         eof.bytes().await.is_err(),
         "a premature close aborts the response"
     );
-    let rows = wait_for_rows(&store, 2).await;
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1].kind, Some(RowKind::Error));
-    assert_eq!(rows[1].error_type.as_deref(), Some("response_protocol"));
-    assert!(rows[1].attempt.is_some());
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows[2].attempt.is_some());
 }
 
 #[tokio::test]
@@ -1382,6 +1400,18 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
     assert_eq!(body["error"]["message"], "invalid model");
     let rows = wait_for_rows(&store, 3).await;
     assert_eq!(rows[2].kind, Some(RowKind::Error));
+
+    let malformed = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/malformed-error","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_GATEWAY);
+    let rows = wait_for_rows(&store, 4).await;
+    assert_eq!(rows[3].kind, Some(RowKind::Error));
+    assert_eq!(rows[3].status, Some(400));
+    assert_eq!(rows[3].error_type.as_deref(), Some("response_protocol"));
 }
 
 #[tokio::test]
@@ -2010,6 +2040,32 @@ async fn an_http_error_maps_through_the_error_table() {
     // The meters still fed from the error response (every response feeds
     // them).
     assert!(store.load_meters("codex_sub").expect("load").is_some());
+}
+
+#[tokio::test]
+async fn malformed_http_error_and_wrong_mode_record_protocol_failures() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("protocol-errors", upstream, false)).await;
+
+    for (index, model) in ["malformed-error", "wrong-mode"].into_iter().enumerate() {
+        let response = client()
+            .post(format!("http://{addr}/v1/messages"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(messages_body(model, false))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{model}");
+
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(
+            rows[index].status,
+            Some(if model == "malformed-error" { 400 } else { 200 })
+        );
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert!(rows[index].attempt.is_some());
+    }
 }
 
 #[tokio::test]

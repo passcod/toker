@@ -1846,6 +1846,7 @@ pub(crate) async fn forward_canonical_messages(
     in_flight: Option<InFlightGuard>,
     model: &str,
     response_projection: ResponseProjection,
+    expected_stream: bool,
     rate_limits: Option<serde_json::Value>,
 ) -> Response {
     let status = upstream.status();
@@ -1899,6 +1900,26 @@ pub(crate) async fn forward_canonical_messages(
                 "toker could not interpret an oversized upstream error",
             );
         }
+        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
+            .ok()
+            .and_then(|body| translate::canonical_turn_from_anthropic(&body).ok())
+            .map(|turn| translate::anthropic_frontend::anthropic_from_canonical(model, &turn));
+        let Some(rendered) = rendered else {
+            if let Some(ctx) = record.as_ref() {
+                record_anthropic_error(
+                    ctx,
+                    status.as_u16(),
+                    Some("response_protocol".to_owned()),
+                    None,
+                    retry_after_ms(&upstream_headers),
+                    rate_limits.as_ref(),
+                );
+            }
+            return super::proxy::upstream_failure(
+                ErrorWire::Anthropic,
+                "toker could not interpret the upstream error response",
+            );
+        };
         if let Some(ctx) = record.as_ref() {
             let (error_type, error_message) = error_pair(&buffered.bytes);
             record_anthropic_error(
@@ -1910,20 +1931,27 @@ pub(crate) async fn forward_canonical_messages(
                 rate_limits.as_ref(),
             );
         }
-        let rendered = serde_json::from_slice::<serde_json::Value>(&buffered.bytes)
-            .ok()
-            .and_then(|body| translate::canonical_turn_from_anthropic(&body).ok())
-            .map(|turn| translate::anthropic_frontend::anthropic_from_canonical(model, &turn));
-        let Some(rendered) = rendered else {
-            return super::proxy::upstream_failure(
-                ErrorWire::Anthropic,
-                "toker could not interpret the upstream error response",
-            );
-        };
         return anthropic_json_response(status, &upstream_headers, &rendered);
     }
 
-    if is_event_stream(&upstream_headers) {
+    if is_event_stream(&upstream_headers) != expected_stream {
+        if let Some(ctx) = record.as_ref() {
+            record_anthropic_error(
+                ctx,
+                status.as_u16(),
+                Some("response_protocol".to_owned()),
+                None,
+                None,
+                rate_limits.as_ref(),
+            );
+        }
+        return super::proxy::upstream_failure(
+            ErrorWire::Anthropic,
+            "upstream Messages response used the wrong streaming mode",
+        );
+    }
+
+    if expected_stream {
         let stream = CanonicalMessagesStream::new(
             upstream,
             status.as_u16(),

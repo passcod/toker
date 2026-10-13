@@ -118,7 +118,25 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    raw_json(Bytes::from(non_stream_body(&model)))
+    if json.get("stream") == Some(&Value::Bool(true)) {
+        let body = format!(
+            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_test_force\",\"model\":{model:?},\"usage\":{{\"input_tokens\":9,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":400,\"output_tokens\":0}}}}}}\n\n\
+             event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Done.\"}}}}\n\n\
+             event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":40}}}}\n\n\
+             event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    } else {
+        raw_json(Bytes::from(non_stream_body(&model)))
+    }
 }
 
 async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response {

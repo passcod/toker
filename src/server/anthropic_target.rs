@@ -544,9 +544,24 @@ impl StreamState {
             self.observer.observe_event(&event);
         }));
         for canonical in self.backend.feed_sse(&event) {
-            match canonical {
+            match &canonical {
                 CanonEvent::TurnEnded { .. } => self.succeeded = true,
-                CanonEvent::TurnFailed { .. } => self.succeeded = false,
+                CanonEvent::TurnFailed { error } => {
+                    self.succeeded = false;
+                    if let Some(ctx) = self.record.take() {
+                        record_anthropic_error(
+                            &ctx,
+                            200,
+                            Some(
+                                translate::anthropic_frontend::anthropic_error_type(error)
+                                    .to_owned(),
+                            ),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
                 _ => {}
             }
             for emitted in self.frontend.feed(&canonical) {

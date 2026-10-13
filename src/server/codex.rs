@@ -40,8 +40,8 @@ use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCa
 use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, plain_status,
-    session_id, transport_failure, truncated_body, upstream_failure,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, is_event_stream,
+    plain_status, session_id, transport_failure, truncated_body, upstream_failure,
 };
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
@@ -563,7 +563,22 @@ async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Respons
                 "toker could not interpret an oversized upstream error",
             );
         }
-        let error = parse_upstream_error(&buffered.bytes);
+        let Some(error) = parse_upstream_error(&buffered.bytes) else {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "response_protocol",
+                    "upstream error response could not be interpreted",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
+            return upstream_failure(
+                frontend_wire.error_wire(),
+                "toker could not interpret the upstream error response",
+            );
+        };
         let kind = translate::anthropic_error_type(&error);
         let message = error
             .message
@@ -582,6 +597,23 @@ async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Respons
             );
         }
         return frontend_error_response(frontend_wire, status, kind, &message, !client_wants_json);
+    }
+
+    if !is_event_stream(&headers) {
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                "upstream Responses response used the wrong streaming mode",
+                None,
+                frontend_wire.protocol(),
+            );
+        }
+        return upstream_failure(
+            frontend_wire.error_wire(),
+            "toker could not interpret a non-streaming upstream response",
+        );
     }
 
     if client_wants_json {
@@ -719,9 +751,9 @@ async fn aggregated_turn(
 
 /// The streaming shape: translate-through, one client event per upstream
 /// event, the in-flight guard riding the stream (dropped when the client
-/// goes away or the turn completes, whichever comes first). The row
-/// lands when the turn completes — a hung-up stream records nothing,
-/// like every other path. An upstream that fails mid-turn (a reset, the
+/// goes away or the turn completes, whichever comes first). The attempt
+/// records its terminal state: completion, client cancellation, or upstream
+/// failure. An upstream that fails mid-turn (a reset, the
 /// idle timeout, or a close before the turn's terminator) aborts the
 /// client's response after the events already translated: the
 /// translation must not end cleanly on a turn the upstream never
@@ -988,31 +1020,27 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
 /// mapping table. Two shapes exist on the wire (both verified live): the
 /// `{"error": {...}}` wrapper the SSE error events carry, and the
 /// FastAPI-style `{"detail": "..."}` the backend's request-validation
-/// 400s use. An unparseable body degrades to a generic error with no
-/// invented fields.
-fn parse_upstream_error(body: &[u8]) -> ResponseError {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|wrapper| {
-            if let Some(error) = wrapper.get("error") {
-                return serde_json::from_value::<ResponseError>(error.clone()).ok();
-            }
-            if let Some(detail) = wrapper.get("detail").cloned() {
-                // {"detail": "..."} — the message is the whole payload.
-                if let Some(message) = detail.as_str() {
-                    return Some(ResponseError {
-                        kind: None,
-                        code: None,
-                        message: Some(message.to_owned()),
-                        resets_at: None,
-                    });
-                }
-                // A structured detail object still names a message.
-                return serde_json::from_value::<ResponseError>(detail).ok();
-            }
-            None
-        })
-        .unwrap_or_default()
+/// 400s use. An unparseable or unrecognised body is a protocol failure;
+/// it must not become a fabricated generic provider error.
+fn parse_upstream_error(body: &[u8]) -> Option<ResponseError> {
+    let wrapper = serde_json::from_slice::<Value>(body).ok()?;
+    let value = if let Some(error) = wrapper.get("error") {
+        error.clone()
+    } else {
+        let detail = wrapper.get("detail")?.clone();
+        // FastAPI's string detail is itself a recognised error shape.
+        if let Some(message) = detail.as_str() {
+            return Some(ResponseError {
+                kind: None,
+                code: None,
+                message: Some(message.to_owned()),
+                resets_at: None,
+            });
+        }
+        detail
+    };
+    let error = serde_json::from_value::<ResponseError>(value).ok()?;
+    (error.kind.is_some() || error.code.is_some()).then_some(error)
 }
 
 fn translation_error_response(

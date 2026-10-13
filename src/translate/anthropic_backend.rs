@@ -661,11 +661,22 @@ fn canonical_error(error: &Value) -> CanonError {
 /// Interpret one complete non-streaming Anthropic Messages response.
 pub fn canonical_turn_from_anthropic(body: &Value) -> Result<CanonTurn, TranslateError> {
     if body.get("type").and_then(Value::as_str) == Some("error") {
+        let error = body
+            .get("error")
+            .filter(|error| {
+                error
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| !kind.is_empty())
+            })
+            .ok_or_else(|| TranslateError::Malformed {
+                reason: "anthropic error response has no typed error object".to_owned(),
+            })?;
         return Ok(CanonTurn {
             turn_id: None,
             stop_reason: CanonStopReason::EndTurn,
             usage: None,
-            error: Some(canonical_error(body.get("error").unwrap_or(body))),
+            error: Some(canonical_error(error)),
             tool_calls: Vec::new(),
             output_extensions: Vec::new(),
             blocks: None,
@@ -940,6 +951,17 @@ data: {"type":"message_stop"}
             })
         ));
         assert!(turn.blocks.is_none());
+        for malformed in [
+            json!({"type": "error"}),
+            json!({"type": "error", "error": null}),
+            json!({"type": "error", "error": {}}),
+            json!({"type": "error", "error": {"message": "untrusted"}}),
+        ] {
+            assert!(
+                canonical_turn_from_anthropic(&malformed).is_err(),
+                "malformed envelope: {malformed}"
+            );
+        }
     }
 
     #[test]

@@ -236,12 +236,13 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         .to_owned();
 
     match model.as_str() {
-        "err-401" => {
-            let mut response = raw_response(
-                StatusCode::UNAUTHORIZED,
-                "application/json",
-                Bytes::from_static(ERROR_BODY.as_bytes()),
-            );
+        "err-401" | "malformed-error" => {
+            let body = if model == "err-401" {
+                Bytes::from_static(ERROR_BODY.as_bytes())
+            } else {
+                Bytes::from_static(br#"{"unexpected":true}"#)
+            };
+            let mut response = raw_response(StatusCode::UNAUTHORIZED, "application/json", body);
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
@@ -282,6 +283,19 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             StatusCode::OK,
             "application/json",
             Bytes::from_static(br#"{"unexpected":true}"#),
+        ),
+        "wrong-mode" => raw_response(
+            StatusCode::OK,
+            if stream {
+                "application/json"
+            } else {
+                "text/event-stream"
+            },
+            if stream {
+                Bytes::from(non_stream_body(&model))
+            } else {
+                fixture("01_simple_text.sse")
+            },
         ),
         "thinking-response" if stream => raw_response(
             StatusCode::OK,
@@ -1338,6 +1352,29 @@ async fn non_2xx_forwards_the_body_and_records_an_unpriced_error_row_with_its_me
     assert_eq!(meters.snapshot, expected_rate_limits("0.77"));
 }
 
+#[tokio::test]
+async fn malformed_http_error_records_a_protocol_failure() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[],
+        &messages_body("malformed-error", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(401));
+    assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
+    assert_eq!(rows[0].retry_after_ms, Some(30_000));
+    assert_eq!(rows[0].rate_limits, Some(expected_rate_limits("0.77")));
+    assert!(rows[0].attempt.is_some());
+}
+
 /// A side call shaped like Claude Code's auto-mode classifier: no tools,
 /// thinking turned off.
 fn thinking_off_body(model: &str, stream: bool) -> Vec<u8> {
@@ -1912,6 +1949,32 @@ async fn compressed_messages_responses_record_a_protocol_failure() {
             .map(|attempt| attempt.attempt_index.get()),
         Some(0)
     );
+}
+
+#[tokio::test]
+async fn wrong_streaming_modes_record_protocol_failures() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+
+    for (index, stream) in [false, true].into_iter().enumerate() {
+        let response = post_messages(
+            addr,
+            "/v1/messages",
+            &[],
+            &messages_body("wrong-mode", stream),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "stream={stream}"
+        );
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(rows[index].status, Some(200));
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert!(rows[index].attempt.is_some());
+    }
 }
 
 #[tokio::test]

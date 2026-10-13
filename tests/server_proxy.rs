@@ -154,12 +154,13 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
             "application/json",
             Bytes::from_static(OPENAI_NON_STREAM_BODY.as_bytes()),
         ),
-        "err-401" => {
-            let mut response = raw_response(
-                StatusCode::UNAUTHORIZED,
-                "application/json",
-                Bytes::from_static(ERROR_BODY.as_bytes()),
-            );
+        "err-401" | "malformed-error" => {
+            let body = if model == "err-401" {
+                Bytes::from_static(ERROR_BODY.as_bytes())
+            } else {
+                Bytes::from_static(br#"{"unexpected":true}"#)
+            };
+            let mut response = raw_response(StatusCode::UNAUTHORIZED, "application/json", body);
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
@@ -202,6 +203,26 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
             );
             response
         }
+        "wrong-mode" => raw_response(
+            StatusCode::OK,
+            if stream {
+                "application/json"
+            } else {
+                "text/event-stream"
+            },
+            if stream {
+                Bytes::from_static(NON_STREAM_BODY.as_bytes())
+            } else {
+                fixture("01_simple_content.sse")
+            },
+        ),
+        "stream-failed" if stream => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                b"data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+            ),
+        ),
         "drop-mid" => {
             // First bytes, then the connection dies: a reset mid-body,
             // on the stream and the buffered shape alike.
@@ -913,6 +934,22 @@ async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
 }
 
 #[tokio::test]
+async fn malformed_http_error_records_a_protocol_failure() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    let response = post_chat(addr, &chat_body("malformed-error", false)).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(401));
+    assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
+    assert_eq!(rows[0].retry_after_ms, Some(7_000));
+    assert!(rows[0].attempt.is_some());
+}
+
+#[tokio::test]
 async fn noncanonical_json_is_normalised_without_a_legacy_drift_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
@@ -1273,6 +1310,43 @@ async fn an_upstream_failure_mid_stream_aborts_and_records_the_attempt() {
     let rows = wait_for_rows(&store, 1).await;
     assert_eq!(rows[0].kind, Some(RowKind::Error));
     assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert!(rows[0].attempt.is_some());
+}
+
+#[tokio::test]
+async fn wrong_streaming_modes_record_protocol_failures() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    for (index, stream) in [false, true].into_iter().enumerate() {
+        let response = post_chat(addr, &chat_body("wrong-mode", stream)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "stream={stream}"
+        );
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(rows[index].status, Some(200));
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert!(rows[index].attempt.is_some());
+    }
+}
+
+#[tokio::test]
+async fn an_in_band_stream_failure_records_the_attempt() {
+    let (_mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    let response = post_chat(addr, &chat_body("stream-failed", true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("stream response");
+    assert!(body.contains("api_error"), "{body}");
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[0].error_type.as_deref(), Some("api_error"));
     assert!(rows[0].attempt.is_some());
 }
 

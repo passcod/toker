@@ -101,9 +101,26 @@ fn non_stream_body(model: &str) -> Vec<u8> {
 }
 
 fn assert_response_model(bytes: &[u8], model: &str) {
-    let body: Value = serde_json::from_slice(bytes).expect("canonical response JSON");
-    assert_eq!(body["model"], json!(model));
-    assert_eq!(body["content"][0]["text"], json!("Done."));
+    if let Ok(body) = serde_json::from_slice::<Value>(bytes) {
+        assert_eq!(body["model"], json!(model));
+        assert_eq!(body["content"][0]["text"], json!("Done."));
+    } else {
+        let body = std::str::from_utf8(bytes).expect("canonical response SSE");
+        assert!(body.contains(&format!(r#""model":"{model}""#)), "{body}");
+        assert!(body.contains(r#""text":"Done.""#), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
+    }
+}
+
+fn stream_body(model: &str) -> Bytes {
+    Bytes::from(format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_test_cold\",\"model\":{model:?},\"usage\":{{\"input_tokens\":9,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":400,\"output_tokens\":0}}}}}}\n\n\
+         event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+         event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"Done.\"}}}}\n\n\
+         event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":40}}}}\n\n\
+         event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    ))
 }
 
 fn assert_canonical_request(source: &[u8], actual: &[u8], model: &str) {
@@ -128,7 +145,17 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    raw_json(Bytes::from(non_stream_body(&model)))
+    if json.get("stream") == Some(&Value::Bool(true)) {
+        let mut response = Response::new(Body::from(stream_body(&model)));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    } else {
+        raw_json(Bytes::from(non_stream_body(&model)))
+    }
 }
 
 /// One mock standing for the anthropic backend.
