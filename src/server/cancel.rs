@@ -136,6 +136,7 @@ mod tests {
             backend,
             binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
             attempt: Some(crate::server::attempt::initial_provenance()),
+            policy_routing: None,
             started: Instant::now(),
             session_id: None,
             ping: false,

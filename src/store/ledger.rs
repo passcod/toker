@@ -642,6 +642,21 @@ pub enum RequestLookupProvenance {
     Compaction,
 }
 
+impl From<&crate::policy::RouteProvenance> for RequestLookupProvenance {
+    fn from(provenance: &crate::policy::RouteProvenance) -> Self {
+        use crate::policy::RouteProvenance;
+        match provenance {
+            RouteProvenance::ProfilePresentation(id) => Self::ProfilePresentation(id.clone()),
+            RouteProvenance::ProtocolPresentation(id) => Self::ProtocolPresentation(id.clone()),
+            RouteProvenance::ProfileRewrite(id) => Self::ProfileRewrite(id.clone()),
+            RouteProvenance::ProtocolRewrite(id) => Self::ProtocolRewrite(id.clone()),
+            RouteProvenance::ProfileDefault => Self::ProfileDefault,
+            RouteProvenance::ProtocolDefault => Self::ProtocolDefault,
+            RouteProvenance::Compaction => Self::Compaction,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRouteProvenance {
     pub policy_revision_id: i64,
@@ -661,6 +676,34 @@ pub enum PolicyRoutingOutcome {
     RouteUnavailable {
         attempt_group_id: AttemptGroupId,
     },
+}
+
+impl PolicyRouteProvenance {
+    pub fn from_attempt_plan(plan: &crate::policy::AttemptPlan) -> Result<Option<Self>> {
+        let Some(policy_revision_id) = plan.policy_revision else {
+            return Ok(None);
+        };
+        let route_id = plan.route_id.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its route id".into())
+        })?;
+        let route_fingerprint = plan.route_fingerprint.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its route fingerprint".into())
+        })?;
+        let candidate_id = plan.candidate_id.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its candidate id".into())
+        })?;
+        Ok(Some(Self {
+            policy_revision_id,
+            lookup: (&plan.provenance).into(),
+            route_id,
+            route_fingerprint,
+            trace: StoredRoutingTrace::from_resolver(&plan.trace)?,
+            outcome: PolicyRoutingOutcome::Attempt {
+                candidate_id,
+                baseline_model: plan.baseline_model.clone(),
+            },
+        }))
+    }
 }
 
 /// One `requests` row: the complete column list as a single struct. Field

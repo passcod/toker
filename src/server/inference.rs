@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold::RetargetOutcome;
 use crate::middleware::model_map::{MapTarget, ModelMap};
+use crate::policy::AttemptPlan;
 use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
 use crate::translate::{Rendered, TranslateError};
@@ -53,6 +54,25 @@ impl InferenceRequest {
             target,
             requested_model: self.requested_model.clone(),
             effective_model: baseline_model,
+            policy_plan: None,
+            mapped: None,
+            canonical,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prepare_policy(
+        &self,
+        target: ModelTarget,
+        plan: AttemptPlan,
+    ) -> InferenceAttempt {
+        let mut canonical = self.canonical();
+        canonical.model = Some(plan.effective_model.clone());
+        InferenceAttempt {
+            target,
+            requested_model: self.requested_model.clone(),
+            effective_model: Some(plan.effective_model.clone()),
+            policy_plan: Some(plan),
             mapped: None,
             canonical,
         }
@@ -63,6 +83,7 @@ pub(crate) struct InferenceAttempt {
     target: ModelTarget,
     requested_model: String,
     effective_model: Option<String>,
+    policy_plan: Option<AttemptPlan>,
     mapped: Option<MapTarget>,
     canonical: CanonicalRequest,
 }
@@ -115,6 +136,16 @@ impl InferenceAttempt {
 
     pub(crate) fn mapped(&self) -> Option<&MapTarget> {
         self.mapped.as_ref()
+    }
+
+    pub(crate) fn policy_routing(
+        &self,
+    ) -> crate::store::Result<Option<crate::store::PolicyRouteProvenance>> {
+        self.policy_plan
+            .as_ref()
+            .map(crate::store::PolicyRouteProvenance::from_attempt_plan)
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn apply_compaction(
@@ -499,6 +530,16 @@ fn prepare_messages(
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
+    let policy_routing = attempt.policy_routing().map_err(|error| {
+        tracing::error!(%error, "policy attempt provenance could not be stored");
+        Box::new(super::proxy::plain_status(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "routing provenance failed\n",
+        ))
+    })?;
+    if let Some(ctx) = record.as_mut() {
+        ctx.policy_routing = policy_routing;
+    }
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
     let rendered = attempt.render_json().map_err(|error| {
@@ -541,12 +582,22 @@ fn prepare_messages(
 fn prepare_chat(
     parts: Parts,
     attempt: InferenceAttempt,
-    record: Option<RecordCtx>,
+    mut record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyChatAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
+    let policy_routing = attempt.policy_routing().map_err(|error| {
+        tracing::error!(%error, "policy attempt provenance could not be stored");
+        Box::new(super::proxy::plain_status(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "routing provenance failed\n",
+        ))
+    })?;
+    if let Some(ctx) = record.as_mut() {
+        ctx.policy_routing = policy_routing;
+    }
     let rendered = attempt
         .render_json()
         .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;

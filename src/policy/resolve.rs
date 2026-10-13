@@ -261,6 +261,11 @@ pub struct AttemptPlan {
 }
 
 impl AttemptPlan {
+    pub fn with_policy_revision(mut self, revision_id: i64) -> Self {
+        self.policy_revision = Some(revision_id);
+        self
+    }
+
     pub fn pin_identity(&self) -> Option<super::PinIdentity> {
         Some(super::PinIdentity {
             policy_revision_id: self.policy_revision?,
@@ -1592,6 +1597,42 @@ mod tests {
             model_id: model_id.to_owned(),
             failure: FailureClass::Overload,
         }
+    }
+
+    #[test]
+    fn persisted_revision_becomes_attempt_provenance() {
+        let inventory = OfferInventory::default();
+        let binding = ANTHROPIC_SUB_MESSAGES.clone();
+        let policy = compile(
+            document(route(
+                candidate("first", &binding, CandidateModel::RequestedModel),
+                vec![],
+            )),
+            &inventory,
+        );
+        let plan = resolve(
+            &policy,
+            &inventory,
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("claude-opus-5"),
+        )
+        .unwrap()
+        .with_policy_revision(7);
+        let stored = crate::store::PolicyRouteProvenance::from_attempt_plan(&plan)
+            .unwrap()
+            .expect("authoritative provenance");
+        assert_eq!(stored.policy_revision_id, 7);
+        assert_eq!(stored.route_id, id("route"));
+        assert_eq!(
+            stored.outcome,
+            crate::store::PolicyRoutingOutcome::Attempt {
+                candidate_id: id("first"),
+                baseline_model: "claude-opus-5".to_owned(),
+            }
+        );
+        assert_eq!(stored.trace.events.len(), plan.trace.len());
     }
 
     #[test]

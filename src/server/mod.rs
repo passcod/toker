@@ -2137,6 +2137,7 @@ api_key = "ak-literal-test"
             backend: target.provider().clone(),
             binding_id: target.binding().id().clone(),
             attempt: None,
+            policy_routing: None,
             betas: None,
             shape: None,
             ping: false,

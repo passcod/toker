@@ -54,7 +54,9 @@ use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{AttemptProvenance, CostKind, RequestRow, RowKind, SessionLineage};
+use crate::store::{
+    AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind, SessionLineage,
+};
 use crate::translate::TranslationReport;
 
 use super::Server;
@@ -86,6 +88,8 @@ pub(crate) struct AnthropicRecordCtx {
     /// The actual upstream send this response completes. Legacy routing owns
     /// no policy revision, but every send still has group/index/reason identity.
     pub(crate) attempt: Option<AttemptProvenance>,
+    /// The authoritative policy route that selected this send.
+    pub(crate) policy_routing: Option<PolicyRouteProvenance>,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
     /// the header was absent.
     pub(crate) betas: Option<Value>,
@@ -542,7 +546,7 @@ fn measurement_row(
         fast: capture.speed().map(|speed| speed == "fast"),
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
     }
 }
@@ -668,7 +672,7 @@ fn error_row(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
     }
 }
@@ -1327,7 +1331,7 @@ pub(crate) fn record_responses_measurement(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);
@@ -1489,7 +1493,7 @@ pub(crate) fn record_codex_error(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);

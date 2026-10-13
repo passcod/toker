@@ -45,7 +45,7 @@ use crate::middleware::lanes;
 use crate::observe::UsageCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{AttemptProvenance, CostKind, RequestRow, RowKind};
+use crate::store::{AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind};
 
 use super::Server;
 
@@ -62,6 +62,8 @@ pub(crate) struct RecordCtx {
     pub(crate) binding_id: BindingId,
     /// The actual upstream send this response completes.
     pub(crate) attempt: Option<AttemptProvenance>,
+    /// The authoritative policy route that selected this send.
+    pub(crate) policy_routing: Option<PolicyRouteProvenance>,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -775,7 +777,7 @@ fn measurement_row(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: None,
     }
 }
@@ -855,7 +857,7 @@ fn error_row(
         fast: None,
         binding_id: Some(ctx.binding_id.clone()),
         attempt: ctx.attempt.clone(),
-        policy_routing: None,
+        policy_routing: ctx.policy_routing.clone(),
         lineage: None,
     }
 }
