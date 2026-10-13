@@ -878,31 +878,6 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
 }
 
 #[tokio::test]
-async fn the_env_key_source_wins_over_the_literal() {
-    // A name only this test touches, so parallel tests cannot observe the
-    // set_var (edition-2024 unsafe env mutation).
-    unsafe { std::env::set_var("TOKER_TEST_KEY_ENV_PICK_4B", "sk-from-env") };
-    let (mock, upstream) = spawn_mock().await;
-    let (addr, _store) = spawn_toker(test_config(
-        upstream,
-        "TOKER_TEST_KEY_ENV_PICK_4B",
-        Some("sk-literal-loses".to_owned()),
-    ))
-    .await;
-
-    let body = chat_body("z-ai/glm-5.3", false);
-    assert_eq!(post_chat(addr, &body).await.status(), StatusCode::OK);
-    assert_eq!(
-        mock.captured()[0]
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        Some("Bearer sk-from-env"),
-        "env beats the literal"
-    );
-}
-
-#[tokio::test]
 async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
@@ -2084,7 +2059,9 @@ async fn shadow_observation_is_one_per_request_and_cannot_alter_chat_traffic() {
 async fn a_keyring_key_is_read_by_the_service_and_injected() {
     let (mock, upstream) = spawn_mock().await;
     let mut config = test_config(upstream, UNSET_KEY_ENV, None);
-    config.openrouter.as_mut().expect("enabled").api_key_keyring = true;
+    let openrouter = config.openrouter.as_mut().expect("enabled");
+    openrouter.api_key_keyring = true;
+    openrouter.api_key = Some("sk-literal-loses".to_owned());
     // Never the real keyring: a map holding the key.
     let secrets = Arc::new(toker::secrets::MemoryStore::new());
     toker::secrets::SecretStore::set(secrets.as_ref(), "openrouter", "sk-from-keyring")

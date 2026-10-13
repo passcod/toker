@@ -15,6 +15,7 @@
 //! ([`crate::secrets::read_key`]), never at load.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -312,7 +313,16 @@ impl OpenRouterConfig {
     /// openrouter's 401 body passes through, which verifies the wiring
     /// (ledger-proxy lesson).
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.api_key_with_env(&ProcessEnvironment, keyring)
+    }
+
+    fn api_key_with_env(
+        &self,
+        environment: &impl Environment,
+        keyring: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
         resolve_api_key(
+            environment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -323,7 +333,16 @@ impl OpenRouterConfig {
     /// Which key sources are set, for status reporting (invariant 2: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        self.key_sources_with_env(&ProcessEnvironment)
+    }
+
+    fn key_sources_with_env(&self, environment: &impl Environment) -> KeySources {
+        key_sources_of(
+            environment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -343,6 +362,7 @@ pub struct OpenAiApiConfig {
 impl OpenAiApiConfig {
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
         resolve_api_key(
+            &ProcessEnvironment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -351,7 +371,12 @@ impl OpenAiApiConfig {
     }
 
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        key_sources_of(
+            &ProcessEnvironment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -392,6 +417,7 @@ impl std::fmt::Debug for AnthropicSubConfig {
 impl AnthropicSubConfig {
     pub fn oauth_token(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
         resolve_api_key(
+            &ProcessEnvironment,
             &self.oauth_token_env,
             self.oauth_token_keyring,
             keyring,
@@ -401,6 +427,7 @@ impl AnthropicSubConfig {
 
     pub fn oauth_sources(&self) -> KeySources {
         key_sources_of(
+            &ProcessEnvironment,
             &self.oauth_token_env,
             self.oauth_token_keyring,
             &self.oauth_token,
@@ -433,7 +460,16 @@ impl AnthropicApiConfig {
     /// only the frontend's own credential, or unauthenticated, and
     /// anthropic's 401 body passes through.
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.api_key_with_env(&ProcessEnvironment, keyring)
+    }
+
+    fn api_key_with_env(
+        &self,
+        environment: &impl Environment,
+        keyring: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
         resolve_api_key(
+            environment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -443,7 +479,16 @@ impl AnthropicApiConfig {
 
     /// Which key sources are set, for status reporting (invariant 2).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        self.key_sources_with_env(&ProcessEnvironment)
+    }
+
+    fn key_sources_with_env(&self, environment: &impl Environment) -> KeySources {
+        key_sources_of(
+            environment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -616,12 +661,16 @@ fn toml_type_of(value: &toml::Value) -> &'static str {
 /// consulted only when configured, so a config without it never touches
 /// the secret service.
 fn resolve_api_key(
+    environment: &impl Environment,
     api_key_env: &str,
     keyring_configured: bool,
     keyring: impl FnOnce() -> Option<String>,
     literal: &Option<String>,
 ) -> Option<String> {
-    if let Some(key) = env::var_os(api_key_env).filter(|key| !key.is_empty()) {
+    if let Some(key) = environment
+        .var_os(api_key_env)
+        .filter(|key| !key.is_empty())
+    {
         return key.into_string().ok();
     }
     if keyring_configured && let Some(key) = keyring().filter(|key| !key.is_empty()) {
@@ -633,9 +682,16 @@ fn resolve_api_key(
 /// Which key sources are set — the whole of what status may report about
 /// credentials (invariant 2). The keyring is reported as configured, not
 /// read: only the service reads it.
-fn key_sources_of(api_key_env: &str, keyring: bool, literal: &Option<String>) -> KeySources {
+fn key_sources_of(
+    environment: &impl Environment,
+    api_key_env: &str,
+    keyring: bool,
+    literal: &Option<String>,
+) -> KeySources {
     KeySources {
-        env_set: env::var_os(api_key_env).is_some_and(|key| !key.is_empty()),
+        env_set: environment
+            .var_os(api_key_env)
+            .is_some_and(|key| !key.is_empty()),
         keyring_configured: keyring,
         literal_set: literal.is_some(),
     }
@@ -651,17 +707,33 @@ pub struct KeySources {
     pub literal_set: bool,
 }
 
+trait Environment {
+    fn var_os(&self, name: &str) -> Option<OsString>;
+}
+
+struct ProcessEnvironment;
+
+impl Environment for ProcessEnvironment {
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        env::var_os(name)
+    }
+}
+
 impl Config {
     /// Load the resolved configuration: defaults ← `toker.toml` ← env.
     /// A missing file is the defaults, not an error; a present file that
     /// does not parse is an error — a hand-edited typo must not silently
     /// read as default.
     pub fn load() -> anyhow::Result<Config> {
-        let path = config_path()?;
+        Self::load_with_env(&ProcessEnvironment)
+    }
+
+    fn load_with_env(environment: &impl Environment) -> anyhow::Result<Config> {
+        let path = config_path_with_env(environment)?;
         let mut config = Self::load_from(&path)?;
 
         // Env overrides (config file loses).
-        if let Some(port) = env::var_os("TOKER_PORT") {
+        if let Some(port) = environment.var_os("TOKER_PORT") {
             let port = port
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("TOKER_PORT is not valid UTF-8"))?
@@ -669,10 +741,10 @@ impl Config {
                 .context("TOKER_PORT must be a port number")?;
             config.port = port;
         }
-        if let Some(db) = env::var_os("TOKER_DB") {
+        if let Some(db) = environment.var_os("TOKER_DB") {
             config.db_path = PathBuf::from(db);
         }
-        if let Some(upstream) = env::var_os("TOKER_UPSTREAM") {
+        if let Some(upstream) = environment.var_os("TOKER_UPSTREAM") {
             let upstream = upstream
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
@@ -1401,13 +1473,21 @@ pub(crate) struct FileCodexSub {
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
 /// `~/.config/toker/toker.toml`.
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = env::var_os("TOKER_CONFIG") {
+    config_path_with_env(&ProcessEnvironment)
+}
+
+fn config_path_with_env(environment: &impl Environment) -> anyhow::Result<PathBuf> {
+    if let Some(path) = environment.var_os("TOKER_CONFIG") {
         return Ok(PathBuf::from(path));
     }
-    let config_home = match env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+    let config_home = match environment
+        .var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+    {
         Some(dir) => PathBuf::from(dir),
         None => {
-            let home = env::var_os("HOME")
+            let home = environment
+                .var_os("HOME")
                 .filter(|home| !home.is_empty())
                 .context("no config home: set XDG_CONFIG_HOME or HOME")?;
             PathBuf::from(home).join(".config")
@@ -1458,22 +1538,24 @@ mod tests {
     use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
 
-    /// Env-reading tests share process-global env vars, so they serialise
-    /// on this lock (RUST_TEST_THREADS-style parallelism would race
-    /// otherwise).
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    #[derive(Default)]
+    struct TestEnvironment(HashMap<String, OsString>);
+
+    impl TestEnvironment {
+        fn with(mut self, name: &str, value: impl Into<OsString>) -> Self {
+            self.0.insert(name.to_owned(), value.into());
+            self
+        }
     }
 
-    fn set_env(name: &str, value: Option<&str>) {
-        match value {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
+    impl super::Environment for TestEnvironment {
+        fn var_os(&self, name: &str) -> Option<OsString> {
+            self.0.get(name).cloned()
         }
     }
 
@@ -1482,18 +1564,15 @@ mod tests {
         crate::test_support::tempdir(&format!("config-{name}-"))
     }
 
-    /// A config pointing at a scratch db, loadable without touching the
-    /// user's real config or env.
+    /// Load the scratch config without process-global mutation or ambient
+    /// `TOKER_*` overrides.
+    fn load_result(dir: &std::path::Path) -> anyhow::Result<super::Config> {
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", dir.join("toker.toml"));
+        super::Config::load_with_env(&environment)
+    }
+
     fn load_from(dir: &std::path::Path) -> super::Config {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
-        set_env("OPENROUTER_API_KEY", None);
-        super::Config::load().expect("load config")
+        load_result(dir).expect("load config")
     }
 
     #[test]
@@ -1664,12 +1743,8 @@ mod tests {
     fn a_default_must_name_an_enabled_backend() {
         let dir = test_dir("default-enabled");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // A known backend whose block is absent: the error says the block
@@ -1816,12 +1891,7 @@ api_key = "ak-literal-test"
         )
         .expect("write config");
 
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
-        let config = super::Config::load().expect("load config");
+        let config = load_result(&dir).expect("load config");
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
             Some("anthropic_api")
@@ -1859,34 +1929,26 @@ api_key = "ak-literal-test"
         );
 
         // The shared KeySources resolution, mirroring openrouter's.
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", Some("ak-from-env"));
+        let api = config.anthropic_api.as_ref().expect("enabled");
+        let environment =
+            TestEnvironment::default().with("TOKER_TEST_ANTHROPIC_KEY_FILE", "ak-from-env");
         assert_eq!(
-            config
-                .anthropic_api
-                .as_ref()
-                .expect("enabled")
-                .api_key(|| None)
-                .as_deref(),
+            api.api_key_with_env(&environment, || None).as_deref(),
             Some("ak-from-env")
         );
         assert_eq!(
-            config
-                .anthropic_api
-                .as_ref()
-                .expect("enabled")
-                .key_sources(),
+            api.key_sources_with_env(&environment),
             KeySources {
                 env_set: true,
                 keyring_configured: false,
                 literal_set: true
             }
         );
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
 
         // A config with no anthropic keys at all (a phase-1 toker.toml)
         // still parses, and enables no anthropic backend.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert_eq!(config.default_backend_anthropic, None);
         assert_eq!(config.anthropic_sub, None);
     }
@@ -1905,11 +1967,7 @@ refresh_url = "http://localhost:10/oauth/token"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(
             config
                 .codex_sub
@@ -1946,7 +2004,7 @@ auth_path = "~/.codex/auth.json"
 "#,
         )
         .expect("rewrite config");
-        let config = super::Config::load().expect("load config");
+        let config = load_result(&dir).expect("load config");
         assert_eq!(
             config.codex_sub.as_ref().expect("enabled").auth_path,
             super::expand_tilde("~/.codex/auth.json")
@@ -1955,7 +2013,7 @@ auth_path = "~/.codex/auth.json"
         // A phase-1 toker.toml (no codex block at all) parses with codex
         // disabled, and a typo'd key is an error, not a silent default.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert_eq!(config.codex_sub, None);
 
         fs::write(
@@ -1964,7 +2022,7 @@ auth_path = "~/.codex/auth.json"
         )
         .expect("rewrite config");
         assert!(
-            super::Config::load().is_err(),
+            load_result(&dir).is_err(),
             "a typo'd codex key must fail to load"
         );
 
@@ -1976,7 +2034,7 @@ auth_path = "~/.codex/auth.json"
             "[providers.codex_sub]\noriginator = \"codex\\ncli\"\n",
         )
         .expect("rewrite config");
-        let error = super::Config::load().expect_err("invalid originator must fail");
+        let error = load_result(&dir).expect_err("invalid originator must fail");
         assert!(format!("{error:#}").contains("originator"));
     }
 
@@ -1999,11 +2057,7 @@ auth_path = "~/.codex/auth.json"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
 
         // Parsed into the committed policy: exact identity ahead of
         // family, published snapshots folding to their identities.
@@ -2071,7 +2125,7 @@ auth_path = "~/.codex/auth.json"
         ];
         for (text, message) in cases {
             fs::write(dir.join("toker.toml"), text).expect("rewrite config");
-            let error = super::Config::load().expect_err("bad policy must fail");
+            let error = load_result(&dir).expect_err("bad policy must fail");
             let chain = format!("{error:#}");
             assert!(
                 chain.contains("model_map") && chain.contains(message),
@@ -2083,7 +2137,7 @@ auth_path = "~/.codex/auth.json"
         // not an error.
         fs::write(dir.join("toker.toml"), "[providers.codex_sub.model_map]\n")
             .expect("rewrite config");
-        let config = super::Config::load().expect("empty table parses");
+        let config = load_result(&dir).expect("empty table parses");
         assert!(
             config
                 .codex_sub
@@ -2117,11 +2171,7 @@ auth_path = "~/.codex/auth.json"
             "default_backend_anthropic = \"codex_sub\"\n[providers.codex_sub]\n",
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
             Some("codex_sub")
@@ -2139,24 +2189,20 @@ quota_enabled = false
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert!(!config.gates.quota_enabled, "the file value is read");
 
         // A phase-1 toker.toml (no [gates] block at all) parses with the
         // default — and an unknown gates key is an error, not a silent
         // default, like every other block.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert!(config.gates.quota_enabled, "absent block = default = on");
         assert!(config.gates.cold_enabled, "the cold gate defaults on too");
 
         fs::write(dir.join("toker.toml"), "[gates]\nquota_on = true\n").expect("rewrite config");
         assert!(
-            super::Config::load().is_err(),
+            load_result(&dir).is_err(),
             "a typo'd gates key must fail to load"
         );
     }
@@ -2165,12 +2211,8 @@ quota_enabled = false
     fn the_cold_gate_block_is_read_and_validated() {
         let dir = test_dir("gates-cold");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Every knob reads: the toggles, the bar, the fractional idle
@@ -2208,12 +2250,8 @@ quota_enabled = false
     fn the_notices_table_is_read_over_the_defaults() {
         let dir = test_dir("notices");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Named styles load whatever their casing; unnamed frontends keep
@@ -2279,11 +2317,7 @@ quota_enabled = false
             r#"default_backend_anthropic = "not-a-backend""#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let error = super::Config::load().expect_err("unroutable default must fail");
+        let error = load_result(&dir).expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
     }
 
@@ -2291,12 +2325,8 @@ quota_enabled = false
     fn the_awake_toggle_reads_the_file_and_defaults_on() {
         let dir = test_dir("awake-toggle");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Off is the only way to disable the idle-sleep lock.
@@ -2318,12 +2348,8 @@ quota_enabled = false
         // expands at lookup, against whatever home is running the view.
         let dir = test_dir("transcript-roots");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         let config = load(r#"transcript_roots = ["/harness/repos/.claude", "~/elsewhere"]"#)
@@ -2358,11 +2384,7 @@ quota_enabled = false
         let dir = test_dir("ping-file");
         fs::write(dir.join("toker.toml"), r#"ping_header_name = "x-my-ping""#)
             .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(config.ping_header_name, "x-my-ping");
 
         // An unusable name is a load error, not a silent no-match.
@@ -2371,25 +2393,18 @@ quota_enabled = false
             r#"ping_header_name = "not a header!""#,
         )
         .expect("rewrite config");
-        let error = super::Config::load().expect_err("an invalid header name must fail");
+        let error = load_result(&dir).expect_err("an invalid header name must fail");
         assert!(error.to_string().contains("ping_header_name"));
 
         fs::write(dir.join("toker.toml"), r#"ping_header_name = """#).expect("rewrite config");
-        assert!(super::Config::load().is_err(), "the empty name fails too");
+        assert!(load_result(&dir).is_err(), "the empty name fails too");
     }
 
     #[test]
     fn unknown_file_keys_are_errors_not_silent_defaults() {
         let dir = test_dir("unknown-key");
         fs::write(dir.join("toker.toml"), "prot = 1\n").expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        assert!(
-            super::Config::load().is_err(),
-            "a typo'd key must fail to load"
-        );
+        assert!(load_result(&dir).is_err(), "a typo'd key must fail to load");
     }
 
     #[test]
@@ -2400,22 +2415,17 @@ quota_enabled = false
         // by a rewrite (see `crate::setup::config_writer`) — while
         // `load()` still layers the env over the same file for the
         // running daemon.
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("load-from");
         fs::write(
             dir.join("toker.toml"),
             "port = 19999\n[providers.openrouter]\n",
         )
         .expect("write config");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("20000"));
-        set_env(
-            "TOKER_DB",
-            Some(&dir.join("elsewhere.db").to_string_lossy()),
-        );
-        set_env("TOKER_UPSTREAM", Some("http://from-env/v1"));
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "20000")
+            .with("TOKER_DB", dir.join("elsewhere.db"))
+            .with("TOKER_UPSTREAM", "http://from-env/v1");
 
         let config = super::Config::load_from(&dir.join("toker.toml")).expect("loads");
         assert_eq!(config.port, 19_999, "no env override applies to load_from");
@@ -2434,7 +2444,7 @@ quota_enabled = false
             "http://from-env/v1"
         );
 
-        let loaded = super::Config::load().expect("loads");
+        let loaded = super::Config::load_with_env(&environment).expect("loads");
         assert_eq!(loaded.port, 20_000);
         assert_eq!(loaded.db_path, dir.join("elsewhere.db"));
         assert_eq!(
@@ -2450,32 +2460,26 @@ quota_enabled = false
         // The upstream override moves an enabled backend and never
         // enables a disabled one.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let loaded = super::Config::load().expect("a stray override does not fail the load");
+        let loaded = super::Config::load_with_env(&environment)
+            .expect("a stray override does not fail the load");
         assert_eq!(loaded.openrouter, None);
-
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
     }
 
     #[test]
     fn env_overrides_the_file() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("env");
         fs::write(
             dir.join("toker.toml"),
             "port = 19999\n[providers.openrouter]\nupstream = \"http://from-file/v1\"\n",
         )
         .expect("write config");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("20000"));
-        set_env("TOKER_DB", Some(&dir.join("env.db").to_string_lossy()));
-        set_env("TOKER_UPSTREAM", Some("http://from-env/v1"));
-        set_env("OPENROUTER_API_KEY", None);
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "20000")
+            .with("TOKER_DB", dir.join("env.db"))
+            .with("TOKER_UPSTREAM", "http://from-env/v1");
 
-        let config = super::Config::load().expect("load config");
+        let config = super::Config::load_with_env(&environment).expect("load config");
         assert_eq!(config.port, 20000);
         assert_eq!(config.db_path, dir.join("env.db"));
         assert_eq!(
@@ -2488,31 +2492,22 @@ quota_enabled = false
             "http://from-env/v1"
         );
 
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
-
         let _ = Store::open(&config.db_path).expect("the env db path is openable");
     }
 
     #[test]
     fn bad_env_port_is_an_error() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("bad-port");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("not-a-port"));
-        let error = super::Config::load().expect_err("TOKER_PORT must be numeric");
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "not-a-port");
+        let error =
+            super::Config::load_with_env(&environment).expect_err("TOKER_PORT must be numeric");
         assert!(error.to_string().contains("TOKER_PORT"));
-        set_env("TOKER_PORT", None);
     }
 
     #[test]
     fn api_key_env_wins_over_the_keyring_over_the_literal_then_none() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut config = OpenRouterConfig {
             upstream: super::parse_upstream(DEFAULT_OPENROUTER_UPSTREAM).unwrap(),
             api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),
@@ -2524,10 +2519,13 @@ quota_enabled = false
         let no_entry = || None;
         let untouched = || -> Option<String> { panic!("the keyring must not be read") };
 
-        set_env("TOKER_TEST_KEY_PRECEDENCE", Some("from-env"));
-        assert_eq!(config.api_key(untouched).as_deref(), Some("from-env"));
+        let with_key = TestEnvironment::default().with("TOKER_TEST_KEY_PRECEDENCE", "from-env");
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&with_key, untouched).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            config.key_sources_with_env(&with_key),
             KeySources {
                 env_set: true,
                 keyring_configured: true,
@@ -2535,16 +2533,25 @@ quota_enabled = false
             }
         );
 
-        set_env("TOKER_TEST_KEY_PRECEDENCE", None);
-        assert_eq!(config.api_key(keyring).as_deref(), Some("from-keyring"));
+        let empty = TestEnvironment::default();
+        assert_eq!(
+            config.api_key_with_env(&empty, keyring).as_deref(),
+            Some("from-keyring")
+        );
         // A keyring read that yields nothing falls to the literal.
-        assert_eq!(config.api_key(no_entry).as_deref(), Some("literal-key"));
+        assert_eq!(
+            config.api_key_with_env(&empty, no_entry).as_deref(),
+            Some("literal-key")
+        );
 
         // Not configured: never read, whatever it holds.
         config.api_key_keyring = false;
-        assert_eq!(config.api_key(untouched).as_deref(), Some("literal-key"));
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&empty, untouched).as_deref(),
+            Some("literal-key")
+        );
+        assert_eq!(
+            config.key_sources_with_env(&empty),
             KeySources {
                 env_set: false,
                 keyring_configured: false,
@@ -2553,9 +2560,13 @@ quota_enabled = false
         );
 
         config.api_key = None;
-        assert_eq!(config.api_key(untouched), None, "no source set");
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&empty, untouched),
+            None,
+            "no source set"
+        );
+        assert_eq!(
+            config.key_sources_with_env(&empty),
             KeySources {
                 env_set: false,
                 keyring_configured: false,
