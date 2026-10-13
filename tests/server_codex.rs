@@ -298,6 +298,22 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
                 br#"{"type":"error","error":{"type":"authentication_error","message":"bad upstream key"}}"#,
             ),
         ),
+        "compressed" => {
+            let mut response = raw_response(
+                StatusCode::OK,
+                "application/json",
+                Bytes::from_static(br#"{"type":"message"}"#),
+            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            response
+        }
+        "malformed" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"type":"message"}"#),
+        ),
         "stream" | "failed" | "eof" => {
             let mut body = concat!(
                 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_api\",\"usage\":{\"input_tokens\":7}}}\n\n",
@@ -1052,6 +1068,39 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
 }
 
 #[tokio::test]
+async fn responses_to_anthropic_api_complete_protocol_failures_are_ledgered() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-protocol", upstream)).await;
+
+    for (index, model) in ["compressed", "malformed"].into_iter().enumerate() {
+        let response = client()
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "model": format!("anthropic_api/{model}"),
+                "input": "hello",
+                "max_output_tokens": 128,
+                "stream": false,
+            }))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(rows[index].status, Some(200));
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert_eq!(
+            rows[index]
+                .attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_index.get()),
+            Some(0)
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_to_anthropic_api_reject_missing_limit_without_upstream() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(anthropic_responses_config("api-limit", upstream)).await;
@@ -1336,7 +1385,7 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
 }
 
 #[tokio::test]
-async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet() {
+async fn openrouter_responses_failed_and_cut_turns_record_errors() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(openrouter_responses_config("router-failures", upstream)).await;
     let failed = client()
@@ -1368,7 +1417,11 @@ async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet
         .unwrap();
     assert_eq!(cut.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(mock.requests.lock().unwrap().len(), 3);
-    assert_eq!(wait_for_rows(&store, 2).await.len(), 2);
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows[2].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].status, Some(200));
+    assert_eq!(rows[2].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows[2].attempt.is_some());
 }
 
 #[tokio::test]

@@ -284,6 +284,7 @@ async fn forward(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     if is_compressed(&headers) {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "toker could not interpret a compressed Messages response",
@@ -291,9 +292,11 @@ async fn forward(
     }
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            record_terminal_failure(record.as_ref(), status, "ambiguous_transport");
             return truncated_body(ErrorWire::Openai);
         };
         if buffered.rest.is_some() {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "upstream error was too large");
         }
         let parsed = serde_json::from_slice::<Value>(&buffered.bytes).ok();
@@ -301,6 +304,7 @@ async fn forward(
             .as_ref()
             .and_then(|body| translate::canonical_turn_from_anthropic(body).ok())
         else {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "invalid upstream error response");
         };
         if let Some(ctx) = record.as_ref() {
@@ -310,6 +314,7 @@ async fn forward(
         return json_response(status, &headers, &frontend.render_complete(model, &turn));
     }
     if is_event_stream(&headers) != expected_stream {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "upstream Messages response used the wrong streaming mode",
@@ -338,9 +343,11 @@ async fn forward(
             .expect("valid streaming response");
     }
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        record_terminal_failure(record.as_ref(), status, "ambiguous_transport");
         return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(ErrorWire::Openai, "upstream response was too large");
     }
     let turn = match serde_json::from_slice::<Value>(&buffered.bytes)
@@ -348,7 +355,10 @@ async fn forward(
         .and_then(|body| translate::canonical_turn_from_anthropic(&body).ok())
     {
         Some(turn) => turn,
-        None => return upstream_failure(ErrorWire::Openai, "invalid upstream response"),
+        None => {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
+            return upstream_failure(ErrorWire::Openai, "invalid upstream response");
+        }
     };
     if let Some(ctx) = record.as_ref() {
         let mut observer = AnthropicObserver::new();
@@ -363,6 +373,23 @@ async fn forward(
         );
     }
     json_response(status, &headers, &frontend.render_complete(model, &turn))
+}
+
+fn record_terminal_failure(
+    record: Option<&AnthropicRecordCtx>,
+    status: StatusCode,
+    error_type: &str,
+) {
+    if let Some(ctx) = record {
+        record_anthropic_error(
+            ctx,
+            status.as_u16(),
+            Some(error_type.to_owned()),
+            None,
+            None,
+            None,
+        );
+    }
 }
 
 fn error_pair(body: Option<&Value>) -> (Option<String>, Option<String>) {

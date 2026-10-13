@@ -1888,7 +1888,7 @@ async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
 }
 
 #[tokio::test]
-async fn compressed_messages_responses_are_rejected_and_unledgered() {
+async fn compressed_messages_responses_record_a_protocol_failure() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1901,11 +1901,21 @@ async fn compressed_messages_responses_are_rejected_and_unledgered() {
             .is_some_and(|message| message.contains("compressed upstream response"))
     );
 
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
+    assert_eq!(
+        rows[0]
+            .attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_index.get()),
+        Some(0)
+    );
 }
 
 #[tokio::test]
-async fn malformed_complete_messages_responses_are_rejected_and_unledgered() {
+async fn malformed_complete_messages_responses_record_a_protocol_failure() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1923,7 +1933,17 @@ async fn malformed_complete_messages_responses_are_rejected_and_unledgered() {
             .as_str()
             .is_some_and(|message| message.contains("could not interpret"))
     );
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
+    assert_eq!(
+        rows[0]
+            .attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_index.get()),
+        Some(0)
+    );
 }
 
 #[tokio::test]

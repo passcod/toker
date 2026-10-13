@@ -1208,7 +1208,7 @@ async fn transport_before_headers_records_the_initial_attempt() {
 }
 
 #[tokio::test]
-async fn unexpected_compression_is_rejected_and_unledgered() {
+async fn unexpected_compression_records_a_protocol_failure() {
     let (_mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
 
@@ -1216,11 +1216,16 @@ async fn unexpected_compression_is_rejected_and_unledgered() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].status, Some(200));
+    assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
     assert_eq!(
-        store.count_requests().expect("count"),
-        0,
-        "compressed responses are unledgered"
+        rows[0]
+            .attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_index.get()),
+        Some(0)
     );
 }
 

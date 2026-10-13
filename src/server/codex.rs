@@ -40,8 +40,8 @@ use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCa
 use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, plain_status, session_id,
-    transport_failure, truncated_body, upstream_failure,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, plain_status,
+    session_id, transport_failure, truncated_body, upstream_failure,
 };
 use crate::server::record::now_ms;
 use crate::server::record_anthropic::AnthropicRecordCtx;
@@ -503,7 +503,8 @@ async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Respons
         ..
     } = ready;
     let status = upstream.status();
-    let meter_snapshot = backend.meters(upstream.headers());
+    let headers = upstream.headers().clone();
+    let meter_snapshot = backend.meters(&headers);
     if let Some(snapshot) = &meter_snapshot {
         server.note_quota(backend.id(), snapshot);
         let row = crate::store::MetersSnapshot {
@@ -515,10 +516,53 @@ async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Respons
         }
     }
 
+    if is_compressed(&headers) {
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                "upstream Responses response was compressed",
+                None,
+                frontend_wire.protocol(),
+            );
+        }
+        return upstream_failure(
+            frontend_wire.error_wire(),
+            "toker could not interpret a compressed upstream response",
+        );
+    }
+
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "ambiguous_transport",
+                    "upstream response body failed after commitment",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
             return truncated_body(frontend_wire.error_wire());
         };
+        if buffered.rest.is_some() {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "response_protocol",
+                    "upstream error response was too large",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
+            return upstream_failure(
+                frontend_wire.error_wire(),
+                "toker could not interpret an oversized upstream error",
+            );
+        }
         let error = parse_upstream_error(&buffered.bytes);
         let kind = translate::anthropic_error_type(&error);
         let message = error
@@ -636,6 +680,16 @@ async fn aggregated_turn(
         // The stream closed before a terminator event (the codex client
         // treats this as an error; so does toker — never a partial row).
         tracing::warn!("codex stream closed before response.completed");
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                200,
+                "response_protocol",
+                "upstream Responses stream ended before completion",
+                None,
+                frontend_wire.protocol(),
+            );
+        }
         return upstream_failure(
             frontend_wire.error_wire(),
             "toker upstream error: the stream failed before the turn ended",

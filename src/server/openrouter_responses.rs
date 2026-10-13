@@ -183,6 +183,7 @@ async fn forward(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     if is_compressed(&headers) {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "toker could not interpret a compressed Responses response",
@@ -190,9 +191,11 @@ async fn forward(
     }
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            record_terminal_failure(record.as_ref(), status, "ambiguous_transport");
             return truncated_body(ErrorWire::Openai);
         };
         if buffered.rest.is_some() {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "upstream error was too large");
         }
         let error = parse_error(&buffered.bytes);
@@ -221,6 +224,7 @@ async fn forward(
         );
     }
     if !is_event_stream(&headers) {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(ErrorWire::Openai, "OpenRouter Responses did not stream");
     }
     if wants_stream {
@@ -247,6 +251,23 @@ fn invalid_request(message: &str, stream: bool) -> Response {
         message,
         stream,
     )
+}
+
+fn record_terminal_failure(
+    record: Option<&AnthropicRecordCtx>,
+    status: StatusCode,
+    error_type: &str,
+) {
+    if let Some(ctx) = record {
+        record_codex_error(
+            ctx,
+            status.as_u16(),
+            error_type,
+            "upstream Responses response ended before completion",
+            None,
+            "openai_responses",
+        );
+    }
 }
 
 fn parse_error(bytes: &[u8]) -> ResponseError {
@@ -276,6 +297,7 @@ async fn complete(
             }
             Ok(None) => break,
             Err(_) => {
+                record_terminal_failure(record.as_ref(), StatusCode::OK, "ambiguous_transport");
                 return upstream_failure(ErrorWire::Openai, "upstream Responses stream failed");
             }
         }
@@ -301,6 +323,7 @@ async fn complete(
         );
     }
     if !capture.turn_ended() {
+        record_terminal_failure(record.as_ref(), StatusCode::OK, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "upstream Responses turn ended prematurely",

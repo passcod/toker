@@ -563,6 +563,14 @@ pub(crate) async fn forward_chat_canonical(
     let upstream_headers = upstream.headers().clone();
     if is_compressed(&upstream_headers) {
         tracing::warn!("compressed canonical chat response could not be interpreted");
+        if let Some(ctx) = record.as_ref() {
+            record_error(
+                ctx,
+                status.as_u16(),
+                Some("response_protocol".to_owned()),
+                None,
+            );
+        }
         return upstream_failure(
             ErrorWire::Openai,
             "toker could not interpret a compressed upstream response",
@@ -571,9 +579,25 @@ pub(crate) async fn forward_chat_canonical(
 
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            if let Some(ctx) = record.as_ref() {
+                record_error(
+                    ctx,
+                    status.as_u16(),
+                    Some("ambiguous_transport".to_owned()),
+                    None,
+                );
+            }
             return truncated_body(ErrorWire::Openai);
         };
         if buffered.rest.is_some() {
+            if let Some(ctx) = record.as_ref() {
+                record_error(
+                    ctx,
+                    status.as_u16(),
+                    Some("response_protocol".to_owned()),
+                    None,
+                );
+            }
             return upstream_failure(
                 ErrorWire::Openai,
                 "toker could not interpret an oversized upstream error",
@@ -624,6 +648,14 @@ pub(crate) async fn forward_chat_canonical(
         return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {
+        if let Some(ctx) = record.as_ref() {
+            record_error(
+                ctx,
+                status.as_u16(),
+                Some("response_protocol".to_owned()),
+                None,
+            );
+        }
         return upstream_failure(
             ErrorWire::Openai,
             "toker could not interpret an oversized upstream response",
@@ -638,6 +670,14 @@ pub(crate) async fn forward_chat_canonical(
         Ok(turn) => translate::openai_chat_from_canonical(model, &turn),
         Err(error) => {
             tracing::warn!(%error, "canonical chat response interpretation failed");
+            if let Some(ctx) = record.as_ref() {
+                record_error(
+                    ctx,
+                    status.as_u16(),
+                    Some("response_protocol".to_owned()),
+                    None,
+                );
+            }
             return upstream_failure(
                 ErrorWire::Openai,
                 "toker could not interpret the upstream response",
