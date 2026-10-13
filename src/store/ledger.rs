@@ -329,12 +329,23 @@ impl StoredRoutingTrace {
         }
         let events = events
             .iter()
-            .map(StoredRoutingTraceEvent::from_resolver)
-            .collect::<Result<Vec<_>>>()?;
-        let trace = Self {
+            .filter_map(StoredRoutingTraceEvent::from_resolver)
+            .collect();
+        let mut trace = Self {
             version: ROUTING_TRACE_VERSION,
             events,
         };
+        if serde_json::to_vec(&trace)?.len() > MAX_ROUTING_TRACE_BYTES {
+            // Candidate identity and its closed verdict are the durable
+            // decision. Model spellings are optional trace detail and may be
+            // omitted when a maximum-sized valid route would otherwise exceed
+            // the independent ledger bound.
+            for event in &mut trace.events {
+                if let StoredRoutingTraceEvent::Candidate { model, .. } = event {
+                    *model = None;
+                }
+            }
+        }
         trace.validate()?;
         Ok(trace)
     }
@@ -385,9 +396,9 @@ impl StoredRoutingTrace {
 }
 
 impl StoredRoutingTraceEvent {
-    fn from_resolver(event: &TraceEvent) -> Result<Self> {
+    fn from_resolver(event: &TraceEvent) -> Option<Self> {
         use crate::policy::{RouteProvenance, SkipReason};
-        Ok(match event {
+        let event = match event {
             TraceEvent::Lookup(provenance) => {
                 let (source, presentation_id, rewrite_id) = match provenance {
                     RouteProvenance::ProfilePresentation(id) => (
@@ -464,20 +475,39 @@ impl StoredRoutingTraceEvent {
                     candidate_id: evidence.candidate_id.clone(),
                     crossed_from: evidence.crossed_from.clone(),
                     binding_id: evidence.binding_id.clone(),
-                    model: evidence.model.clone(),
+                    model: evidence
+                        .model
+                        .as_ref()
+                        .filter(|model| model.len() <= MAX_ROUTING_TRACE_MODEL_BYTES)
+                        .cloned(),
                     state,
                     reason,
                 }
             }
-            TraceEvent::Upgrade { from, to } => Self::Upgrade {
-                from: from.clone(),
-                to: to.clone(),
-            },
-            TraceEvent::Alias { from, to } => Self::Alias {
-                from: from.clone(),
-                to: to.clone(),
-            },
-        })
+            TraceEvent::Upgrade { from, to } => {
+                if from.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                    || to.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                {
+                    return None;
+                }
+                Self::Upgrade {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+            TraceEvent::Alias { from, to } => {
+                if from.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                    || to.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                {
+                    return None;
+                }
+                Self::Alias {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+        };
+        Some(event)
     }
 
     fn validate(&self) -> Result<()> {
@@ -679,6 +709,24 @@ pub enum PolicyRoutingOutcome {
 }
 
 impl PolicyRouteProvenance {
+    pub fn from_route_unavailable(
+        policy_revision_id: i64,
+        route_id: RouteId,
+        route_fingerprint: RouteFingerprint,
+        provenance: &crate::policy::RouteProvenance,
+        trace: &[TraceEvent],
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        Ok(Self {
+            policy_revision_id,
+            lookup: provenance.into(),
+            route_id,
+            route_fingerprint,
+            trace: StoredRoutingTrace::from_resolver(trace)?,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
     pub fn from_attempt_plan(plan: &crate::policy::AttemptPlan) -> Result<Option<Self>> {
         let Some(policy_revision_id) = plan.policy_revision else {
             return Ok(None);

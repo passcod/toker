@@ -665,6 +665,43 @@ impl RouteRegistry {
             })
     }
 
+    /// Build a configured target from a policy-selected binding and model.
+    ///
+    /// Static topology alone is not enough to send: the frontend edge must be
+    /// implemented, and the configured provider must expose that exact verified
+    /// binding.
+    pub fn resolve_binding(
+        &self,
+        frontend: ProtocolId,
+        binding_id: &BindingId,
+        requested_model: Option<&str>,
+        effective_model: &str,
+    ) -> Result<ModelTarget, RouteNotConfigured> {
+        let declaration = ROUTES
+            .iter()
+            .find(|route| route.frontend == frontend && route.binding.id() == binding_id)
+            .ok_or(RouteNotConfigured)?;
+        let provider = self
+            .providers
+            .get(declaration.binding.provider())
+            .cloned()
+            .ok_or(RouteNotConfigured)?;
+        let binding = provider
+            .bindings()
+            .iter()
+            .find(|binding| {
+                **binding == declaration.binding && binding.canonical_backend().is_some()
+            })
+            .cloned()
+            .ok_or(RouteNotConfigured)?;
+        Ok(ModelTarget {
+            provider,
+            binding,
+            requested_model: requested_model.map(str::to_owned),
+            effective_model: Some(effective_model.to_owned()),
+        })
+    }
+
     /// Resolve a frontend model spelling to its provider, backend binding, and
     /// two model identities. Unknown prefixes are provider-owned model ids and
     /// therefore remain intact on the protocol default.
@@ -730,8 +767,8 @@ mod tests {
 
     use super::{
         ANTHROPIC_SUB_MESSAGES, BACKEND_BINDINGS, BackendAdapterId, BackendBinding, Capabilities,
-        DialectId, FrontendProfile, OPENROUTER_CHAT, OPENROUTER_MESSAGES, ProtocolId, ROUTES,
-        RouteRegistry,
+        DialectId, FrontendProfile, OPENAI_API_CHAT, OPENROUTER_CHAT, OPENROUTER_MESSAGES,
+        ProtocolId, ROUTES, RouteRegistry,
     };
     use crate::policy::CostClass;
     use crate::providers::Provider;
@@ -1072,6 +1109,19 @@ mod tests {
         assert_eq!(target.requested_model(), Some("openrouter/openai/gpt-5.2"));
         assert_eq!(target.effective_model(), Some("openai/gpt-5.2"));
 
+        let selected = registry
+            .resolve_binding(
+                ProtocolId::AnthropicMessages,
+                OPENROUTER_MESSAGES.id(),
+                Some("presented-model"),
+                "openai/gpt-5.3",
+            )
+            .expect("policy-selected route");
+        assert_eq!(selected.provider().id(), "openrouter");
+        assert_eq!(selected.binding(), &OPENROUTER_MESSAGES);
+        assert_eq!(selected.requested_model(), Some("presented-model"));
+        assert_eq!(selected.effective_model(), Some("openai/gpt-5.3"));
+
         let alias = registry
             .resolve(
                 ProtocolId::AnthropicMessages,
@@ -1108,6 +1158,28 @@ mod tests {
                     Some("openrouter/z-ai/glm-5.3")
                 )
                 .is_err()
+        );
+        assert!(
+            registry
+                .resolve_binding(
+                    ProtocolId::AnthropicMessages,
+                    OPENROUTER_MESSAGES.id(),
+                    Some("presented-model"),
+                    "z-ai/glm-5.3",
+                )
+                .is_err(),
+            "policy cannot select a binding whose provider is disabled"
+        );
+        assert!(
+            registry
+                .resolve_binding(
+                    ProtocolId::OpenAiResponses,
+                    OPENAI_API_CHAT.id(),
+                    Some("presented-model"),
+                    "gpt-5.3",
+                )
+                .is_err(),
+            "policy cannot select a binding without a frontend edge"
         );
     }
 }

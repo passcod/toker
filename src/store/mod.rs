@@ -3558,6 +3558,27 @@ mod tests {
                 ..
             }
         ));
+        let large = StoredRoutingTrace::from_resolver(
+            &(0..64)
+                .map(|index| {
+                    TraceEvent::Candidate(CandidateEvidence {
+                        candidate_id: CandidateId::new(format!("candidate-{index}")).unwrap(),
+                        crossed_from: None,
+                        binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                        model: Some("x".repeat(crate::policy::MAX_STRING_BYTES)),
+                        result: Err(SkipReason::Disabled),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("a valid maximum-sized route has storable provenance");
+        assert!(large.events.iter().all(|event| matches!(
+            event,
+            StoredRoutingTraceEvent::Candidate { model: None, .. }
+        )));
+        assert!(
+            serde_json::to_vec(&large).unwrap().len() <= super::ledger::MAX_ROUTING_TRACE_BYTES
+        );
         assert!(
             StoredRoutingTrace::from_resolver(&vec![
                 TraceEvent::Lookup(

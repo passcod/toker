@@ -130,6 +130,17 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// of silence is a dead stream, not a slow one.
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PolicyAttemptError {
+    #[error(transparent)]
+    Runtime(#[from] crate::policy::PolicyRuntimeError),
+    #[error("policy revision {revision_id} could not route the request: {failure}")]
+    Resolve {
+        revision_id: i64,
+        failure: crate::policy::ResolveFailure,
+    },
+}
+
 /// The upstream client: a connect timeout and the between-reads idle
 /// timeout, never an overall one (see [`UPSTREAM_IDLE_TIMEOUT`]).
 fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
@@ -527,6 +538,58 @@ impl Server {
             shadow: None,
         };
         shadow.observe_record(record);
+    }
+
+    pub(crate) fn resolve_policy_attempt(
+        &self,
+        facts: &RequestFacts,
+        credentials: &crate::policy::CredentialSnapshot,
+        lane: Option<&LaneFacts>,
+    ) -> Result<Option<crate::policy::AttemptPlan>, PolicyAttemptError> {
+        let Some(runtime) = &self.policy_runtime else {
+            return Ok(None);
+        };
+        let pinned_revision = lane
+            .and_then(|lane| lane.pinned.as_ref())
+            .and_then(|pin| pin.policy_revision_id);
+        let Some((current, evidence, circuits)) =
+            runtime.capture_shadow(pinned_revision, facts.now_ms)
+        else {
+            return Ok(None);
+        };
+        let Some(current_revision_id) = current.revision_id() else {
+            return Ok(None);
+        };
+        let (snapshot, revision_id) = match pinned_revision {
+            Some(revision_id) => (
+                runtime.capture_revision_with_evidence(revision_id, &evidence)?,
+                revision_id,
+            ),
+            None => (current, current_revision_id),
+        };
+        let mut lane = lane.cloned();
+        if let Some(pin) = lane.as_mut().and_then(|lane| lane.pinned.as_mut()) {
+            pin.policy_fingerprint = Some(snapshot.policy().fingerprint().clone());
+        }
+        let availability = snapshot
+            .availability()
+            .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_credentials(credentials);
+        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
+        crate::policy::resolve_with_circuits(
+            snapshot.policy(),
+            snapshot.inventory(),
+            &learning,
+            lane.as_ref(),
+            &availability,
+            &circuits,
+            facts,
+        )
+        .map(|plan| Some(plan.with_policy_revision(revision_id)))
+        .map_err(|failure| PolicyAttemptError::Resolve {
+            revision_id,
+            failure,
+        })
     }
 
     pub(crate) fn observe_policy_shadow(
@@ -986,9 +1049,6 @@ impl Server {
     fn replace_catalogs(&self, next: FetchedCatalogs) {
         let inventory = offers::inventory(&self.registry, &next);
         let availability = availability_for(&self.registry, &next);
-        let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
-            .ok()
-            .and_then(|compilation| compilation.into_policy().ok());
         let mut catalogs = self
             .catalogs
             .write()
@@ -996,27 +1056,76 @@ impl Server {
         let changed_catalogue_bindings =
             changed_catalogue_bindings(&self.registry, &catalogs, &next);
         *catalogs = next;
-        if let Some(runtime) = &self.policy_runtime {
-            // Model-list readers retain this catalogue guard through their
-            // comparison, so they can observe only the old pair or new pair.
-            if let Some(policy) = policy {
-                runtime.replace_candidate(
-                    Arc::new(policy),
-                    Arc::new(inventory),
-                    Arc::new(availability),
-                    &changed_catalogue_bindings,
-                );
+        let Some(runtime) = &self.policy_runtime else {
+            return;
+        };
+        // Model-list readers retain this catalogue guard through their
+        // comparison, so they can observe only the old pair or new pair.
+        if let Some(revision_id) = runtime
+            .capture()
+            .and_then(|snapshot| snapshot.revision_id())
+        {
+            let revision = match self.store.load_policy_revision(revision_id) {
+                Ok(Some(revision)) => revision,
+                Ok(None) => {
+                    tracing::error!(revision_id, "active policy refresh revision is missing");
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(%error, revision_id, "active policy refresh load failed");
+                    return;
+                }
+            };
+            let origin = if revision.source == crate::store::PolicyRevisionSource::Legacy {
+                crate::policy::PolicyOrigin::GeneratedRevisionOne
             } else {
-                tracing::warn!(
-                    code = "policy-shadow-refresh-disabled",
-                    "policy shadow disabled for catalogue generation"
-                );
-                runtime.replace_evidence_and_clear_candidate(
-                    Arc::new(inventory),
-                    Arc::new(availability),
-                    &changed_catalogue_bindings,
-                );
+                crate::policy::PolicyOrigin::Authored
+            };
+            match crate::policy::compile(
+                revision.document.clone(),
+                &self.registry,
+                &inventory,
+                origin,
+            )
+            .into_policy()
+            {
+                Ok(policy) => {
+                    runtime.replace_active(
+                        &revision,
+                        Arc::new(policy),
+                        Arc::new(inventory),
+                        Arc::new(availability),
+                        &changed_catalogue_bindings,
+                    );
+                }
+                Err(_) => tracing::error!(
+                    revision_id = revision.revision_id,
+                    "active policy refresh compilation failed"
+                ),
             }
+            return;
+        }
+
+        let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
+            .ok()
+            .and_then(|compilation| compilation.into_policy().ok());
+        if let Some(policy) = policy {
+            runtime.replace_candidate(
+                Arc::new(policy),
+                Arc::new(inventory),
+                Arc::new(availability),
+                &changed_catalogue_bindings,
+            );
+        } else {
+            tracing::warn!(
+                code = "policy-shadow-refresh-disabled",
+                "policy shadow disabled for catalogue generation"
+            );
+            runtime.replace_evidence_and_clear_candidate(
+                Arc::new(inventory),
+                Arc::new(availability),
+                &changed_catalogue_bindings,
+            );
         }
     }
 
@@ -1536,9 +1645,10 @@ mod tests {
     use crate::config::Config;
     use crate::routing::ProtocolId;
     use crate::store::Store;
-    use axum::http::{HeaderMap, HeaderValue, header};
-    use std::sync::Arc;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+    use axum::response::IntoResponse;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     /// A server over a scratch config whose providers point at
     /// unreachable localhost ports (nothing contacts them at
@@ -1580,6 +1690,219 @@ version_probe = false
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
         Server::new(config, store).expect("server builds")
+    }
+
+    type ChatBodies = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    async fn chat_upstream(
+        axum::extract::State(seen): axum::extract::State<ChatBodies>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let body = match axum::body::to_bytes(request.into_body(), 1 << 20).await {
+            Ok(body) => body,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        seen.lock().unwrap().push(value);
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": "chatcmpl-policy",
+                "model": "policy-effective",
+                "object": "chat.completion",
+                "created": 1,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            })),
+        )
+            .into_response()
+    }
+
+    async fn policy_chat_server() -> (Server, ChatBodies) {
+        let seen: ChatBodies = Arc::default();
+        let upstream = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(chat_upstream))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("mock binds");
+        let address = listener.local_addr().expect("mock address");
+        tokio::spawn(async move { axum::serve(listener, upstream).await.expect("mock serves") });
+
+        let dir = crate::setup::test_dir("active-chat-policy");
+        std::fs::write(
+            dir.join("toker.toml"),
+            format!(
+                r#"
+awake = false
+db_path = ":memory:"
+default_backend_openai_chat = "openrouter"
+
+[providers.openrouter]
+upstream = "http://127.0.0.1:9/v1"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "sk-or-test"
+
+[providers.openai_api]
+upstream = "http://{address}/v1"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "sk-proj-test"
+"#,
+            ),
+        )
+        .expect("write config");
+        let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
+        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
+        let mut server = Server::new(config, store.clone()).expect("server builds");
+        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+            .expect("legacy document");
+        let openai_route =
+            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+        for default in &mut document.defaults {
+            if matches!(
+                &default.scope,
+                crate::policy::FrontendScope::Profile {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                    ..
+                } | crate::policy::FrontendScope::Protocol {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                }
+            ) {
+                default.target.route_id = openai_route.clone();
+            }
+        }
+        document
+            .routes
+            .iter_mut()
+            .find(|route| route.id == openai_route)
+            .expect("OpenAI route")
+            .chain
+            .first
+            .model = crate::policy::CandidateModel::Exact {
+            model_id: "policy-effective".to_owned(),
+        };
+        let document = document.validate().expect("policy validates");
+        let revision = store
+            .insert_policy_revision(&crate::store::NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some("active Chat test"),
+                activation_scope: crate::policy::ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: crate::store::PolicyRevisionSource::Legacy,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .expect("insert revision");
+        let catalogs = crate::catalog::FetchedCatalogs::default();
+        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
+        let policy = crate::policy::compile(
+            document,
+            &server.registry,
+            &inventory,
+            crate::policy::PolicyOrigin::GeneratedRevisionOne,
+        )
+        .into_policy()
+        .expect("policy compiles");
+        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
+            store,
+            server.registry.clone(),
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            Arc::new(super::availability_for(&server.registry, &catalogs)),
+        )));
+        (server, seen)
+    }
+
+    #[tokio::test]
+    async fn active_chat_policy_selects_target_and_records_provenance() {
+        let (server, seen) = policy_chat_server().await;
+        server.install_catalog(
+            "openrouter",
+            crate::catalog::FetchedCatalog {
+                fetched_at_ms: super::now_ms(),
+                models: vec![crate::catalog::FetchedModel {
+                    id: "legacy-only".to_owned(),
+                    context_window: None,
+                    chronology: None,
+                    raw: serde_json::Value::Null,
+                }],
+            },
+        );
+        assert_eq!(
+            server
+                .policy_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capture())
+                .and_then(|snapshot| snapshot.revision_id()),
+            Some(1),
+            "catalogue refresh preserves active routing authority"
+        );
+        let store = server.store.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("toker binds");
+        let address = listener.local_addr().expect("toker address");
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .await
+                .expect("toker serves")
+        });
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "policy-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request succeeds");
+        let status = response.status();
+        let response_bytes = response.bytes().await.expect("response body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response_bytes)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_bytes).expect("JSON response");
+        assert_eq!(body["model"], "policy-alias");
+        assert_eq!(
+            seen.lock().unwrap()[0]["model"],
+            "policy-effective",
+            "the active policy selected both binding and model despite the conflicting legacy default"
+        );
+        let rows = store.requests_since(0, 10).expect("ledger rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider.as_deref(), Some("openai_api"));
+        assert_eq!(
+            rows[0]
+                .binding_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("openai_api.openai_chat_completions")
+        );
+        let routing = rows[0]
+            .policy_routing
+            .as_ref()
+            .expect("authoritative provenance");
+        assert_eq!(routing.policy_revision_id, 1);
+        assert_eq!(
+            routing.route_id.as_str(),
+            "legacy-route-openai_api-openai_chat_completions"
+        );
+        assert!(rows[0].attempt.is_some());
     }
 
     /// The three sources the background task refreshes: the openrouter

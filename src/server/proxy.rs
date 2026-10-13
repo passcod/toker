@@ -66,7 +66,7 @@ use super::InFlightGuard;
 use super::Server;
 use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
-    record_openai_cold, record_openai_cold_quiet, retry_after_ms,
+    record_openai_cold, record_openai_cold_quiet, record_route_unavailable, retry_after_ms,
 };
 use super::record_anthropic::AnthropicRecordCtx;
 
@@ -140,18 +140,11 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
         return compatibility_error("model is missing, empty, or not a string");
     };
-    let target = match server
+    let legacy_target = server
         .registry
-        .resolve(ProtocolId::OpenAiChat, Some(model.as_str()))
-    {
-        Ok(target) => target,
-        Err(_) => return super::openai_not_configured(),
-    };
+        .resolve(ProtocolId::OpenAiChat, Some(model.as_str()));
     let inference = super::inference::InferenceRequest::new(model.clone(), canonical);
-    let gate_model = target.effective_model().map(str::to_owned);
-    let attempt = inference.prepare(target.clone(), gate_model.clone());
-    let gate_model = attempt.effective_model().map(str::to_owned);
-    let canonical = attempt.canonical();
+    let canonical = inference.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
     let system_messages = Some(
         canonical
@@ -161,7 +154,124 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             .count() as u64,
     );
     let stream_requested = canonical.stream == Some(true);
-    let gate_shape = Some(shape.clone());
+    let cold_lane_key = lanes::lane_key(session_id.as_deref(), Some(&shape.tools_hash));
+    let cold_lane = cold_lane_key
+        .as_ref()
+        .and_then(|key| server.store.load_lane(key).ok().flatten());
+    let pinned_binding_id = cold_lane
+        .as_ref()
+        .and_then(|lane| lane.pin.as_ref())
+        .map(|pin| pin.binding_id.clone());
+    let affinity_binding = pinned_binding_id
+        .as_ref()
+        .and_then(|binding_id| server.registry.binding(binding_id))
+        .or_else(|| legacy_target.as_ref().ok().map(|target| target.binding()));
+    let binding_affinity = if canonical.requires_binding_affinity() {
+        let Some(binding) =
+            pinned_binding_id.or_else(|| affinity_binding.map(|binding| binding.id().clone()))
+        else {
+            return super::openai_not_configured();
+        };
+        Some(binding)
+    } else {
+        None
+    };
+    let facts = server.shadow_facts(
+        ProtocolId::OpenAiChat,
+        shadow_profile.as_deref(),
+        Some(model.clone()),
+        cold_lane_key.clone(),
+        force_newest::prompt_bound(original.len() as u64),
+        shape.req_messages,
+        shape.req_tools,
+        super::anthropic::shadow_capabilities(&canonical),
+        binding_affinity,
+        crate::policy::RequestClass::Inference,
+    );
+    let credentials =
+        server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
+    let lane = server.shadow_lane(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
+    let (target, attempt, authoritative) =
+        match server.resolve_policy_attempt(&facts, &credentials, lane.as_ref()) {
+            Ok(Some(plan)) => {
+                let target = match server.registry.resolve_binding(
+                    ProtocolId::OpenAiChat,
+                    &plan.binding_id,
+                    Some(model.as_str()),
+                    &plan.effective_model,
+                ) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        tracing::error!(
+                            binding_id = %plan.binding_id,
+                            "active policy selected an unconfigured Chat binding"
+                        );
+                        return upstream_failure(
+                            ErrorWire::Openai,
+                            "the active routing policy selected an unavailable backend",
+                        );
+                    }
+                };
+                let attempt = inference.prepare_policy(target.clone(), plan);
+                (target, attempt, true)
+            }
+            Ok(None) => {
+                let target = match legacy_target {
+                    Ok(target) => target,
+                    Err(_) => return super::openai_not_configured(),
+                };
+                let gate_model = target.effective_model().map(str::to_owned);
+                let attempt = inference.prepare(target.clone(), gate_model);
+                (target, attempt, false)
+            }
+            Err(super::PolicyAttemptError::Resolve {
+                revision_id,
+                failure:
+                    crate::policy::ResolveFailure::RouteUnavailable {
+                        route_id,
+                        route_fingerprint,
+                        provenance,
+                        trace,
+                    },
+            }) => {
+                match crate::store::PolicyRouteProvenance::from_route_unavailable(
+                    revision_id,
+                    route_id,
+                    route_fingerprint,
+                    &provenance,
+                    &trace,
+                    crate::store::AttemptGroupId::fresh(),
+                ) {
+                    Ok(routing) => record_route_unavailable(
+                        &server,
+                        started,
+                        frontend.as_deref(),
+                        session_id.as_deref(),
+                        Some(model.as_str()),
+                        routing,
+                    ),
+                    Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
+                }
+                return error_response(
+                    ErrorWire::Openai,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    WireError {
+                        anthropic_type: "api_error",
+                        openai_type: "server_error",
+                        openai_code: Some("route_unavailable"),
+                    },
+                    "the active routing policy has no available backend for this request",
+                );
+            }
+            Err(error) => {
+                tracing::error!(%error, "active Chat policy resolution failed");
+                return upstream_failure(
+                    ErrorWire::Openai,
+                    "the active routing policy could not resolve this request",
+                );
+            }
+        };
+    let gate_model = attempt.effective_model().map(str::to_owned);
     let backend = attempt.backend().clone();
     let record = Some(RecordCtx {
         frontend: frontend.clone(),
@@ -175,7 +285,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         ping,
         requested_model: Some(attempt.requested_model().to_owned()),
         effective_model: gate_model.clone(),
-        shape: Some(shape),
+        shape: Some(shape.clone()),
         system_messages,
     });
 
@@ -192,13 +302,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // a false cold notice. Binding-scoped lane state in the live-routing
     // plan generalises this once each binding has a supported clock.
     let cold_armed = server.config.gates.cold_enabled && backend.id() == "openrouter";
-    let cold_lane_key = gate_shape
-        .as_ref()
-        .map(|shape| shape.tools_hash.as_str())
-        .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
-    let cold_lane = cold_lane_key
-        .as_ref()
-        .and_then(|key| server.store.load_lane(key).ok().flatten());
     if cold_armed {
         let gates = &server.config.gates;
         let now = now_ms();
@@ -215,7 +318,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             // the notice exists to advise compacting, and stopping the
             // compaction would halt the user a keystroke after telling
             // them to go ahead.
-            if gate_shape.as_ref().is_some_and(|shape| shape.summarising) {
+            if shape.summarising {
                 cold::Turn::Summarising
             } else {
                 cold::Turn::Ordinary
@@ -254,7 +357,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     server: &server,
                     started,
                     session_id: session_id.as_deref(),
-                    tools_hash: gate_shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+                    tools_hash: Some(shape.tools_hash.as_str()),
                     idle_ms,
                     prompt,
                     req_messages: None,
@@ -301,17 +404,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     server: &server,
                     started,
                     session_id: session_id.as_deref(),
-                    tools_hash: gate_shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+                    tools_hash: Some(shape.tools_hash.as_str()),
                     idle_ms,
                     prompt,
                     // The message count of the stopped request: the
                     // synthetic turn is appended to the client's
                     // transcript, so the next request in this lane
                     // should carry both.
-                    req_messages: gate_shape
-                        .as_ref()
-                        .and_then(|shape| shape.req_messages)
-                        .map(|messages| messages as i64),
+                    req_messages: shape.req_messages.map(|messages| messages as i64),
                     compact_target: None,
                     backend_id: backend.id(),
                 });
@@ -329,45 +429,18 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     }
 
-    let binding_affinity = canonical.requires_binding_affinity().then(|| {
-        cold_lane
-            .as_ref()
-            .and_then(|lane| lane.pin.as_ref())
-            .map_or_else(
-                || target.binding().id().clone(),
-                |pin| pin.binding_id.clone(),
-            )
-    });
-    let facts = server.shadow_facts(
-        ProtocolId::OpenAiChat,
-        shadow_profile.as_deref(),
-        Some(model.clone()),
-        cold_lane_key.clone(),
-        force_newest::prompt_bound(original.len() as u64),
-        gate_shape.as_ref().and_then(|shape| shape.req_messages),
-        gate_shape.as_ref().map_or(0, |shape| shape.req_tools),
-        super::anthropic::shadow_capabilities(&canonical),
-        binding_affinity,
-        crate::policy::RequestClass::Inference,
-    );
-    if let Some(legacy) = server.legacy_shadow_outcome(
-        &facts,
-        &target,
-        gate_model.clone(),
-        None,
-        None,
-        None,
-        gate_model.clone(),
-        false,
-    ) {
-        let lane = server.shadow_lane(
-            cold_lane.as_ref(),
-            Some(target.binding()),
-            facts.now_ms,
+    if !authoritative
+        && let Some(legacy) = server.legacy_shadow_outcome(
+            &facts,
+            &target,
+            gate_model.clone(),
+            None,
+            None,
+            None,
+            gate_model.clone(),
             false,
-        );
-        let credentials =
-            server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
+        )
+    {
         server.observe_policy_shadow(facts, credentials, lane, legacy);
     }
 

@@ -292,7 +292,12 @@ pub enum ResolveFailure {
     #[error("learning evidence could not be read")]
     LearningUnavailable,
     #[error("no candidate is available before send")]
-    RouteUnavailable { trace: Vec<TraceEvent> },
+    RouteUnavailable {
+        route_id: RouteId,
+        route_fingerprint: RouteFingerprint,
+        provenance: RouteProvenance,
+        trace: Vec<TraceEvent>,
+    },
 }
 
 struct SelectedRoute<'a> {
@@ -359,7 +364,12 @@ pub fn resolve_with_circuits<L: LearningView>(
         }
         trace.push(TraceEvent::Candidate(evidence.clone()));
         if evidence.result.is_err() {
-            return Err(ResolveFailure::RouteUnavailable { trace });
+            return Err(ResolveFailure::RouteUnavailable {
+                route_id: route_id.clone(),
+                route_fingerprint: fingerprint.clone(),
+                provenance: selected.provenance.clone(),
+                trace,
+            });
         }
         let provider = live.map_or_else(String::new, |live| live.provider.clone());
         return Ok(AttemptPlan {
@@ -454,7 +464,7 @@ pub fn resolve_with_circuits<L: LearningView>(
                     },
                 );
             }
-            return Err(ResolveFailure::RouteUnavailable { trace });
+            return Err(route_unavailable(route, &selected.provenance, trace));
         }
         let upgraded = choose_upgrade(
             policy, inventory, learning, lane, facts, candidate, &baseline,
@@ -558,7 +568,20 @@ pub fn resolve_with_circuits<L: LearningView>(
             trace,
         });
     }
-    Err(ResolveFailure::RouteUnavailable { trace })
+    Err(route_unavailable(route, &selected.provenance, trace))
+}
+
+fn route_unavailable(
+    route: &CompiledRoute,
+    provenance: &RouteProvenance,
+    trace: Vec<TraceEvent>,
+) -> ResolveFailure {
+    ResolveFailure::RouteUnavailable {
+        route_id: route.id().clone(),
+        route_fingerprint: route.fingerprint().clone(),
+        provenance: provenance.clone(),
+        trace,
+    }
 }
 
 fn lookup<'a>(
@@ -2102,7 +2125,7 @@ mod tests {
             &facts("claude-opus-4-8"),
         )
         .unwrap_err();
-        let ResolveFailure::RouteUnavailable { trace } = failure else {
+        let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
             panic!()
         };
         assert!(matches!(
@@ -2143,7 +2166,7 @@ mod tests {
             &facts("source"),
         )
         .unwrap_err();
-        let ResolveFailure::RouteUnavailable { trace } = failure else {
+        let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
             panic!()
         };
         assert!(matches!(
@@ -2215,7 +2238,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             failure,
-            ResolveFailure::RouteUnavailable { trace }
+            ResolveFailure::RouteUnavailable { trace, .. }
                 if matches!(&trace[1], TraceEvent::Candidate(evidence)
                     if evidence.candidate_id == *candidate_id
                         && evidence.result == Err(SkipReason::HealthCircuitOpen))
@@ -2342,7 +2365,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             failure,
-            ResolveFailure::RouteUnavailable { trace }
+            ResolveFailure::RouteUnavailable { trace, .. }
                 if matches!(&trace[1], TraceEvent::Candidate(evidence)
                     if evidence.result == Err(SkipReason::Disabled))
         ));
@@ -2393,7 +2416,7 @@ mod tests {
             &facts("asked"),
         )
         .unwrap_err();
-        let ResolveFailure::RouteUnavailable { trace } = failure else {
+        let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
             panic!()
         };
         assert_eq!(trace.len(), 2, "the fallback candidate is never considered");
@@ -2455,7 +2478,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             failure,
-            ResolveFailure::RouteUnavailable { trace }
+            ResolveFailure::RouteUnavailable { trace, .. }
                 if matches!(&trace[2], TraceEvent::Candidate(evidence)
                     if evidence.model.as_deref() == Some("two")
                         && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
@@ -2498,7 +2521,7 @@ mod tests {
                 &availability(true, false),
                 &facts("asked"),
             ),
-            Err(ResolveFailure::RouteUnavailable { trace })
+            Err(ResolveFailure::RouteUnavailable { trace, .. })
                 if matches!(&trace[2], TraceEvent::Candidate(evidence)
                     if evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
         ));
@@ -2552,7 +2575,7 @@ mod tests {
                 &availability(true, false),
                 &facts("asked"),
             ),
-            Err(ResolveFailure::RouteUnavailable { trace })
+            Err(ResolveFailure::RouteUnavailable { trace, .. })
                 if matches!(&trace[2], TraceEvent::Candidate(evidence)
                     if evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
         ));
@@ -2624,7 +2647,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             failure,
-            ResolveFailure::RouteUnavailable { trace }
+            ResolveFailure::RouteUnavailable { trace, .. }
                 if matches!(&trace[2], TraceEvent::Candidate(evidence)
                     if evidence.crossed_from.as_ref().is_some_and(|id| id.as_str() == "first"))
                     && matches!(&trace[3], TraceEvent::Candidate(evidence)
@@ -2681,7 +2704,7 @@ mod tests {
             &request,
         )
         .unwrap_err();
-        let ResolveFailure::RouteUnavailable { trace } = failure else {
+        let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
             panic!()
         };
         assert!(
@@ -2744,7 +2767,7 @@ mod tests {
             &request,
         )
         .unwrap_err();
-        let ResolveFailure::RouteUnavailable { trace } = failure else {
+        let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
             panic!()
         };
         assert!(trace.iter().any(|event| matches!(event, TraceEvent::Candidate(e) if e.result == Err(SkipReason::MissingRequiredCapability))));
@@ -2812,7 +2835,7 @@ mod tests {
                 &request,
             )
             .unwrap_err();
-            let ResolveFailure::RouteUnavailable { trace } = failure else {
+            let ResolveFailure::RouteUnavailable { trace, .. } = failure else {
                 panic!()
             };
             assert!(trace.iter().any(|event| matches!(

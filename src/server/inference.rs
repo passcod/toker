@@ -60,7 +60,6 @@ impl InferenceRequest {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn prepare_policy(
         &self,
         target: ModelTarget,
@@ -530,13 +529,10 @@ fn prepare_messages(
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
-    let policy_routing = attempt.policy_routing().map_err(|error| {
-        tracing::error!(%error, "policy attempt provenance could not be stored");
-        Box::new(super::proxy::plain_status(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "routing provenance failed\n",
-        ))
-    })?;
+    let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
+        tracing::error!(%error, "policy attempt provenance omitted");
+        None
+    });
     if let Some(ctx) = record.as_mut() {
         ctx.policy_routing = policy_routing;
     }
@@ -582,22 +578,12 @@ fn prepare_messages(
 fn prepare_chat(
     parts: Parts,
     attempt: InferenceAttempt,
-    mut record: Option<RecordCtx>,
+    record: Option<RecordCtx>,
     in_flight: Option<InFlightGuard>,
 ) -> Result<ReadyChatAttempt, Box<Response>> {
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
-    let policy_routing = attempt.policy_routing().map_err(|error| {
-        tracing::error!(%error, "policy attempt provenance could not be stored");
-        Box::new(super::proxy::plain_status(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "routing provenance failed\n",
-        ))
-    })?;
-    if let Some(ctx) = record.as_mut() {
-        ctx.policy_routing = policy_routing;
-    }
     let rendered = attempt
         .render_json()
         .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;
@@ -693,11 +679,18 @@ pub(crate) async fn coordinate_chat(
     let ChatAttemptInput {
         parts,
         max_tokens,
-        record,
+        mut record,
         in_flight,
         session_id,
         client_wants_json,
     } = input;
+    let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
+        tracing::error!(%error, "policy attempt provenance omitted");
+        None
+    });
+    if let Some(ctx) = record.as_mut() {
+        ctx.policy_routing = policy_routing;
+    }
     let prepared = match adapter {
         Some(BackendAdapterId::OpenAiChatCompletions) => {
             prepare_chat(parts, attempt, record, in_flight).map(ReadyBackendAttempt::Chat)

@@ -519,7 +519,11 @@ impl PolicyRuntime {
             catalogue_generations: evidence.catalogue_generations.clone(),
             credential_generations: evidence.credential_generations.clone(),
         });
-        let circuits = self.open_circuits_with_evidence(pinned_revision, &evidence, now_ms);
+        let circuits = self.open_circuits_with_evidence(
+            pinned_revision.or(current.revision_id),
+            &evidence,
+            now_ms,
+        );
         Some((snapshot, evidence, circuits))
     }
 
@@ -1038,6 +1042,41 @@ mod tests {
         let view = runtime.open_circuits(&snapshot, 10);
         assert_eq!(view.len(), 2);
         assert!(view.contains(&super::super::OpenCircuitTarget {
+            route_id: key.route_id,
+            candidate_id: key.candidate_id,
+            binding_id: binding,
+            model_id: key.model_id,
+            failure: FailureClass::Overload,
+        }));
+    }
+
+    #[test]
+    fn active_shadow_capture_uses_the_current_revision_for_circuits() {
+        let (store, _) = runtime();
+        let revision_id = revision(&store, "active-circuit");
+        let revision = store
+            .load_policy_revision(revision_id)
+            .unwrap()
+            .expect("revision");
+        let topology = RouteRegistry::new(
+            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
+        );
+        let runtime = PolicyRuntime::new_active(
+            store,
+            topology,
+            &revision,
+            compiled("active-circuit"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+        );
+        let snapshot = runtime.capture().unwrap();
+        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
+        let key = circuit_key(revision_id, binding.clone());
+        runtime.open_circuit(&snapshot, key.clone(), 100);
+
+        let (_, _, circuits) = runtime.capture_shadow(None, 10).expect("active capture");
+        assert!(circuits.contains(&super::super::OpenCircuitTarget {
             route_id: key.route_id,
             candidate_id: key.candidate_id,
             binding_id: binding,
