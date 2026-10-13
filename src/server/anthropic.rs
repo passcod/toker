@@ -1575,6 +1575,7 @@ pub(crate) async fn retry_thinking_off(
     sent: Bytes,
     upstream: reqwest::Response,
     record: &mut Option<AnthropicRecordCtx>,
+    cancellation: &mut super::cancel::PrecommitCancellationGuard,
 ) -> Result<ThinkingRetry, Box<Response>> {
     if upstream.status() != StatusCode::BAD_REQUEST {
         return Ok(ThinkingRetry::Original(upstream));
@@ -1641,6 +1642,7 @@ pub(crate) async fn retry_thinking_off(
             attempt_index: AttemptIndex::try_from(1).expect("one retry index is valid"),
             reason: AttemptReason::ThinkingNegotiation,
         });
+        cancellation.update_anthropic(Some(ctx));
         server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }
     send_upstream(server, backend, parts, retry, &[])

@@ -63,6 +63,7 @@
 pub(crate) mod anthropic;
 pub(crate) mod anthropic_target;
 pub(crate) mod attempt;
+pub(crate) mod cancel;
 pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod inference;

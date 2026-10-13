@@ -186,6 +186,19 @@ async fn mock_chat(State(mock): State<MockState>, request: Request) -> Response 
                 .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             response
         }
+        "precommit-hang" if stream => {
+            let body = Body::from_stream(Hanging {
+                mock: mock.clone(),
+                first: None,
+            });
+            let mut response = Response::new(body);
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        }
         "hang" if stream => {
             // First event, then nothing — the client hangs up mid-stream
             // and the abort must propagate (the Drop flag proves it).
@@ -1232,6 +1245,50 @@ async fn unexpected_compression_records_a_protocol_failure() {
     assert_eq!(rows[0].kind, Some(RowKind::Error));
     assert_eq!(rows[0].status, Some(200));
     assert_eq!(rows[0].error_type.as_deref(), Some("response_protocol"));
+    assert_eq!(
+        rows[0]
+            .attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_index.get()),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn aborting_before_commitment_records_cancellation() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+
+    let request = tokio::spawn(async move {
+        client()
+            .post(toker_url(addr, "/v1/chat/completions"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(chat_body("precommit-hang", true))
+            .send()
+            .await
+    });
+    for _ in 0..100 {
+        if !mock.captured().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(mock.captured().len(), 1, "the actual send began");
+    request.abort();
+
+    for _ in 0..100 {
+        if mock.upstream_dropped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        mock.upstream_dropped.load(Ordering::SeqCst),
+        "cancellation dropped the upstream response"
+    );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("client_cancelled"));
     assert_eq!(
         rows[0]
             .attempt

@@ -314,6 +314,10 @@ impl ReadyAttempt {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(super::attempt::initial_provenance());
         }
+        let mut cancellation = super::cancel::PrecommitCancellationGuard::responses(
+            self.record.as_ref(),
+            self.frontend_wire.protocol(),
+        );
         let url = self.backend.endpoint("/responses");
         let upstream = match server
             .http
@@ -325,6 +329,7 @@ impl ReadyAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "codex upstream request failed");
                 if let Some(ctx) = self.record.as_ref() {
                     record_codex_error(
@@ -347,6 +352,7 @@ impl ReadyAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                cancellation.disarm();
                 if let Some(ctx) = self.record.as_ref() {
                     record_codex_error(
                         ctx,
@@ -362,13 +368,8 @@ impl ReadyAttempt {
                     "toker could not interpret the upstream response before commitment",
                 );
             }
-            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
-                return upstream_failure(
-                    self.frontend_wire.error_wire(),
-                    "toker upstream request was cancelled before response commitment",
-                );
-            }
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
                 if let Some(ctx) = self.record.as_ref() {
                     record_codex_error(
@@ -383,7 +384,9 @@ impl ReadyAttempt {
                 return truncated_body(self.frontend_wire.error_wire());
             }
         };
-        forward(self, server, upstream).await
+        let response = forward(self, server, upstream).await;
+        cancellation.disarm();
+        response
     }
 }
 

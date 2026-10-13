@@ -59,7 +59,6 @@ pub(crate) enum PrecommitOutcome<T> {
         failure: AttemptFailure,
         response: Option<T>,
     },
-    Cancelled,
 }
 
 pub(crate) fn transport_failure_type(error: &reqwest::Error) -> &'static str {

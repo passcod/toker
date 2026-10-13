@@ -19,7 +19,9 @@ negative value. `betas` NULL means "not captured", not "no betas".
 Actual upstream sends carry `attempt_group_id`, zero-based `attempt_index`, and
 `fallback_reason` (the physical compatibility name for the reason that attempt
 exists). Index zero is always `initial`; later indices name the transition, such
-as `thinking_negotiation`. Logical request counts group non-NULL group ids,
+as `thinking_negotiation`. A client cancellation after a send is an `error` row
+with `error_type = client_cancelled`, including when it happens before any
+frontend response is committed. Logical request counts group non-NULL group ids,
 while historical rows without one remain independent. Token, cost, meter, and
 error-attempt totals consume physical rows. Policy fields are independently
 nullable: a legacy-selected send has attempt provenance but no policy revision,

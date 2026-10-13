@@ -62,6 +62,7 @@ use super::record::{elapsed_ms, i64_of, now_ms, with_frontend};
 
 /// Everything a completion point knows about one anthropic request,
 /// minus the response itself.
+#[derive(Clone)]
 pub(crate) struct AnthropicRecordCtx {
     /// The server (for the store).
     pub(crate) server: Server,

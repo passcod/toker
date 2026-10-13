@@ -215,6 +215,8 @@ impl ReadyMessagesAttempt {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(super::attempt::initial_provenance());
         }
+        let mut cancellation =
+            super::cancel::PrecommitCancellationGuard::anthropic(self.record.as_ref());
         let sent = self.body.clone();
         let upstream = match super::proxy::send_upstream(
             &server,
@@ -227,6 +229,7 @@ impl ReadyMessagesAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "upstream request failed");
                 if let Some(ctx) = self.record.as_ref() {
                     super::record_anthropic::record_anthropic_error(
@@ -249,12 +252,17 @@ impl ReadyMessagesAttempt {
             sent,
             upstream,
             &mut self.record,
+            &mut cancellation,
         )
         .await
         {
             Ok(retry) => retry,
-            Err(response) => return *response,
+            Err(response) => {
+                cancellation.disarm();
+                return *response;
+            }
         };
+        cancellation.update_anthropic(self.record.as_ref());
         let response = match retry {
             super::anthropic::ThinkingRetry::Original(upstream) => {
                 let status = upstream.status();
@@ -295,6 +303,7 @@ impl ReadyMessagesAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                cancellation.disarm();
                 if let Some(ctx) = self.record.as_ref() {
                     super::record_anthropic::record_anthropic_error(
                         ctx,
@@ -310,13 +319,8 @@ impl ReadyMessagesAttempt {
                     "toker could not interpret the upstream response before commitment",
                 );
             }
-            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
-                return super::proxy::upstream_failure(
-                    super::proxy::ErrorWire::Anthropic,
-                    "toker upstream request was cancelled before response commitment",
-                );
-            }
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
                 if let Some(ctx) = self.record.as_ref() {
                     super::record_anthropic::record_anthropic_error(
@@ -331,7 +335,7 @@ impl ReadyMessagesAttempt {
                 return super::proxy::truncated_body(super::proxy::ErrorWire::Anthropic);
             }
         };
-        super::anthropic::forward_canonical_messages(
+        let response = super::anthropic::forward_canonical_messages(
             upstream,
             self.record,
             self.in_flight,
@@ -340,7 +344,9 @@ impl ReadyMessagesAttempt {
             self.expected_stream,
             rate_limits,
         )
-        .await
+        .await;
+        cancellation.disarm();
+        response
     }
 }
 
@@ -369,6 +375,8 @@ impl ReadyChatAttempt {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(super::attempt::initial_provenance());
         }
+        let mut cancellation =
+            super::cancel::PrecommitCancellationGuard::chat(self.record.as_ref());
         let upstream = match super::proxy::send_upstream(
             &server,
             self.backend.as_ref(),
@@ -380,6 +388,7 @@ impl ReadyChatAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "upstream request failed");
                 if let Some(ctx) = self.record.as_ref() {
                     super::record::record_error(
@@ -400,6 +409,7 @@ impl ReadyChatAttempt {
                 ..
             }) => response,
             Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
+                cancellation.disarm();
                 if let Some(ctx) = self.record.as_ref() {
                     super::record::record_error(
                         ctx,
@@ -413,13 +423,8 @@ impl ReadyChatAttempt {
                     "toker could not interpret the upstream response before commitment",
                 );
             }
-            Ok(super::attempt::PrecommitOutcome::Cancelled) => {
-                return super::proxy::upstream_failure(
-                    super::proxy::ErrorWire::Openai,
-                    "toker upstream request was cancelled before response commitment",
-                );
-            }
             Err(error) => {
+                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
                 if let Some(ctx) = self.record.as_ref() {
                     super::record::record_error(
@@ -432,14 +437,16 @@ impl ReadyChatAttempt {
                 return super::proxy::truncated_body(super::proxy::ErrorWire::Openai);
             }
         };
-        super::proxy::forward_chat_canonical(
+        let response = super::proxy::forward_chat_canonical(
             upstream,
             self.record,
             self.in_flight,
             &self.response_model,
             self.expected_stream,
         )
-        .await
+        .await;
+        cancellation.disarm();
+        response
     }
 }
 

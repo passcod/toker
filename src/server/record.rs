@@ -51,6 +51,7 @@ use super::Server;
 
 /// Everything a completion point knows about one request, minus the
 /// response itself.
+#[derive(Clone)]
 pub(crate) struct RecordCtx {
     /// The server (for the store and the route/backend id).
     pub(crate) server: Server,
