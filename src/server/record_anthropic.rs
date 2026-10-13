@@ -694,16 +694,18 @@ fn error_row(
 /// (row parity: the last-seen meters). No duration, no
 /// usage, never priced — a proxy-written row, excluded from API
 /// measurements by its kind.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_anthropic_released(
     server: &Server,
     session_id: &str,
     backend_id: &str,
+    frontend_protocol: &'static str,
     release: Release,
     grant: &Grant,
     stale_meters: Option<&Value>,
     frontend: Option<&str>,
 ) {
-    let row = crate::release::released_row(
+    let mut row = crate::release::released_row(
         session_id,
         backend_id,
         release,
@@ -712,12 +714,19 @@ pub(crate) fn record_anthropic_released(
         &server.config.gates,
         now_ms(),
     );
+    row.frontend = Some(frontend_protocol.to_owned());
+    row.route = Some(format!("{frontend_protocol}:{backend_id}"));
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
-        "POST /v1/messages → released {} ({release:?}) five_hour={:?} seven_day={:?}",
+        "POST {} → released {} ({release:?}) five_hour={:?} seven_day={:?}",
+        if frontend_protocol == "anthropic" {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        },
         session_id,
         grant.five_hour,
         grant.seven_day,

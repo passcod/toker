@@ -385,6 +385,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     &server,
                     session,
                     backend.id(),
+                    "anthropic",
                     release,
                     &merged,
                     meters_snapshot.as_ref(),

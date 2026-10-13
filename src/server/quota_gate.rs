@@ -6,8 +6,11 @@
 
 use serde_json::Value;
 
+use crate::ir::Release;
 use crate::middleware::lanes;
-use crate::middleware::quota::{Blocking, GateDecision, Meter, Meters, decide, plan_room};
+use crate::middleware::quota::{
+    Blocking, GateDecision, Grant, Meter, Meters, decide, grant_for, plan_room,
+};
 
 use super::{Server, record::now_ms};
 
@@ -35,6 +38,28 @@ pub(crate) fn load_meters(server: &Server, backend_id: &str) -> Option<Value> {
             tracing::error!(%error, "meter snapshot load failed");
             None
         })
+}
+
+pub(crate) fn grant_release(
+    server: &Server,
+    session_id: Option<&str>,
+    backend_id: &str,
+    release: Option<Release>,
+    stale_meters: Option<&Value>,
+) -> Option<(Release, Grant)> {
+    if !armed(server, backend_id) {
+        return None;
+    }
+    let (session, release) = session_id.zip(release)?;
+    let now = now_ms();
+    let fresh = grant_for(stale_meters.map(Meters::over), now);
+    if let Err(error) = crate::release::record_grant(&server.store, session, release, &fresh) {
+        tracing::error!(%error, "allowance record failed");
+    }
+    Some((
+        release,
+        crate::release::merged(&server.store, session, &fresh, now),
+    ))
 }
 
 pub(crate) fn decide_block(

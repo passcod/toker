@@ -68,7 +68,9 @@ use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
     record_openai_cold, record_openai_cold_quiet, record_route_unavailable, retry_after_ms,
 };
-use super::record_anthropic::{AnthropicRecordCtx, QuotaBlockedRecord, record_quota_blocked};
+use super::record_anthropic::{
+    AnthropicRecordCtx, QuotaBlockedRecord, record_anthropic_released, record_quota_blocked,
+};
 
 /// Request bodies are buffered for gating and canonical translation; 64 MiB
 /// is far beyond any chat body, so hitting the cap is a client bug worth a
@@ -143,7 +145,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let legacy_target = server
         .registry
         .resolve(ProtocolId::OpenAiChat, Some(model.as_str()));
-    let inference = super::inference::InferenceRequest::new(model.clone(), canonical);
+    let mut inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let canonical = inference.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
     let system_messages = Some(
@@ -191,7 +193,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let credentials =
         server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
     let lane = server.shadow_lane(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
-    let (target, attempt, authoritative) =
+    let (target, policy_plan) =
         match server.resolve_policy_attempt(&facts, &credentials, lane.as_ref()) {
             Ok(Some(plan)) => {
                 let target = match server.registry.resolve_binding(
@@ -212,17 +214,14 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                         );
                     }
                 };
-                let attempt = inference.prepare_policy(target.clone(), plan);
-                (target, attempt, true)
+                (target, Some(plan))
             }
             Ok(None) => {
                 let target = match legacy_target {
                     Ok(target) => target,
                     Err(_) => return super::openai_not_configured(),
                 };
-                let gate_model = target.effective_model().map(str::to_owned);
-                let attempt = inference.prepare(target.clone(), gate_model);
-                (target, attempt, false)
+                (target, None)
             }
             Err(super::PolicyAttemptError::Resolve {
                 revision_id,
@@ -271,14 +270,45 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                 );
             }
         };
-    let gate_model = attempt.effective_model().map(str::to_owned);
-    let backend = attempt.backend().clone();
+    let gate_model = policy_plan
+        .as_ref()
+        .map(|plan| plan.effective_model.clone())
+        .or_else(|| target.effective_model().map(str::to_owned));
+    let backend = target.provider().clone();
+    let meters = super::quota_gate::load_meters(&server, backend.id());
+    let release = crate::middleware::canonical::release_marker(&inference.canonical());
+    if let Some((release, grant)) = super::quota_gate::grant_release(
+        &server,
+        session_id.as_deref(),
+        backend.id(),
+        release,
+        meters.as_ref(),
+    ) {
+        record_anthropic_released(
+            &server,
+            session_id
+                .as_deref()
+                .expect("a granted release has a session"),
+            backend.id(),
+            "openai_chat",
+            release,
+            &grant,
+            meters.as_ref(),
+            frontend.as_deref(),
+        );
+    }
+    inference.strip_release(&original);
+    let authoritative = policy_plan.is_some();
+    let attempt = match policy_plan {
+        Some(plan) => inference.prepare_policy(target.clone(), plan),
+        None => inference.prepare(target.clone(), gate_model.clone()),
+    };
     if let Some(block) = super::quota_gate::decide_block(
         &server,
         backend.id(),
         session_id.as_deref(),
         frontend.as_deref(),
-        super::quota_gate::load_meters(&server, backend.id()),
+        meters,
     ) {
         let body = cold::ColdBlocking::openai_turn(
             &block.text,

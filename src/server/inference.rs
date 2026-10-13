@@ -43,6 +43,10 @@ impl InferenceRequest {
         self.canonical.as_ref().clone()
     }
 
+    pub(crate) fn strip_release(&mut self, original: &[u8]) -> bool {
+        crate::middleware::canonical::strip_release(Arc::make_mut(&mut self.canonical), original)
+    }
+
     pub(crate) fn prepare(
         &self,
         target: ModelTarget,
