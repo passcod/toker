@@ -86,7 +86,7 @@ impl PolicySnapshot {
 }
 
 struct RuntimeState {
-    candidate: Option<Arc<CompiledPolicy>>,
+    current: Option<CurrentPolicy>,
     inventory: Arc<OfferInventory>,
     availability: Arc<AvailabilitySnapshot>,
     inventory_generation: u64,
@@ -109,6 +109,14 @@ struct OpenCircuit {
     until_ms: i64,
     catalogue_generation: u64,
     credential_generation: u64,
+}
+
+#[derive(Clone)]
+struct CurrentPolicy {
+    revision_id: Option<i64>,
+    activation_scope: Option<ActivationScope>,
+    forced_cache_transition: bool,
+    policy: Arc<CompiledPolicy>,
 }
 
 #[derive(Clone)]
@@ -207,13 +215,56 @@ impl PolicyRuntime {
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
     ) -> Self {
+        Self::with_current(
+            store,
+            topology,
+            CurrentPolicy {
+                revision_id: None,
+                activation_scope: None,
+                forced_cache_transition: false,
+                policy,
+            },
+            inventory,
+            availability,
+        )
+    }
+
+    pub fn new_active(
+        store: Arc<Store>,
+        topology: RouteRegistry,
+        revision: &crate::store::PolicyRevision,
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+    ) -> Self {
+        Self::with_current(
+            store,
+            topology,
+            CurrentPolicy {
+                revision_id: Some(revision.revision_id),
+                activation_scope: Some(revision.activation_scope),
+                forced_cache_transition: revision.forced_cache_transition,
+                policy,
+            },
+            inventory,
+            availability,
+        )
+    }
+
+    fn with_current(
+        store: Arc<Store>,
+        topology: RouteRegistry,
+        current: CurrentPolicy,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+    ) -> Self {
         let catalogue_generations = Arc::new(BTreeMap::new());
         let credential_generations = Arc::new(BTreeMap::new());
         Self {
             store,
             topology,
             state: RwLock::new(RuntimeState {
-                candidate: Some(policy),
+                current: Some(current),
                 inventory,
                 availability,
                 inventory_generation: 0,
@@ -231,11 +282,12 @@ impl PolicyRuntime {
             .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = state.current.as_ref()?;
         Some(Arc::new(PolicySnapshot {
-            revision_id: None,
-            activation_scope: None,
-            forced_cache_transition: false,
-            policy: state.candidate.clone()?,
+            revision_id: current.revision_id,
+            activation_scope: current.activation_scope,
+            forced_cache_transition: current.forced_cache_transition,
+            policy: current.policy.clone(),
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
             inventory_generation: state.inventory_generation,
@@ -264,6 +316,47 @@ impl PolicyRuntime {
         availability: Arc<AvailabilitySnapshot>,
         changed_catalogue_bindings: &BTreeSet<BindingId>,
     ) -> Arc<PolicySnapshot> {
+        self.replace_policy(
+            CurrentPolicy {
+                revision_id: None,
+                activation_scope: None,
+                forced_cache_transition: false,
+                policy,
+            },
+            inventory,
+            availability,
+            changed_catalogue_bindings,
+        )
+    }
+
+    pub fn replace_active(
+        &self,
+        revision: &crate::store::PolicyRevision,
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        changed_catalogue_bindings: &BTreeSet<BindingId>,
+    ) -> Arc<PolicySnapshot> {
+        self.replace_policy(
+            CurrentPolicy {
+                revision_id: Some(revision.revision_id),
+                activation_scope: Some(revision.activation_scope),
+                forced_cache_transition: revision.forced_cache_transition,
+                policy,
+            },
+            inventory,
+            availability,
+            changed_catalogue_bindings,
+        )
+    }
+
+    fn replace_policy(
+        &self,
+        current: CurrentPolicy,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        changed_catalogue_bindings: &BTreeSet<BindingId>,
+    ) -> Arc<PolicySnapshot> {
         let _mutation = self
             .mutation
             .lock()
@@ -274,14 +367,14 @@ impl PolicyRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.inventory_generation = state.inventory_generation.saturating_add(1);
         bump_generations(&mut state.catalogue_generations, changed_catalogue_bindings);
-        state.candidate = Some(policy.clone());
+        state.current = Some(current.clone());
         state.inventory = inventory.clone();
         state.availability = availability.clone();
         let snapshot = Arc::new(PolicySnapshot {
-            revision_id: None,
-            activation_scope: None,
-            forced_cache_transition: false,
-            policy,
+            revision_id: current.revision_id,
+            activation_scope: current.activation_scope,
+            forced_cache_transition: current.forced_cache_transition,
+            policy: current.policy,
             inventory,
             availability,
             inventory_generation: state.inventory_generation,
@@ -310,7 +403,7 @@ impl PolicyRuntime {
         bump_generations(&mut state.catalogue_generations, changed_catalogue_bindings);
         state.inventory = inventory;
         state.availability = availability;
-        state.candidate = None;
+        state.current = None;
         clear_binding_circuits(&self.circuits, changed_catalogue_bindings);
     }
 
@@ -407,7 +500,7 @@ impl PolicyRuntime {
             .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let policy = state.candidate.clone()?;
+        let current = state.current.clone()?;
         let evidence = PolicyEvidence {
             inventory: state.inventory.clone(),
             availability: state.availability.clone(),
@@ -416,10 +509,10 @@ impl PolicyRuntime {
             credential_generations: state.credential_generations.clone(),
         };
         let snapshot = Arc::new(PolicySnapshot {
-            revision_id: None,
-            activation_scope: None,
-            forced_cache_transition: false,
-            policy,
+            revision_id: current.revision_id,
+            activation_scope: current.activation_scope,
+            forced_cache_transition: current.forced_cache_transition,
+            policy: current.policy,
             inventory: evidence.inventory.clone(),
             availability: evidence.availability.clone(),
             inventory_generation: evidence.inventory_generation,
@@ -711,6 +804,40 @@ mod tests {
             model_id: "invented-model".to_owned(),
             failure: FailureClass::Overload,
         }
+    }
+
+    #[test]
+    fn active_snapshot_metadata_survives_inventory_replacement() {
+        let (store, _) = runtime();
+        let revision_id = revision(&store, "active");
+        let revision = store
+            .load_policy_revision(revision_id)
+            .unwrap()
+            .expect("revision");
+        let topology = RouteRegistry::new(
+            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
+        );
+        let runtime = PolicyRuntime::new_active(
+            store,
+            topology,
+            &revision,
+            compiled("active"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+        );
+        let before = runtime.capture().unwrap();
+        let after = runtime.replace_active(
+            &revision,
+            compiled("active refresh"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::new(),
+        );
+        assert_eq!(before.revision_id(), Some(revision_id));
+        assert_eq!(after.revision_id(), Some(revision_id));
+        assert_eq!(after.activation_scope(), Some(ActivationScope::NewLanes));
+        assert_eq!(after.inventory_generation(), 1);
     }
 
     #[test]
