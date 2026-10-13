@@ -42,7 +42,8 @@ pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
     LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
     PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter,
-    PublicationCasResult, PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
+    PublicationCasResult, PublicationKey, PublicationState, RevisionOneActivation,
+    RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -424,6 +425,25 @@ impl Store {
         state::insert_policy_revision(&*self.conn()?, revision)
     }
 
+    /// Atomically establish revision-one routing ownership, or load the
+    /// already-active revision without consulting the supplied legacy document.
+    pub fn activate_revision_one(
+        &self,
+        document: &crate::policy::ValidatedPolicyDocument,
+        activated_ms: i64,
+        desired_inventory_generation: i64,
+        publications: &[PublicationKey],
+    ) -> Result<RevisionOneActivation> {
+        let mut conn = self.conn()?;
+        state::activate_revision_one(
+            &mut conn,
+            document,
+            activated_ms,
+            desired_inventory_generation,
+            publications,
+        )
+    }
+
     pub fn load_policy_revision(&self, revision_id: i64) -> Result<Option<PolicyRevision>> {
         state::load_policy_revision(&*self.conn()?, revision_id)
     }
@@ -704,9 +724,9 @@ mod tests {
         LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
         PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
         PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState,
-        RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, Store,
-        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-        is_api_measurement,
+        RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind, SessionCostGroup,
+        SessionLineage, Store, StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
+        StoredSkipReason, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -2632,6 +2652,104 @@ mod tests {
             document: &policy("missing-parent"),
         });
         assert!(matches!(missing_parent, Err(Error::Sqlite(_))));
+    }
+
+    #[test]
+    fn revision_one_activation_is_atomic_and_idempotent() {
+        let store = mem_store();
+        let document = policy("revision one");
+        let publication = PublicationKey::new(
+            FrontendScope::Profile {
+                profile: ProfileId::new("claude").unwrap(),
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
+        let activated = store
+            .activate_revision_one(&document, 200, 7, std::slice::from_ref(&publication))
+            .expect("activate");
+        let RevisionOneActivation::Activated {
+            revision,
+            state,
+            publications,
+        } = activated
+        else {
+            panic!("first call activates")
+        };
+        assert_eq!(revision.source, PolicyRevisionSource::Legacy);
+        assert_eq!(state.active_revision_id, Some(revision.revision_id));
+        assert_eq!(state.legacy_imported_ms, Some(200));
+        assert_eq!(state.draft_generation, 1);
+        assert_eq!(
+            state.draft.as_ref().unwrap().base_revision_id,
+            revision.revision_id
+        );
+        assert_eq!(state.draft.as_ref().unwrap().document, document);
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].desired_revision_id, revision.revision_id);
+        assert_eq!(publications[0].desired_inventory_generation, 7);
+        assert_eq!(publications[0].state, PublicationState::Pending);
+
+        let other = policy("ignored after ownership");
+        let restarted = store
+            .activate_revision_one(&other, 300, 8, &[])
+            .expect("load active");
+        let RevisionOneActivation::AlreadyActive {
+            revision: loaded,
+            state: loaded_state,
+            publications: loaded_publications,
+        } = restarted
+        else {
+            panic!("restart reuses active revision")
+        };
+        assert_eq!(loaded.revision_id, revision.revision_id);
+        assert_eq!(loaded.document, document);
+        assert_eq!(loaded_state, state);
+        assert_eq!(loaded_publications, publications);
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revision_one_activation_rolls_back_on_publication_failure() {
+        let store = mem_store();
+        let document = policy("revision one");
+        let duplicate = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_revision_one_publication BEFORE INSERT ON routing_publications
+             BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            store
+                .activate_revision_one(&document, 200, 0, &[duplicate])
+                .is_err()
+        );
+        let state = store.load_routing_policy_state().unwrap();
+        assert_eq!(state.active_revision_id, None);
+        assert_eq!(state.legacy_imported_ms, None);
+        assert_eq!(state.draft_generation, 0);
+        assert_eq!(store.load_policy_revisions().unwrap(), vec![]);
+        assert_eq!(store.load_publications().unwrap(), vec![]);
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_revision_one_publication")
+            .unwrap();
+        let retried = store
+            .activate_revision_one(&document, 201, 0, &[])
+            .expect("retry activates");
+        assert!(matches!(retried, RevisionOneActivation::Activated { .. }));
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
     }
 
     #[test]

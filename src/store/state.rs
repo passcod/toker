@@ -159,6 +159,21 @@ pub enum DraftCasResult {
     },
 }
 
+/// Result of the one-time legacy-policy ownership transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionOneActivation {
+    Activated {
+        revision: PolicyRevision,
+        state: RoutingPolicyState,
+        publications: Vec<RoutingPublication>,
+    },
+    AlreadyActive {
+        revision: PolicyRevision,
+        state: RoutingPolicyState,
+        publications: Vec<RoutingPublication>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationState {
     Pending,
@@ -679,6 +694,94 @@ pub(super) fn insert_policy_revision(
     )?;
     load_policy_revision(conn, conn.last_insert_rowid())?
         .ok_or_else(|| Error::InvalidRoutingState("inserted policy revision disappeared".into()))
+}
+
+pub(super) fn activate_revision_one(
+    conn: &mut Connection,
+    document: &ValidatedPolicyDocument,
+    activated_ms: i64,
+    desired_inventory_generation: i64,
+    publications: &[PublicationKey],
+) -> Result<RevisionOneActivation> {
+    if desired_inventory_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative inventory generation".into(),
+        ));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = load_routing_policy_state(&tx)?;
+    if let Some(revision_id) = current.active_revision_id {
+        let revision = load_policy_revision(&tx, revision_id)?.ok_or_else(|| {
+            Error::InvalidRoutingState(format!(
+                "active policy revision {revision_id} does not exist"
+            ))
+        })?;
+        let publications = load_publications(&tx)?;
+        tx.commit()?;
+        return Ok(RevisionOneActivation::AlreadyActive {
+            revision,
+            state: current,
+            publications,
+        });
+    }
+    if current.legacy_imported_ms.is_some() {
+        return Err(Error::InvalidRoutingState(
+            "legacy import marker exists without an active revision".into(),
+        ));
+    }
+
+    let revision = insert_policy_revision(
+        &tx,
+        &NewPolicyRevision {
+            created_ms: activated_ms,
+            activated_ms,
+            description: Some("Generated revision-one legacy routing"),
+            activation_scope: ActivationScope::NewLanes,
+            forced_cache_transition: false,
+            source: PolicyRevisionSource::Legacy,
+            parent_revision_id: None,
+            document,
+        },
+    )?;
+    let document_json = String::from_utf8(
+        policy_bytes(document).map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
+    )
+    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?;
+    let changed = tx.execute(
+        "UPDATE routing_policy_state SET active_revision_id = ?1,
+             draft_generation = draft_generation + 1, draft_base_revision_id = ?1,
+             draft_document_json = ?2, draft_fingerprint = ?3,
+             draft_updated_ms = ?4, legacy_imported_ms = ?4
+         WHERE id = 1 AND active_revision_id IS NULL AND legacy_imported_ms IS NULL",
+        rusqlite::params![
+            revision.revision_id,
+            document_json,
+            revision.fingerprint.to_string(),
+            activated_ms
+        ],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidRoutingState(
+            "revision-one ownership state changed during activation".into(),
+        ));
+    }
+    for key in publications {
+        set_publication_desired(
+            &tx,
+            key,
+            revision.revision_id,
+            desired_inventory_generation,
+            activated_ms,
+        )?;
+    }
+    let state = load_routing_policy_state(&tx)?;
+    let publications = load_publications(&tx)?;
+    tx.commit()?;
+    Ok(RevisionOneActivation::Activated {
+        revision,
+        state,
+        publications,
+    })
 }
 
 pub(super) fn load_policy_revision(
