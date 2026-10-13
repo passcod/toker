@@ -60,7 +60,7 @@ use crate::store::{
 use crate::translate::TranslationReport;
 
 use super::Server;
-use super::record::{elapsed_ms, i64_of, now_ms, with_frontend};
+use super::record::{elapsed_ms, i64_of, now_ms, persist_lane_pin, with_frontend};
 
 /// Everything a completion point knows about one anthropic request,
 /// minus the response itself.
@@ -90,6 +90,8 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) attempt: Option<AttemptProvenance>,
     /// The authoritative policy route that selected this send.
     pub(crate) policy_routing: Option<PolicyRouteProvenance>,
+    /// One successful attempt's already-decided lane-pin transition.
+    pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
     /// the header was absent.
     pub(crate) betas: Option<Value>,
@@ -176,6 +178,7 @@ pub(crate) fn record_anthropic_measurement(
         ctx.server
             .note_binding_observed(&ctx.binding_id, reported_model, ts_ms, None);
     }
+    persist_successful_pin(ctx, ts_ms);
 
     let model = reported_model
         .or_else(|| capture.and_then(AnthropicCapture::model))
@@ -287,6 +290,17 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
         || presence.reasoning
         || presence.web_searches
         || presence.code_execs
+}
+
+fn persist_successful_pin(ctx: &AnthropicRecordCtx, ts_ms: i64) {
+    persist_lane_pin(
+        &ctx.server,
+        ctx.session_id.as_deref(),
+        ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+        ctx.ping,
+        ctx.pin_transition.as_ref(),
+        ts_ms,
+    );
 }
 
 /// What this response taught the lane table and the learned model store,
@@ -1407,6 +1421,7 @@ pub(crate) fn record_responses_measurement(
     ) {
         tracing::error!(%error, "lane update failed");
     }
+    persist_successful_pin(ctx, ts_ms);
     ctx.server.evaluate_awake();
 
     let model = capture.model().unwrap_or("?");

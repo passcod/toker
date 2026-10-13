@@ -64,6 +64,8 @@ pub(crate) struct RecordCtx {
     pub(crate) attempt: Option<AttemptProvenance>,
     /// The authoritative policy route that selected this send.
     pub(crate) policy_routing: Option<PolicyRouteProvenance>,
+    /// One successful attempt's already-decided lane-pin transition.
+    pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -187,6 +189,7 @@ pub(crate) fn record_measurement(
         ctx.server
             .note_binding_observed(&ctx.binding_id, model, ts_ms, None);
     }
+    persist_successful_pin(ctx, ts_ms);
 
     tracing::info!(
         "POST /v1/chat/completions → {} ledgered={} model={} provider={} ({:.1}s)",
@@ -203,9 +206,60 @@ pub(crate) fn record_measurement(
     ctx.server.evaluate_awake();
 }
 
-/// Record a non-2xx usage-path response (plan: Server core): an error row
-/// with status, error type, and retry-after — never priced, no usage
-/// buckets.
+fn persist_successful_pin(ctx: &RecordCtx, ts_ms: i64) {
+    persist_lane_pin(
+        &ctx.server,
+        ctx.session_id.as_deref(),
+        ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+        ctx.ping,
+        ctx.pin_transition.as_ref(),
+        ts_ms,
+    );
+}
+
+pub(super) fn persist_lane_pin(
+    server: &Server,
+    session_id: Option<&str>,
+    tools_hash: Option<&str>,
+    ping: bool,
+    decision: Option<&crate::policy::LaneTransitionDecision>,
+    ts_ms: i64,
+) {
+    let Some(decision) = decision else {
+        return;
+    };
+    let Some(key) = lanes::lane_key(session_id, tools_hash) else {
+        return;
+    };
+    if let Err(error) = server.store.insert_lane_if_absent(&crate::store::Lane {
+        key: key.clone(),
+        session_id: session_id.map(str::to_owned),
+        tools_hash: tools_hash.map(str::to_owned),
+        updated_ms: ts_ms,
+        prompt_tokens: None,
+        ttl: None,
+        ping: ping.then_some(true),
+        noticed_at: None,
+        forced_from: None,
+        forced_to: None,
+        pin_generation: 0,
+        pin: None,
+    }) {
+        tracing::error!(%error, lane_key = key, "lane creation for pin failed");
+        return;
+    }
+    match crate::policy::persist_transition(&server.store, &key, decision) {
+        Ok(crate::policy::PinPersistence::Conflict) => {
+            tracing::debug!(
+                lane_key = key,
+                "lane pin CAS lost to a concurrent completion"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, lane_key = key, "lane pin update failed"),
+    }
+}
+
 pub(crate) fn record_route_unavailable(
     server: &Server,
     started: Instant,

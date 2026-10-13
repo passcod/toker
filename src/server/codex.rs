@@ -244,6 +244,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         binding_id: target.binding().id().clone(),
         attempt: None,
         policy_routing: None,
+        pin_transition: None,
         betas: None,
         shape: prepared_shape.map(|(_, shape)| shape),
         ping,

@@ -103,7 +103,10 @@ mod tests {
 
     use crate::config::{Config, OpenRouterConfig};
     use crate::middleware::awake::ProcessSpawner;
-    use crate::policy::BindingId;
+    use crate::policy::{
+        BindingId, CandidateId, LaneState, PinIdentity, RouteFingerprint, RouteId, TransitionCause,
+        decide_transition,
+    };
     use crate::providers::{OpenRouter, Provider};
     use crate::server::Server;
     use crate::store::{AttemptReason, RowKind, Store};
@@ -137,6 +140,7 @@ mod tests {
             binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
             attempt: Some(crate::server::attempt::initial_provenance()),
             policy_routing: None,
+            pin_transition: None,
             started: Instant::now(),
             session_id: None,
             ping: false,
@@ -156,6 +160,86 @@ mod tests {
                 assert_eq!(
                     row.attempt.as_ref().map(|attempt| attempt.reason),
                     Some(AttemptReason::Initial)
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("cancellation row did not land");
+    }
+
+    #[tokio::test]
+    async fn cancellation_records_the_attempt_without_pinning_the_lane() {
+        let dir = crate::test_support::tempdir("cancel-pin-");
+        let path = dir.join("toker.toml");
+        std::fs::write(&path, "[providers.openrouter]\n").expect("config");
+        let mut config = Config::load_from(&path).expect("load config");
+        config.db_path = ":memory:".into();
+        config.openrouter = Some(OpenRouterConfig::default());
+        config.default_backend_openai_chat = Some("openrouter".to_owned());
+        let store = Arc::new(Store::open(&config.db_path).expect("store"));
+        let server = Server::with_seams(
+            config,
+            store.clone(),
+            Box::new(ProcessSpawner),
+            Arc::new(crate::secrets::MemoryStore::new()),
+        )
+        .expect("server");
+        let backend: Arc<dyn Provider> = Arc::new(OpenRouter::new(
+            "http://127.0.0.1:9/v1".parse().expect("url"),
+            None,
+        ));
+        let pin = PinIdentity {
+            policy_revision_id: 1,
+            policy_route_id: RouteId::new("route").expect("route"),
+            route_fingerprint: "11"
+                .repeat(32)
+                .parse::<RouteFingerprint>()
+                .expect("fingerprint"),
+            candidate_id: CandidateId::new("candidate").expect("candidate"),
+            binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
+            baseline_model: "example/model".to_owned(),
+            effective_model: "example/model".to_owned(),
+        };
+        let ctx = RecordCtx {
+            server,
+            backend,
+            binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
+            attempt: Some(crate::server::attempt::initial_provenance()),
+            policy_routing: None,
+            pin_transition: Some(decide_transition(
+                &LaneState::Absent,
+                pin,
+                TransitionCause::Activation {
+                    scope: crate::policy::ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+            )),
+            started: Instant::now(),
+            session_id: Some("cancelled-session".to_owned()),
+            ping: false,
+            requested_model: Some("example/model".to_owned()),
+            effective_model: Some("example/model".to_owned()),
+            shape: Some(crate::ir::openai_chat::Shape {
+                req_bytes: 1,
+                req_messages: Some(1),
+                req_tools: 0,
+                tools_hash: "tools".to_owned(),
+                system_chars: 0,
+                system_hash: String::new(),
+                system_blocks: vec![],
+                summarising: false,
+            }),
+            system_messages: None,
+            frontend: None,
+        };
+
+        drop(PrecommitCancellationGuard::chat(Some(&ctx)));
+        for _ in 0..100 {
+            if !store.requests_since(0, 10).expect("rows").is_empty() {
+                assert!(
+                    store.load_lanes().expect("lanes").is_empty(),
+                    "client cancellation cannot select the lane pin"
                 );
                 return;
             }

@@ -389,6 +389,11 @@ impl Store {
         state::upsert_lane(&*self.conn()?, lane)
     }
 
+    /// Create an absent lane without replacing evidence written concurrently.
+    pub fn insert_lane_if_absent(&self, lane: &Lane) -> Result<()> {
+        state::insert_lane_if_absent(&*self.conn()?, lane)
+    }
+
     /// One lane by key.
     pub fn load_lane(&self, key: &str) -> Result<Option<Lane>> {
         state::load_lane(&*self.conn()?, key)
@@ -3093,6 +3098,54 @@ mod tests {
                 .unwrap(),
             LanePinCasResult::Updated { generation: 2 },
         );
+    }
+
+    #[test]
+    fn insert_lane_if_absent_preserves_existing_evidence_and_pin() {
+        let store = mem_store();
+        let revision_id = revision(&store, "insert-if-absent", None);
+        let mut existing = unpinned_lane("session|existing");
+        store.upsert_lane(&existing).unwrap();
+        let pin = LanePin {
+            policy_revision_id: revision_id,
+            policy_route_id: RouteId::new("route").unwrap(),
+            route_fingerprint: "22".repeat(32).parse::<RouteFingerprint>().unwrap(),
+            candidate_id: CandidateId::new("candidate").unwrap(),
+            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+            baseline_model: "base".to_owned(),
+            effective_model: "effective".to_owned(),
+        };
+        store
+            .compare_and_swap_lane_pin(&existing.key, 0, None, Some(&pin))
+            .unwrap();
+
+        let placeholder = Lane {
+            key: existing.key.clone(),
+            session_id: existing.session_id.clone(),
+            tools_hash: existing.tools_hash.clone(),
+            updated_ms: 99,
+            prompt_tokens: None,
+            ttl: None,
+            ping: Some(true),
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        };
+        store.insert_lane_if_absent(&placeholder).unwrap();
+
+        let loaded = store.load_lane(&existing.key).unwrap().unwrap();
+        assert_eq!(loaded.updated_ms, existing.updated_ms);
+        assert_eq!(loaded.prompt_tokens, existing.prompt_tokens);
+        assert_eq!(loaded.ttl, existing.ttl);
+        assert_eq!(loaded.ping, existing.ping);
+        assert_eq!(loaded.pin_generation, 1);
+        assert_eq!(loaded.pin, Some(pin));
+
+        existing.key = "session|absent".to_owned();
+        store.insert_lane_if_absent(&existing).unwrap();
+        assert_eq!(store.load_lane(&existing.key).unwrap(), Some(existing));
     }
 
     #[test]

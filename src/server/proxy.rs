@@ -298,6 +298,23 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         );
     }
     inference.strip_release(&original);
+    let pin_transition = if cold_lane.is_none() {
+        policy_plan
+            .as_ref()
+            .and_then(crate::policy::AttemptPlan::pin_identity)
+            .map(|prospective| {
+                crate::policy::decide_transition(
+                    &crate::policy::LaneState::Absent,
+                    prospective,
+                    crate::policy::TransitionCause::Activation {
+                        scope: crate::policy::ActivationScope::NewLanes,
+                        forced_cache_transition: false,
+                    },
+                )
+            })
+    } else {
+        None
+    };
     let authoritative = policy_plan.is_some();
     let attempt = match policy_plan {
         Some(plan) => inference.prepare_policy(target.clone(), plan),
@@ -347,6 +364,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         binding_id: attempt.binding().id().clone(),
         attempt: None,
         policy_routing: None,
+        pin_transition,
         started,
         session_id: session_id.clone(),
         ping,
@@ -1073,6 +1091,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         binding_id: ctx.binding_id,
         attempt: ctx.attempt,
         policy_routing: ctx.policy_routing,
+        pin_transition: ctx.pin_transition,
         betas: None,
         shape,
         ping: ctx.ping,

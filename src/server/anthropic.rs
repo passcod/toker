@@ -449,6 +449,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,
+            pin_transition: None,
             betas,
             shape: shape.clone(),
             ping,

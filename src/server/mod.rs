@@ -561,6 +561,12 @@ impl Server {
         let Some(current_revision_id) = current.revision_id() else {
             return Ok(None);
         };
+        if pinned_revision.is_none()
+            && lane.is_some()
+            && current.activation_scope() == Some(crate::policy::ActivationScope::NewLanes)
+        {
+            return Ok(None);
+        }
         let (snapshot, revision_id) = match pinned_revision {
             Some(revision_id) => (
                 runtime.capture_revision_with_evidence(revision_id, &evidence)?,
@@ -1648,7 +1654,7 @@ mod tests {
     use crate::store::Store;
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::IntoResponse;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A server over a scratch config whose providers point at
@@ -1693,10 +1699,19 @@ version_probe = false
         Server::new(config, store).expect("server builds")
     }
 
-    type ChatBodies = Arc<Mutex<Vec<serde_json::Value>>>;
+    const CHAT_WITHOUT_USAGE: u8 = 1;
+    const CHAT_FAILURE: u8 = 2;
+
+    #[derive(Default)]
+    struct ChatUpstream {
+        seen: Mutex<Vec<serde_json::Value>>,
+        response_mode: AtomicU8,
+    }
+
+    type ChatBodies = Arc<ChatUpstream>;
 
     async fn chat_upstream(
-        axum::extract::State(seen): axum::extract::State<ChatBodies>,
+        axum::extract::State(upstream): axum::extract::State<ChatBodies>,
         request: axum::extract::Request,
     ) -> axum::response::Response {
         let body = match axum::body::to_bytes(request.into_body(), 1 << 20).await {
@@ -1707,23 +1722,33 @@ version_probe = false
             Ok(value) => value,
             Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         };
-        seen.lock().unwrap().push(value);
-        (
-            StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "id": "chatcmpl-policy",
-                "model": "policy-effective",
-                "object": "chat.completion",
-                "created": 1,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "ok"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
-            })),
-        )
-            .into_response()
+        upstream.seen.lock().unwrap().push(value);
+        let response_mode = upstream.response_mode.load(Ordering::Relaxed);
+        if response_mode == CHAT_FAILURE {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "upstream_error", "message": "test failure"}
+                })),
+            )
+                .into_response();
+        }
+        let mut response = serde_json::json!({
+            "id": "chatcmpl-policy",
+            "model": "policy-effective",
+            "object": "chat.completion",
+            "created": 1,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        });
+        if response_mode == 1 {
+            response.as_object_mut().unwrap().remove("usage");
+        }
+        (StatusCode::OK, axum::Json(response)).into_response()
     }
 
     async fn policy_chat_server() -> (Server, ChatBodies) {
@@ -1823,6 +1848,260 @@ api_key = "sk-proj-test"
         (server, seen)
     }
 
+    #[test]
+    fn new_lanes_activation_preserves_an_existing_unpinned_lane() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let lane = crate::policy::LaneFacts {
+            temperature: crate::policy::CacheTemperature::Unknown,
+            pinned: None,
+            forced_from: None,
+            forced_to: None,
+        };
+        assert!(
+            server
+                .resolve_policy_attempt(
+                    &facts,
+                    &crate::policy::CredentialSnapshot::new(),
+                    Some(&lane),
+                )
+                .expect("preservation is not a resolver failure")
+                .is_none(),
+            "an existing unpinned lane stays on legacy authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_policy_chat_without_usage_still_pins_its_lane() {
+        let (server, upstream) = policy_chat_server().await;
+        upstream.response_mode.store(1, Ordering::Relaxed);
+        let store = server.store.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("toker binds");
+        let address = listener.local_addr().expect("toker address");
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .await
+                .expect("toker serves")
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .header("x-toker-session", "policy-no-usage")
+            .json(&serde_json::json!({
+                "model": "policy-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let lane = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("policy-no-usage"))
+            .expect("successful policy request created a lane");
+        assert_eq!(lane.pin_generation, 1);
+        assert_eq!(
+            lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
+            Some("openai_api.openai_chat_completions")
+        );
+        assert!(
+            store.requests_since(0, 10).expect("ledger rows").is_empty(),
+            "usage-less success preserves the existing no-measurement behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_policy_chat_does_not_pin_its_lane() {
+        let (server, upstream) = policy_chat_server().await;
+        upstream.response_mode.store(2, Ordering::Relaxed);
+        let store = server.store.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("toker binds");
+        let address = listener.local_addr().expect("toker address");
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .await
+                .expect("toker serves")
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .header("x-toker-session", "policy-failure")
+            .json(&serde_json::json!({
+                "model": "policy-alias",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            store
+                .load_lanes()
+                .expect("lanes")
+                .into_iter()
+                .all(|lane| lane.session_id.as_deref() != Some("policy-failure")),
+            "a terminal provider failure cannot select the lane pin"
+        );
+        let rows = store.requests_since(0, 10).expect("ledger rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, Some(crate::store::RowKind::Error));
+    }
+
+    #[test]
+    fn translated_chat_successes_persist_the_pending_lane_pin() {
+        use crate::policy::{
+            BindingId, CandidateId, LaneState, PinIdentity, RouteFingerprint, RouteId,
+            TransitionCause, decide_transition,
+        };
+        use crate::server::record::RecordCtx;
+        use crate::server::record_anthropic::{
+            record_anthropic_measurement, record_responses_measurement,
+        };
+
+        let dir = crate::setup::test_dir("translated-chat-pin");
+        let server = server(&dir);
+        let document = crate::policy::PolicyDocument {
+            format_version: crate::policy::CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![],
+            presentations: vec![],
+            routes: vec![],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
+        }
+        .validate()
+        .expect("policy validates");
+        let revision = server
+            .store
+            .insert_policy_revision(&crate::store::NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some("translated Chat pin test"),
+                activation_scope: crate::policy::ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: crate::store::PolicyRevisionSource::Draft,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .expect("revision");
+        let make_record = |session: &str, binding: &str, model: &str| {
+            let binding_id = BindingId::new(binding).expect("binding");
+            let target = server
+                .registry
+                .resolve_binding(ProtocolId::OpenAiChat, &binding_id, Some(model), model)
+                .expect("configured translated Chat target");
+            let pin = PinIdentity {
+                policy_revision_id: revision.revision_id,
+                policy_route_id: RouteId::new(format!("route-{session}")).expect("route"),
+                route_fingerprint: "11"
+                    .repeat(32)
+                    .parse::<RouteFingerprint>()
+                    .expect("fingerprint"),
+                candidate_id: CandidateId::new(format!("candidate-{session}")).expect("candidate"),
+                binding_id: binding_id.clone(),
+                baseline_model: model.to_owned(),
+                effective_model: model.to_owned(),
+            };
+            RecordCtx {
+                server: server.clone(),
+                backend: target.provider().clone(),
+                binding_id,
+                attempt: None,
+                policy_routing: None,
+                pin_transition: Some(decide_transition(
+                    &LaneState::Absent,
+                    pin,
+                    TransitionCause::Activation {
+                        scope: crate::policy::ActivationScope::NewLanes,
+                        forced_cache_transition: false,
+                    },
+                )),
+                started: std::time::Instant::now(),
+                session_id: Some(session.to_owned()),
+                ping: false,
+                requested_model: Some(model.to_owned()),
+                effective_model: Some(model.to_owned()),
+                shape: Some(crate::ir::openai_chat::Shape {
+                    req_bytes: 1,
+                    req_messages: Some(1),
+                    req_tools: 0,
+                    tools_hash: format!("tools-{session}"),
+                    system_chars: 0,
+                    system_hash: String::new(),
+                    system_blocks: vec![],
+                    summarising: false,
+                }),
+                system_messages: None,
+                frontend: None,
+            }
+        };
+
+        let anthropic = make_record(
+            "anthropic-chat",
+            "anthropic_sub.anthropic_messages",
+            "claude-sonnet-5",
+        );
+        let anthropic_backend = anthropic.backend.clone();
+        let anthropic = super::proxy::chat_cross_record(anthropic, anthropic_backend);
+        record_anthropic_measurement(&anthropic, None, Some("claude-sonnet-5"), None, 200);
+
+        let codex = make_record("codex-chat", "codex_sub.codex_responses", "gpt-5.6-sol");
+        let codex_backend = codex.backend.clone();
+        let codex = super::proxy::chat_cross_record(codex, codex_backend);
+        let mut parser = crate::providers::codex::ResponsesSse::new();
+        let mut capture = crate::providers::codex::TurnCapture::new();
+        for event in parser.feed(
+            br#"data: {"type":"response.completed","response":{"id":"response_test","model":"gpt-5.6-sol","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"end_turn":true}}
+
+"#,
+        ) {
+            capture.observe(&event);
+        }
+        assert!(capture.turn_ended());
+        record_responses_measurement(&codex, &capture, None, 200, "openai_chat", None);
+
+        for (session, binding) in [
+            ("anthropic-chat", "anthropic_sub.anthropic_messages"),
+            ("codex-chat", "codex_sub.codex_responses"),
+        ] {
+            let lane = server
+                .store
+                .load_lanes()
+                .expect("lanes")
+                .into_iter()
+                .find(|lane| lane.session_id.as_deref() == Some(session))
+                .expect("translated success created a lane");
+            assert_eq!(lane.pin_generation, 1);
+            assert_eq!(
+                lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
+                Some(binding)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn active_chat_policy_selects_target_and_records_provenance() {
         let (server, seen) = policy_chat_server().await;
@@ -1859,6 +2138,7 @@ api_key = "sk-proj-test"
         });
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/chat/completions"))
+            .header("x-toker-session", "policy-session")
             .json(&serde_json::json!({
                 "model": "policy-alias",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1879,7 +2159,7 @@ api_key = "sk-proj-test"
             serde_json::from_slice(&response_bytes).expect("JSON response");
         assert_eq!(body["model"], "policy-alias");
         assert_eq!(
-            seen.lock().unwrap()[0]["model"],
+            seen.seen.lock().unwrap()[0]["model"],
             "policy-effective",
             "the active policy selected both binding and model despite the conflicting legacy default"
         );
@@ -1904,6 +2184,20 @@ api_key = "sk-proj-test"
             "legacy-route-openai_api-openai_chat_completions"
         );
         assert!(rows[0].attempt.is_some());
+        let lane = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("policy-session"))
+            .expect("successful policy request created a lane");
+        let pin = lane.pin.expect("successful policy request pinned its lane");
+        assert_eq!(pin.policy_revision_id, 1);
+        assert_eq!(
+            pin.binding_id.as_str(),
+            "openai_api.openai_chat_completions"
+        );
+        assert_eq!(pin.effective_model, "policy-effective");
+        assert_eq!(lane.pin_generation, 1);
     }
 
     /// The three sources the background task refreshes: the openrouter
@@ -2462,6 +2756,7 @@ api_key = "ak-literal-test"
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,
+            pin_transition: None,
             betas: None,
             shape: None,
             ping: false,

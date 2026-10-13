@@ -398,6 +398,29 @@ pub struct MetersSnapshot {
     pub snapshot: Value,
 }
 
+pub(super) fn insert_lane_if_absent(conn: &Connection, lane: &Lane) -> Result<()> {
+    conn.execute(
+        "INSERT INTO lanes (key, session_id, tools_hash, updated_ms, prompt_tokens, ttl, ping,
+                            noticed_at, forced_from, forced_to)
+         VALUES (:key, :session_id, :tools_hash, :updated_ms, :prompt_tokens, :ttl, :ping,
+                 :noticed_at, :forced_from, :forced_to)
+         ON CONFLICT (key) DO NOTHING",
+        rusqlite::named_params! {
+            ":key": lane.key,
+            ":session_id": lane.session_id,
+            ":tools_hash": lane.tools_hash,
+            ":updated_ms": lane.updated_ms,
+            ":prompt_tokens": lane.prompt_tokens,
+            ":ttl": lane.ttl,
+            ":ping": lane.ping,
+            ":noticed_at": lane.noticed_at,
+            ":forced_from": lane.forced_from,
+            ":forced_to": lane.forced_to,
+        },
+    )?;
+    Ok(())
+}
+
 pub(super) fn upsert_lane(conn: &Connection, lane: &Lane) -> Result<()> {
     // Ordinary lane observations intentionally omit every pin column. On an
     // existing row this preserves a concurrent routing decision and its CAS
