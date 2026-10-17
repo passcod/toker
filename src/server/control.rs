@@ -130,8 +130,14 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         "port": config.port,
         "db_path": config.db_path.display().to_string(),
         "session_header_names": config.session_header_names,
-        "default_backend_openai_chat": config.default_backend_openai_chat,
-        "default_backend_anthropic": config.default_backend_anthropic,
+        "routing": if server.has_active_policy() { "database" } else { "config" },
+        "policy_revision_id": server.policy_runtime.as_ref()
+            .and_then(|runtime| runtime.capture())
+            .and_then(|snapshot| snapshot.revision_id()),
+        "default_backend_openai_chat": (!server.has_active_policy())
+            .then(|| config.default_backend_openai_chat.clone()).flatten(),
+        "default_backend_anthropic": (!server.has_active_policy())
+            .then(|| config.default_backend_anthropic.clone()).flatten(),
         "providers": providers,
         "requests": rows,
         "last_request_ts_ms": last_request_ts_ms,
