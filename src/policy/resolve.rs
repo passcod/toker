@@ -346,7 +346,7 @@ pub fn resolve_with_circuits<L: LearningView>(
     circuits: &CircuitSnapshot,
     facts: &RequestFacts,
 ) -> Result<AttemptPlan, ResolveFailure> {
-    resolve_with_activation_cache_consent(
+    resolve_with_options(
         policy,
         inventory,
         learning,
@@ -354,8 +354,46 @@ pub fn resolve_with_circuits<L: LearningView>(
         availability,
         circuits,
         facts,
-        false,
+        ResolveOptions::default(),
     )
+}
+
+pub fn resolve_first_candidate<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+) -> Result<AttemptPlan, ResolveFailure> {
+    resolve_with_options(
+        policy,
+        inventory,
+        learning,
+        None,
+        availability,
+        circuits,
+        facts,
+        ResolveOptions {
+            activation_allows_cache_loss: false,
+            traverse_candidates: false,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolveOptions {
+    activation_allows_cache_loss: bool,
+    traverse_candidates: bool,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        Self {
+            activation_allows_cache_loss: false,
+            traverse_candidates: true,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,6 +407,33 @@ pub(crate) fn resolve_with_activation_cache_consent<L: LearningView>(
     facts: &RequestFacts,
     activation_allows_cache_loss: bool,
 ) -> Result<AttemptPlan, ResolveFailure> {
+    resolve_with_options(
+        policy,
+        inventory,
+        learning,
+        lane,
+        availability,
+        circuits,
+        facts,
+        ResolveOptions {
+            activation_allows_cache_loss,
+            traverse_candidates: true,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_options<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+    options: ResolveOptions,
+) -> Result<AttemptPlan, ResolveFailure> {
+    let activation_allows_cache_loss = options.activation_allows_cache_loss;
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
         && lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold)
@@ -434,7 +499,12 @@ pub(crate) fn resolve_with_activation_cache_consent<L: LearningView>(
         })
         .unwrap_or(0);
     let mut prior_live: Option<&BindingAvailability> = None;
-    for (index, candidate) in route.candidates().iter().enumerate().skip(start) {
+    let end = if options.traverse_candidates {
+        route.candidates().len()
+    } else {
+        (start + 1).min(route.candidates().len())
+    };
+    for (index, candidate) in route.candidates().iter().enumerate().take(end).skip(start) {
         if index > start {
             let edge = &route.edges()[index - 1];
             if let Some(reason) =
@@ -2771,6 +2841,58 @@ mod tests {
             selected.fallback_cache_transition,
             Some(CacheTransitionPolicy::AllowWhenCold)
         );
+    }
+
+    #[test]
+    fn administrative_resolution_never_crosses_the_first_candidate_edge() {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        first.enabled = false;
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let failure = resolve_first_candidate(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            &availability(true, false),
+            &CircuitSnapshot::new(),
+            &facts("asked"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace, .. }
+                if trace.len() == 2
+                    && matches!(&trace[1], TraceEvent::Candidate(evidence)
+                        if evidence.candidate_id == id("first")
+                            && evidence.result == Err(SkipReason::Disabled))
+        ));
     }
 
     #[test]
