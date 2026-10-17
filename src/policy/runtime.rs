@@ -466,10 +466,18 @@ impl PolicyRuntime {
             };
             let activation_scope = stored.activation_scope;
             let forced_cache_transition = stored.forced_cache_transition;
-            let policy =
+            let compilation = if origin == PolicyOrigin::GeneratedRevisionOne {
+                super::legacy::compile_document(
+                    stored.document,
+                    &self.topology,
+                    &evidence.inventory,
+                )
+            } else {
                 super::compile(stored.document, &self.topology, &evidence.inventory, origin)
-                    .into_policy()
-                    .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
+            };
+            let policy = compilation
+                .into_policy()
+                .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;
             let revision = CachedRevision {
                 policy: Arc::new(policy),
                 activation_scope,

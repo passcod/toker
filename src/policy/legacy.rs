@@ -48,8 +48,20 @@ pub fn compile(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> anyhow::Result<Compilation> {
-    let mut compilation = super::compile(
+    Ok(compile_document(
         validated(config, topology)?,
+        topology,
+        inventory,
+    ))
+}
+
+pub fn compile_document(
+    document: super::ValidatedPolicyDocument,
+    topology: &RouteRegistry,
+    inventory: &OfferInventory,
+) -> Compilation {
+    let mut compilation = super::compile(
+        document,
         topology,
         inventory,
         PolicyOrigin::GeneratedRevisionOne,
@@ -64,7 +76,7 @@ pub fn compile(
             );
         }
     }
-    Ok(compilation)
+    compilation
 }
 
 struct LegacyBuilder<'a> {
