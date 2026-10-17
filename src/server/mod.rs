@@ -558,15 +558,15 @@ impl Server {
             .is_some_and(|snapshot| snapshot.revision_id().is_some())
     }
 
-    pub(crate) fn active_publication_models(
+    pub(crate) fn active_publication(
         &self,
         profile: Option<&str>,
         protocol: crate::policy::FrontendProtocol,
-    ) -> Option<Vec<crate::catalog::offers::ModelOffer>> {
+    ) -> Option<crate::catalog::offers::PolicyPublication> {
         let snapshot = self.policy_runtime.as_ref()?.capture()?;
         snapshot.revision_id()?;
         let profile = profile.and_then(|profile| crate::policy::ProfileId::new(profile).ok());
-        Some(crate::catalog::offers::from_policy(
+        Some(crate::catalog::offers::render_policy(
             snapshot.policy(),
             snapshot.inventory(),
             profile.as_ref(),

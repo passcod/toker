@@ -112,33 +112,65 @@ pub struct ModelOffer {
     pub raw: Value,
 }
 
-pub fn from_policy(
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyPublication {
+    Ready(Value),
+    Unresolved,
+}
+
+pub fn render_policy(
     policy: &crate::policy::CompiledPolicy,
     inventory: &OfferInventory,
     profile: Option<&crate::policy::ProfileId>,
     protocol: crate::policy::FrontendProtocol,
-) -> Vec<ModelOffer> {
-    let mut offers = Vec::new();
-    for (slug, presentation) in policy.publication(profile, protocol) {
-        let Some((binding_id, model_id)) = presentation.route().exact_offer() else {
-            continue;
-        };
-        let Some(offer) = inventory.get(binding_id, model_id) else {
-            continue;
-        };
-        offers.push(ModelOffer {
-            provider: offer.provider.clone(),
-            backend_model_id: offer.backend_model_id.clone(),
-            routed_model_id: slug.to_owned(),
-            binding: offer.binding.clone(),
-            context_window: offer.context_window,
-            chronology: offer.chronology,
-            fetched_at_ms: offer.fetched_at_ms,
-            raw: offer.raw.clone(),
-        });
+) -> PolicyPublication {
+    let publication = policy.publication(profile, protocol);
+    let mut exact = Vec::new();
+    let mut virtual_slugs = Vec::new();
+    for (slug, presentation) in publication {
+        match presentation.route().exact_offer() {
+            Some((binding_id, model_id)) => {
+                let Some(offer) = inventory.get(binding_id, model_id) else {
+                    return PolicyPublication::Unresolved;
+                };
+                exact.push(ModelOffer {
+                    provider: offer.provider.clone(),
+                    backend_model_id: offer.backend_model_id.clone(),
+                    routed_model_id: slug.to_owned(),
+                    binding: offer.binding.clone(),
+                    context_window: offer.context_window,
+                    chronology: offer.chronology,
+                    fetched_at_ms: offer.fetched_at_ms,
+                    raw: offer.raw.clone(),
+                });
+            }
+            None => virtual_slugs.push(slug.to_owned()),
+        }
     }
-    offers.sort_by(|left, right| left.routed_model_id.cmp(&right.routed_model_id));
-    offers
+    exact.sort_by(|left, right| left.routed_model_id.cmp(&right.routed_model_id));
+    match protocol {
+        crate::policy::FrontendProtocol::OpenaiChat => {
+            let mut data = render_chat(&exact)
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            data.extend(
+                virtual_slugs
+                    .into_iter()
+                    .map(|slug| json!({"id": slug, "object": "model", "owned_by": "toker"})),
+            );
+            data.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            PolicyPublication::Ready(json!({"object": "list", "data": data}))
+        }
+        crate::policy::FrontendProtocol::OpenaiResponses if virtual_slugs.is_empty() => {
+            PolicyPublication::Ready(render_responses(&exact))
+        }
+        crate::policy::FrontendProtocol::OpenaiResponses => PolicyPublication::Unresolved,
+        crate::policy::FrontendProtocol::AnthropicMessages => {
+            PolicyPublication::Ready(Value::Array(Vec::new()))
+        }
+    }
 }
 
 /// Project canonical offers into the legacy frontend aliases. Equal slugs on

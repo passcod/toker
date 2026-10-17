@@ -550,43 +550,58 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
     let profile = super::frontend_profile_of(request.extensions()).and_then(|p| p.protocol());
     if let Some(frontend @ (ProtocolId::OpenAiChat | ProtocolId::OpenAiResponses)) = profile {
-        let active = server
-            .active_publication_models(super::frontend_of(request.extensions()), frontend.into());
-        if active.is_none() && server.registry.resolve(frontend, None).is_err() {
-            return match frontend {
-                ProtocolId::OpenAiChat => super::openai_not_configured(),
-                ProtocolId::OpenAiResponses => super::responses_not_configured(),
-                ProtocolId::AnthropicMessages => unreachable!(),
-            };
-        }
-        let models = active.unwrap_or_else(|| {
-            let catalogs = server
-                .catalogs
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            offers::for_frontend(&server.registry, &catalogs, frontend)
-        });
-        server.compare_publication_shadow(
-            frontend,
-            super::frontend_of(request.extensions()),
-            models.iter().map(|model| model.routed_model_id.clone()),
-        );
-        if models.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(serde_json::json!({
-                    "error": {
-                        "type": "catalog_unavailable",
-                        "message": "No provider model catalogue is available yet"
-                    }
-                })),
-            )
-                .into_response();
-        }
-        let body = match frontend {
-            ProtocolId::OpenAiChat => offers::render_chat(&models),
-            ProtocolId::OpenAiResponses => offers::render_responses(&models),
-            ProtocolId::AnthropicMessages => unreachable!(),
+        let active =
+            server.active_publication(super::frontend_of(request.extensions()), frontend.into());
+        let body = match active {
+            Some(offers::PolicyPublication::Ready(body)) => body,
+            Some(offers::PolicyPublication::Unresolved) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "type": "catalog_unavailable",
+                            "message": "The active policy publication cannot be resolved yet"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            None => {
+                if server.registry.resolve(frontend, None).is_err() {
+                    return match frontend {
+                        ProtocolId::OpenAiChat => super::openai_not_configured(),
+                        ProtocolId::OpenAiResponses => super::responses_not_configured(),
+                        ProtocolId::AnthropicMessages => unreachable!(),
+                    };
+                }
+                let catalogs = server
+                    .catalogs
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let models = offers::for_frontend(&server.registry, &catalogs, frontend);
+                server.compare_publication_shadow(
+                    frontend,
+                    super::frontend_of(request.extensions()),
+                    models.iter().map(|model| model.routed_model_id.clone()),
+                );
+                if models.is_empty() {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({
+                            "error": {
+                                "type": "catalog_unavailable",
+                                "message": "No provider model catalogue is available yet"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                match frontend {
+                    ProtocolId::OpenAiChat => offers::render_chat(&models),
+                    ProtocolId::OpenAiResponses => offers::render_responses(&models),
+                    ProtocolId::AnthropicMessages => unreachable!(),
+                }
+            }
         };
         return axum::Json(body).into_response();
     }
