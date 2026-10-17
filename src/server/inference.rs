@@ -533,13 +533,6 @@ fn prepare_messages(
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
-    let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
-        tracing::error!(%error, "policy attempt provenance omitted");
-        None
-    });
-    if let Some(ctx) = record.as_mut() {
-        ctx.policy_routing = policy_routing;
-    }
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
     let rendered = attempt.render_json().map_err(|error| {
@@ -621,11 +614,24 @@ pub(crate) async fn coordinate_messages(
 ) -> Response {
     let MessagesAttemptInput {
         parts,
-        record,
+        mut record,
         in_flight,
         session_id,
         client_wants_json,
     } = input;
+    let policy_routing = attempt
+        .as_ref()
+        .ok()
+        .map(InferenceAttempt::policy_routing)
+        .transpose()
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "policy attempt provenance omitted");
+            None
+        })
+        .flatten();
+    if let Some(ctx) = record.as_mut() {
+        ctx.policy_routing = policy_routing;
+    }
     if let Err(error @ TranslateError::Malformed { .. }) = &attempt {
         return super::codex::anthropic_error_response(
             axum::http::StatusCode::BAD_REQUEST,

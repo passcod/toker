@@ -1168,20 +1168,27 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     //
                     // Named as the identity the backend's model map will
                     // send — what the compaction will actually run on.
-                    let compact_on = server
-                        .models
-                        .compaction_target(
-                            &compact_spec(gates),
-                            prompt,
-                            backend.model_map(),
-                            &|model: &str| declared_window(&server, backend.as_ref(), model),
-                        )
-                        .ok()
-                        .flatten()
-                        .and_then(|target| {
-                            model_map::preview_mapped_model(backend.model_map(), &target)
-                                .map(str::to_owned)
-                        });
+                    let compact_on = if policy_attempt.is_some() {
+                        policy_attempt
+                            .as_ref()
+                            .filter(|resolved| resolved.plan.compaction)
+                            .map(|resolved| resolved.plan.effective_model.clone())
+                    } else {
+                        server
+                            .models
+                            .compaction_target(
+                                &compact_spec(gates),
+                                prompt,
+                                backend.model_map(),
+                                &|model: &str| declared_window(&server, backend.as_ref(), model),
+                            )
+                            .ok()
+                            .flatten()
+                            .and_then(|target| {
+                                model_map::preview_mapped_model(backend.model_map(), &target)
+                                    .map(str::to_owned)
+                            })
+                    };
                     let text = cold::ColdBlocking::notice_for(
                         // The re-read is written back at the lane's own
                         // tier; a lane with no recorded tier says nothing
@@ -1301,7 +1308,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // interrupted it: the gate exists to advise this.
     if path == "/v1/messages"
         && (!authoritative || policy_compaction)
-        && picks_from_anthropic_catalogue(backend.as_ref())
+        && (authoritative || picks_from_anthropic_catalogue(backend.as_ref()))
         && gate_shape
             .as_ref()
             .is_some_and(AnthropicShape::is_compaction)
