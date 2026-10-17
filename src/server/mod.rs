@@ -152,6 +152,12 @@ pub(crate) struct PolicyAttempt {
     pub(crate) pin_transition: crate::policy::LaneTransitionDecision,
 }
 
+#[derive(Clone, Copy)]
+enum RoutingOwnership {
+    LegacyShadow,
+    Policy,
+}
+
 /// The upstream client: a connect timeout and the between-reads idle
 /// timeout, never an overall one (see [`UPSTREAM_IDLE_TIMEOUT`]).
 fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
@@ -258,6 +264,17 @@ impl Server {
         Self::with_awake_spawner(config, store, Box::new(awake::ProcessSpawner))
     }
 
+    pub fn new_authoritative(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
+        Self::with_routing_ownership(
+            config,
+            store,
+            Box::new(awake::ProcessSpawner),
+            Arc::new(OsKeyring),
+            Arc::new(TracingObserver),
+            RoutingOwnership::Policy,
+        )
+    }
+
     /// [`Server::new`], with the sleep-lock spawner injected. The real
     /// spawner takes a REAL idle-sleep lock via systemd-inhibit /
     /// gnome-session-inhibit, so tests inject a fake through here and
@@ -291,6 +308,24 @@ impl Server {
         spawner: Box<dyn LockSpawner>,
         secrets: Arc<dyn SecretStore>,
         shadow_observer: Arc<dyn ShadowObserver>,
+    ) -> anyhow::Result<Server> {
+        Self::with_routing_ownership(
+            config,
+            store,
+            spawner,
+            secrets,
+            shadow_observer,
+            RoutingOwnership::LegacyShadow,
+        )
+    }
+
+    fn with_routing_ownership(
+        config: Config,
+        store: Arc<Store>,
+        spawner: Box<dyn LockSpawner>,
+        secrets: Arc<dyn SecretStore>,
+        shadow_observer: Arc<dyn ShadowObserver>,
+        routing_ownership: RoutingOwnership,
     ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
         // tests, any embedder) must not reach the registry with a default
@@ -401,33 +436,112 @@ impl Server {
             store.clone(),
             &seed,
         ));
-        let initial_catalogs = FetchedCatalogs::default();
-        let inventory = offers::inventory(&registry, &initial_catalogs);
-        let policy_runtime = match crate::policy::legacy::compile(&config, &registry, &inventory)
-            .and_then(|compilation| {
-                compilation
-                    .into_policy()
-                    .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
-            }) {
-            Ok(policy) => Some(Arc::new(crate::policy::PolicyRuntime::new(
-                store.clone(),
-                registry.clone(),
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(availability_for(&registry, &initial_catalogs)),
-            ))),
-            Err(error) => {
-                tracing::warn!(code = "policy-shadow-startup-disabled", %error);
-                None
+        let (initial_catalogs, initial_catalog_dir) = match routing_ownership {
+            RoutingOwnership::LegacyShadow => (FetchedCatalogs::default(), None),
+            RoutingOwnership::Policy => {
+                let cache_dir = fetched::cache_dir().ok();
+                let catalogs = cache_dir
+                    .as_deref()
+                    .map(fetched::load_cached)
+                    .unwrap_or_default();
+                (catalogs, cache_dir)
             }
         };
-        let policy_shadow = policy_runtime.as_ref().map(|runtime| {
-            Arc::new(PolicyShadow::new(
-                runtime.clone(),
-                Arc::new(LegacyLearningView::new(models.clone())),
-                shadow_observer.clone(),
-            ))
-        });
+        let inventory = offers::inventory(&registry, &initial_catalogs);
+        let availability = Arc::new(availability_for(&registry, &initial_catalogs));
+        let (policy_runtime, policy_shadow) = match routing_ownership {
+            RoutingOwnership::LegacyShadow => {
+                let policy_runtime = match crate::policy::legacy::compile(
+                    &config, &registry, &inventory,
+                )
+                .and_then(|compilation| {
+                    compilation
+                        .into_policy()
+                        .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
+                }) {
+                    Ok(policy) => Some(Arc::new(crate::policy::PolicyRuntime::new(
+                        store.clone(),
+                        registry.clone(),
+                        Arc::new(policy),
+                        Arc::new(inventory),
+                        availability,
+                    ))),
+                    Err(error) => {
+                        tracing::warn!(code = "policy-shadow-startup-disabled", %error);
+                        None
+                    }
+                };
+                let policy_shadow = policy_runtime.as_ref().map(|runtime| {
+                    Arc::new(PolicyShadow::new(
+                        runtime.clone(),
+                        Arc::new(LegacyLearningView::new(models.clone())),
+                        shadow_observer,
+                    ))
+                });
+                (policy_runtime, policy_shadow)
+            }
+            RoutingOwnership::Policy => {
+                let has_inventory = !inventory.is_empty();
+                let state = store.load_routing_policy_state()?;
+                let (revision, policy) = match state.active_revision_id {
+                    Some(revision_id) => {
+                        let revision =
+                            store.load_policy_revision(revision_id)?.ok_or_else(|| {
+                                anyhow::anyhow!("active policy revision {revision_id} is missing")
+                            })?;
+                        let policy = compile_stored_policy(&revision, &registry, &inventory)?;
+                        (revision, policy)
+                    }
+                    None => {
+                        let document = crate::policy::legacy::validated(&config, &registry)?;
+                        let generated = crate::policy::legacy::compile_document(
+                            document.clone(),
+                            &registry,
+                            &inventory,
+                        )
+                        .into_policy()
+                        .map_err(|diagnostics| {
+                            anyhow::anyhow!(
+                                "generated revision one has {} compile diagnostics",
+                                diagnostics.len()
+                            )
+                        })?;
+                        let activation = store.activate_revision_one(
+                            &document,
+                            now_ms(),
+                            i64::from(has_inventory),
+                            &publication_targets()?,
+                        )?;
+                        match activation {
+                            crate::store::RevisionOneActivation::Activated { revision, .. } => {
+                                (revision, generated)
+                            }
+                            crate::store::RevisionOneActivation::AlreadyActive {
+                                revision, ..
+                            } => {
+                                let policy =
+                                    compile_stored_policy(&revision, &registry, &inventory)?;
+                                (revision, policy)
+                            }
+                        }
+                    }
+                };
+                let runtime = crate::policy::PolicyRuntime::new_active_at_generation(
+                    store.clone(),
+                    registry.clone(),
+                    &revision,
+                    Arc::new(policy),
+                    Arc::new(inventory),
+                    availability,
+                    u64::from(has_inventory),
+                );
+                (Some(Arc::new(runtime)), None)
+            }
+        };
+        let catalog_dir = Arc::new(std::sync::OnceLock::new());
+        if let Some(initial_catalog_dir) = initial_catalog_dir {
+            let _ = catalog_dir.set(initial_catalog_dir);
+        }
         Ok(Server {
             store,
             config: Arc::new(config),
@@ -437,7 +551,7 @@ impl Server {
             models,
             binding_learning,
             catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
-            catalog_dir: Arc::default(),
+            catalog_dir,
             catalog_borrowed_at: Arc::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             awake,
@@ -1294,16 +1408,10 @@ impl Server {
                     return;
                 }
             };
-            let origin = if revision.source == crate::store::PolicyRevisionSource::Legacy {
-                crate::policy::PolicyOrigin::GeneratedRevisionOne
-            } else {
-                crate::policy::PolicyOrigin::Authored
-            };
-            match crate::policy::compile(
-                revision.document.clone(),
+            match crate::policy::runtime::compile_stored_revision(
+                &revision,
                 &self.registry,
                 &inventory,
-                origin,
             )
             .into_policy()
             {
@@ -1483,15 +1591,21 @@ impl Server {
     /// fetch is bounded by [`fetched::FETCH_TIMEOUT`], and every
     /// failure is the refresh chain's own fallback plus a debug log.
     fn spawn_catalog_refresh(&self) {
-        match fetched::cache_dir() {
-            Ok(dir) => {
-                self.replace_catalogs(fetched::load_cached(&dir));
-                let _ = self.catalog_dir.set(dir);
-            }
-            Err(_) => {
+        let dir = match self
+            .catalog_dir
+            .get()
+            .cloned()
+            .or_else(|| fetched::cache_dir().ok())
+        {
+            Some(dir) => dir,
+            None => {
                 tracing::debug!("no data home; models catalogues disabled");
                 return;
             }
+        };
+        if self.catalog_dir.get().is_none() {
+            self.replace_catalogs(fetched::load_cached(&dir));
+            let _ = self.catalog_dir.set(dir);
         }
         let server = self.clone();
         tokio::spawn(async move {
@@ -1619,6 +1733,22 @@ fn effective_catalogue<'a>(
     catalogs
         .get(source)
         .filter(|catalog| !catalog.models.is_empty())
+}
+
+fn compile_stored_policy(
+    revision: &crate::store::PolicyRevision,
+    registry: &RouteRegistry,
+    inventory: &crate::catalog::offers::OfferInventory,
+) -> anyhow::Result<crate::policy::CompiledPolicy> {
+    let compilation =
+        crate::policy::runtime::compile_stored_revision(revision, registry, inventory);
+    compilation.into_policy().map_err(|diagnostics| {
+        anyhow::anyhow!(
+            "active policy revision {} has {} compile diagnostics",
+            revision.revision_id,
+            diagnostics.len()
+        )
+    })
 }
 
 fn publication_targets() -> crate::store::Result<Vec<crate::store::InitialPublication>> {
@@ -2014,6 +2144,112 @@ version_probe = false
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
         Server::new(config, store).expect("server builds")
+    }
+
+    #[test]
+    fn authoritative_startup_activates_once_and_ignores_later_legacy_routing_changes() {
+        let dir = crate::setup::test_dir("authoritative-startup");
+        let path = dir.join("toker.toml");
+        std::fs::write(
+            &path,
+            r#"
+awake = false
+default_backend_openai_chat = "openrouter"
+
+[providers.openrouter]
+upstream = "http://127.0.0.1:9/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.db_path = dir.join("toker.db");
+        let store = Arc::new(Store::open(&config.db_path).unwrap());
+        let first = Server::new_authoritative(config.clone(), store.clone()).unwrap();
+        let first_revision = first
+            .policy_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capture())
+            .and_then(|snapshot| snapshot.revision_id())
+            .expect("active revision");
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            Some(first_revision)
+        );
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+        let publications = store.load_publications().unwrap();
+        assert_eq!(publications.len(), 3);
+        assert_eq!(
+            publications
+                .iter()
+                .filter(|row| row.state == crate::store::PublicationState::Applied)
+                .count(),
+            2
+        );
+
+        config.gates.force_newest = !config.gates.force_newest;
+        let restarted = Server::new_authoritative(config, store.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .policy_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capture())
+                .and_then(|snapshot| snapshot.revision_id()),
+            Some(first_revision)
+        );
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn authoritative_startup_rejects_a_corrupt_active_document() {
+        let dir = crate::setup::test_dir("authoritative-corrupt-revision");
+        let path = dir.join("toker.toml");
+        std::fs::write(&path, "[providers.openrouter]\napi_key = 'sk-test'\n").unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.db_path = dir.join("toker.db");
+        let store = Arc::new(Store::open(&config.db_path).unwrap());
+        Server::new_authoritative(config.clone(), store.clone()).unwrap();
+        store
+            .execute_for_test(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE routing_policy_revisions SET document_json = '{' WHERE revision_id = 1;",
+            )
+            .unwrap();
+        let error = Server::new_authoritative(config, store)
+            .err()
+            .expect("startup fails");
+        assert!(
+            error.to_string().contains("invalid stored routing state")
+                || error.to_string().contains("invalid policy document"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn authoritative_startup_rejects_a_missing_active_revision() {
+        let dir = crate::setup::test_dir("authoritative-missing-revision");
+        let server = server(&dir);
+        server
+            .store
+            .execute_for_test(
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE routing_policy_state SET active_revision_id = 999 WHERE id = 1;",
+            )
+            .unwrap();
+        let config = (*server.config).clone();
+        let store = server.store.clone();
+        drop(server);
+        let error = Server::new_authoritative(config, store)
+            .err()
+            .expect("startup fails");
+        assert!(
+            error
+                .to_string()
+                .contains("active policy revision 999 is missing")
+        );
     }
 
     const CHAT_WITHOUT_USAGE: u8 = 1;

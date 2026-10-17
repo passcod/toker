@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::offers::OfferInventory;
 use crate::routing::RouteRegistry;
-use crate::store::{PolicyRevisionSource, Store};
+use crate::store::{PolicyRevision, PolicyRevisionSource, Store};
 
 use super::{
-    ActivationScope, AvailabilitySnapshot, BindingId, CandidateId, CompiledPolicy, FailureClass,
-    PolicyOrigin, RouteId,
+    ActivationScope, AvailabilitySnapshot, BindingId, CandidateId, Compilation, CompiledPolicy,
+    FailureClass, PolicyOrigin, RouteId,
 };
 
 const REVISION_CACHE_CAPACITY: usize = 32;
@@ -194,6 +194,23 @@ fn bump_generations(
     *generations = Arc::new(next);
 }
 
+pub(crate) fn compile_stored_revision(
+    revision: &PolicyRevision,
+    topology: &RouteRegistry,
+    inventory: &OfferInventory,
+) -> Compilation {
+    if revision.source == PolicyRevisionSource::Legacy {
+        super::legacy::compile_document(revision.document.clone(), topology, inventory)
+    } else {
+        super::compile(
+            revision.document.clone(),
+            topology,
+            inventory,
+            PolicyOrigin::Authored,
+        )
+    }
+}
+
 fn clear_binding_circuits(
     circuits: &Mutex<HashMap<HealthCircuitKey, OpenCircuit>>,
     changed: &BTreeSet<BindingId>,
@@ -237,7 +254,27 @@ impl PolicyRuntime {
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
     ) -> Self {
-        Self::with_current(
+        Self::new_active_at_generation(
+            store,
+            topology,
+            revision,
+            policy,
+            inventory,
+            availability,
+            0,
+        )
+    }
+
+    pub fn new_active_at_generation(
+        store: Arc<Store>,
+        topology: RouteRegistry,
+        revision: &crate::store::PolicyRevision,
+        policy: Arc<CompiledPolicy>,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        inventory_generation: u64,
+    ) -> Self {
+        Self::with_current_at_generation(
             store,
             topology,
             CurrentPolicy {
@@ -248,6 +285,7 @@ impl PolicyRuntime {
             },
             inventory,
             availability,
+            inventory_generation,
         )
     }
 
@@ -258,6 +296,17 @@ impl PolicyRuntime {
         inventory: Arc<OfferInventory>,
         availability: Arc<AvailabilitySnapshot>,
     ) -> Self {
+        Self::with_current_at_generation(store, topology, current, inventory, availability, 0)
+    }
+
+    fn with_current_at_generation(
+        store: Arc<Store>,
+        topology: RouteRegistry,
+        current: CurrentPolicy,
+        inventory: Arc<OfferInventory>,
+        availability: Arc<AvailabilitySnapshot>,
+        inventory_generation: u64,
+    ) -> Self {
         let catalogue_generations = Arc::new(BTreeMap::new());
         let credential_generations = Arc::new(BTreeMap::new());
         Self {
@@ -267,7 +316,7 @@ impl PolicyRuntime {
                 current: Some(current),
                 inventory,
                 availability,
-                inventory_generation: 0,
+                inventory_generation,
                 catalogue_generations,
                 credential_generations,
             }),
@@ -459,22 +508,9 @@ impl PolicyRuntime {
                 .store
                 .load_policy_revision(revision_id)?
                 .ok_or(PolicyRuntimeError::MissingRevision(revision_id))?;
-            let origin = if stored.source == PolicyRevisionSource::Legacy {
-                PolicyOrigin::GeneratedRevisionOne
-            } else {
-                PolicyOrigin::Authored
-            };
             let activation_scope = stored.activation_scope;
             let forced_cache_transition = stored.forced_cache_transition;
-            let compilation = if origin == PolicyOrigin::GeneratedRevisionOne {
-                super::legacy::compile_document(
-                    stored.document,
-                    &self.topology,
-                    &evidence.inventory,
-                )
-            } else {
-                super::compile(stored.document, &self.topology, &evidence.inventory, origin)
-            };
+            let compilation = compile_stored_revision(&stored, &self.topology, &evidence.inventory);
             let policy = compilation
                 .into_policy()
                 .map_err(|_| PolicyRuntimeError::Compilation(revision_id))?;

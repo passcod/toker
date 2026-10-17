@@ -121,13 +121,14 @@ Serialisation purity and prefix stability are covered by
    NULL-costed for the same reason: there is no per-token price for its slugs to
    verify.
 
-6. **Inference bodies cross canonical IR; legacy administrative bodies are the
-   client's.** Every inference binding deterministically renders its backend
-   wire from canonical semantics. Messages inference middleware keeps the
-   parsed canonical request across its gate and rewrite stages. Only these
-   deliberate transformations may change its semantics. Count-token, batch,
-   and unmatched administrative
-   paths retain the client's buffer except for the applicable routing map:
+6. **Inference bodies cross canonical IR; administrative bodies retain the
+   client's bytes except documented model tokens.** Every inference binding
+   deterministically renders its backend wire from canonical semantics.
+   Messages inference middleware keeps the parsed canonical request across its
+   gate and rewrite stages. Only these deliberate transformations may change
+   its semantics. Count-token and batch creation splice only policy-selected
+   model positions; unmatched administrative paths retain the complete client
+   buffer:
 
    - `canonical::strip_release` removes the release markers
      (`$#$BURN$#$`, and the plan-only `$#$OVER$#$`), strings toker itself
@@ -138,9 +139,10 @@ Serialisation purity and prefix stability are covered by
    - The `provider/model` prefix strip (`anthropic_sub/`, `anthropic_api/`,
      `anthropic/`, `openrouter/`, `openai_api/`, `codex_sub/`) is the client
      choosing a backend in the model string; `set_model` writes the rest back.
-   - Force-newest's `set_model` changes the model on a request that can lose no
-     cache by it, and nothing else, keeping `cache_control` because that
-     conversation still has a cache to build. See [models.md](models.md).
+   - Policy-selected `set_model` changes only the candidate-local model. Upgrade
+     and activation decisions license the cache transition before the body is
+     rendered, keeping `cache_control` because that conversation still has a
+     cache to build. See [models.md](models.md).
    - `cold::retarget_compaction` rewrites a *cold compaction only*: model, cache
      breakpoints, and mid-conversation system messages, together or not at all.
      That one is defensible because a compaction is a dead end: its body is
@@ -158,9 +160,10 @@ Serialisation purity and prefix stability are covered by
      wants it. Only the rendered request's thinking mode changes, and the
      client's transcript is untouched: the next turn sends `disabled` again
      and is judged afresh.
-   - `canonical::map_model` applies an explicit, configured routing map to
-     inference as the last model stage. Administrative bodies use the lexical
-     `model_map::rewrite_mapped_models`. An unmatched map changes neither.
+   - Candidate-local aliases are compiled into policy and applied before an
+     inference body is rendered. Administrative bodies use
+     `model_map::rewrite_model_positions` to splice only the documented model
+     strings. An unchanged target changes no bytes.
    - Canonical rendering builds a new body even when the protocols match. It
      is pure, so turn N+1 reproduces turn N's backend prefix wherever the
      conversation did not change.

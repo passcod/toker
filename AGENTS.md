@@ -47,12 +47,13 @@ The full text and the incidents behind them are in
    one. Do not add one without the same gate.
 5. **Never guess prices.** Verify against the published page and move
    `catalog::pricing::VERIFIED_ON`. Store cache-read rates explicitly.
-6. **Every inference body is canonical-rendered; a legacy administrative body
-   is the client's.** Before Messages rendering, only `strip_release`, the
-   `provider/model` prefix strip, force-newest `set_model`,
-   `retarget_compaction`, `strip_message_effort`, `thinking_between_tools`, and
-   `rewrite_mapped_models` may alter semantics. Editing it anywhere else is a
-   bug.
+6. **Every inference body is canonical-rendered; administrative bodies retain
+   the client's bytes except documented model tokens.** Before Messages
+   rendering, only `strip_release`, policy-selected `set_model`,
+   `retarget_compaction`, `strip_message_effort`, and `thinking_between_tools`
+   may alter semantics. `count_tokens` and batch creation may splice only their
+   documented model positions from policy results. Editing any other body
+   position is a bug.
 7. **Never pin a quota weight.** Weights are fitted from the ledger on every run
    and carry their spread; one the data cannot separate from zero is no weight.
 8. **Gate notices are model-visible and byte-stable.** A notice enters the

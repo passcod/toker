@@ -39,7 +39,7 @@ pub async fn serve() -> anyhow::Result<()> {
             .unwrap_or("not configured"),
         config.db_path.display()
     );
-    Server::new(config, store)?.serve().await
+    Server::new_authoritative(config, store)?.serve().await
 }
 
 /// `setup`: the interactive wizard (plan: "Setup wizard") — the ONLY
@@ -81,26 +81,36 @@ pub fn status() -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Store::open(&config.db_path)?;
 
+    let routing_state = store.load_routing_policy_state()?;
     println!("port: {}", config.port);
     println!("db: {}", config.db_path.display());
+    println!(
+        "routing: {}",
+        routing_state.active_revision_id.map_or_else(
+            || "config".to_owned(),
+            |revision| format!("database revision {revision}")
+        )
+    );
     println!(
         "session headers: {}",
         config.session_header_names.join(", ")
     );
-    println!(
-        "default backend (anthropic): {}",
-        config
-            .default_backend_anthropic
-            .as_deref()
-            .unwrap_or("none — no anthropic backend is enabled")
-    );
-    println!(
-        "default backend (openai_chat): {}",
-        config
-            .default_backend_openai_chat
-            .as_deref()
-            .unwrap_or("none — no openai_chat backend is enabled")
-    );
+    if routing_state.active_revision_id.is_none() {
+        println!(
+            "default backend (anthropic): {}",
+            config
+                .default_backend_anthropic
+                .as_deref()
+                .unwrap_or("none — no anthropic backend is enabled")
+        );
+        println!(
+            "default backend (openai_chat): {}",
+            config
+                .default_backend_openai_chat
+                .as_deref()
+                .unwrap_or("none — no openai_chat backend is enabled")
+        );
+    }
 
     // Enabled backends only: a block's presence is what enables one, so
     // an absent block has nothing to report.

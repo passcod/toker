@@ -1014,7 +1014,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     // client's alias is not one. Measured on the routed
                     // backend's own meters only.
                     let sent = served_model.as_deref().and_then(|model| {
-                        model_map::preview_mapped_model(backend.model_map(), model)
+                        if policy_attempt.is_some() {
+                            Some(model)
+                        } else {
+                            model_map::preview_mapped_model(backend.model_map(), model)
+                        }
                     });
                     cold::outlook_over(&server.store, backend.id(), sent, *prompt, gate_armed, now)
                 }
@@ -2098,9 +2102,13 @@ fn writes_free_of(server: &Server, backend: &dyn Provider, model: Option<&str>) 
     let Some(model) = model.filter(|model| !model.is_empty()) else {
         return false;
     };
-    let effective = match backend.model_map() {
-        Some(map) => model_map::preview_mapped_model(Some(map), model),
-        None => Some(model),
+    let effective = if server.has_active_policy() {
+        Some(model)
+    } else {
+        match backend.model_map() {
+            Some(map) => model_map::preview_mapped_model(Some(map), model),
+            None => Some(model),
+        }
     };
     let Some(effective) = effective else {
         return false;
