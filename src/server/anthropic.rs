@@ -396,8 +396,19 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         model.as_deref(),
                         &plan.effective_model,
                     ) {
-                        Ok(target) => target,
-                        Err(_) => return super::anthropic_not_configured(),
+                        Ok(target)
+                            if target.binding().administrative_capabilities().count_tokens =>
+                        {
+                            target
+                        }
+                        _ => {
+                            return super::codex::anthropic_error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                "the active routing policy selected a backend without count_tokens support",
+                                false,
+                            );
+                        }
                     };
                 }
                 Ok(None) => {
@@ -412,6 +423,124 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         StatusCode::SERVICE_UNAVAILABLE,
                         "api_error",
                         "the active routing policy has no tokenizer backend for this model",
+                        false,
+                    );
+                }
+            }
+        } else if path == "/v1/messages/batches" {
+            let Some(requests) = ir
+                .value()
+                .get("requests")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return super::codex::anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "batch requests must contain a requests array",
+                    false,
+                );
+            };
+            let models = requests
+                .iter()
+                .map(|request| {
+                    request
+                        .get("params")
+                        .and_then(|params| params.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|model| !model.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(models) = models.filter(|models| !models.is_empty()) else {
+                return super::codex::anthropic_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "every batch request must name a non-empty model",
+                    false,
+                );
+            };
+            let facts = models
+                .iter()
+                .map(|model| {
+                    server.shadow_facts(
+                        ProtocolId::AnthropicMessages,
+                        shadow_profile.as_deref(),
+                        Some(model.clone()),
+                        None,
+                        force_newest::prompt_bound(original.len() as u64),
+                        None,
+                        0,
+                        Default::default(),
+                        None,
+                        crate::policy::RequestClass::Inference,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let credentials = server.shadow_credentials(
+                &parts.headers,
+                ProtocolId::AnthropicMessages,
+                facts[0].now_ms,
+            );
+            match server.resolve_policy_first_candidates(&facts, &credentials) {
+                Ok(Some(plans)) => {
+                    let Some(first) = plans.first() else {
+                        unreachable!("a non-empty batch yields plans")
+                    };
+                    if plans.iter().any(|plan| plan.binding_id != first.binding_id) {
+                        return super::codex::anthropic_error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "all batch requests must resolve to one backend binding",
+                            false,
+                        );
+                    }
+                    target = match server.registry.resolve_binding(
+                        ProtocolId::AnthropicMessages,
+                        &first.binding_id,
+                        models.first().map(String::as_str),
+                        &first.effective_model,
+                    ) {
+                        Ok(target) if target.binding().administrative_capabilities().batches => {
+                            target
+                        }
+                        _ => {
+                            return super::codex::anthropic_error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                "the active routing policy selected a backend without batch support",
+                                false,
+                            );
+                        }
+                    };
+                    let replacements = plans
+                        .iter()
+                        .map(|plan| plan.effective_model.clone())
+                        .collect::<Vec<_>>();
+                    let Some(rewritten) =
+                        model_map::rewrite_model_positions(&original, "POST", path, &replacements)
+                    else {
+                        return super::codex::anthropic_error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            "batch model positions could not be rewritten safely",
+                            false,
+                        );
+                    };
+                    ir = IrRequest::parse(&rewritten).expect("lexical rewrite preserves JSON");
+                    forward = Bytes::from(rewritten);
+                }
+                Ok(None) => {
+                    target = match legacy_target {
+                        Ok(target) => target,
+                        Err(_) => return super::anthropic_not_configured(),
+                    };
+                }
+                Err(error) => {
+                    tracing::error!(%error, "active batch policy resolution failed");
+                    return super::codex::anthropic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "the active routing policy cannot route every batch request",
                         false,
                     );
                 }

@@ -611,6 +611,48 @@ impl Server {
         })
     }
 
+    pub(crate) fn resolve_policy_first_candidates(
+        &self,
+        facts: &[RequestFacts],
+        credentials: &crate::policy::CredentialSnapshot,
+    ) -> Result<Option<Vec<crate::policy::AttemptPlan>>, PolicyAttemptError> {
+        let Some(runtime) = &self.policy_runtime else {
+            return Ok(None);
+        };
+        let Some((snapshot, _, _)) =
+            runtime.capture_shadow(None, facts.first().map_or(0, |f| f.now_ms))
+        else {
+            return Ok(None);
+        };
+        let Some(revision_id) = snapshot.revision_id() else {
+            return Ok(None);
+        };
+        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
+        let mut plans = Vec::with_capacity(facts.len());
+        for facts in facts {
+            let availability = snapshot
+                .availability()
+                .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+                .with_credentials(credentials);
+            let circuits = runtime.open_circuits(&snapshot, facts.now_ms);
+            let plan = crate::policy::resolve_first_candidate(
+                snapshot.policy(),
+                snapshot.inventory(),
+                &learning,
+                &availability,
+                &circuits,
+                facts,
+            )
+            .map(|plan| plan.with_policy_revision(revision_id))
+            .map_err(|failure| PolicyAttemptError::Resolve {
+                revision_id,
+                failure,
+            })?;
+            plans.push(plan);
+        }
+        Ok(Some(plans))
+    }
+
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,

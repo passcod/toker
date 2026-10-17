@@ -409,6 +409,53 @@ fn unchanged(body: &[u8]) -> MappedRewrite {
 /// lexically, so bytes outside those documented positions survive even
 /// when a parsed value could not be represented exactly — a mapping
 /// changes no unrelated JSON bytes.
+pub fn rewrite_model_positions(
+    body: &[u8],
+    method: &str,
+    url: &str,
+    replacements_by_index: &[String],
+) -> Option<Vec<u8>> {
+    if method != "POST" {
+        return None;
+    }
+    let path = url.split('?').next().unwrap_or(url);
+    let top_level = path == "/v1/messages" || path == "/v1/messages/count_tokens";
+    let batch = path == "/v1/messages/batches";
+    if !top_level && !batch {
+        return None;
+    }
+    std::str::from_utf8(body).ok()?;
+    serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let root = json_tree(body)?;
+    let mut positions = Vec::new();
+    if top_level {
+        positions.extend(
+            property_of(&root, "model").filter(|model| matches!(model, Node::String { .. })),
+        );
+    } else if let Some(Node::Array { items }) = property_of(&root, "requests") {
+        for request in items {
+            if let Some(params) = property_of(request, "params")
+                && let Some(model) = property_of(params, "model")
+                && matches!(model, Node::String { .. })
+            {
+                positions.push(model);
+            }
+        }
+    }
+    if positions.len() != replacements_by_index.len() {
+        return None;
+    }
+    let mut rewritten = body.to_vec();
+    for (position, replacement) in positions.iter().zip(replacements_by_index).rev() {
+        let Node::String { start, end, .. } = position else {
+            unreachable!("only string model positions were retained")
+        };
+        let token = serde_json::to_string(&serde_json::Value::String(replacement.clone())).ok()?;
+        rewritten.splice(*start..*end, token.bytes());
+    }
+    Some(rewritten)
+}
+
 pub fn rewrite_mapped_models(
     policy: Option<&ModelMap>,
     body: &[u8],
@@ -527,6 +574,7 @@ pub fn rewrite_mapped_models(
 mod tests {
     use super::{
         MapTarget, mapped_model, parse_model_map, preview_mapped_model, rewrite_mapped_models,
+        rewrite_model_positions,
     };
 
     /// The routing policy the predecessor's test suite pinned.
@@ -543,6 +591,27 @@ mod tests {
 
     fn body(value: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&value).expect("serialise test body")
+    }
+
+    #[test]
+    fn explicit_batch_replacements_splice_only_model_tokens() {
+        let input = br#"{ "requests" : [
+            {"params":{"model":"first","temperature":0.7}},
+            {"params":{"model":"second"}}
+        ], "large": 9007199254740993 }"#;
+        let rewritten = rewrite_model_positions(
+            input,
+            "POST",
+            "/v1/messages/batches",
+            &["one".to_owned(), "two/two".to_owned()],
+        )
+        .expect("documented positions");
+        let expected = String::from_utf8(input.to_vec())
+            .unwrap()
+            .replacen(r#""first""#, r#""one""#, 1)
+            .replacen(r#""second""#, r#""two/two""#, 1);
+        assert_eq!(rewritten, expected.as_bytes());
+        assert!(rewrite_model_positions(input, "POST", "/v1/messages/batches", &[]).is_none());
     }
 
     #[test]
