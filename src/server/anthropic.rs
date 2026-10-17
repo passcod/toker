@@ -155,9 +155,7 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     if path == "/_toker" || path.starts_with("/_toker/") {
         return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
     }
-    let Ok(default) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
-        return super::anthropic_not_configured();
-    };
+    let legacy_default = server.registry.resolve(ProtocolId::AnthropicMessages, None);
     let facts = server.shadow_facts(
         ProtocolId::AnthropicMessages,
         super::frontend_of(request.extensions()),
@@ -170,23 +168,49 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         None,
         crate::policy::RequestClass::Inference,
     );
-    if let Some(legacy) = server.legacy_shadow_outcome(
-        &facts,
-        &default,
-        default.effective_model().map(str::to_owned),
-        None,
-        None,
-        None,
-        default.effective_model().map(str::to_owned),
-        false,
-    ) {
-        let credentials = server.shadow_credentials(
-            request.headers(),
+    let credentials = server.shadow_credentials(
+        request.headers(),
+        ProtocolId::AnthropicMessages,
+        facts.now_ms,
+    );
+    let default = match server.resolve_policy_first_candidate(&facts, &credentials) {
+        Ok(Some(plan)) => match server.registry.resolve_binding(
             ProtocolId::AnthropicMessages,
-            facts.now_ms,
-        );
-        server.observe_policy_shadow(facts, credentials, None, legacy);
-    }
+            &plan.binding_id,
+            None,
+            &plan.effective_model,
+        ) {
+            Ok(target) => target,
+            Err(_) => return super::anthropic_not_configured(),
+        },
+        Ok(None) => match legacy_default {
+            Ok(default) => {
+                if let Some(legacy) = server.legacy_shadow_outcome(
+                    &facts,
+                    &default,
+                    default.effective_model().map(str::to_owned),
+                    None,
+                    None,
+                    None,
+                    default.effective_model().map(str::to_owned),
+                    false,
+                ) {
+                    server.observe_policy_shadow(facts, credentials, None, legacy);
+                }
+                default
+            }
+            Err(_) => return super::anthropic_not_configured(),
+        },
+        Err(error) => {
+            tracing::error!(%error, "active administrative policy resolution failed");
+            return codex::anthropic_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "the active routing policy has no backend for this path",
+                false,
+            );
+        }
+    };
     if default
         .binding()
         .canonical_backend()
@@ -200,7 +224,7 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
             false,
         );
     }
-    transparent(server, request).await
+    transparent_to(server, request, default).await
 }
 
 /// The shared usage-path pipeline (see the module docs). `path` is the
@@ -1936,6 +1960,10 @@ async fn transparent(server: Server, request: Request) -> Response {
     let Ok(target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
         return super::anthropic_not_configured();
     };
+    transparent_to(server, request, target).await
+}
+
+async fn transparent_to(server: Server, request: Request, target: ModelTarget) -> Response {
     let backend = target.provider().clone();
     // The batch paths have no codex equivalent: the same typed error the
     // usage path answers for count_tokens and batch creation, rather

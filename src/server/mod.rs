@@ -576,6 +576,41 @@ impl Server {
         )
     }
 
+    pub(crate) fn resolve_policy_first_candidate(
+        &self,
+        facts: &RequestFacts,
+        credentials: &crate::policy::CredentialSnapshot,
+    ) -> Result<Option<crate::policy::AttemptPlan>, PolicyAttemptError> {
+        let Some(runtime) = &self.policy_runtime else {
+            return Ok(None);
+        };
+        let Some((snapshot, _, _)) = runtime.capture_shadow(None, facts.now_ms) else {
+            return Ok(None);
+        };
+        let Some(revision_id) = snapshot.revision_id() else {
+            return Ok(None);
+        };
+        let availability = snapshot
+            .availability()
+            .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_credentials(credentials);
+        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
+        let circuits = runtime.open_circuits(&snapshot, facts.now_ms);
+        crate::policy::resolve_first_candidate(
+            snapshot.policy(),
+            snapshot.inventory(),
+            &learning,
+            &availability,
+            &circuits,
+            facts,
+        )
+        .map(|plan| Some(plan.with_policy_revision(revision_id)))
+        .map_err(|failure| PolicyAttemptError::Resolve {
+            revision_id,
+            failure,
+        })
+    }
+
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,
