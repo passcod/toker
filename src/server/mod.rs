@@ -551,6 +551,13 @@ impl Server {
         shadow.observe_record(record);
     }
 
+    pub(crate) fn has_active_policy(&self) -> bool {
+        self.policy_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capture())
+            .is_some_and(|snapshot| snapshot.revision_id().is_some())
+    }
+
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,

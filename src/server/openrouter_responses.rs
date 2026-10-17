@@ -350,12 +350,10 @@ async fn complete(
                 provider.as_deref(),
             );
         } else {
-            ctx.server.note_binding_observed(
-                &ctx.binding_id,
-                capture.model(),
-                super::record::now_ms(),
-                None,
-            );
+            let ts_ms = super::record::now_ms();
+            ctx.server
+                .note_binding_observed(&ctx.binding_id, capture.model(), ts_ms, None);
+            super::record_anthropic::persist_successful_pin(ctx, ts_ms);
         }
     }
     let turn = translate::codex_backend::canonical_turn_from_capture(&capture);
@@ -501,12 +499,14 @@ impl StreamState {
                     self.provider.as_deref(),
                 );
             } else {
+                let ts_ms = super::record::now_ms();
                 ctx.server.note_binding_observed(
                     &ctx.binding_id,
                     self.capture.model(),
-                    super::record::now_ms(),
+                    ts_ms,
                     None,
                 );
+                super::record_anthropic::persist_successful_pin(&ctx, ts_ms);
             }
         }
         drop(self.in_flight.take());

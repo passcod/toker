@@ -750,13 +750,26 @@ pub(crate) async fn coordinate_responses(
         parts,
         max_output_tokens,
         had_prompt_cache_key,
-        record,
+        mut record,
         in_flight,
         session_id,
         thread_id,
         request_id,
         client_wants_json,
     } = input;
+    let policy_routing = attempt
+        .as_ref()
+        .ok()
+        .map(InferenceAttempt::policy_routing)
+        .transpose()
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "policy attempt provenance omitted");
+            None
+        })
+        .flatten();
+    if let Some(ctx) = record.as_mut() {
+        ctx.policy_routing = policy_routing;
+    }
     let prepared = match adapter {
         Some(BackendAdapterId::AnthropicMessages) => {
             let attempt = match attempt {

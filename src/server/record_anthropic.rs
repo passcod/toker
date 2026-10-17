@@ -292,7 +292,7 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
         || presence.code_execs
 }
 
-fn persist_successful_pin(ctx: &AnthropicRecordCtx, ts_ms: i64) {
+pub(super) fn persist_successful_pin(ctx: &AnthropicRecordCtx, ts_ms: i64) {
     persist_lane_pin(
         &ctx.server,
         ctx.session_id.as_deref(),

@@ -43,7 +43,7 @@ use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, is_event_stream,
     plain_status, session_id, transport_failure, truncated_body, upstream_failure,
 };
-use crate::server::record::now_ms;
+use crate::server::record::{now_ms, record_route_unavailable};
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_responses_measurement};
 use crate::store::SessionLineage;
@@ -143,94 +143,210 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             false,
         );
     };
-    let target = match server
+    let legacy_target = server
         .registry
-        .resolve(ProtocolId::OpenAiResponses, Some(requested_model.as_str()))
-    {
-        Ok(target) => target,
-        Err(_) => return super::responses_not_configured(),
-    };
-    let backend = target.provider().clone();
-    let effective_model = target.effective_model().map(str::to_owned);
-    let attempt = canonical.map(|result| {
-        result.map(|canonical| {
-            super::inference::InferenceRequest::new(requested_model.clone(), canonical)
-                .prepare(target.clone(), effective_model.clone())
-        })
-    });
+        .resolve(ProtocolId::OpenAiResponses, Some(requested_model.as_str()));
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
-    let prepared_shape = attempt
+    let canonical_request = canonical.as_ref().and_then(|result| result.as_ref().ok());
+    let shape = canonical_request.map(|canonical| {
+        AnthropicShape::from_canonical_responses(
+            canonical,
+            original.len() as u64,
+            parsed
+                .as_ref()
+                .and_then(|request| request.get("input"))
+                .and_then(Value::as_array)
+                .map(|input| input.len() as u64),
+        )
+    });
+    let lane_reference = shape.as_ref().and_then(|shape| {
+        lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()))
+    });
+    let stored_lane = lane_reference.as_deref().and_then(|key| {
+        server
+            .store
+            .load_lane(key)
+            .inspect_err(|error| tracing::error!(%error, lane_key = key, "lane load failed"))
+            .ok()
+            .flatten()
+    });
+    let legacy_affinity = legacy_target.as_ref().ok().map(|target| target.binding());
+    let pinned_binding = stored_lane
         .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .map(|attempt| {
-            let canonical = attempt.canonical();
-            let shape = AnthropicShape::from_canonical_responses(
-                &canonical,
-                original.len() as u64,
-                parsed
-                    .as_ref()
-                    .and_then(|request| request.get("input"))
-                    .and_then(Value::as_array)
-                    .map(|input| input.len() as u64),
-            );
-            (canonical, shape)
-        });
-    if let Some((canonical, shape)) = prepared_shape.as_ref() {
-        let lane_reference =
-            lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()));
-        let lane = lane_reference
-            .as_deref()
-            .and_then(|key| server.store.load_lane(key).ok().flatten());
+        .and_then(|lane| lane.pin.as_ref())
+        .map(|pin| pin.binding_id.clone());
+
+    let (target, policy_attempt) = if let (Some(canonical), Some(shape)) =
+        (canonical_request, shape.as_ref())
+    {
         let binding_affinity = if canonical.requires_binding_affinity() {
-            lane.as_ref()
-                .and_then(|lane| lane.pin.as_ref())
-                .map(|pin| pin.binding_id.clone())
-                .or_else(|| {
-                    (target.binding().id_str() == "codex_sub.codex_responses")
-                        .then(|| target.binding().id().clone())
-                })
+            let Some(binding) = pinned_binding.clone().or_else(|| {
+                legacy_affinity
+                    .filter(|binding| binding.id_str() == "codex_sub.codex_responses")
+                    .map(|binding| binding.id().clone())
+            }) else {
+                return frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "the request contains provider-owned state with unknown binding affinity",
+                    false,
+                );
+            };
+            Some(binding)
         } else {
             None
         };
-        if canonical.requires_binding_affinity() && binding_affinity.is_none() {
-            // Unknown ownership cannot mean unconstrained: omit this shadow
-            // observation rather than blessing a binding that drops ciphertext.
-        } else {
-            let facts = server.shadow_facts(
-                ProtocolId::OpenAiResponses,
-                shadow_profile.as_deref(),
-                Some(requested_model.clone()),
-                lane_reference.clone(),
-                crate::middleware::force_newest::prompt_bound(original.len() as u64),
-                shape.req_messages,
-                shape.req_tools,
-                super::anthropic::shadow_capabilities(canonical),
-                binding_affinity,
-                crate::policy::RequestClass::Inference,
-            );
-            if let Some(legacy) = server.legacy_shadow_outcome(
-                &facts,
-                &target,
-                effective_model.clone(),
-                None,
-                None,
-                None,
-                effective_model.clone(),
-                false,
-            ) {
-                let credentials = server.shadow_credentials(
-                    &parts.headers,
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiResponses,
+            shadow_profile.as_deref(),
+            Some(requested_model.clone()),
+            lane_reference.clone(),
+            crate::middleware::force_newest::prompt_bound(original.len() as u64),
+            shape.req_messages,
+            shape.req_tools,
+            super::anthropic::shadow_capabilities(canonical),
+            binding_affinity,
+            crate::policy::RequestClass::Inference,
+        );
+        let credentials =
+            server.shadow_credentials(&parts.headers, ProtocolId::OpenAiResponses, facts.now_ms);
+        let lane = server.shadow_lane(
+            stored_lane.as_ref(),
+            pinned_binding
+                .as_ref()
+                .and_then(|binding| server.registry.binding(binding))
+                .or(legacy_affinity),
+            facts.now_ms,
+            false,
+        );
+        match server.resolve_policy_attempt(
+            &facts,
+            &credentials,
+            stored_lane.as_ref(),
+            lane.as_ref(),
+        ) {
+            Ok(Some(resolved)) => {
+                let target = match server.registry.resolve_binding(
                     ProtocolId::OpenAiResponses,
-                    facts.now_ms,
+                    &resolved.plan.binding_id,
+                    Some(requested_model.as_str()),
+                    &resolved.plan.effective_model,
+                ) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        tracing::error!(
+                            binding_id = %resolved.plan.binding_id,
+                            "active policy selected an unconfigured Responses binding"
+                        );
+                        return frontend_error_response(
+                            CodexFrontendWire::OpenAiResponses,
+                            StatusCode::BAD_GATEWAY,
+                            "server_error",
+                            "the active routing policy selected an unavailable backend",
+                            !client_wants_json,
+                        );
+                    }
+                };
+                (target, Some(resolved))
+            }
+            Ok(None) => {
+                let target = match legacy_target.clone() {
+                    Ok(target) => target,
+                    Err(_) => return super::responses_not_configured(),
+                };
+                let effective_model = target.effective_model().map(str::to_owned);
+                if let Some(legacy) = server.legacy_shadow_outcome(
+                    &facts,
+                    &target,
+                    effective_model.clone(),
+                    None,
+                    None,
+                    None,
+                    effective_model,
+                    false,
+                ) {
+                    server.observe_policy_shadow(facts, credentials, lane, legacy);
+                }
+                (target, None)
+            }
+            Err(super::PolicyAttemptError::Resolve {
+                revision_id,
+                failure:
+                    crate::policy::ResolveFailure::RouteUnavailable {
+                        route_id,
+                        route_fingerprint,
+                        provenance,
+                        trace,
+                    },
+            }) => {
+                match crate::store::PolicyRouteProvenance::from_route_unavailable(
+                    revision_id,
+                    route_id,
+                    route_fingerprint,
+                    &provenance,
+                    &trace,
+                    crate::store::AttemptGroupId::fresh(),
+                ) {
+                    Ok(routing) => record_route_unavailable(
+                        &server,
+                        started,
+                        frontend.as_deref(),
+                        RESPONSES_FRONTEND,
+                        request_session.as_deref(),
+                        Some(requested_model.as_str()),
+                        routing,
+                    ),
+                    Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
+                }
+                return frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "the active routing policy has no available backend for this request",
+                    !client_wants_json,
                 );
-                let shadow_lane =
-                    server.shadow_lane(lane.as_ref(), Some(target.binding()), facts.now_ms, false);
-                server.observe_policy_shadow(facts, credentials, shadow_lane, legacy);
+            }
+            Err(error) => {
+                tracing::error!(%error, "active Responses policy resolution failed");
+                return frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "the active routing policy could not resolve this request",
+                    !client_wants_json,
+                );
             }
         }
-    }
+    } else {
+        if server.has_active_policy() {
+            return super::inference::invalid_responses_body(client_wants_json);
+        }
+        match legacy_target.clone() {
+            Ok(target) => (target, None),
+            Err(_) => return super::responses_not_configured(),
+        }
+    };
+    let backend = target.provider().clone();
+    let effective_model = policy_attempt
+        .as_ref()
+        .map(|resolved| resolved.plan.effective_model.clone())
+        .or_else(|| target.effective_model().map(str::to_owned));
+    let pin_transition = policy_attempt
+        .as_ref()
+        .map(|resolved| resolved.pin_transition.clone());
+    let attempt = canonical.map(|result| {
+        result.map(|canonical| {
+            let inference =
+                super::inference::InferenceRequest::new(requested_model.clone(), canonical);
+            match policy_attempt {
+                Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan),
+                None => inference.prepare(target.clone(), effective_model.clone()),
+            }
+        })
+    });
 
     let record = parsed.as_ref().map(|_| AnthropicRecordCtx {
         server: server.clone(),
@@ -244,9 +360,9 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         binding_id: target.binding().id().clone(),
         attempt: None,
         policy_routing: None,
-        pin_transition: None,
+        pin_transition,
         betas: None,
-        shape: prepared_shape.map(|(_, shape)| shape),
+        shape,
         ping,
         downgraded_from: None,
         downgraded_to: None,
