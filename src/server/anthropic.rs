@@ -89,7 +89,7 @@ use super::proxy::{
     buffered_body, build_response, is_compressed, is_event_stream, plain_status, response_headers,
     send_upstream, session_id, transport_failure, truncated_body,
 };
-use super::record::{now_ms, retry_after_ms};
+use super::record::{now_ms, record_route_unavailable, retry_after_ms};
 use super::record_anthropic::{
     AnthropicRecordCtx, ColdRecord, QuotaBlockedRecord, error_pair, record_anthropic_cold,
     record_anthropic_cold_quiet, record_anthropic_cold_recap, record_anthropic_error,
@@ -251,8 +251,27 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         );
     }
 
-    let Ok(mut target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
+    let legacy_default = server.registry.resolve(ProtocolId::AnthropicMessages, None);
+    if path != "/v1/messages" && legacy_default.is_err() {
         return super::anthropic_not_configured();
+    }
+    // Active policy authority is only reachable after canonical parsing below.
+    // Until then, a configured target is a temporary provider context for the
+    // parse-failure and administrative legacy paths.
+    let mut target = match legacy_default {
+        Ok(target) => target,
+        Err(_) if path == "/v1/messages" && server.has_active_policy() => {
+            match server.registry.bindings().find_map(|binding| {
+                server
+                    .registry
+                    .resolve_binding(ProtocolId::AnthropicMessages, binding.id(), None, "pending")
+                    .ok()
+            }) {
+                Some(target) => target,
+                None => return super::anthropic_not_configured(),
+            }
+        }
+        Err(_) => return super::anthropic_not_configured(),
     };
     let mut backend = target.provider().clone();
 
@@ -292,6 +311,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut shadow_upgraded: Option<String> = None;
     let mut shadow_retargeted: Option<String> = None;
     let mut shadow_compaction_applied = false;
+    let mut policy_attempt: Option<super::PolicyAttempt> = None;
+    let mut cold_lane_key = None;
+    let mut cold_lane = None;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
@@ -314,15 +336,192 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
-        target = match server
+        let legacy_target = server
             .registry
-            .resolve(ProtocolId::AnthropicMessages, model.as_deref())
+            .resolve(ProtocolId::AnthropicMessages, model.as_deref());
+        if path == "/v1/messages"
+            && let Some(request) = ingress_canonical.as_ref()
         {
-            Ok(target) => target,
-            Err(_) => return super::anthropic_not_configured(),
-        };
+            let shape = AnthropicShape::from_canonical_messages(request, original.len() as u64);
+            cold_lane_key = lanes::lane_key(session_id.as_deref(), Some(shape.tools_hash.as_str()));
+            cold_lane = cold_lane_key.as_deref().and_then(|key| {
+                server
+                    .store
+                    .load_lane(key)
+                    .inspect_err(
+                        |error| tracing::error!(%error, lane_key = key, "lane load failed"),
+                    )
+                    .ok()
+                    .flatten()
+            });
+            let pinned_binding = cold_lane
+                .as_ref()
+                .and_then(|lane| lane.pin.as_ref())
+                .map(|pin| pin.binding_id.clone());
+            let legacy_binding = legacy_target.as_ref().ok().map(|target| target.binding());
+            let binding_affinity = if request.requires_binding_affinity() {
+                let Some(binding) = pinned_binding
+                    .clone()
+                    .or_else(|| legacy_binding.map(|binding| binding.id().clone()))
+                else {
+                    return super::codex::anthropic_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "the request contains provider-owned state with unknown binding affinity",
+                        request.stream == Some(true),
+                    );
+                };
+                Some(binding)
+            } else {
+                None
+            };
+            let class = if shape.is_compaction() {
+                crate::policy::RequestClass::Compaction
+            } else {
+                crate::policy::RequestClass::Inference
+            };
+            let mut facts = server.shadow_facts(
+                ProtocolId::AnthropicMessages,
+                shadow_profile.as_deref(),
+                model.clone(),
+                cold_lane_key.clone(),
+                force_newest::prompt_bound(original.len() as u64),
+                shape.req_messages,
+                shape.req_tools,
+                shadow_capabilities(request),
+                binding_affinity,
+                class,
+            );
+            if class == crate::policy::RequestClass::Compaction {
+                facts.legacy_compaction = Some(crate::policy::LegacyCompactionFacts {
+                    lane_cold: cold::lane_is_cold(
+                        cold_lane.as_ref(),
+                        server.config.gates.cold_min_tokens,
+                        cold_idle_ms(&server.config.gates),
+                        facts.now_ms,
+                    ),
+                    prompt_tokens: cold_lane
+                        .as_ref()
+                        .and_then(|lane| lane.prompt_tokens)
+                        .and_then(|prompt| u64::try_from(prompt).ok())
+                        .unwrap_or_default(),
+                    transform_applied: {
+                        let mut probe = request.clone();
+                        crate::middleware::canonical::retarget_compaction(
+                            &mut probe, None, true, None,
+                        )
+                        .is_some()
+                    },
+                });
+            }
+            let credentials = server.shadow_credentials(
+                &parts.headers,
+                ProtocolId::AnthropicMessages,
+                facts.now_ms,
+            );
+            let lane = server.shadow_lane(
+                cold_lane.as_ref(),
+                pinned_binding
+                    .as_ref()
+                    .and_then(|binding| server.registry.binding(binding))
+                    .or(legacy_binding),
+                facts.now_ms,
+                class == crate::policy::RequestClass::Compaction,
+            );
+            match server.resolve_policy_attempt(
+                &facts,
+                &credentials,
+                cold_lane.as_ref(),
+                lane.as_ref(),
+            ) {
+                Ok(Some(resolved)) => {
+                    target = match server.registry.resolve_binding(
+                        ProtocolId::AnthropicMessages,
+                        &resolved.plan.binding_id,
+                        model.as_deref(),
+                        &resolved.plan.effective_model,
+                    ) {
+                        Ok(target) => target,
+                        Err(_) => {
+                            tracing::error!(
+                                binding_id = %resolved.plan.binding_id,
+                                "active policy selected an unconfigured Messages binding"
+                            );
+                            return super::codex::anthropic_error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "api_error",
+                                "the active routing policy selected an unavailable backend",
+                                request.stream == Some(true),
+                            );
+                        }
+                    };
+                    policy_attempt = Some(resolved);
+                }
+                Ok(None) => {
+                    target = match legacy_target {
+                        Ok(target) => target,
+                        Err(_) => return super::anthropic_not_configured(),
+                    };
+                }
+                Err(super::PolicyAttemptError::Resolve {
+                    revision_id,
+                    failure:
+                        crate::policy::ResolveFailure::RouteUnavailable {
+                            route_id,
+                            route_fingerprint,
+                            provenance,
+                            trace,
+                        },
+                }) => {
+                    match crate::store::PolicyRouteProvenance::from_route_unavailable(
+                        revision_id,
+                        route_id,
+                        route_fingerprint,
+                        &provenance,
+                        &trace,
+                        crate::store::AttemptGroupId::fresh(),
+                    ) {
+                        Ok(routing) => record_route_unavailable(
+                            &server,
+                            started,
+                            frontend.as_deref(),
+                            "anthropic",
+                            session_id.as_deref(),
+                            model.as_deref(),
+                            routing,
+                        ),
+                        Err(error) => {
+                            tracing::error!(%error, "route-unavailable provenance omitted")
+                        }
+                    }
+                    return super::codex::anthropic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "the active routing policy has no available backend for this request",
+                        request.stream == Some(true),
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "active Messages policy resolution failed");
+                    return super::codex::anthropic_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "the active routing policy could not resolve this request",
+                        request.stream == Some(true),
+                    );
+                }
+            }
+        } else {
+            target = match legacy_target {
+                Ok(target) => target,
+                Err(_) => return super::anthropic_not_configured(),
+            };
+        }
         backend = target.provider().clone();
-        let effective_model = target.effective_model().map(str::to_owned);
+        let effective_model = policy_attempt
+            .as_ref()
+            .map(|resolved| resolved.plan.effective_model.clone())
+            .or_else(|| target.effective_model().map(str::to_owned));
         shadow_baseline.clone_from(&effective_model);
         let mut transformed = false;
         if effective_model.as_deref() != model.as_deref()
@@ -421,12 +620,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forward = Bytes::from(ir.serialise());
         }
         let shape = if path == "/v1/messages" {
-            serde_json::from_slice::<serde_json::Value>(&original)
-                .ok()
-                .and_then(|body| translate::from_anthropic(&body).ok())
-                .map(|request| {
-                    AnthropicShape::from_canonical_messages(&request, original.len() as u64)
-                })
+            ingress_canonical.as_ref().map(|request| {
+                AnthropicShape::from_canonical_messages(request, original.len() as u64)
+            })
         } else {
             Some(ir.anthropic().shape())
         };
@@ -449,7 +645,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             binding_id: target.binding().id().clone(),
             attempt: None,
             policy_routing: None,
-            pin_transition: None,
+            pin_transition: policy_attempt
+                .as_ref()
+                .map(|resolved| resolved.pin_transition.clone()),
             betas,
             shape: shape.clone(),
             ping,
@@ -553,13 +751,15 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Every failure below is "a lost notice, never a lost request": a
     // store error reads as absence and the request forwards.
     let cold_armed = path == "/v1/messages" && server.config.gates.cold_enabled;
-    let cold_lane_key = gate_shape
-        .as_ref()
-        .map(|shape| shape.tools_hash.as_str())
-        .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
-    let cold_lane = cold_lane_key
-        .as_ref()
-        .and_then(|key| server.store.load_lane(key).ok().flatten());
+    if cold_lane_key.is_none() {
+        cold_lane_key = gate_shape
+            .as_ref()
+            .map(|shape| shape.tools_hash.as_str())
+            .and_then(|tools| lanes::lane_key(session_id.as_deref(), Some(tools)));
+        cold_lane = cold_lane_key
+            .as_ref()
+            .and_then(|key| server.store.load_lane(key).ok().flatten());
+    }
     if cold_armed {
         let gates = &server.config.gates;
         let now = now_ms();
@@ -862,6 +1062,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
+    let authoritative = policy_attempt.is_some();
+    let policy_compaction = policy_attempt
+        .as_ref()
+        .is_some_and(|resolved| resolved.plan.compaction);
     // The common coordinator baseline is after request-global gates and before
     // every candidate-local model, compaction, mapping, or capability transform.
     if path == "/v1/messages"
@@ -873,7 +1077,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .expect("inference model validated before gates"),
             request.clone(),
         );
-        inference_attempt = Some(inference.prepare(target.clone(), served_model.clone()));
+        inference_attempt = Some(match policy_attempt.take() {
+            Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan),
+            None => inference.prepare(target.clone(), served_model.clone()),
+        });
     }
 
     // ── the compaction retarget ──
@@ -887,6 +1094,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // above exempted it by the summarising flag, so nothing has
     // interrupted it: the gate exists to advise this.
     if path == "/v1/messages"
+        && (!authoritative || policy_compaction)
         && picks_from_anthropic_catalogue(backend.as_ref())
         && gate_shape
             .as_ref()
@@ -909,16 +1117,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .and_then(|lane| lane.prompt_tokens)
                 .filter(|prompt| *prompt >= 0)
                 .unwrap_or_default() as u64;
-            let compaction_target = server
-                .models
-                .compaction_target(
-                    &compact_spec(gates),
-                    prompt,
-                    backend.model_map(),
-                    &|model: &str| declared_window(&server, backend.as_ref(), model),
-                )
-                .ok()
-                .flatten();
+            let compaction_target = if authoritative {
+                inference_attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.effective_model().map(str::to_owned))
+            } else {
+                server
+                    .models
+                    .compaction_target(
+                        &compact_spec(gates),
+                        prompt,
+                        backend.model_map(),
+                        &|model: &str| declared_window(&server, backend.as_ref(), model),
+                    )
+                    .ok()
+                    .flatten()
+            };
             let retargeted = inference_attempt.as_mut().and_then(|attempt| {
                 let outcome =
                     attempt.apply_compaction(compaction_target.as_deref(), backend.model_map())?;
@@ -992,6 +1206,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // STARTS a conversation that should cache its prefix on the model it
     // is actually going to use.
     if path == "/v1/messages"
+        && !authoritative
         && server.config.gates.force_newest
         && picks_from_anthropic_catalogue(backend.as_ref())
         && record
@@ -1068,7 +1283,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // requests keep their exact bytes (the unchanged path). Applies AFTER
     // force-newest (which previewed through the map above), and BEFORE
     // the served-model mark — the mark must see what is actually sent.
-    if let Some(map) = backend.model_map() {
+    if !authoritative && let Some(map) = backend.model_map() {
         let canonical_rewrite = (path == "/v1/messages")
             .then_some(inference_attempt.as_mut())
             .flatten()
@@ -1163,23 +1378,25 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Compare only after all authoritative routing transforms have completed.
     // The observer has no request body, headers, credentials, providers, or
     // mutable state and its result is deliberately ignored.
-    observe_messages_shadow(
-        &server,
-        &parts.headers,
-        &target,
-        shadow_profile.as_deref(),
-        client_model.clone(),
-        session_id.as_deref(),
-        &original,
-        gate_shape.as_ref(),
-        canonical.as_ref(),
-        cold_lane.as_ref(),
-        shadow_baseline.clone(),
-        shadow_upgraded.clone(),
-        shadow_retargeted.clone(),
-        served_model.clone(),
-        shadow_compaction_applied,
-    );
+    if !authoritative {
+        observe_messages_shadow(
+            &server,
+            &parts.headers,
+            &target,
+            shadow_profile.as_deref(),
+            client_model.clone(),
+            session_id.as_deref(),
+            &original,
+            gate_shape.as_ref(),
+            canonical.as_ref(),
+            cold_lane.as_ref(),
+            shadow_baseline.clone(),
+            shadow_upgraded.clone(),
+            shadow_retargeted.clone(),
+            served_model.clone(),
+            shadow_compaction_applied,
+        );
+    }
 
     // ── mid-conversation effort, for models that reject it ──
     //
