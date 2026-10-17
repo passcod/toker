@@ -104,8 +104,8 @@ mod tests {
     use crate::config::{Config, OpenRouterConfig};
     use crate::middleware::awake::ProcessSpawner;
     use crate::policy::{
-        BindingId, CandidateId, LaneState, PinIdentity, RouteFingerprint, RouteId, TransitionCause,
-        decide_transition,
+        BindingId, CandidateId, LaneState, LaneTransitionDecision, PinIdentity, RouteFingerprint,
+        RouteId, TransitionCause, decide_transition,
     };
     use crate::providers::{OpenRouter, Provider};
     use crate::server::Server;
@@ -113,9 +113,12 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn an_armed_guard_records_cancellation_off_the_dropping_task() {
-        let dir = crate::test_support::tempdir("cancel-guard-");
+    fn chat_record(
+        prefix: &str,
+        session_id: Option<&str>,
+        pin_transition: Option<LaneTransitionDecision>,
+    ) -> (Arc<Store>, RecordCtx) {
+        let dir = crate::test_support::tempdir(prefix);
         let path = dir.join("toker.toml");
         std::fs::write(&path, "[providers.openrouter]\n").expect("config");
         let mut config = Config::load_from(&path).expect("load config");
@@ -134,22 +137,38 @@ mod tests {
             "http://127.0.0.1:9/v1".parse().expect("url"),
             None,
         ));
+        let shape = session_id.map(|_| crate::ir::openai_chat::Shape {
+            req_bytes: 1,
+            req_messages: Some(1),
+            req_tools: 0,
+            tools_hash: "tools".to_owned(),
+            system_chars: 0,
+            system_hash: String::new(),
+            system_blocks: vec![],
+            summarising: false,
+        });
         let ctx = RecordCtx {
             server,
             backend,
             binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
             attempt: Some(crate::server::attempt::initial_provenance()),
             policy_routing: None,
-            pin_transition: None,
+            pin_transition,
             started: Instant::now(),
-            session_id: None,
+            session_id: session_id.map(str::to_owned),
             ping: false,
             requested_model: Some("example/model".to_owned()),
             effective_model: Some("example/model".to_owned()),
-            shape: None,
+            shape,
             system_messages: None,
             frontend: None,
         };
+        (store, ctx)
+    }
+
+    #[tokio::test]
+    async fn an_armed_guard_records_cancellation_off_the_dropping_task() {
+        let (store, ctx) = chat_record("cancel-guard-", None, None);
 
         drop(PrecommitCancellationGuard::chat(Some(&ctx)));
         for _ in 0..100 {
@@ -170,25 +189,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_records_the_attempt_without_pinning_the_lane() {
-        let dir = crate::test_support::tempdir("cancel-pin-");
-        let path = dir.join("toker.toml");
-        std::fs::write(&path, "[providers.openrouter]\n").expect("config");
-        let mut config = Config::load_from(&path).expect("load config");
-        config.db_path = ":memory:".into();
-        config.openrouter = Some(OpenRouterConfig::default());
-        config.default_backend_openai_chat = Some("openrouter".to_owned());
-        let store = Arc::new(Store::open(&config.db_path).expect("store"));
-        let server = Server::with_seams(
-            config,
-            store.clone(),
-            Box::new(ProcessSpawner),
-            Arc::new(crate::secrets::MemoryStore::new()),
-        )
-        .expect("server");
-        let backend: Arc<dyn Provider> = Arc::new(OpenRouter::new(
-            "http://127.0.0.1:9/v1".parse().expect("url"),
-            None,
-        ));
         let pin = PinIdentity {
             policy_revision_id: 1,
             policy_route_id: RouteId::new("route").expect("route"),
@@ -201,38 +201,19 @@ mod tests {
             baseline_model: "example/model".to_owned(),
             effective_model: "example/model".to_owned(),
         };
-        let ctx = RecordCtx {
-            server,
-            backend,
-            binding_id: BindingId::new("openrouter.openrouter_chat_completions").expect("binding"),
-            attempt: Some(crate::server::attempt::initial_provenance()),
-            policy_routing: None,
-            pin_transition: Some(decide_transition(
-                &LaneState::Absent,
-                pin,
-                TransitionCause::Activation {
-                    scope: crate::policy::ActivationScope::NewLanes,
-                    forced_cache_transition: false,
-                },
-            )),
-            started: Instant::now(),
-            session_id: Some("cancelled-session".to_owned()),
-            ping: false,
-            requested_model: Some("example/model".to_owned()),
-            effective_model: Some("example/model".to_owned()),
-            shape: Some(crate::ir::openai_chat::Shape {
-                req_bytes: 1,
-                req_messages: Some(1),
-                req_tools: 0,
-                tools_hash: "tools".to_owned(),
-                system_chars: 0,
-                system_hash: String::new(),
-                system_blocks: vec![],
-                summarising: false,
-            }),
-            system_messages: None,
-            frontend: None,
-        };
+        let pin_transition = decide_transition(
+            &LaneState::Absent,
+            pin,
+            TransitionCause::Activation {
+                scope: crate::policy::ActivationScope::NewLanes,
+                forced_cache_transition: false,
+            },
+        );
+        let (store, ctx) = chat_record(
+            "cancel-pin-",
+            Some("cancelled-session"),
+            Some(pin_transition),
+        );
 
         drop(PrecommitCancellationGuard::chat(Some(&ctx)));
         for _ in 0..100 {

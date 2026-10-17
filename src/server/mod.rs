@@ -1745,10 +1745,23 @@ version_probe = false
             }],
             "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
         });
-        if response_mode == 1 {
+        if response_mode == CHAT_WITHOUT_USAGE {
             response.as_object_mut().unwrap().remove("usage");
         }
         (StatusCode::OK, axum::Json(response)).into_response()
+    }
+
+    async fn serve(server: Server) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("toker binds");
+        let address = listener.local_addr().expect("toker address");
+        tokio::spawn(async move {
+            axum::serve(listener, server.router())
+                .await
+                .expect("toker serves")
+        });
+        address
     }
 
     async fn policy_chat_server() -> (Server, ChatBodies) {
@@ -1887,17 +1900,11 @@ api_key = "sk-proj-test"
     #[tokio::test]
     async fn successful_policy_chat_without_usage_still_pins_its_lane() {
         let (server, upstream) = policy_chat_server().await;
-        upstream.response_mode.store(1, Ordering::Relaxed);
+        upstream
+            .response_mode
+            .store(CHAT_WITHOUT_USAGE, Ordering::Relaxed);
         let store = server.store.clone();
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("toker binds");
-        let address = listener.local_addr().expect("toker address");
-        tokio::spawn(async move {
-            axum::serve(listener, server.router())
-                .await
-                .expect("toker serves")
-        });
+        let address = serve(server).await;
 
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/chat/completions"))
@@ -1931,17 +1938,11 @@ api_key = "sk-proj-test"
     #[tokio::test]
     async fn failed_policy_chat_does_not_pin_its_lane() {
         let (server, upstream) = policy_chat_server().await;
-        upstream.response_mode.store(2, Ordering::Relaxed);
+        upstream
+            .response_mode
+            .store(CHAT_FAILURE, Ordering::Relaxed);
         let store = server.store.clone();
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("toker binds");
-        let address = listener.local_addr().expect("toker address");
-        tokio::spawn(async move {
-            axum::serve(listener, server.router())
-                .await
-                .expect("toker serves")
-        });
+        let address = serve(server).await;
 
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/chat/completions"))
@@ -2127,15 +2128,7 @@ api_key = "sk-proj-test"
             "catalogue refresh preserves active routing authority"
         );
         let store = server.store.clone();
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("toker binds");
-        let address = listener.local_addr().expect("toker address");
-        tokio::spawn(async move {
-            axum::serve(listener, server.router())
-                .await
-                .expect("toker serves")
-        });
+        let address = serve(server).await;
         let response = reqwest::Client::new()
             .post(format!("http://{address}/v1/chat/completions"))
             .header("x-toker-session", "policy-session")
