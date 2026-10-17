@@ -171,7 +171,7 @@ mod tests {
         let (store, ctx) = chat_record("cancel-guard-", None, None);
 
         drop(PrecommitCancellationGuard::chat(Some(&ctx)));
-        for _ in 0..100 {
+        for _ in 0..200 {
             let rows = store.requests_since(0, 10).expect("rows");
             if let Some(row) = rows.first() {
                 assert_eq!(row.kind, Some(RowKind::Error));
@@ -182,7 +182,7 @@ mod tests {
                 );
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("cancellation row did not land");
     }
@@ -216,7 +216,7 @@ mod tests {
         );
 
         drop(PrecommitCancellationGuard::chat(Some(&ctx)));
-        for _ in 0..100 {
+        for _ in 0..200 {
             if !store.requests_since(0, 10).expect("rows").is_empty() {
                 assert!(
                     store.load_lanes().expect("lanes").is_empty(),
@@ -224,7 +224,7 @@ mod tests {
                 );
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("cancellation row did not land");
     }
