@@ -53,21 +53,43 @@ pub fn write_config(
     path: &Path,
     changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    write_config_with_ownership(path, false, changes)
+}
+
+pub fn write_owned_config(
+    path: &Path,
+    changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    write_config_with_ownership(path, true, changes)
+}
+
+fn write_config_with_ownership(
+    path: &Path,
+    policy_owned: bool,
+    changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut config = Config::load_from(path)
         .with_context(|| format!("reading the existing {}", path.display()))?;
     changes(&mut config).context("applying the wizard's config changes")?;
     config
         .validate()
         .context("the wizard's config changes do not validate")?;
-    let text = toml::to_string_pretty(&config.to_file()).context("serialising toker.toml")?;
+    let file = if policy_owned {
+        config.to_owned_file()
+    } else {
+        config.to_file()
+    };
+    let text = toml::to_string_pretty(&file).context("serialising toker.toml")?;
     let intended = config;
     atomic_write_bytes(path, text.as_bytes(), Some(0o600), move |temp, _written| {
-        // The re-parse side, stronger than a byte compare: the bytes on
-        // disk go back through the REAL loader — parsing them, applying
-        // defaults, validating them — and must resolve to exactly the
-        // config we meant to write.
         let reloaded = Config::load_from(temp).context("re-loading the written toker.toml")?;
-        if reloaded != intended {
+        let matches = if policy_owned {
+            toml::to_string(&reloaded.to_owned_file()).ok()
+                == toml::to_string(&intended.to_owned_file()).ok()
+        } else {
+            reloaded == intended
+        };
+        if !matches {
             bail!(
                 "the written toker.toml does not round-trip to the intended config — \
                  refusing to rename"
@@ -114,6 +136,21 @@ default_backend_anthropic = "codex_sub"
         )
         .expect("the expected map parses")
         .expect("enabled")
+    }
+
+    #[test]
+    fn policy_owned_write_omits_operational_routing_fields() {
+        let dir = test_dir("owned-config");
+        let path = dir.join("toker.toml");
+        fs::write(&path, REAL_MACHINE_TOML).expect("write fixture");
+        write_owned_config(&path, |_| Ok(())).expect("owned write");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("default_backend_"));
+        assert!(!text.contains("model_map"));
+        assert!(!text.contains("picker"));
+        assert!(!text.contains("compact_model"));
+        assert!(!text.contains("force_newest"));
+        assert!(text.contains("[providers.codex_sub]"));
     }
 
     #[test]

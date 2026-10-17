@@ -798,13 +798,25 @@ impl Config {
     /// selectors canonical; comments and hand formatting are not
     /// carried.
     pub(crate) fn to_file(&self) -> FileConfig {
+        self.to_file_with_routing(true)
+    }
+
+    pub(crate) fn to_owned_file(&self) -> FileConfig {
+        self.to_file_with_routing(false)
+    }
+
+    fn to_file_with_routing(&self, include_routing: bool) -> FileConfig {
         FileConfig {
             port: Some(self.port),
             db_path: Some(self.db_path.to_string_lossy().into_owned()),
             session_header_names: Some(self.session_header_names.clone()),
             ping_header_name: Some(self.ping_header_name.clone()),
-            default_backend_openai_chat: self.default_backend_openai_chat.clone(),
-            default_backend_anthropic: self.default_backend_anthropic.clone(),
+            default_backend_openai_chat: include_routing
+                .then(|| self.default_backend_openai_chat.clone())
+                .flatten(),
+            default_backend_anthropic: include_routing
+                .then(|| self.default_backend_anthropic.clone())
+                .flatten(),
             awake: Some(self.awake),
             transcript_roots: Some(
                 self.transcript_roots
@@ -820,7 +832,7 @@ impl Config {
                     api_key_env: Some(openrouter.api_key_env.clone()),
                     api_key_keyring: openrouter.api_key_keyring.then_some(true),
                     api_key: openrouter.api_key.clone(),
-                    picker: openrouter.picker.clone(),
+                    picker: include_routing.then(|| openrouter.picker.clone()).flatten(),
                 }),
                 openai_api: self.openai_api.as_ref().map(|api| FileOpenAiApi {
                     upstream: Some(api.upstream.to_string()),
@@ -837,14 +849,18 @@ impl Config {
                         .claude_credentials_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned()),
-                    model_map: sub.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| sub.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
                 anthropic_api: self.anthropic_api.as_ref().map(|api| FileAnthropicApi {
                     upstream: Some(api.upstream.to_string()),
                     api_key_env: Some(api.api_key_env.clone()),
                     api_key_keyring: api.api_key_keyring.then_some(true),
                     api_key: api.api_key.clone(),
-                    model_map: api.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| api.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
                 codex_sub: self.codex_sub.as_ref().map(|codex| FileCodexSub {
                     upstream: Some(codex.upstream.to_string()),
@@ -853,7 +869,9 @@ impl Config {
                     refresh_url: Some(codex.refresh_url.to_string()),
                     client_version: codex.client_version.clone(),
                     version_probe: Some(codex.version_probe),
-                    model_map: codex.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| codex.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
             },
             notices: std::iter::once(("default".to_owned(), self.notices.default))
@@ -873,8 +891,10 @@ impl Config {
                 cold_outlook: Some(self.gates.cold_outlook),
                 cold_min_tokens: Some(self.gates.cold_min_tokens),
                 cold_idle_min: self.gates.cold_idle_min,
-                compact_model: self.gates.compact_model.clone(),
-                force_newest: Some(self.gates.force_newest),
+                compact_model: include_routing
+                    .then(|| self.gates.compact_model.clone())
+                    .flatten(),
+                force_newest: include_routing.then_some(self.gates.force_newest),
             },
         }
     }
