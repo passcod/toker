@@ -25,8 +25,15 @@ use anyhow::bail;
 /// `serve`: config → store → server, with tracing on.
 pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
-    let config = Config::load()?;
+    let config = Config::load_for_owned_service()?;
     let store = Arc::new(Store::open(&config.db_path)?);
+    if store
+        .load_routing_policy_state()?
+        .active_revision_id
+        .is_none()
+    {
+        config.validate()?;
+    }
     tracing::info!(
         "serving anthropic → {}, openai_chat → {} (db: {})",
         config

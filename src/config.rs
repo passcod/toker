@@ -728,9 +728,20 @@ impl Config {
         Self::load_with_env(&ProcessEnvironment)
     }
 
+    pub(crate) fn load_for_owned_service() -> anyhow::Result<Config> {
+        Self::load_with_env_mode(&ProcessEnvironment, false)
+    }
+
     fn load_with_env(environment: &impl Environment) -> anyhow::Result<Config> {
+        Self::load_with_env_mode(environment, true)
+    }
+
+    fn load_with_env_mode(
+        environment: &impl Environment,
+        validate_routing: bool,
+    ) -> anyhow::Result<Config> {
         let path = config_path_with_env(environment)?;
-        let mut config = Self::load_from(&path)?;
+        let mut config = Self::load_from_mode(&path, validate_routing)?;
 
         // Env overrides (config file loses).
         if let Some(port) = environment.var_os("TOKER_PORT") {
@@ -760,7 +771,10 @@ impl Config {
             }
         }
 
-        config.validate()?;
+        config.validate_retained()?;
+        if validate_routing {
+            config.validate_routing()?;
+        }
         Ok(config)
     }
 
@@ -773,6 +787,10 @@ impl Config {
     /// file that does not parse or validate is an error — a
     /// hand-edited typo must not be silently clobbered.
     pub fn load_from(path: &Path) -> anyhow::Result<Config> {
+        Self::load_from_mode(path, true)
+    }
+
+    fn load_from_mode(path: &Path, validate_routing: bool) -> anyhow::Result<Config> {
         let file = match fs::read_to_string(path) {
             Ok(text) => toml::from_str::<FileConfig>(&text)
                 .with_context(|| format!("parsing {}", path.display()))?,
@@ -782,7 +800,10 @@ impl Config {
             }
         };
         let config = Self::resolve_file(file)?;
-        config.validate()?;
+        config.validate_retained()?;
+        if validate_routing {
+            config.validate_routing()?;
+        }
         Ok(config)
     }
 
@@ -1121,6 +1142,11 @@ impl Config {
     /// the wizard's gate: [`crate::setup::config_writer`] re-runs it
     /// over the wizard's changes before anything is written.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.validate_retained()?;
+        self.validate_routing()
+    }
+
+    fn validate_retained(&self) -> anyhow::Result<()> {
         // Session header names must be usable as header names, or the
         // per-request lookup by name would silently never match.
         for name in &self.session_header_names {
@@ -1149,9 +1175,20 @@ impl Config {
         {
             bail!("cold_idle_min must be a non-negative number of minutes");
         }
-        // Each protocol default must name an enabled backend of that
-        // protocol: anything else cannot route anywhere. The load already
-        // checks this; the wizard's edits are re-checked here.
+        // The codex originator rides on every request header: an
+        // unusable value would silently never reach the upstream.
+        if let Some(codex) = &self.codex_sub
+            && let Err(error) = axum::http::HeaderValue::from_str(&codex.originator)
+        {
+            bail!(
+                "providers.codex_sub originator {:?} is not a valid header value: {error}",
+                codex.originator
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_routing(&self) -> anyhow::Result<()> {
         check_default(
             "default_backend_anthropic",
             self.default_backend_anthropic.as_deref(),
@@ -1173,18 +1210,7 @@ impl Config {
                 &legacy_chat_enabled
             },
             OPENAI_CHAT_BACKENDS,
-        )?;
-        // The codex originator rides on every request header: an
-        // unusable value would silently never reach the upstream.
-        if let Some(codex) = &self.codex_sub
-            && let Err(error) = axum::http::HeaderValue::from_str(&codex.originator)
-        {
-            bail!(
-                "providers.codex_sub originator {:?} is not a valid header value: {error}",
-                codex.originator
-            );
-        }
-        Ok(())
+        )
     }
 }
 
@@ -2425,6 +2451,28 @@ quota_enabled = false
         let dir = test_dir("unknown-key");
         fs::write(dir.join("toker.toml"), "prot = 1\n").expect("write config");
         assert!(load_result(&dir).is_err(), "a typo'd key must fail to load");
+    }
+
+    #[test]
+    fn owned_service_load_ignores_obsolete_default_validation() {
+        let dir = test_dir("owned-service-config");
+        let path = dir.join("toker.toml");
+        fs::write(
+            &path,
+            r#"
+default_backend_anthropic = "codex_sub"
+[providers.openrouter]
+"#,
+        )
+        .unwrap();
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
+        assert!(super::Config::load_with_env(&environment).is_err());
+        let config = super::Config::load_with_env_mode(&environment, false).unwrap();
+        assert!(config.openrouter.is_some());
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
+        );
     }
 
     #[test]
