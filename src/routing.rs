@@ -309,6 +309,25 @@ pub struct BackendBinding {
     cost_class: CostClass,
     cache_domain: Option<CacheDomain>,
     canonical: Option<CanonicalBackend>,
+    administrative: AdministrativeCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct AdministrativeCapabilities {
+    pub count_tokens: bool,
+    pub batches: bool,
+}
+
+impl AdministrativeCapabilities {
+    pub const MESSAGES: Self = Self {
+        count_tokens: true,
+        batches: true,
+    };
+
+    pub const OPENROUTER_MESSAGES: Self = Self {
+        count_tokens: false,
+        batches: false,
+    };
 }
 
 impl BackendBinding {
@@ -330,6 +349,10 @@ impl BackendBinding {
             cost_class,
             cache_domain,
             canonical: None,
+            administrative: AdministrativeCapabilities {
+                count_tokens: false,
+                batches: false,
+            },
         }
     }
 
@@ -344,6 +367,7 @@ impl BackendBinding {
         cache_domain: Option<CacheDomain>,
         adapter: BackendAdapterId,
         capabilities: Capabilities,
+        administrative: AdministrativeCapabilities,
     ) -> BackendBinding {
         BackendBinding {
             id: BindingId::from_static(id),
@@ -356,6 +380,7 @@ impl BackendBinding {
                 adapter,
                 capabilities,
             }),
+            administrative,
         }
     }
 
@@ -392,6 +417,10 @@ impl BackendBinding {
     pub const fn canonical_backend(&self) -> Option<CanonicalBackend> {
         self.canonical
     }
+
+    pub const fn administrative_capabilities(&self) -> AdministrativeCapabilities {
+        self.administrative
+    }
 }
 
 pub const ANTHROPIC_SUB_MESSAGES: BackendBinding = BackendBinding::canonical(
@@ -403,6 +432,7 @@ pub const ANTHROPIC_SUB_MESSAGES: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::AnthropicMessages,
     Capabilities::MESSAGES,
+    AdministrativeCapabilities::MESSAGES,
 );
 
 pub const ANTHROPIC_API_MESSAGES: BackendBinding = BackendBinding::canonical(
@@ -414,6 +444,7 @@ pub const ANTHROPIC_API_MESSAGES: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::AnthropicMessages,
     Capabilities::MESSAGES,
+    AdministrativeCapabilities::MESSAGES,
 );
 
 pub const OPENAI_API_CHAT: BackendBinding = BackendBinding::canonical(
@@ -425,6 +456,10 @@ pub const OPENAI_API_CHAT: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::OpenAiChatCompletions,
     Capabilities::OPENAI_CHAT,
+    AdministrativeCapabilities {
+        count_tokens: false,
+        batches: false,
+    },
 );
 
 pub const OPENROUTER_CHAT: BackendBinding = BackendBinding::canonical(
@@ -436,6 +471,10 @@ pub const OPENROUTER_CHAT: BackendBinding = BackendBinding::canonical(
     Some(CacheDomain::new("openrouter.chat", 10 * 60 * 1000)),
     BackendAdapterId::OpenAiChatCompletions,
     Capabilities::CHAT,
+    AdministrativeCapabilities {
+        count_tokens: false,
+        batches: false,
+    },
 );
 
 pub const OPENROUTER_MESSAGES: BackendBinding = BackendBinding::canonical(
@@ -447,6 +486,7 @@ pub const OPENROUTER_MESSAGES: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::AnthropicMessages,
     Capabilities::MESSAGES,
+    AdministrativeCapabilities::OPENROUTER_MESSAGES,
 );
 
 pub const OPENROUTER_RESPONSES: BackendBinding = BackendBinding::canonical(
@@ -458,6 +498,10 @@ pub const OPENROUTER_RESPONSES: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::OpenRouterResponses,
     Capabilities::OPENROUTER_RESPONSES,
+    AdministrativeCapabilities {
+        count_tokens: false,
+        batches: false,
+    },
 );
 
 pub const CODEX_SUB_RESPONSES: BackendBinding = BackendBinding::canonical(
@@ -469,6 +513,10 @@ pub const CODEX_SUB_RESPONSES: BackendBinding = BackendBinding::canonical(
     None,
     BackendAdapterId::CodexResponses,
     Capabilities::CODEX,
+    AdministrativeCapabilities {
+        count_tokens: false,
+        batches: false,
+    },
 );
 
 pub const BACKEND_BINDINGS: &[BackendBinding] = &[
@@ -766,9 +814,9 @@ mod tests {
     use reqwest::Url;
 
     use super::{
-        ANTHROPIC_SUB_MESSAGES, BACKEND_BINDINGS, BackendAdapterId, BackendBinding, Capabilities,
-        DialectId, FrontendProfile, OPENAI_API_CHAT, OPENROUTER_CHAT, OPENROUTER_MESSAGES,
-        ProtocolId, ROUTES, RouteRegistry,
+        ANTHROPIC_SUB_MESSAGES, AdministrativeCapabilities, BACKEND_BINDINGS, BackendAdapterId,
+        BackendBinding, Capabilities, DialectId, FrontendProfile, OPENAI_API_CHAT, OPENROUTER_CHAT,
+        OPENROUTER_MESSAGES, ProtocolId, ROUTES, RouteRegistry,
     };
     use crate::policy::CostClass;
     use crate::providers::Provider;
@@ -848,10 +896,25 @@ mod tests {
             None,
             BackendAdapterId::CodexResponses,
             Capabilities::CODEX,
+            AdministrativeCapabilities::default(),
         );
         let canonical = ready.canonical_backend().expect("adapter is verified");
         assert_eq!(canonical.adapter(), BackendAdapterId::CodexResponses);
         assert_eq!(canonical.capabilities(), Capabilities::CODEX);
+        assert!(!ready.administrative_capabilities().count_tokens);
+        assert!(!ready.administrative_capabilities().batches);
+        assert!(
+            ANTHROPIC_SUB_MESSAGES
+                .administrative_capabilities()
+                .count_tokens
+        );
+        assert!(ANTHROPIC_SUB_MESSAGES.administrative_capabilities().batches);
+        assert!(
+            !OPENROUTER_MESSAGES
+                .administrative_capabilities()
+                .count_tokens
+        );
+        assert!(!OPENROUTER_MESSAGES.administrative_capabilities().batches);
     }
 
     #[test]
