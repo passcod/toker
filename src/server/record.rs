@@ -231,24 +231,52 @@ pub(super) fn persist_lane_pin(
     let Some(key) = lanes::lane_key(session_id, tools_hash) else {
         return;
     };
-    if let Err(error) = server.store.insert_lane_if_absent(&crate::store::Lane {
-        key: key.clone(),
-        session_id: session_id.map(str::to_owned),
-        tools_hash: tools_hash.map(str::to_owned),
-        updated_ms: ts_ms,
-        prompt_tokens: None,
-        ttl: None,
-        ping: ping.then_some(true),
-        noticed_at: None,
-        forced_from: None,
-        forced_to: None,
-        pin_generation: 0,
-        pin: None,
-    }) {
-        tracing::error!(%error, lane_key = key, "lane creation for pin failed");
-        return;
-    }
-    match crate::policy::persist_transition(&server.store, &key, decision) {
+    let activation_revision = match decision {
+        crate::policy::LaneTransitionDecision::FirstPin {
+            new_pin,
+            source:
+                crate::policy::TransitionSource::NewLane | crate::policy::TransitionSource::Activation,
+            ..
+        }
+        | crate::policy::LaneTransitionDecision::Replace {
+            new_pin,
+            source: crate::policy::TransitionSource::Activation,
+            ..
+        } => Some(new_pin.policy_revision_id),
+        _ => None,
+    };
+    let persist = || {
+        server.store.insert_lane_if_absent(&crate::store::Lane {
+            key: key.clone(),
+            session_id: session_id.map(str::to_owned),
+            tools_hash: tools_hash.map(str::to_owned),
+            updated_ms: ts_ms,
+            prompt_tokens: None,
+            ttl: None,
+            ping: ping.then_some(true),
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        })?;
+        crate::policy::persist_transition(&server.store, &key, decision)
+    };
+    let result = if let (Some(runtime), Some(revision_id)) =
+        (server.policy_runtime.as_ref(), activation_revision)
+    {
+        let Some(result) = runtime.with_activation_fence(revision_id, persist) else {
+            tracing::debug!(
+                lane_key = key,
+                "lane activation pin lost to a newer active revision"
+            );
+            return;
+        };
+        result
+    } else {
+        persist()
+    };
+    match result {
         Ok(crate::policy::PinPersistence::Conflict) => {
             tracing::debug!(
                 lane_key = key,

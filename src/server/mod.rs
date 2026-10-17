@@ -140,6 +140,16 @@ pub(crate) enum PolicyAttemptError {
         revision_id: i64,
         failure: crate::policy::ResolveFailure,
     },
+    #[error("policy revision {revision_id} could not safely transition the lane: {reason:?}")]
+    Transition {
+        revision_id: i64,
+        reason: crate::policy::TransitionDenied,
+    },
+}
+
+pub(crate) struct PolicyAttempt {
+    pub(crate) plan: crate::policy::AttemptPlan,
+    pub(crate) pin_transition: crate::policy::LaneTransitionDecision,
 }
 
 /// The upstream client: a connect timeout and the between-reads idle
@@ -545,35 +555,134 @@ impl Server {
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
+        stored_lane: Option<&crate::store::Lane>,
         lane: Option<&LaneFacts>,
-    ) -> Result<Option<crate::policy::AttemptPlan>, PolicyAttemptError> {
+    ) -> Result<Option<PolicyAttempt>, PolicyAttemptError> {
         let Some(runtime) = &self.policy_runtime else {
             return Ok(None);
         };
-        let pinned_revision = lane
-            .and_then(|lane| lane.pinned.as_ref())
-            .and_then(|pin| pin.policy_revision_id);
-        let Some((current, evidence, circuits)) =
-            runtime.capture_shadow(pinned_revision, facts.now_ms)
-        else {
+        let Some((current, evidence, _)) = runtime.capture_shadow(None, facts.now_ms) else {
             return Ok(None);
         };
         let Some(current_revision_id) = current.revision_id() else {
             return Ok(None);
         };
-        if pinned_revision.is_none()
-            && lane.is_some()
-            && current.activation_scope() == Some(crate::policy::ActivationScope::NewLanes)
-        {
+        let scope = current
+            .activation_scope()
+            .expect("a persisted current revision has an activation scope");
+        if stored_lane.is_some() != lane.is_some() {
+            tracing::error!("stored lane and policy lane facts disagreed");
             return Ok(None);
         }
-        let (snapshot, revision_id) = match pinned_revision {
-            Some(revision_id) => (
-                runtime.capture_revision_with_evidence(revision_id, &evidence)?,
-                revision_id,
-            ),
-            None => (current, current_revision_id),
+        let temperature = lane
+            .map(|lane| lane.temperature)
+            .unwrap_or(crate::policy::CacheTemperature::Unknown);
+        let lane_state = crate::policy::LaneState::from_stored(stored_lane, temperature);
+        let pinned_revision = stored_lane
+            .and_then(|lane| lane.pin.as_ref())
+            .map(|pin| pin.policy_revision_id);
+
+        let use_active = match (stored_lane, pinned_revision, scope) {
+            (None, _, _) => true,
+            (Some(_), None, crate::policy::ActivationScope::NewLanes) => return Ok(None),
+            (Some(_), None, _) if temperature != crate::policy::CacheTemperature::Cold => {
+                return Ok(None);
+            }
+            (Some(_), None, _) => true,
+            (_, Some(revision), _) if revision > current_revision_id => {
+                return Err(PolicyAttemptError::Transition {
+                    revision_id: revision,
+                    reason: crate::policy::TransitionDenied::StaleRevision,
+                });
+            }
+            (_, Some(revision), _) if revision == current_revision_id => true,
+            (_, Some(_), crate::policy::ActivationScope::NewLanes) => false,
+            (_, Some(_), crate::policy::ActivationScope::NewAndColdLanes) => {
+                temperature == crate::policy::CacheTemperature::Cold
+            }
+            (_, Some(_), crate::policy::ActivationScope::Immediate) => true,
         };
+        let snapshot = if use_active {
+            current
+        } else {
+            runtime.capture_revision_with_evidence(
+                pinned_revision.expect("a non-active selection is pinned"),
+                &evidence,
+            )?
+        };
+        let forced_immediate = use_active
+            && scope == crate::policy::ActivationScope::Immediate
+            && snapshot.forced_cache_transition();
+        let mut plan = match self.resolve_policy_snapshot(
+            runtime,
+            &snapshot,
+            facts,
+            credentials,
+            lane,
+            forced_immediate,
+        ) {
+            Ok(plan) => plan,
+            Err(_)
+                if use_active
+                    && scope == crate::policy::ActivationScope::Immediate
+                    && !forced_immediate
+                    && pinned_revision.is_some_and(|revision| revision != current_revision_id) =>
+            {
+                let revision_id = pinned_revision.expect("the guarded case is pinned");
+                let pinned = runtime.capture_revision_with_evidence(revision_id, &evidence)?;
+                self.resolve_policy_snapshot(runtime, &pinned, facts, credentials, lane, false)?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut decision = policy_transition(
+            &lane_state,
+            &plan,
+            scope,
+            snapshot.forced_cache_transition(),
+        );
+
+        if use_active
+            && scope == crate::policy::ActivationScope::Immediate
+            && matches!(
+                decision,
+                crate::policy::LaneTransitionDecision::Denied(
+                    crate::policy::TransitionDenied::WarmCacheLoss
+                )
+            )
+            && let Some(revision_id) = pinned_revision
+            && revision_id != current_revision_id
+        {
+            let pinned = runtime.capture_revision_with_evidence(revision_id, &evidence)?;
+            plan =
+                self.resolve_policy_snapshot(runtime, &pinned, facts, credentials, lane, false)?;
+            decision = policy_transition(&lane_state, &plan, scope, false);
+        }
+        if let crate::policy::LaneTransitionDecision::Denied(reason) = decision {
+            return Err(PolicyAttemptError::Transition {
+                revision_id: plan
+                    .policy_revision
+                    .expect("an authoritative plan has a persisted revision"),
+                reason,
+            });
+        }
+        Ok(Some(PolicyAttempt {
+            plan,
+            pin_transition: decision,
+        }))
+    }
+
+    fn resolve_policy_snapshot(
+        &self,
+        runtime: &crate::policy::PolicyRuntime,
+        snapshot: &crate::policy::PolicySnapshot,
+        facts: &RequestFacts,
+        credentials: &crate::policy::CredentialSnapshot,
+        lane: Option<&LaneFacts>,
+        activation_allows_cache_loss: bool,
+    ) -> Result<crate::policy::AttemptPlan, PolicyAttemptError> {
+        let revision_id = snapshot
+            .revision_id()
+            .expect("an authoritative snapshot has a persisted revision");
         let mut lane = lane.cloned();
         if let Some(pin) = lane.as_mut().and_then(|lane| lane.pinned.as_mut()) {
             pin.policy_fingerprint = Some(snapshot.policy().fingerprint().clone());
@@ -583,7 +692,8 @@ impl Server {
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
             .with_credentials(credentials);
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
-        crate::policy::resolve_with_circuits(
+        let circuits = runtime.open_circuits(snapshot, facts.now_ms);
+        crate::policy::resolve::resolve_with_activation_cache_consent(
             snapshot.policy(),
             snapshot.inventory(),
             &learning,
@@ -591,8 +701,9 @@ impl Server {
             &availability,
             &circuits,
             facts,
+            activation_allows_cache_loss,
         )
-        .map(|plan| Some(plan.with_policy_revision(revision_id)))
+        .map(|plan| plan.with_policy_revision(revision_id))
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
@@ -1439,6 +1550,60 @@ fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> Ava
     AvailabilitySnapshot::new(bindings)
 }
 
+fn policy_transition(
+    lane: &crate::policy::LaneState,
+    plan: &crate::policy::AttemptPlan,
+    scope: crate::policy::ActivationScope,
+    forced_cache_transition: bool,
+) -> crate::policy::LaneTransitionDecision {
+    let prospective = plan
+        .pin_identity()
+        .expect("an authoritative inference plan has complete pin identity");
+    let same_revision = matches!(
+        lane,
+        crate::policy::LaneState::Existing {
+            pin: Some(current), ..
+        } if current.policy_revision_id == prospective.policy_revision_id
+    );
+    let fell_back = plan.fallback_cache_transition.is_some();
+    let cause = match lane {
+        _ if plan.compaction && same_revision => crate::policy::TransitionCause::Compaction {
+            lane: plan.lane_transition,
+            cache: plan
+                .cache_transition
+                .unwrap_or(crate::policy::CacheTransitionPolicy::PreserveWarm),
+        },
+        crate::policy::LaneState::Existing {
+            pin: Some(current), ..
+        } if current.policy_revision_id == prospective.policy_revision_id
+            && current.policy_route_id == prospective.policy_route_id
+            && current.route_fingerprint == prospective.route_fingerprint
+            && current.candidate_id == prospective.candidate_id
+            && current.binding_id == prospective.binding_id
+            && current.baseline_model == prospective.baseline_model =>
+        {
+            crate::policy::TransitionCause::Upgrade {
+                lane: plan.lane_transition,
+            }
+        }
+        _ if fell_back && same_revision => crate::policy::TransitionCause::Fallback {
+            cache: plan
+                .fallback_cache_transition
+                .expect("a fallback plan retains its crossed-edge consent"),
+        },
+        _ if same_revision => crate::policy::TransitionCause::ExplicitUserChange {
+            cache: plan
+                .cache_transition
+                .unwrap_or(crate::policy::CacheTransitionPolicy::PreserveWarm),
+        },
+        _ => crate::policy::TransitionCause::Activation {
+            scope,
+            forced_cache_transition,
+        },
+    };
+    crate::policy::decide_transition(lane, prospective, cause)
+}
+
 fn cache_temperature(
     lane: &crate::store::Lane,
     binding: Option<&crate::routing::BackendBinding>,
@@ -1861,6 +2026,102 @@ api_key = "sk-proj-test"
         (server, seen)
     }
 
+    fn activate_chat_revision(
+        server: &Server,
+        scope: crate::policy::ActivationScope,
+        forced_cache_transition: bool,
+        model: &str,
+    ) -> i64 {
+        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+            .expect("legacy document");
+        let route_id =
+            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+        for default in &mut document.defaults {
+            if matches!(
+                &default.scope,
+                crate::policy::FrontendScope::Profile {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                    ..
+                } | crate::policy::FrontendScope::Protocol {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                }
+            ) {
+                default.target.route_id = route_id.clone();
+            }
+        }
+        document
+            .routes
+            .iter_mut()
+            .find(|route| route.id == route_id)
+            .expect("OpenAI route")
+            .chain
+            .first
+            .model = crate::policy::CandidateModel::Exact {
+            model_id: model.to_owned(),
+        };
+        let document = document.validate().expect("policy validates");
+        let parent_revision_id = server
+            .policy_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capture())
+            .and_then(|snapshot| snapshot.revision_id());
+        let revision = server
+            .store
+            .insert_policy_revision(&crate::store::NewPolicyRevision {
+                created_ms: 3,
+                activated_ms: 4,
+                description: Some("replacement Chat test"),
+                activation_scope: scope,
+                forced_cache_transition,
+                source: crate::store::PolicyRevisionSource::Legacy,
+                parent_revision_id,
+                document: &document,
+            })
+            .expect("insert revision");
+        let catalogs = crate::catalog::FetchedCatalogs::default();
+        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
+        let policy = crate::policy::compile(
+            document,
+            &server.registry,
+            &inventory,
+            crate::policy::PolicyOrigin::GeneratedRevisionOne,
+        )
+        .into_policy()
+        .expect("policy compiles");
+        server
+            .policy_runtime
+            .as_ref()
+            .expect("active runtime")
+            .replace_active(
+                &revision,
+                Arc::new(policy),
+                Arc::new(inventory),
+                Arc::new(super::availability_for(&server.registry, &catalogs)),
+                &std::collections::BTreeSet::new(),
+            );
+        revision.revision_id
+    }
+
+    fn lane_facts(
+        lane: &crate::store::Lane,
+        temperature: crate::policy::CacheTemperature,
+    ) -> crate::policy::LaneFacts {
+        crate::policy::LaneFacts {
+            temperature,
+            pinned: lane.pin.as_ref().map(|pin| crate::policy::ProvisionalPin {
+                policy_revision_id: Some(pin.policy_revision_id),
+                policy_fingerprint: None,
+                route_fingerprint: pin.route_fingerprint.clone(),
+                candidate_id: pin.candidate_id.clone(),
+                binding_id: pin.binding_id.clone(),
+                baseline_model: pin.baseline_model.clone(),
+                effective_model: pin.effective_model.clone(),
+            }),
+            forced_from: lane.forced_from.clone(),
+            forced_to: lane.forced_to.clone(),
+        }
+    }
+
     #[test]
     fn new_lanes_activation_preserves_an_existing_unpinned_lane() {
         let (server, _) = tokio::runtime::Runtime::new()
@@ -1878,6 +2139,20 @@ api_key = "sk-proj-test"
             None,
             crate::policy::RequestClass::Inference,
         );
+        let stored_lane = crate::store::Lane {
+            key: "lane".to_owned(),
+            session_id: Some("session".to_owned()),
+            tools_hash: Some("tools".to_owned()),
+            updated_ms: 0,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        };
         let lane = crate::policy::LaneFacts {
             temperature: crate::policy::CacheTemperature::Unknown,
             pinned: None,
@@ -1889,12 +2164,264 @@ api_key = "sk-proj-test"
                 .resolve_policy_attempt(
                     &facts,
                     &crate::policy::CredentialSnapshot::new(),
+                    Some(&stored_lane),
                     Some(&lane),
                 )
                 .expect("preservation is not a resolver failure")
                 .is_none(),
             "an existing unpinned lane stays on legacy authority"
         );
+    }
+
+    #[test]
+    fn activation_scope_arbitrates_between_pinned_and_active_revisions() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let first = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                None,
+                None,
+            )
+            .expect("first resolution")
+            .expect("active policy");
+        let mut lane = crate::store::Lane {
+            key: "lane".to_owned(),
+            session_id: Some("session".to_owned()),
+            tools_hash: Some("tools".to_owned()),
+            updated_ms: 0,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 1,
+            pin: first.plan.pin_identity().map(crate::store::LanePin::from),
+        };
+
+        let active_revision = activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::NewAndColdLanes,
+            false,
+            "policy-next",
+        );
+        for temperature in [
+            crate::policy::CacheTemperature::Warm,
+            crate::policy::CacheTemperature::Unknown,
+        ] {
+            let resolved = server
+                .resolve_policy_attempt(
+                    &facts,
+                    &crate::policy::CredentialSnapshot::new(),
+                    Some(&lane),
+                    Some(&lane_facts(&lane, temperature)),
+                )
+                .expect("pinned resolution")
+                .expect("active policy");
+            assert_eq!(resolved.plan.policy_revision, Some(1));
+            assert!(matches!(
+                resolved.pin_transition,
+                crate::policy::LaneTransitionDecision::Keep { .. }
+            ));
+        }
+        let resolved = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                Some(&lane),
+                Some(&lane_facts(&lane, crate::policy::CacheTemperature::Cold)),
+            )
+            .expect("cold activation resolution")
+            .expect("active policy");
+        assert_eq!(resolved.plan.policy_revision, Some(active_revision));
+        assert_eq!(resolved.plan.effective_model, "policy-next");
+        assert!(matches!(
+            resolved.pin_transition,
+            crate::policy::LaneTransitionDecision::Replace {
+                expected_generation: 1,
+                source: crate::policy::TransitionSource::Activation,
+                ..
+            }
+        ));
+
+        lane.pin = resolved
+            .plan
+            .pin_identity()
+            .map(crate::store::LanePin::from);
+        lane.pin_generation = 2;
+        let _unforced_revision = activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::Immediate,
+            false,
+            "policy-immediate",
+        );
+        let preserved = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                Some(&lane),
+                Some(&lane_facts(&lane, crate::policy::CacheTemperature::Warm)),
+            )
+            .expect("warm immediate resolution")
+            .expect("active policy");
+        assert_eq!(preserved.plan.policy_revision, Some(active_revision));
+        assert!(matches!(
+            preserved.pin_transition,
+            crate::policy::LaneTransitionDecision::Keep { .. }
+        ));
+
+        let newest_revision = activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::Immediate,
+            true,
+            "policy-forced",
+        );
+        let moved = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                Some(&lane),
+                Some(&lane_facts(&lane, crate::policy::CacheTemperature::Unknown)),
+            )
+            .expect("forced immediate resolution")
+            .expect("active policy");
+        assert_eq!(moved.plan.policy_revision, Some(newest_revision));
+        assert_eq!(moved.plan.effective_model, "policy-forced");
+        assert!(matches!(
+            moved.pin_transition,
+            crate::policy::LaneTransitionDecision::Replace {
+                expected_generation: 2,
+                source: crate::policy::TransitionSource::Activation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_old_first_pin_completion_cannot_cross_the_activation_fence() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            Some("fenced|tools".to_owned()),
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let old = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                None,
+                None,
+            )
+            .expect("old resolution")
+            .expect("active policy");
+        activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::NewLanes,
+            false,
+            "policy-next",
+        );
+
+        super::record::persist_lane_pin(
+            &server,
+            Some("fenced"),
+            Some("tools"),
+            false,
+            Some(&old.pin_transition),
+            super::record::now_ms(),
+        );
+        assert_eq!(server.store.load_lane("fenced|tools").expect("lane"), None);
+    }
+
+    #[tokio::test]
+    async fn immediate_activation_preserves_or_replaces_the_live_chat_lane() {
+        let (server, upstream) = policy_chat_server().await;
+        let store = server.store.clone();
+        let address = serve(server.clone()).await;
+        let send = |session: &'static str| async move {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat/completions"))
+                .header("x-toker-session", session)
+                .json(&serde_json::json!({
+                    "model": "policy-alias",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false
+                }))
+                .send()
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+
+        send("activation-session").await;
+        let initial = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("activation-session"))
+            .expect("first request pinned the lane");
+        assert_eq!(initial.pin_generation, 1);
+
+        let unforced = activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::Immediate,
+            false,
+            "policy-immediate",
+        );
+        send("activation-session").await;
+        let preserved = store.load_lane(&initial.key).expect("lane").expect("lane");
+        assert_eq!(preserved.pin_generation, 1);
+        assert_eq!(
+            preserved.pin.as_ref().map(|pin| pin.policy_revision_id),
+            Some(1)
+        );
+        assert_eq!(
+            upstream.seen.lock().unwrap().last().unwrap()["model"],
+            "policy-effective",
+            "unforced immediate activation preserves an unknown-temperature cache"
+        );
+
+        let forced = activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::Immediate,
+            true,
+            "policy-forced",
+        );
+        send("activation-session").await;
+        let moved = store.load_lane(&initial.key).expect("lane").expect("lane");
+        assert_eq!(moved.pin_generation, 2);
+        assert_eq!(
+            moved.pin.as_ref().map(|pin| pin.policy_revision_id),
+            Some(forced)
+        );
+        assert_eq!(
+            upstream.seen.lock().unwrap().last().unwrap()["model"],
+            "policy-forced"
+        );
+        assert!(forced > unforced);
     }
 
     #[tokio::test]

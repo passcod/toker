@@ -193,86 +193,90 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let credentials =
         server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
     let lane = server.shadow_lane(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
-    let (target, policy_plan) =
-        match server.resolve_policy_attempt(&facts, &credentials, lane.as_ref()) {
-            Ok(Some(plan)) => {
-                let target = match server.registry.resolve_binding(
-                    ProtocolId::OpenAiChat,
-                    &plan.binding_id,
-                    Some(model.as_str()),
-                    &plan.effective_model,
-                ) {
-                    Ok(target) => target,
-                    Err(_) => {
-                        tracing::error!(
-                            binding_id = %plan.binding_id,
-                            "active policy selected an unconfigured Chat binding"
-                        );
-                        return upstream_failure(
-                            ErrorWire::Openai,
-                            "the active routing policy selected an unavailable backend",
-                        );
-                    }
-                };
-                (target, Some(plan))
-            }
-            Ok(None) => {
-                let target = match legacy_target {
-                    Ok(target) => target,
-                    Err(_) => return super::openai_not_configured(),
-                };
-                (target, None)
-            }
-            Err(super::PolicyAttemptError::Resolve {
-                revision_id,
-                failure:
-                    crate::policy::ResolveFailure::RouteUnavailable {
-                        route_id,
-                        route_fingerprint,
-                        provenance,
-                        trace,
-                    },
-            }) => {
-                match crate::store::PolicyRouteProvenance::from_route_unavailable(
-                    revision_id,
+    let (target, policy_plan) = match server.resolve_policy_attempt(
+        &facts,
+        &credentials,
+        cold_lane.as_ref(),
+        lane.as_ref(),
+    ) {
+        Ok(Some(resolved)) => {
+            let target = match server.registry.resolve_binding(
+                ProtocolId::OpenAiChat,
+                &resolved.plan.binding_id,
+                Some(model.as_str()),
+                &resolved.plan.effective_model,
+            ) {
+                Ok(target) => target,
+                Err(_) => {
+                    tracing::error!(
+                        binding_id = %resolved.plan.binding_id,
+                        "active policy selected an unconfigured Chat binding"
+                    );
+                    return upstream_failure(
+                        ErrorWire::Openai,
+                        "the active routing policy selected an unavailable backend",
+                    );
+                }
+            };
+            (target, Some(resolved))
+        }
+        Ok(None) => {
+            let target = match legacy_target {
+                Ok(target) => target,
+                Err(_) => return super::openai_not_configured(),
+            };
+            (target, None)
+        }
+        Err(super::PolicyAttemptError::Resolve {
+            revision_id,
+            failure:
+                crate::policy::ResolveFailure::RouteUnavailable {
                     route_id,
                     route_fingerprint,
-                    &provenance,
-                    &trace,
-                    crate::store::AttemptGroupId::fresh(),
-                ) {
-                    Ok(routing) => record_route_unavailable(
-                        &server,
-                        started,
-                        frontend.as_deref(),
-                        session_id.as_deref(),
-                        Some(model.as_str()),
-                        routing,
-                    ),
-                    Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
-                }
-                return error_response(
-                    ErrorWire::Openai,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    WireError {
-                        anthropic_type: "api_error",
-                        openai_type: "server_error",
-                        openai_code: Some("route_unavailable"),
-                    },
-                    "the active routing policy has no available backend for this request",
-                );
+                    provenance,
+                    trace,
+                },
+        }) => {
+            match crate::store::PolicyRouteProvenance::from_route_unavailable(
+                revision_id,
+                route_id,
+                route_fingerprint,
+                &provenance,
+                &trace,
+                crate::store::AttemptGroupId::fresh(),
+            ) {
+                Ok(routing) => record_route_unavailable(
+                    &server,
+                    started,
+                    frontend.as_deref(),
+                    session_id.as_deref(),
+                    Some(model.as_str()),
+                    routing,
+                ),
+                Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
             }
-            Err(error) => {
-                tracing::error!(%error, "active Chat policy resolution failed");
-                return upstream_failure(
-                    ErrorWire::Openai,
-                    "the active routing policy could not resolve this request",
-                );
-            }
-        };
+            return error_response(
+                ErrorWire::Openai,
+                StatusCode::SERVICE_UNAVAILABLE,
+                WireError {
+                    anthropic_type: "api_error",
+                    openai_type: "server_error",
+                    openai_code: Some("route_unavailable"),
+                },
+                "the active routing policy has no available backend for this request",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "active Chat policy resolution failed");
+            return upstream_failure(
+                ErrorWire::Openai,
+                "the active routing policy could not resolve this request",
+            );
+        }
+    };
     let gate_model = policy_plan
         .as_ref()
-        .map(|plan| plan.effective_model.clone())
+        .map(|resolved| resolved.plan.effective_model.clone())
         .or_else(|| target.effective_model().map(str::to_owned));
     let backend = target.provider().clone();
     let meters = super::quota_gate::load_meters(&server, backend.id());
@@ -298,27 +302,13 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         );
     }
     inference.strip_release(&original);
-    let pin_transition = if cold_lane.is_none() {
-        policy_plan
-            .as_ref()
-            .and_then(crate::policy::AttemptPlan::pin_identity)
-            .map(|prospective| {
-                crate::policy::decide_transition(
-                    &crate::policy::LaneState::Absent,
-                    prospective,
-                    crate::policy::TransitionCause::Activation {
-                        scope: crate::policy::ActivationScope::NewLanes,
-                        forced_cache_transition: false,
-                    },
-                )
-            })
-    } else {
-        None
-    };
     let authoritative = policy_plan.is_some();
-    let attempt = match policy_plan {
-        Some(plan) => inference.prepare_policy(target.clone(), plan),
-        None => inference.prepare(target.clone(), gate_model.clone()),
+    let (attempt, pin_transition) = match policy_plan {
+        Some(resolved) => (
+            inference.prepare_policy(target.clone(), resolved.plan),
+            Some(resolved.pin_transition),
+        ),
+        None => (inference.prepare(target.clone(), gate_model.clone()), None),
     };
     if let Some(block) = super::quota_gate::decide_block(
         &server,

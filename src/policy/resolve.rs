@@ -257,6 +257,8 @@ pub struct AttemptPlan {
     pub effective_model: String,
     pub compaction: bool,
     pub lane_transition: LaneTransitionPolicy,
+    pub cache_transition: Option<CacheTransitionPolicy>,
+    pub fallback_cache_transition: Option<CacheTransitionPolicy>,
     pub trace: Vec<TraceEvent>,
 }
 
@@ -344,6 +346,29 @@ pub fn resolve_with_circuits<L: LearningView>(
     circuits: &CircuitSnapshot,
     facts: &RequestFacts,
 ) -> Result<AttemptPlan, ResolveFailure> {
+    resolve_with_activation_cache_consent(
+        policy,
+        inventory,
+        learning,
+        lane,
+        availability,
+        circuits,
+        facts,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_with_activation_cache_consent<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+    activation_allows_cache_loss: bool,
+) -> Result<AttemptPlan, ResolveFailure> {
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
         && lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold)
@@ -389,6 +414,8 @@ pub fn resolve_with_circuits<L: LearningView>(
             effective_model: model.to_owned(),
             compaction: selected.provenance == RouteProvenance::Compaction,
             lane_transition: LaneTransitionPolicy::PreservePinned,
+            cache_transition: selected.cache_transition,
+            fallback_cache_transition: None,
             trace,
         });
     }
@@ -499,6 +526,7 @@ pub fn resolve_with_circuits<L: LearningView>(
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
         if index > start
+            && !activation_allows_cache_loss
             && let Some(reason) = cache_edge_denial(
                 &route.edges()[start..index],
                 candidate.binding_id(),
@@ -565,6 +593,14 @@ pub fn resolve_with_circuits<L: LearningView>(
                         .and_then(CompiledCompaction::revision_one_legacy)
                         .is_some_and(|(_, bindings)| bindings.contains(candidate.binding_id()))),
             lane_transition: lane_policy,
+            cache_transition: selected.cache_transition,
+            fallback_cache_transition: (index > start).then(|| {
+                route.edges()[start..index]
+                    .iter()
+                    .fold(CacheTransitionPolicy::AllowCacheLoss, |policy, edge| {
+                        stricter_cache_transition(policy, edge.cache_transition)
+                    })
+            }),
             trace,
         });
     }
@@ -956,6 +992,18 @@ fn cache_edge_denial(
         Some(SkipReason::WarmCacheTransitionDenied)
     } else {
         None
+    }
+}
+
+fn stricter_cache_transition(
+    left: CacheTransitionPolicy,
+    right: CacheTransitionPolicy,
+) -> CacheTransitionPolicy {
+    use CacheTransitionPolicy::{AllowCacheLoss, AllowWhenCold, PreserveWarm};
+    match (left, right) {
+        (PreserveWarm, _) | (_, PreserveWarm) => PreserveWarm,
+        (AllowWhenCold, _) | (_, AllowWhenCold) => AllowWhenCold,
+        (AllowCacheLoss, AllowCacheLoss) => AllowCacheLoss,
     }
 }
 
@@ -2337,6 +2385,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.candidate_id, Some(id("fallback")));
+        assert_eq!(
+            selected.fallback_cache_transition,
+            Some(CacheTransitionPolicy::AllowCacheLoss)
+        );
         assert!(matches!(
             &selected.trace[1],
             TraceEvent::Candidate(evidence)
@@ -2655,6 +2707,70 @@ mod tests {
                             && evidence.model.as_deref() == Some("three")
                             && evidence.result == Err(SkipReason::WarmCacheTransitionDenied))
         ));
+    }
+
+    #[test]
+    fn successful_fallback_retains_the_strictest_crossed_cache_consent() {
+        let mut first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        first.enabled = false;
+        let mut second = candidate(
+            "second",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        second.enabled = false;
+        let third = candidate(
+            "third",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "three".to_owned(),
+            },
+        );
+        let edge = |cache_transition| CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![
+                    RouteStep {
+                        edge: edge(CacheTransitionPolicy::AllowWhenCold),
+                        candidate: second,
+                    },
+                    RouteStep {
+                        edge: edge(CacheTransitionPolicy::AllowCacheLoss),
+                        candidate: third,
+                    },
+                ],
+            )),
+            &OfferInventory::default(),
+        );
+        let selected = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("asked"),
+        )
+        .unwrap();
+        assert_eq!(selected.candidate_id, Some(id("third")));
+        assert_eq!(
+            selected.fallback_cache_transition,
+            Some(CacheTransitionPolicy::AllowWhenCold)
+        );
     }
 
     #[test]

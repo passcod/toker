@@ -296,6 +296,27 @@ impl PolicyRuntime {
         }))
     }
 
+    /// Run an activation-derived write only while its revision remains active.
+    pub(crate) fn with_activation_fence<T>(
+        &self,
+        revision_id: i64,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let allowed = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .as_ref()
+            .and_then(|current| current.revision_id)
+            .is_none_or(|active| active == revision_id);
+        allowed.then(action)
+    }
+
     /// Capture the immutable revision named by a lane pin, or the current
     /// candidate snapshot for an unpinned/absent lane. This selection is
     /// observational until policy routing becomes authoritative.
@@ -842,6 +863,38 @@ mod tests {
         assert_eq!(after.revision_id(), Some(revision_id));
         assert_eq!(after.activation_scope(), Some(ActivationScope::NewLanes));
         assert_eq!(after.inventory_generation(), 1);
+    }
+
+    #[test]
+    fn activation_revision_fence_moves_with_runtime_replacement() {
+        let (store, _) = runtime();
+        let first_id = revision(&store, "first");
+        let second_id = revision(&store, "second");
+        let first = store.load_policy_revision(first_id).unwrap().unwrap();
+        let second = store.load_policy_revision(second_id).unwrap().unwrap();
+        let runtime = PolicyRuntime::new_active(
+            store,
+            RouteRegistry::new(
+                std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
+                std::iter::empty::<(crate::routing::ProtocolId, String)>(),
+            ),
+            &first,
+            compiled("first"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+        );
+        assert_eq!(runtime.with_activation_fence(first_id, || 1), Some(1));
+        assert_eq!(runtime.with_activation_fence(second_id, || 1), None);
+
+        runtime.replace_active(
+            &second,
+            compiled("second"),
+            Arc::new(OfferInventory::default()),
+            Arc::new(AvailabilitySnapshot::default()),
+            &BTreeSet::new(),
+        );
+        assert_eq!(runtime.with_activation_fence(first_id, || 1), None);
+        assert_eq!(runtime.with_activation_fence(second_id, || 1), Some(1));
     }
 
     #[test]
