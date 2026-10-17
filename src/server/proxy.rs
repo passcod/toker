@@ -249,6 +249,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     &server,
                     started,
                     frontend.as_deref(),
+                    "openai_chat",
                     session_id.as_deref(),
                     Some(model.as_str()),
                     routing,
