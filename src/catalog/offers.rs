@@ -112,6 +112,35 @@ pub struct ModelOffer {
     pub raw: Value,
 }
 
+pub fn from_policy(
+    policy: &crate::policy::CompiledPolicy,
+    inventory: &OfferInventory,
+    profile: Option<&crate::policy::ProfileId>,
+    protocol: crate::policy::FrontendProtocol,
+) -> Vec<ModelOffer> {
+    let mut offers = Vec::new();
+    for (slug, presentation) in policy.publication(profile, protocol) {
+        let Some((binding_id, model_id)) = presentation.route().exact_offer() else {
+            continue;
+        };
+        let Some(offer) = inventory.get(binding_id, model_id) else {
+            continue;
+        };
+        offers.push(ModelOffer {
+            provider: offer.provider.clone(),
+            backend_model_id: offer.backend_model_id.clone(),
+            routed_model_id: slug.to_owned(),
+            binding: offer.binding.clone(),
+            context_window: offer.context_window,
+            chronology: offer.chronology,
+            fetched_at_ms: offer.fetched_at_ms,
+            raw: offer.raw.clone(),
+        });
+    }
+    offers.sort_by(|left, right| left.routed_model_id.cmp(&right.routed_model_id));
+    offers
+}
+
 /// Project canonical offers into the legacy frontend aliases. Equal slugs on
 /// two providers never merge. Staleness remains in `fetched_at_ms`, not a
 /// made-up fresh claim.

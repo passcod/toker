@@ -550,23 +550,22 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
     let profile = super::frontend_profile_of(request.extensions()).and_then(|p| p.protocol());
     if let Some(frontend @ (ProtocolId::OpenAiChat | ProtocolId::OpenAiResponses)) = profile {
-        if server.registry.resolve(frontend, None).is_err() {
+        let active = server
+            .active_publication_models(super::frontend_of(request.extensions()), frontend.into());
+        if active.is_none() && server.registry.resolve(frontend, None).is_err() {
             return match frontend {
                 ProtocolId::OpenAiChat => super::openai_not_configured(),
                 ProtocolId::OpenAiResponses => super::responses_not_configured(),
                 ProtocolId::AnthropicMessages => unreachable!(),
             };
         }
-        let catalogs = server
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut models = offers::for_frontend(&server.registry, &catalogs, frontend);
-        if let Some(slugs) = server
-            .active_publication_slugs(super::frontend_of(request.extensions()), frontend.into())
-        {
-            offers::retain_publication(&mut models, &slugs);
-        }
+        let models = active.unwrap_or_else(|| {
+            let catalogs = server
+                .catalogs
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            offers::for_frontend(&server.registry, &catalogs, frontend)
+        });
         server.compare_publication_shadow(
             frontend,
             super::frontend_of(request.extensions()),

@@ -134,6 +134,53 @@ impl CompiledPolicy {
     /// Expand the publication visible to one frontend. Protocol-scoped rows
     /// are inherited, while an exact profile row with the same slug replaces
     /// the inherited row, matching resolver scope precedence.
+    pub fn publication(
+        &self,
+        profile: Option<&ProfileId>,
+        protocol: FrontendProtocol,
+    ) -> BTreeMap<&str, &CompiledPresentation> {
+        let protocol_key = ScopeKey {
+            profile: None,
+            protocol,
+        };
+        let mut expanded = self
+            .presentations
+            .get(&protocol_key)
+            .into_iter()
+            .flatten()
+            .map(|(slug, presentation)| (slug.as_str(), presentation))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(profile) = profile {
+            let profile_key = ScopeKey {
+                profile: Some(profile.to_string()),
+                protocol,
+            };
+            if let Some(items) = self.presentations.get(&profile_key) {
+                expanded.extend(
+                    items
+                        .iter()
+                        .map(|(slug, presentation)| (slug.as_str(), presentation)),
+                );
+            }
+        }
+        expanded.retain(|slug, presentation| {
+            let published = self
+                .publication
+                .get(&protocol_key)
+                .is_some_and(|items| items.contains(*slug))
+                || profile.is_some_and(|profile| {
+                    self.publication
+                        .get(&ScopeKey {
+                            profile: Some(profile.to_string()),
+                            protocol,
+                        })
+                        .is_some_and(|items| items.contains(*slug))
+                });
+            presentation.enabled() && published
+        });
+        expanded
+    }
+
     pub fn publication_slugs(
         &self,
         profile: Option<&ProfileId>,
@@ -342,6 +389,19 @@ pub enum PresentationRoute {
         binding_id: BindingId,
         model_id: String,
     },
+}
+
+impl PresentationRoute {
+    pub fn exact_offer(&self) -> Option<(&BindingId, &str)> {
+        match self {
+            Self::Exact {
+                binding_id,
+                model_id,
+                ..
+            } => Some((binding_id, model_id)),
+            Self::Reference(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2127,6 +2187,14 @@ mod tests {
         assert_eq!(
             policy.publication_slugs(None, FrontendProtocol::AnthropicMessages),
             BTreeSet::from(["shared"])
+        );
+        assert_eq!(
+            policy
+                .publication(Some(&profile), FrontendProtocol::AnthropicMessages)
+                .get("shared")
+                .map(|presentation| presentation.id().as_str()),
+            Some("profile"),
+            "the exact-profile record replaces the inherited record"
         );
     }
 
