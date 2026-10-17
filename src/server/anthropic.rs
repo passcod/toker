@@ -115,23 +115,23 @@ pub(crate) async fn batches_create(State(server): State<Server>, request: Reques
 
 /// `GET /v1/messages/batches` — transparent forwarding.
 pub(crate) async fn batches_list(State(server): State<Server>, request: Request) -> Response {
-    transparent(server, request).await
+    transparent_administrative(server, request).await
 }
 
 /// `GET /v1/messages/batches/{id}` — transparent forwarding.
 pub(crate) async fn batches_get(State(server): State<Server>, request: Request) -> Response {
-    transparent(server, request).await
+    transparent_administrative(server, request).await
 }
 
 /// `GET /v1/messages/batches/{id}/results` — transparent forwarding.
 pub(crate) async fn batches_results(State(server): State<Server>, request: Request) -> Response {
-    transparent(server, request).await
+    transparent_administrative(server, request).await
 }
 
 /// `POST /v1/messages/batches/{id}/cancel` — transparent forwarding: batch
 /// management, not a usage path.
 pub(crate) async fn batches_cancel(State(server): State<Server>, request: Request) -> Response {
-    transparent(server, request).await
+    transparent_administrative(server, request).await
 }
 
 /// Any request the route table does not match: forwarded transparently
@@ -2138,9 +2138,48 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// meters still feed: a background batch poll is exactly the call the
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
-async fn transparent(server: Server, request: Request) -> Response {
-    let Ok(target) = server.registry.resolve(ProtocolId::AnthropicMessages, None) else {
-        return super::anthropic_not_configured();
+async fn transparent_administrative(server: Server, request: Request) -> Response {
+    let legacy = server.registry.resolve(ProtocolId::AnthropicMessages, None);
+    let facts = server.shadow_facts(
+        ProtocolId::AnthropicMessages,
+        super::frontend_of(request.extensions()),
+        None,
+        None,
+        0,
+        None,
+        0,
+        Default::default(),
+        None,
+        crate::policy::RequestClass::Inference,
+    );
+    let credentials = server.shadow_credentials(
+        request.headers(),
+        ProtocolId::AnthropicMessages,
+        facts.now_ms,
+    );
+    let target = match server.resolve_policy_first_candidate(&facts, &credentials) {
+        Ok(Some(plan)) => match server.registry.resolve_binding(
+            ProtocolId::AnthropicMessages,
+            &plan.binding_id,
+            None,
+            &plan.effective_model,
+        ) {
+            Ok(target) => target,
+            Err(_) => return super::anthropic_not_configured(),
+        },
+        Ok(None) => match legacy {
+            Ok(target) => target,
+            Err(_) => return super::anthropic_not_configured(),
+        },
+        Err(error) => {
+            tracing::error!(%error, "active batch-management policy resolution failed");
+            return codex::anthropic_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "the active routing policy has no backend for batch management",
+                false,
+            );
+        }
     };
     transparent_to(server, request, target).await
 }
