@@ -243,6 +243,12 @@ impl PublicationKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialPublication {
+    pub key: PublicationKey,
+    pub state: PublicationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingPublication {
     pub key: PublicationKey,
     pub desired_revision_id: i64,
@@ -724,7 +730,7 @@ pub(super) fn activate_revision_one(
     document: &ValidatedPolicyDocument,
     activated_ms: i64,
     desired_inventory_generation: i64,
-    publications: &[PublicationKey],
+    publications: &[InitialPublication],
 ) -> Result<RevisionOneActivation> {
     if desired_inventory_generation < 0 {
         return Err(Error::InvalidRoutingState(
@@ -788,14 +794,36 @@ pub(super) fn activate_revision_one(
             "revision-one ownership state changed during activation".into(),
         ));
     }
-    for key in publications {
+    for publication in publications {
         set_publication_desired(
             &tx,
-            key,
+            &publication.key,
             revision.revision_id,
             desired_inventory_generation,
             activated_ms,
         )?;
+        if publication.state == PublicationState::Applied {
+            let result = compare_and_swap_publication_result(
+                &tx,
+                &publication.key,
+                revision.revision_id,
+                desired_inventory_generation,
+                PublicationState::Applied,
+                Some(revision.revision_id),
+                Some(desired_inventory_generation),
+                None,
+                activated_ms,
+            )?;
+            if result != PublicationCasResult::Updated {
+                return Err(Error::InvalidRoutingState(
+                    "initial publication state changed during activation".into(),
+                ));
+            }
+        } else if publication.state != PublicationState::Pending {
+            return Err(Error::InvalidRoutingState(
+                "initial publication must be pending or applied".into(),
+            ));
+        }
     }
     let state = load_routing_policy_state(&tx)?;
     let publications = load_publications(&tx)?;

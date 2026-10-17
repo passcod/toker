@@ -39,11 +39,11 @@ pub use ledger::{
     is_api_measurement,
 };
 pub use state::{
-    Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult, Lane,
-    LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
-    PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter,
-    PublicationCasResult, PublicationKey, PublicationState, RevisionOneActivation,
-    RoutingPolicyState, RoutingPublication,
+    Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult,
+    InitialPublication, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
+    NewPolicyRevision, PingAction, PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource,
+    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState,
+    RevisionOneActivation, RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -437,7 +437,7 @@ impl Store {
         document: &crate::policy::ValidatedPolicyDocument,
         activated_ms: i64,
         desired_inventory_generation: i64,
-        publications: &[PublicationKey],
+        publications: &[InitialPublication],
     ) -> Result<RevisionOneActivation> {
         let mut conn = self.conn()?;
         state::activate_revision_one(
@@ -725,13 +725,13 @@ mod tests {
     use super::schema;
     use super::{
         Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason,
-        BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error, Lane, LanePin,
-        LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry, NewPolicyRevision,
-        PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
-        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState,
-        RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind, SessionCostGroup,
-        SessionLineage, Store, StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
-        StoredSkipReason, is_api_measurement,
+        BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error, InitialPublication,
+        Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry,
+        NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance,
+        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
+        PublicationState, RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind,
+        SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
+        StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -2670,6 +2670,10 @@ mod tests {
             },
             PublicationAdapter::new("claude_settings").unwrap(),
         );
+        let publication = InitialPublication {
+            key: publication,
+            state: PublicationState::Applied,
+        };
         let activated = store
             .activate_revision_one(&document, 200, 7, std::slice::from_ref(&publication))
             .expect("activate");
@@ -2693,7 +2697,12 @@ mod tests {
         assert_eq!(publications.len(), 1);
         assert_eq!(publications[0].desired_revision_id, revision.revision_id);
         assert_eq!(publications[0].desired_inventory_generation, 7);
-        assert_eq!(publications[0].state, PublicationState::Pending);
+        assert_eq!(publications[0].state, PublicationState::Applied);
+        assert_eq!(
+            publications[0].applied_revision_id,
+            Some(revision.revision_id)
+        );
+        assert_eq!(publications[0].applied_inventory_generation, Some(7));
 
         let other = policy("ignored after ownership");
         let restarted = store
@@ -2734,7 +2743,15 @@ mod tests {
 
         assert!(
             store
-                .activate_revision_one(&document, 200, 0, &[duplicate])
+                .activate_revision_one(
+                    &document,
+                    200,
+                    0,
+                    &[InitialPublication {
+                        key: duplicate,
+                        state: PublicationState::Pending,
+                    }],
+                )
                 .is_err()
         );
         let state = store.load_routing_policy_state().unwrap();
