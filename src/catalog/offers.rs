@@ -202,6 +202,13 @@ pub fn render_chat(offers: &[ModelOffer]) -> Value {
 /// so keep its provider-owned metadata and change only the routed slug.
 /// Other provider entries are not projected until their Responses binding
 /// and this frontend shape have been verified together.
+pub fn retain_publication(
+    offers: &mut Vec<ModelOffer>,
+    slugs: &std::collections::BTreeSet<String>,
+) {
+    offers.retain(|offer| slugs.contains(&offer.routed_model_id));
+}
+
 pub fn render_responses(offers: &[ModelOffer]) -> Value {
     let models: Vec<Value> = offers
         .iter()
@@ -253,6 +260,21 @@ mod tests {
             },
         );
         catalogs
+    }
+
+    #[test]
+    fn policy_publication_filters_without_changing_offer_metadata() {
+        let mut offers = for_frontend(&registry(), &catalogs(), ProtocolId::OpenAiChat);
+        let kept = offers
+            .iter()
+            .find(|offer| offer.routed_model_id == "openrouter/vendor/model")
+            .cloned()
+            .expect("prefixed projection");
+        retain_publication(
+            &mut offers,
+            &["openrouter/vendor/model".to_owned()].into_iter().collect(),
+        );
+        assert_eq!(offers, vec![kept]);
     }
 
     #[test]
