@@ -363,7 +363,60 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let legacy_target = server
             .registry
             .resolve(ProtocolId::AnthropicMessages, model.as_deref());
-        if path == "/v1/messages"
+        if path == "/v1/messages/count_tokens" {
+            let canonical = translate::from_anthropic(ir.value()).ok();
+            let shape = canonical.as_ref().map(|request| {
+                AnthropicShape::from_canonical_messages(request, original.len() as u64)
+            });
+            let facts = server.shadow_facts(
+                ProtocolId::AnthropicMessages,
+                shadow_profile.as_deref(),
+                model.clone(),
+                None,
+                force_newest::prompt_bound(original.len() as u64),
+                shape.as_ref().and_then(|shape| shape.req_messages),
+                shape.as_ref().map_or(0, |shape| shape.req_tools),
+                canonical
+                    .as_ref()
+                    .map(shadow_capabilities)
+                    .unwrap_or_default(),
+                None,
+                crate::policy::RequestClass::Inference,
+            );
+            let credentials = server.shadow_credentials(
+                &parts.headers,
+                ProtocolId::AnthropicMessages,
+                facts.now_ms,
+            );
+            match server.resolve_policy_first_candidate(&facts, &credentials) {
+                Ok(Some(plan)) => {
+                    target = match server.registry.resolve_binding(
+                        ProtocolId::AnthropicMessages,
+                        &plan.binding_id,
+                        model.as_deref(),
+                        &plan.effective_model,
+                    ) {
+                        Ok(target) => target,
+                        Err(_) => return super::anthropic_not_configured(),
+                    };
+                }
+                Ok(None) => {
+                    target = match legacy_target {
+                        Ok(target) => target,
+                        Err(_) => return super::anthropic_not_configured(),
+                    };
+                }
+                Err(error) => {
+                    tracing::error!(%error, "active count_tokens policy resolution failed");
+                    return super::codex::anthropic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "api_error",
+                        "the active routing policy has no tokenizer backend for this model",
+                        false,
+                    );
+                }
+            }
+        } else if path == "/v1/messages"
             && let Some(request) = ingress_canonical.as_ref()
         {
             let shape = AnthropicShape::from_canonical_messages(request, original.len() as u64);
