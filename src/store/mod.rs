@@ -497,6 +497,23 @@ impl Store {
         )
     }
 
+    pub fn set_publications_desired(
+        &self,
+        publications: &[InitialPublication],
+        desired_revision_id: i64,
+        desired_inventory_generation: i64,
+        updated_ms: i64,
+    ) -> Result<Vec<RoutingPublication>> {
+        let mut conn = self.conn()?;
+        state::set_publications_desired(
+            &mut conn,
+            publications,
+            desired_revision_id,
+            desired_inventory_generation,
+            updated_ms,
+        )
+    }
+
     pub fn load_publication(&self, key: &PublicationKey) -> Result<Option<RoutingPublication>> {
         state::load_publication(&*self.conn()?, key)
     }
@@ -2840,6 +2857,75 @@ mod tests {
                 .execute("DELETE FROM routing_publications", [])
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn publication_desired_handoff_updates_all_adapters_atomically() {
+        let store = mem_store();
+        let revision_id = revision(&store, "publication handoff", None);
+        let publication = |adapter: &str, state| InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiChat,
+                },
+                PublicationAdapter::new(adapter).unwrap(),
+            ),
+            state,
+        };
+        let rows = store
+            .set_publications_desired(
+                &[
+                    publication("dynamic_chat_models", PublicationState::Applied),
+                    publication("claude_settings", PublicationState::Pending),
+                ],
+                revision_id,
+                9,
+                100,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let dynamic = rows
+            .iter()
+            .find(|row| row.key.adapter().as_str() == "dynamic_chat_models")
+            .unwrap();
+        assert_eq!(dynamic.state, PublicationState::Applied);
+        assert_eq!(dynamic.applied_revision_id, Some(revision_id));
+        assert_eq!(dynamic.applied_inventory_generation, Some(9));
+        let claude = rows
+            .iter()
+            .find(|row| row.key.adapter().as_str() == "claude_settings")
+            .unwrap();
+        assert_eq!(claude.state, PublicationState::Pending);
+        assert_eq!(claude.applied_revision_id, None);
+
+        store
+            .execute_for_test(
+                "CREATE TRIGGER fail_publication_handoff BEFORE UPDATE ON routing_publications
+                 WHEN NEW.adapter = 'claude_settings'
+                 BEGIN SELECT RAISE(ABORT, 'injected handoff failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .set_publications_desired(
+                    &[
+                        publication("dynamic_chat_models", PublicationState::Applied),
+                        publication("claude_settings", PublicationState::Pending),
+                    ],
+                    revision_id,
+                    10,
+                    101,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .load_publications()
+                .unwrap()
+                .iter()
+                .all(|row| row.desired_inventory_generation == 9),
+            "a failed adapter update rolls the entire desired handoff back"
+        );
     }
 
     #[test]

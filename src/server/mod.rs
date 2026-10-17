@@ -1308,6 +1308,23 @@ impl Server {
             .into_policy()
             {
                 Ok(policy) => {
+                    let next_generation = runtime.capture().map_or(0, |snapshot| {
+                        snapshot.inventory_generation().saturating_add(1)
+                    });
+                    let generation = i64::try_from(next_generation).unwrap_or(i64::MAX);
+                    if let Err(error) = publication_targets().and_then(|targets| {
+                        self.store
+                            .set_publications_desired(
+                                &targets,
+                                revision.revision_id,
+                                generation,
+                                now_ms(),
+                            )
+                            .map(|_| ())
+                    }) {
+                        tracing::error!(%error, revision_id, "active publication handoff failed");
+                        return;
+                    }
                     runtime.replace_active(
                         &revision,
                         Arc::new(policy),
@@ -1602,6 +1619,41 @@ fn effective_catalogue<'a>(
     catalogs
         .get(source)
         .filter(|catalog| !catalog.models.is_empty())
+}
+
+fn publication_targets() -> crate::store::Result<Vec<crate::store::InitialPublication>> {
+    use crate::policy::{FrontendProtocol, FrontendScope};
+    use crate::store::{InitialPublication, PublicationAdapter, PublicationKey, PublicationState};
+
+    Ok(vec![
+        InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiChat,
+                },
+                PublicationAdapter::new("dynamic_chat_models")?,
+            ),
+            state: PublicationState::Applied,
+        },
+        InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiResponses,
+                },
+                PublicationAdapter::new("dynamic_responses_models")?,
+            ),
+            state: PublicationState::Applied,
+        },
+        InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::AnthropicMessages,
+                },
+                PublicationAdapter::new("claude_settings")?,
+            ),
+            state: PublicationState::Pending,
+        },
+    ])
 }
 
 fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> AvailabilitySnapshot {

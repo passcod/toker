@@ -1087,6 +1087,50 @@ pub(super) fn set_publication_desired(
     Ok(())
 }
 
+pub(super) fn set_publications_desired(
+    conn: &mut Connection,
+    publications: &[InitialPublication],
+    desired_revision_id: i64,
+    desired_inventory_generation: i64,
+    updated_ms: i64,
+) -> Result<Vec<RoutingPublication>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for publication in publications {
+        set_publication_desired(
+            &tx,
+            &publication.key,
+            desired_revision_id,
+            desired_inventory_generation,
+            updated_ms,
+        )?;
+        if publication.state == PublicationState::Applied {
+            let result = compare_and_swap_publication_result(
+                &tx,
+                &publication.key,
+                desired_revision_id,
+                desired_inventory_generation,
+                PublicationState::Applied,
+                Some(desired_revision_id),
+                Some(desired_inventory_generation),
+                None,
+                updated_ms,
+            )?;
+            if result != PublicationCasResult::Updated {
+                return Err(Error::InvalidRoutingState(
+                    "publication state changed during desired handoff".into(),
+                ));
+            }
+        } else if publication.state != PublicationState::Pending {
+            return Err(Error::InvalidRoutingState(
+                "desired publication must be pending or applied".into(),
+            ));
+        }
+    }
+    let rows = load_publications(&tx)?;
+    tx.commit()?;
+    Ok(rows)
+}
+
 pub(super) fn load_publication(
     conn: &Connection,
     key: &PublicationKey,
