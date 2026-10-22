@@ -628,6 +628,21 @@ pub enum AttemptReason {
     AmbiguousTransport,
 }
 
+impl From<crate::policy::FailureClass> for AttemptReason {
+    fn from(failure: crate::policy::FailureClass) -> Self {
+        match failure {
+            crate::policy::FailureClass::Authentication => Self::Authentication,
+            crate::policy::FailureClass::ModelNotFound => Self::ModelNotFound,
+            crate::policy::FailureClass::RateLimit => Self::RateLimit,
+            crate::policy::FailureClass::ProviderQuota => Self::ProviderQuota,
+            crate::policy::FailureClass::Overload => Self::Overload,
+            crate::policy::FailureClass::ServerError => Self::ServerError,
+            crate::policy::FailureClass::TransportBeforeAccept => Self::TransportBeforeAccept,
+            crate::policy::FailureClass::AmbiguousTransport => Self::AmbiguousTransport,
+        }
+    }
+}
+
 impl AttemptReason {
     fn as_str(self) -> &'static str {
         match self {

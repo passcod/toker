@@ -77,6 +77,18 @@ pub(crate) fn initial_provenance() -> AttemptProvenance {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn next_provenance(
+    current: &AttemptProvenance,
+    failure: FailureClass,
+) -> Option<AttemptProvenance> {
+    Some(AttemptProvenance {
+        attempt_group_id: current.attempt_group_id.clone(),
+        attempt_index: current.attempt_index.next()?,
+        reason: failure.into(),
+    })
+}
+
 /// Classify a complete Anthropic-native error without inspecting message text.
 #[allow(dead_code)]
 pub(crate) fn classify_anthropic_error(status: StatusCode, body: &Value) -> AttemptFailure {
@@ -512,6 +524,16 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use serde_json::json;
+
+    #[test]
+    fn fallback_provenance_stays_in_one_group_and_advances_reason() {
+        let initial = initial_provenance();
+        let fallback = next_provenance(&initial, FailureClass::Overload).unwrap();
+
+        assert_eq!(fallback.attempt_group_id, initial.attempt_group_id);
+        assert_eq!(fallback.attempt_index.get(), 1);
+        assert_eq!(fallback.reason, AttemptReason::Overload);
+    }
 
     #[test]
     fn anthropic_native_types_classify_without_message_heuristics() {
