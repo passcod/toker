@@ -245,9 +245,13 @@ impl ReadyMessagesAttempt {
         &self.effective_model
     }
 
-    async fn execute(mut self, server: Server) -> Response {
+    async fn execute(
+        mut self,
+        server: Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> Response {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(super::attempt::initial_provenance());
+            ctx.attempt = Some(provenance);
         }
         let mut cancellation =
             super::cancel::PrecommitCancellationGuard::anthropic(self.record.as_ref());
@@ -405,9 +409,13 @@ impl ReadyChatAttempt {
         &self.effective_model
     }
 
-    async fn execute(mut self, server: Server) -> Response {
+    async fn execute(
+        mut self,
+        server: Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> Response {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(super::attempt::initial_provenance());
+            ctx.attempt = Some(provenance);
         }
         let mut cancellation =
             super::cancel::PrecommitCancellationGuard::chat(self.record.as_ref());
@@ -513,13 +521,17 @@ impl ReadyBackendAttempt {
         }
     }
 
-    async fn execute(self, server: Server) -> Response {
+    async fn execute(
+        self,
+        server: Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> Response {
         match self {
-            Self::Messages(ready) => ready.execute(server).await,
-            Self::Chat(ready) => ready.execute(server).await,
-            Self::Anthropic(ready) => ready.execute(server).await,
-            Self::OpenRouter(ready) => ready.execute(server).await,
-            Self::Codex(ready) => ready.execute(server).await,
+            Self::Messages(ready) => ready.execute(server, provenance).await,
+            Self::Chat(ready) => ready.execute(server, provenance).await,
+            Self::Anthropic(ready) => ready.execute(server, provenance).await,
+            Self::OpenRouter(ready) => ready.execute(server, provenance).await,
+            Self::Codex(ready) => ready.execute(server, provenance).await,
         }
     }
 }
@@ -677,7 +689,9 @@ pub(crate) async fn coordinate_messages(
         Err(response) => return *response,
     };
     server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready.execute(server).await
+    ready
+        .execute(server, super::attempt::initial_provenance())
+        .await
 }
 
 pub(crate) async fn coordinate_chat(
@@ -743,7 +757,9 @@ pub(crate) async fn coordinate_chat(
         Err(response) => return *response,
     };
     server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready.execute(server).await
+    ready
+        .execute(server, super::attempt::initial_provenance())
+        .await
 }
 
 pub(crate) async fn coordinate_responses(
@@ -829,7 +845,9 @@ pub(crate) async fn coordinate_responses(
         Err(response) => return *response,
     };
     server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready.execute(server).await
+    ready
+        .execute(server, super::attempt::initial_provenance())
+        .await
 }
 
 pub(crate) fn invalid_responses_body(client_wants_json: bool) -> Response {

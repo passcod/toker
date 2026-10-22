@@ -428,9 +428,13 @@ impl ReadyAttempt {
         &self.effective_model
     }
 
-    pub(crate) async fn execute(mut self, server: Server) -> Response {
+    pub(crate) async fn execute(
+        mut self,
+        server: Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> Response {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(super::attempt::initial_provenance());
+            ctx.attempt = Some(provenance);
         }
         let mut cancellation = super::cancel::PrecommitCancellationGuard::responses(
             self.record.as_ref(),
