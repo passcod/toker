@@ -674,7 +674,10 @@ impl ReadyBackendAttempt {
                 }
             },
             Self::Anthropic(ready) => ready.execute(server, provenance).await,
-            Self::OpenRouter(ready) => ready.execute(server, provenance).await,
+            Self::OpenRouter(mut ready) => {
+                let outcome = ready.execute_precommit(&server, provenance).await;
+                super::openrouter_responses::finish(outcome).await
+            }
             Self::Codex(ready) => ready.execute(server, provenance).await,
         }
     }
