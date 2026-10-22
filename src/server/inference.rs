@@ -928,9 +928,6 @@ async fn coordinate_native_chat(
                 expected_stream,
                 mut cancellation,
             } => {
-                if let Some(attempt) = policy_attempt.as_ref() {
-                    server.clear_policy_target_circuits(attempt);
-                }
                 let response = super::proxy::forward_chat_canonical(
                     upstream,
                     record,
@@ -1054,6 +1051,7 @@ async fn coordinate_native_chat(
                             });
                     ctx.pin_transition = Some(next.pin_transition.clone());
                     ctx.effective_model = Some(next.plan.effective_model.clone());
+                    ctx.policy_attempt = Some(Arc::new(next.clone()));
                 }
                 let next_attempt = inference.prepare_policy(target, next.plan.clone());
                 ready = match prepare_chat(ready.parts, next_attempt, next_record, in_flight) {

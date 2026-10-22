@@ -148,6 +148,7 @@ pub(crate) enum PolicyAttemptError {
 }
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct PolicyAttempt {
     pub(crate) plan: crate::policy::AttemptPlan,
     pub(crate) pin_transition: crate::policy::LaneTransitionDecision,
@@ -163,6 +164,7 @@ struct PolicyContinuation {
     circuits: crate::policy::CircuitSnapshot,
     lane_state: crate::policy::LaneState,
     activation_scope: crate::policy::ActivationScope,
+    request_native_credentials: std::collections::BTreeSet<crate::policy::BindingId>,
 }
 
 struct ResolvedPolicySnapshot {
@@ -908,6 +910,11 @@ impl Server {
             circuits: resolved.circuits,
             lane_state,
             activation_scope: scope,
+            request_native_credentials: credentials
+                .iter()
+                .filter(|(_, evidence)| matches!(evidence, Evidence::Positive("passing_native")))
+                .map(|(binding, _)| binding.clone())
+                .collect(),
         };
         Ok(Some(PolicyAttempt {
             plan: resolved.plan,
@@ -925,6 +932,14 @@ impl Server {
         let Some(runtime) = self.policy_runtime.as_ref() else {
             return;
         };
+        if failure == crate::policy::FailureClass::Authentication
+            && attempt
+                .continuation
+                .request_native_credentials
+                .contains(&attempt.plan.binding_id)
+        {
+            return;
+        }
         let Some(revision_id) = attempt.plan.policy_revision else {
             return;
         };
@@ -3398,6 +3413,7 @@ api_key = "sk-proj-test"
                 }),
                 system_messages: None,
                 frontend: None,
+                policy_attempt: None,
             }
         };
 

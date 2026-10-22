@@ -162,6 +162,7 @@ mod tests {
             shape,
             system_messages: None,
             frontend: None,
+            policy_attempt: None,
         };
         (store, ctx)
     }

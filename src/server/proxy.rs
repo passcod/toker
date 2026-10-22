@@ -363,6 +363,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         effective_model: gate_model.clone(),
         shape: Some(shape.clone()),
         system_messages,
+        policy_attempt: policy_plan.clone().map(Arc::new),
     });
 
     // 6. The cold-cache notice (see the module docs). Advisory like the

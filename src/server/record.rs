@@ -85,6 +85,8 @@ pub(crate) struct RecordCtx {
     /// The frontend's name from its `/f/<frontend>` prefix, recorded in
     /// `extra` ([`with_frontend`]).
     pub(crate) frontend: Option<String>,
+    /// Clears matching health circuits only after canonical success completes.
+    pub(crate) policy_attempt: Option<Arc<super::PolicyAttempt>>,
 }
 
 /// Note the frontend a row's request came through, from its
@@ -190,6 +192,11 @@ pub(crate) fn record_measurement(
             .note_binding_observed(&ctx.binding_id, model, ts_ms, None);
     }
     persist_successful_pin(ctx, ts_ms);
+    if status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
+    }
 
     tracing::info!(
         "POST /v1/chat/completions → {} ledgered={} model={} provider={} ({:.1}s)",
