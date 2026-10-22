@@ -1227,7 +1227,7 @@ pub(crate) fn record_responses_measurement(
     ctx: &AnthropicRecordCtx,
     capture: &crate::providers::codex::TurnCapture,
     meters: Option<Value>,
-    _status: u16,
+    status: u16,
     frontend_protocol: &'static str,
     serving_provider: Option<&str>,
 ) {
@@ -1429,7 +1429,7 @@ pub(crate) fn record_responses_measurement(
         tracing::error!(%error, "lane update failed");
     }
     persist_successful_pin(ctx, ts_ms);
-    if _status < 400
+    if status < 400
         && let Some(attempt) = ctx.policy_attempt.as_deref()
     {
         ctx.server.clear_policy_target_circuits(attempt);
@@ -1440,7 +1440,7 @@ pub(crate) fn record_responses_measurement(
     tracing::info!(
         "POST {} → {} ledgered=yes model={} provider={} ({:.1}s)",
         ctx.path,
-        _status,
+        status,
         model,
         ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
