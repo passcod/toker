@@ -861,14 +861,73 @@ pub(crate) async fn coordinate_chat(
     if let Some(ctx) = record.as_mut() {
         ctx.policy_routing = policy_routing;
     }
-    let prepared = match adapter {
+    let prepared = prepare_chat_backend(
+        &server,
+        adapter,
+        attempt,
+        ChatBackendInput {
+            parts,
+            max_tokens: max_tokens.clone(),
+            record,
+            in_flight,
+            session_id: session_id.clone(),
+            client_wants_json,
+        },
+    )
+    .await;
+    let ready = match prepared {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    let provenance = super::attempt::initial_provenance();
+    let ReadyBackendAttempt::Chat(ready) = ready else {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        return ready.execute(server, provenance).await;
+    };
+    coordinate_native_chat(
+        server,
+        ready,
+        provenance,
+        policy_attempt,
+        inference,
+        max_tokens,
+        session_id,
+        client_wants_json,
+    )
+    .await
+}
+
+struct ChatBackendInput {
+    parts: Parts,
+    max_tokens: Option<Value>,
+    record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    session_id: Option<String>,
+    client_wants_json: bool,
+}
+
+async fn prepare_chat_backend(
+    server: &Server,
+    adapter: Option<BackendAdapterId>,
+    attempt: InferenceAttempt,
+    input: ChatBackendInput,
+) -> Result<ReadyBackendAttempt, Box<Response>> {
+    let ChatBackendInput {
+        parts,
+        max_tokens,
+        record,
+        in_flight,
+        session_id,
+        client_wants_json,
+    } = input;
+    match adapter {
         Some(BackendAdapterId::OpenAiChatCompletions) => {
             prepare_chat(parts, attempt, record, in_flight).map(ReadyBackendAttempt::Chat)
         }
         Some(BackendAdapterId::AnthropicMessages) => {
             let backend = attempt.backend().clone();
             super::anthropic_target::prepare(
-                &server,
+                server,
                 parts,
                 attempt,
                 max_tokens,
@@ -881,7 +940,7 @@ pub(crate) async fn coordinate_chat(
         Some(BackendAdapterId::CodexResponses) => {
             let backend = attempt.backend().clone();
             super::codex::prepare(
-                &server,
+                server,
                 super::codex::AttemptInput {
                     attempt: Ok(attempt),
                     record: record.map(|ctx| super::proxy::chat_cross_record(ctx, backend)),
@@ -897,25 +956,19 @@ pub(crate) async fn coordinate_chat(
             .map(ReadyBackendAttempt::Codex)
         }
         _ => Err(Box::new(super::openai_not_configured())),
-    };
-    let ready = match prepared {
-        Ok(ready) => ready,
-        Err(response) => return *response,
-    };
-    let provenance = super::attempt::initial_provenance();
-    let ReadyBackendAttempt::Chat(ready) = ready else {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        return ready.execute(server, provenance).await;
-    };
-    coordinate_native_chat(server, ready, provenance, policy_attempt, inference).await
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn coordinate_native_chat(
     server: Server,
     mut ready: ReadyChatAttempt,
     mut provenance: crate::store::AttemptProvenance,
     mut policy_attempt: Option<super::PolicyAttempt>,
     inference: InferenceRequest,
+    max_tokens: Option<Value>,
+    session_id: Option<String>,
+    client_wants_json: bool,
 ) -> Response {
     loop {
         server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
@@ -1053,13 +1106,41 @@ async fn coordinate_native_chat(
                     ctx.effective_model = Some(next.plan.effective_model.clone());
                     ctx.policy_attempt = Some(Arc::new(next.clone()));
                 }
+                let adapter = target
+                    .binding()
+                    .canonical_backend()
+                    .map(|backend| backend.adapter());
                 let next_attempt = inference.prepare_policy(target, next.plan.clone());
-                ready = match prepare_chat(ready.parts, next_attempt, next_record, in_flight) {
-                    Ok(ready) => ready,
+                let prepared = prepare_chat_backend(
+                    &server,
+                    adapter,
+                    next_attempt,
+                    ChatBackendInput {
+                        parts: ready.parts,
+                        max_tokens: max_tokens.clone(),
+                        record: next_record,
+                        in_flight,
+                        session_id: session_id.clone(),
+                        client_wants_json,
+                    },
+                )
+                .await;
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
                     Err(response) => return *response,
                 };
                 provenance = next_provenance;
                 policy_attempt = Some(next);
+                match prepared {
+                    ReadyBackendAttempt::Chat(next) => ready = next,
+                    prepared => {
+                        server.note_binding_sent(
+                            prepared.binding_id(),
+                            Some(prepared.effective_model()),
+                        );
+                        return prepared.execute(server, provenance).await;
+                    }
+                }
             }
         }
     }
