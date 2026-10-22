@@ -3480,6 +3480,7 @@ api_key = "sk-proj-test"
 
         let rows = store.requests_since(0, 10).expect("ledger rows");
         assert_eq!(rows.len(), 2);
+        assert_eq!(store.count_logical_requests().expect("logical count"), 1);
         let first = rows[0].attempt.as_ref().expect("first attempt");
         let second = rows[1].attempt.as_ref().expect("fallback attempt");
         assert_eq!(first.attempt_group_id, second.attempt_group_id);
