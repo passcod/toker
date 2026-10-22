@@ -975,6 +975,7 @@ async fn coordinate_native_chat(
                     )
                     .await;
                 };
+                server.open_policy_circuit(current, class, super::record::now_ms());
                 let next = match server.continue_policy_attempt(current, class) {
                     Ok(Some(next)) => next,
                     Ok(None) => {
@@ -1038,7 +1039,6 @@ async fn coordinate_native_chat(
                     .await;
                 };
                 record_chat_attempt_failure(record.as_ref(), &failure, &response);
-                server.open_policy_circuit(current, class, super::record::now_ms());
                 cancellation.disarm();
                 drop(response);
                 let mut next_record = record.take();
