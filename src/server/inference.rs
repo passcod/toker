@@ -388,6 +388,31 @@ impl ReadyMessagesAttempt {
     }
 }
 
+enum ChatFailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
+}
+
+enum ReadyChatOutcome {
+    Accepted {
+        upstream: reqwest::Response,
+        record: Option<RecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        expected_stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        failure: super::attempt::AttemptFailure,
+        response: ChatFailureResponse,
+        record: Option<RecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        expected_stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
 struct ReadyChatAttempt {
     parts: Parts,
     backend: Arc<dyn Provider>,
@@ -409,18 +434,17 @@ impl ReadyChatAttempt {
         &self.effective_model
     }
 
-    async fn execute(
+    async fn execute_precommit(
         mut self,
-        server: Server,
+        server: &Server,
         provenance: crate::store::AttemptProvenance,
-    ) -> Response {
+    ) -> ReadyChatOutcome {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance);
         }
-        let mut cancellation =
-            super::cancel::PrecommitCancellationGuard::chat(self.record.as_ref());
+        let cancellation = super::cancel::PrecommitCancellationGuard::chat(self.record.as_ref());
         let upstream = match super::proxy::send_upstream(
-            &server,
+            server,
             self.backend.as_ref(),
             &self.parts,
             self.body,
@@ -430,66 +454,133 @@ impl ReadyChatAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream request failed");
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record::record_error(
-                        ctx,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                        Some(super::attempt::transport_failure_type(&error).to_owned()),
-                        None,
-                    );
-                }
-                return super::proxy::transport_failure(super::proxy::ErrorWire::Openai, &error);
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyChatOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: ChatFailureResponse::Local(super::proxy::transport_failure(
+                        super::proxy::ErrorWire::Openai,
+                        &error,
+                    )),
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    expected_stream: self.expected_stream,
+                    cancellation,
+                };
             }
         };
         let response_status = upstream.status();
-        let upstream = match super::attempt::precommit_openai_chat(upstream).await {
-            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
-            | Ok(super::attempt::PrecommitOutcome::Failure {
-                response: Some(response),
-                ..
-            }) => response,
-            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
-                cancellation.disarm();
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record::record_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("response_protocol".to_owned()),
-                        None,
-                    );
+        match super::attempt::precommit_openai_chat(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyChatOutcome::Accepted {
+                    upstream: response,
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    expected_stream: self.expected_stream,
+                    cancellation,
                 }
-                return super::proxy::upstream_failure(
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyChatOutcome::Failure {
+                failure,
+                response: ChatFailureResponse::Upstream(response),
+                record: self.record,
+                in_flight: self.in_flight,
+                response_model: self.response_model,
+                expected_stream: self.expected_stream,
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyChatOutcome::Failure {
+                failure,
+                response: ChatFailureResponse::Local(super::proxy::upstream_failure(
                     super::proxy::ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
-                );
-            }
+                )),
+                record: self.record,
+                in_flight: self.in_flight,
+                response_model: self.response_model,
+                expected_stream: self.expected_stream,
+                cancellation,
+            },
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record::record_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("ambiguous_transport".to_owned()),
-                        None,
-                    );
+                ReadyChatOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: ChatFailureResponse::Local(super::proxy::truncated_body(
+                        super::proxy::ErrorWire::Openai,
+                    )),
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    expected_stream: self.expected_stream,
+                    cancellation,
                 }
-                return super::proxy::truncated_body(super::proxy::ErrorWire::Openai);
             }
-        };
-        let response = super::proxy::forward_chat_canonical(
-            upstream,
-            self.record,
-            self.in_flight,
-            &self.response_model,
-            self.expected_stream,
-        )
-        .await;
-        cancellation.disarm();
-        response
+        }
     }
+}
+
+fn record_chat_attempt_failure(
+    record: Option<&RecordCtx>,
+    failure: &super::attempt::AttemptFailure,
+    response: &ChatFailureResponse,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    let retry_after = match response {
+        ChatFailureResponse::Upstream(response) => {
+            super::record::retry_after_ms(response.headers())
+        }
+        ChatFailureResponse::Local(_) => None,
+    };
+    super::record::record_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        Some(error_type.to_owned()),
+        retry_after,
+    );
 }
 
 enum ReadyBackendAttempt {
@@ -528,7 +619,58 @@ impl ReadyBackendAttempt {
     ) -> Response {
         match self {
             Self::Messages(ready) => ready.execute(server, provenance).await,
-            Self::Chat(ready) => ready.execute(server, provenance).await,
+            Self::Chat(ready) => match ready.execute_precommit(&server, provenance).await {
+                ReadyChatOutcome::Accepted {
+                    upstream,
+                    record,
+                    in_flight,
+                    response_model,
+                    expected_stream,
+                    mut cancellation,
+                } => {
+                    let response = super::proxy::forward_chat_canonical(
+                        upstream,
+                        record,
+                        in_flight,
+                        &response_model,
+                        expected_stream,
+                    )
+                    .await;
+                    cancellation.disarm();
+                    response
+                }
+                ReadyChatOutcome::Failure {
+                    failure,
+                    response,
+                    record,
+                    in_flight,
+                    response_model,
+                    expected_stream,
+                    mut cancellation,
+                } => {
+                    let response = match response {
+                        ChatFailureResponse::Upstream(response) => {
+                            super::proxy::forward_chat_canonical(
+                                response,
+                                record,
+                                in_flight,
+                                &response_model,
+                                expected_stream,
+                            )
+                            .await
+                        }
+                        response @ ChatFailureResponse::Local(_) => {
+                            record_chat_attempt_failure(record.as_ref(), &failure, &response);
+                            let ChatFailureResponse::Local(response) = response else {
+                                unreachable!()
+                            };
+                            response
+                        }
+                    };
+                    cancellation.disarm();
+                    response
+                }
+            },
             Self::Anthropic(ready) => ready.execute(server, provenance).await,
             Self::OpenRouter(ready) => ready.execute(server, provenance).await,
             Self::Codex(ready) => ready.execute(server, provenance).await,
