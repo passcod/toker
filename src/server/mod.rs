@@ -2403,6 +2403,7 @@ api_key = "sk-test"
 
     const CHAT_WITHOUT_USAGE: u8 = 1;
     const CHAT_FAILURE: u8 = 2;
+    const CHAT_RATE_LIMIT: u8 = 3;
 
     #[derive(Default)]
     struct ChatUpstream {
@@ -2431,6 +2432,15 @@ api_key = "sk-test"
                 StatusCode::BAD_GATEWAY,
                 axum::Json(serde_json::json!({
                     "error": {"type": "upstream_error", "message": "test failure"}
+                })),
+            )
+                .into_response();
+        }
+        if response_mode == CHAT_RATE_LIMIT {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "rate_limit_error", "message": "test limit"}
                 })),
             )
                 .into_response();
@@ -3515,6 +3525,36 @@ api_key = "sk-proj-test"
         assert_eq!(
             lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
             Some("backup-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_chat_policy_does_not_fall_back_for_an_unlisted_failure() {
+        let (server, primary, backup) = policy_chat_fallback_server().await;
+        primary
+            .response_mode
+            .store(CHAT_RATE_LIMIT, Ordering::Relaxed);
+        let store = server.store.clone();
+        let address = serve(server).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "asked-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request completes");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(primary.seen.lock().unwrap().len(), 1);
+        assert!(backup.seen.lock().unwrap().is_empty());
+        let rows = store.requests_since(0, 10).expect("ledger rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].attempt.as_ref().map(|attempt| attempt.reason),
+            Some(crate::store::AttemptReason::Initial)
         );
     }
 
