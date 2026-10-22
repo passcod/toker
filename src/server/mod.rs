@@ -2428,6 +2428,34 @@ api_key = "sk-test"
 
     type ChatBodies = Arc<ChatUpstream>;
 
+    async fn anthropic_chat_upstream(
+        axum::extract::State(upstream): axum::extract::State<ChatBodies>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let body = match axum::body::to_bytes(request.into_body(), 1 << 20).await {
+            Ok(body) => body,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        upstream.seen.lock().unwrap().push(value);
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": "msg-policy",
+                "type": "message",
+                "role": "assistant",
+                "model": "backup-model",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })),
+        )
+            .into_response()
+    }
+
     async fn chat_upstream(
         axum::extract::State(upstream): axum::extract::State<ChatBodies>,
         request: axum::extract::Request,
@@ -2508,7 +2536,7 @@ api_key = "sk-test"
                 .expect("primary mock serves")
         });
         let backup_upstream = axum::Router::new()
-            .route("/v1/chat/completions", axum::routing::post(chat_upstream))
+            .route("/v1/messages", axum::routing::post(anthropic_chat_upstream))
             .with_state(backup.clone());
         let backup_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2534,10 +2562,10 @@ upstream = "http://{primary_address}/v1"
 api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
 api_key = "sk-or-test"
 
-[providers.openai_api]
-upstream = "http://{backup_address}/v1"
+[providers.anthropic_api]
+upstream = "http://{backup_address}"
 api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
-api_key = "sk-proj-test"
+api_key = "sk-ant-test"
 "#,
             ),
         )
@@ -2589,7 +2617,7 @@ api_key = "sk-proj-test"
             },
             candidate: crate::policy::Candidate {
                 id: crate::policy::CandidateId::new("backup").unwrap(),
-                binding_id: crate::routing::OPENAI_API_CHAT.id().clone(),
+                binding_id: crate::routing::ANTHROPIC_API_MESSAGES.id().clone(),
                 model: crate::policy::CandidateModel::Exact {
                     model_id: "backup-model".to_owned(),
                 },
@@ -3268,6 +3296,7 @@ api_key = "sk-proj-test"
             .json(&serde_json::json!({
                 "model": "policy-alias",
                 "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
                 "stream": false
             }))
             .send()
@@ -3306,6 +3335,7 @@ api_key = "sk-proj-test"
             .json(&serde_json::json!({
                 "model": "policy-alias",
                 "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
                 "stream": false
             }))
             .send()
@@ -3489,6 +3519,7 @@ api_key = "sk-proj-test"
             .json(&serde_json::json!({
                 "model": "asked-model",
                 "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
                 "stream": false
             }))
             .send()
@@ -3515,7 +3546,7 @@ api_key = "sk-proj-test"
         assert_eq!(second.attempt_index.get(), 1);
         assert_eq!(second.reason, crate::store::AttemptReason::ServerError);
         assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
-        assert_eq!(rows[1].provider.as_deref(), Some("openai_api"));
+        assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
         assert_eq!(
             rows[1]
                 .policy_routing
@@ -3536,7 +3567,7 @@ api_key = "sk-proj-test"
             .expect("successful fallback pinned the lane");
         assert_eq!(
             lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
-            Some("openai_api.openai_chat_completions")
+            Some("anthropic_api.anthropic_messages")
         );
         assert_eq!(
             lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
@@ -3557,6 +3588,7 @@ api_key = "sk-proj-test"
             .json(&serde_json::json!({
                 "model": "asked-model",
                 "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
                 "stream": false
             }))
             .send()
@@ -3606,6 +3638,7 @@ api_key = "sk-proj-test"
             .json(&serde_json::json!({
                 "model": "policy-alias",
                 "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
                 "stream": false
             }))
             .send()
