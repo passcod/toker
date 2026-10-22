@@ -916,7 +916,73 @@ impl Server {
         }))
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn open_policy_circuit(
+        &self,
+        attempt: &PolicyAttempt,
+        failure: crate::policy::FailureClass,
+        now_ms: i64,
+    ) {
+        let Some(runtime) = self.policy_runtime.as_ref() else {
+            return;
+        };
+        let Some(revision_id) = attempt.plan.policy_revision else {
+            return;
+        };
+        let (Some(route_id), Some(candidate_id)) = (
+            attempt.plan.route_id.as_ref(),
+            attempt.plan.candidate_id.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(duration) = attempt
+            .continuation
+            .snapshot
+            .policy()
+            .route(route_id)
+            .and_then(|route| {
+                route
+                    .candidates()
+                    .iter()
+                    .find(|candidate| candidate.id() == candidate_id)
+            })
+            .and_then(|candidate| candidate.health_circuit_seconds(failure))
+        else {
+            return;
+        };
+        let duration_ms = i64::try_from(duration.saturating_mul(1_000)).unwrap_or(i64::MAX);
+        runtime.open_circuit(
+            &attempt.continuation.snapshot,
+            crate::policy::HealthCircuitKey {
+                policy_revision_id: revision_id,
+                route_id: route_id.clone(),
+                candidate_id: candidate_id.clone(),
+                binding_id: attempt.plan.binding_id.clone(),
+                model_id: attempt.plan.effective_model.clone(),
+                failure,
+            },
+            now_ms.saturating_add(duration_ms),
+        );
+    }
+
+    pub(crate) fn clear_policy_target_circuits(&self, attempt: &PolicyAttempt) {
+        let Some(runtime) = self.policy_runtime.as_ref() else {
+            return;
+        };
+        let (Some(route_id), Some(candidate_id)) = (
+            attempt.plan.route_id.as_ref(),
+            attempt.plan.candidate_id.as_ref(),
+        ) else {
+            return;
+        };
+        runtime.clear_target_circuits(
+            &attempt.continuation.snapshot,
+            route_id,
+            candidate_id,
+            &attempt.plan.binding_id,
+            &attempt.plan.effective_model,
+        );
+    }
+
     pub(crate) fn continue_policy_attempt(
         &self,
         failed: &PolicyAttempt,
@@ -2400,6 +2466,149 @@ api_key = "sk-test"
         address
     }
 
+    async fn policy_chat_fallback_server() -> (Server, ChatBodies, ChatBodies) {
+        let primary: ChatBodies = Arc::default();
+        primary.response_mode.store(CHAT_FAILURE, Ordering::Relaxed);
+        let backup: ChatBodies = Arc::default();
+        let primary_upstream = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(chat_upstream))
+            .with_state(primary.clone());
+        let primary_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("primary mock binds");
+        let primary_address = primary_listener.local_addr().expect("primary mock address");
+        tokio::spawn(async move {
+            axum::serve(primary_listener, primary_upstream)
+                .await
+                .expect("primary mock serves")
+        });
+        let backup_upstream = axum::Router::new()
+            .route("/v1/chat/completions", axum::routing::post(chat_upstream))
+            .with_state(backup.clone());
+        let backup_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("backup mock binds");
+        let backup_address = backup_listener.local_addr().expect("backup mock address");
+        tokio::spawn(async move {
+            axum::serve(backup_listener, backup_upstream)
+                .await
+                .expect("backup mock serves")
+        });
+
+        let dir = crate::setup::test_dir("active-chat-fallback-policy");
+        std::fs::write(
+            dir.join("toker.toml"),
+            format!(
+                r#"
+awake = false
+db_path = ":memory:"
+default_backend_openai_chat = "openrouter"
+
+[providers.openrouter]
+upstream = "http://{primary_address}/v1"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "sk-or-test"
+
+[providers.openai_api]
+upstream = "http://{backup_address}/v1"
+api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
+api_key = "sk-proj-test"
+"#,
+            ),
+        )
+        .expect("write config");
+        let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
+        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
+        let mut server = Server::new(config, store.clone()).expect("server builds");
+        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+            .expect("legacy document");
+        let route_id =
+            crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
+                .unwrap();
+        for default in &mut document.defaults {
+            if matches!(
+                &default.scope,
+                crate::policy::FrontendScope::Profile {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                    ..
+                } | crate::policy::FrontendScope::Protocol {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                }
+            ) {
+                default.target.route_id = route_id.clone();
+            }
+        }
+        let route = document
+            .routes
+            .iter_mut()
+            .find(|route| route.id == route_id)
+            .expect("OpenRouter route");
+        route.chain.first.model = crate::policy::CandidateModel::Exact {
+            model_id: "primary-model".to_owned(),
+        };
+        route
+            .chain
+            .first
+            .health_circuits
+            .push(crate::policy::HealthCircuit {
+                failure: crate::policy::FailureClass::ServerError,
+                duration_seconds: 30,
+            });
+        route.chain.steps.push(crate::policy::RouteStep {
+            edge: crate::policy::CandidateEdge {
+                preflight: crate::policy::FallbackPermission::Enabled,
+                post_send: vec![crate::policy::FailureClass::ServerError],
+                billed_boundary: crate::policy::BoundaryConsent::Deny,
+                ambiguous_transport: crate::policy::BoundaryConsent::Deny,
+                cache_transition: crate::policy::CacheTransitionPolicy::AllowCacheLoss,
+            },
+            candidate: crate::policy::Candidate {
+                id: crate::policy::CandidateId::new("backup").unwrap(),
+                binding_id: crate::routing::OPENAI_API_CHAT.id().clone(),
+                model: crate::policy::CandidateModel::Exact {
+                    model_id: "backup-model".to_owned(),
+                },
+                upgrade_policy_id: None,
+                alias_policy: None,
+                required_capabilities: Default::default(),
+                enabled: true,
+                health_circuits: vec![],
+            },
+        });
+        let document = document.validate().expect("policy validates");
+        let revision = store
+            .insert_policy_revision(&crate::store::NewPolicyRevision {
+                created_ms: 1,
+                activated_ms: 2,
+                description: Some("active Chat fallback test"),
+                activation_scope: crate::policy::ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: crate::store::PolicyRevisionSource::Legacy,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .expect("insert revision");
+        let catalogs = crate::catalog::FetchedCatalogs::default();
+        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
+        let policy = crate::policy::compile(
+            document,
+            &server.registry,
+            &inventory,
+            crate::policy::PolicyOrigin::GeneratedRevisionOne,
+        )
+        .into_policy()
+        .expect("policy compiles");
+        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
+            store,
+            server.registry.clone(),
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            Arc::new(super::availability_for(&server.registry, &catalogs)),
+        )));
+        (server, primary, backup)
+    }
+
     async fn policy_chat_server() -> (Server, ChatBodies) {
         let seen: ChatBodies = Arc::default();
         let upstream = axum::Router::new()
@@ -3223,6 +3432,89 @@ api_key = "sk-proj-test"
                 Some(binding)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn active_chat_policy_falls_back_before_commitment() {
+        let (server, primary, backup) = policy_chat_fallback_server().await;
+        let store = server.store.clone();
+        let runtime = server.policy_runtime.as_ref().unwrap().clone();
+        let snapshot = runtime.capture().unwrap();
+        let route = snapshot
+            .policy()
+            .route(
+                &crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
+                    .unwrap(),
+            )
+            .unwrap();
+        let primary_candidate = &route.candidates()[0];
+        let primary_circuit = crate::policy::HealthCircuitKey {
+            policy_revision_id: snapshot.revision_id().unwrap(),
+            route_id: route.id().clone(),
+            candidate_id: primary_candidate.id().clone(),
+            binding_id: primary_candidate.binding_id().clone(),
+            model_id: "primary-model".to_owned(),
+            failure: crate::policy::FailureClass::ServerError,
+        };
+        let address = serve(server).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .header("x-toker-session", "fallback-session")
+            .json(&serde_json::json!({
+                "model": "asked-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("JSON response");
+        assert_eq!(body["model"], "asked-model");
+        assert_eq!(primary.seen.lock().unwrap()[0]["model"], "primary-model");
+        assert_eq!(backup.seen.lock().unwrap()[0]["model"], "backup-model");
+        assert!(
+            runtime.circuit_is_open(&snapshot, &primary_circuit, super::now_ms()),
+            "a configured classified failure opens the exact failed target circuit"
+        );
+
+        let rows = store.requests_since(0, 10).expect("ledger rows");
+        assert_eq!(rows.len(), 2);
+        let first = rows[0].attempt.as_ref().expect("first attempt");
+        let second = rows[1].attempt.as_ref().expect("fallback attempt");
+        assert_eq!(first.attempt_group_id, second.attempt_group_id);
+        assert_eq!(first.attempt_index.get(), 0);
+        assert_eq!(first.reason, crate::store::AttemptReason::Initial);
+        assert_eq!(second.attempt_index.get(), 1);
+        assert_eq!(second.reason, crate::store::AttemptReason::ServerError);
+        assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
+        assert_eq!(rows[1].provider.as_deref(), Some("openai_api"));
+        assert_eq!(
+            rows[1]
+                .policy_routing
+                .as_ref()
+                .and_then(|routing| match &routing.outcome {
+                    crate::store::PolicyRoutingOutcome::Attempt { candidate_id, .. } => {
+                        Some(candidate_id.as_str())
+                    }
+                    crate::store::PolicyRoutingOutcome::RouteUnavailable { .. } => None,
+                }),
+            Some("backup")
+        );
+        let lane = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("fallback-session"))
+            .expect("successful fallback pinned the lane");
+        assert_eq!(
+            lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
+            Some("openai_api.openai_chat_completions")
+        );
+        assert_eq!(
+            lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
+            Some("backup-model")
+        );
     }
 
     #[tokio::test]

@@ -304,12 +304,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     }
     inference.strip_release(&original);
     let authoritative = policy_plan.is_some();
-    let (attempt, pin_transition) = match policy_plan {
-        Some(resolved) => (
-            inference.prepare_policy(target.clone(), resolved.plan),
-            Some(resolved.pin_transition),
-        ),
-        None => (inference.prepare(target.clone(), gate_model.clone()), None),
+    let pin_transition = policy_plan
+        .as_ref()
+        .map(|resolved| resolved.pin_transition.clone());
+    let attempt = match policy_plan.as_ref() {
+        Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan.clone()),
+        None => inference.prepare(target.clone(), gate_model.clone()),
     };
     if let Some(block) = super::quota_gate::decide_block(
         &server,
@@ -528,6 +528,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         server,
         adapter,
         attempt,
+        policy_plan,
+        inference,
         super::inference::ChatAttemptInput {
             parts,
             max_tokens: value

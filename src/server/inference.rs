@@ -435,19 +435,21 @@ impl ReadyChatAttempt {
     }
 
     async fn execute_precommit(
-        mut self,
+        &mut self,
         server: &Server,
         provenance: crate::store::AttemptProvenance,
     ) -> ReadyChatOutcome {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance);
         }
-        let cancellation = super::cancel::PrecommitCancellationGuard::chat(self.record.as_ref());
+        let record = self.record.take();
+        let in_flight = self.in_flight.take();
+        let cancellation = super::cancel::PrecommitCancellationGuard::chat(record.as_ref());
         let upstream = match super::proxy::send_upstream(
             server,
             self.backend.as_ref(),
             &self.parts,
-            self.body,
+            self.body.clone(),
             &[],
         )
         .await
@@ -474,9 +476,9 @@ impl ReadyChatAttempt {
                         super::proxy::ErrorWire::Openai,
                         &error,
                     )),
-                    record: self.record,
-                    in_flight: self.in_flight,
-                    response_model: self.response_model,
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
                     expected_stream: self.expected_stream,
                     cancellation,
                 };
@@ -487,9 +489,9 @@ impl ReadyChatAttempt {
             Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
                 ReadyChatOutcome::Accepted {
                     upstream: response,
-                    record: self.record,
-                    in_flight: self.in_flight,
-                    response_model: self.response_model,
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
                     expected_stream: self.expected_stream,
                     cancellation,
                 }
@@ -500,9 +502,9 @@ impl ReadyChatAttempt {
             }) => ReadyChatOutcome::Failure {
                 failure,
                 response: ChatFailureResponse::Upstream(response),
-                record: self.record,
-                in_flight: self.in_flight,
-                response_model: self.response_model,
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
                 expected_stream: self.expected_stream,
                 cancellation,
             },
@@ -515,9 +517,9 @@ impl ReadyChatAttempt {
                     super::proxy::ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
                 )),
-                record: self.record,
-                in_flight: self.in_flight,
-                response_model: self.response_model,
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
                 expected_stream: self.expected_stream,
                 cancellation,
             },
@@ -532,9 +534,9 @@ impl ReadyChatAttempt {
                     response: ChatFailureResponse::Local(super::proxy::truncated_body(
                         super::proxy::ErrorWire::Openai,
                     )),
-                    record: self.record,
-                    in_flight: self.in_flight,
-                    response_model: self.response_model,
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
                     expected_stream: self.expected_stream,
                     cancellation,
                 }
@@ -619,7 +621,7 @@ impl ReadyBackendAttempt {
     ) -> Response {
         match self {
             Self::Messages(ready) => ready.execute(server, provenance).await,
-            Self::Chat(ready) => match ready.execute_precommit(&server, provenance).await {
+            Self::Chat(mut ready) => match ready.execute_precommit(&server, provenance).await {
                 ReadyChatOutcome::Accepted {
                     upstream,
                     record,
@@ -840,6 +842,8 @@ pub(crate) async fn coordinate_chat(
     server: Server,
     adapter: Option<BackendAdapterId>,
     attempt: InferenceAttempt,
+    policy_attempt: Option<super::PolicyAttempt>,
+    inference: InferenceRequest,
     input: ChatAttemptInput,
 ) -> Response {
     let ChatAttemptInput {
@@ -898,10 +902,201 @@ pub(crate) async fn coordinate_chat(
         Ok(ready) => ready,
         Err(response) => return *response,
     };
-    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready
-        .execute(server, super::attempt::initial_provenance())
-        .await
+    let provenance = super::attempt::initial_provenance();
+    let ReadyBackendAttempt::Chat(ready) = ready else {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        return ready.execute(server, provenance).await;
+    };
+    coordinate_native_chat(server, ready, provenance, policy_attempt, inference).await
+}
+
+async fn coordinate_native_chat(
+    server: Server,
+    mut ready: ReadyChatAttempt,
+    mut provenance: crate::store::AttemptProvenance,
+    mut policy_attempt: Option<super::PolicyAttempt>,
+    inference: InferenceRequest,
+) -> Response {
+    loop {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        match ready.execute_precommit(&server, provenance.clone()).await {
+            ReadyChatOutcome::Accepted {
+                upstream,
+                record,
+                in_flight,
+                response_model,
+                expected_stream,
+                mut cancellation,
+            } => {
+                if let Some(attempt) = policy_attempt.as_ref() {
+                    server.clear_policy_target_circuits(attempt);
+                }
+                let response = super::proxy::forward_chat_canonical(
+                    upstream,
+                    record,
+                    in_flight,
+                    &response_model,
+                    expected_stream,
+                )
+                .await;
+                cancellation.disarm();
+                return response;
+            }
+            ReadyChatOutcome::Failure {
+                failure,
+                response,
+                mut record,
+                in_flight,
+                response_model,
+                expected_stream,
+                mut cancellation,
+            } => {
+                let Some(class) = failure.class else {
+                    return finish_chat_failure(
+                        failure,
+                        response,
+                        record,
+                        in_flight,
+                        response_model,
+                        expected_stream,
+                        cancellation,
+                    )
+                    .await;
+                };
+                let Some(current) = policy_attempt.as_ref() else {
+                    return finish_chat_failure(
+                        failure,
+                        response,
+                        record,
+                        in_flight,
+                        response_model,
+                        expected_stream,
+                        cancellation,
+                    )
+                    .await;
+                };
+                let next = match server.continue_policy_attempt(current, class) {
+                    Ok(Some(next)) => next,
+                    Ok(None) => {
+                        return finish_chat_failure(
+                            failure,
+                            response,
+                            record,
+                            in_flight,
+                            response_model,
+                            expected_stream,
+                            cancellation,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "policy fallback continuation failed");
+                        return finish_chat_failure(
+                            failure,
+                            response,
+                            record,
+                            in_flight,
+                            response_model,
+                            expected_stream,
+                            cancellation,
+                        )
+                        .await;
+                    }
+                };
+                let target = match server.registry.resolve_binding(
+                    crate::routing::ProtocolId::OpenAiChat,
+                    &next.plan.binding_id,
+                    next.plan.requested_model.as_deref(),
+                    &next.plan.effective_model,
+                ) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        tracing::error!(?error, binding_id = %next.plan.binding_id, "policy fallback selected an unavailable Chat binding");
+                        return finish_chat_failure(
+                            failure,
+                            response,
+                            record,
+                            in_flight,
+                            response_model,
+                            expected_stream,
+                            cancellation,
+                        )
+                        .await;
+                    }
+                };
+                let Some(next_provenance) = super::attempt::next_provenance(&provenance, class)
+                else {
+                    return finish_chat_failure(
+                        failure,
+                        response,
+                        record,
+                        in_flight,
+                        response_model,
+                        expected_stream,
+                        cancellation,
+                    )
+                    .await;
+                };
+                record_chat_attempt_failure(record.as_ref(), &failure, &response);
+                server.open_policy_circuit(current, class, super::record::now_ms());
+                cancellation.disarm();
+                drop(response);
+                let mut next_record = record.take();
+                if let Some(ctx) = next_record.as_mut() {
+                    ctx.backend = target.provider().clone();
+                    ctx.binding_id = next.plan.binding_id.clone();
+                    ctx.attempt = None;
+                    ctx.policy_routing =
+                        crate::store::PolicyRouteProvenance::from_attempt_plan(&next.plan)
+                            .unwrap_or_else(|error| {
+                                tracing::error!(%error, "policy fallback provenance omitted");
+                                None
+                            });
+                    ctx.pin_transition = Some(next.pin_transition.clone());
+                    ctx.effective_model = Some(next.plan.effective_model.clone());
+                }
+                let next_attempt = inference.prepare_policy(target, next.plan.clone());
+                ready = match prepare_chat(ready.parts, next_attempt, next_record, in_flight) {
+                    Ok(ready) => ready,
+                    Err(response) => return *response,
+                };
+                provenance = next_provenance;
+                policy_attempt = Some(next);
+            }
+        }
+    }
+}
+
+async fn finish_chat_failure(
+    failure: super::attempt::AttemptFailure,
+    response: ChatFailureResponse,
+    record: Option<RecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    response_model: String,
+    expected_stream: bool,
+    mut cancellation: super::cancel::PrecommitCancellationGuard,
+) -> Response {
+    let response = match response {
+        ChatFailureResponse::Upstream(response) => {
+            super::proxy::forward_chat_canonical(
+                response,
+                record,
+                in_flight,
+                &response_model,
+                expected_stream,
+            )
+            .await
+        }
+        response @ ChatFailureResponse::Local(_) => {
+            record_chat_attempt_failure(record.as_ref(), &failure, &response);
+            let ChatFailureResponse::Local(response) = response else {
+                unreachable!()
+            };
+            response
+        }
+    };
+    cancellation.disarm();
+    response
 }
 
 pub(crate) async fn coordinate_responses(
