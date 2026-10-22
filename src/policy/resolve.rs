@@ -261,13 +261,15 @@ pub struct AttemptPlan {
     pub cache_transition: Option<CacheTransitionPolicy>,
     pub fallback_cache_transition: Option<CacheTransitionPolicy>,
     pub trace: Vec<TraceEvent>,
-    route_start_index: usize,
-    candidate_index: usize,
+    continuation: Option<PostSendContinuation>,
 }
 
 impl AttemptPlan {
     pub fn with_policy_revision(mut self, revision_id: i64) -> Self {
         self.policy_revision = Some(revision_id);
+        if let Some(continuation) = self.continuation.as_mut() {
+            continuation.policy_revision = Some(revision_id);
+        }
         self
     }
 
@@ -385,8 +387,18 @@ pub fn resolve_first_candidate<L: LearningView>(
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PostSendContinuation {
+    policy_fingerprint: PolicyFingerprint,
+    policy_revision: Option<i64>,
+    route_id: RouteId,
+    route_fingerprint: RouteFingerprint,
+    provenance: RouteProvenance,
+    parameters: BTreeMap<StableId, String>,
+    lane_transition: Option<LaneTransitionPolicy>,
+    cache_transition: Option<CacheTransitionPolicy>,
+    facts: RequestFacts,
+    lane: Option<LaneFacts>,
     route_start_index: usize,
     failed_candidate_index: usize,
     trace: Vec<TraceEvent>,
@@ -441,48 +453,55 @@ pub fn resolve_after_failure<L: LearningView>(
     policy: &CompiledPolicy,
     inventory: &OfferInventory,
     learning: &L,
-    lane: Option<&LaneFacts>,
     availability: &AvailabilitySnapshot,
     circuits: &CircuitSnapshot,
-    facts: &RequestFacts,
     failed: &AttemptPlan,
     failure: FailureClass,
 ) -> Result<Option<AttemptPlan>, ResolveFailure> {
-    if failed.policy_fingerprint != *policy.fingerprint() {
-        return Err(ResolveFailure::MissingRoute);
-    }
-    let Some(route_id) = failed.route_id.as_ref() else {
+    let Some(continuation) = failed.continuation.as_ref() else {
         return Ok(None);
     };
-    let Some(route) = policy.route(route_id) else {
+    if continuation.policy_fingerprint != *policy.fingerprint() {
+        return Err(ResolveFailure::MissingRoute);
+    }
+    let Some(route) = policy.route(&continuation.route_id) else {
         return Err(ResolveFailure::MissingRoute);
     };
-    if failed.candidate_index >= route.edges().len()
-        || !route.edges()[failed.candidate_index]
+    if continuation.route_fingerprint != *route.fingerprint()
+        || continuation.failed_candidate_index >= route.edges().len()
+        || !route.edges()[continuation.failed_candidate_index]
             .post_send
             .contains(&failure)
     {
         return Ok(None);
     }
-    let mut resolved = resolve_with_options(
+    let selected = SelectedRoute {
+        route: Some(route),
+        exact: None,
+        parameters: continuation.parameters.clone(),
+        provenance: continuation.provenance.clone(),
+        lane_transition: continuation.lane_transition,
+        cache_transition: continuation.cache_transition,
+    };
+    let mut resolved = resolve_selected(
         policy,
         inventory,
         learning,
-        lane,
+        continuation.lane.as_ref(),
         availability,
         circuits,
-        facts,
+        &continuation.facts,
+        selected,
         ResolveOptions {
             activation_allows_cache_loss: false,
             traverse_candidates: true,
-            post_send: Some(PostSendContinuation {
-                route_start_index: failed.route_start_index,
-                failed_candidate_index: failed.candidate_index,
-                trace: failed.trace.clone(),
-            }),
+            post_send: Some(continuation.clone()),
         },
     )?;
-    resolved.policy_revision = failed.policy_revision;
+    resolved.policy_revision = continuation.policy_revision;
+    if let Some(next) = resolved.continuation.as_mut() {
+        next.policy_revision = continuation.policy_revision;
+    }
     Ok(Some(resolved))
 }
 
@@ -497,7 +516,6 @@ fn resolve_with_options<L: LearningView>(
     facts: &RequestFacts,
     options: ResolveOptions,
 ) -> Result<AttemptPlan, ResolveFailure> {
-    let activation_allows_cache_loss = options.activation_allows_cache_loss;
     let mut selected = lookup(policy, facts)?;
     if facts.class == RequestClass::Compaction
         && lane.is_some_and(|lane| lane.temperature == super::CacheTemperature::Cold)
@@ -508,7 +526,32 @@ fn resolve_with_options<L: LearningView>(
         selected.lane_transition = Some(lane_transition);
         selected.cache_transition = Some(cache_transition);
     }
+    resolve_selected(
+        policy,
+        inventory,
+        learning,
+        lane,
+        availability,
+        circuits,
+        facts,
+        selected,
+        options,
+    )
+}
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_selected<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+    selected: SelectedRoute<'_>,
+    options: ResolveOptions,
+) -> Result<AttemptPlan, ResolveFailure> {
+    let activation_allows_cache_loss = options.activation_allows_cache_loss;
     let mut trace = options.post_send.as_ref().map_or_else(
         || vec![TraceEvent::Lookup(selected.provenance.clone())],
         |next| next.trace.clone(),
@@ -552,8 +595,7 @@ fn resolve_with_options<L: LearningView>(
             cache_transition: selected.cache_transition,
             fallback_cache_transition: None,
             trace,
-            route_start_index: 0,
-            candidate_index: 0,
+            continuation: None,
         });
     }
 
@@ -763,9 +805,22 @@ fn resolve_with_options<L: LearningView>(
                         stricter_cache_transition(policy, edge.cache_transition)
                     })
             }),
+            continuation: Some(PostSendContinuation {
+                policy_fingerprint: policy.fingerprint().clone(),
+                policy_revision: None,
+                route_id: route.id().clone(),
+                route_fingerprint: route.fingerprint().clone(),
+                provenance: selected.provenance.clone(),
+                parameters: selected.parameters.clone(),
+                lane_transition: selected.lane_transition,
+                cache_transition: selected.cache_transition,
+                facts: facts.clone(),
+                lane: lane.cloned(),
+                route_start_index: route_start,
+                failed_candidate_index: index,
+                trace: trace.clone(),
+            }),
             trace,
-            route_start_index: route_start,
-            candidate_index: index,
         });
     }
     Err(route_unavailable(route, &selected.provenance, trace))
@@ -2297,10 +2352,8 @@ mod tests {
             &policy,
             &OfferInventory::default(),
             &NoLearning,
-            None,
             &availability,
             &CircuitSnapshot::default(),
-            &request,
             &first,
             FailureClass::Overload,
         )
@@ -2323,6 +2376,123 @@ mod tests {
                 ..
             })) if candidate_id.as_str() == "second" && crossed_from.as_str() == "first"
         ));
+    }
+
+    #[test]
+    fn post_send_continuation_uses_the_captured_route_and_inputs() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        let edge = CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![FailureClass::Overload],
+            billed_boundary: BoundaryConsent::Allow,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge,
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let availability = availability(true, false);
+        let request = facts("captured");
+        let mut first = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability,
+            &CircuitSnapshot::default(),
+            &request,
+        )
+        .unwrap();
+        first.route_id = Some(id("invented-public-view"));
+        first.candidate_id = Some(id("invented-public-view"));
+        first.trace.clear();
+
+        let second = resolve_after_failure(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            &availability,
+            &CircuitSnapshot::default(),
+            &first,
+            FailureClass::Overload,
+        )
+        .unwrap()
+        .expect("captured continuation remains authoritative");
+
+        assert_eq!(second.route_id, Some(id("route")));
+        assert_eq!(second.candidate_id, Some(id("second")));
+        assert_eq!(second.baseline_model, "captured");
+        assert!(matches!(second.trace.first(), Some(TraceEvent::Lookup(_))));
+    }
+
+    #[test]
+    fn exact_presentations_have_no_post_send_continuation() {
+        let mut doc = document(route(
+            candidate(
+                "unused",
+                &ANTHROPIC_SUB_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        ));
+        doc.presentations.push(Presentation {
+            id: id("exact"),
+            scope: scope(Some("claude")),
+            slug: "friendly".to_owned(),
+            label: None,
+            description: None,
+            enabled: true,
+            shadow_native: false,
+            source: PresentationSource::ExactOffer {
+                binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                model_id: "exact-model".to_owned(),
+            },
+            metadata: None,
+        });
+        let policy = compile(doc, &OfferInventory::default());
+        let availability = availability(true, false);
+        let plan = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability,
+            &CircuitSnapshot::default(),
+            &facts("friendly"),
+        )
+        .unwrap();
+
+        assert!(
+            resolve_after_failure(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                &availability,
+                &CircuitSnapshot::default(),
+                &plan,
+                FailureClass::Overload,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -2376,10 +2546,8 @@ mod tests {
                 &policy,
                 &OfferInventory::default(),
                 &NoLearning,
-                None,
                 &availability,
                 &CircuitSnapshot::default(),
-                &request,
                 &first,
                 FailureClass::Overload,
             )
