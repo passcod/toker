@@ -147,9 +147,30 @@ pub(crate) enum PolicyAttemptError {
     },
 }
 
+#[allow(dead_code)]
 pub(crate) struct PolicyAttempt {
     pub(crate) plan: crate::policy::AttemptPlan,
     pub(crate) pin_transition: crate::policy::LaneTransitionDecision,
+    continuation: PolicyContinuation,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct PolicyContinuation {
+    snapshot: Arc<crate::policy::PolicySnapshot>,
+    learning: crate::policy::LearningSnapshot,
+    availability: crate::policy::AvailabilitySnapshot,
+    circuits: crate::policy::CircuitSnapshot,
+    lane_state: crate::policy::LaneState,
+    activation_scope: crate::policy::ActivationScope,
+}
+
+struct ResolvedPolicySnapshot {
+    plan: crate::policy::AttemptPlan,
+    snapshot: Arc<crate::policy::PolicySnapshot>,
+    learning: crate::policy::LearningSnapshot,
+    availability: crate::policy::AvailabilitySnapshot,
+    circuits: crate::policy::CircuitSnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -827,7 +848,7 @@ impl Server {
         let forced_immediate = use_active
             && scope == crate::policy::ActivationScope::Immediate
             && snapshot.forced_cache_transition();
-        let mut plan = match self.resolve_policy_snapshot(
+        let mut resolved = match self.resolve_policy_snapshot(
             runtime,
             &snapshot,
             facts,
@@ -835,7 +856,7 @@ impl Server {
             lane,
             forced_immediate,
         ) {
-            Ok(plan) => plan,
+            Ok(resolved) => resolved,
             Err(_)
                 if use_active
                     && scope == crate::policy::ActivationScope::Immediate
@@ -850,9 +871,9 @@ impl Server {
         };
         let mut decision = policy_transition(
             &lane_state,
-            &plan,
+            &resolved.plan,
             scope,
-            snapshot.forced_cache_transition(),
+            resolved.snapshot.forced_cache_transition(),
         );
 
         if use_active
@@ -867,33 +888,88 @@ impl Server {
             && revision_id != current_revision_id
         {
             let pinned = runtime.capture_revision_with_evidence(revision_id, &evidence)?;
-            plan =
+            resolved =
                 self.resolve_policy_snapshot(runtime, &pinned, facts, credentials, lane, false)?;
-            decision = policy_transition(&lane_state, &plan, scope, false);
+            decision = policy_transition(&lane_state, &resolved.plan, scope, false);
         }
         if let crate::policy::LaneTransitionDecision::Denied(reason) = decision {
             return Err(PolicyAttemptError::Transition {
-                revision_id: plan
+                revision_id: resolved
+                    .plan
                     .policy_revision
                     .expect("an authoritative plan has a persisted revision"),
+                reason,
+            });
+        }
+        let continuation = PolicyContinuation {
+            snapshot: resolved.snapshot,
+            learning: resolved.learning,
+            availability: resolved.availability,
+            circuits: resolved.circuits,
+            lane_state,
+            activation_scope: scope,
+        };
+        Ok(Some(PolicyAttempt {
+            plan: resolved.plan,
+            pin_transition: decision,
+            continuation,
+        }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn continue_policy_attempt(
+        &self,
+        failed: &PolicyAttempt,
+        failure: crate::policy::FailureClass,
+    ) -> Result<Option<PolicyAttempt>, PolicyAttemptError> {
+        let revision_id = failed
+            .plan
+            .policy_revision
+            .expect("an authoritative attempt has a persisted revision");
+        let plan = crate::policy::resolve_after_failure(
+            failed.continuation.snapshot.policy(),
+            failed.continuation.snapshot.inventory(),
+            &failed.continuation.learning,
+            &failed.continuation.availability,
+            &failed.continuation.circuits,
+            &failed.plan,
+            failure,
+        )
+        .map_err(|failure| PolicyAttemptError::Resolve {
+            revision_id,
+            failure,
+        })?;
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        let decision = policy_transition(
+            &failed.continuation.lane_state,
+            &plan,
+            failed.continuation.activation_scope,
+            failed.continuation.snapshot.forced_cache_transition(),
+        );
+        if let crate::policy::LaneTransitionDecision::Denied(reason) = decision {
+            return Err(PolicyAttemptError::Transition {
+                revision_id,
                 reason,
             });
         }
         Ok(Some(PolicyAttempt {
             plan,
             pin_transition: decision,
+            continuation: failed.continuation.clone(),
         }))
     }
 
     fn resolve_policy_snapshot(
         &self,
         runtime: &crate::policy::PolicyRuntime,
-        snapshot: &crate::policy::PolicySnapshot,
+        snapshot: &Arc<crate::policy::PolicySnapshot>,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
         lane: Option<&LaneFacts>,
         activation_allows_cache_loss: bool,
-    ) -> Result<crate::policy::AttemptPlan, PolicyAttemptError> {
+    ) -> Result<ResolvedPolicySnapshot, PolicyAttemptError> {
         let revision_id = snapshot
             .revision_id()
             .expect("an authoritative snapshot has a persisted revision");
@@ -907,7 +983,7 @@ impl Server {
             .with_credentials(credentials);
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let circuits = runtime.open_circuits(snapshot, facts.now_ms);
-        crate::policy::resolve::resolve_with_activation_cache_consent(
+        let plan = crate::policy::resolve::resolve_with_activation_cache_consent(
             snapshot.policy(),
             snapshot.inventory(),
             &learning,
@@ -921,6 +997,13 @@ impl Server {
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
+        })?;
+        Ok(ResolvedPolicySnapshot {
+            plan,
+            snapshot: snapshot.clone(),
+            learning,
+            availability,
+            circuits,
         })
     }
 
@@ -2508,6 +2591,130 @@ api_key = "sk-proj-test"
             forced_from: lane.forced_from.clone(),
             forced_to: lane.forced_to.clone(),
         }
+    }
+
+    #[test]
+    fn policy_continuation_uses_the_captured_revision_and_evidence() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let runtime = server.policy_runtime.as_ref().expect("active runtime");
+        let snapshot = runtime.capture().expect("active snapshot");
+        let route_id =
+            crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
+        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+            .expect("legacy document");
+        for default in &mut document.defaults {
+            if matches!(
+                &default.scope,
+                crate::policy::FrontendScope::Profile {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                    ..
+                } | crate::policy::FrontendScope::Protocol {
+                    protocol: crate::policy::FrontendProtocol::OpenaiChat,
+                }
+            ) {
+                default.target.route_id = route_id.clone();
+            }
+        }
+        let route = document
+            .routes
+            .iter_mut()
+            .find(|route| route.id == route_id)
+            .expect("OpenAI route");
+        route.chain.first.model = crate::policy::CandidateModel::Exact {
+            model_id: "first-model".to_owned(),
+        };
+        route
+            .chain
+            .first
+            .health_circuits
+            .push(crate::policy::HealthCircuit {
+                failure: crate::policy::FailureClass::Overload,
+                duration_seconds: 10,
+            });
+        let mut backup = route.chain.first.clone();
+        backup.id = crate::policy::CandidateId::new("backup").unwrap();
+        backup.model = crate::policy::CandidateModel::Exact {
+            model_id: "backup-model".to_owned(),
+        };
+        route.chain.steps.push(crate::policy::RouteStep {
+            edge: crate::policy::CandidateEdge {
+                preflight: crate::policy::FallbackPermission::Enabled,
+                post_send: vec![crate::policy::FailureClass::Overload],
+                billed_boundary: crate::policy::BoundaryConsent::Deny,
+                ambiguous_transport: crate::policy::BoundaryConsent::Deny,
+                cache_transition: crate::policy::CacheTransitionPolicy::AllowCacheLoss,
+            },
+            candidate: backup,
+        });
+        let document = document.validate().expect("policy validates");
+        let revision = server
+            .store
+            .insert_policy_revision(&crate::store::NewPolicyRevision {
+                created_ms: 3,
+                activated_ms: 4,
+                description: Some("fallback continuation test"),
+                activation_scope: crate::policy::ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: crate::store::PolicyRevisionSource::Legacy,
+                parent_revision_id: snapshot.revision_id(),
+                document: &document,
+            })
+            .expect("insert revision");
+        let inventory = snapshot.inventory().clone();
+        let policy = crate::policy::compile(
+            document,
+            &server.registry,
+            &inventory,
+            crate::policy::PolicyOrigin::GeneratedRevisionOne,
+        )
+        .into_policy()
+        .expect("policy compiles");
+        runtime.replace_active(
+            &revision,
+            Arc::new(policy),
+            inventory,
+            snapshot.availability().clone(),
+            &std::collections::BTreeSet::new(),
+        );
+        let facts = server.shadow_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("asked".to_owned()),
+            None,
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let first = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                None,
+                None,
+            )
+            .expect("initial resolution")
+            .expect("active policy");
+        assert_eq!(first.plan.effective_model, "first-model");
+
+        activate_chat_revision(
+            &server,
+            crate::policy::ActivationScope::NewLanes,
+            false,
+            "new-active-model",
+        );
+        let next = server
+            .continue_policy_attempt(&first, crate::policy::FailureClass::Overload)
+            .expect("continuation resolves")
+            .expect("fallback is allowed");
+
+        assert_eq!(next.plan.policy_revision, Some(revision.revision_id));
+        assert_eq!(next.plan.candidate_id.as_ref().unwrap().as_str(), "backup");
+        assert_eq!(next.plan.effective_model, "backup-model");
     }
 
     #[test]
