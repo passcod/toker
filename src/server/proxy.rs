@@ -1117,6 +1117,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
         model_mappings: None,
         frontend: ctx.frontend,
         translation_report: None,
+        policy_attempt: ctx.policy_attempt,
     }
 }
 

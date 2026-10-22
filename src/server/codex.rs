@@ -337,6 +337,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     let pin_transition = policy_attempt
         .as_ref()
         .map(|resolved| resolved.pin_transition.clone());
+    let policy_record = policy_attempt.clone().map(std::sync::Arc::new);
     let attempt = canonical.map(|result| {
         result.map(|canonical| {
             let inference =
@@ -373,6 +374,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         model_mappings: None,
         frontend,
         translation_report: None,
+        policy_attempt: policy_record,
     });
 
     let Some(attempt) = attempt else {

@@ -126,6 +126,8 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) frontend: Option<String>,
     /// Content-free semantic omissions made by canonical rendering.
     pub(crate) translation_report: Option<TranslationReport>,
+    /// Clears matching health circuits only after canonical success completes.
+    pub(crate) policy_attempt: Option<Arc<super::PolicyAttempt>>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -179,6 +181,11 @@ pub(crate) fn record_anthropic_measurement(
             .note_binding_observed(&ctx.binding_id, reported_model, ts_ms, None);
     }
     persist_successful_pin(ctx, ts_ms);
+    if status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
+    }
 
     let model = reported_model
         .or_else(|| capture.and_then(AnthropicCapture::model))
@@ -1422,6 +1429,11 @@ pub(crate) fn record_responses_measurement(
         tracing::error!(%error, "lane update failed");
     }
     persist_successful_pin(ctx, ts_ms);
+    if _status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
+    }
     ctx.server.evaluate_awake();
 
     let model = capture.model().unwrap_or("?");

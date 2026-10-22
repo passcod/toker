@@ -865,6 +865,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             forced_to: None,
             model_mappings: None,
             translation_report: None,
+            policy_attempt: policy_attempt.clone().map(Arc::new),
         });
         gate_shape = shape;
     }
