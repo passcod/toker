@@ -16,10 +16,11 @@ use crate::routing::Capabilities;
 use super::{
     ArgumentBinding, BindingId, BoundaryConsent, CacheTransitionPolicy, CandidateEdge, CandidateId,
     CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledCompaction, CompiledPolicy,
-    CompiledRoute, CompiledRouteReference, CostClass, FallbackPermission, FrontendProtocol,
-    FrontendScope, InventorySource, LaneTransitionPolicy, LearningView, MatcherCaptures,
-    MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId, PresentationRoute,
-    ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId, StableId,
+    CompiledRoute, CompiledRouteReference, CostClass, FailureClass, FallbackPermission,
+    FrontendProtocol, FrontendScope, InventorySource, LaneTransitionPolicy, LearningView,
+    MatcherCaptures, MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId,
+    PresentationRoute, ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId,
+    StableId,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -260,6 +261,8 @@ pub struct AttemptPlan {
     pub cache_transition: Option<CacheTransitionPolicy>,
     pub fallback_cache_transition: Option<CacheTransitionPolicy>,
     pub trace: Vec<TraceEvent>,
+    route_start_index: usize,
+    candidate_index: usize,
 }
 
 impl AttemptPlan {
@@ -377,14 +380,23 @@ pub fn resolve_first_candidate<L: LearningView>(
         ResolveOptions {
             activation_allows_cache_loss: false,
             traverse_candidates: false,
+            post_send: None,
         },
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+struct PostSendContinuation {
+    route_start_index: usize,
+    failed_candidate_index: usize,
+    trace: Vec<TraceEvent>,
+}
+
+#[derive(Debug, Clone)]
 struct ResolveOptions {
     activation_allows_cache_loss: bool,
     traverse_candidates: bool,
+    post_send: Option<PostSendContinuation>,
 }
 
 impl Default for ResolveOptions {
@@ -392,6 +404,7 @@ impl Default for ResolveOptions {
         Self {
             activation_allows_cache_loss: false,
             traverse_candidates: true,
+            post_send: None,
         }
     }
 }
@@ -418,8 +431,59 @@ pub(crate) fn resolve_with_activation_cache_consent<L: LearningView>(
         ResolveOptions {
             activation_allows_cache_loss,
             traverse_candidates: true,
+            post_send: None,
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_after_failure<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    lane: Option<&LaneFacts>,
+    availability: &AvailabilitySnapshot,
+    circuits: &CircuitSnapshot,
+    facts: &RequestFacts,
+    failed: &AttemptPlan,
+    failure: FailureClass,
+) -> Result<Option<AttemptPlan>, ResolveFailure> {
+    if failed.policy_fingerprint != *policy.fingerprint() {
+        return Err(ResolveFailure::MissingRoute);
+    }
+    let Some(route_id) = failed.route_id.as_ref() else {
+        return Ok(None);
+    };
+    let Some(route) = policy.route(route_id) else {
+        return Err(ResolveFailure::MissingRoute);
+    };
+    if failed.candidate_index >= route.edges().len()
+        || !route.edges()[failed.candidate_index]
+            .post_send
+            .contains(&failure)
+    {
+        return Ok(None);
+    }
+    let mut resolved = resolve_with_options(
+        policy,
+        inventory,
+        learning,
+        lane,
+        availability,
+        circuits,
+        facts,
+        ResolveOptions {
+            activation_allows_cache_loss: false,
+            traverse_candidates: true,
+            post_send: Some(PostSendContinuation {
+                route_start_index: failed.route_start_index,
+                failed_candidate_index: failed.candidate_index,
+                trace: failed.trace.clone(),
+            }),
+        },
+    )?;
+    resolved.policy_revision = failed.policy_revision;
+    Ok(Some(resolved))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -445,8 +509,14 @@ fn resolve_with_options<L: LearningView>(
         selected.cache_transition = Some(cache_transition);
     }
 
-    let mut trace = vec![TraceEvent::Lookup(selected.provenance.clone())];
+    let mut trace = options.post_send.as_ref().map_or_else(
+        || vec![TraceEvent::Lookup(selected.provenance.clone())],
+        |next| next.trace.clone(),
+    );
     if let Some((binding_id, model, route_id, fingerprint, candidate_id)) = selected.exact {
+        if options.post_send.is_some() {
+            return Err(ResolveFailure::MissingRoute);
+        }
         let live = availability.get(binding_id);
         let mut evidence = exact_evidence(candidate_id, binding_id, model, live, inventory, facts);
         if target_has_open_circuit(circuits, route_id, candidate_id, binding_id, model) {
@@ -482,15 +552,24 @@ fn resolve_with_options<L: LearningView>(
             cache_transition: selected.cache_transition,
             fallback_cache_transition: None,
             trace,
+            route_start_index: 0,
+            candidate_index: 0,
         });
     }
 
     let route = selected.route.ok_or(ResolveFailure::MissingRoute)?;
+    if options.post_send.as_ref().is_some_and(|next| {
+        next.route_start_index >= route.candidates().len()
+            || next.failed_candidate_index < next.route_start_index
+            || next.failed_candidate_index >= route.candidates().len()
+    }) {
+        return Err(ResolveFailure::MissingRoute);
+    }
     let pinned = lane
         .and_then(|lane| lane.pinned.as_ref())
         .filter(|pin| pin.policy_fingerprint.as_ref() == Some(policy.fingerprint()))
         .filter(|pin| pin.route_fingerprint == *route.fingerprint());
-    let start = pinned
+    let pinned_start = pinned
         .and_then(|pin| {
             route
                 .candidates()
@@ -498,18 +577,31 @@ fn resolve_with_options<L: LearningView>(
                 .position(|candidate| candidate.id() == &pin.candidate_id)
         })
         .unwrap_or(0);
-    let mut prior_live: Option<&BindingAvailability> = None;
+    let route_start = options
+        .post_send
+        .as_ref()
+        .map_or(pinned_start, |next| next.route_start_index);
+    let start = options
+        .post_send
+        .as_ref()
+        .map_or(route_start, |next| next.failed_candidate_index + 1);
+    let mut prior_live = (start > route_start)
+        .then(|| route.candidates()[start - 1].binding_id())
+        .and_then(|binding| availability.get(binding));
     let end = if options.traverse_candidates {
         route.candidates().len()
     } else {
         (start + 1).min(route.candidates().len())
     };
     for (index, candidate) in route.candidates().iter().enumerate().take(end).skip(start) {
-        if index > start {
+        if index > route_start {
             let edge = &route.edges()[index - 1];
-            if let Some(reason) =
+            let edge_failure = if index == start && options.post_send.is_some() {
+                post_send_edge_denial(edge, prior_live, availability.get(candidate.binding_id()))
+            } else {
                 edge_denial(edge, prior_live, availability.get(candidate.binding_id()))
-            {
+            };
+            if let Some(reason) = edge_failure {
                 trace.push(TraceEvent::Candidate(CandidateEvidence {
                     candidate_id: candidate.id().clone(),
                     crossed_from: None,
@@ -533,7 +625,7 @@ fn resolve_with_options<L: LearningView>(
         prior_live = live;
         let mut evidence =
             candidate_evidence(candidate, baseline.as_deref(), live, inventory, facts);
-        if index > start {
+        if index > route_start {
             evidence.crossed_from = Some(route.candidates()[index - 1].id().clone());
         }
         let candidate_trace_index = trace.len();
@@ -595,10 +687,10 @@ fn resolve_with_options<L: LearningView>(
             .or_else(|| retargeted.clone())
             .or_else(|| upgraded.clone())
             .unwrap_or_else(|| baseline.clone());
-        if index > start
+        if index > route_start
             && !activation_allows_cache_loss
             && let Some(reason) = cache_edge_denial(
-                &route.edges()[start..index],
+                &route.edges()[route_start..index],
                 candidate.binding_id(),
                 &effective,
                 lane,
@@ -664,14 +756,16 @@ fn resolve_with_options<L: LearningView>(
                         .is_some_and(|(_, bindings)| bindings.contains(candidate.binding_id()))),
             lane_transition: lane_policy,
             cache_transition: selected.cache_transition,
-            fallback_cache_transition: (index > start).then(|| {
-                route.edges()[start..index]
+            fallback_cache_transition: (index > route_start).then(|| {
+                route.edges()[route_start..index]
                     .iter()
                     .fold(CacheTransitionPolicy::AllowCacheLoss, |policy, edge| {
                         stricter_cache_transition(policy, edge.cache_transition)
                     })
             }),
             trace,
+            route_start_index: route_start,
+            candidate_index: index,
         });
     }
     Err(route_unavailable(route, &selected.provenance, trace))
@@ -1038,6 +1132,25 @@ fn edge_denial(
         return Some(SkipReason::BilledBoundaryDenied);
     }
     None
+}
+
+fn post_send_edge_denial(
+    edge: &CandidateEdge,
+    from: Option<&BindingAvailability>,
+    to: Option<&BindingAvailability>,
+) -> Option<SkipReason> {
+    if matches!(
+        (from.map(|v| v.cost_class), to.map(|v| v.cost_class)),
+        (
+            Some(CostClass::Subscription),
+            Some(CostClass::Billed | CostClass::Unknown)
+        )
+    ) && edge.billed_boundary == BoundaryConsent::Deny
+    {
+        Some(SkipReason::BilledBoundaryDenied)
+    } else {
+        None
+    }
 }
 
 fn cache_edge_denial(
@@ -2131,6 +2244,147 @@ mod tests {
                 &facts("asked"),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn post_send_failure_continues_from_the_selected_candidate() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let edge = CandidateEdge {
+            preflight: FallbackPermission::Disabled,
+            post_send: vec![FailureClass::Overload],
+            billed_boundary: BoundaryConsent::Allow,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge,
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let availability = availability(true, false);
+        let request = facts("asked");
+        let first = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability,
+            &CircuitSnapshot::default(),
+            &request,
+        )
+        .unwrap();
+
+        let second = resolve_after_failure(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability,
+            &CircuitSnapshot::default(),
+            &request,
+            &first,
+            FailureClass::Overload,
+        )
+        .unwrap()
+        .expect("the edge authorizes overload fallback");
+
+        assert_eq!(second.candidate_id, Some(id("second")));
+        assert_eq!(second.binding_id, *ANTHROPIC_API_MESSAGES.id());
+        assert_eq!(second.baseline_model, "two");
+        assert_eq!(
+            second.fallback_cache_transition,
+            Some(CacheTransitionPolicy::AllowCacheLoss)
+        );
+        assert!(matches!(
+            second.trace.last(),
+            Some(TraceEvent::Candidate(CandidateEvidence {
+                candidate_id,
+                crossed_from: Some(crossed_from),
+                result: Ok(()),
+                ..
+            })) if candidate_id.as_str() == "second" && crossed_from.as_str() == "first"
+        ));
+    }
+
+    #[test]
+    fn post_send_failure_stops_when_the_outgoing_edge_does_not_list_it() {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "one".to_owned(),
+            },
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::Exact {
+                model_id: "two".to_owned(),
+            },
+        );
+        let edge = CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![FailureClass::RateLimit],
+            billed_boundary: BoundaryConsent::Allow,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        };
+        let policy = compile(
+            document(route(
+                first,
+                vec![RouteStep {
+                    edge,
+                    candidate: second,
+                }],
+            )),
+            &OfferInventory::default(),
+        );
+        let availability = availability(true, false);
+        let request = facts("asked");
+        let first = resolve_with_circuits(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability,
+            &CircuitSnapshot::default(),
+            &request,
+        )
+        .unwrap();
+
+        assert!(
+            resolve_after_failure(
+                &policy,
+                &OfferInventory::default(),
+                &NoLearning,
+                None,
+                &availability,
+                &CircuitSnapshot::default(),
+                &request,
+                &first,
+                FailureClass::Overload,
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
