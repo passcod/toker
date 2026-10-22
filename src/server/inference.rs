@@ -1182,6 +1182,8 @@ pub(crate) async fn coordinate_responses(
     server: Server,
     adapter: Option<BackendAdapterId>,
     attempt: Result<InferenceAttempt, TranslateError>,
+    _policy_attempt: Option<super::PolicyAttempt>,
+    _inference: InferenceRequest,
     input: ResponsesAttemptInput,
 ) -> Response {
     let ResponsesAttemptInput {

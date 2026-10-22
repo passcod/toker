@@ -338,14 +338,17 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .as_ref()
         .map(|resolved| resolved.pin_transition.clone());
     let policy_record = policy_attempt.clone().map(std::sync::Arc::new);
+    let mut inference = None;
     let attempt = canonical.map(|result| {
         result.map(|canonical| {
-            let inference =
+            let request =
                 super::inference::InferenceRequest::new(requested_model.clone(), canonical);
-            match policy_attempt {
-                Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan),
-                None => inference.prepare(target.clone(), effective_model.clone()),
-            }
+            let attempt = match policy_attempt.as_ref() {
+                Some(resolved) => request.prepare_policy(target.clone(), resolved.plan.clone()),
+                None => request.prepare(target.clone(), effective_model.clone()),
+            };
+            inference = Some(request);
+            attempt
         })
     });
 
@@ -388,6 +391,8 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         server,
         adapter,
         attempt,
+        policy_attempt,
+        inference.expect("a canonical Responses attempt retains its baseline"),
         super::inference::ResponsesAttemptInput {
             parts,
             max_output_tokens: parsed
