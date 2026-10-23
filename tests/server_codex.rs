@@ -33,7 +33,14 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
 use toker::middleware::model_map;
-use toker::policy::{CollectingObserver, ShadowComparison, ShadowRecord};
+use toker::policy::{
+    ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
+    CandidateEdge, CandidateId, CandidateModel, CollectingObserver, DefaultRoute, FailureClass,
+    FallbackPermission, FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
+    REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
+    ShadowComparison, ShadowRecord,
+};
+use toker::routing::{ANTHROPIC_API_MESSAGES, OPENROUTER_RESPONSES};
 use toker::server::Server;
 use toker::store::{RequestRow, RowKind, Store};
 
@@ -645,10 +652,87 @@ fn openrouter_responses_config(tag: &str, upstream: reqwest::Url) -> TestConfig 
     fixture
 }
 
-async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
-    let TestConfig { config, dir } = fixture;
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+fn id<T: std::str::FromStr>(value: &str) -> T
+where
+    T::Err: std::fmt::Debug,
+{
+    value.parse().unwrap()
+}
+
+fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    let route_id: RouteId = id("responses-fallback");
+    PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("Responses fallback fixture".to_owned()),
+        defaults: vec![DefaultRoute {
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiResponses,
+            },
+            target: RouteReference {
+                route_id: route_id.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    id(REQUESTED_MODEL_PARAMETER),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        }],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id,
+            display_name: "Responses fallback".to_owned(),
+            description: None,
+            parameters: vec![id(REQUESTED_MODEL_PARAMETER)],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("primary").unwrap(),
+                    binding_id: OPENROUTER_RESPONSES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "failed".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![FailureClass::ServerError],
+                        billed_boundary: BoundaryConsent::Deny,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: Candidate {
+                        id: CandidateId::new("backup").unwrap(),
+                        binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                        model: CandidateModel::Exact {
+                            model_id: "backup".to_owned(),
+                        },
+                        upgrade_policy_id: None,
+                        alias_policy: None,
+                        required_capabilities: Default::default(),
+                        enabled: true,
+                        health_circuits: vec![],
+                    },
+                }],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap()
+}
+
+async fn serve_toker(
+    server: Server,
+    store: Arc<Store>,
+    dir: common::TestDir,
+) -> (SocketAddr, Arc<Store>) {
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -659,6 +743,26 @@ async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
         axum::serve(listener, app).await.expect("toker serves");
     });
     (addr, store)
+}
+
+async fn spawn_toker_with_policy(
+    fixture: TestConfig,
+    policy: toker::policy::ValidatedPolicyDocument,
+) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    store
+        .activate_revision_one(&policy, 1, 0, &[])
+        .expect("activate policy fixture");
+    let server = Server::new_authoritative(config, store.clone()).expect("build server");
+    serve_toker(server, store, dir).await
+}
+
+async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::new(config, store.clone()).expect("build server");
+    serve_toker(server, store, dir).await
 }
 
 async fn spawn_toker_cataloged(
@@ -1405,6 +1509,92 @@ async fn explicit_anthropic_chat_route_needs_no_chat_default() {
         .expect("chat answers");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn active_responses_policy_falls_back_from_openrouter_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-fallback", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) = spawn_toker_with_policy(fixture, responses_fallback_policy()).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-fallback")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    let primary: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let backup: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(primary["model"], "failed");
+    assert_eq!(backup["model"], "backup");
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(store.count_logical_requests().unwrap(), 1);
+    let first = rows[0].attempt.as_ref().unwrap();
+    let second = rows[1].attempt.as_ref().unwrap();
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(first.reason, toker::store::AttemptReason::Initial);
+    assert_eq!(second.attempt_index.get(), 1);
+    assert_eq!(second.reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].kind, None);
+    assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_responses")
+    );
+    assert_eq!(
+        rows[1].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
+    let candidate = |row: &RequestRow| {
+        row.policy_routing
+            .as_ref()
+            .and_then(|routing| match &routing.outcome {
+                toker::store::PolicyRoutingOutcome::Attempt { candidate_id, .. } => {
+                    Some(candidate_id.as_str().to_owned())
+                }
+                toker::store::PolicyRoutingOutcome::RouteUnavailable { .. } => None,
+            })
+    };
+    assert_eq!(candidate(&rows[0]).as_deref(), Some("primary"));
+    assert_eq!(candidate(&rows[1]).as_deref(), Some("backup"));
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("responses-fallback"))
+        .expect("fallback success pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
+        Some("backup")
+    );
+    assert_eq!(lane.pin.as_ref().map(|pin| pin.policy_revision_id), Some(1));
 }
 
 #[tokio::test]
