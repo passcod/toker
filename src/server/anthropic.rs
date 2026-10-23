@@ -76,9 +76,7 @@ use crate::middleware::quota::{Blocking, Meters, Rendering, grant_for};
 use crate::observe::{AnthropicObserver, SseSplitter};
 use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, ModelTarget, ProtocolId};
-use crate::store::{
-    AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, MetersSnapshot,
-};
+use crate::store::MetersSnapshot;
 use crate::translate;
 
 use super::InFlightGuard;
@@ -2024,16 +2022,10 @@ pub(crate) async fn retry_thinking_off(
             retry_after_ms(&headers),
             rate_limits.as_ref(),
         );
-        let group = ctx
+        ctx.attempt = ctx
             .attempt
             .as_ref()
-            .map(|attempt| attempt.attempt_group_id.clone())
-            .unwrap_or_else(AttemptGroupId::fresh);
-        ctx.attempt = Some(AttemptProvenance {
-            attempt_group_id: group,
-            attempt_index: AttemptIndex::try_from(1).expect("one retry index is valid"),
-            reason: AttemptReason::ThinkingNegotiation,
-        });
+            .and_then(super::attempt::thinking_provenance);
         cancellation.update_anthropic(Some(ctx));
         server.note_binding_sent(&ctx.binding_id, ctx.effective_model.as_deref());
     }

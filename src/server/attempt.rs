@@ -77,6 +77,14 @@ pub(crate) fn initial_provenance() -> AttemptProvenance {
     }
 }
 
+pub(crate) fn thinking_provenance(current: &AttemptProvenance) -> Option<AttemptProvenance> {
+    Some(AttemptProvenance {
+        attempt_group_id: current.attempt_group_id.clone(),
+        attempt_index: current.attempt_index.next()?,
+        reason: AttemptReason::ThinkingNegotiation,
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn next_provenance(
     current: &AttemptProvenance,
@@ -533,6 +541,17 @@ mod tests {
         assert_eq!(fallback.attempt_group_id, initial.attempt_group_id);
         assert_eq!(fallback.attempt_index.get(), 1);
         assert_eq!(fallback.reason, AttemptReason::Overload);
+    }
+
+    #[test]
+    fn thinking_provenance_advances_from_the_current_attempt() {
+        let initial = initial_provenance();
+        let fallback = next_provenance(&initial, FailureClass::Overload).unwrap();
+        let thinking = thinking_provenance(&fallback).unwrap();
+
+        assert_eq!(thinking.attempt_group_id, initial.attempt_group_id);
+        assert_eq!(thinking.attempt_index.get(), 2);
+        assert_eq!(thinking.reason, AttemptReason::ThinkingNegotiation);
     }
 
     #[test]
