@@ -35,6 +35,7 @@ pub(crate) enum FailureResponse {
     Local(Response),
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReadyOutcome {
     Accepted {
         upstream: reqwest::Response,
@@ -47,6 +48,7 @@ pub(crate) enum ReadyOutcome {
     Failure {
         failure: super::attempt::AttemptFailure,
         response: FailureResponse,
+        parts: Parts,
         record: Option<AnthropicRecordCtx>,
         in_flight: Option<InFlightGuard>,
         response_model: String,
@@ -118,6 +120,7 @@ impl ReadyAttempt {
                         },
                         status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                     },
+                    parts: self.parts.clone(),
                     response: FailureResponse::Local(transport_failure(ErrorWire::Openai, &error)),
                     record,
                     in_flight,
@@ -145,6 +148,7 @@ impl ReadyAttempt {
             }) => ReadyOutcome::Failure {
                 failure,
                 response: FailureResponse::Upstream(response),
+                parts: self.parts.clone(),
                 record,
                 in_flight,
                 response_model: self.response_model.clone(),
@@ -156,6 +160,7 @@ impl ReadyAttempt {
                 response: None,
             }) => ReadyOutcome::Failure {
                 failure,
+                parts: self.parts.clone(),
                 response: FailureResponse::Local(upstream_failure(
                     ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
@@ -174,6 +179,7 @@ impl ReadyAttempt {
                         mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
                         status: Some(response_status.as_u16()),
                     },
+                    parts: self.parts.clone(),
                     response: FailureResponse::Local(truncated_body(ErrorWire::Openai)),
                     record,
                     in_flight,
@@ -203,6 +209,7 @@ pub(crate) async fn finish(outcome: ReadyOutcome) -> Response {
         ReadyOutcome::Failure {
             failure,
             response,
+            parts: _,
             record,
             in_flight,
             response_model,

@@ -1185,8 +1185,8 @@ pub(crate) async fn coordinate_responses(
     server: Server,
     adapter: Option<BackendAdapterId>,
     attempt: Result<InferenceAttempt, TranslateError>,
-    _policy_attempt: Option<super::PolicyAttempt>,
-    _inference: InferenceRequest,
+    policy_attempt: Option<super::PolicyAttempt>,
+    inference: InferenceRequest,
     input: ResponsesAttemptInput,
 ) -> Response {
     let ResponsesAttemptInput {
@@ -1223,7 +1223,7 @@ pub(crate) async fn coordinate_responses(
                 &server,
                 parts,
                 attempt,
-                max_output_tokens,
+                max_output_tokens.clone(),
                 record,
                 in_flight,
                 super::anthropic_target::FrontendWire::Responses,
@@ -1250,9 +1250,9 @@ pub(crate) async fn coordinate_responses(
                 attempt,
                 record,
                 in_flight,
-                session_id,
-                thread_id,
-                request_id,
+                session_id: session_id.clone(),
+                thread_id: thread_id.clone(),
+                request_id: request_id.clone(),
                 client_wants_json,
                 frontend_wire: CodexFrontendWire::OpenAiResponses,
             },
@@ -1265,10 +1265,259 @@ pub(crate) async fn coordinate_responses(
         Ok(ready) => ready,
         Err(response) => return *response,
     };
-    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready
-        .execute(server, super::attempt::initial_provenance())
+    let provenance = super::attempt::initial_provenance();
+    let ReadyBackendAttempt::OpenRouter(ready) = ready else {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        return ready.execute(server, provenance).await;
+    };
+    coordinate_openrouter_responses(
+        server,
+        ready,
+        provenance,
+        policy_attempt,
+        inference,
+        had_prompt_cache_key,
+        max_output_tokens,
+        session_id,
+        thread_id,
+        request_id,
+        client_wants_json,
+    )
+    .await
+}
+
+async fn prepare_responses_backend(
+    server: &Server,
+    adapter: Option<BackendAdapterId>,
+    attempt: Result<InferenceAttempt, TranslateError>,
+    input: ResponsesAttemptInput,
+) -> Result<ReadyBackendAttempt, Box<Response>> {
+    let ResponsesAttemptInput {
+        parts,
+        max_output_tokens,
+        had_prompt_cache_key,
+        record,
+        in_flight,
+        session_id,
+        thread_id,
+        request_id,
+        client_wants_json,
+    } = input;
+    match adapter {
+        Some(BackendAdapterId::AnthropicMessages) => {
+            let attempt =
+                attempt.map_err(|_| Box::new(invalid_responses_body(client_wants_json)))?;
+            super::anthropic_target::prepare(
+                server,
+                parts,
+                attempt,
+                max_output_tokens,
+                record,
+                in_flight,
+                super::anthropic_target::FrontendWire::Responses,
+            )
+            .map(ReadyBackendAttempt::Anthropic)
+        }
+        Some(BackendAdapterId::OpenRouterResponses) => {
+            let attempt =
+                attempt.map_err(|_| Box::new(invalid_responses_body(client_wants_json)))?;
+            super::openrouter_responses::prepare(
+                parts,
+                attempt,
+                had_prompt_cache_key,
+                record,
+                in_flight,
+            )
+            .map(ReadyBackendAttempt::OpenRouter)
+        }
+        Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
+            server,
+            super::codex::AttemptInput {
+                attempt,
+                record,
+                in_flight,
+                session_id,
+                thread_id,
+                request_id,
+                client_wants_json,
+                frontend_wire: CodexFrontendWire::OpenAiResponses,
+            },
+        )
         .await
+        .map(ReadyBackendAttempt::Codex),
+        _ => Err(Box::new(super::responses_not_configured())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn coordinate_openrouter_responses(
+    server: Server,
+    mut ready: super::openrouter_responses::ReadyAttempt,
+    mut provenance: crate::store::AttemptProvenance,
+    mut policy_attempt: Option<super::PolicyAttempt>,
+    inference: InferenceRequest,
+    had_prompt_cache_key: bool,
+    max_output_tokens: Option<Value>,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+    request_id: Option<String>,
+    client_wants_json: bool,
+) -> Response {
+    loop {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        let outcome = ready.execute_precommit(&server, provenance.clone()).await;
+        let super::openrouter_responses::ReadyOutcome::Failure {
+            failure,
+            response,
+            parts,
+            mut record,
+            in_flight,
+            response_model,
+            wants_stream,
+            mut cancellation,
+        } = outcome
+        else {
+            return super::openrouter_responses::finish(outcome).await;
+        };
+        let Some(class) = failure.class else {
+            return super::openrouter_responses::finish(
+                super::openrouter_responses::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    wants_stream,
+                    cancellation,
+                },
+            )
+            .await;
+        };
+        let Some(current) = policy_attempt.as_ref() else {
+            return super::openrouter_responses::finish(
+                super::openrouter_responses::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    wants_stream,
+                    cancellation,
+                },
+            )
+            .await;
+        };
+        server.open_policy_circuit(current, class, super::record::now_ms());
+        let next = match server.continue_policy_attempt(current, class) {
+            Ok(Some(next)) => next,
+            Ok(None) | Err(_) => {
+                return super::openrouter_responses::finish(
+                    super::openrouter_responses::ReadyOutcome::Failure {
+                        failure,
+                        response,
+                        parts,
+                        record,
+                        in_flight,
+                        response_model,
+                        wants_stream,
+                        cancellation,
+                    },
+                )
+                .await;
+            }
+        };
+        let target = match server.registry.resolve_binding(
+            crate::routing::ProtocolId::OpenAiResponses,
+            &next.plan.binding_id,
+            next.plan.requested_model.as_deref(),
+            &next.plan.effective_model,
+        ) {
+            Ok(target) => target,
+            Err(_) => {
+                return super::openrouter_responses::finish(
+                    super::openrouter_responses::ReadyOutcome::Failure {
+                        failure,
+                        response,
+                        parts,
+                        record,
+                        in_flight,
+                        response_model,
+                        wants_stream,
+                        cancellation,
+                    },
+                )
+                .await;
+            }
+        };
+        let Some(next_provenance) = super::attempt::next_provenance(&provenance, class) else {
+            return super::openrouter_responses::finish(
+                super::openrouter_responses::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    wants_stream,
+                    cancellation,
+                },
+            )
+            .await;
+        };
+        super::openrouter_responses::record_failure(record.as_ref(), &failure);
+        cancellation.disarm();
+        drop(response);
+        if let Some(ctx) = record.as_mut() {
+            ctx.backend = target.provider().clone();
+            ctx.binding_id = next.plan.binding_id.clone();
+            ctx.attempt = None;
+            ctx.policy_routing = crate::store::PolicyRouteProvenance::from_attempt_plan(&next.plan)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "policy fallback provenance omitted");
+                    None
+                });
+            ctx.pin_transition = Some(next.pin_transition.clone());
+            ctx.effective_model = Some(next.plan.effective_model.clone());
+            ctx.policy_attempt = Some(Arc::new(next.clone()));
+        }
+        let adapter = target
+            .binding()
+            .canonical_backend()
+            .map(|backend| backend.adapter());
+        let attempt = Ok(inference.prepare_policy(target, next.plan.clone()));
+        let prepared = match prepare_responses_backend(
+            &server,
+            adapter,
+            attempt,
+            ResponsesAttemptInput {
+                parts,
+                max_output_tokens: max_output_tokens.clone(),
+                had_prompt_cache_key,
+                record,
+                in_flight,
+                session_id: session_id.clone(),
+                thread_id: thread_id.clone(),
+                request_id: request_id.clone(),
+                client_wants_json,
+            },
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return *response,
+        };
+        provenance = next_provenance;
+        policy_attempt = Some(next);
+        match prepared {
+            ReadyBackendAttempt::OpenRouter(next) => ready = next,
+            prepared => {
+                server.note_binding_sent(prepared.binding_id(), Some(prepared.effective_model()));
+                return prepared.execute(server, provenance).await;
+            }
+        }
+    }
 }
 
 pub(crate) fn invalid_responses_body(client_wants_json: bool) -> Response {
