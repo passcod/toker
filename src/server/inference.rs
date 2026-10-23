@@ -1213,54 +1213,23 @@ pub(crate) async fn coordinate_responses(
     if let Some(ctx) = record.as_mut() {
         ctx.policy_routing = policy_routing;
     }
-    let prepared = match adapter {
-        Some(BackendAdapterId::AnthropicMessages) => {
-            let attempt = match attempt {
-                Ok(attempt) => attempt,
-                Err(_) => return invalid_responses_body(client_wants_json),
-            };
-            super::anthropic_target::prepare(
-                &server,
-                parts,
-                attempt,
-                max_output_tokens.clone(),
-                record,
-                in_flight,
-                super::anthropic_target::FrontendWire::Responses,
-            )
-            .map(ReadyBackendAttempt::Anthropic)
-        }
-        Some(BackendAdapterId::OpenRouterResponses) => {
-            let attempt = match attempt {
-                Ok(attempt) => attempt,
-                Err(_) => return invalid_responses_body(client_wants_json),
-            };
-            super::openrouter_responses::prepare(
-                parts,
-                attempt,
-                had_prompt_cache_key,
-                record,
-                in_flight,
-            )
-            .map(ReadyBackendAttempt::OpenRouter)
-        }
-        Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
-            &server,
-            super::codex::AttemptInput {
-                attempt,
-                record,
-                in_flight,
-                session_id: session_id.clone(),
-                thread_id: thread_id.clone(),
-                request_id: request_id.clone(),
-                client_wants_json,
-                frontend_wire: CodexFrontendWire::OpenAiResponses,
-            },
-        )
-        .await
-        .map(ReadyBackendAttempt::Codex),
-        _ => Err(Box::new(super::responses_not_configured())),
-    };
+    let prepared = prepare_responses_backend(
+        &server,
+        adapter,
+        attempt,
+        ResponsesAttemptInput {
+            parts,
+            max_output_tokens: max_output_tokens.clone(),
+            had_prompt_cache_key,
+            record,
+            in_flight,
+            session_id: session_id.clone(),
+            thread_id: thread_id.clone(),
+            request_id: request_id.clone(),
+            client_wants_json,
+        },
+    )
+    .await;
     let ready = match prepared {
         Ok(ready) => ready,
         Err(response) => return *response,
