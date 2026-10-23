@@ -681,7 +681,10 @@ impl ReadyBackendAttempt {
                 let outcome = ready.execute_precommit(&server, provenance).await;
                 super::openrouter_responses::finish(outcome).await
             }
-            Self::Codex(ready) => ready.execute(server, provenance).await,
+            Self::Codex(ready) => {
+                let outcome = ready.execute_precommit(&server, provenance).await;
+                super::codex::finish(outcome, server).await
+            }
         }
     }
 }
@@ -820,6 +823,7 @@ pub(crate) async fn coordinate_messages(
         Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
             &server,
             super::codex::AttemptInput {
+                parts,
                 attempt,
                 record,
                 in_flight,
@@ -948,6 +952,7 @@ async fn prepare_chat_backend(
             super::codex::prepare(
                 server,
                 super::codex::AttemptInput {
+                    parts,
                     attempt: Ok(attempt),
                     record: record.map(|ctx| super::proxy::chat_cross_record(ctx, backend)),
                     in_flight,
@@ -1305,6 +1310,7 @@ async fn prepare_responses_backend(
         Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
             server,
             super::codex::AttemptInput {
+                parts,
                 attempt,
                 record,
                 in_flight,
@@ -1333,6 +1339,10 @@ enum ResponsesFailureTerminal {
         frontend: super::anthropic_target::FrontendWire,
         stream: bool,
     },
+    Codex {
+        ready: Box<super::codex::ReadyAttempt>,
+        response: super::codex::FailureResponse,
+    },
 }
 
 struct PolicyResponsesFailure {
@@ -1353,10 +1363,17 @@ impl PolicyResponsesFailure {
             ResponsesFailureTerminal::Anthropic { .. } => {
                 super::anthropic_target::record_failure(self.record.as_ref(), &self.failure);
             }
+            ResponsesFailureTerminal::Codex { ready, .. } => {
+                super::codex::record_failure(
+                    self.record.as_ref(),
+                    ready.frontend_wire(),
+                    &self.failure,
+                );
+            }
         }
     }
 
-    async fn finish(self) -> Response {
+    async fn finish(self, server: &Server) -> Response {
         let Self {
             failure,
             parts,
@@ -1402,6 +1419,22 @@ impl PolicyResponsesFailure {
                     stream,
                     cancellation,
                 })
+                .await
+            }
+            ResponsesFailureTerminal::Codex {
+                mut ready,
+                response,
+            } => {
+                ready.restore_terminal_state(record, in_flight);
+                super::codex::finish(
+                    super::codex::ReadyOutcome::Failure {
+                        ready: *ready,
+                        failure,
+                        response,
+                        cancellation,
+                    },
+                    server.clone(),
+                )
                 .await
             }
         }
@@ -1472,6 +1505,34 @@ async fn execute_policy_responses_precommit(
                 })),
             }
         }
+        ReadyBackendAttempt::Codex(ready) => {
+            match ready.execute_precommit(server, provenance).await {
+                outcome @ super::codex::ReadyOutcome::Accepted { .. } => {
+                    Ok(super::codex::finish(outcome, server.clone()).await)
+                }
+                super::codex::ReadyOutcome::Failure {
+                    mut ready,
+                    failure,
+                    response,
+                    cancellation,
+                } => {
+                    let frontend = ready.frontend_wire();
+                    let (parts, record, in_flight) = ready.take_retry_state();
+                    debug_assert_eq!(frontend, CodexFrontendWire::OpenAiResponses);
+                    Err(Box::new(PolicyResponsesFailure {
+                        failure,
+                        parts,
+                        record,
+                        in_flight,
+                        cancellation,
+                        terminal: ResponsesFailureTerminal::Codex {
+                            ready: Box::new(ready),
+                            response,
+                        },
+                    }))
+                }
+            }
+        }
         ready => Ok(ready.execute(server.clone(), provenance).await),
     }
 }
@@ -1498,15 +1559,15 @@ async fn coordinate_policy_responses(
                 Err(failed) => failed,
             };
         let Some(class) = failed.failure.class else {
-            return failed.finish().await;
+            return failed.finish(&server).await;
         };
         server.open_policy_circuit(&policy_attempt, class, super::record::now_ms());
         let next = match server.continue_policy_attempt(&policy_attempt, class) {
             Ok(Some(next)) => next,
-            Ok(None) => return failed.finish().await,
+            Ok(None) => return failed.finish(&server).await,
             Err(error) => {
                 tracing::error!(%error, "policy fallback continuation failed");
-                return failed.finish().await;
+                return failed.finish(&server).await;
             }
         };
         let target = match server.registry.resolve_binding(
@@ -1518,11 +1579,11 @@ async fn coordinate_policy_responses(
             Ok(target) => target,
             Err(error) => {
                 tracing::error!(?error, binding_id = %next.plan.binding_id, "policy fallback selected an unavailable Responses binding");
-                return failed.finish().await;
+                return failed.finish(&server).await;
             }
         };
         let Some(next_provenance) = super::attempt::next_provenance(&provenance, class) else {
-            return failed.finish().await;
+            return failed.finish(&server).await;
         };
         failed.record();
         failed.cancellation.disarm();

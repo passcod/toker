@@ -412,12 +412,34 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
     .await
 }
 
+pub(crate) enum FailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadyOutcome {
+    Accepted {
+        ready: ReadyAttempt,
+        upstream: reqwest::Response,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        ready: ReadyAttempt,
+        failure: super::attempt::AttemptFailure,
+        response: FailureResponse,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
 pub(crate) struct ReadyAttempt {
+    parts: axum::http::request::Parts,
     backend: std::sync::Arc<dyn Provider>,
     binding_id: BindingId,
     effective_model: String,
     response_model: String,
     response_projection: ResponseProjection,
+    meter_snapshot: Option<Value>,
     headers: HeaderMap,
     body: Vec<u8>,
     record: Option<AnthropicRecordCtx>,
@@ -435,15 +457,15 @@ impl ReadyAttempt {
         &self.effective_model
     }
 
-    pub(crate) async fn execute(
+    pub(crate) async fn execute_precommit(
         mut self,
-        server: Server,
+        server: &Server,
         provenance: crate::store::AttemptProvenance,
-    ) -> Response {
+    ) -> ReadyOutcome {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance);
         }
-        let mut cancellation = super::cancel::PrecommitCancellationGuard::responses(
+        let cancellation = super::cancel::PrecommitCancellationGuard::responses(
             self.record.as_ref(),
             self.frontend_wire.protocol(),
         );
@@ -458,68 +480,177 @@ impl ReadyAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "codex upstream request failed");
-                if let Some(ctx) = self.record.as_ref() {
-                    record_codex_error(
-                        ctx,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                        super::attempt::transport_failure_type(&error),
-                        "upstream transport failed before response headers",
-                        None,
-                        self.frontend_wire.protocol(),
-                    );
-                }
-                return transport_failure(self.frontend_wire.error_wire(), &error);
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: FailureResponse::Local(transport_failure(
+                        self.frontend_wire.error_wire(),
+                        &error,
+                    )),
+                    ready: self,
+                    cancellation,
+                };
             }
         };
+        note_meters(server, self.backend.as_ref(), upstream.headers());
+        self.meter_snapshot = self.backend.meters(upstream.headers());
         let response_status = upstream.status();
-        let upstream = match super::attempt::precommit_responses(upstream).await {
-            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
-            | Ok(super::attempt::PrecommitOutcome::Failure {
-                response: Some(response),
-                ..
-            }) => response,
-            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
-                cancellation.disarm();
-                if let Some(ctx) = self.record.as_ref() {
-                    record_codex_error(
-                        ctx,
-                        response_status.as_u16(),
-                        "response_protocol",
-                        "upstream response could not be interpreted before commitment",
-                        None,
-                        self.frontend_wire.protocol(),
-                    );
+        match super::attempt::precommit_responses(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyOutcome::Accepted {
+                    ready: self,
+                    upstream: response,
+                    cancellation,
                 }
-                return upstream_failure(
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyOutcome::Failure {
+                ready: self,
+                failure,
+                response: FailureResponse::Upstream(response),
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyOutcome::Failure {
+                response: FailureResponse::Local(upstream_failure(
                     self.frontend_wire.error_wire(),
                     "toker could not interpret the upstream response before commitment",
-                );
-            }
+                )),
+                ready: self,
+                failure,
+                cancellation,
+            },
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
-                if let Some(ctx) = self.record.as_ref() {
-                    record_codex_error(
-                        ctx,
-                        response_status.as_u16(),
-                        "ambiguous_transport",
-                        "upstream response body failed before commitment",
-                        None,
-                        self.frontend_wire.protocol(),
-                    );
+                ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: FailureResponse::Local(truncated_body(
+                        self.frontend_wire.error_wire(),
+                    )),
+                    ready: self,
+                    cancellation,
                 }
-                return truncated_body(self.frontend_wire.error_wire());
             }
-        };
-        let response = forward(self, server, upstream).await;
-        cancellation.disarm();
-        response
+        }
+    }
+
+    pub(crate) fn frontend_wire(&self) -> CodexFrontendWire {
+        self.frontend_wire
+    }
+
+    pub(crate) fn take_retry_state(
+        &mut self,
+    ) -> (
+        axum::http::request::Parts,
+        Option<AnthropicRecordCtx>,
+        Option<InFlightGuard>,
+    ) {
+        (
+            self.parts.clone(),
+            self.record.take(),
+            self.in_flight.take(),
+        )
+    }
+
+    pub(crate) fn restore_terminal_state(
+        &mut self,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+    ) {
+        self.record = record;
+        self.in_flight = in_flight;
     }
 }
 
+pub(crate) async fn finish(outcome: ReadyOutcome, server: Server) -> Response {
+    match outcome {
+        ReadyOutcome::Accepted {
+            ready,
+            upstream,
+            mut cancellation,
+        } => {
+            let response = forward(ready, server, upstream).await;
+            cancellation.disarm();
+            response
+        }
+        ReadyOutcome::Failure {
+            ready,
+            failure,
+            response,
+            mut cancellation,
+        } => {
+            let response = match response {
+                FailureResponse::Upstream(upstream) => forward(ready, server, upstream).await,
+                FailureResponse::Local(response) => {
+                    record_failure(ready.record.as_ref(), ready.frontend_wire, &failure);
+                    response
+                }
+            };
+            cancellation.disarm();
+            response
+        }
+    }
+}
+
+pub(crate) fn record_failure(
+    record: Option<&AnthropicRecordCtx>,
+    frontend_wire: CodexFrontendWire,
+    failure: &super::attempt::AttemptFailure,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    record_codex_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        error_type,
+        "upstream Responses attempt failed before commitment",
+        None,
+        frontend_wire.protocol(),
+    );
+}
+
 pub(crate) struct AttemptInput {
+    pub(crate) parts: axum::http::request::Parts,
     pub(crate) attempt: Result<super::inference::InferenceAttempt, TranslateError>,
     pub(crate) record: Option<AnthropicRecordCtx>,
     pub(crate) in_flight: Option<InFlightGuard>,
@@ -535,6 +666,7 @@ pub(crate) async fn prepare(
     input: AttemptInput,
 ) -> Result<ReadyAttempt, Box<Response>> {
     let AttemptInput {
+        parts,
         attempt,
         mut record,
         in_flight,
@@ -609,11 +741,13 @@ pub(crate) async fn prepare(
     let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
 
     Ok(ReadyAttempt {
+        parts,
         backend,
         binding_id,
         effective_model,
         response_model,
         response_projection,
+        meter_snapshot: None,
         headers,
         body,
         record,
@@ -623,11 +757,25 @@ pub(crate) async fn prepare(
     })
 }
 
-async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Response) -> Response {
+fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
+    let Some(snapshot) = backend.meters(headers) else {
+        return;
+    };
+    server.note_quota(backend.id(), &snapshot);
+    let row = crate::store::MetersSnapshot {
+        updated_ms: now_ms(),
+        snapshot,
+    };
+    if let Err(error) = server.store.save_meters(backend.id(), &row) {
+        tracing::error!(%error, "codex meter snapshot save failed");
+    }
+}
+
+async fn forward(ready: ReadyAttempt, _server: Server, upstream: reqwest::Response) -> Response {
     let ReadyAttempt {
-        backend,
         response_model,
         response_projection,
+        meter_snapshot,
         record,
         in_flight,
         client_wants_json,
@@ -636,17 +784,6 @@ async fn forward(ready: ReadyAttempt, server: Server, upstream: reqwest::Respons
     } = ready;
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let meter_snapshot = backend.meters(&headers);
-    if let Some(snapshot) = &meter_snapshot {
-        server.note_quota(backend.id(), snapshot);
-        let row = crate::store::MetersSnapshot {
-            updated_ms: now_ms(),
-            snapshot: snapshot.clone(),
-        };
-        if let Err(error) = server.store.save_meters(backend.id(), &row) {
-            tracing::error!(%error, "codex meter snapshot save failed");
-        }
-    }
 
     if is_compressed(&headers) {
         if let Some(ctx) = record.as_ref() {

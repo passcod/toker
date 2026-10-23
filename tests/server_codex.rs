@@ -40,7 +40,7 @@ use toker::policy::{
     REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
     ShadowComparison, ShadowRecord,
 };
-use toker::routing::{ANTHROPIC_API_MESSAGES, OPENROUTER_RESPONSES};
+use toker::routing::{ANTHROPIC_API_MESSAGES, CODEX_SUB_RESPONSES, OPENROUTER_RESPONSES};
 use toker::server::Server;
 use toker::store::{RequestRow, RowKind, Store};
 
@@ -255,6 +255,16 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
             StatusCode::OK,
             "text/event-stream",
             fixture("03_failed.sse"),
+        ),
+        "failed-precommit" => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                br#"event: response.failed
+data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"failed before acceptance"}}}
+
+"#,
+            ),
         ),
         other => {
             return raw_response(
@@ -667,10 +677,13 @@ where
 }
 
 fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
-    responses_fallback_chain(false)
+    responses_fallback_chain(false, false)
 }
 
-fn responses_fallback_chain(multi_hop: bool) -> toker::policy::ValidatedPolicyDocument {
+fn responses_fallback_chain(
+    multi_hop: bool,
+    codex_middle: bool,
+) -> toker::policy::ValidatedPolicyDocument {
     let route_id: RouteId = id("responses-fallback");
     PolicyDocument {
         format_version: CURRENT_FORMAT_VERSION,
@@ -710,7 +723,11 @@ fn responses_fallback_chain(multi_hop: bool) -> toker::policy::ValidatedPolicyDo
                     let edge = || CandidateEdge {
                         preflight: FallbackPermission::Enabled,
                         post_send: vec![FailureClass::ServerError, FailureClass::Overload],
-                        billed_boundary: BoundaryConsent::Deny,
+                        billed_boundary: if codex_middle {
+                            BoundaryConsent::Allow
+                        } else {
+                            BoundaryConsent::Deny
+                        },
                         ambiguous_transport: BoundaryConsent::Deny,
                         cache_transition: CacheTransitionPolicy::AllowCacheLoss,
                     };
@@ -718,10 +735,20 @@ fn responses_fallback_chain(multi_hop: bool) -> toker::policy::ValidatedPolicyDo
                         edge: edge(),
                         candidate: Candidate {
                             id: CandidateId::new("backup").unwrap(),
-                            binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                            binding_id: if codex_middle {
+                                CODEX_SUB_RESPONSES.id().clone()
+                            } else {
+                                ANTHROPIC_API_MESSAGES.id().clone()
+                            },
                             model: CandidateModel::Exact {
-                                model_id: if multi_hop { "overloaded" } else { "backup" }
-                                    .to_owned(),
+                                model_id: if codex_middle {
+                                    "failed-precommit"
+                                } else if multi_hop {
+                                    "overloaded"
+                                } else {
+                                    "backup"
+                                }
+                                .to_owned(),
                             },
                             upgrade_policy_id: None,
                             alias_policy: None,
@@ -1639,7 +1666,8 @@ async fn active_responses_policy_continues_after_crossing_adapters() {
         .parse()
         .unwrap();
     router.api_key = Some("sk-or-test".to_owned());
-    let (addr, store) = spawn_toker_with_policy(fixture, responses_fallback_chain(true)).await;
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, responses_fallback_chain(true, false)).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/responses"))
@@ -1705,6 +1733,58 @@ async fn active_responses_policy_continues_after_crossing_adapters() {
     assert_eq!(
         lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
         Some("final")
+    );
+}
+
+#[tokio::test]
+async fn active_responses_policy_continues_after_codex() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-codex-hop", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, responses_fallback_chain(true, true)).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-codex-hop")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/backend-api/codex/responses");
+    assert_eq!(requests[2].path, "/v1/responses");
+    let rows = wait_for_rows(&store, 3).await;
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(attempts[2].reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[1].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[2].provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        store
+            .load_meters("codex_sub")
+            .expect("load Codex meters")
+            .expect("failed Codex attempt updates meters")
+            .snapshot,
+        expected_meters()
     );
 }
 
