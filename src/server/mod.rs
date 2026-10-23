@@ -2419,6 +2419,7 @@ api_key = "sk-test"
     const CHAT_WITHOUT_USAGE: u8 = 1;
     const CHAT_FAILURE: u8 = 2;
     const CHAT_RATE_LIMIT: u8 = 3;
+    const CHAT_AUTH_FAILURE: u8 = 4;
 
     #[derive(Default)]
     struct ChatUpstream {
@@ -2484,6 +2485,15 @@ api_key = "sk-test"
                 StatusCode::TOO_MANY_REQUESTS,
                 axum::Json(serde_json::json!({
                     "error": {"type": "rate_limit_error", "message": "test limit"}
+                })),
+            )
+                .into_response();
+        }
+        if response_mode == CHAT_AUTH_FAILURE {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "authentication_error", "message": "test credential"}
                 })),
             )
                 .into_response();
@@ -2599,14 +2609,16 @@ api_key = "sk-ant-test"
         route.chain.first.model = crate::policy::CandidateModel::Exact {
             model_id: "primary-model".to_owned(),
         };
-        route
-            .chain
-            .first
-            .health_circuits
-            .push(crate::policy::HealthCircuit {
+        route.chain.first.health_circuits.extend([
+            crate::policy::HealthCircuit {
                 failure: crate::policy::FailureClass::ServerError,
                 duration_seconds: 30,
-            });
+            },
+            crate::policy::HealthCircuit {
+                failure: crate::policy::FailureClass::Authentication,
+                duration_seconds: 30,
+            },
+        ]);
         route.chain.steps.push(crate::policy::RouteStep {
             edge: crate::policy::CandidateEdge {
                 preflight: crate::policy::FallbackPermission::Enabled,
@@ -3572,6 +3584,53 @@ api_key = "sk-proj-test"
         assert_eq!(
             lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
             Some("backup-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_native_auth_failure_does_not_open_a_shared_circuit() {
+        let (server, primary, backup) = policy_chat_fallback_server().await;
+        primary
+            .response_mode
+            .store(CHAT_AUTH_FAILURE, Ordering::Relaxed);
+        let runtime = server.policy_runtime.as_ref().unwrap().clone();
+        let snapshot = runtime.capture().unwrap();
+        let route = snapshot
+            .policy()
+            .route(
+                &crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
+                    .unwrap(),
+            )
+            .unwrap();
+        let primary_candidate = &route.candidates()[0];
+        let auth_circuit = crate::policy::HealthCircuitKey {
+            policy_revision_id: snapshot.revision_id().unwrap(),
+            route_id: route.id().clone(),
+            candidate_id: primary_candidate.id().clone(),
+            binding_id: primary_candidate.binding_id().clone(),
+            model_id: "primary-model".to_owned(),
+            failure: crate::policy::FailureClass::Authentication,
+        };
+        let address = serve(server).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/v1/chat/completions"))
+            .header(axum::http::header::AUTHORIZATION, "Bearer request-key")
+            .json(&serde_json::json!({
+                "model": "asked-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+                "stream": false
+            }))
+            .send()
+            .await
+            .expect("request completes");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(primary.seen.lock().unwrap().len(), 1);
+        assert!(backup.seen.lock().unwrap().is_empty());
+        assert!(
+            !runtime.circuit_is_open(&snapshot, &auth_circuit, super::now_ms()),
+            "a request-supplied credential must not poison shared availability"
         );
     }
 
