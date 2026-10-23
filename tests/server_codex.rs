@@ -315,6 +315,13 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
                 br#"{"type":"error","error":{"type":"authentication_error","message":"bad upstream key"}}"#,
             ),
         ),
+        "overloaded" => raw_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+        ),
         "compressed" => {
             let mut response = raw_response(
                 StatusCode::OK,
@@ -660,6 +667,10 @@ where
 }
 
 fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    responses_fallback_chain(false)
+}
+
+fn responses_fallback_chain(multi_hop: bool) -> toker::policy::ValidatedPolicyDocument {
     let route_id: RouteId = id("responses-fallback");
     PolicyDocument {
         format_version: CURRENT_FORMAT_VERSION,
@@ -695,27 +706,49 @@ fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
                     enabled: true,
                     health_circuits: vec![],
                 },
-                steps: vec![RouteStep {
-                    edge: CandidateEdge {
+                steps: {
+                    let edge = || CandidateEdge {
                         preflight: FallbackPermission::Enabled,
-                        post_send: vec![FailureClass::ServerError],
+                        post_send: vec![FailureClass::ServerError, FailureClass::Overload],
                         billed_boundary: BoundaryConsent::Deny,
                         ambiguous_transport: BoundaryConsent::Deny,
                         cache_transition: CacheTransitionPolicy::AllowCacheLoss,
-                    },
-                    candidate: Candidate {
-                        id: CandidateId::new("backup").unwrap(),
-                        binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
-                        model: CandidateModel::Exact {
-                            model_id: "backup".to_owned(),
+                    };
+                    let mut steps = vec![RouteStep {
+                        edge: edge(),
+                        candidate: Candidate {
+                            id: CandidateId::new("backup").unwrap(),
+                            binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                            model: CandidateModel::Exact {
+                                model_id: if multi_hop { "overloaded" } else { "backup" }
+                                    .to_owned(),
+                            },
+                            upgrade_policy_id: None,
+                            alias_policy: None,
+                            required_capabilities: Default::default(),
+                            enabled: true,
+                            health_circuits: vec![],
                         },
-                        upgrade_policy_id: None,
-                        alias_policy: None,
-                        required_capabilities: Default::default(),
-                        enabled: true,
-                        health_circuits: vec![],
-                    },
-                }],
+                    }];
+                    if multi_hop {
+                        steps.push(RouteStep {
+                            edge: edge(),
+                            candidate: Candidate {
+                                id: CandidateId::new("last").unwrap(),
+                                binding_id: OPENROUTER_RESPONSES.id().clone(),
+                                model: CandidateModel::Exact {
+                                    model_id: "final".to_owned(),
+                                },
+                                upgrade_policy_id: None,
+                                alias_policy: None,
+                                required_capabilities: Default::default(),
+                                enabled: true,
+                                health_circuits: vec![],
+                            },
+                        });
+                    }
+                    steps
+                },
             },
             lane_transition: LaneTransitionPolicy::PreservePinned,
         }],
@@ -1595,6 +1628,84 @@ async fn active_responses_policy_falls_back_from_openrouter_to_anthropic() {
         Some("backup")
     );
     assert_eq!(lane.pin.as_ref().map(|pin| pin.policy_revision_id), Some(1));
+}
+
+#[tokio::test]
+async fn active_responses_policy_continues_after_crossing_adapters() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-multi-hop", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) = spawn_toker_with_policy(fixture, responses_fallback_chain(true)).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-multi-hop")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    assert_eq!(requests[2].path, "/v1/responses");
+    let models = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models, ["failed", "overloaded", "final"]);
+
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(store.count_logical_requests().unwrap(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].kind, None);
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        attempts
+            .windows(2)
+            .all(|pair| pair[0].attempt_group_id == pair[1].attempt_group_id)
+    );
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[1].reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(attempts[2].reason, toker::store::AttemptReason::Overload);
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("responses-multi-hop"))
+        .expect("last successful target pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
+        Some("last")
+    );
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
+        Some("final")
+    );
 }
 
 #[tokio::test]

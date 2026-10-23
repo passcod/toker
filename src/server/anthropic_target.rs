@@ -65,6 +65,35 @@ impl FrontendWire {
     }
 }
 
+pub(crate) enum FailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadyOutcome {
+    Accepted {
+        upstream: reqwest::Response,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        frontend: FrontendWire,
+        stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        failure: super::attempt::AttemptFailure,
+        response: FailureResponse,
+        parts: Parts,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        frontend: FrontendWire,
+        stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
 pub(crate) struct ReadyAttempt {
     parts: Parts,
     backend: Arc<dyn Provider>,
@@ -87,21 +116,22 @@ impl ReadyAttempt {
         &self.effective_model
     }
 
-    pub(crate) async fn execute(
-        mut self,
-        server: Server,
+    pub(crate) async fn execute_precommit(
+        &mut self,
+        server: &Server,
         provenance: crate::store::AttemptProvenance,
-    ) -> Response {
+    ) -> ReadyOutcome {
         if let Some(ctx) = self.record.as_mut() {
             ctx.attempt = Some(provenance);
         }
-        let mut cancellation =
-            super::cancel::PrecommitCancellationGuard::anthropic(self.record.as_ref());
+        let record = self.record.take();
+        let in_flight = self.in_flight.take();
+        let cancellation = super::cancel::PrecommitCancellationGuard::anthropic(record.as_ref());
         let upstream = match send_upstream_to(
-            &server,
+            server,
             self.backend.as_ref(),
             &self.parts,
-            self.body,
+            self.body.clone(),
             &server.config.session_header_names,
             self.frontend.protocol(),
             "/v1/messages",
@@ -110,73 +140,189 @@ impl ReadyAttempt {
         {
             Ok(upstream) => upstream,
             Err(error) => {
-                cancellation.disarm();
-                if let Some(ctx) = self.record.as_ref() {
-                    record_anthropic_error(
-                        ctx,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                        Some(super::attempt::transport_failure_type(&error).to_owned()),
-                        None,
-                        None,
-                        None,
-                    );
-                }
-                return transport_failure(ErrorWire::Openai, &error);
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: FailureResponse::Local(transport_failure(ErrorWire::Openai, &error)),
+                    parts: self.parts.clone(),
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
+                };
             }
         };
-        super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
         let response_status = upstream.status();
-        let upstream = match super::attempt::precommit_anthropic(upstream).await {
-            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
-            | Ok(super::attempt::PrecommitOutcome::Failure {
-                response: Some(response),
-                ..
-            }) => response,
-            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
-                cancellation.disarm();
-                if let Some(ctx) = self.record.as_ref() {
-                    record_anthropic_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("response_protocol".to_owned()),
-                        None,
-                        None,
-                        None,
-                    );
+        match super::attempt::precommit_anthropic(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyOutcome::Accepted {
+                    upstream: response,
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
                 }
-                return upstream_failure(
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyOutcome::Failure {
+                failure,
+                response: FailureResponse::Upstream(response),
+                parts: self.parts.clone(),
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
+                frontend: self.frontend,
+                stream: self.stream,
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyOutcome::Failure {
+                failure,
+                response: FailureResponse::Local(upstream_failure(
                     ErrorWire::Openai,
                     "toker could not interpret the upstream response before commitment",
-                );
-            }
+                )),
+                parts: self.parts.clone(),
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
+                frontend: self.frontend,
+                stream: self.stream,
+                cancellation,
+            },
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
-                if let Some(ctx) = self.record.as_ref() {
-                    record_anthropic_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("ambiguous_transport".to_owned()),
-                        None,
-                        None,
-                        None,
-                    );
+                ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: FailureResponse::Local(truncated_body(ErrorWire::Openai)),
+                    parts: self.parts.clone(),
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
                 }
-                return truncated_body(ErrorWire::Openai);
             }
-        };
-        let response = forward(
-            upstream,
-            self.record,
-            self.in_flight,
-            &self.response_model,
-            self.frontend,
-            self.stream,
-        )
-        .await;
-        cancellation.disarm();
-        response
+        }
     }
+}
+
+pub(crate) async fn finish(outcome: ReadyOutcome) -> Response {
+    match outcome {
+        ReadyOutcome::Accepted {
+            upstream,
+            record,
+            in_flight,
+            response_model,
+            frontend,
+            stream,
+            mut cancellation,
+        } => {
+            let response = forward(
+                upstream,
+                record,
+                in_flight,
+                &response_model,
+                frontend,
+                stream,
+            )
+            .await;
+            cancellation.disarm();
+            response
+        }
+        ReadyOutcome::Failure {
+            failure,
+            response,
+            parts: _,
+            record,
+            in_flight,
+            response_model,
+            frontend,
+            stream,
+            mut cancellation,
+        } => {
+            let response = match response {
+                FailureResponse::Upstream(response) => {
+                    forward(
+                        response,
+                        record,
+                        in_flight,
+                        &response_model,
+                        frontend,
+                        stream,
+                    )
+                    .await
+                }
+                FailureResponse::Local(response) => {
+                    record_failure(record.as_ref(), &failure);
+                    response
+                }
+            };
+            cancellation.disarm();
+            response
+        }
+    }
+}
+
+pub(crate) fn record_failure(
+    record: Option<&AnthropicRecordCtx>,
+    failure: &super::attempt::AttemptFailure,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    record_anthropic_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        Some(error_type.to_owned()),
+        None,
+        None,
+        None,
+    );
 }
 
 pub(crate) fn prepare(

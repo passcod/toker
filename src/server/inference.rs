@@ -673,7 +673,10 @@ impl ReadyBackendAttempt {
                     response
                 }
             },
-            Self::Anthropic(ready) => ready.execute(server, provenance).await,
+            Self::Anthropic(mut ready) => {
+                let outcome = ready.execute_precommit(&server, provenance).await;
+                super::anthropic_target::finish(outcome).await
+            }
             Self::OpenRouter(mut ready) => {
                 let outcome = ready.execute_precommit(&server, provenance).await;
                 super::openrouter_responses::finish(outcome).await
@@ -1235,11 +1238,11 @@ pub(crate) async fn coordinate_responses(
         Err(response) => return *response,
     };
     let provenance = super::attempt::initial_provenance();
-    let ReadyBackendAttempt::OpenRouter(ready) = ready else {
+    let Some(policy_attempt) = policy_attempt else {
         server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
         return ready.execute(server, provenance).await;
     };
-    coordinate_openrouter_responses(
+    coordinate_policy_responses(
         server,
         ready,
         provenance,
@@ -1318,12 +1321,167 @@ async fn prepare_responses_backend(
     }
 }
 
+enum ResponsesFailureTerminal {
+    OpenRouter {
+        response: super::openrouter_responses::FailureResponse,
+        response_model: String,
+        wants_stream: bool,
+    },
+    Anthropic {
+        response: super::anthropic_target::FailureResponse,
+        response_model: String,
+        frontend: super::anthropic_target::FrontendWire,
+        stream: bool,
+    },
+}
+
+struct PolicyResponsesFailure {
+    failure: super::attempt::AttemptFailure,
+    parts: Parts,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    cancellation: super::cancel::PrecommitCancellationGuard,
+    terminal: ResponsesFailureTerminal,
+}
+
+impl PolicyResponsesFailure {
+    fn record(&self) {
+        match &self.terminal {
+            ResponsesFailureTerminal::OpenRouter { .. } => {
+                super::openrouter_responses::record_failure(self.record.as_ref(), &self.failure);
+            }
+            ResponsesFailureTerminal::Anthropic { .. } => {
+                super::anthropic_target::record_failure(self.record.as_ref(), &self.failure);
+            }
+        }
+    }
+
+    async fn finish(self) -> Response {
+        let Self {
+            failure,
+            parts,
+            record,
+            in_flight,
+            cancellation,
+            terminal,
+        } = self;
+        match terminal {
+            ResponsesFailureTerminal::OpenRouter {
+                response,
+                response_model,
+                wants_stream,
+            } => {
+                super::openrouter_responses::finish(
+                    super::openrouter_responses::ReadyOutcome::Failure {
+                        failure,
+                        response,
+                        parts,
+                        record,
+                        in_flight,
+                        response_model,
+                        wants_stream,
+                        cancellation,
+                    },
+                )
+                .await
+            }
+            ResponsesFailureTerminal::Anthropic {
+                response,
+                response_model,
+                frontend,
+                stream,
+            } => {
+                super::anthropic_target::finish(super::anthropic_target::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    frontend,
+                    stream,
+                    cancellation,
+                })
+                .await
+            }
+        }
+    }
+}
+
+async fn execute_policy_responses_precommit(
+    server: &Server,
+    ready: ReadyBackendAttempt,
+    provenance: crate::store::AttemptProvenance,
+) -> Result<Response, Box<PolicyResponsesFailure>> {
+    match ready {
+        ReadyBackendAttempt::OpenRouter(mut ready) => {
+            match ready.execute_precommit(server, provenance).await {
+                outcome @ super::openrouter_responses::ReadyOutcome::Accepted { .. } => {
+                    Ok(super::openrouter_responses::finish(outcome).await)
+                }
+                super::openrouter_responses::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    wants_stream,
+                    cancellation,
+                } => Err(Box::new(PolicyResponsesFailure {
+                    failure,
+                    parts,
+                    record,
+                    in_flight,
+                    cancellation,
+                    terminal: ResponsesFailureTerminal::OpenRouter {
+                        response,
+                        response_model,
+                        wants_stream,
+                    },
+                })),
+            }
+        }
+        ReadyBackendAttempt::Anthropic(mut ready) => {
+            match ready.execute_precommit(server, provenance).await {
+                outcome @ super::anthropic_target::ReadyOutcome::Accepted { .. } => {
+                    Ok(super::anthropic_target::finish(outcome).await)
+                }
+                super::anthropic_target::ReadyOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    frontend,
+                    stream,
+                    cancellation,
+                } => Err(Box::new(PolicyResponsesFailure {
+                    failure,
+                    parts,
+                    record,
+                    in_flight,
+                    cancellation,
+                    terminal: ResponsesFailureTerminal::Anthropic {
+                        response,
+                        response_model,
+                        frontend,
+                        stream,
+                    },
+                })),
+            }
+        }
+        ready => Ok(ready.execute(server.clone(), provenance).await),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn coordinate_openrouter_responses(
+async fn coordinate_policy_responses(
     server: Server,
-    mut ready: super::openrouter_responses::ReadyAttempt,
+    mut ready: ReadyBackendAttempt,
     mut provenance: crate::store::AttemptProvenance,
-    mut policy_attempt: Option<super::PolicyAttempt>,
+    mut policy_attempt: super::PolicyAttempt,
     inference: InferenceRequest,
     had_prompt_cache_key: bool,
     max_output_tokens: Option<Value>,
@@ -1334,67 +1492,21 @@ async fn coordinate_openrouter_responses(
 ) -> Response {
     loop {
         server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        let outcome = ready.execute_precommit(&server, provenance.clone()).await;
-        let super::openrouter_responses::ReadyOutcome::Failure {
-            failure,
-            response,
-            parts,
-            mut record,
-            in_flight,
-            response_model,
-            wants_stream,
-            mut cancellation,
-        } = outcome
-        else {
-            return super::openrouter_responses::finish(outcome).await;
+        let mut failed =
+            match execute_policy_responses_precommit(&server, ready, provenance.clone()).await {
+                Ok(response) => return response,
+                Err(failed) => failed,
+            };
+        let Some(class) = failed.failure.class else {
+            return failed.finish().await;
         };
-        let Some(class) = failure.class else {
-            return super::openrouter_responses::finish(
-                super::openrouter_responses::ReadyOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    wants_stream,
-                    cancellation,
-                },
-            )
-            .await;
-        };
-        let Some(current) = policy_attempt.as_ref() else {
-            return super::openrouter_responses::finish(
-                super::openrouter_responses::ReadyOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    wants_stream,
-                    cancellation,
-                },
-            )
-            .await;
-        };
-        server.open_policy_circuit(current, class, super::record::now_ms());
-        let next = match server.continue_policy_attempt(current, class) {
+        server.open_policy_circuit(&policy_attempt, class, super::record::now_ms());
+        let next = match server.continue_policy_attempt(&policy_attempt, class) {
             Ok(Some(next)) => next,
-            Ok(None) | Err(_) => {
-                return super::openrouter_responses::finish(
-                    super::openrouter_responses::ReadyOutcome::Failure {
-                        failure,
-                        response,
-                        parts,
-                        record,
-                        in_flight,
-                        response_model,
-                        wants_stream,
-                        cancellation,
-                    },
-                )
-                .await;
+            Ok(None) => return failed.finish().await,
+            Err(error) => {
+                tracing::error!(%error, "policy fallback continuation failed");
+                return failed.finish().await;
             }
         };
         let target = match server.registry.resolve_binding(
@@ -1404,41 +1516,17 @@ async fn coordinate_openrouter_responses(
             &next.plan.effective_model,
         ) {
             Ok(target) => target,
-            Err(_) => {
-                return super::openrouter_responses::finish(
-                    super::openrouter_responses::ReadyOutcome::Failure {
-                        failure,
-                        response,
-                        parts,
-                        record,
-                        in_flight,
-                        response_model,
-                        wants_stream,
-                        cancellation,
-                    },
-                )
-                .await;
+            Err(error) => {
+                tracing::error!(?error, binding_id = %next.plan.binding_id, "policy fallback selected an unavailable Responses binding");
+                return failed.finish().await;
             }
         };
         let Some(next_provenance) = super::attempt::next_provenance(&provenance, class) else {
-            return super::openrouter_responses::finish(
-                super::openrouter_responses::ReadyOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    wants_stream,
-                    cancellation,
-                },
-            )
-            .await;
+            return failed.finish().await;
         };
-        super::openrouter_responses::record_failure(record.as_ref(), &failure);
-        cancellation.disarm();
-        drop(response);
-        if let Some(ctx) = record.as_mut() {
+        failed.record();
+        failed.cancellation.disarm();
+        if let Some(ctx) = failed.record.as_mut() {
             ctx.backend = target.provider().clone();
             ctx.binding_id = next.plan.binding_id.clone();
             ctx.attempt = None;
@@ -1451,6 +1539,9 @@ async fn coordinate_openrouter_responses(
             ctx.effective_model = Some(next.plan.effective_model.clone());
             ctx.policy_attempt = Some(Arc::new(next.clone()));
         }
+        let parts = failed.parts;
+        let record = failed.record;
+        let in_flight = failed.in_flight;
         let adapter = target
             .binding()
             .canonical_backend()
@@ -1478,14 +1569,8 @@ async fn coordinate_openrouter_responses(
             Err(response) => return *response,
         };
         provenance = next_provenance;
-        policy_attempt = Some(next);
-        match prepared {
-            ReadyBackendAttempt::OpenRouter(next) => ready = next,
-            prepared => {
-                server.note_binding_sent(prepared.binding_id(), Some(prepared.effective_model()));
-                return prepared.execute(server, provenance).await;
-            }
-        }
+        policy_attempt = next;
+        ready = prepared;
     }
 }
 
