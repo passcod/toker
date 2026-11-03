@@ -78,6 +78,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
@@ -101,6 +103,11 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// listing both anthropic backends share), codex_sub (the codex
 /// backend's own models endpoint).
 pub const SOURCES: &[&str] = &["openrouter", "openai_api", "anthropic", "codex_sub"];
+
+/// Stable snapshot identity of no persisted catalogues. It is a non-negative
+/// Store generation and differs from every SHA-256-derived snapshot value.
+pub const EMPTY_SNAPSHOT_GENERATION: i64 = 0;
+const SNAPSHOT_GENERATION_DOMAIN: &[u8] = b"toker.catalogue.snapshot.v1\0";
 
 /// One provider's response parser: the listing shape's reader.
 pub type Parse = fn(&Value, i64) -> anyhow::Result<FetchedCatalog>;
@@ -240,6 +247,10 @@ pub struct FetchedCatalogs {
 }
 
 impl FetchedCatalogs {
+    pub fn is_empty(&self) -> bool {
+        self.by_source.is_empty()
+    }
+
     /// Replace (or first install) one source's catalogue.
     pub fn set(&mut self, source: &'static str, catalog: FetchedCatalog) {
         self.by_source.insert(source, catalog);
@@ -390,6 +401,32 @@ pub fn load_cached(dir: &Path) -> FetchedCatalogs {
     catalogs
 }
 
+/// Stable identity for the cached catalogue snapshot a user-side publication
+/// rendered. The daemon only advances publication desired state after persisting
+/// this exact snapshot, so another process can reproduce it.
+pub fn snapshot_generation(catalogs: &FetchedCatalogs) -> i64 {
+    if catalogs.by_source.is_empty() {
+        return EMPTY_SNAPSHOT_GENERATION;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(SNAPSHOT_GENERATION_DOMAIN);
+    for source in SOURCES {
+        hasher.update(source.as_bytes());
+        match catalogs.get(source) {
+            Some(catalog) => {
+                hasher.update([1]);
+                hasher.update(catalog.fetched_at_ms.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (u64::from_be_bytes(bytes) & i64::MAX as u64) as i64
+}
+
 /// Persist one fetched response as a source's cache file: the setup
 /// wizard's atomic primitive (temp beside the target, fsync, re-parse,
 /// compare, rename), 0644 on a fresh file — machine-readable cache
@@ -465,8 +502,10 @@ pub async fn refresh(
         Ok(response) => match parse(&response, now_ms) {
             Ok(catalog) if !catalog.models.is_empty() => {
                 if let Err(error) = persist(dir, source.provider, now_ms, &response) {
-                    // The catalogue is good; only its disk copy is
-                    // missing — the next cycle re-fetches.
+                    // Context-window reads may still use the good response in
+                    // memory. Publication compares its desired generation with
+                    // the durable cache and leaves settings pending until the
+                    // timer can reproduce this catalogue.
                     tracing::debug!(
                         provider = source.provider,
                         %error,
@@ -1520,6 +1559,39 @@ mod tests {
         // The cache file was NOT clobbered by the failure.
         let (fetched_at, _) = load_cache(&dir, "openrouter").expect("cache survives");
         assert_eq!(fetched_at, NOW - CACHE_TTL_MS * 7);
+    }
+
+    #[test]
+    fn snapshot_generation_changes_with_catalogue_content_and_is_stable_for_a_clone() {
+        let mut catalogs = FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: NOW,
+                models: vec![FetchedModel {
+                    id: "vendor/model".to_owned(),
+                    context_window: Some(128_000),
+                    chronology: None,
+                    raw: json!({"id": "vendor/model"}),
+                }],
+            },
+        );
+        let first = super::snapshot_generation(&catalogs);
+        assert_eq!(first, super::snapshot_generation(&catalogs.clone()));
+
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: NOW + 1,
+                models: vec![FetchedModel {
+                    id: "vendor/model".to_owned(),
+                    context_window: Some(128_000),
+                    chronology: None,
+                    raw: json!({"id": "vendor/model"}),
+                }],
+            },
+        );
+        assert_ne!(first, super::snapshot_generation(&catalogs));
     }
 
     #[tokio::test]

@@ -805,6 +805,18 @@ pub(super) const MIGRATIONS: &[&str] = &[
             )
         );
     "#,
+    // v14 — a v12 applied publication predates exact row ownership. It cannot
+    // remain applied after v13: treating unknown ownership as empty would let
+    // the next reconciliation remove a user's row. It is pending until the
+    // user-side adapter applies and records an exact set.
+    r#"
+    UPDATE routing_publications
+    SET state = 'pending',
+        applied_revision_id = NULL,
+        applied_inventory_generation = NULL,
+        detail_code = 'legacy_applied_identities_unknown'
+    WHERE state = 'applied' AND applied_identities_json IS NULL;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

@@ -419,10 +419,12 @@ fn configured_bindings(config: &crate::config::Config) -> BTreeSet<crate::policy
         .collect()
 }
 
-fn policy_rows(policy: &crate::policy::CompiledPolicy) -> anyhow::Result<Vec<Row>> {
-    let profile = ProfileId::new("claude")?;
+fn rows_for_profile(
+    policy: &crate::policy::CompiledPolicy,
+    profile: Option<&ProfileId>,
+) -> anyhow::Result<Vec<Row>> {
     policy
-        .publication(Some(&profile), FrontendProtocol::AnthropicMessages)
+        .publication(profile, FrontendProtocol::AnthropicMessages)
         .into_values()
         .filter_map(|presentation| {
             let AdapterMetadata::Claude { behaves_as } = presentation.metadata()? else {
@@ -448,20 +450,51 @@ fn policy_rows(policy: &crate::policy::CompiledPolicy) -> anyhow::Result<Vec<Row
         .collect()
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Claude settings cannot represent the incompatible picker presentation for profile {profile:?}"
+)]
+struct IncompatibleClaudeProfile {
+    profile: String,
+}
+
+/// Claude Code has one user settings file even when toker serves several
+/// Anthropic profiles. A profile-local presentation is publishable only when
+/// every profile projects the same rows as the unprefixed/protocol view.
+fn policy_rows(policy: &crate::policy::CompiledPolicy) -> anyhow::Result<Vec<Row>> {
+    let claude = ProfileId::new("claude")?;
+    let shared = rows_for_profile(policy, Some(&claude))?;
+    for profile in policy.anthropic_profiles() {
+        let rows = rows_for_profile(policy, Some(&profile))?;
+        if rows != shared {
+            return Err(IncompatibleClaudeProfile {
+                profile: profile.as_str().to_owned(),
+            }
+            .into());
+        }
+    }
+    Ok(shared)
+}
+
 fn cached_policy_rows(
     config: &crate::config::Config,
     store: &Store,
+    publication: RoutingPublication,
 ) -> anyhow::Result<(Vec<Row>, RoutingPublication)> {
-    let key = claude_publication_key()?;
-    let publication = store
-        .load_publication(&key)?
-        .context("active policy has no Claude settings publication")?;
     let revision = store
         .load_policy_revision(publication.desired_revision_id)?
         .context("Claude settings publication references no policy revision")?;
     let catalogs = fetched::cache_dir()
         .map(|dir| fetched::load_cached(&dir))
         .unwrap_or_default();
+    if catalogs.is_empty()
+        && publication.desired_inventory_generation != fetched::EMPTY_SNAPSHOT_GENERATION
+    {
+        bail!("Claude picker catalogue is unavailable; run `toker picker sync` again");
+    }
+    if fetched::snapshot_generation(&catalogs) != publication.desired_inventory_generation {
+        bail!("Claude picker catalogue changed while synchronising; run `toker picker sync` again");
+    }
     let registry = RouteRegistry::configured_bindings(configured_bindings(config));
     let inventory = offers::inventory(&registry, &catalogs);
     let policy = crate::policy::runtime::compile_stored_revision(&revision, &registry, &inventory)
@@ -497,11 +530,22 @@ pub async fn sync(
     http: &reqwest::Client,
     dry_run: bool,
 ) -> anyhow::Result<SyncReport> {
-    let store = Store::open(&config.db_path)?;
-    if store
-        .load_routing_policy_state()?
-        .active_revision_id
-        .is_some()
+    let policy_store = if dry_run {
+        match Store::open_read_only(&config.db_path) {
+            Ok(store) => Some(store),
+            Err(crate::store::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        Some(Store::open(&config.db_path)?)
+    };
+    if let Some(store) = policy_store
+        && store
+            .load_routing_policy_state()?
+            .active_revision_id
+            .is_some()
     {
         return sync_active_policy(config, &store, settings, dry_run);
     }
@@ -572,7 +616,19 @@ fn sync_active_policy(
     dry_run: bool,
 ) -> anyhow::Result<SyncReport> {
     let key = claude_publication_key()?;
-    let (rows, publication) = cached_policy_rows(config, store)?;
+    let publication = store
+        .load_publication(&key)?
+        .context("active policy has no Claude settings publication")?;
+    let (rows, publication) = match cached_policy_rows(config, store, publication.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            if !dry_run {
+                let (state, detail_code) = publication_error_state(&error);
+                record_publication_result(store, &key, &publication, state, detail_code);
+            }
+            return Err(error);
+        }
+    };
     if dry_run {
         return Ok(SyncReport {
             rows,
@@ -589,7 +645,13 @@ fn sync_active_policy(
     ) {
         Ok(result) => result,
         Err(error) => {
-            record_failed_publication(store, &key, &publication);
+            record_publication_result(
+                store,
+                &key,
+                &publication,
+                PublicationState::Failed,
+                "settings_write_failed",
+            );
             return Err(error);
         }
     };
@@ -629,7 +691,7 @@ fn sync_active_policy(
             // the state race before it could record them. Take those exact
             // rows into the immediate retry so the newer policy can converge
             // without mistaking the prior write for a user collision.
-            let (rows, publication) = cached_policy_rows(config, store)?;
+            let (rows, publication) = cached_policy_rows(config, store, current.clone())?;
             if publication.desired_revision_id != current.desired_revision_id
                 || publication.desired_inventory_generation != current.desired_inventory_generation
             {
@@ -643,7 +705,13 @@ fn sync_active_policy(
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        record_failed_publication(store, &key, &publication);
+                        record_publication_result(
+                            store,
+                            &key,
+                            &publication,
+                            PublicationState::Failed,
+                            "settings_write_failed",
+                        );
                         return Err(error);
                     }
                 };
@@ -677,17 +745,29 @@ fn sync_active_policy(
     }
 }
 
-fn record_failed_publication(
+fn publication_error_state(error: &anyhow::Error) -> (PublicationState, &'static str) {
+    if error.downcast_ref::<IncompatibleClaudeProfile>().is_some() {
+        (
+            PublicationState::Unsupported,
+            "incompatible_profile_presentation",
+        )
+    } else {
+        (PublicationState::Failed, "settings_render_failed")
+    }
+}
+
+fn record_publication_result(
     store: &Store,
     key: &PublicationKey,
     publication: &RoutingPublication,
+    state: PublicationState,
+    detail_code: &str,
 ) {
     let update = PublicationResultUpdate {
-        state: PublicationState::Failed,
+        state,
         applied_identities: None,
         detail_code: Some(
-            crate::policy::StableId::new("settings_write_failed")
-                .expect("static publication failure code"),
+            crate::policy::StableId::new(detail_code).expect("static publication failure code"),
         ),
         updated_ms: jiff::Timestamp::now().as_millisecond(),
     };
@@ -697,12 +777,14 @@ fn record_failed_publication(
         publication.desired_inventory_generation,
         &update,
     ) {
-        tracing::error!(%error, "could not record failed Claude picker publication");
+        tracing::error!(%error, "could not record Claude picker publication result");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn listing() -> Value {
@@ -727,6 +809,90 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn incompatible_anthropic_profile_presentations_are_rejected() {
+        use crate::policy::{
+            ArgumentBinding, CURRENT_FORMAT_VERSION, Candidate, CandidateId, CandidateModel,
+            LaneTransitionPolicy, PolicyDocument, PolicyOrigin, Presentation, PresentationId,
+            PresentationSource, Route, RouteChain, RouteId, RouteReference,
+        };
+        use crate::routing::ANTHROPIC_SUB_MESSAGES;
+
+        let requested_model = crate::policy::StableId::new("requested_model").unwrap();
+        let route = Route {
+            id: RouteId::new("route").unwrap(),
+            display_name: "Route".to_owned(),
+            description: None,
+            parameters: vec![requested_model.clone()],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("candidate").unwrap(),
+                    binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "model".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        };
+        let reference = RouteReference {
+            route_id: route.id.clone(),
+            parameters: BTreeMap::from([(requested_model, ArgumentBinding::RequestedModel)]),
+        };
+        let presentation = |id: &str, profile: &str, slug: &str| Presentation {
+            id: PresentationId::new(id).unwrap(),
+            scope: crate::policy::FrontendScope::Profile {
+                profile: ProfileId::new(profile).unwrap(),
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            slug: slug.to_owned(),
+            label: None,
+            description: None,
+            enabled: true,
+            shadow_native: false,
+            source: PresentationSource::Virtual {
+                target: reference.clone(),
+            },
+            metadata: Some(AdapterMetadata::Claude {
+                behaves_as: Some("claude-sonnet-5".to_owned()),
+            }),
+        };
+        let policy = PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![],
+            presentations: vec![
+                presentation("claude", "claude", "claude-model"),
+                presentation("workhorse", "workhorse", "workhorse-model"),
+            ],
+            routes: vec![route],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
+        }
+        .validate()
+        .unwrap();
+        let topology = RouteRegistry::configured_bindings([ANTHROPIC_SUB_MESSAGES.id().clone()]);
+        let compiled = crate::policy::compile(
+            policy,
+            &topology,
+            &offers::OfferInventory::default(),
+            PolicyOrigin::Authored,
+        )
+        .into_policy()
+        .unwrap();
+
+        let error = policy_rows(&compiled).unwrap_err();
+        assert!(error.downcast_ref::<IncompatibleClaudeProfile>().is_some());
     }
 
     #[test]

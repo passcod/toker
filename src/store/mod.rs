@@ -4539,6 +4539,55 @@ mod tests {
     }
 
     #[test]
+    fn migration_v14_invalidates_applied_publications_without_exact_identities() {
+        let dir = test_dir("v13-publication-identities");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..13] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 13).unwrap();
+            conn.execute(
+                "INSERT INTO routing_policy_revisions
+                 (revision_id, created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+                 VALUES (1, 1, 1, NULL, 'new_lanes', 0, 'legacy', NULL, ?1, ?2)",
+                rusqlite::params![
+                    String::from_utf8(crate::policy::policy_bytes(&policy("v13")).unwrap())
+                        .unwrap(),
+                    crate::policy::policy_fingerprint(&policy("v13"))
+                        .unwrap()
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO routing_publications
+                 (scope_key, adapter, desired_revision_id, applied_revision_id,
+                  desired_inventory_generation, applied_inventory_generation, state, updated_ms)
+                 VALUES ('protocol:anthropic_messages', 'claude_settings', 1, 1, 3, 3,
+                         'applied', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
+        let publication = store.load_publications().unwrap().pop().unwrap();
+        assert_eq!(publication.state, PublicationState::Pending);
+        assert_eq!(publication.applied_revision_id, None);
+        assert_eq!(publication.applied_inventory_generation, None);
+        assert_eq!(publication.applied_identities, None);
+        assert_eq!(
+            publication.detail_code.unwrap().as_str(),
+            "legacy_applied_identities_unknown"
+        );
+    }
+
+    #[test]
     fn migration_v12_rejects_malformed_v11_history_atomically() {
         let dir = test_dir("v11-malformed-attempt-reason");
         let db = dir.join("toker.db");
