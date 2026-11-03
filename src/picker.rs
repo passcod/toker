@@ -618,6 +618,27 @@ pub async fn sync(
     })
 }
 
+fn legacy_picker_identities(settings: &std::path::Path) -> BTreeSet<String> {
+    std::fs::read_to_string(settings)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| {
+            settings
+                .pointer("/modelPicker/options")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            row.get("model")
+                .and_then(Value::as_str)
+                .filter(|model| model.starts_with(ROW_PREFIX))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 fn sync_active_policy(
     config: &crate::config::Config,
     store: &Store,
@@ -647,23 +668,29 @@ fn sync_active_policy(
     }
 
     let json: Vec<_> = rows.iter().map(Row::to_json).collect();
-    let (changed, identities) = match crate::setup::patchers::reconcile_model_picker(
-        settings,
-        publication.applied_identities.as_ref(),
-        &json,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            record_publication_result(
-                store,
-                &key,
-                &publication,
-                PublicationState::Failed,
-                "settings_write_failed",
-            );
-            return Err(error);
-        }
-    };
+    let legacy_unknown = publication
+        .detail_code
+        .as_ref()
+        .is_some_and(|code| code.as_str() == "legacy_applied_identities_unknown");
+    let legacy_identities = legacy_unknown.then(|| legacy_picker_identities(settings));
+    let prior_identities = publication
+        .applied_identities
+        .as_ref()
+        .or(legacy_identities.as_ref());
+    let (changed, identities) =
+        match crate::setup::patchers::reconcile_model_picker(settings, prior_identities, &json) {
+            Ok(result) => result,
+            Err(error) => {
+                record_publication_result(
+                    store,
+                    &key,
+                    &publication,
+                    PublicationState::Failed,
+                    "settings_write_failed",
+                );
+                return Err(error);
+            }
+        };
     let update = PublicationResultUpdate {
         state: PublicationState::Applied,
         applied_identities: Some(identities.clone()),
@@ -818,6 +845,26 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn legacy_picker_identity_adoption_is_limited_to_the_old_prefix() {
+        let dir = crate::test_support::tempdir("picker-legacy-ownership-");
+        let settings = dir.join("settings.json");
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"modelPicker": {"options": [
+                {"model": "openrouter/old"},
+                {"model": "claude-user"},
+                {"model": 42}
+            ]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_picker_identities(&settings),
+            BTreeSet::from(["openrouter/old".to_owned()])
+        );
     }
 
     #[test]
