@@ -42,8 +42,8 @@ pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult,
     InitialPublication, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
     NewPolicyRevision, PingAction, PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource,
-    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationState,
-    RevisionOneActivation, RoutingPolicyState, RoutingPublication,
+    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -522,28 +522,19 @@ impl Store {
         state::load_publications(&*self.conn()?)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn compare_and_swap_publication_result(
         &self,
         key: &PublicationKey,
         expected_revision_id: i64,
         expected_inventory_generation: i64,
-        state_value: PublicationState,
-        applied_revision_id: Option<i64>,
-        applied_inventory_generation: Option<i64>,
-        detail_code: Option<&crate::policy::StableId>,
-        updated_ms: i64,
+        update: &PublicationResultUpdate,
     ) -> Result<PublicationCasResult> {
         state::compare_and_swap_publication_result(
             &*self.conn()?,
             key,
             expected_revision_id,
             expected_inventory_generation,
-            state_value,
-            applied_revision_id,
-            applied_inventory_generation,
-            detail_code,
-            updated_ms,
+            update,
         )
     }
 
@@ -746,9 +737,10 @@ mod tests {
         Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry,
         NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance,
         PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationState, RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind,
-        SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
-        StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
+        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
+        is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -2945,33 +2937,41 @@ mod tests {
             store.load_publication(&key).unwrap().unwrap().state,
             PublicationState::Pending
         );
+        let first_identities = BTreeSet::from([
+            "openrouter/anthropic/claude-sonnet".to_owned(),
+            "route/virtual-model".to_owned(),
+        ]);
         assert_eq!(
             store
                 .compare_and_swap_publication_result(
                     &key,
                     first,
                     4,
-                    PublicationState::Applied,
-                    Some(first),
-                    Some(4),
-                    None,
-                    101,
+                    &PublicationResultUpdate {
+                        state: PublicationState::Applied,
+                        applied_identities: Some(first_identities.clone()),
+                        detail_code: None,
+                        updated_ms: 101,
+                    },
                 )
                 .unwrap(),
             PublicationCasResult::Updated,
         );
         store.set_publication_desired(&key, second, 5, 102).unwrap();
+        let pending = store.load_publication(&key).unwrap().unwrap();
+        assert_eq!(pending.applied_identities, Some(first_identities.clone()));
         let write_failed = StableId::new("write_failed").unwrap();
         let stale = store
             .compare_and_swap_publication_result(
                 &key,
                 first,
                 4,
-                PublicationState::Failed,
-                Some(first),
-                Some(4),
-                Some(&write_failed),
-                103,
+                &PublicationResultUpdate {
+                    state: PublicationState::Failed,
+                    applied_identities: None,
+                    detail_code: Some(write_failed.clone()),
+                    updated_ms: 103,
+                },
             )
             .unwrap();
         assert!(
@@ -2982,11 +2982,12 @@ mod tests {
             &key,
             second,
             5,
-            PublicationState::Applied,
-            Some(first),
-            Some(4),
-            None,
-            104,
+            &PublicationResultUpdate {
+                state: PublicationState::Failed,
+                applied_identities: Some(first_identities.clone()),
+                detail_code: Some(write_failed.clone()),
+                updated_ms: 104,
+            },
         );
         assert!(matches!(invalid, Err(Error::InvalidRoutingState(_))));
         assert_eq!(
@@ -2995,19 +2996,19 @@ mod tests {
                     &key,
                     second,
                     5,
-                    PublicationState::Failed,
-                    Some(first),
-                    Some(4),
-                    Some(&write_failed),
-                    105,
+                    &PublicationResultUpdate {
+                        state: PublicationState::Failed,
+                        applied_identities: None,
+                        detail_code: Some(write_failed.clone()),
+                        updated_ms: 105,
+                    },
                 )
                 .unwrap(),
             PublicationCasResult::Updated,
         );
-        assert_eq!(
-            store.load_publication(&key).unwrap().unwrap().detail_code,
-            Some(write_failed)
-        );
+        let failed = store.load_publication(&key).unwrap().unwrap();
+        assert_eq!(failed.detail_code, Some(write_failed));
+        assert_eq!(failed.applied_identities, Some(first_identities));
     }
 
     #[test]
@@ -4416,7 +4417,7 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&db).unwrap();
-        assert_eq!(user_version(&store), 12);
+        assert_eq!(user_version(&store), schema::MIGRATIONS.len() as i64);
         drop(store);
         let conn = Connection::open(&db).unwrap();
         let group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

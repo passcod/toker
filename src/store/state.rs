@@ -255,7 +255,16 @@ pub struct RoutingPublication {
     pub applied_revision_id: Option<i64>,
     pub desired_inventory_generation: i64,
     pub applied_inventory_generation: Option<i64>,
+    pub applied_identities: Option<BTreeSet<String>>,
     pub state: PublicationState,
+    pub detail_code: Option<StableId>,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationResultUpdate {
+    pub state: PublicationState,
+    pub applied_identities: Option<BTreeSet<String>>,
     pub detail_code: Option<StableId>,
     pub updated_ms: i64,
 }
@@ -808,11 +817,12 @@ pub(super) fn activate_revision_one(
                 &publication.key,
                 revision.revision_id,
                 desired_inventory_generation,
-                PublicationState::Applied,
-                Some(revision.revision_id),
-                Some(desired_inventory_generation),
-                None,
-                activated_ms,
+                &PublicationResultUpdate {
+                    state: PublicationState::Applied,
+                    applied_identities: None,
+                    detail_code: None,
+                    updated_ms: activated_ms,
+                },
             )?;
             if result != PublicationCasResult::Updated {
                 return Err(Error::InvalidRoutingState(
@@ -1109,11 +1119,12 @@ pub(super) fn set_publications_desired(
                 &publication.key,
                 desired_revision_id,
                 desired_inventory_generation,
-                PublicationState::Applied,
-                Some(desired_revision_id),
-                Some(desired_inventory_generation),
-                None,
-                updated_ms,
+                &PublicationResultUpdate {
+                    state: PublicationState::Applied,
+                    applied_identities: None,
+                    detail_code: None,
+                    updated_ms,
+                },
             )?;
             if result != PublicationCasResult::Updated {
                 return Err(Error::InvalidRoutingState(
@@ -1140,7 +1151,7 @@ pub(super) fn load_publication(
         conn,
         "SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
                 desired_inventory_generation, applied_inventory_generation,
-                state, detail_code, updated_ms
+                applied_identities_json, state, detail_code, updated_ms
          FROM routing_publications WHERE scope_key = ?1 AND adapter = ?2",
         [scope_key.as_str(), key.adapter.as_str()],
         read_publication,
@@ -1152,7 +1163,7 @@ pub(super) fn load_publications(conn: &Connection) -> Result<Vec<RoutingPublicat
         conn,
         "SELECT scope_key, adapter, desired_revision_id, applied_revision_id,
                 desired_inventory_generation, applied_inventory_generation,
-                state, detail_code, updated_ms
+                applied_identities_json, state, detail_code, updated_ms
          FROM routing_publications ORDER BY scope_key, adapter",
         [],
         read_publication,
@@ -1172,6 +1183,10 @@ fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
     let applied_revision_id = row.get("applied_revision_id")?;
     let desired_inventory_generation = row.get("desired_inventory_generation")?;
     let applied_inventory_generation = row.get("applied_inventory_generation")?;
+    let applied_identities = row
+        .get::<_, Option<String>>("applied_identities_json")?
+        .map(|json| parse_publication_identities(&json))
+        .transpose()?;
     let detail_code = row
         .get::<_, Option<String>>("detail_code")?
         .map(|value| parse_id("routing_publications.detail_code", value))
@@ -1190,55 +1205,73 @@ fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
         applied_revision_id,
         desired_inventory_generation,
         applied_inventory_generation,
+        applied_identities,
         state,
         detail_code,
         updated_ms: row.get("updated_ms")?,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn compare_and_swap_publication_result(
     conn: &Connection,
     key: &PublicationKey,
     expected_revision_id: i64,
     expected_inventory_generation: i64,
-    state: PublicationState,
-    applied_revision_id: Option<i64>,
-    applied_inventory_generation: Option<i64>,
-    detail_code: Option<&StableId>,
-    updated_ms: i64,
+    update: &PublicationResultUpdate,
 ) -> Result<PublicationCasResult> {
-    if applied_revision_id.is_some() != applied_inventory_generation.is_some() {
+    if update.state == PublicationState::Pending {
         return Err(Error::InvalidRoutingState(
-            "applied publication identity must be all NULL or all present".into(),
+            "publication result cannot be pending".into(),
         ));
     }
-    if state == PublicationState::Applied
-        && (applied_revision_id != Some(expected_revision_id)
-            || applied_inventory_generation != Some(expected_inventory_generation))
-    {
+    if update.state != PublicationState::Applied && update.applied_identities.is_some() {
         return Err(Error::InvalidRoutingState(
-            "applied result must match expected desired identity".into(),
+            "only an applied result may replace publication row identities".into(),
         ));
     }
+    validate_publication_identities(update.applied_identities.as_ref())?;
+    let applied_identities_json = update
+        .applied_identities
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
     let scope_key = encode_publication_scope(&key.scope);
-    let changed = conn.execute(
-        "UPDATE routing_publications SET state = ?1, applied_revision_id = ?2,
-             applied_inventory_generation = ?3, detail_code = ?4, updated_ms = ?5
-         WHERE scope_key = ?6 AND adapter = ?7 AND desired_revision_id = ?8
-           AND desired_inventory_generation = ?9",
-        rusqlite::params![
-            state.as_str(),
-            applied_revision_id,
-            applied_inventory_generation,
-            detail_code.map(StableId::as_str),
-            updated_ms,
-            scope_key,
-            key.adapter.as_str(),
-            expected_revision_id,
-            expected_inventory_generation
-        ],
-    )?;
+    let changed = if update.state == PublicationState::Applied {
+        conn.execute(
+            "UPDATE routing_publications SET state = ?1,
+                 applied_revision_id = desired_revision_id,
+                 applied_inventory_generation = desired_inventory_generation,
+                 applied_identities_json = ?2, detail_code = ?3, updated_ms = ?4
+             WHERE scope_key = ?5 AND adapter = ?6 AND desired_revision_id = ?7
+               AND desired_inventory_generation = ?8",
+            rusqlite::params![
+                update.state.as_str(),
+                applied_identities_json,
+                update.detail_code.as_ref().map(StableId::as_str),
+                update.updated_ms,
+                scope_key,
+                key.adapter.as_str(),
+                expected_revision_id,
+                expected_inventory_generation
+            ],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE routing_publications SET state = ?1, detail_code = ?2,
+                 updated_ms = ?3
+             WHERE scope_key = ?4 AND adapter = ?5 AND desired_revision_id = ?6
+               AND desired_inventory_generation = ?7",
+            rusqlite::params![
+                update.state.as_str(),
+                update.detail_code.as_ref().map(StableId::as_str),
+                update.updated_ms,
+                scope_key,
+                key.adapter.as_str(),
+                expected_revision_id,
+                expected_inventory_generation
+            ],
+        )?
+    };
     if changed == 1 {
         Ok(PublicationCasResult::Updated)
     } else {
@@ -1246,6 +1279,38 @@ pub(super) fn compare_and_swap_publication_result(
             current: load_publication(conn, key)?,
         })
     }
+}
+
+fn parse_publication_identities(json: &str) -> Result<BTreeSet<String>> {
+    let values: Vec<String> = serde_json::from_str(json)?;
+    let identities = values.iter().cloned().collect::<BTreeSet<_>>();
+    if identities.len() != values.len() {
+        return Err(Error::InvalidRoutingState(
+            "publication row identities are not unique".into(),
+        ));
+    }
+    validate_publication_identities(Some(&identities))?;
+    Ok(identities)
+}
+
+fn validate_publication_identities(identities: Option<&BTreeSet<String>>) -> Result<()> {
+    let Some(identities) = identities else {
+        return Ok(());
+    };
+    if identities.len() > crate::policy::MAX_COLLECTION_ITEMS {
+        return Err(Error::InvalidRoutingState(
+            "too many publication row identities".into(),
+        ));
+    }
+    if identities
+        .iter()
+        .any(|identity| identity.is_empty() || identity.len() > crate::policy::MAX_STRING_BYTES)
+    {
+        return Err(Error::InvalidRoutingState(
+            "invalid publication row identity".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_learning(update: &BindingLearningUpdate) -> Result<()> {

@@ -791,6 +791,20 @@ pub(super) const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'route-unavailable carries send-only provenance');
     END;
     "#,
+    // v13 — publication adapters own only the exact row identities they last
+    // applied. The set advances atomically with the applied revision/inventory
+    // pair, while pending and failed desired handoffs retain it.
+    r#"
+    ALTER TABLE routing_publications ADD COLUMN applied_identities_json TEXT
+        CHECK (
+            applied_identities_json IS NULL OR (
+                applied_revision_id IS NOT NULL
+                AND json_valid(applied_identities_json)
+                AND json_type(applied_identities_json) = 'array'
+                AND json_array_length(applied_identities_json) <= 1024
+            )
+        );
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {
