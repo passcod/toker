@@ -2206,6 +2206,7 @@ mod tests {
         assert_eq!(
             policy
                 .anthropic_profiles()
+                .into_iter()
                 .map(|profile| profile.to_string())
                 .collect::<Vec<_>>(),
             ["claude", "workhorse"]
