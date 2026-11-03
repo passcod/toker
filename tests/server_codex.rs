@@ -395,6 +395,35 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
     }
 }
 
+async fn mock_openrouter_chat(State(mock): State<MockState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    mock.requests.lock().unwrap().push(CapturedRequest {
+        path: parts.uri.path().to_owned(),
+        headers: parts.headers,
+        body,
+    });
+    raw_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(
+            json!({
+                "id": "chatcmpl-final",
+                "object": "chat.completion",
+                "model": value["model"],
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            })
+            .to_string(),
+        ),
+    )
+}
+
 async fn mock_openrouter_responses(State(mock): State<MockState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
@@ -611,6 +640,7 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
         .route("/backend-api/codex/responses", post(mock_responses))
         .route("/backend-api/codex/models", get(mock_models))
         .route("/v1/messages", post(mock_anthropic_messages))
+        .route("/v1/chat/completions", post(mock_openrouter_chat))
         .route("/v1/responses", post(mock_openrouter_responses))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -674,6 +704,39 @@ where
     T::Err: std::fmt::Debug,
 {
     value.parse().unwrap()
+}
+
+fn chat_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    let mut policy = messages_codex_fallback_policy_with_model("failed-precommit").into_document();
+    policy.description = Some("Chat Codex fallback fixture".to_owned());
+    policy.defaults[0].scope = FrontendScope::Protocol {
+        protocol: FrontendProtocol::OpenaiChat,
+    };
+    policy.routes[0].chain.steps[0].candidate.model = CandidateModel::Exact {
+        model_id: "overloaded".to_owned(),
+    };
+    policy.routes[0].chain.steps.push(RouteStep {
+        edge: CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![FailureClass::Overload],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        },
+        candidate: Candidate {
+            id: CandidateId::new("last").unwrap(),
+            binding_id: toker::routing::OPENROUTER_CHAT.id().clone(),
+            model: CandidateModel::Exact {
+                model_id: "final".to_owned(),
+            },
+            upgrade_policy_id: None,
+            alias_policy: None,
+            required_capabilities: Default::default(),
+            enabled: true,
+            health_circuits: vec![],
+        },
+    });
+    policy.validate().unwrap()
 }
 
 fn messages_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
@@ -1644,6 +1707,55 @@ async fn explicit_anthropic_chat_route_needs_no_chat_default() {
         .expect("chat answers");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn active_chat_policy_falls_back_from_codex_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("chat-codex-fallback", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) = spawn_toker_with_policy(fixture, chat_codex_fallback_policy()).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-toker-session", "chat-codex-fallback")
+        .json(&json!({
+            "model": "asked-model",
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Chat fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    assert_eq!(requests[2].path, "/v1/chat/completions");
+    let rows = wait_for_rows(&store, 3).await;
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        attempts
+            .windows(2)
+            .all(|pair| { pair[0].attempt_group_id == pair[1].attempt_group_id })
+    );
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(rows[2].provider.as_deref(), Some("openrouter"));
 }
 
 #[tokio::test]

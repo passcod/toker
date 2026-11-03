@@ -563,6 +563,14 @@ impl ReadyAttempt {
         self.record.as_ref()?.attempt.as_ref()
     }
 
+    pub(crate) fn record(&self) -> &Option<AnthropicRecordCtx> {
+        &self.record
+    }
+
+    pub(crate) fn parts(&self) -> &axum::http::request::Parts {
+        &self.parts
+    }
+
     pub(crate) fn take_retry_state(
         &mut self,
     ) -> (
