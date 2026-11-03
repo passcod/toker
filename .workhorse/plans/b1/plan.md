@@ -127,7 +127,7 @@ Full `cargo test` remains blocked by six pre-existing Codex policy-fallback
 failures in `tests/server_codex.rs`; these failures are outside this card's
 control and TUI paths.
 
-DO NOT ADD A TUI. THIS COMES IN A FUTURE CARD.
+DO NOT ADD A TUI. THIS COMES IN A FUTURE CARD. YOU HAVE ACCESS TO THE GODDAMNED WORKHORSE MCP. USE IT FOR FUCK'S SAKE.
 
 ## Tests
 
