@@ -127,6 +127,8 @@ Full `cargo test` remains blocked by six pre-existing Codex policy-fallback
 failures in `tests/server_codex.rs`; these failures are outside this card's
 control and TUI paths.
 
+DO NOT ADD A TUI. THIS COMES IN A FUTURE CARD.
+
 ## Tests
 
 Server tests drive the real router and cover every operation’s correct gate,
