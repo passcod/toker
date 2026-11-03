@@ -559,6 +559,10 @@ impl ReadyAttempt {
         self.frontend_wire
     }
 
+    pub(crate) fn attempt_provenance(&self) -> Option<&crate::store::AttemptProvenance> {
+        self.record.as_ref()?.attempt.as_ref()
+    }
+
     pub(crate) fn take_retry_state(
         &mut self,
     ) -> (

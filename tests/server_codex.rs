@@ -676,6 +676,75 @@ where
     value.parse().unwrap()
 }
 
+fn messages_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    let route_id = RouteId::new("messages-codex-fallback").unwrap();
+    PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("Messages Codex fallback fixture".to_owned()),
+        defaults: vec![DefaultRoute {
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            target: RouteReference {
+                route_id: route_id.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        }],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id,
+            display_name: "Messages Codex fallback".to_owned(),
+            description: None,
+            parameters: vec![REQUESTED_MODEL_PARAMETER.parse().unwrap()],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("codex").unwrap(),
+                    binding_id: CODEX_SUB_RESPONSES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "failed-precommit".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![FailureClass::ServerError],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: Candidate {
+                        id: CandidateId::new("anthropic").unwrap(),
+                        binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                        model: CandidateModel::Exact {
+                            model_id: "backup".to_owned(),
+                        },
+                        upgrade_policy_id: None,
+                        alias_policy: None,
+                        required_capabilities: Default::default(),
+                        enabled: true,
+                        health_circuits: vec![],
+                    },
+                }],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap()
+}
+
 fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
     responses_fallback_chain(false, false)
 }
@@ -1569,6 +1638,47 @@ async fn explicit_anthropic_chat_route_needs_no_chat_default() {
         .expect("chat answers");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn active_messages_policy_falls_back_from_codex_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = anthropic_responses_config("messages-codex-fallback", upstream);
+    let (addr, store) = spawn_toker_with_policy(fixture, messages_codex_fallback_policy()).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-toker-session", "messages-codex-fallback")
+        .body(messages_body("asked-model", false))
+        .send()
+        .await
+        .expect("Messages fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    let rows = wait_for_rows(&store, 2).await;
+    let first = rows[0].attempt.as_ref().unwrap();
+    let second = rows[1].attempt.as_ref().unwrap();
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(second.attempt_index.get(), 1);
+    assert_eq!(second.reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("messages-codex-fallback"))
+        .expect("fallback success pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
+        Some("anthropic")
+    );
 }
 
 #[tokio::test]

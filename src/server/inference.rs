@@ -592,6 +592,104 @@ fn record_messages_failure(
     );
 }
 
+enum MessagesFailureTerminal {
+    Native {
+        response: MessagesFailureResponse,
+        response_model: String,
+        response_projection: crate::ir::canonical::ResponseProjection,
+        expected_stream: bool,
+        rate_limits: Option<Value>,
+    },
+    Codex {
+        ready: Box<super::codex::ReadyAttempt>,
+        response: super::codex::FailureResponse,
+    },
+}
+
+struct PolicyMessagesFailure {
+    failure: super::attempt::AttemptFailure,
+    parts: Parts,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    provenance: crate::store::AttemptProvenance,
+    cancellation: super::cancel::PrecommitCancellationGuard,
+    terminal: MessagesFailureTerminal,
+}
+
+impl PolicyMessagesFailure {
+    fn record(&self) {
+        match &self.terminal {
+            MessagesFailureTerminal::Native {
+                response,
+                rate_limits,
+                ..
+            } => record_messages_failure(
+                self.record.as_ref(),
+                &self.failure,
+                response,
+                rate_limits.as_ref(),
+            ),
+            MessagesFailureTerminal::Codex { ready, .. } => super::codex::record_failure(
+                self.record.as_ref(),
+                ready.frontend_wire(),
+                &self.failure,
+            ),
+        }
+    }
+
+    async fn finish(self, server: &Server) -> Response {
+        let Self {
+            failure,
+            parts,
+            record,
+            in_flight,
+            provenance,
+            cancellation,
+            terminal,
+        } = self;
+        match terminal {
+            MessagesFailureTerminal::Native {
+                response,
+                response_model,
+                response_projection,
+                expected_stream,
+                rate_limits,
+            } => {
+                finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    response_projection,
+                    expected_stream,
+                    rate_limits,
+                    provenance,
+                    cancellation,
+                })
+                .await
+            }
+            MessagesFailureTerminal::Codex {
+                mut ready,
+                response,
+            } => {
+                ready.restore_terminal_state(record, in_flight);
+                super::codex::finish(
+                    super::codex::ReadyOutcome::Failure {
+                        ready: *ready,
+                        failure,
+                        response,
+                        cancellation,
+                    },
+                    server.clone(),
+                )
+                .await
+            }
+        }
+    }
+}
+
 enum ChatFailureResponse {
     Upstream(reqwest::Response),
     Local(Response),
@@ -1036,12 +1134,8 @@ pub(crate) async fn coordinate_messages(
         server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
         return ready.execute(server, provenance).await;
     };
-    let ReadyBackendAttempt::Messages(ready) = ready else {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        return ready.execute(server, provenance).await;
-    };
     let inference = inference.expect("an authoritative Messages attempt retains its baseline");
-    coordinate_native_messages(
+    coordinate_policy_messages(
         server,
         ready,
         provenance,
@@ -1098,10 +1192,82 @@ async fn prepare_messages_backend(
     }
 }
 
+async fn execute_policy_messages_precommit(
+    server: &Server,
+    ready: ReadyBackendAttempt,
+    provenance: crate::store::AttemptProvenance,
+) -> Result<Response, Box<PolicyMessagesFailure>> {
+    match ready {
+        ReadyBackendAttempt::Messages(ready) => {
+            match ready.execute_precommit(server, provenance).await {
+                outcome @ ReadyMessagesOutcome::Accepted { .. } => {
+                    Ok(finish_messages_outcome(outcome).await)
+                }
+                ReadyMessagesOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    response_projection,
+                    expected_stream,
+                    rate_limits,
+                    provenance,
+                    cancellation,
+                } => Err(Box::new(PolicyMessagesFailure {
+                    failure,
+                    parts,
+                    record,
+                    in_flight,
+                    provenance,
+                    cancellation,
+                    terminal: MessagesFailureTerminal::Native {
+                        response,
+                        response_model,
+                        response_projection,
+                        expected_stream,
+                        rate_limits,
+                    },
+                })),
+            }
+        }
+        ReadyBackendAttempt::Codex(ready) => {
+            match ready.execute_precommit(server, provenance.clone()).await {
+                outcome @ super::codex::ReadyOutcome::Accepted { .. } => {
+                    Ok(super::codex::finish(outcome, server.clone()).await)
+                }
+                super::codex::ReadyOutcome::Failure {
+                    mut ready,
+                    failure,
+                    response,
+                    cancellation,
+                } => {
+                    let provenance = ready.attempt_provenance().cloned().unwrap_or(provenance);
+                    let (parts, record, in_flight) = ready.take_retry_state();
+                    Err(Box::new(PolicyMessagesFailure {
+                        failure,
+                        parts,
+                        record,
+                        in_flight,
+                        provenance,
+                        cancellation,
+                        terminal: MessagesFailureTerminal::Codex {
+                            ready: Box::new(ready),
+                            response,
+                        },
+                    }))
+                }
+            }
+        }
+        ready => Ok(ready.execute(server.clone(), provenance).await),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn coordinate_native_messages(
+async fn coordinate_policy_messages(
     server: Server,
-    mut ready: ReadyMessagesAttempt,
+    mut ready: ReadyBackendAttempt,
     mut provenance: crate::store::AttemptProvenance,
     mut policy_attempt: super::PolicyAttempt,
     inference: InferenceRequest,
@@ -1110,74 +1276,23 @@ async fn coordinate_native_messages(
 ) -> Response {
     loop {
         server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        let outcome = ready.execute_precommit(&server, provenance.clone()).await;
-        let ReadyMessagesOutcome::Failure {
-            failure,
-            response,
-            parts,
-            mut record,
-            in_flight,
-            response_model,
-            response_projection,
-            expected_stream,
-            rate_limits,
-            provenance: failed_provenance,
-            mut cancellation,
-        } = outcome
-        else {
-            return finish_messages_outcome(outcome).await;
-        };
+        let mut failed =
+            match execute_policy_messages_precommit(&server, ready, provenance.clone()).await {
+                Ok(response) => return response,
+                Err(failed) => failed,
+            };
+        let failure = failed.failure.clone();
+        let failed_provenance = failed.provenance.clone();
         let Some(class) = failure.class else {
-            return finish_messages_outcome(ReadyMessagesOutcome::Failure {
-                failure,
-                response,
-                parts,
-                record,
-                in_flight,
-                response_model,
-                response_projection,
-                expected_stream,
-                rate_limits,
-                provenance: failed_provenance,
-                cancellation,
-            })
-            .await;
+            return failed.finish(&server).await;
         };
         server.open_policy_circuit(&policy_attempt, class, super::record::now_ms());
         let next = match server.continue_policy_attempt(&policy_attempt, class) {
             Ok(Some(next)) => next,
-            Ok(None) => {
-                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    response_projection,
-                    expected_stream,
-                    rate_limits,
-                    provenance: failed_provenance,
-                    cancellation,
-                })
-                .await;
-            }
+            Ok(None) => return failed.finish(&server).await,
             Err(error) => {
                 tracing::error!(%error, "policy fallback continuation failed");
-                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    response_projection,
-                    expected_stream,
-                    rate_limits,
-                    provenance: failed_provenance,
-                    cancellation,
-                })
-                .await;
+                return failed.finish(&server).await;
             }
         };
         let target = match server.registry.resolve_binding(
@@ -1189,43 +1304,16 @@ async fn coordinate_native_messages(
             Ok(target) => target,
             Err(error) => {
                 tracing::error!(?error, binding_id = %next.plan.binding_id, "policy fallback selected an unavailable Messages binding");
-                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
-                    failure,
-                    response,
-                    parts,
-                    record,
-                    in_flight,
-                    response_model,
-                    response_projection,
-                    expected_stream,
-                    rate_limits,
-                    provenance: failed_provenance,
-                    cancellation,
-                })
-                .await;
+                return failed.finish(&server).await;
             }
         };
         let Some(next_provenance) = super::attempt::next_provenance(&failed_provenance, class)
         else {
-            return finish_messages_outcome(ReadyMessagesOutcome::Failure {
-                failure,
-                response,
-                parts,
-                record,
-                in_flight,
-                response_model,
-                response_projection,
-                expected_stream,
-                rate_limits,
-                provenance: failed_provenance,
-                cancellation,
-            })
-            .await;
+            return failed.finish(&server).await;
         };
-        record_messages_failure(record.as_ref(), &failure, &response, rate_limits.as_ref());
-        cancellation.disarm();
-        drop(response);
-        if let Some(ctx) = record.as_mut() {
+        failed.record();
+        failed.cancellation.disarm();
+        if let Some(ctx) = failed.record.as_mut() {
             ctx.backend = target.provider().clone();
             ctx.binding_id = next.plan.binding_id.clone();
             ctx.attempt = None;
@@ -1238,6 +1326,9 @@ async fn coordinate_native_messages(
             ctx.effective_model = Some(next.plan.effective_model.clone());
             ctx.policy_attempt = Some(Arc::new(next.clone()));
         }
+        let parts = failed.parts;
+        let mut record = failed.record;
+        let in_flight = failed.in_flight;
         let adapter = target
             .binding()
             .canonical_backend()
@@ -1262,13 +1353,7 @@ async fn coordinate_native_messages(
         };
         provenance = next_provenance;
         policy_attempt = next;
-        match prepared {
-            ReadyBackendAttempt::Messages(next) => ready = next,
-            prepared => {
-                server.note_binding_sent(prepared.binding_id(), Some(prepared.effective_model()));
-                return prepared.execute(server, provenance).await;
-            }
-        }
+        ready = prepared;
     }
 }
 
