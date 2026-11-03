@@ -240,7 +240,6 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
         window_mins,
         &config.transcript_roots,
         &config.gates,
-        config.port,
     )
 }
 
