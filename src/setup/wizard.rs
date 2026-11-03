@@ -75,6 +75,7 @@ use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
 use crate::setup::{Step, plan};
+use crate::store::Store;
 use crate::timers::{self, HOLD_UNIT_FOR, PING_DELAY_MINUTES};
 
 /// The enabled unit (the socket). The service is never enabled
@@ -2218,7 +2219,11 @@ impl<'a> Wizard<'a> {
             return Ok(());
         }
         let installed = self.paths.units_dir.join(PICKER_TIMER_UNIT).exists();
-        if config.openrouter.is_none() {
+        let database_owned = Store::open(&config.db_path)
+            .ok()
+            .and_then(|store| store.load_routing_policy_state().ok())
+            .is_some_and(|state| state.active_revision_id.is_some());
+        if config.openrouter.is_none() && !database_owned {
             if !installed {
                 return Ok(());
             }
@@ -2228,7 +2233,7 @@ impl<'a> Wizard<'a> {
                 "no openrouter backend: rows and timer removed".to_owned()
             } else {
                 format!(
-                    "no openrouter backend: NOT fully removed — finish by hand: \
+                    "no OpenRouter backend: NOT fully removed — finish by hand: \
                      systemctl --user start {PICKER_SERVICE_UNIT} && \
                      systemctl --user disable --now {PICKER_TIMER_UNIT}"
                 )

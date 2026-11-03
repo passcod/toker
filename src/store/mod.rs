@@ -3012,6 +3012,100 @@ mod tests {
     }
 
     #[test]
+    fn applied_publications_require_canonical_exact_identities_and_reject_late_failures() {
+        let store = mem_store();
+        let revision_id = revision(&store, "publication identities", None);
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
+        store
+            .set_publication_desired(&key, revision_id, 1, 1)
+            .unwrap();
+        let no_identities = store.compare_and_swap_publication_result(
+            &key,
+            revision_id,
+            1,
+            &PublicationResultUpdate {
+                state: PublicationState::Applied,
+                applied_identities: None,
+                detail_code: None,
+                updated_ms: 2,
+            },
+        );
+        assert!(matches!(no_identities, Err(Error::InvalidRoutingState(_))));
+
+        let identities = BTreeSet::new();
+        assert_eq!(
+            store
+                .compare_and_swap_publication_result(
+                    &key,
+                    revision_id,
+                    1,
+                    &PublicationResultUpdate {
+                        state: PublicationState::Applied,
+                        applied_identities: Some(identities),
+                        detail_code: None,
+                        updated_ms: 3,
+                    },
+                )
+                .unwrap(),
+            PublicationCasResult::Updated
+        );
+        let late = store
+            .compare_and_swap_publication_result(
+                &key,
+                revision_id,
+                1,
+                &PublicationResultUpdate {
+                    state: PublicationState::Failed,
+                    applied_identities: None,
+                    detail_code: Some(StableId::new("write_failed").unwrap()),
+                    updated_ms: 4,
+                },
+            )
+            .unwrap();
+        assert!(matches!(late, PublicationCasResult::Conflict { .. }));
+
+        store
+            .execute_for_test(
+                "UPDATE routing_publications
+                 SET applied_identities_json = '[\"z\",\"a\"]'
+                 WHERE scope_key = 'protocol:anthropic_messages'",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_publication(&key),
+            Err(Error::InvalidRoutingState(_))
+        ));
+
+        let large = (0..crate::policy::MAX_COLLECTION_ITEMS)
+            .map(|index| {
+                format!(
+                    "{index:04}-{}",
+                    "x".repeat(crate::policy::MAX_STRING_BYTES - 5)
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(matches!(
+            store.compare_and_swap_publication_result(
+                &key,
+                revision_id,
+                1,
+                &PublicationResultUpdate {
+                    state: PublicationState::Applied,
+                    applied_identities: Some(large),
+                    detail_code: None,
+                    updated_ms: 5,
+                },
+            ),
+            Err(Error::InvalidRoutingState(_))
+        ));
+    }
+
+    #[test]
     fn binding_learning_merge_unions_maxes_replaces_and_promotes() {
         let store = mem_store();
         let binding = BindingId::new("openrouter.openrouter_messages").unwrap();

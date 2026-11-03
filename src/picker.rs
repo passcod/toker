@@ -17,7 +17,7 @@
 //! it may not write outside the state dir, so `toker picker sync` runs
 //! as the user, from setup and from the daily picker timer.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Context, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -27,9 +27,14 @@ use serde_json::{Value, json};
 use crate::catalog::windows::verified_ids;
 use crate::catalog::{fetched, offers};
 use crate::middleware::models::{family_of, newest_in_family};
+use crate::policy::{AdapterMetadata, FrontendProtocol, ProfileId};
 use crate::providers::{OpenRouter, Provider};
 use crate::routing::{ProtocolId, RouteRegistry};
 use crate::store::ModelEntry;
+use crate::store::{
+    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+    PublicationState, RoutingPublication, Store,
+};
 
 /// The prefix that routes a model to openrouter on the Anthropic wire,
 /// and marks a picker row as toker's: rows whose `model` starts with it
@@ -395,6 +400,82 @@ pub fn resolve_behaves_as(value: &str, learned: &[ModelEntry]) -> Option<String>
     })
 }
 
+fn claude_publication_key() -> anyhow::Result<PublicationKey> {
+    Ok(PublicationKey::new(
+        crate::policy::FrontendScope::Protocol {
+            protocol: FrontendProtocol::AnthropicMessages,
+        },
+        PublicationAdapter::new("claude_settings")?,
+    ))
+}
+
+fn configured_bindings(config: &crate::config::Config) -> BTreeSet<crate::policy::BindingId> {
+    let enabled = config.enabled_backends();
+    crate::routing::BACKEND_BINDINGS
+        .iter()
+        .filter(|binding| enabled.contains(&binding.provider()))
+        .filter(|binding| binding.canonical_backend().is_some())
+        .map(|binding| binding.id().clone())
+        .collect()
+}
+
+fn policy_rows(policy: &crate::policy::CompiledPolicy) -> anyhow::Result<Vec<Row>> {
+    let profile = ProfileId::new("claude")?;
+    policy
+        .publication(Some(&profile), FrontendProtocol::AnthropicMessages)
+        .into_values()
+        .filter_map(|presentation| {
+            let AdapterMetadata::Claude { behaves_as } = presentation.metadata()? else {
+                return None;
+            };
+            let behaves_as = behaves_as.as_ref()?;
+            Some(Row {
+                model: presentation.slug().to_owned(),
+                label: presentation
+                    .label()
+                    .unwrap_or_else(|| presentation.slug())
+                    .to_owned(),
+                description: presentation.description().unwrap_or_default().to_owned(),
+                behaves_as: behaves_as.to_owned(),
+            })
+        })
+        .map(|row| {
+            if row.model.is_empty() {
+                bail!("policy generated an empty Claude picker model")
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
+fn cached_policy_rows(
+    config: &crate::config::Config,
+    store: &Store,
+) -> anyhow::Result<(Vec<Row>, RoutingPublication)> {
+    let key = claude_publication_key()?;
+    let publication = store
+        .load_publication(&key)?
+        .context("active policy has no Claude settings publication")?;
+    let revision = store
+        .load_policy_revision(publication.desired_revision_id)?
+        .context("Claude settings publication references no policy revision")?;
+    let catalogs = fetched::cache_dir()
+        .map(|dir| fetched::load_cached(&dir))
+        .unwrap_or_default();
+    let registry = RouteRegistry::configured_bindings(configured_bindings(config));
+    let inventory = offers::inventory(&registry, &catalogs);
+    let policy = crate::policy::runtime::compile_stored_revision(&revision, &registry, &inventory)
+        .into_policy()
+        .map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "active policy revision {} has {} compilation diagnostics",
+                revision.revision_id,
+                diagnostics.len()
+            )
+        })?;
+    Ok((policy_rows(&policy)?, publication))
+}
+
 /// What one sync did.
 #[derive(Debug)]
 pub struct SyncReport {
@@ -416,6 +497,14 @@ pub async fn sync(
     http: &reqwest::Client,
     dry_run: bool,
 ) -> anyhow::Result<SyncReport> {
+    let store = Store::open(&config.db_path)?;
+    if store
+        .load_routing_policy_state()?
+        .active_revision_id
+        .is_some()
+    {
+        return sync_active_policy(config, &store, settings, dry_run);
+    }
     let (rows, warnings) = match &config.openrouter {
         None => (Vec::new(), Vec::new()),
         Some(openrouter) => {
@@ -474,6 +563,142 @@ pub async fn sync(
         warnings,
         changed,
     })
+}
+
+fn sync_active_policy(
+    config: &crate::config::Config,
+    store: &Store,
+    settings: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<SyncReport> {
+    let key = claude_publication_key()?;
+    let (rows, publication) = cached_policy_rows(config, store)?;
+    if dry_run {
+        return Ok(SyncReport {
+            rows,
+            warnings: Vec::new(),
+            changed: false,
+        });
+    }
+
+    let json: Vec<_> = rows.iter().map(Row::to_json).collect();
+    let (changed, identities) = match crate::setup::patchers::reconcile_model_picker(
+        settings,
+        publication.applied_identities.as_ref(),
+        &json,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            record_failed_publication(store, &key, &publication);
+            return Err(error);
+        }
+    };
+    let update = PublicationResultUpdate {
+        state: PublicationState::Applied,
+        applied_identities: Some(identities.clone()),
+        detail_code: None,
+        updated_ms: jiff::Timestamp::now().as_millisecond(),
+    };
+    match store.compare_and_swap_publication_result(
+        &key,
+        publication.desired_revision_id,
+        publication.desired_inventory_generation,
+        &update,
+    )? {
+        PublicationCasResult::Updated => Ok(SyncReport {
+            rows,
+            warnings: Vec::new(),
+            changed,
+        }),
+        PublicationCasResult::Conflict {
+            current: Some(current),
+        } if current.state == PublicationState::Applied
+            && current.desired_revision_id == publication.desired_revision_id
+            && current.desired_inventory_generation == publication.desired_inventory_generation =>
+        {
+            Ok(SyncReport {
+                rows,
+                warnings: Vec::new(),
+                changed,
+            })
+        }
+        PublicationCasResult::Conflict {
+            current: Some(current),
+        } => {
+            // This process wrote `identities`, but a new desired snapshot won
+            // the state race before it could record them. Take those exact
+            // rows into the immediate retry so the newer policy can converge
+            // without mistaking the prior write for a user collision.
+            let (rows, publication) = cached_policy_rows(config, store)?;
+            if publication.desired_revision_id != current.desired_revision_id
+                || publication.desired_inventory_generation != current.desired_inventory_generation
+            {
+                bail!("Claude picker changed while synchronising; run `toker picker sync` again");
+            }
+            let mut prior = publication.applied_identities.clone().unwrap_or_default();
+            prior.extend(identities);
+            let json: Vec<_> = rows.iter().map(Row::to_json).collect();
+            let (retry_changed, identities) =
+                match crate::setup::patchers::reconcile_model_picker(settings, Some(&prior), &json)
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        record_failed_publication(store, &key, &publication);
+                        return Err(error);
+                    }
+                };
+            let update = PublicationResultUpdate {
+                state: PublicationState::Applied,
+                applied_identities: Some(identities),
+                detail_code: None,
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+            };
+            match store.compare_and_swap_publication_result(
+                &key,
+                publication.desired_revision_id,
+                publication.desired_inventory_generation,
+                &update,
+            )? {
+                PublicationCasResult::Updated => Ok(SyncReport {
+                    rows,
+                    warnings: Vec::new(),
+                    changed: changed || retry_changed,
+                }),
+                PublicationCasResult::Conflict { .. } => {
+                    bail!(
+                        "Claude picker changed while synchronising; run `toker picker sync` again"
+                    )
+                }
+            }
+        }
+        PublicationCasResult::Conflict { current: None } => {
+            bail!("Claude picker publication disappeared while synchronising")
+        }
+    }
+}
+
+fn record_failed_publication(
+    store: &Store,
+    key: &PublicationKey,
+    publication: &RoutingPublication,
+) {
+    let update = PublicationResultUpdate {
+        state: PublicationState::Failed,
+        applied_identities: None,
+        detail_code: Some(
+            crate::policy::StableId::new("settings_write_failed")
+                .expect("static publication failure code"),
+        ),
+        updated_ms: jiff::Timestamp::now().as_millisecond(),
+    };
+    if let Err(error) = store.compare_and_swap_publication_result(
+        key,
+        publication.desired_revision_id,
+        publication.desired_inventory_generation,
+        &update,
+    ) {
+        tracing::error!(%error, "could not record failed Claude picker publication");
+    }
 }
 
 #[cfg(test)]
