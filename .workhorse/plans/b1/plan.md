@@ -114,17 +114,17 @@ desired state. Free-form external error text is not accepted or stored.
 
 ## Implementation
 
-- [x] Add atomic Store transactions for live apply and restore-as-new-revision.
-- [x] Add Server orchestration that compiles a candidate against one captured
+- [ ] Add atomic Store transactions for live apply and restore-as-new-revision.
+- [ ] Add Server orchestration that compiles a candidate against one captured
   inventory, persists the revision, and swaps the live runtime after commit.
-- [x] Add gated routing snapshot, apply, history, restore, promotion, and
+- [ ] Add gated routing snapshot, apply, history, restore, promotion, and
   publication-result endpoints.
-- [x] Add a routing TUI page: Tab switches pages, e opens the active document
+- [ ] Add a routing TUI page: Tab switches pages, e opens the active document
   in `$EDITOR` for immediate apply, and Enter restores a selected revision after
   a second confirmation.
-- [x] Cover the control boundary and all live revision transitions with router
+- [ ] Cover the control boundary and all live revision transitions with router
   and Store tests.
-- [x] Run formatting, focused unit/integration tests, and clippy.
+- [ ] Run formatting, focused unit/integration tests, and clippy.
 
 Full `cargo test` remains blocked by six pre-existing Codex policy-fallback
 failures in `tests/server_codex.rs`; these failures are outside this card's
