@@ -18,8 +18,3 @@
 
 - [ ] Promotion requires a binding ID and updates only that binding’s learned model state. Verifies spec: RCTL
 - [ ] A publication acknowledgement with stale desired revision or inventory generation does not overwrite the current publication row. Verifies spec: RCTL
-
-## Terminal workflow
-
-- [ ] Tab switches between the operational dashboard and routing page. Verifies spec: RCTL
-- [ ] The routing page shows active configuration and revision history, applies a saved `$EDITOR` edit immediately, and requires a second Enter before restoring a historical revision. Verifies spec: RCTL
