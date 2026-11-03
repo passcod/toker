@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 
 use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
 use crate::catalog::offers;
@@ -90,9 +90,9 @@ use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::policy::{
-    ActivationScope, AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence,
-    FrontendProtocol, LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId,
-    RequestClass, RequestFacts, ShadowObserver, TracingObserver, ValidatedPolicyDocument,
+    AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
+    LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
+    RequestFacts, ShadowObserver, TracingObserver,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
@@ -130,30 +130,6 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// read timeout: the API sends pings through a long turn, so five minutes
 /// of silence is a dead stream, not a slow one.
 pub const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum RoutingControlError {
-    #[error("live routing is not active")]
-    Inactive,
-    #[error("routing revision {0} does not exist")]
-    MissingRevision(i64),
-    #[error(transparent)]
-    Store(#[from] crate::store::Error),
-}
-
-#[derive(Debug)]
-pub(crate) enum RoutingMutationError {
-    Invalid {
-        diagnostics: Vec<crate::policy::Diagnostic>,
-    },
-    Control(RoutingControlError),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RoutingActivation {
-    pub(crate) activation: crate::store::PolicyActivation,
-    pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PolicyAttemptError {
@@ -232,10 +208,6 @@ pub struct Server {
     /// non-authoritative policy evidence; revision-one routing continues to
     /// read [`Self::models`].
     pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
-    /// Serialises a live policy mutation against another mutation. Catalogue
-    /// refresh may proceed independently because each runtime replacement keeps
-    /// a whole immutable snapshot.
-    routing_mutation: Arc<Mutex<()>>,
     /// The fetched models catalogues (one per source: openrouter's
     /// public listing, anthropic's presence list, the codex backend's
     /// own models endpoint — see [`crate::catalog::fetched`]), projected
@@ -601,7 +573,6 @@ impl Server {
             codex_turn,
             models,
             binding_learning,
-            routing_mutation: Arc::default(),
             catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
             catalog_dir,
             catalog_borrowed_at: Arc::default(),
@@ -722,180 +693,6 @@ impl Server {
             .as_ref()
             .and_then(|runtime| runtime.capture())
             .is_some_and(|snapshot| snapshot.revision_id().is_some())
-    }
-
-    /// Apply an authored routing document immediately. Compilation is complete
-    /// before the Store transaction starts, so an invalid document cannot
-    /// replace either the persisted active revision or the live snapshot.
-    pub(crate) fn apply_routing_policy(
-        &self,
-        document: &ValidatedPolicyDocument,
-        description: Option<&str>,
-    ) -> Result<RoutingActivation, RoutingMutationError> {
-        let _mutation = self
-            .routing_mutation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let catalogs = self
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let inventory = offers::inventory(&self.registry, &catalogs);
-        let availability = availability_for(&self.registry, &catalogs);
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or(RoutingMutationError::Control(RoutingControlError::Inactive))?;
-        let active_revision_id = runtime
-            .capture()
-            .and_then(|snapshot| snapshot.revision_id())
-            .ok_or(RoutingMutationError::Control(RoutingControlError::Inactive))?;
-        let active_revision = self
-            .store
-            .load_policy_revision(active_revision_id)
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?
-            .ok_or(RoutingMutationError::Control(
-                RoutingControlError::MissingRevision(active_revision_id),
-            ))?;
-        let compilation = crate::policy::compile(
-            document.clone(),
-            &self.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::Authored,
-        );
-        let authored_diagnostics = compilation.diagnostics().to_vec();
-        let (policy, diagnostics, source) = match compilation.into_policy() {
-            Ok(policy) => (
-                policy,
-                authored_diagnostics,
-                crate::store::PolicyRevisionSource::Applied,
-            ),
-            Err(authored_diagnostics)
-                if active_revision.source == crate::store::PolicyRevisionSource::Legacy =>
-            {
-                let legacy = crate::policy::legacy::compile_document(
-                    document.clone(),
-                    &self.registry,
-                    &inventory,
-                );
-                let diagnostics = legacy.diagnostics().to_vec();
-                let policy = legacy
-                    .into_policy()
-                    .map_err(|_| RoutingMutationError::Invalid {
-                        diagnostics: authored_diagnostics,
-                    })?;
-                (
-                    policy,
-                    diagnostics,
-                    crate::store::PolicyRevisionSource::Legacy,
-                )
-            }
-            Err(diagnostics) => return Err(RoutingMutationError::Invalid { diagnostics }),
-        };
-        let publication_generation = fetched::snapshot_generation(&catalogs);
-        let publications = publication_targets()
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?;
-        let now = now_ms();
-        let activation = self
-            .store
-            .apply_policy_revision(
-                document,
-                crate::store::PolicyActivationInput {
-                    created_ms: now,
-                    activated_ms: now,
-                    description,
-                    activation_scope: ActivationScope::NewLanes,
-                    forced_cache_transition: false,
-                },
-                source,
-                publication_generation,
-                &publications,
-            )
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?;
-        runtime.replace_active(
-            &activation.revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(availability),
-            &std::collections::BTreeSet::new(),
-        );
-        Ok(RoutingActivation {
-            activation,
-            diagnostics,
-        })
-    }
-
-    /// Restore a selected immutable revision as a new live revision. Loading
-    /// and compiling happen before the transaction so invalid historical data
-    /// cannot change the active pointer.
-    pub(crate) fn restore_routing_policy(
-        &self,
-        revision_id: i64,
-        description: Option<&str>,
-    ) -> Result<RoutingActivation, RoutingMutationError> {
-        let _mutation = self
-            .routing_mutation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let catalogs = self
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let inventory = offers::inventory(&self.registry, &catalogs);
-        let availability = availability_for(&self.registry, &catalogs);
-        let selected = self
-            .store
-            .load_policy_revision(revision_id)
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?
-            .ok_or(RoutingMutationError::Control(
-                RoutingControlError::MissingRevision(revision_id),
-            ))?;
-        let compilation =
-            crate::policy::runtime::compile_stored_revision(&selected, &self.registry, &inventory);
-        let diagnostics = compilation.diagnostics().to_vec();
-        let policy = compilation
-            .into_policy()
-            .map_err(|diagnostics| RoutingMutationError::Invalid { diagnostics })?;
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or(RoutingMutationError::Control(RoutingControlError::Inactive))?;
-        let publication_generation = fetched::snapshot_generation(&catalogs);
-        let publications = publication_targets()
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?;
-        let now = now_ms();
-        let activation = self
-            .store
-            .reactivate_policy_revision(
-                revision_id,
-                crate::store::PolicyActivationInput {
-                    created_ms: now,
-                    activated_ms: now,
-                    description,
-                    activation_scope: ActivationScope::NewLanes,
-                    forced_cache_transition: false,
-                },
-                publication_generation,
-                &publications,
-            )
-            .map_err(RoutingControlError::from)
-            .map_err(RoutingMutationError::Control)?;
-        runtime.replace_active(
-            &activation.revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(availability),
-            &std::collections::BTreeSet::new(),
-        );
-        Ok(RoutingActivation {
-            activation,
-            diagnostics,
-        })
     }
 
     pub(crate) fn active_publication(
@@ -1546,18 +1343,6 @@ impl Server {
             .route("/_toker/session", get(control::session))
             .route("/_toker/models/merge", post(control::models_merge))
             .route("/_toker/shutdown", post(control::shutdown))
-            .route("/_toker/routing/snapshot", any(control::routing::snapshot))
-            .route("/_toker/routing/apply", any(control::routing::apply))
-            .route(
-                "/_toker/routing/revisions",
-                any(control::routing::revisions),
-            )
-            .route("/_toker/routing/restore", any(control::routing::restore))
-            .route("/_toker/routing/promote", any(control::routing::promote))
-            .route(
-                "/_toker/routing/publication",
-                any(control::routing::publication),
-            )
             // Everything else passes through to the default anthropic
             // backend, as the predecessor forwarded every path but its
             // control path. A known path with the wrong method still
