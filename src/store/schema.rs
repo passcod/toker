@@ -817,6 +817,25 @@ pub(super) const MIGRATIONS: &[&str] = &[
         detail_code = 'legacy_applied_identities_unknown'
     WHERE state = 'applied' AND applied_identities_json IS NULL;
     "#,
+    // v15 — revision history source records the operation that created it;
+    // compiler origin records document semantics. Restoring generated revision
+    // one is a reactivation that must still compile with legacy compatibility.
+    r#"
+    ALTER TABLE routing_policy_revisions ADD COLUMN compiler_origin TEXT
+        NOT NULL DEFAULT 'authored' CHECK (
+            compiler_origin IN ('authored', 'generated_revision_one')
+        );
+    UPDATE routing_policy_revisions
+    SET compiler_origin = 'generated_revision_one'
+    WHERE source = 'legacy'
+       OR source = 'reactivation'
+          AND parent_revision_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM routing_policy_revisions AS parent
+              WHERE parent.revision_id = routing_policy_revisions.parent_revision_id
+                AND parent.source = 'legacy'
+          );
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

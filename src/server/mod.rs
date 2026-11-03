@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 
 use crate::catalog::fetched::{self, FetchedCatalog, FetchedCatalogs};
 use crate::catalog::offers;
@@ -97,7 +97,11 @@ use crate::policy::{
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
-use crate::store::Store;
+use crate::store::{
+    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, PolicyCompilerOrigin,
+    PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
+    PublicationResultUpdate, PublicationState, RoutingPublication, Store,
+};
 
 use record::now_ms;
 
@@ -271,6 +275,10 @@ pub struct Server {
     /// The console quota events' per-backend latches (see
     /// [`quota_events`]).
     pub(crate) quota_events: Arc<quota_events::QuotaEvents>,
+    /// Serialises catalogue replacement with a control-plane activation, so a
+    /// persisted desired inventory generation always matches the snapshot the
+    /// new runtime policy was compiled against.
+    routing_control: Arc<Mutex<()>>,
     /// Atomically captured candidate policy and live evidence. It remains
     /// non-authoritative until the explicit routing cutover.
     pub(crate) policy_runtime: Option<Arc<crate::policy::PolicyRuntime>>,
@@ -584,6 +592,7 @@ impl Server {
             shutdown: Arc::default(),
             force: Arc::default(),
             quota_events: Arc::default(),
+            routing_control: Arc::default(),
             policy_runtime,
             policy_shadow,
         })
@@ -693,6 +702,172 @@ impl Server {
             .as_ref()
             .and_then(|runtime| runtime.capture())
             .is_some_and(|snapshot| snapshot.revision_id().is_some())
+    }
+
+    /// Capture the active runtime policy and all evidence derived from one
+    /// catalogue snapshot. Control handlers use this to compile, persist and
+    /// swap a revision without mixing inventory generations.
+    pub(crate) fn routing_snapshot(&self) -> anyhow::Result<RoutingControlSnapshot> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.routing_snapshot_locked()
+    }
+
+    fn routing_snapshot_locked(&self) -> anyhow::Result<RoutingControlSnapshot> {
+        let runtime = self
+            .policy_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
+        let runtime_snapshot = runtime
+            .capture()
+            .ok_or_else(|| anyhow::anyhow!("policy runtime has no active snapshot"))?;
+        let revision_id = runtime_snapshot
+            .revision_id()
+            .ok_or_else(|| anyhow::anyhow!("routing is not yet policy-owned"))?;
+        let revision = self
+            .store
+            .load_policy_revision(revision_id)?
+            .ok_or_else(|| anyhow::anyhow!("active policy revision {revision_id} is missing"))?;
+        let catalogs = self
+            .catalogs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let inventory = offers::inventory(&self.registry, &catalogs);
+        let availability = availability_for(&self.registry, &catalogs);
+        let publications = self.store.load_publications()?;
+        Ok(RoutingControlSnapshot {
+            active_revision: revision,
+            inventory_generation: fetched::snapshot_generation(&catalogs),
+            inventory,
+            availability,
+            publications,
+        })
+    }
+
+    /// Compile a complete control-plane document against a captured topology
+    /// snapshot, persist it atomically, then install it for new captures.
+    pub(crate) fn apply_routing_policy(
+        &self,
+        document: crate::policy::ValidatedPolicyDocument,
+        description: Option<&str>,
+    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
+        self.activate_routing_policy(
+            document,
+            description,
+            PolicyRevisionSource::Draft,
+            None,
+            None,
+        )
+    }
+
+    /// Reactivate an immutable historical revision by creating a new revision.
+    pub(crate) fn restore_routing_policy(
+        &self,
+        selected_revision_id: i64,
+        description: Option<&str>,
+    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
+        let selected = self
+            .store
+            .load_policy_revision(selected_revision_id)?
+            .ok_or(RoutingControlError::MissingRevision(selected_revision_id))?;
+        self.activate_routing_policy(
+            selected.document,
+            description,
+            PolicyRevisionSource::Reactivation,
+            Some(selected.compiler_origin),
+            Some(selected_revision_id),
+        )
+    }
+
+    fn activate_routing_policy(
+        &self,
+        document: crate::policy::ValidatedPolicyDocument,
+        description: Option<&str>,
+        source: PolicyRevisionSource,
+        requested_origin: Option<PolicyCompilerOrigin>,
+        parent_revision_id: Option<i64>,
+    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = self.routing_snapshot_locked()?;
+        let compiler_origin = requested_origin.unwrap_or(snapshot.active_revision.compiler_origin);
+        let policy = compile_control_policy(
+            &document,
+            compiler_origin,
+            &self.registry,
+            &snapshot.inventory,
+        )?;
+        let activation = self
+            .store
+            .activate_policy_revision(&ActivatePolicyRevision {
+                created_ms: now_ms(),
+                description,
+                activation_scope: crate::policy::ActivationScope::Immediate,
+                forced_cache_transition: false,
+                source,
+                compiler_origin,
+                parent_revision_id,
+                expected_active_revision_id: snapshot.active_revision.revision_id,
+                document: &document,
+                desired_inventory_generation: snapshot.inventory_generation,
+                publications: &publication_targets()?,
+            })?;
+        let runtime = self
+            .policy_runtime
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
+        runtime.replace_active(
+            &activation.revision,
+            Arc::new(policy),
+            Arc::new(snapshot.inventory),
+            Arc::new(snapshot.availability),
+            &std::collections::BTreeSet::new(),
+        );
+        Ok(activation)
+    }
+
+    pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
+        self.store.load_policy_revisions()
+    }
+
+    pub(crate) fn promote_routing_learning(
+        &self,
+        binding_id: &crate::policy::BindingId,
+        model_id: &str,
+    ) -> Result<Option<BindingLearning>, crate::store::Error> {
+        let learning = self
+            .store
+            .promote_binding_learning(binding_id, model_id, now_ms())?;
+        if learning.is_some() {
+            crate::policy::LearningView::refresh_snapshot(self.binding_learning.as_ref())?;
+        }
+        Ok(learning)
+    }
+
+    pub(crate) fn record_routing_publication(
+        &self,
+        key: &PublicationKey,
+        expected_revision_id: i64,
+        expected_inventory_generation: i64,
+        state: PublicationState,
+        detail_code: Option<crate::policy::StableId>,
+    ) -> Result<PublicationCasResult, crate::store::Error> {
+        self.store.compare_and_swap_publication_result(
+            key,
+            expected_revision_id,
+            expected_inventory_generation,
+            &PublicationResultUpdate {
+                state,
+                applied_identities: None,
+                detail_code,
+                updated_ms: now_ms(),
+            },
+        )
     }
 
     pub(crate) fn active_publication(
@@ -1343,6 +1518,18 @@ impl Server {
             .route("/_toker/session", get(control::session))
             .route("/_toker/models/merge", post(control::models_merge))
             .route("/_toker/shutdown", post(control::shutdown))
+            .route("/_toker/routing/snapshot", any(control::routing::snapshot))
+            .route(
+                "/_toker/routing/revisions",
+                any(control::routing::revisions),
+            )
+            .route("/_toker/routing/apply", any(control::routing::apply))
+            .route("/_toker/routing/restore", any(control::routing::restore))
+            .route("/_toker/routing/promote", any(control::routing::promote))
+            .route(
+                "/_toker/routing/publication",
+                any(control::routing::publication),
+            )
             // Everything else passes through to the default anthropic
             // backend, as the predecessor forwarded every path but its
             // control path. A known path with the wrong method still
@@ -1543,6 +1730,10 @@ impl Server {
     /// Replace catalogue state and every immutable shadow projection derived
     /// from it as one update. In-flight observations retain the old snapshot.
     fn replace_catalogs(&self, next: FetchedCatalogs) {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let inventory = offers::inventory(&self.registry, &next);
         let availability = availability_for(&self.registry, &next);
         let publication_generation = fetched::snapshot_generation(&next);
@@ -1905,6 +2096,49 @@ fn effective_catalogue<'a>(
     catalogs
         .get(source)
         .filter(|catalog| !catalog.models.is_empty())
+}
+
+/// A catalogue-consistent input for one routing control operation.
+pub(crate) struct RoutingControlSnapshot {
+    pub(crate) active_revision: PolicyRevision,
+    pub(crate) inventory_generation: i64,
+    pub(crate) inventory: crate::catalog::offers::OfferInventory,
+    pub(crate) availability: AvailabilitySnapshot,
+    pub(crate) publications: Vec<RoutingPublication>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RoutingControlError {
+    #[error(transparent)]
+    Store(#[from] crate::store::Error),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+    #[error("routing policy compilation failed")]
+    Compilation(Vec<crate::policy::Diagnostic>),
+    #[error("routing policy revision {0} does not exist")]
+    MissingRevision(i64),
+}
+
+fn compile_control_policy(
+    document: &crate::policy::ValidatedPolicyDocument,
+    origin: PolicyCompilerOrigin,
+    registry: &RouteRegistry,
+    inventory: &crate::catalog::offers::OfferInventory,
+) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
+    let compilation = match origin {
+        PolicyCompilerOrigin::Authored => crate::policy::compile(
+            document.clone(),
+            registry,
+            inventory,
+            crate::policy::PolicyOrigin::Authored,
+        ),
+        PolicyCompilerOrigin::GeneratedRevisionOne => {
+            crate::policy::legacy::compile_document(document.clone(), registry, inventory)
+        }
+    };
+    compilation
+        .into_policy()
+        .map_err(RoutingControlError::Compilation)
 }
 
 fn compile_stored_policy(
@@ -2657,6 +2891,7 @@ api_key = "sk-ant-test"
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
+                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })
@@ -2754,6 +2989,7 @@ api_key = "sk-proj-test"
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
+                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })
@@ -2827,6 +3063,7 @@ api_key = "sk-proj-test"
                 activation_scope: scope,
                 forced_cache_transition,
                 source: crate::store::PolicyRevisionSource::Legacy,
+                compiler_origin: None,
                 parent_revision_id,
                 document: &document,
             })
@@ -2940,6 +3177,7 @@ api_key = "sk-proj-test"
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
+                compiler_origin: None,
                 parent_revision_id: snapshot.revision_id(),
                 document: &document,
             })
@@ -3410,6 +3648,7 @@ api_key = "sk-proj-test"
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Draft,
+                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })

@@ -97,6 +97,7 @@ mod tests {
                 activation_scope: crate::policy::ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
+                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })

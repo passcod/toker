@@ -39,9 +39,10 @@ pub use ledger::{
     is_api_measurement,
 };
 pub use state::{
-    Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult,
-    InitialPublication, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
-    NewPolicyRevision, PingAction, PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource,
+    ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
+    BindingLearningReplay, BindingLearningUpdate, DraftCasResult, InitialPublication, Lane,
+    LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
+    PingRecord, PolicyCompilerOrigin, PolicyDraft, PolicyRevision, PolicyRevisionSource,
     PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
     PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
 };
@@ -449,6 +450,15 @@ impl Store {
         )
     }
 
+    /// Atomically install an already-compiled policy revision and its desired
+    /// publication rows. The caller swaps the in-memory runtime afterwards.
+    pub fn activate_policy_revision(
+        &self,
+        activation: &ActivatePolicyRevision<'_>,
+    ) -> Result<ActivatedPolicyRevision> {
+        state::activate_policy_revision(&mut *self.conn()?, activation)
+    }
+
     pub fn load_policy_revision(&self, revision_id: i64) -> Result<Option<PolicyRevision>> {
         state::load_policy_revision(&*self.conn()?, revision_id)
     }
@@ -732,15 +742,15 @@ where
 mod tests {
     use super::schema;
     use super::{
-        Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason,
-        BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error, InitialPublication,
-        Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry,
-        NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance,
-        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
-        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
-        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-        is_api_measurement,
+        ActivatePolicyRevision, Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance,
+        AttemptReason, BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error,
+        InitialPublication, Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS,
+        MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
+        PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
+        PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+        PublicationState, RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind,
+        SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
+        StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
     };
     use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
@@ -797,6 +807,7 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
+                compiler_origin: None,
                 parent_revision_id,
                 document: &document,
             })
@@ -2662,6 +2673,7 @@ mod tests {
             activation_scope: ActivationScope::Immediate,
             forced_cache_transition: true,
             source: PolicyRevisionSource::Reactivation,
+            compiler_origin: None,
             parent_revision_id: Some(999_999),
             document: &policy("missing-parent"),
         });
@@ -2780,6 +2792,121 @@ mod tests {
             .activate_revision_one(&document, 201, 0, &[])
             .expect("retry activates");
         assert!(matches!(retried, RevisionOneActivation::Activated { .. }));
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn live_activation_is_atomic_and_reactivation_preserves_compiler_origin() {
+        let store = mem_store();
+        let legacy = policy("legacy routing");
+        let RevisionOneActivation::Activated {
+            revision: first, ..
+        } = store
+            .activate_revision_one(&legacy, 100, 4, &[])
+            .expect("activate revision one")
+        else {
+            panic!("revision one is activated")
+        };
+        let publication = InitialPublication {
+            key: PublicationKey::new(
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiChat,
+                },
+                PublicationAdapter::new("dynamic_chat_models").unwrap(),
+            ),
+            state: PublicationState::Pending,
+        };
+        let activated = store
+            .activate_policy_revision(&ActivatePolicyRevision {
+                created_ms: 200,
+                description: Some("restore the initial routing"),
+                activation_scope: ActivationScope::Immediate,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Reactivation,
+                compiler_origin: PolicyCompilerOrigin::GeneratedRevisionOne,
+                parent_revision_id: Some(first.revision_id),
+                expected_active_revision_id: first.revision_id,
+                document: &first.document,
+                desired_inventory_generation: 9,
+                publications: std::slice::from_ref(&publication),
+            })
+            .expect("reactivate revision");
+        assert_ne!(activated.revision.revision_id, first.revision_id);
+        assert_eq!(
+            activated.revision.parent_revision_id,
+            Some(first.revision_id),
+            "restoration creates an auditable forward revision"
+        );
+        assert_eq!(
+            activated.revision.source,
+            PolicyRevisionSource::Reactivation
+        );
+        assert_eq!(
+            activated.revision.compiler_origin,
+            PolicyCompilerOrigin::GeneratedRevisionOne
+        );
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            Some(activated.revision.revision_id)
+        );
+        assert_eq!(
+            activated.publications[0].desired_revision_id,
+            activated.revision.revision_id
+        );
+        assert_eq!(activated.publications[0].desired_inventory_generation, 9);
+        assert_eq!(
+            store
+                .load_policy_revision(first.revision_id)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn live_activation_rolls_back_the_revision_when_publication_handoff_fails() {
+        let store = mem_store();
+        let document = policy("initial routing");
+        store
+            .activate_revision_one(&document, 100, 0, &[])
+            .expect("activate revision one");
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_live_publication BEFORE INSERT ON routing_publications
+             BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = store.load_routing_policy_state().unwrap();
+        assert!(
+            store
+                .activate_policy_revision(&ActivatePolicyRevision {
+                    created_ms: 200,
+                    description: None,
+                    activation_scope: ActivationScope::Immediate,
+                    forced_cache_transition: false,
+                    source: PolicyRevisionSource::Draft,
+                    compiler_origin: PolicyCompilerOrigin::Authored,
+                    parent_revision_id: None,
+                    expected_active_revision_id: 1,
+                    document: &policy("new routing"),
+                    desired_inventory_generation: 7,
+                    publications: &[InitialPublication {
+                        key: PublicationKey::new(
+                            FrontendScope::Protocol {
+                                protocol: FrontendProtocol::OpenaiChat,
+                            },
+                            PublicationAdapter::new("dynamic_chat_models").unwrap(),
+                        ),
+                        state: PublicationState::Pending,
+                    }],
+                })
+                .is_err()
+        );
+        assert_eq!(store.load_routing_policy_state().unwrap(), before);
         assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
     }
 
@@ -4356,6 +4483,7 @@ mod tests {
                 activation_scope: ActivationScope::NewLanes,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Draft,
+                compiler_origin: None,
                 parent_revision_id: None,
                 document: &document,
             })
@@ -4368,6 +4496,7 @@ mod tests {
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Reactivation,
+                compiler_origin: None,
                 parent_revision_id: Some(parent.revision_id),
                 document: &document,
             })
@@ -4588,6 +4717,61 @@ mod tests {
     }
 
     #[test]
+    fn migration_v15_preserves_legacy_compiler_origin_for_historical_reactivation() {
+        let dir = test_dir("v14-compiler-origin");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = policy("legacy generated revision");
+        let restored = policy("historical reactivation");
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..14] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 14).unwrap();
+            for (revision_id, source, parent, document) in [
+                (1, "legacy", None, &legacy),
+                (2, "reactivation", Some(1), &restored),
+            ] {
+                conn.execute(
+                    "INSERT INTO routing_policy_revisions
+                     (revision_id, created_ms, activated_ms, description, activation_scope,
+                      forced_cache_transition, source, parent_revision_id, document_json,
+                      fingerprint)
+                     VALUES (?1, 1, 1, NULL, 'immediate', 0, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        revision_id,
+                        source,
+                        parent,
+                        String::from_utf8(crate::policy::policy_bytes(document).unwrap()).unwrap(),
+                        crate::policy::policy_fingerprint(document)
+                            .unwrap()
+                            .to_string(),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .load_policy_revision(1)
+                .unwrap()
+                .unwrap()
+                .compiler_origin,
+            PolicyCompilerOrigin::GeneratedRevisionOne
+        );
+        assert_eq!(
+            store
+                .load_policy_revision(2)
+                .unwrap()
+                .unwrap()
+                .compiler_origin,
+            PolicyCompilerOrigin::GeneratedRevisionOne
+        );
+    }
+
+    #[test]
     fn migration_v12_rejects_malformed_v11_history_atomically() {
         let dir = test_dir("v11-malformed-attempt-reason");
         let db = dir.join("toker.db");
@@ -4740,6 +4924,7 @@ mod tests {
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
                 source: PolicyRevisionSource::Reactivation,
+                compiler_origin: None,
                 parent_revision_id: Some(1),
                 document: &document,
             })

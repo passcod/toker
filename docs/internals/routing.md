@@ -53,6 +53,33 @@ Every path the route table does not match is forwarded to the default anthropic
 backend (`anthropic::unmatched`), as ctp forwarded everything, except the
 `/_toker/` namespace, which never leaves the proxy.
 
+### Live routing controls
+
+`/_toker/routing/` exposes the running policy to local control clients. Every
+operation requires its matching `x-toker-control` value before parsing its body:
+`routing-snapshot`, `routing-apply`, `routing-revisions`, `routing-restore`,
+`routing-promote`, or `routing-publication`. Mutations require JSON and reject
+unknown fields.
+
+An apply submits one complete policy document. The daemon compiles it against
+one captured inventory, then atomically inserts and activates a new revision
+and records every publication adapter's desired revision and inventory
+generation. Only the committed revision is installed into the runtime, so
+in-flight requests keep their earlier immutable snapshot. A failed compiler
+diagnostic leaves the active revision untouched.
+
+A restore selects a historical revision's document and produces a new active
+reactivation revision. The selected revision remains immutable. History source
+and compiler origin are separate: restoring the generated initial policy keeps
+its legacy compatibility semantics while recording the later reactivation.
+
+Publication acknowledgements are compare-and-swap updates over the desired
+revision and inventory generation. The generic control endpoint records only
+pending failure or unsupported outcomes with a stable detail code. Publishing
+adapters persist their own successful result and exact owned external row
+identities, so a caller cannot claim ownership of a user-managed row. A stale
+acknowledgement cannot overwrite a newer publication handoff.
+
 The Codex Responses route is canonical even though both ends speak Responses. Toker
 parses the request into canonical IR, deterministically renders it for the
 Codex binding, interprets upstream events canonically, and renders Responses
