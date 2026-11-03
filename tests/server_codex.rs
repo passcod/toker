@@ -677,6 +677,12 @@ where
 }
 
 fn messages_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    messages_codex_fallback_policy_with_model("failed-precommit")
+}
+
+fn messages_codex_fallback_policy_with_model(
+    primary_model: &str,
+) -> toker::policy::ValidatedPolicyDocument {
     let route_id = RouteId::new("messages-codex-fallback").unwrap();
     PolicyDocument {
         format_version: CURRENT_FORMAT_VERSION,
@@ -704,7 +710,7 @@ fn messages_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
                     id: CandidateId::new("codex").unwrap(),
                     binding_id: CODEX_SUB_RESPONSES.id().clone(),
                     model: CandidateModel::Exact {
-                        model_id: "failed-precommit".to_owned(),
+                        model_id: primary_model.to_owned(),
                     },
                     upgrade_policy_id: None,
                     alias_policy: None,
@@ -1681,6 +1687,29 @@ async fn active_messages_policy_falls_back_from_codex_to_anthropic() {
         lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
         Some("anthropic")
     );
+}
+
+#[tokio::test]
+async fn committed_codex_messages_failure_does_not_fall_back() {
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = anthropic_responses_config("messages-codex-committed", upstream);
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, messages_codex_fallback_policy_with_model("failed")).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .body(messages_body("asked-model", false))
+        .send()
+        .await
+        .expect("Messages failure answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].attempt.as_ref().unwrap().attempt_index.get(), 0);
 }
 
 #[tokio::test]
