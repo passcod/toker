@@ -825,16 +825,22 @@ pub(super) const MIGRATIONS: &[&str] = &[
         NOT NULL DEFAULT 'authored' CHECK (
             compiler_origin IN ('authored', 'generated_revision_one')
         );
+    WITH RECURSIVE generated_lineage(revision_id) AS (
+        SELECT revision_id
+        FROM routing_policy_revisions
+        WHERE source = 'legacy'
+
+        UNION ALL
+
+        SELECT child.revision_id
+        FROM routing_policy_revisions AS child
+        JOIN generated_lineage AS parent
+          ON child.parent_revision_id = parent.revision_id
+        WHERE child.source = 'reactivation'
+    )
     UPDATE routing_policy_revisions
     SET compiler_origin = 'generated_revision_one'
-    WHERE source = 'legacy'
-       OR source = 'reactivation'
-          AND parent_revision_id IS NOT NULL
-          AND EXISTS (
-              SELECT 1 FROM routing_policy_revisions AS parent
-              WHERE parent.revision_id = routing_policy_revisions.parent_revision_id
-                AND parent.source = 'legacy'
-          );
+    WHERE revision_id IN (SELECT revision_id FROM generated_lineage);
     "#,
 ];
 

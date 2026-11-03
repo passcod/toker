@@ -4723,6 +4723,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let legacy = policy("legacy generated revision");
         let restored = policy("historical reactivation");
+        let restored_again = policy("historical reactivation again");
         {
             let conn = Connection::open(&db).unwrap();
             for script in &schema::MIGRATIONS[..14] {
@@ -4732,6 +4733,7 @@ mod tests {
             for (revision_id, source, parent, document) in [
                 (1, "legacy", None, &legacy),
                 (2, "reactivation", Some(1), &restored),
+                (3, "reactivation", Some(2), &restored_again),
             ] {
                 conn.execute(
                     "INSERT INTO routing_policy_revisions
@@ -4768,6 +4770,15 @@ mod tests {
                 .unwrap()
                 .compiler_origin,
             PolicyCompilerOrigin::GeneratedRevisionOne
+        );
+        assert_eq!(
+            store
+                .load_policy_revision(3)
+                .unwrap()
+                .unwrap()
+                .compiler_origin,
+            PolicyCompilerOrigin::GeneratedRevisionOne,
+            "compiler origin propagates across every historical reactivation"
         );
     }
 
