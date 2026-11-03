@@ -119,9 +119,6 @@ desired state. Free-form external error text is not accepted or stored.
   inventory, persists the revision, and swaps the live runtime after commit.
 - [ ] Add gated routing snapshot, apply, history, restore, promotion, and
   publication-result endpoints.
-- [ ] Add a routing TUI page: Tab switches pages, e opens the active document
-  in `$EDITOR` for immediate apply, and Enter restores a selected revision after
-  a second confirmation.
 - [ ] Cover the control boundary and all live revision transitions with router
   and Store tests.
 - [ ] Run formatting, focused unit/integration tests, and clippy.
