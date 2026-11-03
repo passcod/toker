@@ -251,6 +251,14 @@ impl FetchedCatalogs {
         self.by_source.is_empty()
     }
 
+    /// Drop cache entries whose providers are not configured for the current
+    /// process. A user-side publication must hash the same source set as the
+    /// daemon, even when stale files for removed providers remain on disk.
+    pub fn retain_sources(&mut self, sources: impl IntoIterator<Item = &'static str>) {
+        let sources: std::collections::HashSet<_> = sources.into_iter().collect();
+        self.by_source.retain(|source, _| sources.contains(source));
+    }
+
     /// Replace (or first install) one source's catalogue.
     pub fn set(&mut self, source: &'static str, catalog: FetchedCatalog) {
         self.by_source.insert(source, catalog);
@@ -1578,6 +1586,13 @@ mod tests {
         );
         let first = super::snapshot_generation(&catalogs);
         assert_eq!(first, super::snapshot_generation(&catalogs.clone()));
+
+        let mut without_openrouter = catalogs.clone();
+        without_openrouter.retain_sources(["anthropic"]);
+        assert_eq!(
+            super::snapshot_generation(&without_openrouter),
+            super::EMPTY_SNAPSHOT_GENERATION
+        );
 
         catalogs.set(
             "openrouter",

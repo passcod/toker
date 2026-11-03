@@ -419,6 +419,14 @@ fn configured_bindings(config: &crate::config::Config) -> BTreeSet<crate::policy
         .collect()
 }
 
+fn configured_catalogue_sources(config: &crate::config::Config) -> BTreeSet<&'static str> {
+    config
+        .enabled_backends()
+        .into_iter()
+        .filter_map(fetched::FetchedCatalogs::source_of)
+        .collect()
+}
+
 fn rows_for_profile(
     policy: &crate::policy::CompiledPolicy,
     profile: Option<&ProfileId>,
@@ -484,9 +492,10 @@ fn cached_policy_rows(
     let revision = store
         .load_policy_revision(publication.desired_revision_id)?
         .context("Claude settings publication references no policy revision")?;
-    let catalogs = fetched::cache_dir()
+    let mut catalogs = fetched::cache_dir()
         .map(|dir| fetched::load_cached(&dir))
         .unwrap_or_default();
+    catalogs.retain_sources(configured_catalogue_sources(config));
     if catalogs.is_empty()
         && publication.desired_inventory_generation != fetched::EMPTY_SNAPSHOT_GENERATION
     {

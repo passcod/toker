@@ -1725,13 +1725,21 @@ impl Server {
         let mut next = FetchedCatalogs::default();
         for source in self.catalog_sources() {
             match fetched::refresh(&source, dir, &self.http, record::now_ms()).await {
-                Ok(catalog) => {
+                Ok(catalog) if !catalog.models.is_empty() => {
                     tracing::debug!(
                         provider = source.provider,
                         "models catalogue refreshed: {} models",
                         catalog.models.len()
                     );
                     next.set(source.provider, catalog);
+                }
+                Ok(_) => {
+                    // An absent cache plus an unavailable listing is unknown,
+                    // not an empty provider catalogue. Do not publish a
+                    // process-local empty entry the picker cannot reproduce.
+                    if let Some(previous) = previous.get(source.provider) {
+                        next.set(source.provider, previous.clone());
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(
