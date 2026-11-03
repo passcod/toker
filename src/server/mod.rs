@@ -504,7 +504,7 @@ impl Server {
                 (policy_runtime, policy_shadow)
             }
             RoutingOwnership::Policy => {
-                let has_inventory = !inventory.is_empty();
+                let publication_generation = fetched::snapshot_generation(&initial_catalogs);
                 let state = store.load_routing_policy_state()?;
                 let (revision, policy) = match state.active_revision_id {
                     Some(revision_id) => {
@@ -532,7 +532,7 @@ impl Server {
                         let activation = store.activate_revision_one(
                             &document,
                             now_ms(),
-                            i64::from(has_inventory),
+                            publication_generation,
                             &publication_targets()?,
                         )?;
                         match activation {
@@ -556,7 +556,7 @@ impl Server {
                     Arc::new(policy),
                     Arc::new(inventory),
                     availability,
-                    u64::from(has_inventory),
+                    0,
                 );
                 (Some(Arc::new(runtime)), None)
             }
@@ -1545,14 +1545,15 @@ impl Server {
     fn replace_catalogs(&self, next: FetchedCatalogs) {
         let inventory = offers::inventory(&self.registry, &next);
         let availability = availability_for(&self.registry, &next);
+        let publication_generation = fetched::snapshot_generation(&next);
         let mut catalogs = self
             .catalogs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed_catalogue_bindings =
             changed_catalogue_bindings(&self.registry, &catalogs, &next);
-        *catalogs = next;
         let Some(runtime) = &self.policy_runtime else {
+            *catalogs = next;
             return;
         };
         // Model-list readers retain this catalogue guard through their
@@ -1580,10 +1581,7 @@ impl Server {
             .into_policy()
             {
                 Ok(policy) => {
-                    let next_generation = runtime.capture().map_or(0, |snapshot| {
-                        snapshot.inventory_generation().saturating_add(1)
-                    });
-                    let generation = i64::try_from(next_generation).unwrap_or(i64::MAX);
+                    let generation = publication_generation;
                     if let Err(error) = publication_targets().and_then(|targets| {
                         self.store
                             .set_publications_desired(
@@ -1604,6 +1602,7 @@ impl Server {
                         Arc::new(availability),
                         &changed_catalogue_bindings,
                     );
+                    *catalogs = next;
                 }
                 Err(_) => tracing::error!(
                     revision_id = revision.revision_id,
@@ -1613,6 +1612,7 @@ impl Server {
             return;
         }
 
+        *catalogs = next;
         let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
             .ok()
             .and_then(|compilation| compilation.into_policy().ok());
@@ -1725,13 +1725,21 @@ impl Server {
         let mut next = FetchedCatalogs::default();
         for source in self.catalog_sources() {
             match fetched::refresh(&source, dir, &self.http, record::now_ms()).await {
-                Ok(catalog) => {
+                Ok(catalog) if !catalog.models.is_empty() => {
                     tracing::debug!(
                         provider = source.provider,
                         "models catalogue refreshed: {} models",
                         catalog.models.len()
                     );
                     next.set(source.provider, catalog);
+                }
+                Ok(_) => {
+                    // An absent cache plus an unavailable listing is unknown,
+                    // not an empty provider catalogue. Do not publish a
+                    // process-local empty entry the picker cannot reproduce.
+                    if let Some(previous) = previous.get(source.provider) {
+                        next.set(source.provider, previous.clone());
+                    }
                 }
                 Err(error) => {
                     tracing::debug!(

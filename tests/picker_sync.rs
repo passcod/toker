@@ -123,6 +123,25 @@ async fn a_failed_fetch_leaves_the_picker_alone() {
 }
 
 #[tokio::test]
+async fn a_legacy_dry_run_does_not_create_the_ledger() {
+    let addr = spawn_listing(StatusCode::OK).await;
+    let dir = test_dir("dry-run-no-ledger");
+    let config = config(
+        &dir,
+        &format!("[providers.openrouter]\nupstream = \"http://{addr}/v1\"\n"),
+    );
+    let settings = dir.join("settings.json");
+    std::fs::write(&settings, "{}\n").expect("settings");
+
+    let report = toker::picker::sync(&config, &settings, &reqwest::Client::new(), true)
+        .await
+        .expect("dry run");
+    assert!(!report.rows.is_empty());
+    assert!(!config.db_path.exists(), "dry run leaves no ledger behind");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{}\n");
+}
+
+#[tokio::test]
 async fn without_an_openrouter_block_toker_s_rows_go() {
     let dir = test_dir("no-block");
     let config = config(&dir, "[providers.anthropic_sub]\n");

@@ -181,6 +181,23 @@ impl CompiledPolicy {
         expanded
     }
 
+    /// Every named profile with an Anthropic Messages presentation or
+    /// publication. The Claude settings adapter compares each of these with
+    /// the shared protocol projection before writing its one settings file.
+    pub fn anthropic_profiles(&self) -> impl Iterator<Item = ProfileId> + '_ {
+        self.presentations
+            .keys()
+            .chain(self.publication.keys())
+            .filter(|scope| scope.protocol == FrontendProtocol::AnthropicMessages)
+            .filter_map(|scope| scope.profile.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|profile| {
+                // Every ScopeKey profile came from a validated ProfileId.
+                ProfileId::new(profile).expect("compiled profile id stays valid")
+            })
+    }
+
     pub fn publication_slugs(
         &self,
         profile: Option<&ProfileId>,
@@ -2157,6 +2174,42 @@ mod tests {
         assert_eq!(
             candidate.health_circuit_seconds(FailureClass::ServerError),
             None
+        );
+    }
+
+    #[test]
+    fn anthropic_profiles_include_presentation_and_publication_scopes_once() {
+        let mut document = document();
+        document.presentations[0].scope = FrontendScope::Profile {
+            profile: ProfileId::new("claude").unwrap(),
+            protocol: FrontendProtocol::AnthropicMessages,
+        };
+        document.presentations.push(Presentation {
+            id: PresentationId::new("workhorse-presented").unwrap(),
+            scope: FrontendScope::Profile {
+                profile: ProfileId::new("workhorse").unwrap(),
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            slug: "workhorse-friendly".to_owned(),
+            label: None,
+            description: None,
+            enabled: true,
+            shadow_native: false,
+            source: PresentationSource::Virtual {
+                target: reference("route"),
+            },
+            metadata: None,
+        });
+        let policy = compile_document(document, PolicyOrigin::Authored)
+            .into_policy()
+            .unwrap();
+        assert_eq!(
+            policy
+                .anthropic_profiles()
+                .into_iter()
+                .map(|profile| profile.to_string())
+                .collect::<Vec<_>>(),
+            ["claude", "workhorse"]
         );
     }
 

@@ -196,17 +196,6 @@ pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let config = Config::load()?;
-    let store = Store::open(&config.db_path)?;
-    if store
-        .load_routing_policy_state()?
-        .active_revision_id
-        .is_some()
-    {
-        if dry_run {
-            println!("picker: routing is database-owned; legacy TOML projection is disabled");
-        }
-        return Ok(());
-    }
     let settings = crate::setup::wizard::Paths::real()?.claude_settings;
     let report = tokio::runtime::Builder::new_current_thread()
         .enable_all()

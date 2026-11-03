@@ -275,6 +275,11 @@ pub enum PublicationCasResult {
     Conflict { current: Option<RoutingPublication> },
 }
 
+/// Maximum encoded size of the exact external row identities a publication
+/// adapter owns. This is deliberately much smaller than a policy document: it
+/// is only a bounded set of setting keys, not arbitrary adapter data.
+const MAX_PUBLICATION_IDENTITIES_JSON_BYTES: usize = 64 * 1024;
+
 /// Binding-scoped model evidence. Days are a sorted canonical local-day set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingLearning {
@@ -819,7 +824,7 @@ pub(super) fn activate_revision_one(
                 desired_inventory_generation,
                 &PublicationResultUpdate {
                     state: PublicationState::Applied,
-                    applied_identities: None,
+                    applied_identities: Some(BTreeSet::new()),
                     detail_code: None,
                     updated_ms: activated_ms,
                 },
@@ -1121,7 +1126,7 @@ pub(super) fn set_publications_desired(
                 desired_inventory_generation,
                 &PublicationResultUpdate {
                     state: PublicationState::Applied,
-                    applied_identities: None,
+                    applied_identities: Some(BTreeSet::new()),
                     detail_code: None,
                     updated_ms,
                 },
@@ -1193,10 +1198,11 @@ fn read_publication(row: &rusqlite::Row<'_>) -> Result<RoutingPublication> {
         .transpose()?;
     if state == PublicationState::Applied
         && (applied_revision_id != Some(desired_revision_id)
-            || applied_inventory_generation != Some(desired_inventory_generation))
+            || applied_inventory_generation != Some(desired_inventory_generation)
+            || applied_identities.is_none())
     {
         return Err(Error::InvalidRoutingState(
-            "applied publication does not match desired identity".into(),
+            "applied publication does not carry its exact desired identity set".into(),
         ));
     }
     Ok(RoutingPublication {
@@ -1222,6 +1228,11 @@ pub(super) fn compare_and_swap_publication_result(
     if update.state == PublicationState::Pending {
         return Err(Error::InvalidRoutingState(
             "publication result cannot be pending".into(),
+        ));
+    }
+    if update.state == PublicationState::Applied && update.applied_identities.is_none() {
+        return Err(Error::InvalidRoutingState(
+            "an applied publication result needs an exact row identity set".into(),
         ));
     }
     if update.state != PublicationState::Applied && update.applied_identities.is_some() {
@@ -1256,11 +1267,13 @@ pub(super) fn compare_and_swap_publication_result(
             ],
         )?
     } else {
+        // A result that races a successful reconciliation of this desired
+        // identity must not turn the published state back into failure.
         conn.execute(
             "UPDATE routing_publications SET state = ?1, detail_code = ?2,
                  updated_ms = ?3
              WHERE scope_key = ?4 AND adapter = ?5 AND desired_revision_id = ?6
-               AND desired_inventory_generation = ?7",
+               AND desired_inventory_generation = ?7 AND state != 'applied'",
             rusqlite::params![
                 update.state.as_str(),
                 update.detail_code.as_ref().map(StableId::as_str),
@@ -1282,12 +1295,21 @@ pub(super) fn compare_and_swap_publication_result(
 }
 
 fn parse_publication_identities(json: &str) -> Result<BTreeSet<String>> {
+    if json.len() > MAX_PUBLICATION_IDENTITIES_JSON_BYTES {
+        return Err(Error::InvalidRoutingState(
+            "publication row identities exceed the stored size limit".into(),
+        ));
+    }
     let values: Vec<String> = serde_json::from_str(json)?;
-    let value_count = values.len();
-    let identities = values.into_iter().collect::<BTreeSet<_>>();
-    if identities.len() != value_count {
+    let identities = values.iter().cloned().collect::<BTreeSet<_>>();
+    if identities.len() != values.len() {
         return Err(Error::InvalidRoutingState(
             "publication row identities are not unique".into(),
+        ));
+    }
+    if values.iter().ne(identities.iter()) {
+        return Err(Error::InvalidRoutingState(
+            "publication row identities are not in canonical order".into(),
         ));
     }
     validate_publication_identities(Some(&identities))?;
@@ -1309,6 +1331,12 @@ fn validate_publication_identities(identities: Option<&BTreeSet<String>>) -> Res
     {
         return Err(Error::InvalidRoutingState(
             "invalid publication row identity".into(),
+        ));
+    }
+    let encoded = serde_json::to_vec(identities)?;
+    if encoded.len() > MAX_PUBLICATION_IDENTITIES_JSON_BYTES {
+        return Err(Error::InvalidRoutingState(
+            "publication row identities exceed the stored size limit".into(),
         ));
     }
     Ok(())

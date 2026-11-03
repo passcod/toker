@@ -4,7 +4,7 @@
 //! resolver described in `docs/internals/routing.md`. Protocol identities are
 //! data; frontend and backend adapter behavior remains in typed modules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -662,6 +662,10 @@ pub struct RouteNotConfigured;
 pub struct RouteRegistry {
     providers: HashMap<String, Arc<dyn Provider>>,
     defaults: HashMap<ProtocolId, String>,
+    /// User-side policy publication needs the static topology and an inventory
+    /// from cached catalogues, but must neither initialise providers nor read
+    /// credentials. Normal registries leave this empty.
+    configured_binding_ids: HashSet<BindingId>,
 }
 
 impl RouteRegistry {
@@ -675,6 +679,18 @@ impl RouteRegistry {
                 .map(|provider| (provider.id().to_owned(), provider))
                 .collect(),
             defaults: defaults.into_iter().collect(),
+            configured_binding_ids: HashSet::new(),
+        }
+    }
+
+    /// Build a credential-free topology view for user-side publication. This
+    /// deliberately cannot resolve a request, only declare which bindings the
+    /// loaded configuration has enabled.
+    pub fn configured_bindings(binding_ids: impl IntoIterator<Item = BindingId>) -> RouteRegistry {
+        RouteRegistry {
+            providers: HashMap::new(),
+            defaults: HashMap::new(),
+            configured_binding_ids: binding_ids.into_iter().collect(),
         }
     }
 
@@ -704,13 +720,15 @@ impl RouteRegistry {
     }
 
     pub fn binding_is_configured(&self, binding: &BackendBinding) -> bool {
-        self.providers
-            .get(binding.provider())
-            .is_some_and(|provider| {
-                provider.bindings().iter().any(|implemented| {
-                    implemented == binding && implemented.canonical_backend().is_some()
+        self.configured_binding_ids.contains(binding.id())
+            || self
+                .providers
+                .get(binding.provider())
+                .is_some_and(|provider| {
+                    provider.bindings().iter().any(|implemented| {
+                        implemented == binding && implemented.canonical_backend().is_some()
+                    })
                 })
-            })
     }
 
     /// Build a configured target from a policy-selected binding and model.

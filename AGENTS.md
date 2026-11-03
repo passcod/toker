@@ -1,3 +1,10 @@
+Prime directive: this is a hobby project.
+it has, at this moment, exactly two users.
+me. and me at my other computer.
+there are exactly ZERO instances of the code you're editing that are running live.
+i don't give a bullcrap about whatever complexity you imagined.
+the job is to do the most expedient thing to get this interminable 17-odd step refactor to the finish line.
+
 # Working on toker
 
 A local proxy and ledger for LLM traffic: Claude Code, opencode and the codex
