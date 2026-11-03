@@ -256,10 +256,18 @@ impl Col {
 /// Sparkline blocks, low → high (▁▂▃▄▅▆▇█ style; a space is a flat minute).
 const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
+/// The TUI's two top-level pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Page {
+    Dashboard,
+    Routing,
+}
+
 /// What the loop holds for the view beyond the snapshot: the display
 /// formatter, resolved once at startup.
 pub(crate) struct Ui {
     pub fmt: Fmt,
+    pub page: Page,
     /// `NO_COLOR` was set (see [`no_color`]): the frame renders without
     /// colour.
     pub no_color: bool,
@@ -2582,6 +2590,7 @@ mod tests {
     fn plain() -> super::Ui {
         super::Ui {
             fmt: Fmt::fixed(),
+            page: super::Page::Dashboard,
             no_color: false,
             legend: false,
             scroll: super::Scroll::default(),

@@ -48,6 +48,7 @@ mod model;
 mod quota;
 mod rebuilds;
 mod reexec;
+mod routing;
 mod view;
 
 use std::collections::HashMap;
@@ -133,12 +134,13 @@ pub fn run(
     window_mins: u64,
     extra_transcript_roots: &[PathBuf],
     gates: &crate::config::GatesConfig,
+    _control_port: u16,
 ) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
     // Taken before the terminal: the file this process was started
     // from, while it is still the one on disk.
     let mut exe = reexec::ExeWatch::current();
-    let mut terminal = ratatui::try_init()?;
+    let mut terminal = Some(ratatui::try_init()?);
     let restore = RestoreGuard;
     crossterm::execute!(std::io::stdout(), WheelCapture(true))?;
 
@@ -149,6 +151,7 @@ pub fn run(
     // grouped counts follow it; nothing model-visible does.
     let mut ui = view::Ui {
         fmt: locale::Fmt::from_env(),
+        page: view::Page::Dashboard,
         no_color: view::no_color(std::env::var_os("NO_COLOR")),
         legend: false,
         scroll: view::Scroll::default(),
@@ -183,6 +186,7 @@ pub fn run(
         }
     };
     let mut snapshot = model::empty(window_mins);
+    let mut routing = routing::State::default();
     let mut upgraded = false;
     loop {
         if Instant::now() >= next_tick {
@@ -212,6 +216,9 @@ pub fn run(
             if due.read || due.heavy {
                 released = released_sessions(&store, quota.as_ref())?;
             }
+            if ui.page == view::Page::Routing {
+                routing.refresh(_control_port);
+            }
             if let Some(window) = &mut window {
                 snapshot = window.snapshot(
                     window_mins,
@@ -236,9 +243,16 @@ pub fn run(
             }
             next_tick = Instant::now() + TICK;
         }
-        terminal.draw(|frame| {
-            drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
-        })?;
+        terminal
+            .as_mut()
+            .expect("terminal is restored")
+            .draw(|frame| {
+                if ui.page == view::Page::Routing {
+                    routing::render(frame, frame.area(), &routing);
+                } else {
+                    drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+                }
+            })?;
         // The list may have shrunk under its offset since the last
         // frame: hold the offset at what the frame could show.
         ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
@@ -324,6 +338,46 @@ pub fn run(
             match key.code {
                 // q (or the habitual Ctrl+C in raw mode) quits.
                 crossterm::event::KeyCode::Char('q') => break,
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k')
+                    if ui.page == view::Page::Routing =>
+                {
+                    routing.move_selection(-1)
+                }
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j')
+                    if ui.page == view::Page::Routing =>
+                {
+                    routing.move_selection(1)
+                }
+                crossterm::event::KeyCode::Enter if ui.page == view::Page::Routing => {
+                    routing.restore_selected(_control_port);
+                    next_tick = Instant::now();
+                }
+                crossterm::event::KeyCode::Char('e') if ui.page == view::Page::Routing => {
+                    if let Some(document) = routing.active_document()
+                        && let Ok(path) = std::env::temp_dir().canonicalize()
+                    {
+                        let file = path.join(format!(
+                            "toker-routing-edit-{}.json",
+                            uuid::Uuid::new_v4().simple()
+                        ));
+                        if std::fs::write(&file, &document).is_ok() {
+                            if let Some(editor) = std::env::var_os("EDITOR") {
+                                let _ = crossterm::execute!(std::io::stdout(), WheelCapture(false));
+                                drop(terminal.take());
+                                let _ = std::process::Command::new(editor).arg(&file).status();
+                                terminal = Some(ratatui::try_init()?);
+                                let _ = crossterm::execute!(std::io::stdout(), WheelCapture(true));
+                                if let Ok(document) = std::fs::read(&file) {
+                                    routing.apply_document(_control_port, &document);
+                                }
+                                let _ = std::fs::remove_file(&file);
+                            } else {
+                                let _ = std::fs::remove_file(&file);
+                            }
+                        }
+                    }
+                    next_tick = Instant::now();
+                }
                 crossterm::event::KeyCode::Char('c')
                     if key
                         .modifiers
@@ -334,6 +388,16 @@ pub fn run(
                 // ? toggles the legend over the frame; Esc closes it, or
                 // the detail popup. The two are never open together.
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
+                // Routing is a separate top-level page. It will read and
+                // mutate only through the daemon's guarded control surface.
+                crossterm::event::KeyCode::Tab => {
+                    ui.page = match ui.page {
+                        view::Page::Dashboard => view::Page::Routing,
+                        view::Page::Routing => view::Page::Dashboard,
+                    };
+                    ui.legend = false;
+                    ui.detail = None;
+                }
                 crossterm::event::KeyCode::Esc => {
                     ui.legend = false;
                     ui.detail = None;

@@ -19,6 +19,7 @@ use crate::policy::{
     ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
     RouteId, StableId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
 };
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use super::{Error, Result, row_of, rows_of};
@@ -80,15 +81,19 @@ pub enum LanePinCasResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyRevisionSource {
     Legacy,
+    /// A legacy staged edit retained for compatibility with existing ledgers.
     Draft,
+    /// An authored configuration applied directly to live routing.
+    Applied,
     Reactivation,
 }
 
 impl PolicyRevisionSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Legacy => "legacy",
             Self::Draft => "draft",
+            Self::Applied => "applied",
             Self::Reactivation => "reactivation",
         }
     }
@@ -97,6 +102,7 @@ impl PolicyRevisionSource {
         match value {
             "legacy" => Some(Self::Legacy),
             "draft" => Some(Self::Draft),
+            "applied" => Some(Self::Applied),
             "reactivation" => Some(Self::Reactivation),
             _ => None,
         }
@@ -129,6 +135,16 @@ pub struct NewPolicyRevision<'a> {
     pub source: PolicyRevisionSource,
     pub parent_revision_id: Option<i64>,
     pub document: &'a ValidatedPolicyDocument,
+}
+
+/// Operator-provided metadata shared by direct applies and restores.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyActivationInput<'a> {
+    pub created_ms: i64,
+    pub activated_ms: i64,
+    pub description: Option<&'a str>,
+    pub activation_scope: ActivationScope,
+    pub forced_cache_transition: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +190,15 @@ pub enum RevisionOneActivation {
     },
 }
 
+/// The committed result of applying an authored document or reactivating a
+/// selected immutable revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyActivation {
+    pub revision: PolicyRevision,
+    pub state: RoutingPolicyState,
+    pub publications: Vec<RoutingPublication>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationState {
     Pending,
@@ -183,7 +208,7 @@ pub enum PublicationState {
 }
 
 impl PublicationState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Applied => "applied",
@@ -218,6 +243,16 @@ impl PublicationAdapter {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for PublicationAdapter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -809,36 +844,13 @@ pub(super) fn activate_revision_one(
         ));
     }
     for publication in publications {
-        set_publication_desired(
+        set_initial_publication(
             &tx,
-            &publication.key,
+            publication,
             revision.revision_id,
             desired_inventory_generation,
             activated_ms,
         )?;
-        if publication.state == PublicationState::Applied {
-            let result = compare_and_swap_publication_result(
-                &tx,
-                &publication.key,
-                revision.revision_id,
-                desired_inventory_generation,
-                &PublicationResultUpdate {
-                    state: PublicationState::Applied,
-                    applied_identities: Some(BTreeSet::new()),
-                    detail_code: None,
-                    updated_ms: activated_ms,
-                },
-            )?;
-            if result != PublicationCasResult::Updated {
-                return Err(Error::InvalidRoutingState(
-                    "initial publication state changed during activation".into(),
-                ));
-            }
-        } else if publication.state != PublicationState::Pending {
-            return Err(Error::InvalidRoutingState(
-                "initial publication must be pending or applied".into(),
-            ));
-        }
     }
     let state = load_routing_policy_state(&tx)?;
     let publications = load_publications(&tx)?;
@@ -847,6 +859,154 @@ pub(super) fn activate_revision_one(
         revision,
         state,
         publications,
+    })
+}
+
+/// Apply a document as a new immutable revision and make it live.
+///
+/// The server normally uses [`PolicyRevisionSource::Applied`]. It may retain
+/// [`PolicyRevisionSource::Legacy`] when an active legacy policy's document can
+/// only compile under its legacy origin. The current active revision is selected
+/// as the parent inside the transaction. Legacy draft state is untouched.
+pub(super) fn apply_policy_revision(
+    conn: &mut Connection,
+    document: &ValidatedPolicyDocument,
+    input: PolicyActivationInput<'_>,
+    source: PolicyRevisionSource,
+    desired_inventory_generation: i64,
+    publications: &[InitialPublication],
+) -> Result<PolicyActivation> {
+    if !matches!(
+        source,
+        PolicyRevisionSource::Applied | PolicyRevisionSource::Legacy
+    ) {
+        return Err(Error::InvalidRoutingState(
+            "direct policy apply source must be applied or legacy".into(),
+        ));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = active_routing_policy_state(&tx)?;
+    let active_revision_id = current.active_revision_id.ok_or_else(|| {
+        Error::InvalidRoutingState("active policy revision disappeared during apply".into())
+    })?;
+    if source == PolicyRevisionSource::Legacy
+        && load_policy_revision(&tx, active_revision_id)?
+            .is_some_and(|revision| revision.source != PolicyRevisionSource::Legacy)
+    {
+        return Err(Error::InvalidRoutingState(
+            "only a legacy active policy may apply another legacy revision".into(),
+        ));
+    }
+    let revision = NewPolicyRevision {
+        created_ms: input.created_ms,
+        activated_ms: input.activated_ms,
+        description: input.description,
+        activation_scope: input.activation_scope,
+        forced_cache_transition: input.forced_cache_transition,
+        source,
+        parent_revision_id: Some(active_revision_id),
+        document,
+    };
+    let activation = activate_policy_revision_in_transaction(
+        &tx,
+        &revision,
+        desired_inventory_generation,
+        publications,
+    )?;
+    tx.commit()?;
+    Ok(activation)
+}
+
+/// Reactivate an existing revision's document as a new immutable revision.
+///
+/// The selected revision, rather than the currently active one, is its parent
+/// so the immutable history records the operator's choice directly. A selected
+/// legacy revision remains legacy so the compiler retains its legacy origin.
+pub(super) fn reactivate_policy_revision(
+    conn: &mut Connection,
+    selected_revision_id: i64,
+    input: PolicyActivationInput<'_>,
+    desired_inventory_generation: i64,
+    publications: &[InitialPublication],
+) -> Result<PolicyActivation> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    active_routing_policy_state(&tx)?;
+    let selected = load_policy_revision(&tx, selected_revision_id)?.ok_or_else(|| {
+        Error::InvalidRoutingState(format!(
+            "selected policy revision {selected_revision_id} does not exist"
+        ))
+    })?;
+    let revision = NewPolicyRevision {
+        created_ms: input.created_ms,
+        activated_ms: input.activated_ms,
+        description: input.description,
+        activation_scope: input.activation_scope,
+        forced_cache_transition: input.forced_cache_transition,
+        source: if selected.source == PolicyRevisionSource::Legacy {
+            PolicyRevisionSource::Legacy
+        } else {
+            PolicyRevisionSource::Reactivation
+        },
+        parent_revision_id: Some(selected.revision_id),
+        document: &selected.document,
+    };
+    let activation = activate_policy_revision_in_transaction(
+        &tx,
+        &revision,
+        desired_inventory_generation,
+        publications,
+    )?;
+    tx.commit()?;
+    Ok(activation)
+}
+
+fn active_routing_policy_state(conn: &Connection) -> Result<RoutingPolicyState> {
+    let state = load_routing_policy_state(conn)?;
+    let active_revision_id = state.active_revision_id.ok_or_else(|| {
+        Error::InvalidRoutingState("cannot apply policy without an active revision".into())
+    })?;
+    if load_policy_revision(conn, active_revision_id)?.is_none() {
+        return Err(Error::InvalidRoutingState(format!(
+            "active policy revision {active_revision_id} does not exist"
+        )));
+    }
+    Ok(state)
+}
+
+fn activate_policy_revision_in_transaction(
+    conn: &Connection,
+    revision: &NewPolicyRevision<'_>,
+    desired_inventory_generation: i64,
+    publications: &[InitialPublication],
+) -> Result<PolicyActivation> {
+    if desired_inventory_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative inventory generation".into(),
+        ));
+    }
+    let revision = insert_policy_revision(conn, revision)?;
+    let changed = conn.execute(
+        "UPDATE routing_policy_state SET active_revision_id = ?1 WHERE id = 1",
+        [revision.revision_id],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidRoutingState(
+            "routing policy state singleton row is missing".into(),
+        ));
+    }
+    for publication in publications {
+        set_initial_publication(
+            conn,
+            publication,
+            revision.revision_id,
+            desired_inventory_generation,
+            revision.activated_ms,
+        )?;
+    }
+    Ok(PolicyActivation {
+        revision,
+        state: load_routing_policy_state(conn)?,
+        publications: load_publications(conn)?,
     })
 }
 
@@ -1102,6 +1262,46 @@ pub(super) fn set_publication_desired(
     Ok(())
 }
 
+fn set_initial_publication(
+    conn: &Connection,
+    publication: &InitialPublication,
+    desired_revision_id: i64,
+    desired_inventory_generation: i64,
+    updated_ms: i64,
+) -> Result<()> {
+    set_publication_desired(
+        conn,
+        &publication.key,
+        desired_revision_id,
+        desired_inventory_generation,
+        updated_ms,
+    )?;
+    if publication.state == PublicationState::Applied {
+        let result = compare_and_swap_publication_result(
+            conn,
+            &publication.key,
+            desired_revision_id,
+            desired_inventory_generation,
+            &PublicationResultUpdate {
+                state: PublicationState::Applied,
+                applied_identities: Some(BTreeSet::new()),
+                detail_code: None,
+                updated_ms,
+            },
+        )?;
+        if result != PublicationCasResult::Updated {
+            return Err(Error::InvalidRoutingState(
+                "publication state changed during desired handoff".into(),
+            ));
+        }
+    } else if publication.state != PublicationState::Pending {
+        return Err(Error::InvalidRoutingState(
+            "desired publication must be pending or applied".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn set_publications_desired(
     conn: &mut Connection,
     publications: &[InitialPublication],
@@ -1111,36 +1311,13 @@ pub(super) fn set_publications_desired(
 ) -> Result<Vec<RoutingPublication>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for publication in publications {
-        set_publication_desired(
+        set_initial_publication(
             &tx,
-            &publication.key,
+            publication,
             desired_revision_id,
             desired_inventory_generation,
             updated_ms,
         )?;
-        if publication.state == PublicationState::Applied {
-            let result = compare_and_swap_publication_result(
-                &tx,
-                &publication.key,
-                desired_revision_id,
-                desired_inventory_generation,
-                &PublicationResultUpdate {
-                    state: PublicationState::Applied,
-                    applied_identities: Some(BTreeSet::new()),
-                    detail_code: None,
-                    updated_ms,
-                },
-            )?;
-            if result != PublicationCasResult::Updated {
-                return Err(Error::InvalidRoutingState(
-                    "publication state changed during desired handoff".into(),
-                ));
-            }
-        } else if publication.state != PublicationState::Pending {
-            return Err(Error::InvalidRoutingState(
-                "desired publication must be pending or applied".into(),
-            ));
-        }
     }
     let rows = load_publications(&tx)?;
     tx.commit()?;

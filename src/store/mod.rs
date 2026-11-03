@@ -41,9 +41,10 @@ pub use ledger::{
 pub use state::{
     Allowance, BindingLearning, BindingLearningReplay, BindingLearningUpdate, DraftCasResult,
     InitialPublication, Lane, LanePin, LanePinCasResult, MetersSnapshot, ModelEntry,
-    NewPolicyRevision, PingAction, PingRecord, PolicyDraft, PolicyRevision, PolicyRevisionSource,
-    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
+    NewPolicyRevision, PingAction, PingRecord, PolicyActivation, PolicyActivationInput,
+    PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult,
+    PublicationKey, PublicationResultUpdate, PublicationState, RevisionOneActivation,
+    RoutingPolicyState, RoutingPublication,
 };
 
 use std::env;
@@ -427,6 +428,11 @@ impl Store {
         &self,
         revision: &NewPolicyRevision<'_>,
     ) -> Result<PolicyRevision> {
+        if revision.source == PolicyRevisionSource::Applied {
+            return Err(Error::InvalidRoutingState(
+                "applied revisions must use the atomic policy apply transaction".into(),
+            ));
+        }
         state::insert_policy_revision(&*self.conn()?, revision)
     }
 
@@ -444,6 +450,51 @@ impl Store {
             &mut conn,
             document,
             activated_ms,
+            desired_inventory_generation,
+            publications,
+        )
+    }
+
+    /// Atomically create and activate a direct live-routing revision.
+    ///
+    /// The transaction assigns the current active revision as the immutable
+    /// parent's revision and marks every supplied publication desired at the
+    /// supplied inventory generation. `source` is normally `Applied`; a
+    /// legacy-origin document may be retained as `Legacy`. Existing draft state
+    /// is not touched.
+    pub fn apply_policy_revision(
+        &self,
+        document: &crate::policy::ValidatedPolicyDocument,
+        input: PolicyActivationInput<'_>,
+        source: PolicyRevisionSource,
+        desired_inventory_generation: i64,
+        publications: &[InitialPublication],
+    ) -> Result<PolicyActivation> {
+        let mut conn = self.conn()?;
+        state::apply_policy_revision(
+            &mut conn,
+            document,
+            input,
+            source,
+            desired_inventory_generation,
+            publications,
+        )
+    }
+
+    /// Atomically copy an existing revision's document into a new live
+    /// revision. The new revision records the selected revision as its parent.
+    pub fn reactivate_policy_revision(
+        &self,
+        selected_revision_id: i64,
+        input: PolicyActivationInput<'_>,
+        desired_inventory_generation: i64,
+        publications: &[InitialPublication],
+    ) -> Result<PolicyActivation> {
+        let mut conn = self.conn()?;
+        state::reactivate_policy_revision(
+            &mut conn,
+            selected_revision_id,
+            input,
             desired_inventory_generation,
             publications,
         )
@@ -735,10 +786,10 @@ mod tests {
         Allowance, AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason,
         BindingLearningUpdate, CostKind, DisplayRow, DraftCasResult, Error, InitialPublication,
         Lane, LanePin, LanePinCasResult, MAX_ROUTING_TRACE_EVENTS, MetersSnapshot, ModelEntry,
-        NewPolicyRevision, PingAction, PingRecord, PolicyRevisionSource, PolicyRouteProvenance,
-        PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult, PublicationKey,
-        PublicationResultUpdate, PublicationState, RequestLookupProvenance, RequestRow,
-        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        NewPolicyRevision, PingAction, PingRecord, PolicyActivationInput, PolicyRevisionSource,
+        PolicyRouteProvenance, PolicyRoutingOutcome, PublicationAdapter, PublicationCasResult,
+        PublicationKey, PublicationResultUpdate, PublicationState, RequestLookupProvenance,
+        RequestRow, RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
         StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
         is_api_measurement,
     };
@@ -2733,6 +2784,380 @@ mod tests {
     }
 
     #[test]
+    fn direct_policy_apply_activates_an_authored_child_and_updates_publications() {
+        let store = mem_store();
+        let base = store
+            .activate_revision_one(&policy("base"), 100, 1, &[])
+            .unwrap();
+        let RevisionOneActivation::Activated { revision: base, .. } = base else {
+            panic!("first activation creates revision one")
+        };
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiChat,
+            },
+            PublicationAdapter::new("dynamic_chat_models").unwrap(),
+        );
+        let document = policy("authored");
+        let publication = InitialPublication {
+            key,
+            state: PublicationState::Applied,
+        };
+        let activation = store
+            .apply_policy_revision(
+                &document,
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 201,
+                    description: Some("authored apply"),
+                    activation_scope: ActivationScope::NewAndColdLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Applied,
+                9,
+                std::slice::from_ref(&publication),
+            )
+            .unwrap();
+
+        assert_eq!(activation.revision.source, PolicyRevisionSource::Applied);
+        assert_eq!(
+            activation.revision.parent_revision_id,
+            Some(base.revision_id)
+        );
+        assert_eq!(activation.revision.document, document);
+        assert_eq!(
+            activation.state.active_revision_id,
+            Some(activation.revision.revision_id)
+        );
+        assert_eq!(activation.state.draft_generation, 1);
+        assert_eq!(
+            activation.state.draft.as_ref().unwrap().base_revision_id,
+            base.revision_id
+        );
+        assert_eq!(activation.publications.len(), 1);
+        assert_eq!(
+            activation.publications[0].desired_revision_id,
+            activation.revision.revision_id
+        );
+        assert_eq!(activation.publications[0].desired_inventory_generation, 9);
+        assert_eq!(activation.publications[0].state, PublicationState::Applied);
+        assert_eq!(
+            activation.publications[0].applied_revision_id,
+            Some(activation.revision.revision_id)
+        );
+        assert_eq!(
+            activation.publications[0].applied_inventory_generation,
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn direct_legacy_policy_apply_retains_legacy_origin() {
+        let store = mem_store();
+        let first = store
+            .activate_revision_one(&policy("legacy"), 100, 1, &[])
+            .unwrap();
+        let RevisionOneActivation::Activated {
+            revision: legacy, ..
+        } = first
+        else {
+            panic!("first activation creates revision one")
+        };
+        let activation = store
+            .apply_policy_revision(
+                &legacy.document,
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 201,
+                    description: Some("apply legacy document"),
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Legacy,
+                2,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(activation.revision.source, PolicyRevisionSource::Legacy);
+        assert_eq!(
+            activation.revision.parent_revision_id,
+            Some(legacy.revision_id)
+        );
+        assert_eq!(activation.revision.document, legacy.document);
+    }
+
+    #[test]
+    fn direct_policy_apply_rejects_non_apply_sources() {
+        let store = mem_store();
+        store
+            .activate_revision_one(&policy("base"), 100, 1, &[])
+            .unwrap();
+        let error = store
+            .apply_policy_revision(
+                &policy("draft source"),
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 200,
+                    description: None,
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Draft,
+                2,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRoutingState(_)));
+    }
+
+    #[test]
+    fn direct_legacy_policy_apply_requires_a_legacy_active_revision() {
+        let store = mem_store();
+        store
+            .activate_revision_one(&policy("legacy"), 100, 1, &[])
+            .unwrap();
+        store
+            .apply_policy_revision(
+                &policy("authored"),
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 200,
+                    description: None,
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Applied,
+                2,
+                &[],
+            )
+            .unwrap();
+        let error = store
+            .apply_policy_revision(
+                &policy("attempt legacy"),
+                PolicyActivationInput {
+                    created_ms: 300,
+                    activated_ms: 300,
+                    description: None,
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Legacy,
+                3,
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRoutingState(_)));
+    }
+
+    #[test]
+    fn reactivation_copies_selected_document_and_preserves_legacy_origin() {
+        let store = mem_store();
+        let first = store
+            .activate_revision_one(&policy("legacy"), 100, 1, &[])
+            .unwrap();
+        let RevisionOneActivation::Activated {
+            revision: legacy, ..
+        } = first
+        else {
+            panic!("first activation creates revision one")
+        };
+        let authored = store
+            .apply_policy_revision(
+                &policy("authored"),
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 200,
+                    description: None,
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Applied,
+                2,
+                &[],
+            )
+            .unwrap();
+        let reactivation = store
+            .reactivate_policy_revision(
+                legacy.revision_id,
+                PolicyActivationInput {
+                    created_ms: 300,
+                    activated_ms: 301,
+                    description: Some("restore revision one"),
+                    activation_scope: ActivationScope::Immediate,
+                    forced_cache_transition: true,
+                },
+                3,
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(reactivation.revision.document, legacy.document);
+        assert_eq!(
+            reactivation.revision.parent_revision_id,
+            Some(legacy.revision_id)
+        );
+        assert_eq!(reactivation.revision.source, PolicyRevisionSource::Legacy);
+        assert_eq!(
+            reactivation.state.active_revision_id,
+            Some(reactivation.revision.revision_id)
+        );
+        assert_eq!(
+            store
+                .load_policy_revision(authored.revision.revision_id)
+                .unwrap(),
+            Some(authored.clone().revision)
+        );
+        let authored_reactivation = store
+            .reactivate_policy_revision(
+                authored.revision.revision_id,
+                PolicyActivationInput {
+                    created_ms: 400,
+                    activated_ms: 401,
+                    description: Some("restore authored revision"),
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                4,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            authored_reactivation.revision.document,
+            authored.revision.document
+        );
+        assert_eq!(
+            authored_reactivation.revision.parent_revision_id,
+            Some(authored.revision.revision_id)
+        );
+        assert_eq!(
+            authored_reactivation.revision.source,
+            PolicyRevisionSource::Reactivation
+        );
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn policy_apply_rolls_back_the_revision_and_pointer_on_publication_failure() {
+        let store = mem_store();
+        let base = store
+            .activate_revision_one(&policy("base"), 100, 1, &[])
+            .unwrap();
+        let RevisionOneActivation::Activated { revision: base, .. } = base else {
+            panic!("first activation creates revision one")
+        };
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiChat,
+            },
+            PublicationAdapter::new("dynamic_chat_models").unwrap(),
+        );
+        store
+            .execute_for_test(
+                "CREATE TRIGGER fail_live_apply_publication BEFORE INSERT ON routing_publications
+                 BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .apply_policy_revision(
+                    &policy("will roll back"),
+                    PolicyActivationInput {
+                        created_ms: 200,
+                        activated_ms: 200,
+                        description: None,
+                        activation_scope: ActivationScope::NewLanes,
+                        forced_cache_transition: false,
+                    },
+                    PolicyRevisionSource::Applied,
+                    2,
+                    &[InitialPublication {
+                        key,
+                        state: PublicationState::Pending,
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            Some(base.revision_id)
+        );
+        assert_eq!(store.load_policy_revisions().unwrap(), vec![base]);
+        assert_eq!(store.load_publications().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn policy_reactivation_rolls_back_the_revision_and_pointer_on_publication_failure() {
+        let store = mem_store();
+        let base = store
+            .activate_revision_one(&policy("base"), 100, 1, &[])
+            .unwrap();
+        let RevisionOneActivation::Activated { revision: base, .. } = base else {
+            panic!("first activation creates revision one")
+        };
+        let applied = store
+            .apply_policy_revision(
+                &policy("applied"),
+                PolicyActivationInput {
+                    created_ms: 200,
+                    activated_ms: 200,
+                    description: None,
+                    activation_scope: ActivationScope::NewLanes,
+                    forced_cache_transition: false,
+                },
+                PolicyRevisionSource::Applied,
+                2,
+                &[],
+            )
+            .unwrap();
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiChat,
+            },
+            PublicationAdapter::new("dynamic_chat_models").unwrap(),
+        );
+        store
+            .execute_for_test(
+                "CREATE TRIGGER fail_live_restore_publication BEFORE INSERT ON routing_publications
+                 BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .reactivate_policy_revision(
+                    base.revision_id,
+                    PolicyActivationInput {
+                        created_ms: 300,
+                        activated_ms: 300,
+                        description: None,
+                        activation_scope: ActivationScope::Immediate,
+                        forced_cache_transition: false,
+                    },
+                    3,
+                    &[InitialPublication {
+                        key,
+                        state: PublicationState::Pending,
+                    }],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_routing_policy_state()
+                .unwrap()
+                .active_revision_id,
+            Some(applied.revision.revision_id)
+        );
+        assert_eq!(store.load_policy_revisions().unwrap().len(), 2);
+        assert_eq!(store.load_publications().unwrap(), vec![]);
+    }
+
+    #[test]
     fn revision_one_activation_rolls_back_on_publication_failure() {
         let store = mem_store();
         let document = policy("revision one");
@@ -4584,6 +5009,73 @@ mod tests {
         assert_eq!(
             publication.detail_code.unwrap().as_str(),
             "legacy_applied_identities_unknown"
+        );
+    }
+
+    #[test]
+    fn migration_v15_accepts_applied_and_preserves_draft_sources() {
+        let dir = test_dir("v14-policy-revision-source");
+        let db = dir.join("toker.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&db).unwrap();
+            for script in &schema::MIGRATIONS[..14] {
+                conn.execute_batch(script).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 14).unwrap();
+            let document = policy("v14");
+            let json = String::from_utf8(crate::policy::policy_bytes(&document).unwrap()).unwrap();
+            let fingerprint = crate::policy::policy_fingerprint(&document)
+                .unwrap()
+                .to_string();
+            conn.execute(
+                "INSERT INTO routing_policy_revisions
+                 (revision_id, created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+                 VALUES (1, 1, 1, NULL, 'new_lanes', 0, 'draft', NULL, ?1, ?2)",
+                rusqlite::params![json, fingerprint],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(user_version(&store), 15);
+        assert_eq!(
+            store.load_policy_revision(1).unwrap().unwrap().source,
+            PolicyRevisionSource::Draft
+        );
+        let document = policy("applied");
+        let direct_insert = store.insert_policy_revision(&NewPolicyRevision {
+            created_ms: 2,
+            activated_ms: 2,
+            description: None,
+            activation_scope: ActivationScope::NewLanes,
+            forced_cache_transition: false,
+            source: PolicyRevisionSource::Applied,
+            parent_revision_id: Some(1),
+            document: &document,
+        });
+        assert!(matches!(direct_insert, Err(Error::InvalidRoutingState(_))));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO routing_policy_revisions
+                 (created_ms, activated_ms, description, activation_scope,
+                  forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
+                 VALUES (2, 2, NULL, 'new_lanes', 0, 'applied', 1, ?1, ?2)",
+                rusqlite::params![
+                    String::from_utf8(crate::policy::policy_bytes(&document).unwrap()).unwrap(),
+                    crate::policy::policy_fingerprint(&document)
+                        .unwrap()
+                        .to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_policy_revision(2).unwrap().unwrap().source,
+            PolicyRevisionSource::Applied
         );
     }
 
