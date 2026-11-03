@@ -42,13 +42,11 @@ use super::Server;
 use crate::middleware::models::{MergeIncoming, MergeOutcome};
 use crate::store::SessionSummary;
 
-pub(crate) mod routing;
-
 const CONTROL_HEADER: &str = "x-toker-control";
 
 /// A control body larger than this is a client bug, not a promotion —
 /// the handover carries one model's days and ceiling.
-pub(super) const MAX_CONTROL_BODY: usize = 1024 * 1024;
+const MAX_CONTROL_BODY: usize = 1024 * 1024;
 
 /// `GET /_toker/status` — the resolved config (sans secrets), ledger row
 /// count, last request ts, and uptime.
@@ -491,7 +489,7 @@ fn shutdown_error(status: StatusCode, error: &str) -> Response {
 /// (the prefix check) — the second half of what keeps a browser
 /// out: a cross-origin page cannot send either half without an
 /// unanswered preflight.
-pub(super) fn json_content_type(headers: &HeaderMap) -> bool {
+fn json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -513,14 +511,14 @@ fn merge_error(status: StatusCode, error: &str) -> Response {
 }
 
 /// The gate check: the control header's value names the operation.
-pub(super) fn control_token_ok(headers: &HeaderMap, verb: &str) -> bool {
+fn control_token_ok(headers: &HeaderMap, verb: &str) -> bool {
     headers
         .get(CONTROL_HEADER)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case(verb))
 }
 
-pub(super) fn forbidden() -> Response {
+fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
         "this endpoint requires the x-toker-control header naming its operation\n",
