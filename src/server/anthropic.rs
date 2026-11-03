@@ -312,6 +312,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // Inference middleware keeps one canonical request across the gates and
     // rewrites. Administrative bodies continue through the lexical IR.
     let mut canonical: Option<CanonicalRequest> = None;
+    let mut inference_request: Option<super::inference::InferenceRequest> = None;
     let mut inference_attempt: Option<super::inference::InferenceAttempt> = None;
     let mut canonical_error: Option<translate::TranslateError> = None;
     // The request's own shape, kept past the record context (which takes
@@ -1293,10 +1294,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .expect("inference model validated before gates"),
             request.clone(),
         );
-        inference_attempt = Some(match policy_attempt.take() {
-            Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan),
+        inference_attempt = Some(match policy_attempt.as_ref() {
+            Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan.clone()),
             None => inference.prepare(target.clone(), served_model.clone()),
         });
+        inference_request = Some(inference);
     }
 
     // ── the compaction retarget ──
@@ -1704,6 +1706,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server,
         adapter,
         attempt,
+        policy_attempt,
+        inference_request,
         super::inference::MessagesAttemptInput {
             parts,
             record,
@@ -1958,6 +1962,12 @@ pub(crate) enum ThinkingRetry {
     Inspected(super::attempt::PrecommitOutcome<reqwest::Response>),
 }
 
+pub(crate) struct ThinkingRetryFailure {
+    pub(crate) failure: super::attempt::AttemptFailure,
+    pub(crate) response: Response,
+    pub(crate) rate_limits: Option<serde_json::Value>,
+}
+
 pub(crate) async fn retry_thinking_off(
     server: &Server,
     backend: &dyn Provider,
@@ -1966,7 +1976,7 @@ pub(crate) async fn retry_thinking_off(
     upstream: reqwest::Response,
     record: &mut Option<AnthropicRecordCtx>,
     cancellation: &mut super::cancel::PrecommitCancellationGuard,
-) -> Result<ThinkingRetry, Box<Response>> {
+) -> Result<ThinkingRetry, Box<ThinkingRetryFailure>> {
     if upstream.status() != StatusCode::BAD_REQUEST {
         return Ok(ThinkingRetry::Original(upstream));
     }
@@ -1976,17 +1986,15 @@ pub(crate) async fn retry_thinking_off(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let Ok(buffered) = buffer_up_to(upstream, super::proxy::PRECOMMIT_BODY_CAP).await else {
-        if let Some(ctx) = record.as_ref() {
-            record_anthropic_error(
-                ctx,
-                status.as_u16(),
-                Some("ambiguous_transport".to_owned()),
-                None,
-                retry_after_ms(&headers),
-                parse_rate_limits(&headers).as_ref(),
-            );
-        }
-        return Err(Box::new(truncated_body(ErrorWire::Anthropic)));
+        return Err(Box::new(ThinkingRetryFailure {
+            failure: super::attempt::AttemptFailure {
+                class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                status: Some(status.as_u16()),
+            },
+            response: truncated_body(ErrorWire::Anthropic),
+            rate_limits: parse_rate_limits(&headers),
+        }));
     };
     let wants_between_tools = buffered.rest.is_none()
         && error_pair(&buffered.bytes)
@@ -2034,17 +2042,24 @@ pub(crate) async fn retry_thinking_off(
         .map(ThinkingRetry::Retried)
         .map_err(|error| {
             tracing::warn!(%error, "upstream request failed");
-            if let Some(ctx) = record.as_ref() {
-                record_anthropic_error(
-                    ctx,
-                    StatusCode::BAD_GATEWAY.as_u16(),
-                    Some(super::attempt::transport_failure_type(&error).to_owned()),
-                    None,
-                    None,
-                    None,
-                );
-            }
-            Box::new(transport_failure(ErrorWire::Anthropic, &error))
+            let class = if error.is_connect() {
+                crate::policy::FailureClass::TransportBeforeAccept
+            } else {
+                crate::policy::FailureClass::AmbiguousTransport
+            };
+            Box::new(ThinkingRetryFailure {
+                failure: super::attempt::AttemptFailure {
+                    class: Some(class),
+                    mechanism: if error.is_connect() {
+                        super::attempt::FailureMechanism::TransportBeforeAccept
+                    } else {
+                        super::attempt::FailureMechanism::AmbiguousTransport
+                    },
+                    status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                },
+                response: transport_failure(ErrorWire::Anthropic, &error),
+                rate_limits: None,
+            })
         })
 }
 

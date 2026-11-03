@@ -223,6 +223,38 @@ impl InferenceAttempt {
     }
 }
 
+enum MessagesFailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ReadyMessagesOutcome {
+    Accepted {
+        upstream: reqwest::Response,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        response_projection: crate::ir::canonical::ResponseProjection,
+        expected_stream: bool,
+        rate_limits: Option<Value>,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        failure: super::attempt::AttemptFailure,
+        response: MessagesFailureResponse,
+        parts: Parts,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        response_projection: crate::ir::canonical::ResponseProjection,
+        expected_stream: bool,
+        rate_limits: Option<Value>,
+        provenance: crate::store::AttemptProvenance,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
 struct ReadyMessagesAttempt {
     parts: Parts,
     backend: Arc<dyn Provider>,
@@ -245,46 +277,63 @@ impl ReadyMessagesAttempt {
         &self.effective_model
     }
 
-    async fn execute(
+    async fn execute_precommit(
         mut self,
-        server: Server,
+        server: &Server,
         provenance: crate::store::AttemptProvenance,
-    ) -> Response {
+    ) -> ReadyMessagesOutcome {
         if let Some(ctx) = self.record.as_mut() {
-            ctx.attempt = Some(provenance);
+            ctx.attempt = Some(provenance.clone());
         }
         let mut cancellation =
             super::cancel::PrecommitCancellationGuard::anthropic(self.record.as_ref());
         let sent = self.body.clone();
         let upstream = match super::proxy::send_upstream(
-            &server,
+            server,
             self.backend.as_ref(),
             &self.parts,
-            self.body,
+            self.body.clone(),
             &[],
         )
         .await
         {
             Ok(upstream) => upstream,
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream request failed");
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record_anthropic::record_anthropic_error(
-                        ctx,
-                        StatusCode::BAD_GATEWAY.as_u16(),
-                        Some(super::attempt::transport_failure_type(&error).to_owned()),
-                        None,
-                        None,
-                        None,
-                    );
-                }
-                return super::proxy::transport_failure(super::proxy::ErrorWire::Anthropic, &error);
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyMessagesOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: MessagesFailureResponse::Local(super::proxy::transport_failure(
+                        super::proxy::ErrorWire::Anthropic,
+                        &error,
+                    )),
+                    parts: self.parts,
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    response_projection: self.response_projection,
+                    expected_stream: self.expected_stream,
+                    rate_limits: None,
+                    provenance,
+                    cancellation,
+                };
             }
         };
-        super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
         let retry = match super::anthropic::retry_thinking_off(
-            &server,
+            server,
             self.backend.as_ref(),
             &self.parts,
             sent,
@@ -295,9 +344,25 @@ impl ReadyMessagesAttempt {
         .await
         {
             Ok(retry) => retry,
-            Err(response) => {
-                cancellation.disarm();
-                return *response;
+            Err(failed) => {
+                let provenance = self
+                    .record
+                    .as_ref()
+                    .and_then(|ctx| ctx.attempt.clone())
+                    .unwrap_or(provenance);
+                return ReadyMessagesOutcome::Failure {
+                    failure: failed.failure,
+                    response: MessagesFailureResponse::Local(failed.response),
+                    parts: self.parts,
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    response_projection: self.response_projection,
+                    expected_stream: self.expected_stream,
+                    rate_limits: failed.rate_limits,
+                    provenance,
+                    cancellation,
+                };
             }
         };
         cancellation.update_anthropic(self.record.as_ref());
@@ -312,7 +377,7 @@ impl ReadyMessagesAttempt {
                 )
             }
             super::anthropic::ThinkingRetry::Retried(upstream) => {
-                super::anthropic::note_meters(&server, self.backend.as_ref(), upstream.headers());
+                super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
                 let status = upstream.status();
                 let rate_limits = parse_rate_limits(upstream.headers());
                 (
@@ -334,58 +399,197 @@ impl ReadyMessagesAttempt {
             }
         };
         let (outcome, rate_limits, response_status) = response;
-        let upstream = match outcome {
-            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. })
-            | Ok(super::attempt::PrecommitOutcome::Failure {
-                response: Some(response),
-                ..
-            }) => response,
-            Ok(super::attempt::PrecommitOutcome::Failure { response: None, .. }) => {
-                cancellation.disarm();
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record_anthropic::record_anthropic_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("response_protocol".to_owned()),
-                        None,
-                        None,
-                        rate_limits.as_ref(),
-                    );
+        let provenance = self
+            .record
+            .as_ref()
+            .and_then(|ctx| ctx.attempt.clone())
+            .unwrap_or(provenance);
+        match outcome {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyMessagesOutcome::Accepted {
+                    upstream: response,
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    response_projection: self.response_projection,
+                    expected_stream: self.expected_stream,
+                    rate_limits,
+                    cancellation,
                 }
-                return super::proxy::upstream_failure(
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyMessagesOutcome::Failure {
+                failure,
+                response: MessagesFailureResponse::Upstream(response),
+                parts: self.parts,
+                record: self.record,
+                in_flight: self.in_flight,
+                response_model: self.response_model,
+                response_projection: self.response_projection,
+                expected_stream: self.expected_stream,
+                rate_limits,
+                provenance,
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyMessagesOutcome::Failure {
+                failure,
+                response: MessagesFailureResponse::Local(super::proxy::upstream_failure(
                     super::proxy::ErrorWire::Anthropic,
                     "toker could not interpret the upstream response before commitment",
-                );
-            }
+                )),
+                parts: self.parts,
+                record: self.record,
+                in_flight: self.in_flight,
+                response_model: self.response_model,
+                response_projection: self.response_projection,
+                expected_stream: self.expected_stream,
+                rate_limits,
+                provenance,
+                cancellation,
+            },
             Err(error) => {
-                cancellation.disarm();
                 tracing::warn!(%error, "upstream response failed before commitment");
-                if let Some(ctx) = self.record.as_ref() {
-                    super::record_anthropic::record_anthropic_error(
-                        ctx,
-                        response_status.as_u16(),
-                        Some("ambiguous_transport".to_owned()),
-                        None,
-                        None,
+                ReadyMessagesOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: MessagesFailureResponse::Local(super::proxy::truncated_body(
+                        super::proxy::ErrorWire::Anthropic,
+                    )),
+                    parts: self.parts,
+                    record: self.record,
+                    in_flight: self.in_flight,
+                    response_model: self.response_model,
+                    response_projection: self.response_projection,
+                    expected_stream: self.expected_stream,
+                    rate_limits,
+                    provenance,
+                    cancellation,
+                }
+            }
+        }
+    }
+}
+
+async fn finish_messages_outcome(outcome: ReadyMessagesOutcome) -> Response {
+    match outcome {
+        ReadyMessagesOutcome::Accepted {
+            upstream,
+            record,
+            in_flight,
+            response_model,
+            response_projection,
+            expected_stream,
+            rate_limits,
+            mut cancellation,
+        } => {
+            let response = super::anthropic::forward_canonical_messages(
+                upstream,
+                record,
+                in_flight,
+                &response_model,
+                response_projection,
+                expected_stream,
+                rate_limits,
+            )
+            .await;
+            cancellation.disarm();
+            response
+        }
+        ReadyMessagesOutcome::Failure {
+            failure,
+            response,
+            parts: _,
+            record,
+            in_flight,
+            response_model,
+            response_projection,
+            expected_stream,
+            rate_limits,
+            provenance: _,
+            mut cancellation,
+        } => {
+            let response = match response {
+                MessagesFailureResponse::Upstream(response) => {
+                    super::anthropic::forward_canonical_messages(
+                        response,
+                        record,
+                        in_flight,
+                        &response_model,
+                        response_projection,
+                        expected_stream,
+                        rate_limits,
+                    )
+                    .await
+                }
+                MessagesFailureResponse::Local(response) => {
+                    let failure_response = MessagesFailureResponse::Local(response);
+                    record_messages_failure(
+                        record.as_ref(),
+                        &failure,
+                        &failure_response,
                         rate_limits.as_ref(),
                     );
+                    let MessagesFailureResponse::Local(response) = failure_response else {
+                        unreachable!()
+                    };
+                    response
                 }
-                return super::proxy::truncated_body(super::proxy::ErrorWire::Anthropic);
-            }
-        };
-        let response = super::anthropic::forward_canonical_messages(
-            upstream,
-            self.record,
-            self.in_flight,
-            &self.response_model,
-            self.response_projection,
-            self.expected_stream,
-            rate_limits,
-        )
-        .await;
-        cancellation.disarm();
-        response
+            };
+            cancellation.disarm();
+            response
+        }
     }
+}
+
+fn record_messages_failure(
+    record: Option<&AnthropicRecordCtx>,
+    failure: &super::attempt::AttemptFailure,
+    response: &MessagesFailureResponse,
+    rate_limits: Option<&Value>,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    let retry_after = match response {
+        MessagesFailureResponse::Upstream(response) => {
+            super::record::retry_after_ms(response.headers())
+        }
+        MessagesFailureResponse::Local(_) => None,
+    };
+    super::record_anthropic::record_anthropic_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        Some(error_type.to_owned()),
+        None,
+        retry_after,
+        rate_limits,
+    );
 }
 
 enum ChatFailureResponse {
@@ -620,7 +824,10 @@ impl ReadyBackendAttempt {
         provenance: crate::store::AttemptProvenance,
     ) -> Response {
         match self {
-            Self::Messages(ready) => ready.execute(server, provenance).await,
+            Self::Messages(ready) => {
+                let outcome = ready.execute_precommit(&server, provenance).await;
+                finish_messages_outcome(outcome).await
+            }
             Self::Chat(mut ready) => match ready.execute_precommit(&server, provenance).await {
                 ReadyChatOutcome::Accepted {
                     upstream,
@@ -775,6 +982,8 @@ pub(crate) async fn coordinate_messages(
     server: Server,
     adapter: Option<BackendAdapterId>,
     attempt: Result<InferenceAttempt, TranslateError>,
+    policy_attempt: Option<super::PolicyAttempt>,
+    inference: Option<InferenceRequest>,
     input: MessagesAttemptInput,
 ) -> Response {
     let MessagesAttemptInput {
@@ -805,23 +1014,72 @@ pub(crate) async fn coordinate_messages(
             false,
         );
     }
-    let prepared = match adapter {
+    let prepared = prepare_messages_backend(
+        &server,
+        adapter,
+        attempt,
+        MessagesAttemptInput {
+            parts,
+            record,
+            in_flight,
+            session_id: session_id.clone(),
+            client_wants_json,
+        },
+    )
+    .await;
+    let ready = match prepared {
+        Ok(ready) => ready,
+        Err(response) => return *response,
+    };
+    let provenance = super::attempt::initial_provenance();
+    let Some(policy_attempt) = policy_attempt else {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        return ready.execute(server, provenance).await;
+    };
+    let ReadyBackendAttempt::Messages(ready) = ready else {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        return ready.execute(server, provenance).await;
+    };
+    let inference = inference.expect("an authoritative Messages attempt retains its baseline");
+    coordinate_native_messages(
+        server,
+        ready,
+        provenance,
+        policy_attempt,
+        inference,
+        session_id,
+        client_wants_json,
+    )
+    .await
+}
+
+async fn prepare_messages_backend(
+    server: &Server,
+    adapter: Option<BackendAdapterId>,
+    attempt: Result<InferenceAttempt, TranslateError>,
+    input: MessagesAttemptInput,
+) -> Result<ReadyBackendAttempt, Box<Response>> {
+    let MessagesAttemptInput {
+        parts,
+        record,
+        in_flight,
+        session_id,
+        client_wants_json,
+    } = input;
+    match adapter {
         Some(BackendAdapterId::AnthropicMessages) => {
-            let attempt = match attempt {
-                Ok(attempt) => attempt,
-                Err(error) => {
-                    return super::codex::anthropic_error_response(
-                        axum::http::StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        &format!("the request could not be translated: {error}"),
-                        false,
-                    );
-                }
-            };
+            let attempt = attempt.map_err(|error| {
+                Box::new(super::codex::anthropic_error_response(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("the request could not be translated: {error}"),
+                    false,
+                ))
+            })?;
             prepare_messages(parts, attempt, record, in_flight).map(ReadyBackendAttempt::Messages)
         }
         Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
-            &server,
+            server,
             super::codex::AttemptInput {
                 parts,
                 attempt,
@@ -837,15 +1095,209 @@ pub(crate) async fn coordinate_messages(
         .await
         .map(ReadyBackendAttempt::Codex),
         _ => Err(Box::new(super::anthropic_not_configured())),
-    };
-    let ready = match prepared {
-        Ok(ready) => ready,
-        Err(response) => return *response,
-    };
-    server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-    ready
-        .execute(server, super::attempt::initial_provenance())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn coordinate_native_messages(
+    server: Server,
+    mut ready: ReadyMessagesAttempt,
+    mut provenance: crate::store::AttemptProvenance,
+    mut policy_attempt: super::PolicyAttempt,
+    inference: InferenceRequest,
+    session_id: Option<String>,
+    client_wants_json: bool,
+) -> Response {
+    loop {
+        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
+        let outcome = ready.execute_precommit(&server, provenance.clone()).await;
+        let ReadyMessagesOutcome::Failure {
+            failure,
+            response,
+            parts,
+            mut record,
+            in_flight,
+            response_model,
+            response_projection,
+            expected_stream,
+            rate_limits,
+            provenance: failed_provenance,
+            mut cancellation,
+        } = outcome
+        else {
+            return finish_messages_outcome(outcome).await;
+        };
+        let Some(class) = failure.class else {
+            return finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                failure,
+                response,
+                parts,
+                record,
+                in_flight,
+                response_model,
+                response_projection,
+                expected_stream,
+                rate_limits,
+                provenance: failed_provenance,
+                cancellation,
+            })
+            .await;
+        };
+        server.open_policy_circuit(&policy_attempt, class, super::record::now_ms());
+        let next = match server.continue_policy_attempt(&policy_attempt, class) {
+            Ok(Some(next)) => next,
+            Ok(None) => {
+                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    response_projection,
+                    expected_stream,
+                    rate_limits,
+                    provenance: failed_provenance,
+                    cancellation,
+                })
+                .await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "policy fallback continuation failed");
+                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    response_projection,
+                    expected_stream,
+                    rate_limits,
+                    provenance: failed_provenance,
+                    cancellation,
+                })
+                .await;
+            }
+        };
+        let target = match server.registry.resolve_binding(
+            crate::routing::ProtocolId::AnthropicMessages,
+            &next.plan.binding_id,
+            next.plan.requested_model.as_deref(),
+            &next.plan.effective_model,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                tracing::error!(?error, binding_id = %next.plan.binding_id, "policy fallback selected an unavailable Messages binding");
+                return finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                    failure,
+                    response,
+                    parts,
+                    record,
+                    in_flight,
+                    response_model,
+                    response_projection,
+                    expected_stream,
+                    rate_limits,
+                    provenance: failed_provenance,
+                    cancellation,
+                })
+                .await;
+            }
+        };
+        let Some(next_provenance) = super::attempt::next_provenance(&failed_provenance, class)
+        else {
+            return finish_messages_outcome(ReadyMessagesOutcome::Failure {
+                failure,
+                response,
+                parts,
+                record,
+                in_flight,
+                response_model,
+                response_projection,
+                expected_stream,
+                rate_limits,
+                provenance: failed_provenance,
+                cancellation,
+            })
+            .await;
+        };
+        record_messages_failure(record.as_ref(), &failure, &response, rate_limits.as_ref());
+        cancellation.disarm();
+        drop(response);
+        if let Some(ctx) = record.as_mut() {
+            ctx.backend = target.provider().clone();
+            ctx.binding_id = next.plan.binding_id.clone();
+            ctx.attempt = None;
+            ctx.policy_routing = crate::store::PolicyRouteProvenance::from_attempt_plan(&next.plan)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "policy fallback provenance omitted");
+                    None
+                });
+            ctx.pin_transition = Some(next.pin_transition.clone());
+            ctx.effective_model = Some(next.plan.effective_model.clone());
+            ctx.policy_attempt = Some(Arc::new(next.clone()));
+        }
+        let adapter = target
+            .binding()
+            .canonical_backend()
+            .map(|backend| backend.adapter());
+        let attempt = prepare_messages_fallback_attempt(&inference, target, &next, record.as_mut());
+        let prepared = match prepare_messages_backend(
+            &server,
+            adapter,
+            attempt,
+            MessagesAttemptInput {
+                parts,
+                record,
+                in_flight,
+                session_id: session_id.clone(),
+                client_wants_json,
+            },
+        )
         .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return *response,
+        };
+        provenance = next_provenance;
+        policy_attempt = next;
+        match prepared {
+            ReadyBackendAttempt::Messages(next) => ready = next,
+            prepared => {
+                server.note_binding_sent(prepared.binding_id(), Some(prepared.effective_model()));
+                return prepared.execute(server, provenance).await;
+            }
+        }
+    }
+}
+
+fn prepare_messages_fallback_attempt(
+    inference: &InferenceRequest,
+    target: ModelTarget,
+    policy_attempt: &super::PolicyAttempt,
+    record: Option<&mut AnthropicRecordCtx>,
+) -> Result<InferenceAttempt, TranslateError> {
+    let backend = target.provider().clone();
+    let mut attempt = inference.prepare_policy(target, policy_attempt.plan.clone());
+    if policy_attempt.plan.compaction
+        && let Some(outcome) = attempt.apply_compaction(
+            Some(&policy_attempt.plan.effective_model),
+            backend.model_map(),
+        )
+        && let Some(record) = record
+    {
+        let moved = outcome.from != outcome.to;
+        record.downgraded_from = moved.then_some(outcome.from).flatten();
+        record.downgraded_to = moved.then_some(outcome.to).flatten();
+        record.cache_stripped = (outcome.stripped > 0).then_some(true);
+        record.system_merged = (outcome.merged > 0).then_some(true);
+    }
+    if !backend.accepts_message_effort(&policy_attempt.plan.effective_model) {
+        let source = attempt.render_json()?.value;
+        attempt.strip_message_effort(&source);
+    }
+    Ok(attempt)
 }
 
 pub(crate) async fn coordinate_chat(

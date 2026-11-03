@@ -61,14 +61,6 @@ pub(crate) enum PrecommitOutcome<T> {
     },
 }
 
-pub(crate) fn transport_failure_type(error: &reqwest::Error) -> &'static str {
-    if error.is_connect() {
-        "transport_before_accept"
-    } else {
-        "ambiguous_transport"
-    }
-}
-
 pub(crate) fn initial_provenance() -> AttemptProvenance {
     AttemptProvenance {
         attempt_group_id: AttemptGroupId::fresh(),

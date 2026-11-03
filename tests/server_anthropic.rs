@@ -40,6 +40,13 @@ use toker::config::{
 use toker::ir::{PLAN_SENTINEL, Release, Request as IrRequest, SENTINEL};
 use toker::middleware::notice::NoticeStyle;
 use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering, decide};
+use toker::policy::{
+    ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
+    CandidateEdge, CandidateId, CandidateModel, DefaultRoute, FailureClass, FallbackPermission,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
+    REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
+};
+use toker::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES};
 use toker::server::Server;
 use toker::store::{Allowance, CostKind, MetersSnapshot, RequestRow, RowKind, Store};
 use toker::translate::from_anthropic;
@@ -236,6 +243,13 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         .to_owned();
 
     match model.as_str() {
+        "overloaded" => raw_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+        ),
         "err-401" | "malformed-error" => {
             let body = if model == "err-401" {
                 Bytes::from_static(ERROR_BODY.as_bytes())
@@ -253,7 +267,7 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         // 2026-10-08: `disabled` is refused with the form it wants instead.
         // `thinking-always-400` refuses whatever it is sent, so the retry
         // must stop at one.
-        "thinking-strict" | "thinking-always-400"
+        "thinking-strict" | "thinking-always-400" | "thinking-then-overload"
             if model == "thinking-always-400"
                 || json.pointer("/thinking/type") == Some(&json!("disabled")) =>
         {
@@ -265,6 +279,13 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
             metered(&mut response, "0.31");
             response
         }
+        "thinking-then-overload" => raw_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+        ),
         "gzip-me" => {
             // "Compressed" bytes that are not really gzip: the point is
             // verbatim passthrough, not decompression.
@@ -646,6 +667,105 @@ fn test_config(
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
     spawn_toker_idle(config, None).await
+}
+
+fn messages_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    messages_fallback_policy_with_model("overloaded")
+}
+
+fn messages_fallback_policy_with_model(
+    primary_model: &str,
+) -> toker::policy::ValidatedPolicyDocument {
+    let route_id = RouteId::new("messages-fallback").unwrap();
+    PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("Messages fallback fixture".to_owned()),
+        defaults: vec![DefaultRoute {
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            target: RouteReference {
+                route_id: route_id.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        }],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id,
+            display_name: "Messages fallback".to_owned(),
+            description: None,
+            parameters: vec![REQUESTED_MODEL_PARAMETER.parse().unwrap()],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("primary").unwrap(),
+                    binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: primary_model.to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![FailureClass::Overload],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: Candidate {
+                        id: CandidateId::new("backup").unwrap(),
+                        binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                        model: CandidateModel::Exact {
+                            model_id: "backup".to_owned(),
+                        },
+                        upgrade_policy_id: None,
+                        alias_policy: None,
+                        required_capabilities: Default::default(),
+                        enabled: true,
+                        health_circuits: vec![],
+                    },
+                }],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap()
+}
+
+async fn spawn_toker_with_policy(config: Config) -> (SocketAddr, Arc<Store>) {
+    spawn_toker_with_policy_document(config, messages_fallback_policy()).await
+}
+
+async fn spawn_toker_with_policy_document(
+    config: Config,
+    policy: toker::policy::ValidatedPolicyDocument,
+) -> (SocketAddr, Arc<Store>) {
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    store
+        .activate_revision_one(&policy, 1, 0, &[])
+        .expect("activate policy fixture");
+    let server = Server::new_authoritative(config, store.clone()).expect("build server");
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    (addr, store)
 }
 
 /// [`spawn_toker`], with the upstream idle timeout shortened so a stall
@@ -3591,6 +3711,99 @@ async fn capture_localises_a_system_change_and_keeps_ladders_only_where_it_matte
         rows[2].system_change.as_ref().expect("localised").to_string(),
         @r#"{"delta":0,"where":"block 0 (20021 → 20021 chars), 16-24 bytes from the end"}"#
     );
+}
+
+#[tokio::test]
+async fn active_messages_policy_falls_back_before_commitment() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-ant-test".to_owned()), "anthropic_sub");
+    config.anthropic_sub.as_mut().unwrap().oauth_token = Some("held-token".to_owned());
+    config.db_path = common::tempdir("server-anthropic-policy-fallback-").join("toker.db");
+    let (addr, store) = spawn_toker_with_policy(config).await;
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("x-toker-session", "messages-fallback")],
+        &messages_body("asked-model", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("Message JSON");
+    assert_eq!(body["model"], "asked-model");
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 2);
+    let primary: Value = serde_json::from_slice(&captured[0].body).unwrap();
+    let backup: Value = serde_json::from_slice(&captured[1].body).unwrap();
+    assert_eq!(primary["model"], "overloaded");
+    assert_eq!(backup["model"], "backup");
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(store.count_logical_requests().unwrap(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].kind, None);
+    let first = rows[0].attempt.as_ref().unwrap();
+    let second = rows[1].attempt.as_ref().unwrap();
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(second.attempt_index.get(), 1);
+    assert_eq!(second.reason, toker::store::AttemptReason::Overload);
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("messages-fallback"))
+        .expect("fallback success pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
+        Some("backup")
+    );
+}
+
+#[tokio::test]
+async fn thinking_retry_precedes_route_fallback_in_one_attempt_group() {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-ant-test".to_owned()), "anthropic_sub");
+    config.anthropic_sub.as_mut().unwrap().oauth_token = Some("held-token".to_owned());
+    config.db_path = common::tempdir("server-anthropic-thinking-fallback-").join("toker.db");
+    let (addr, store) = spawn_toker_with_policy_document(
+        config,
+        messages_fallback_policy_with_model("thinking-then-overload"),
+    )
+    .await;
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("x-toker-session", "thinking-fallback")],
+        &thinking_off_body("asked-model", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("Message body");
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 3);
+    let attempts = wait_for_rows(&store, 3).await;
+    let provenance = attempts
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        provenance
+            .windows(2)
+            .all(|pair| pair[0].attempt_group_id == pair[1].attempt_group_id)
+    );
+    assert_eq!(provenance[0].attempt_index.get(), 0);
+    assert_eq!(provenance[0].reason, toker::store::AttemptReason::Initial);
+    assert_eq!(provenance[1].attempt_index.get(), 1);
+    assert_eq!(
+        provenance[1].reason,
+        toker::store::AttemptReason::ThinkingNegotiation
+    );
+    assert_eq!(provenance[2].attempt_index.get(), 2);
+    assert_eq!(provenance[2].reason, toker::store::AttemptReason::Overload);
+    assert_eq!(attempts[0].kind, Some(RowKind::Error));
+    assert_eq!(attempts[1].kind, Some(RowKind::Error));
+    assert_eq!(attempts[2].kind, None);
 }
 
 #[tokio::test]
