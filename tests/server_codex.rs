@@ -1668,6 +1668,8 @@ async fn active_messages_policy_falls_back_from_codex_to_anthropic() {
     assert_eq!(second.attempt_index.get(), 1);
     assert_eq!(second.reason, toker::store::AttemptReason::ServerError);
     assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[0].status, Some(StatusCode::OK.as_u16().into()));
+    assert_eq!(rows[0].error_type.as_deref(), Some("server_error"));
     assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
     let lane = store
         .load_lanes()

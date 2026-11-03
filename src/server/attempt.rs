@@ -296,7 +296,7 @@ pub(crate) async fn precommit_responses(
         });
         let failure = parsed.as_ref().and_then(|event| match event {
             ResponseEvent::Failed { error, .. } | ResponseEvent::Error { error } => {
-                Some(classify_responses_error(None, error, true))
+                Some(classify_responses_error(Some(status), error, true))
             }
             _ => None,
         });
@@ -598,9 +598,10 @@ mod tests {
             classify_responses_error(Some(StatusCode::INTERNAL_SERVER_ERROR), &error, false).class,
             Some(FailureClass::ServerError)
         );
-        let in_band = classify_responses_error(None, &error, true);
+        let in_band = classify_responses_error(Some(StatusCode::OK), &error, true);
         assert_eq!(in_band.class, Some(FailureClass::ServerError));
         assert_eq!(in_band.mechanism, FailureMechanism::InBandEvent);
+        assert_eq!(in_band.status, Some(StatusCode::OK.as_u16()));
     }
 
     fn streaming_response<S, E>(stream: S) -> reqwest::Response
