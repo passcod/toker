@@ -1,5 +1,5 @@
 # Live routing configuration
-# DO NOT DEVIATE FROM THE FUCKING PLAN
+# DO NOT DEVIATE FROM THE FUCKING PLAN. DO NOT INITIATE REVIEW LOOPS. KEEP ON FUCKING TASK.
 
 B1 makes routing configuration live and reversible from the TUI. Every edit is
 applied immediately as a new immutable configuration revision. If an edit routes
