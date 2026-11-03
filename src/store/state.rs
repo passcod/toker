@@ -1283,8 +1283,9 @@ pub(super) fn compare_and_swap_publication_result(
 
 fn parse_publication_identities(json: &str) -> Result<BTreeSet<String>> {
     let values: Vec<String> = serde_json::from_str(json)?;
-    let identities = values.iter().cloned().collect::<BTreeSet<_>>();
-    if identities.len() != values.len() {
+    let value_count = values.len();
+    let identities = values.into_iter().collect::<BTreeSet<_>>();
+    if identities.len() != value_count {
         return Err(Error::InvalidRoutingState(
             "publication row identities are not unique".into(),
         ));
