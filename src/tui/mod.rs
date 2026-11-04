@@ -48,6 +48,7 @@ mod model;
 mod quota;
 mod rebuilds;
 mod reexec;
+mod routing;
 mod view;
 
 use std::collections::HashMap;
@@ -118,6 +119,15 @@ const REBUILD_ROWS: u64 = 20_000;
 /// guards a pathologically hot ledger.
 const ROW_CAP: u64 = 10_000;
 
+/// The TUI's top-level page. Page-owned state remains alive while the other
+/// page is visible, so moving between the dashboard and routing never drops a
+/// fetched snapshot or a selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Dashboard,
+    Routing,
+}
+
 /// `toker tui --window-mins <m>`: open the ledger and run the dashboard
 /// loop until the user quits. Terminal setup/teardown goes through
 /// `ratatui::try_init` (alternate screen, raw mode, a panic hook that
@@ -133,6 +143,7 @@ pub fn run(
     window_mins: u64,
     extra_transcript_roots: &[PathBuf],
     gates: &crate::config::GatesConfig,
+    port: u16,
 ) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
     // Taken before the terminal: the file this process was started
@@ -156,6 +167,8 @@ pub fn run(
         detail: None,
     };
     let mut drawn = view::Drawn::default();
+    let mut page = Page::Dashboard;
+    let mut routing = routing::Page::new(port);
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
@@ -236,15 +249,25 @@ pub fn run(
             }
             next_tick = Instant::now() + TICK;
         }
-        terminal.draw(|frame| {
-            drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+        routing.poll();
+        terminal.draw(|frame| match page {
+            Page::Dashboard => {
+                drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
+            }
+            Page::Routing => {
+                let routing_drawn = routing.render(frame, ui.legend);
+                drawn.legend_button = routing_drawn.legend_button;
+                drawn.routing_button = routing_drawn.routing_button;
+            }
         })?;
         // The list may have shrunk under its offset since the last
         // frame: hold the offset at what the frame could show.
-        ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
-        ui.scroll.context = ui.scroll.context.min(drawn.context.max_offset);
-        ui.scroll.rebuilds = ui.scroll.rebuilds.min(drawn.rebuilds.max_offset);
-        ui.scroll.spend = ui.scroll.spend.min(drawn.spend.max_offset);
+        if page == Page::Dashboard {
+            ui.scroll.sessions = ui.scroll.sessions.min(drawn.sessions.max_offset);
+            ui.scroll.context = ui.scroll.context.min(drawn.context.max_offset);
+            ui.scroll.rebuilds = ui.scroll.rebuilds.min(drawn.rebuilds.max_offset);
+            ui.scroll.spend = ui.scroll.spend.min(drawn.spend.max_offset);
+        }
 
         // Block until the next tick or an input event. The deadline was
         // set after the tick's work, so it is in the future unless the
@@ -261,11 +284,32 @@ pub fn run(
         // click opens a session's detail, or acts in the open one.
         if let crossterm::event::Event::Mouse(mouse) = event {
             let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if page == Page::Routing {
+                // Both header actions remain available on both pages. The
+                // body stays keyboard-first until its editing forms land.
+                if mouse.kind
+                    == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                {
+                    if drawn.legend_button.contains(at) {
+                        toggle_legend(&mut ui);
+                    } else if drawn.routing_button.contains(at) {
+                        page = Page::Dashboard;
+                        ui.legend = false;
+                    }
+                }
+                continue;
+            }
             if mouse.kind
                 == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
             {
                 if drawn.legend_button.contains(at) {
                     toggle_legend(&mut ui);
+                    continue;
+                }
+                if drawn.routing_button.contains(at) {
+                    page = Page::Routing;
+                    ui.legend = false;
+                    routing.refresh();
                     continue;
                 }
                 match (&mut ui.detail, &drawn.popup) {
@@ -322,6 +366,58 @@ pub fn run(
                 continue;
             }
             match key.code {
+                crossterm::event::KeyCode::Tab => {
+                    page = match page {
+                        Page::Dashboard => {
+                            ui.detail = None;
+                            ui.legend = false;
+                            routing.refresh();
+                            Page::Routing
+                        }
+                        Page::Routing => {
+                            ui.legend = false;
+                            Page::Dashboard
+                        }
+                    };
+                }
+                crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
+                crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,
+                crossterm::event::KeyCode::Esc if page == Page::Routing => {
+                    page = Page::Dashboard;
+                }
+                crossterm::event::KeyCode::Char('r') if page == Page::Routing => routing.refresh(),
+                crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')
+                    if page == Page::Routing =>
+                {
+                    routing.move_view(-1)
+                }
+                crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Char('l')
+                    if page == Page::Routing =>
+                {
+                    routing.move_view(1)
+                }
+                crossterm::event::KeyCode::Char('1') if page == Page::Routing => {
+                    routing.set_view(0)
+                }
+                crossterm::event::KeyCode::Char('2') if page == Page::Routing => {
+                    routing.set_view(1)
+                }
+                crossterm::event::KeyCode::Char('3') if page == Page::Routing => {
+                    routing.set_view(2)
+                }
+                crossterm::event::KeyCode::Char('4') if page == Page::Routing => {
+                    routing.set_view(3)
+                }
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k')
+                    if page == Page::Routing =>
+                {
+                    routing.move_selection(-1)
+                }
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j')
+                    if page == Page::Routing =>
+                {
+                    routing.move_selection(1)
+                }
                 // q (or the habitual Ctrl+C in raw mode) quits.
                 crossterm::event::KeyCode::Char('q') => break,
                 crossterm::event::KeyCode::Char('c')
@@ -331,9 +427,8 @@ pub fn run(
                 {
                     break;
                 }
-                // ? toggles the legend over the frame; Esc closes it, or
-                // the detail popup. The two are never open together.
-                crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
+                // Esc closes a dashboard detail. Page and legend handling
+                // above keep the routing page's state intact.
                 crossterm::event::KeyCode::Esc => {
                     ui.legend = false;
                     ui.detail = None;
