@@ -424,6 +424,29 @@ pub fn snapshot_generation(catalogs: &FetchedCatalogs) -> i64 {
             Some(catalog) => {
                 hasher.update([1]);
                 hasher.update(catalog.fetched_at_ms.to_be_bytes());
+                hasher.update((catalog.models.len() as u64).to_be_bytes());
+                for model in &catalog.models {
+                    hasher.update((model.id.len() as u64).to_be_bytes());
+                    hasher.update(model.id.as_bytes());
+                    match model.context_window {
+                        Some(window) => {
+                            hasher.update([1]);
+                            hasher.update(window.to_be_bytes());
+                        }
+                        None => hasher.update([0]),
+                    }
+                    match model.chronology {
+                        Some(chronology) => {
+                            hasher.update([1]);
+                            hasher.update(chronology.unix_ms().to_be_bytes());
+                        }
+                        None => hasher.update([0]),
+                    }
+                    let raw =
+                        serde_json::to_vec(&model.raw).expect("serde_json values always serialise");
+                    hasher.update((raw.len() as u64).to_be_bytes());
+                    hasher.update(raw);
+                }
             }
             None => hasher.update([0]),
         }
@@ -1607,6 +1630,25 @@ mod tests {
             },
         );
         assert_ne!(first, super::snapshot_generation(&catalogs));
+
+        let mut same_timestamp = catalogs.clone();
+        same_timestamp.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: NOW + 1,
+                models: vec![FetchedModel {
+                    id: "vendor/replaced-model".to_owned(),
+                    context_window: Some(128_000),
+                    chronology: None,
+                    raw: json!({"id": "vendor/replaced-model"}),
+                }],
+            },
+        );
+        assert_ne!(
+            super::snapshot_generation(&catalogs),
+            super::snapshot_generation(&same_timestamp),
+            "a generation identifies the catalogue content as well as its timestamp"
+        );
     }
 
     #[tokio::test]

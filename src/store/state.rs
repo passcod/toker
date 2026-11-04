@@ -103,6 +103,39 @@ impl PolicyRevisionSource {
     }
 }
 
+/// Which compiler semantics a revision's document requires. This is separate
+/// from its history source: restoring generated revision one must retain its
+/// legacy compatibility semantics while still recording a reactivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCompilerOrigin {
+    Authored,
+    GeneratedRevisionOne,
+}
+
+impl PolicyCompilerOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::GeneratedRevisionOne => "generated_revision_one",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "authored" => Some(Self::Authored),
+            "generated_revision_one" => Some(Self::GeneratedRevisionOne),
+            _ => None,
+        }
+    }
+
+    fn for_source(source: PolicyRevisionSource) -> Self {
+        match source {
+            PolicyRevisionSource::Legacy => Self::GeneratedRevisionOne,
+            PolicyRevisionSource::Draft | PolicyRevisionSource::Reactivation => Self::Authored,
+        }
+    }
+}
+
 /// One immutable stored policy revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRevision {
@@ -113,6 +146,7 @@ pub struct PolicyRevision {
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
     pub source: PolicyRevisionSource,
+    pub compiler_origin: PolicyCompilerOrigin,
     pub parent_revision_id: Option<i64>,
     pub document: ValidatedPolicyDocument,
     pub fingerprint: PolicyFingerprint,
@@ -127,6 +161,9 @@ pub struct NewPolicyRevision<'a> {
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
     pub source: PolicyRevisionSource,
+    /// `None` preserves the source-derived legacy behaviour used by existing
+    /// callers; live restore passes the selected revision's origin explicitly.
+    pub compiler_origin: Option<PolicyCompilerOrigin>,
     pub parent_revision_id: Option<i64>,
     pub document: &'a ValidatedPolicyDocument,
 }
@@ -172,6 +209,38 @@ pub enum RevisionOneActivation {
         state: RoutingPolicyState,
         publications: Vec<RoutingPublication>,
     },
+}
+
+/// Input to atomically install a new live policy revision and publication
+/// desires. The Store deliberately does not compile the document: the caller
+/// must compile it against the same immutable inventory it will install.
+#[derive(Debug, Clone)]
+pub struct ActivatePolicyRevision<'a> {
+    pub created_ms: i64,
+    pub description: Option<&'a str>,
+    pub activation_scope: ActivationScope,
+    pub forced_cache_transition: bool,
+    pub source: PolicyRevisionSource,
+    pub compiler_origin: PolicyCompilerOrigin,
+    /// The selected history revision for reactivation, or no explicit parent
+    /// for a direct apply.
+    pub parent_revision_id: Option<i64>,
+    /// The active revision observed while compilation ran. The Store compares
+    /// it in the activation transaction so a control operation cannot install
+    /// against a stale live base.
+    pub expected_active_revision_id: i64,
+    pub document: &'a ValidatedPolicyDocument,
+    pub desired_inventory_generation: i64,
+    pub publications: &'a [InitialPublication],
+}
+
+/// The committed policy revision and the state projected from the same
+/// transaction. Callers may swap their runtime only after receiving this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivatedPolicyRevision {
+    pub revision: PolicyRevision,
+    pub state: RoutingPolicyState,
+    pub publications: Vec<RoutingPublication>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,8 +790,9 @@ pub(super) fn insert_policy_revision(
     conn.execute(
         "INSERT INTO routing_policy_revisions
          (created_ms, activated_ms, description, activation_scope,
-          forced_cache_transition, source, parent_revision_id, document_json, fingerprint)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          forced_cache_transition, source, compiler_origin, parent_revision_id, document_json,
+          fingerprint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             revision.created_ms,
             revision.activated_ms,
@@ -730,6 +800,10 @@ pub(super) fn insert_policy_revision(
             activation_scope_name(revision.activation_scope),
             revision.forced_cache_transition,
             revision.source.as_str(),
+            revision
+                .compiler_origin
+                .unwrap_or_else(|| PolicyCompilerOrigin::for_source(revision.source))
+                .as_str(),
             revision.parent_revision_id,
             document_json,
             fingerprint.to_string(),
@@ -782,6 +856,7 @@ pub(super) fn activate_revision_one(
             activation_scope: ActivationScope::NewLanes,
             forced_cache_transition: false,
             source: PolicyRevisionSource::Legacy,
+            compiler_origin: Some(PolicyCompilerOrigin::GeneratedRevisionOne),
             parent_revision_id: None,
             document,
         },
@@ -850,6 +925,106 @@ pub(super) fn activate_revision_one(
     })
 }
 
+/// Insert, activate, and hand publication desire to every adapter in one
+/// immediate transaction. The active revision, its publications, and the
+/// response projection therefore cannot disagree after the transaction commits.
+pub(super) fn activate_policy_revision(
+    conn: &mut Connection,
+    activation: &ActivatePolicyRevision<'_>,
+) -> Result<ActivatedPolicyRevision> {
+    if activation.desired_inventory_generation < 0 {
+        return Err(Error::InvalidRoutingState(
+            "negative inventory generation".into(),
+        ));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = load_routing_policy_state(&tx)?;
+    let active_revision_id = current.active_revision_id.ok_or_else(|| {
+        Error::InvalidRoutingState(
+            "cannot activate a policy without an active base revision".into(),
+        )
+    })?;
+    if active_revision_id != activation.expected_active_revision_id {
+        return Err(Error::InvalidRoutingState(
+            "active policy revision changed before activation".into(),
+        ));
+    }
+    if let Some(parent_revision_id) = activation.parent_revision_id
+        && load_policy_revision(&tx, parent_revision_id)?.is_none()
+    {
+        return Err(Error::InvalidRoutingState(format!(
+            "policy revision parent {parent_revision_id} does not exist"
+        )));
+    }
+    let revision = insert_policy_revision(
+        &tx,
+        &NewPolicyRevision {
+            created_ms: activation.created_ms,
+            activated_ms: activation.created_ms,
+            description: activation.description,
+            activation_scope: activation.activation_scope,
+            forced_cache_transition: activation.forced_cache_transition,
+            source: activation.source,
+            compiler_origin: Some(activation.compiler_origin),
+            parent_revision_id: activation.parent_revision_id.or(Some(active_revision_id)),
+            document: activation.document,
+        },
+    )?;
+    let changed = tx.execute(
+        "UPDATE routing_policy_state SET active_revision_id = ?1,
+             draft_generation = draft_generation + 1,
+             draft_base_revision_id = NULL, draft_document_json = NULL,
+             draft_fingerprint = NULL, draft_updated_ms = NULL
+         WHERE id = 1 AND active_revision_id = ?2",
+        rusqlite::params![revision.revision_id, active_revision_id],
+    )?;
+    if changed != 1 {
+        return Err(Error::InvalidRoutingState(
+            "active policy revision changed during activation".into(),
+        ));
+    }
+    for publication in activation.publications {
+        set_publication_desired(
+            &tx,
+            &publication.key,
+            revision.revision_id,
+            activation.desired_inventory_generation,
+            activation.created_ms,
+        )?;
+        if publication.state == PublicationState::Applied {
+            let result = compare_and_swap_publication_result(
+                &tx,
+                &publication.key,
+                revision.revision_id,
+                activation.desired_inventory_generation,
+                &PublicationResultUpdate {
+                    state: PublicationState::Applied,
+                    applied_identities: Some(BTreeSet::new()),
+                    detail_code: None,
+                    updated_ms: activation.created_ms,
+                },
+            )?;
+            if result != PublicationCasResult::Updated {
+                return Err(Error::InvalidRoutingState(
+                    "initial publication state changed during activation".into(),
+                ));
+            }
+        } else if publication.state != PublicationState::Pending {
+            return Err(Error::InvalidRoutingState(
+                "initial publication must be pending or applied".into(),
+            ));
+        }
+    }
+    let state = load_routing_policy_state(&tx)?;
+    let publications = load_publications(&tx)?;
+    tx.commit()?;
+    Ok(ActivatedPolicyRevision {
+        revision,
+        state,
+        publications,
+    })
+}
+
 pub(super) fn load_policy_revision(
     conn: &Connection,
     revision_id: i64,
@@ -857,7 +1032,7 @@ pub(super) fn load_policy_revision(
     row_of(
         conn,
         "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
-                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+                forced_cache_transition, source, compiler_origin, parent_revision_id, document_json, fingerprint
          FROM routing_policy_revisions WHERE revision_id = ?1",
         [revision_id],
         read_policy_revision,
@@ -868,7 +1043,7 @@ pub(super) fn load_policy_revisions(conn: &Connection) -> Result<Vec<PolicyRevis
     rows_of(
         conn,
         "SELECT revision_id, created_ms, activated_ms, description, activation_scope,
-                forced_cache_transition, source, parent_revision_id, document_json, fingerprint
+                forced_cache_transition, source, compiler_origin, parent_revision_id, document_json, fingerprint
          FROM routing_policy_revisions ORDER BY revision_id",
         [],
         read_policy_revision,
@@ -893,6 +1068,11 @@ fn read_policy_revision(row: &rusqlite::Row<'_>) -> Result<PolicyRevision> {
             "routing_policy_revisions.source",
             row.get("source")?,
             PolicyRevisionSource::parse,
+        )?,
+        compiler_origin: parse_required(
+            "routing_policy_revisions.compiler_origin",
+            row.get("compiler_origin")?,
+            PolicyCompilerOrigin::parse,
         )?,
         parent_revision_id: row.get("parent_revision_id")?,
         document,

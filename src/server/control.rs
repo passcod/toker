@@ -38,6 +38,8 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+pub(super) mod routing;
+
 use super::Server;
 use crate::middleware::models::{MergeIncoming, MergeOutcome};
 use crate::store::SessionSummary;
