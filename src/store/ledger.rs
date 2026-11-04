@@ -181,7 +181,7 @@ pub enum ChildRole {
 }
 
 impl ChildRole {
-    fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Guardian => "guardian",
         }
@@ -1478,8 +1478,13 @@ pub struct DisplayRow {
     /// Attempt identity for logical request counts. Historical rows have neither.
     pub attempt_group_id: Option<AttemptGroupId>,
     pub attempt_index: Option<AttemptIndex>,
-    /// Frontend-provided session identity, when known.
+    /// Frontend-provided raw session identity, when known. This remains the
+    /// lane and cache key even when [`DisplayRow::lineage`] groups it under a
+    /// display parent.
     pub session_id: Option<String>,
+    /// Explicit display-only parent relation. Absence means the raw session
+    /// stays separate; aggregation must never infer a relation from traffic.
+    pub lineage: Option<SessionLineage>,
     /// The request's tool-set digest — with the session, the lane key.
     /// `None` rows share one lane, as the rebuild walk's do.
     pub tools_hash: Option<String>,
@@ -1545,7 +1550,8 @@ pub(super) fn display_rows_since(
         conn,
         "SELECT * FROM (
             SELECT id, ts_ms, kind, attempt_group_id, attempt_index,
-                   session_id, tools_hash, model, provider,
+                   session_id, parent_session_id, child_role, relation_source,
+                   tools_hash, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
@@ -1583,6 +1589,7 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
             .transpose()
             .map_err(Error::InvalidRoutingState)?,
         session_id: row.get("session_id")?,
+        lineage: read_lineage(row)?,
         tools_hash: row.get("tools_hash")?,
         model: row.get("model")?,
         provider: row.get("provider")?,
@@ -1954,6 +1961,23 @@ pub(super) fn latest_session_row(
     )
 }
 
+/// The newest measurement for one display session: its raw parent rows plus
+/// rows that explicitly name it as their display parent. This is attribution
+/// only; lane state and request identities remain raw in the returned row.
+pub(super) fn latest_display_session_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<RequestRow>> {
+    super::row_of(
+        conn,
+        "SELECT * FROM requests
+         WHERE (session_id = ?1 OR parent_session_id = ?1) AND kind IS NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        [session_id],
+        read_row,
+    )
+}
+
 /// The newest row's timestamp, of any kind; `None` on an empty ledger.
 /// `MAX` over the indexed `ts_ms` is answered from the index's last
 /// entry, so this stays cheap however large the ledger grows — the TUI
@@ -2021,6 +2045,18 @@ pub struct SessionSummary {
 /// skips NULLs and
 /// yields NULL when no row carried the metric — exactly the absence ≠
 /// zero rule, so the sums need no post-processing.
+const DISPLAY_SESSION_TOTALS_SQL: &str = concat!(
+    "SELECT COALESCE(COUNT(DISTINCT attempt_group_id)",
+    " + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END), 0) AS requests,",
+    " MIN(ts_ms) AS first_ts_ms, MAX(ts_ms) AS last_ts_ms,",
+    " SUM(input) AS input, SUM(output) AS output,",
+    " SUM(reasoning) AS reasoning, SUM(cache_read) AS cache_read,",
+    " SUM(cache_write_total) AS cache_write_total,",
+    " SUM(CASE WHEN cost_kind = 'billed' THEN cost_usd END) AS billed_total",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1) AND kind IS NULL",
+);
+
 const SESSION_TOTALS_SQL: &str = concat!(
     "SELECT COALESCE(COUNT(DISTINCT attempt_group_id)",
     " + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END), 0) AS requests,",
@@ -2039,6 +2075,17 @@ const SESSION_TOTALS_SQL: &str = concat!(
 /// also a column name, and resolution by alias is a rule not worth
 /// leaning on. The name ASC tiebreaker keeps equal-cost groups in a
 /// deterministic order.
+const DISPLAY_SESSION_PROVIDER_SQL: &str = concat!(
+    "SELECT COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1)",
+    " AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC,",
+    " COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') ASC",
+);
+
 const SESSION_PROVIDER_SQL: &str = concat!(
     "SELECT COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') AS label,",
     " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
@@ -2051,6 +2098,16 @@ const SESSION_PROVIDER_SQL: &str = concat!(
 
 /// The billed cost by model, same shape and ordering as the provider
 /// breakdown.
+const DISPLAY_SESSION_MODEL_SQL: &str = concat!(
+    "SELECT COALESCE(model, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1)",
+    " AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(model, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC, COALESCE(model, 'unknown') ASC",
+);
+
 const SESSION_MODEL_SQL: &str = concat!(
     "SELECT COALESCE(model, 'unknown') AS label,",
     " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
@@ -2075,6 +2132,37 @@ fn read_cost_group(row: &rusqlite::Row<'_>) -> Result<SessionCostGroup> {
 /// all — the endpoint cannot tell them apart, by design) answers
 /// `requests: 0` with `None` everywhere else.
 pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<SessionSummary> {
+    session_summary_with(
+        conn,
+        session_id,
+        SESSION_TOTALS_SQL,
+        SESSION_PROVIDER_SQL,
+        SESSION_MODEL_SQL,
+    )
+}
+
+/// The TUI detail aggregate for a display parent. It includes only rows that
+/// explicitly name the parent relation, never guessed neighbours.
+pub(super) fn display_session_summary(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionSummary> {
+    session_summary_with(
+        conn,
+        session_id,
+        DISPLAY_SESSION_TOTALS_SQL,
+        DISPLAY_SESSION_PROVIDER_SQL,
+        DISPLAY_SESSION_MODEL_SQL,
+    )
+}
+
+fn session_summary_with(
+    conn: &Connection,
+    session_id: &str,
+    totals_sql: &str,
+    provider_sql: &str,
+    model_sql: &str,
+) -> Result<SessionSummary> {
     // COUNT(*) always yields exactly one row, even over an empty set, so
     // the only failure mode here is a genuine SQLite error.
     let (
@@ -2087,7 +2175,7 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
         cache_read,
         cache_write_total,
         billed_total,
-    ) = conn.query_row(SESSION_TOTALS_SQL, [session_id], |row| {
+    ) = conn.query_row(totals_sql, [session_id], |row| {
         Ok((
             row.get::<_, i64>("requests")?,
             row.get::<_, Option<i64>>("first_ts_ms")?,
@@ -2100,8 +2188,8 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
             row.get::<_, Option<f64>>("billed_total")?,
         ))
     })?;
-    let per_provider = rows_of(conn, SESSION_PROVIDER_SQL, [session_id], read_cost_group)?;
-    let per_model = rows_of(conn, SESSION_MODEL_SQL, [session_id], read_cost_group)?;
+    let per_provider = rows_of(conn, provider_sql, [session_id], read_cost_group)?;
+    let per_model = rows_of(conn, model_sql, [session_id], read_cost_group)?;
     Ok(SessionSummary {
         requests,
         first_ts_ms,

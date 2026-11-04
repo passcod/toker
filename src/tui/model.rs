@@ -28,7 +28,7 @@ use super::rebuilds::RebuildAgg;
 use crate::catalog::fetched::FetchedCatalogs;
 use crate::catalog::windows::{ContextWindow, resolve_context_window};
 use crate::ir::Release;
-use crate::store::{CostKind, DisplayRow, RowKind, is_api_measurement};
+use crate::store::{ChildRole, CostKind, DisplayRow, RowKind, is_api_measurement};
 
 /// The sessions holding a live allowance for the running window, and
 /// which release each holds (see [`SessionAgg::released`]).
@@ -36,6 +36,13 @@ pub(crate) type Released = HashMap<String, Release>;
 
 /// The label for rows grouped without a session id (NULL `session_id`).
 pub(crate) const NO_SESSION: &str = "-";
+
+/// One child role's accounting within a display session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildRoleAgg {
+    pub role: ChildRole,
+    pub requests: usize,
+}
 
 /// Everything one dashboard frame needs, computed from one window of rows
 /// plus the ledger's total row count.
@@ -107,9 +114,13 @@ pub(crate) struct Snapshot {
 /// to a lane that is not the conversation, and reset its idle clock.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SessionAgg {
-    /// The session id, or [`NO_SESSION`] for the NULL-session group.
+    /// The display session id: its own raw id, or an explicit child's parent.
+    /// [`NO_SESSION`] groups rows with a NULL raw id.
     pub session: String,
-    /// Measurement rows in this session, every lane.
+    /// Explicitly linked child accounting by content-free role. Empty for
+    /// unlinked sessions and rows of the parent.
+    pub child_roles: Vec<ChildRoleAgg>,
+    /// Measurement rows in this display session, including linked children.
     pub requests: usize,
     /// Measurement rows in the main lane — the CONTEXT panel's floor
     /// counts the conversation's turns, not a subagent's.
@@ -175,11 +186,10 @@ pub(crate) struct SessionAgg {
     /// becomes a real window), then unknown — `?` renders, never a
     /// guess.
     pub ctx: ContextWindow,
-    /// The session's name from Claude Code's own transcript (see
-    /// [super::labels]): the working directory and title the tail
-    /// carries, newest-wins, read-only at view time and never stored
-    /// (invariant 1). `None` when no transcript carries one — the view
-    /// falls back to the session id, never an empty cell.
+    /// The display session's name from its transcript (see [super::labels]).
+    /// A linked child reads the explicit parent's label, never its own raw
+    /// lane id; this is read-only at view time and never stored (invariant 1).
+    /// `None` makes the view fall back to the display session id.
     pub label: Option<Label>,
     /// The main lane's newest row timestamp (epoch ms) — the idle clock
     /// and the table's order. A subagent's turn does not touch the
@@ -416,8 +426,10 @@ pub(crate) fn aggregate(
 
     let mut sessions: Vec<SessionAgg> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    // Per session (parallel to `sessions`), its lanes by tool-set digest.
-    let mut lanes: Vec<HashMap<Option<String>, LaneAgg>> = Vec::new();
+    // Per display session (parallel to `sessions`), raw lanes by their raw
+    // session and tool-set digest. A child is grouped only for accounting: it
+    // must never compete with its parent for the parent's main lane.
+    let mut lanes: Vec<HashMap<(String, Option<String>), LaneAgg>> = Vec::new();
     let mut spend = SpendAgg {
         billed_total: None,
         billed_requests: 0,
@@ -451,8 +463,10 @@ pub(crate) fn aggregate(
         };
         if let Some(is_stop) = decides {
             let key = row
-                .session_id
-                .clone()
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.parent_session_id().to_owned())
+                .or_else(|| row.session_id.clone())
                 .unwrap_or_else(|| NO_SESSION.to_owned());
             stopped.insert(key, is_stop);
         }
@@ -502,16 +516,23 @@ pub(crate) fn aggregate(
             tokens.cold += 1;
         }
 
-        // Sessions: group by id (NULL under the dash). Requests, output
-        // and the dim `↑` are session-wide; everything the main lane
-        // decides accumulates per lane and is picked after the pass.
-        let key = row
+        // Sessions group only under explicit, validated lineage. The raw
+        // session stays in the lane key, so a linked child contributes usage
+        // to its parent without becoming the parent's conversation lane.
+        // Unlinked ids, including UUID-looking ones, remain independent.
+        let raw_session = row
             .session_id
             .clone()
             .unwrap_or_else(|| NO_SESSION.to_owned());
+        let key = row
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.parent_session_id().to_owned())
+            .unwrap_or_else(|| raw_session.clone());
         let slot = *index.entry(key.clone()).or_insert_with(|| {
             sessions.push(SessionAgg {
                 session: key.clone(),
+                child_roles: Vec::new(),
                 requests: 0,
                 lane_requests: 0,
                 model: None,
@@ -534,6 +555,18 @@ pub(crate) fn aggregate(
         });
         let session = &mut sessions[slot];
         if counts_as_request {
+            if let Some(lineage) = &row.lineage {
+                let role = lineage.child_role();
+                if let Some(aggregate) = session
+                    .child_roles
+                    .iter_mut()
+                    .find(|aggregate| aggregate.role == role)
+                {
+                    aggregate.requests += 1;
+                } else {
+                    session.child_roles.push(ChildRoleAgg { role, requests: 1 });
+                }
+            }
             session.requests += 1;
         }
         if let Some(output) = row.output {
@@ -541,7 +574,7 @@ pub(crate) fn aggregate(
         }
         session.forced_any |= row.forced_to.is_some();
         lanes[slot]
-            .entry(row.tools_hash.clone())
+            .entry((raw_session, row.tools_hash.clone()))
             .or_default()
             .add(row, counts_as_request);
 
@@ -578,21 +611,30 @@ pub(crate) fn aggregate(
         }
     }
 
-    // Each session reads its main lane, then the context ceiling is a
-    // catalogue lookup off that lane's model — the hand-verified
+    // Each display session reads a main lane from its own raw session when
+    // present; only a parent absent from this window falls back to a child
+    // lane. Children never displace an observed parent conversation lane.
+    // The context ceiling is then a catalogue lookup off that lane's model.
     // catalogue first, then the fetched catalogue of the provider that
     // named it — resolved as of the lane's latest row, so a phased
     // capability resolves to the phase that applied, never to today's
     // against historical rows.
     for (session, lanes) in sessions.iter_mut().zip(lanes) {
         session.stopped = stopped.get(&session.session).copied().unwrap_or(false);
-        if let Some((_, main)) = lanes.into_iter().max_by(|(a_key, a), (b_key, b)| {
-            a.held
-                .cmp(&b.held)
-                .then_with(|| a.latest_ts_ms.cmp(&b.latest_ts_ms))
-                // Last resort, so the pick never rests on hash order.
-                .then_with(|| b_key.cmp(a_key))
-        }) {
+        let has_parent_lane = lanes
+            .keys()
+            .any(|(raw_session, _)| raw_session == &session.session);
+        if let Some((_, main)) = lanes
+            .into_iter()
+            .filter(|((raw_session, _), _)| !has_parent_lane || raw_session == &session.session)
+            .max_by(|(a_key, a), (b_key, b)| {
+                a.held
+                    .cmp(&b.held)
+                    .then_with(|| a.latest_ts_ms.cmp(&b.latest_ts_ms))
+                    // Last resort, so the pick never rests on hash order.
+                    .then_with(|| b_key.cmp(a_key))
+            })
+        {
             session.lane_requests = main.requests;
             session.model = main.model;
             session.provider = main.provider;
@@ -805,7 +847,7 @@ fn bucket_of(ts_ms: i64, now_ms: i64, window_mins: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{NO_SESSION, Snapshot};
-    use crate::store::{CostKind, DisplayRow, RowKind};
+    use crate::store::{CostKind, DisplayRow, RowKind, SessionLineage};
     use crate::tui::testrows::{
         as_display_rows, as_meter_rows, bare, billed, display_bare, display_billed,
         display_kind_row, kind_row, metered_full,
@@ -858,6 +900,73 @@ mod tests {
     /// A measurement row a given number of minutes before `NOW`.
     fn mins_ago(mins: i64) -> i64 {
         NOW - mins * 60_000
+    }
+
+    #[test]
+    fn explicit_children_group_only_for_display_and_keep_raw_lanes() {
+        let mut parent = display_bare(mins_ago(3));
+        parent.session_id = Some("parent-session".to_owned());
+        parent.tools_hash = Some("parent-tools".to_owned());
+        parent.input = Some(100_000);
+        parent.cache_read = Some(1);
+        parent.cache_write_1h = Some(0);
+        parent.model = Some("parent-model".to_owned());
+
+        let mut child = display_bare(mins_ago(1));
+        child.session_id = Some("guardian:parent-session".to_owned());
+        child.lineage = SessionLineage::codex_guardian("guardian:parent-session");
+        child.tools_hash = Some("child-tools".to_owned());
+        child.input = Some(500_000);
+        child.cache_read = Some(1);
+        child.cache_write_1h = Some(0);
+        child.model = Some("child-model".to_owned());
+        child.output = Some(7);
+
+        let mut unlinked = display_bare(mins_ago(2));
+        unlinked.session_id = Some("nearby-uuid".to_owned());
+        unlinked.input = Some(2);
+        unlinked.cache_read = Some(1);
+        unlinked.cache_write_1h = Some(0);
+
+        let snapshot = agg(&[parent, child, unlinked], 3);
+        assert_eq!(snapshot.sessions.len(), 2);
+        let parent = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session == "parent-session")
+            .expect("display parent");
+        assert_eq!(parent.requests, 2, "linked child contributes accounting");
+        assert_eq!(parent.output_total, Some(7));
+        assert_eq!(parent.child_roles.len(), 1);
+        assert_eq!(parent.child_roles[0].role.as_str(), "guardian");
+        assert_eq!(parent.child_roles[0].requests, 1);
+        assert_eq!(parent.model.as_deref(), Some("parent-model"));
+        assert_eq!(parent.lane_requests, 1, "child lane stays separate");
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session.session == "nearby-uuid")
+        );
+    }
+
+    #[test]
+    fn linked_child_without_parent_uses_its_raw_lane_for_context() {
+        let mut child = display_bare(mins_ago(1));
+        child.session_id = Some("guardian:missing-parent".to_owned());
+        child.lineage = SessionLineage::codex_guardian("guardian:missing-parent");
+        child.tools_hash = Some("child-tools".to_owned());
+        child.input = Some(50);
+        child.cache_read = Some(1);
+        child.cache_write_1h = Some(0);
+        child.model = Some("child-model".to_owned());
+
+        let snapshot = agg(&[child], 1);
+        assert_eq!(snapshot.sessions.len(), 1);
+        let display = &snapshot.sessions[0];
+        assert_eq!(display.session, "missing-parent");
+        assert_eq!(display.model.as_deref(), Some("child-model"));
+        assert_eq!(display.lane_requests, 1);
     }
 
     #[test]
