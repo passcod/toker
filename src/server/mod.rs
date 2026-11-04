@@ -819,18 +819,14 @@ impl Server {
         )?)
     }
 
-    /// Read-modify-write the current draft under the server mutation lock.
-    /// `mutate` only sees a normal editable document, never storage JSON.
-    pub(crate) fn patch_routing_draft<F>(
+    /// Applies one typed edit to the current draft under the server mutation
+    /// lock. The policy module owns edit semantics and validation; this method
+    /// owns the draft generation CAS and durable replacement.
+    pub(crate) fn patch_routing_draft(
         &self,
         expected_generation: i64,
-        mutate: F,
-    ) -> Result<DraftCasResult, RoutingControlError>
-    where
-        F: FnOnce(
-            &mut crate::policy::PolicyDocument,
-        ) -> Result<crate::policy::ValidatedPolicyDocument, DraftMutation>,
-    {
+        edit: &crate::policy::PolicyEdit,
+    ) -> Result<DraftCasResult, RoutingControlError> {
         let _control = self
             .routing_control
             .lock()
@@ -842,8 +838,9 @@ impl Server {
             });
         }
         let draft = state.draft.ok_or(RoutingControlError::DraftMissing)?;
-        let mut document = draft.document.into_document();
-        let document = mutate(&mut document).map_err(RoutingControlError::DraftMutation)?;
+        let document = edit
+            .apply_validated(&draft.document)
+            .map_err(RoutingControlError::DraftEdit)?;
         Ok(self.store.compare_and_swap_policy_draft(
             expected_generation,
             draft.base_revision_id,
@@ -2496,12 +2493,6 @@ struct DraftActivationOptions {
     parent_revision_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum DraftMutation {
-    MissingRecord,
-    InvalidDocument,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RoutingControlError {
     #[error(transparent)]
@@ -2517,7 +2508,7 @@ pub(crate) enum RoutingControlError {
     #[error("routing draft generation changed")]
     StaleDraft { current: Box<RoutingPolicyState> },
     #[error("routing draft edit is invalid")]
-    DraftMutation(DraftMutation),
+    DraftEdit(#[from] crate::policy::PolicyEditError),
     #[error("an immediate activation needs explicit warm-cache consent")]
     ForcedTransitionRequired { impacts: RoutingLaneImpacts },
 }

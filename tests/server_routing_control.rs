@@ -186,7 +186,7 @@ async fn typed_patch_only_changes_its_target_and_validation_is_non_mutating() {
     let generation = initial["draft_generation"].as_i64().unwrap();
     let before = initial["draft"]["policy"].clone();
 
-    let patched = app
+    let obsolete_envelope = app
         .clone()
         .oneshot(request(
             "PATCH",
@@ -196,8 +196,49 @@ async fn typed_patch_only_changes_its_target_and_validation_is_non_mutating() {
                 "expected_generation": generation,
                 "edits": [{
                     "kind": "set_description",
-                    "description": "edited in a typed control request",
+                    "description": "the server must not retain its old edit vocabulary",
                 }],
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(obsolete_envelope.status(), StatusCode::BAD_REQUEST);
+
+    let unknown_operation_field = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            "/_toker/routing/draft",
+            Some("routing-draft-edit"),
+            Some(json!({
+                "expected_generation": generation,
+                "edit": {
+                    "operations": [{
+                        "kind": "set_description",
+                        "description": "the policy DTO is strict",
+                        "unexpected": true,
+                    }],
+                },
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_operation_field.status(), StatusCode::BAD_REQUEST);
+
+    let patched = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            "/_toker/routing/draft",
+            Some("routing-draft-edit"),
+            Some(json!({
+                "expected_generation": generation,
+                "edit": {
+                    "operations": [{
+                        "kind": "set_description",
+                        "description": "edited in a typed control request",
+                    }],
+                },
             })),
         ))
         .await
@@ -221,6 +262,30 @@ async fn typed_patch_only_changes_its_target_and_validation_is_non_mutating() {
     ] {
         assert_eq!(patched["draft"]["policy"][key], before[key]);
     }
+
+    let stale = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            "/_toker/routing/draft",
+            Some("routing-draft-edit"),
+            Some(json!({
+                "expected_generation": generation - 1,
+                "edit": {
+                    "operations": [{
+                        "kind": "set_description",
+                        "description": "stale edit",
+                    }],
+                },
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale = body(stale).await;
+    assert_eq!(stale["error"], "stale_draft");
+    assert_eq!(stale["generation"], generation);
+    assert_eq!(stale["draft"], patched["draft"]);
 
     let validated = app
         .clone()

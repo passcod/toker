@@ -14,14 +14,10 @@ use serde_json::{Value, json};
 
 use super::{MAX_CONTROL_BODY, control_token_ok, forbidden, json_content_type, store_error};
 use crate::policy::{
-    BindingId, CanonicalLimits, CapabilityFlags, ClassifierId, CompactionPolicy, DefaultRoute,
-    FamilyClassifier, FrontendProtocol, FrontendScope, Presentation, PresentationId, ProfileId,
-    RewriteId, RewriteRule, Route, RouteId, StableId, UpgradePolicy, UpgradePolicyId,
-    decode_policy, policy_bytes,
+    BindingId, CanonicalLimits, CapabilityFlags, FrontendProtocol, FrontendScope, PolicyEdit,
+    PolicyEditError, ProfileId, StableId, decode_policy, policy_bytes,
 };
-use crate::server::{
-    DraftMutation, RoutingControlError, RoutingControlSnapshot, RoutingLaneImpacts, Server,
-};
+use crate::server::{RoutingControlError, RoutingControlSnapshot, RoutingLaneImpacts, Server};
 use crate::store::{
     DraftCasResult, PolicyDraft, PolicyRevision, PublicationAdapter, PublicationCasResult,
     PublicationKey, PublicationState, RoutingPolicyState, RoutingPublication,
@@ -31,7 +27,6 @@ use crate::store::{
 /// small generic control cap; an envelope gets a little room around the
 /// document's independently bounded canonical form.
 const MAX_ROUTING_POLICY_BODY: usize = crate::policy::MAX_DOCUMENT_BYTES + 16 * 1024;
-const MAX_DRAFT_EDITS: usize = 128;
 
 pub(crate) async fn snapshot(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "routing-snapshot") || request.method() != Method::GET {
@@ -115,62 +110,13 @@ async fn replace_draft(State(server): State<Server>, request: Request) -> Respon
     }
 }
 
-/// The deliberately closed patch vocabulary keeps an editor from smuggling
-/// arbitrary JSON-pointer writes through the control plane. Each payload is a
-/// policy DTO, so additions get exactly the same strict field validation as a
-/// full replacement.
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum DraftEdit {
-    SetDescription {
-        description: Option<String>,
-    },
-    PutDefault {
-        default: DefaultRoute,
-    },
-    RemoveDefault {
-        scope: FrontendScope,
-    },
-    PutPresentation {
-        presentation: Presentation,
-    },
-    RemovePresentation {
-        id: PresentationId,
-    },
-    PutRoute {
-        route: Route,
-    },
-    RemoveRoute {
-        id: RouteId,
-    },
-    PutRewrite {
-        rewrite: RewriteRule,
-    },
-    RemoveRewrite {
-        id: RewriteId,
-    },
-    PutClassifier {
-        classifier: FamilyClassifier,
-    },
-    RemoveClassifier {
-        id: ClassifierId,
-    },
-    PutUpgrade {
-        upgrade: UpgradePolicy,
-    },
-    RemoveUpgrade {
-        id: UpgradePolicyId,
-    },
-    SetCompaction {
-        compaction: Option<CompactionPolicy>,
-    },
-}
-
+/// The edit is the policy module's closed typed vocabulary. It keeps an editor
+/// from smuggling arbitrary JSON-pointer writes through the control plane.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchDraftRequest {
     expected_generation: i64,
-    edits: Vec<DraftEdit>,
+    edit: PolicyEdit,
 }
 
 async fn patch_draft(State(server): State<Server>, request: Request) -> Response {
@@ -185,17 +131,10 @@ async fn patch_draft(State(server): State<Server>, request: Request) -> Response
         Ok(request) => request,
         Err(response) => return *response,
     };
-    if request.edits.is_empty() || request.edits.len() > MAX_DRAFT_EDITS {
+    if request.edit.operations.is_empty() {
         return invalid_request("routing-draft-edit");
     }
-    match server.patch_routing_draft(request.expected_generation, |document| {
-        for edit in request.edits {
-            apply_edit(document, edit)?;
-        }
-        document
-            .validate()
-            .map_err(|_| DraftMutation::InvalidDocument)
-    }) {
+    match server.patch_routing_draft(request.expected_generation, &request.edit) {
         Ok(DraftCasResult::Updated { generation, draft }) => draft_updated_response(
             "routing-draft-edit",
             generation,
@@ -210,104 +149,33 @@ async fn patch_draft(State(server): State<Server>, request: Request) -> Response
             "draft_missing",
             None,
         ),
-        Err(RoutingControlError::DraftMutation(DraftMutation::InvalidDocument)) => {
-            invalid_policy(Vec::new())
+        Err(RoutingControlError::StaleDraft { current }) => {
+            draft_conflict_response("routing-draft-edit", *current)
         }
-        Err(RoutingControlError::DraftMutation(DraftMutation::MissingRecord)) => routing_error(
+        Err(RoutingControlError::DraftEdit(error)) => draft_edit_error_response(error),
+        Err(error) => routing_internal_error(error),
+    }
+}
+
+fn draft_edit_error_response(error: PolicyEditError) -> Response {
+    match error {
+        PolicyEditError::RecordNotFound { .. }
+        | PolicyEditError::DefaultNotFound
+        | PolicyEditError::CompactionNotFound
+        | PolicyEditError::CandidateNotFound { .. } => routing_error(
             StatusCode::NOT_FOUND,
             "routing-draft-edit",
             "record_not_found",
             None,
         ),
-        Err(error) => routing_internal_error(error),
+        PolicyEditError::InvalidDocument(_) => invalid_policy(Vec::new()),
+        _ => routing_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "routing-draft-edit",
+            "invalid_policy_edit",
+            None,
+        ),
     }
-}
-
-fn apply_edit(
-    document: &mut crate::policy::PolicyDocument,
-    edit: DraftEdit,
-) -> Result<(), DraftMutation> {
-    match edit {
-        DraftEdit::SetDescription { description } => document.description = description,
-        DraftEdit::PutDefault { default } => put_by(
-            &mut document.defaults,
-            default,
-            |item| &item.scope,
-            |item| &item.scope,
-        ),
-        DraftEdit::RemoveDefault { scope } => {
-            remove_by(&mut document.defaults, &scope, |item| &item.scope)?
-        }
-        DraftEdit::PutPresentation { presentation } => put_by(
-            &mut document.presentations,
-            presentation,
-            |item| &item.id,
-            |item| &item.id,
-        ),
-        DraftEdit::RemovePresentation { id } => {
-            remove_by(&mut document.presentations, &id, |item| &item.id)?
-        }
-        DraftEdit::PutRoute { route } => put_by(
-            &mut document.routes,
-            route,
-            |item| &item.id,
-            |item| &item.id,
-        ),
-        DraftEdit::RemoveRoute { id } => remove_by(&mut document.routes, &id, |item| &item.id)?,
-        DraftEdit::PutRewrite { rewrite } => put_by(
-            &mut document.rewrites,
-            rewrite,
-            |item| &item.id,
-            |item| &item.id,
-        ),
-        DraftEdit::RemoveRewrite { id } => remove_by(&mut document.rewrites, &id, |item| &item.id)?,
-        DraftEdit::PutClassifier { classifier } => put_by(
-            &mut document.classifiers,
-            classifier,
-            |item| &item.id,
-            |item| &item.id,
-        ),
-        DraftEdit::RemoveClassifier { id } => {
-            remove_by(&mut document.classifiers, &id, |item| &item.id)?
-        }
-        DraftEdit::PutUpgrade { upgrade } => put_by(
-            &mut document.upgrades,
-            upgrade,
-            |item| &item.id,
-            |item| &item.id,
-        ),
-        DraftEdit::RemoveUpgrade { id } => remove_by(&mut document.upgrades, &id, |item| &item.id)?,
-        DraftEdit::SetCompaction { compaction } => document.compaction = compaction,
-    }
-    Ok(())
-}
-
-fn put_by<T, K: PartialEq>(
-    items: &mut Vec<T>,
-    value: T,
-    key_of: impl Fn(&T) -> &K,
-    value_key: impl Fn(&T) -> &K,
-) {
-    if let Some(existing) = items
-        .iter_mut()
-        .find(|item| key_of(item) == value_key(&value))
-    {
-        *existing = value;
-    } else {
-        items.push(value);
-    }
-}
-
-fn remove_by<T, K: PartialEq>(
-    items: &mut Vec<T>,
-    key: &K,
-    key_of: impl Fn(&T) -> &K,
-) -> Result<(), DraftMutation> {
-    let Some(index) = items.iter().position(|item| key_of(item) == key) else {
-        return Err(DraftMutation::MissingRecord);
-    };
-    items.remove(index);
-    Ok(())
 }
 
 #[derive(Deserialize)]
