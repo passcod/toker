@@ -644,8 +644,16 @@ fn read_window(
     let latest = store.latest_ts_ms()?;
     labels.start_refresh();
     let mut session_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for session_id in rows.iter().filter_map(|row| row.session_id.as_deref()) {
-        session_ids.insert(session_id);
+    for row in &rows {
+        if let Some(parent) = row
+            .lineage
+            .as_ref()
+            .map(crate::store::SessionLineage::parent_session_id)
+        {
+            session_ids.insert(parent);
+        } else if let Some(session_id) = row.session_id.as_deref() {
+            session_ids.insert(session_id);
+        }
     }
     let mut resolved = HashMap::new();
     for session_id in session_ids {
