@@ -303,6 +303,27 @@ impl Server {
             Arc::new(OsKeyring),
             Arc::new(TracingObserver),
             RoutingOwnership::Policy,
+            None,
+        )
+    }
+
+    /// Build an authoritative server with an explicit initial fetched-model
+    /// catalogue snapshot. The normal constructor keeps loading the host's
+    /// cached catalogues; this seam lets embedders and integration tests make
+    /// their startup inventory deterministic.
+    pub fn new_authoritative_with_catalogs(
+        config: Config,
+        store: Arc<Store>,
+        catalogs: FetchedCatalogs,
+    ) -> anyhow::Result<Server> {
+        Self::with_routing_ownership(
+            config,
+            store,
+            Box::new(awake::ProcessSpawner),
+            Arc::new(OsKeyring),
+            Arc::new(TracingObserver),
+            RoutingOwnership::Policy,
+            Some(catalogs),
         )
     }
 
@@ -347,6 +368,7 @@ impl Server {
             secrets,
             shadow_observer,
             RoutingOwnership::LegacyShadow,
+            None,
         )
     }
 
@@ -357,6 +379,7 @@ impl Server {
         secrets: Arc<dyn SecretStore>,
         shadow_observer: Arc<dyn ShadowObserver>,
         routing_ownership: RoutingOwnership,
+        initial_catalogs: Option<FetchedCatalogs>,
     ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
         // tests, any embedder) must not reach the registry with a default
@@ -469,14 +492,17 @@ impl Server {
         ));
         let (initial_catalogs, initial_catalog_dir) = match routing_ownership {
             RoutingOwnership::LegacyShadow => (FetchedCatalogs::default(), None),
-            RoutingOwnership::Policy => {
-                let cache_dir = fetched::cache_dir().ok();
-                let catalogs = cache_dir
-                    .as_deref()
-                    .map(fetched::load_cached)
-                    .unwrap_or_default();
-                (catalogs, cache_dir)
-            }
+            RoutingOwnership::Policy => match initial_catalogs {
+                Some(catalogs) => (catalogs, None),
+                None => {
+                    let cache_dir = fetched::cache_dir().ok();
+                    let catalogs = cache_dir
+                        .as_deref()
+                        .map(fetched::load_cached)
+                        .unwrap_or_default();
+                    (catalogs, cache_dir)
+                }
+            },
         };
         let inventory = offers::inventory(&registry, &initial_catalogs);
         let availability = Arc::new(availability_for(&registry, &initial_catalogs));
