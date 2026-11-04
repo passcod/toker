@@ -737,6 +737,18 @@ mod tests {
             .collect()
     }
 
+    fn classifier(id: &str) -> FamilyClassifier {
+        FamilyClassifier {
+            id: super::super::ClassifierId::new(id).unwrap(),
+            binding_id: BindingId::new("provider.dialect").unwrap(),
+            model_matcher: crate::policy::MatcherSpec::Exact("model".to_owned()),
+            family_template: "family".to_owned(),
+            version_template: "version".to_owned(),
+            version_parser: crate::policy::VersionParserSpec::Semver,
+            legacy_hyphenated: false,
+        }
+    }
+
     #[test]
     fn records_append_replace_in_place_and_remove_without_reordering() {
         let mut document = document();
@@ -776,6 +788,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first-route", "last-route"]
         );
+    }
+
+    #[test]
+    fn high_level_entities_apply_by_stable_id() {
+        let mut document = document();
+        document.classifiers.push(classifier("old"));
+
+        let edit = PolicyEdit {
+            operations: vec![
+                PolicyEditOperation::AddClassifier {
+                    classifier: classifier("new"),
+                },
+                PolicyEditOperation::ReplaceClassifier {
+                    id: super::super::ClassifierId::new("old").unwrap(),
+                    classifier: classifier("old"),
+                },
+                PolicyEditOperation::RemoveClassifier {
+                    id: super::super::ClassifierId::new("new").unwrap(),
+                },
+                PolicyEditOperation::AddCompaction {
+                    compaction: CompactionPolicy {
+                        target: super::super::CompactionTarget::Route(
+                            super::super::RouteReference {
+                                route_id: RouteId::new("first-route").unwrap(),
+                                parameters: Default::default(),
+                            },
+                        ),
+                        lane_transition: LaneTransitionPolicy::PreservePinned,
+                        cache_transition: CacheTransitionPolicy::PreserveWarm,
+                    },
+                },
+                PolicyEditOperation::RemoveCompaction,
+            ],
+        };
+
+        let edited = edit.apply(&document).unwrap();
+        assert_eq!(edited.classifiers, vec![classifier("old")]);
+        assert!(edited.compaction.is_none());
     }
 
     #[test]
