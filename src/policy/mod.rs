@@ -8,6 +8,7 @@ pub mod canonical;
 pub mod compile;
 pub mod diagnostic;
 pub mod document;
+pub mod edit;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;
@@ -33,6 +34,10 @@ pub use diagnostic::{
     Diagnostic, DiagnosticCode, DiagnosticField, DiagnosticPath, DiagnosticPathError, Severity,
 };
 pub use document::*;
+pub use edit::{
+    CandidateMoveDestination, MAX_POLICY_EDIT_OPERATIONS, PolicyEdit, PolicyEditError,
+    PolicyEditOperation,
+};
 pub use learning::{
     BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, LegacyLearningView,
     RecencyEvidence,
