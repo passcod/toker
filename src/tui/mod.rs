@@ -365,6 +365,13 @@ pub fn run(
             if key.kind != crossterm::event::KeyEventKind::Press {
                 continue;
             }
+            // A routing form owns every key, including Tab and Esc. Otherwise a
+            // text field could accidentally switch pages or dismiss the page
+            // instead of its safety confirmation.
+            if page == Page::Routing && routing.modal_active() {
+                routing.key(key);
+                continue;
+            }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
                     page = match page {
@@ -385,7 +392,21 @@ pub fn run(
                 crossterm::event::KeyCode::Esc if page == Page::Routing => {
                     page = Page::Dashboard;
                 }
-                crossterm::event::KeyCode::Char('r') if page == Page::Routing => routing.refresh(),
+                crossterm::event::KeyCode::Char('r')
+                    if page == Page::Routing && !routing.modal_active() =>
+                {
+                    routing.refresh()
+                }
+                code if page == Page::Routing
+                    && matches!(
+                        code,
+                        crossterm::event::KeyCode::Char(
+                            'e' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p'
+                        )
+                    ) =>
+                {
+                    routing.key(key);
+                }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')
                     if page == Page::Routing =>
                 {
