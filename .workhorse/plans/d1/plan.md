@@ -8,14 +8,14 @@ activation.
 
 ## Control lifecycle
 
-- [ ] Expand `src/server/control/routing.rs` and its server/store integration
+- [x] Expand `src/server/control/routing.rs` and its server/store integration
   from direct apply/restore operations to draft replacement and typed
   generation-CAS edits.
-- [ ] Return draft state, compile diagnostics, offer inventory, publication
+- [x] Return draft state, compile diagnostics, offer inventory, publication
   state, revision summaries, and lane-impact data from the routing snapshot.
-- [ ] Add validation and pure preview endpoints with stable, content-free
+- [x] Add validation and pure preview endpoints with stable, content-free
   diagnostics and trace data.
-- [ ] Make activation consume the current draft with a selected activation
+- [x] Make activation consume the current draft with a selected activation
   scope and explicit warm-cache override, and make reactivation create a new
   revision without moving the active pointer backwards.
 - [ ] Invoke Claude settings reconciliation after a successful activation while
@@ -55,7 +55,7 @@ activation.
 
 ## Coverage and finalisation
 
-- [ ] Cover control operation gates, body schemas and limits, draft CAS,
+- [x] Cover control operation gates, body schemas and limits, draft CAS,
   validation/preview projections, activation/reaction semantics, and
   publication failure isolation.
 - [ ] Cover routing model transitions, keyboard/mouse page navigation, forms,

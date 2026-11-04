@@ -2,18 +2,18 @@
 
 ## Control lifecycle
 
-- [ ] Draft replacement rejects a stale generation and returns the daemon draft.
-- [ ] Typed draft edit updates only the requested policy field and advances the generation.
-- [ ] Draft validation returns stable diagnostics without changing active routing.
-- [ ] Preview uses only content-free request facts and reports match, selection,
+- [x] Draft replacement rejects a stale generation and returns the daemon draft.
+- [x] Typed draft edit updates only the requested policy field and advances the generation.
+- [x] Draft validation returns stable diagnostics without changing active routing.
+- [x] Preview uses only content-free request facts and reports match, selection,
   skips, upgrade, cost transition, and final binding.
-- [ ] Activation retains a compiled policy revision captured by requests already
+- [x] Activation retains a compiled policy revision captured by requests already
   in progress.
-- [ ] A reactivation creates a new active revision whose parent is the selected
+- [x] A reactivation creates a new active revision whose parent is the selected
   historical revision.
-- [ ] An activation scope preserves warm pins unless an explicit cache-safe
+- [x] An activation scope preserves warm pins unless an explicit cache-safe
   transition permits movement.
-- [ ] Forced warm-lane movement requires explicit confirmation.
+- [x] Forced warm-lane movement requires explicit confirmation.
 - [ ] A failed Claude settings reconciliation leaves the activated server policy
   in place.
 

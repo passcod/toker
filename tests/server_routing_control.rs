@@ -1,4 +1,4 @@
-//! End-to-end coverage for the gated live routing control surface.
+//! End-to-end coverage for the gated live routing control lifecycle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
 use toker::config::{Config, OpenRouterConfig};
 use toker::server::Server;
-use toker::store::Store;
+use toker::store::{Lane, LanePin, Store};
 use tower::ServiceExt;
 
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_ROUTING_CONTROL";
@@ -70,8 +70,23 @@ fn request(method: &str, uri: &str, gate: Option<&str>, value: Option<Value>) ->
     builder.body(body).unwrap()
 }
 
+async fn snapshot(app: &axum::Router) -> Value {
+    body(
+        app.clone()
+            .oneshot(request(
+                "GET",
+                "/_toker/routing/snapshot",
+                Some("routing-snapshot"),
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
 #[tokio::test]
-async fn routing_controls_are_local_and_operation_gated() {
+async fn routing_controls_are_local_operation_gated_and_snapshot_is_content_free() {
     let (server, _) = server();
     let app = server.router();
     let response = app
@@ -85,113 +100,312 @@ async fn routing_controls_are_local_and_operation_gated() {
         .clone()
         .oneshot(request(
             "POST",
-            "/_toker/routing/snapshot",
-            Some("routing-snapshot"),
+            "/_toker/routing/validate",
+            Some("routing-preview"),
             Some(json!({})),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-    let response = app
-        .oneshot(request(
-            "GET",
-            "/_toker/routing/snapshot",
-            Some("routing-snapshot"),
-            None,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let value = body(response).await;
-    assert_eq!(value["toker"], "routing-snapshot");
-    assert_eq!(value["active_revision"]["revision_id"], 1);
+    let snapshot = snapshot(&app).await;
+    assert_eq!(snapshot["toker"], "routing-snapshot");
+    assert_eq!(snapshot["active_revision"]["revision_id"], 1);
+    assert_eq!(snapshot["draft_generation"], 1);
+    assert!(snapshot.get("offers").is_some());
+    assert!(snapshot.get("lane_impacts").is_some());
+    assert!(!snapshot.to_string().contains(UNSET_KEY_ENV));
 }
 
 #[tokio::test]
-async fn apply_rejects_unknown_fields_and_preserves_the_active_revision_on_invalid_policy() {
-    let (server, store) = server();
+async fn draft_replace_uses_generation_cas_and_denies_unknown_fields() {
+    let (server, _) = server();
     let app = server.router();
+    let initial = snapshot(&app).await;
+    let generation = initial["draft_generation"].as_i64().unwrap();
+    let policy = initial["draft"]["policy"].clone();
+
     let response = app
         .clone()
         .oneshot(request(
-            "POST",
-            "/_toker/routing/apply",
-            Some("routing-apply"),
-            Some(json!({ "policy": {}, "surprise": true })),
+            "PUT",
+            "/_toker/routing/draft",
+            Some("routing-draft-replace"),
+            Some(json!({
+                "expected_generation": generation,
+                "policy": policy,
+                "surprise": true,
+            })),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
 
-    let response = app
+    let updated = app
+        .clone()
         .oneshot(request(
-            "POST",
-            "/_toker/routing/apply",
-            Some("routing-apply"),
-            Some(json!({ "policy": {} })),
+            "PUT",
+            "/_toker/routing/draft",
+            Some("routing-draft-replace"),
+            Some(json!({
+                "expected_generation": generation,
+                "policy": policy,
+            })),
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
-    assert_eq!(
-        store
-            .load_routing_policy_state()
-            .unwrap()
-            .active_revision_id,
-        Some(1)
-    );
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = body(updated).await;
+    let next_generation = updated["generation"].as_i64().unwrap();
+    assert_eq!(next_generation, generation + 1);
+    assert_eq!(updated["draft"]["policy"], policy);
+
+    let stale = app
+        .oneshot(request(
+            "PUT",
+            "/_toker/routing/draft",
+            Some("routing-draft-replace"),
+            Some(json!({
+                "expected_generation": generation,
+                "policy": policy,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale = body(stale).await;
+    assert_eq!(stale["error"], "stale_draft");
+    assert_eq!(stale["generation"], next_generation);
 }
 
 #[tokio::test]
-async fn restore_is_a_forward_revision_and_stale_publication_acknowledgement_conflicts() {
+async fn typed_patch_only_changes_its_target_and_validation_is_non_mutating() {
     let (server, store) = server();
     let app = server.router();
-    let snapshot = app
+    let initial = snapshot(&app).await;
+    let generation = initial["draft_generation"].as_i64().unwrap();
+    let before = initial["draft"]["policy"].clone();
+
+    let patched = app
         .clone()
         .oneshot(request(
-            "GET",
-            "/_toker/routing/snapshot",
-            Some("routing-snapshot"),
-            None,
+            "PATCH",
+            "/_toker/routing/draft",
+            Some("routing-draft-edit"),
+            Some(json!({
+                "expected_generation": generation,
+                "edits": [{
+                    "kind": "set_description",
+                    "description": "edited in a typed control request",
+                }],
+            })),
         ))
         .await
         .unwrap();
-    let snapshot = body(snapshot).await;
-    let policy = snapshot["active_revision"]["policy"].clone();
+    assert_eq!(patched.status(), StatusCode::OK);
+    let patched = body(patched).await;
+    let generation = patched["generation"].as_i64().unwrap();
+    assert_eq!(
+        patched["draft"]["policy"]["description"],
+        "edited in a typed control request"
+    );
+    for key in [
+        "format_version",
+        "defaults",
+        "presentations",
+        "routes",
+        "rewrites",
+        "classifiers",
+        "upgrades",
+        "compaction",
+    ] {
+        assert_eq!(patched["draft"]["policy"][key], before[key]);
+    }
 
-    let applied = app
+    let validated = app
         .clone()
         .oneshot(request(
             "POST",
-            "/_toker/routing/apply",
-            Some("routing-apply"),
-            Some(json!({ "policy": policy, "description": "same configuration" })),
+            "/_toker/routing/validate",
+            Some("routing-validate"),
+            Some(json!({ "expected_generation": generation })),
         ))
         .await
         .unwrap();
-    assert_eq!(applied.status(), StatusCode::OK);
-    assert_eq!(body(applied).await["active_revision"]["revision_id"], 2);
+    assert_eq!(validated.status(), StatusCode::OK);
+    let validated = body(validated).await;
+    assert_eq!(validated["generation"], generation);
+    assert!(validated["diagnostics"].is_array());
+    assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
+}
 
-    let restored = app
+#[tokio::test]
+async fn preview_rejects_content_fields_and_only_projects_content_free_trace() {
+    let (server, _) = server();
+    let app = server.router();
+    let generation = snapshot(&app).await["draft_generation"].as_i64().unwrap();
+
+    let rejected = app
         .clone()
         .oneshot(request(
             "POST",
-            "/_toker/routing/restore",
-            Some("routing-restore"),
-            Some(json!({ "revision_id": 1 })),
+            "/_toker/routing/preview",
+            Some("routing-preview"),
+            Some(json!({
+                "expected_generation": generation,
+                "protocol": "openai_chat",
+                "prompt": "never accepted",
+            })),
         ))
         .await
         .unwrap();
-    assert_eq!(restored.status(), StatusCode::OK);
-    let restored = body(restored).await;
-    assert_eq!(restored["active_revision"]["revision_id"], 3);
-    assert_eq!(restored["active_revision"]["parent_revision_id"], 1);
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let preview = app
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/preview",
+            Some("routing-preview"),
+            Some(json!({
+                "expected_generation": generation,
+                "protocol": "openai_chat",
+                "model": "unmatched-model",
+                "prompt_bound": 100,
+                "message_count": 1,
+                "tool_count": 0,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let preview = body(preview).await;
+    assert_eq!(preview["error"], "invalid_policy");
+    assert!(preview["diagnostics"].is_array());
+    assert!(!preview.to_string().contains("never accepted"));
+}
+
+#[tokio::test]
+async fn activation_keeps_the_editable_draft_and_reactivation_moves_forward() {
+    let (server, store) = server();
+    let app = server.router();
+    let initial = snapshot(&app).await;
+    let generation = initial["draft_generation"].as_i64().unwrap();
+
+    let activated = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/activate",
+            Some("routing-activate"),
+            Some(json!({
+                "expected_generation": generation,
+                "scope": "new_lanes",
+                "description": "same document as a fresh revision",
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(activated.status(), StatusCode::OK);
+    let activated = body(activated).await;
+    assert_eq!(activated["active_revision"]["revision_id"], 2);
+    assert_eq!(activated["draft"]["base_revision_id"], 2);
+    let generation = activated["generation"].as_i64().unwrap();
+
+    let reactivated = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/reactivate",
+            Some("routing-reactivate"),
+            Some(json!({
+                "expected_generation": generation,
+                "revision_id": 1,
+                "scope": "new_lanes",
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reactivated.status(), StatusCode::OK);
+    let reactivated = body(reactivated).await;
+    assert_eq!(reactivated["active_revision"]["revision_id"], 3);
+    assert_eq!(reactivated["active_revision"]["parent_revision_id"], 1);
     assert_eq!(store.load_policy_revisions().unwrap().len(), 3);
+}
 
-    let publication = app
+#[tokio::test]
+async fn immediate_activation_requires_an_explicit_warm_cache_override() {
+    let (server, store) = server();
+    let app = server.router();
+    let initial = snapshot(&app).await;
+    let generation = initial["draft_generation"].as_i64().unwrap();
+
+    store
+        .upsert_lane(&Lane {
+            key: "warm-lane".to_owned(),
+            session_id: None,
+            tools_hash: None,
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: Some(LanePin {
+                policy_revision_id: 1,
+                policy_route_id: "route".parse().unwrap(),
+                route_fingerprint: "11".repeat(32).parse().unwrap(),
+                candidate_id: "candidate".parse().unwrap(),
+                binding_id: "openrouter.openai_chat".parse().unwrap(),
+                baseline_model: "base".to_owned(),
+                effective_model: "effective".to_owned(),
+            }),
+        })
+        .unwrap();
+
+    let denied = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/activate",
+            Some("routing-activate"),
+            Some(json!({
+                "expected_generation": generation,
+                "scope": "immediate",
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::CONFLICT);
+    let denied = body(denied).await;
+    assert_eq!(denied["error"], "forced_cache_transition_required");
+    assert_eq!(denied["lane_impacts"]["unknown"], 1);
+
+    let forced = app
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/activate",
+            Some("routing-activate"),
+            Some(json!({
+                "expected_generation": generation,
+                "scope": "immediate",
+                "force_cache_transition": true,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forced.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stale_publication_acknowledgement_conflicts_and_generic_call_cannot_claim_applied() {
+    let (server, _) = server();
+    let app = server.router();
+    let current = snapshot(&app).await["active_revision"]["revision_id"]
+        .as_i64()
+        .unwrap();
+    let stale = app
         .clone()
         .oneshot(request(
             "POST",
@@ -200,15 +414,14 @@ async fn restore_is_a_forward_revision_and_stale_publication_acknowledgement_con
             Some(json!({
                 "scope": { "kind": "protocol", "protocol": "openai_chat" },
                 "adapter": "dynamic_chat_models",
-                "expected_revision_id": 2,
+                "expected_revision_id": current - 1,
                 "expected_inventory_generation": 0,
                 "outcome": "failed",
             })),
         ))
         .await
         .unwrap();
-    assert_eq!(publication.status(), StatusCode::CONFLICT);
-    assert_eq!(body(publication).await["error"], "stale_publication");
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
 
     let applied = app
         .oneshot(request(
@@ -218,7 +431,7 @@ async fn restore_is_a_forward_revision_and_stale_publication_acknowledgement_con
             Some(json!({
                 "scope": { "kind": "protocol", "protocol": "openai_chat" },
                 "adapter": "dynamic_chat_models",
-                "expected_revision_id": 3,
+                "expected_revision_id": current,
                 "expected_inventory_generation": 0,
                 "outcome": "applied",
             })),

@@ -2883,6 +2883,7 @@ mod tests {
         let activated = store
             .activate_policy_revision(&ActivatePolicyRevision {
                 created_ms: 200,
+                expected_draft_generation: None,
                 description: Some("restore the initial routing"),
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
@@ -2949,6 +2950,7 @@ mod tests {
             store
                 .activate_policy_revision(&ActivatePolicyRevision {
                     created_ms: 200,
+                    expected_draft_generation: None,
                     description: None,
                     activation_scope: ActivationScope::Immediate,
                     forced_cache_transition: false,

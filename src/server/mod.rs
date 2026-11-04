@@ -98,9 +98,10 @@ use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRout
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
 use crate::secrets::{self, KEYRING_READ_TIMEOUT, OsKeyring, SecretStore};
 use crate::store::{
-    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, PolicyCompilerOrigin,
-    PolicyRevision, PolicyRevisionSource, PublicationCasResult, PublicationKey,
-    PublicationResultUpdate, PublicationState, RoutingPublication, Store,
+    ActivatePolicyRevision, ActivatedPolicyRevision, BindingLearning, DraftCasResult,
+    PolicyCompilerOrigin, PolicyRevision, PolicyRevisionSource, PublicationCasResult,
+    PublicationKey, PublicationResultUpdate, PublicationState, RoutingPolicyState,
+    RoutingPublication, Store,
 };
 
 use record::now_ms;
@@ -763,67 +764,314 @@ impl Server {
             .clone();
         let inventory = offers::inventory(&self.registry, &catalogs);
         let availability = availability_for(&self.registry, &catalogs);
+        let state = self.store.load_routing_policy_state()?;
+        let draft_diagnostics = state
+            .draft
+            .as_ref()
+            .map(|draft| {
+                compile_control_policy(
+                    &draft.document,
+                    PolicyCompilerOrigin::Authored,
+                    &self.registry,
+                    &inventory,
+                )
+                .err()
+                .and_then(|error| match error {
+                    RoutingControlError::Compilation(diagnostics) => Some(diagnostics),
+                    _ => None,
+                })
+                .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms());
         let publications = self.store.load_publications()?;
         Ok(RoutingControlSnapshot {
             active_revision: revision,
+            state,
+            draft_diagnostics,
             inventory_generation: fetched::snapshot_generation(&catalogs),
             inventory,
             availability,
+            lane_impacts,
             publications,
         })
     }
 
-    /// Compile a complete control-plane document against a captured topology
-    /// snapshot, persist it atomically, then install it for new captures.
-    pub(crate) fn apply_routing_policy(
+    /// Replace the only daemon-owned draft with a canonical policy document.
+    pub(crate) fn replace_routing_draft(
         &self,
+        expected_generation: i64,
         document: crate::policy::ValidatedPolicyDocument,
-        description: Option<&str>,
-    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
-        self.activate_routing_policy(
-            document,
-            description,
-            PolicyRevisionSource::Draft,
-            None,
-            None,
-        )
+    ) -> Result<DraftCasResult, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.store.load_routing_policy_state()?;
+        let base_revision_id = state.active_revision_id.ok_or_else(|| {
+            anyhow::anyhow!("cannot edit a draft without an active policy revision")
+        })?;
+        Ok(self.store.compare_and_swap_policy_draft(
+            expected_generation,
+            base_revision_id,
+            &document,
+            now_ms(),
+        )?)
     }
 
-    /// Reactivate an immutable historical revision by creating a new revision.
-    pub(crate) fn restore_routing_policy(
+    /// Read-modify-write the current draft under the server mutation lock.
+    /// `mutate` only sees a normal editable document, never storage JSON.
+    pub(crate) fn patch_routing_draft<F>(
         &self,
-        selected_revision_id: i64,
-        description: Option<&str>,
-    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
-        let selected = self
-            .store
-            .load_policy_revision(selected_revision_id)?
-            .ok_or(RoutingControlError::MissingRevision(selected_revision_id))?;
-        self.activate_routing_policy(
-            selected.document,
-            description,
-            PolicyRevisionSource::Reactivation,
-            Some(selected.compiler_origin),
-            Some(selected_revision_id),
-        )
+        expected_generation: i64,
+        mutate: F,
+    ) -> Result<DraftCasResult, RoutingControlError>
+    where
+        F: FnOnce(
+            &mut crate::policy::PolicyDocument,
+        ) -> Result<crate::policy::ValidatedPolicyDocument, DraftMutation>,
+    {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.store.load_routing_policy_state()?;
+        if state.draft_generation != expected_generation {
+            return Err(RoutingControlError::StaleDraft {
+                current: Box::new(state),
+            });
+        }
+        let draft = state.draft.ok_or(RoutingControlError::DraftMissing)?;
+        let mut document = draft.document.into_document();
+        let document = mutate(&mut document).map_err(RoutingControlError::DraftMutation)?;
+        Ok(self.store.compare_and_swap_policy_draft(
+            expected_generation,
+            draft.base_revision_id,
+            &document,
+            now_ms(),
+        )?)
     }
 
-    fn activate_routing_policy(
+    /// Compile the current draft against exactly one captured offer inventory.
+    pub(crate) fn validate_routing_draft(
         &self,
-        document: crate::policy::ValidatedPolicyDocument,
-        description: Option<&str>,
-        source: PolicyRevisionSource,
-        requested_origin: Option<PolicyCompilerOrigin>,
-        parent_revision_id: Option<i64>,
-    ) -> Result<ActivatedPolicyRevision, RoutingControlError> {
+        expected_generation: Option<i64>,
+    ) -> Result<RoutingDraftValidation, RoutingControlError> {
         let _control = self
             .routing_control
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = self.routing_snapshot_locked()?;
-        let compiler_origin = requested_origin.unwrap_or(snapshot.active_revision.compiler_origin);
+        self.expect_draft_generation(&snapshot.state, expected_generation)?;
+        let draft = snapshot
+            .state
+            .draft
+            .ok_or(RoutingControlError::DraftMissing)?;
+        let diagnostics = match compile_control_policy(
+            &draft.document,
+            PolicyCompilerOrigin::Authored,
+            &self.registry,
+            &snapshot.inventory,
+        ) {
+            Ok(_) => Vec::new(),
+            Err(RoutingControlError::Compilation(diagnostics)) => diagnostics,
+            Err(error) => return Err(error),
+        };
+        Ok(RoutingDraftValidation {
+            generation: snapshot.state.draft_generation,
+            diagnostics,
+        })
+    }
+
+    /// Resolve content-free preview facts through the exact same pure resolver
+    /// inference uses, against the draft rather than the active revision.
+    pub(crate) fn preview_routing_draft(
+        &self,
+        request: RoutingPreviewRequest,
+    ) -> Result<RoutingDraftPreview, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let snapshot = self.routing_snapshot_locked()?;
+        self.expect_draft_generation(&snapshot.state, request.expected_generation)?;
+        let draft = snapshot
+            .state
+            .draft
+            .ok_or(RoutingControlError::DraftMissing)?;
         let policy = compile_control_policy(
-            &document,
+            &draft.document,
+            PolicyCompilerOrigin::Authored,
+            &self.registry,
+            &snapshot.inventory,
+        )?;
+        let lane = request
+            .lane_key
+            .as_deref()
+            .map(|key| self.store.load_lane(key))
+            .transpose()?;
+        let now = now_ms();
+        let lane = lane.as_ref().and_then(|lane| {
+            lane.as_ref().and_then(|lane| {
+                self.shadow_lane(
+                    Some(lane),
+                    lane.pin
+                        .as_ref()
+                        .and_then(|pin| self.registry.binding(&pin.binding_id)),
+                    now,
+                    false,
+                )
+            })
+        });
+        let facts = crate::policy::RequestFacts {
+            profile: request.profile,
+            protocol: request.protocol,
+            requested_model: request.model,
+            lane_reference: request.lane_key,
+            prompt_bound: request.prompt_bound,
+            message_count: request.message_count,
+            tool_count: request.tool_count,
+            required_capabilities: request.required_capabilities,
+            binding_affinity: request.binding_affinity,
+            class: RequestClass::Inference,
+            legacy_compaction: None,
+            now_ms: now,
+        };
+        let availability = snapshot
+            .availability
+            .at(now, crate::catalog::fetched::CACHE_TTL_MS);
+        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
+        let result = crate::policy::resolve(
+            &policy,
+            &snapshot.inventory,
+            &learning,
+            lane.as_ref(),
+            &availability,
+            &facts,
+        );
+        Ok(RoutingDraftPreview {
+            generation: snapshot.state.draft_generation,
+            diagnostics: Vec::new(),
+            result: preview_result_body(result),
+        })
+    }
+
+    /// Activate the current draft. The store checks the generation as part of
+    /// the immediate activation transaction, so a completed validation cannot
+    /// be mistaken for permission to activate a later draft.
+    pub(crate) fn activate_routing_draft(
+        &self,
+        expected_generation: i64,
+        scope: crate::policy::ActivationScope,
+        forced_cache_transition: bool,
+        description: Option<&str>,
+    ) -> Result<RoutingActivation, RoutingControlError> {
+        self.activate_current_draft(
+            expected_generation,
+            description,
+            DraftActivationOptions {
+                scope,
+                forced_cache_transition,
+                source: PolicyRevisionSource::Draft,
+                requested_origin: None,
+                parent_revision_id: None,
+            },
+        )
+    }
+
+    /// Reactivating history always copies it into a fresh revision. It also
+    /// refreshes the draft to that document before the generation-CAS
+    /// activation, so the active pointer can never move backwards.
+    pub(crate) fn reactivate_routing_policy(
+        &self,
+        expected_generation: i64,
+        selected_revision_id: i64,
+        scope: crate::policy::ActivationScope,
+        forced_cache_transition: bool,
+        description: Option<&str>,
+    ) -> Result<RoutingActivation, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.store.load_routing_policy_state()?;
+        if state.draft_generation != expected_generation {
+            return Err(RoutingControlError::StaleDraft {
+                current: Box::new(state),
+            });
+        }
+        let selected = self
+            .store
+            .load_policy_revision(selected_revision_id)?
+            .ok_or(RoutingControlError::MissingRevision(selected_revision_id))?;
+        let base_revision_id = state.active_revision_id.ok_or_else(|| {
+            anyhow::anyhow!("cannot reactivate without an active policy revision")
+        })?;
+        match self.store.compare_and_swap_policy_draft(
+            expected_generation,
+            base_revision_id,
+            &selected.document,
+            now_ms(),
+        )? {
+            DraftCasResult::Updated { generation, .. } => self.activate_current_draft_locked(
+                generation,
+                description,
+                DraftActivationOptions {
+                    scope,
+                    forced_cache_transition,
+                    source: PolicyRevisionSource::Reactivation,
+                    requested_origin: Some(selected.compiler_origin),
+                    parent_revision_id: Some(selected_revision_id),
+                },
+            ),
+            DraftCasResult::Conflict { current } => Err(RoutingControlError::StaleDraft {
+                current: Box::new(current),
+            }),
+        }
+    }
+
+    fn activate_current_draft(
+        &self,
+        expected_generation: i64,
+        description: Option<&str>,
+        options: DraftActivationOptions,
+    ) -> Result<RoutingActivation, RoutingControlError> {
+        let _control = self
+            .routing_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.activate_current_draft_locked(expected_generation, description, options)
+    }
+
+    fn activate_current_draft_locked(
+        &self,
+        expected_generation: i64,
+        description: Option<&str>,
+        options: DraftActivationOptions,
+    ) -> Result<RoutingActivation, RoutingControlError> {
+        let snapshot = self.routing_snapshot_locked()?;
+        if snapshot.state.draft_generation != expected_generation {
+            return Err(RoutingControlError::StaleDraft {
+                current: Box::new(snapshot.state),
+            });
+        }
+        let draft = snapshot
+            .state
+            .draft
+            .clone()
+            .ok_or(RoutingControlError::DraftMissing)?;
+        let impacts = self.routing_lane_impacts_locked(&snapshot.state, now_ms());
+        if options.scope == crate::policy::ActivationScope::Immediate
+            && impacts.warm + impacts.unknown > 0
+            && !options.forced_cache_transition
+        {
+            return Err(RoutingControlError::ForcedTransitionRequired { impacts });
+        }
+        let compiler_origin = options
+            .requested_origin
+            .unwrap_or(snapshot.active_revision.compiler_origin);
+        let policy = compile_control_policy(
+            &draft.document,
             compiler_origin,
             &self.registry,
             &snapshot.inventory,
@@ -832,14 +1080,15 @@ impl Server {
             .store
             .activate_policy_revision(&ActivatePolicyRevision {
                 created_ms: now_ms(),
+                expected_draft_generation: Some(expected_generation),
                 description,
-                activation_scope: crate::policy::ActivationScope::Immediate,
-                forced_cache_transition: false,
-                source,
+                activation_scope: options.scope,
+                forced_cache_transition: options.forced_cache_transition,
+                source: options.source,
                 compiler_origin,
-                parent_revision_id,
+                parent_revision_id: options.parent_revision_id,
                 expected_active_revision_id: snapshot.active_revision.revision_id,
-                document: &document,
+                document: &draft.document,
                 desired_inventory_generation: snapshot.inventory_generation,
                 publications: &publication_targets()?,
             })?;
@@ -854,7 +1103,61 @@ impl Server {
             Arc::new(snapshot.availability),
             &std::collections::BTreeSet::new(),
         );
-        Ok(activation)
+        Ok(RoutingActivation {
+            activation,
+            lane_impacts: impacts,
+        })
+    }
+
+    fn expect_draft_generation(
+        &self,
+        state: &RoutingPolicyState,
+        expected_generation: Option<i64>,
+    ) -> Result<(), RoutingControlError> {
+        if let Some(expected_generation) = expected_generation
+            && state.draft_generation != expected_generation
+        {
+            return Err(RoutingControlError::StaleDraft {
+                current: Box::new(state.clone()),
+            });
+        }
+        Ok(())
+    }
+
+    fn routing_lane_impacts_locked(
+        &self,
+        _state: &RoutingPolicyState,
+        now: i64,
+    ) -> RoutingLaneImpacts {
+        let mut impacts = RoutingLaneImpacts::default();
+        let Ok(lanes) = self.store.load_lanes() else {
+            return impacts;
+        };
+        for lane in lanes {
+            impacts.total += 1;
+            let Some(pin) = lane.pin.as_ref() else {
+                // An older, unpinned lane may still retain a cache. It has no
+                // policy identity to prove safe movement, so never call it
+                // cold for an immediate activation.
+                impacts.unpinned += 1;
+                impacts.unknown += 1;
+                continue;
+            };
+            // The active binding's cache domain is the only place the TTL is
+            // known. A still-live pinned lane with a binding no longer in the
+            // current topology is conservatively warm for activation consent:
+            // unknown never proves cold.
+            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), now) {
+                crate::policy::CacheTemperature::Warm => impacts.warm += 1,
+                crate::policy::CacheTemperature::Cold => impacts.cold += 1,
+                crate::policy::CacheTemperature::Unknown => {
+                    // No cache-domain TTL is not evidence that the lane is
+                    // cold, so an immediate activation must be forced.
+                    impacts.unknown += 1;
+                }
+            }
+        }
+        impacts
     }
 
     pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
@@ -1545,12 +1848,18 @@ impl Server {
             .route("/_toker/models/merge", post(control::models_merge))
             .route("/_toker/shutdown", post(control::shutdown))
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
+            .route("/_toker/routing/draft", any(control::routing::draft))
             .route(
                 "/_toker/routing/revisions",
                 any(control::routing::revisions),
             )
-            .route("/_toker/routing/apply", any(control::routing::apply))
-            .route("/_toker/routing/restore", any(control::routing::restore))
+            .route("/_toker/routing/validate", any(control::routing::validate))
+            .route("/_toker/routing/preview", any(control::routing::preview))
+            .route("/_toker/routing/activate", any(control::routing::activate))
+            .route(
+                "/_toker/routing/reactivate",
+                any(control::routing::reactivate),
+            )
             .route("/_toker/routing/promote", any(control::routing::promote))
             .route(
                 "/_toker/routing/publication",
@@ -2127,10 +2436,70 @@ fn effective_catalogue<'a>(
 /// A catalogue-consistent input for one routing control operation.
 pub(crate) struct RoutingControlSnapshot {
     pub(crate) active_revision: PolicyRevision,
+    pub(crate) state: RoutingPolicyState,
+    pub(crate) draft_diagnostics: Vec<crate::policy::Diagnostic>,
     pub(crate) inventory_generation: i64,
     pub(crate) inventory: crate::catalog::offers::OfferInventory,
     pub(crate) availability: AvailabilitySnapshot,
+    pub(crate) lane_impacts: RoutingLaneImpacts,
     pub(crate) publications: Vec<RoutingPublication>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoutingLaneImpacts {
+    pub(crate) total: u64,
+    pub(crate) unpinned: u64,
+    pub(crate) warm: u64,
+    pub(crate) cold: u64,
+    pub(crate) unknown: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutingDraftValidation {
+    pub(crate) generation: i64,
+    pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutingPreviewRequest {
+    pub(crate) expected_generation: Option<i64>,
+    pub(crate) protocol: FrontendProtocol,
+    pub(crate) profile: Option<ProfileId>,
+    pub(crate) model: Option<String>,
+    pub(crate) lane_key: Option<String>,
+    pub(crate) prompt_bound: u64,
+    pub(crate) message_count: Option<u64>,
+    pub(crate) tool_count: u64,
+    pub(crate) required_capabilities: crate::policy::CapabilityFlags,
+    pub(crate) binding_affinity: Option<crate::policy::BindingId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutingDraftPreview {
+    pub(crate) generation: i64,
+    pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
+    pub(crate) result: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutingActivation {
+    pub(crate) activation: ActivatedPolicyRevision,
+    pub(crate) lane_impacts: RoutingLaneImpacts,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DraftActivationOptions {
+    scope: crate::policy::ActivationScope,
+    forced_cache_transition: bool,
+    source: PolicyRevisionSource,
+    requested_origin: Option<PolicyCompilerOrigin>,
+    parent_revision_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DraftMutation {
+    MissingRecord,
+    InvalidDocument,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2143,6 +2512,89 @@ pub(crate) enum RoutingControlError {
     Compilation(Vec<crate::policy::Diagnostic>),
     #[error("routing policy revision {0} does not exist")]
     MissingRevision(i64),
+    #[error("routing draft is absent")]
+    DraftMissing,
+    #[error("routing draft generation changed")]
+    StaleDraft { current: Box<RoutingPolicyState> },
+    #[error("routing draft edit is invalid")]
+    DraftMutation(DraftMutation),
+    #[error("an immediate activation needs explicit warm-cache consent")]
+    ForcedTransitionRequired { impacts: RoutingLaneImpacts },
+}
+
+fn preview_result_body(
+    result: Result<crate::policy::AttemptPlan, crate::policy::ResolveFailure>,
+) -> serde_json::Value {
+    match result {
+        Ok(plan) => serde_json::json!({
+            "outcome": "selected",
+            "policy_revision": plan.policy_revision,
+            "route_id": plan.route_id,
+            "route_fingerprint": plan.route_fingerprint.map(|value| value.to_string()),
+            "provenance": format!("{:?}", plan.provenance),
+            "candidate_id": plan.candidate_id,
+            "binding_id": plan.binding_id,
+            "baseline_model": plan.baseline_model,
+            "upgraded_model": plan.upgraded_model,
+            "effective_model": plan.effective_model,
+            "cache_transition": plan.cache_transition.map(|value| format!("{:?}", value)),
+            "trace": plan.trace.into_iter().map(preview_trace_event).collect::<Vec<_>>(),
+        }),
+        Err(crate::policy::ResolveFailure::RouteUnavailable {
+            route_id,
+            route_fingerprint,
+            provenance,
+            trace,
+        }) => serde_json::json!({
+            "outcome": "unavailable",
+            "route_id": route_id,
+            "route_fingerprint": route_fingerprint.to_string(),
+            "provenance": format!("{:?}", provenance),
+            "trace": trace.into_iter().map(preview_trace_event).collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({
+            "outcome": "unresolved",
+            "code": preview_failure_code(&error),
+        }),
+    }
+}
+
+fn preview_trace_event(event: crate::policy::TraceEvent) -> serde_json::Value {
+    match event {
+        crate::policy::TraceEvent::Lookup(provenance) => serde_json::json!({
+            "kind": "lookup",
+            "provenance": format!("{:?}", provenance),
+        }),
+        crate::policy::TraceEvent::Candidate(candidate) => serde_json::json!({
+            "kind": "candidate",
+            "candidate_id": candidate.candidate_id,
+            "crossed_from": candidate.crossed_from,
+            "binding_id": candidate.binding_id,
+            "model": candidate.model,
+            "result": candidate.result.map_err(|reason| format!("{:?}", reason)),
+        }),
+        crate::policy::TraceEvent::Upgrade { from, to } => serde_json::json!({
+            "kind": "upgrade",
+            "from": from,
+            "to": to,
+        }),
+        crate::policy::TraceEvent::Alias { from, to } => serde_json::json!({
+            "kind": "alias",
+            "from": from,
+            "to": to,
+        }),
+    }
+}
+
+fn preview_failure_code(error: &crate::policy::ResolveFailure) -> &'static str {
+    match error {
+        crate::policy::ResolveFailure::NoRoute => "no_route",
+        crate::policy::ResolveFailure::MissingRoute => "missing_route",
+        crate::policy::ResolveFailure::InvalidArgument => "invalid_argument",
+        crate::policy::ResolveFailure::InvalidTemplate => "invalid_template",
+        crate::policy::ResolveFailure::LearningUnavailable => "learning_unavailable",
+        crate::policy::ResolveFailure::RouteUnavailable { .. } => "route_unavailable",
+    }
 }
 
 fn compile_control_policy(
