@@ -7,6 +7,8 @@
 //! by `x-session-id` (the header opencode sends), read back through the
 //! endpoint.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +24,6 @@ use serde_json::Value;
 use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
-use toker::server::Server;
 use toker::store::{CostKind, Lane, RequestRow, RowKind, Store};
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
@@ -91,7 +92,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
-            api_key: None,
+            // Policy refuses a backend with no credential to sign with.
+            api_key: Some("sk-or-test".to_owned()),
             picker: None,
         }),
         openai_api: None,
@@ -139,16 +141,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
 async fn spawn_toker(upstream: reqwest::Url) -> (SocketAddr, Arc<Store>) {
     let config = test_config(upstream);
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
-        .expect("build server");
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let addr = common::serve(common::server(config, &store)).await;
     (addr, store)
 }
 
