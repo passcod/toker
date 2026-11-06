@@ -1,0 +1,99 @@
+# F1: remove legacy routing machinery and finish docs
+
+Changeset 18 of `docs/plans/live-model-routing-implementation.md`, plus the
+other outstanding plans in `docs/plans/`. The prime directive applies: two
+users, no live fleet, take the expedient path.
+
+## Decisions
+
+- An existing lane with no routing pin resolves under the active revision like
+  a new lane. This costs at most one cold re-read per lane that was warm at
+  upgrade, and lets the legacy resolver go entirely. No pin seeding.
+- In scope beyond changeset 18: the OpenRouter placeholder-bearer bug, moving
+  the subscription signing checklist out of `docs/plans/`, and opencode session
+  lanes. Server safeguards stays planned and out of this card.
+
+## Findings that widen changeset 18
+
+Changeset 12 left legacy routing reachable in production:
+
+- `Server::resolve_policy_attempt` returns `Ok(None)` for an unpinned existing
+  lane (scope `new_lanes`, or not cold) and on a stored/facts lane mismatch;
+  Messages, Chat and Responses then route via `RouteRegistry::resolve`, and
+  Messages re-runs legacy compaction, force-newest and model map.
+- count_tokens and batches apply the TOML model map on top of the policy's
+  effective model, because the guard is `policy_attempt.is_some()` and only
+  `/v1/messages` sets it.
+- Administrative paths return not-configured when no legacy Anthropic default
+  resolves, before policy is consulted.
+- `/v1/models` on non-OpenAI profiles forwards to the legacy Chat default.
+- `toker promote` compiles the legacy config at runtime.
+- The policy compaction resolver calls `middleware::models::{family_of,
+  newer_than}` directly.
+- The legacy `ModelStore` is still written per request; `/_toker/models/merge`
+  has no in-tree client.
+
+## Steps
+
+### Make policy routing total
+
+- [ ] Unpinned existing lanes resolve under the active revision; a lane
+      mismatch is an error path, not a legacy fallback
+- [ ] Drop the legacy-default gate on administrative Anthropic paths; resolve
+      count_tokens, batches, unmatched and batch GET/cancel from policy only
+- [ ] Stop applying provider model maps after policy resolution (count_tokens,
+      batches) and stop passing them into cold-gate compaction pricing
+- [ ] `/v1/models` for every profile from the active revision
+- [ ] `toker promote` and `toker status` read the active revision; drop the
+      "legacy-authoritative" wording and the `serve` default-backend log line
+
+### Delete the legacy runtime
+
+- [ ] `RouteRegistry` becomes topology and binding lookup only: no prefix,
+      alias or default interpretation; `default_backend_*` read only by the
+      legacy compiler and setup import
+- [ ] Remove runtime model-map plumbing (`Provider::model_map`,
+      `canonical::map_model`, `inference::apply_model_map`,
+      `compaction_target_of`); keep `middleware::model_map` parsing and
+      `rewrite_model_positions` for the legacy compiler and batch splicing
+- [ ] Move `family_of`/`newer_than` beside the revision-one classifier in
+      `policy/`; route compaction through classifier output
+- [ ] Move `force_newest` constants and `prompt_bound` into `policy/`; delete
+      `decide`, `ForceContext`, `force_target_of`, `ModelStore::force_target`
+- [ ] Remove `compact_spec` runtime reads; compaction comes from the compiled
+      route only
+- [ ] Stop dual-writing the legacy `ModelStore`; remove `/_toker/models/merge`
+      and test-only promotion planning
+- [ ] Remove shadow mode (`policy/shadow.rs`, `LegacyShadow` ownership, shadow
+      observers and callers); rename the live `shadow_*` helpers and
+      `capture_shadow`
+- [ ] Port server integration tests to an authoritative server with an active
+      revision
+- [ ] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
+      `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
+      `middleware/mod.rs`, `middleware/model_map.rs`)
+
+### Other outstanding work
+
+- [ ] OpenRouter: when toker holds its own key, strip every incoming credential
+      rather than only `sk-ant-` bearers; delete `docs/plans/token-bug-claude.md`
+- [ ] Move the subscription signing checklist out of `docs/plans/`
+- [ ] Opencode session lanes per `docs/plans/opencode-session-lanes.md`, then
+      unplan it
+
+### Docs
+
+- [ ] Rewrite stale routing passages in `routing.md`, `models.md`,
+      `invariants.md`, `cold-gate.md`, `lanes.md`, `ledger-schema.md` and the
+      internals `README.md` file map (add `src/policy/`)
+- [ ] Document policy lifecycle, resolver, fallback commitment, lane/cache
+      domains, attempt read models, publication ownership, control operations,
+      lineage evidence and migration recovery
+- [ ] Check `README.md` and `AGENTS.md` against the result
+
+### Reconcile and unplan
+
+- [ ] Re-read both live-model-routing plans against the code, including the
+      auxiliary bare `claude-*` scenario with no Anthropic binding; record
+      anything consciously dropped
+- [ ] `unplan:` the two live-model-routing plans
