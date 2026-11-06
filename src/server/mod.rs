@@ -12,23 +12,23 @@
 //!   binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
 //!     the IR, routed, recorded ([`proxy`]).
-//!   - `GET /v1/models` — local route-graph projection for a known Chat
-//!     profile, no recording.
+//!   - `GET /v1/models` — a local projection of the active revision's
+//!     publication for the profile; nothing is forwarded or recorded.
 //! - Anthropic frontend (→ any registered Messages/Codex binding):
 //!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
 //!     `count_tokens` and `batches` run the same pipeline (they are not
 //!     gated — gates arrive with the quota-gate unit) but carry no usage,
 //!     so they record nothing in practice ([`anthropic`]).
-//!   - The batch-result GETs (and cancel) — transparent forwarding like
-//!     `/v1/models` (a local projection for a known Responses profile).
+//!   - The batch-result GETs (and cancel) — transparent forwarding to the
+//!     binding the active revision's default route names, no recording.
 //! - `GET /_toker/status`, `POST /_toker/models/merge`,
 //!   `GET /_toker/session`, `POST /_toker/shutdown` — the control
 //!   endpoints, gated by a custom header ([`control`]); `session` is the
 //!   attribution plugin's query, `shutdown` is `toker restart`'s drain.
 //!   Any other `/_toker/` path is a local 404.
-//! - Every other path — transparent forwarding to the default anthropic
-//!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
-//!   everything but its control path.
+//! - Every other path — transparent forwarding to the binding the active
+//!   revision's default route names ([`anthropic::unmatched`]), as the
+//!   predecessor forwarded everything but its control path.
 //!
 //! Every route above also answers under a `/f/<frontend>` prefix: the
 //! router strips it before matching and keeps the profile
@@ -41,8 +41,8 @@
 //! not-configured error in that protocol's own error shape
 //! ([`anthropic_not_configured`], [`openai_not_configured`]) and reaches
 //! no upstream; that includes the unmatched-path fallback, which is the
-//! anthropic default's. Unprefixed or unknown-profile `GET /v1/models`
-//! retains path-driven forwarding; known OpenAI profiles use local discovery.
+//! anthropic default's. Policy chooses the binding for every request; the
+//! route registry only turns that choice into a target.
 //!
 //! Timeouts: axum applies no default request or idle timeout on the
 //! client side, so streams run as long as both ends keep the connection
@@ -272,9 +272,8 @@ pub struct Server {
     /// family election) with its in-memory recently-served map, seeded
     /// from the ledger tail at startup.
     pub(crate) models: Arc<ModelStore>,
-    /// Binding-attributed observations and recently-sent targets. This is
-    /// non-authoritative policy evidence; revision-one routing continues to
-    /// read [`Self::models`].
+    /// Binding-attributed observations and recently-sent targets: the
+    /// learning evidence policy resolves against.
     pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
     /// The fetched models catalogues (one per source: openrouter's
     /// public listing, anthropic's presence list, the codex backend's
@@ -300,7 +299,8 @@ pub struct Server {
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
     /// The enabled provider bindings and implemented frontend-to-backend
-    /// routes. Every inference handler resolves a concrete model target here.
+    /// routes. Policy picks the binding; handlers turn it into a concrete
+    /// model target here.
     pub(crate) registry: RouteRegistry,
     /// The codex subscription backend, concretely — the translation
     /// branch needs [`crate::providers::codex::CodexSub`]'s own methods
@@ -546,7 +546,7 @@ impl Server {
 
     /// Mark one selected binding and effective target immediately before an
     /// actual inference transport starts. This state is deliberately separate
-    /// from the authoritative legacy model store.
+    /// from the legacy model store.
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,
@@ -2498,7 +2498,7 @@ fn policy_transition(
 ) -> crate::policy::LaneTransitionDecision {
     let prospective = plan
         .pin_identity()
-        .expect("an authoritative inference plan has complete pin identity");
+        .expect("an inference plan has complete pin identity");
     let same_revision = matches!(
         lane,
         crate::policy::LaneState::Existing {
@@ -3487,8 +3487,8 @@ api_key = "sk-proj-test"
             .unwrap()
             .block_on(policy_chat_server());
         // The server's revision activates for new lanes only. A lane with no
-        // pin is not preserved on the legacy resolver for it: it takes the
-        // active revision, and is pinned at the lane's own generation.
+        // pin has no revision to be preserved on: it takes the active
+        // revision, and is pinned at the lane's own generation.
         let facts = chat_facts(&server);
         let stored_lane = unpinned_lane();
         for temperature in [
@@ -3799,7 +3799,7 @@ api_key = "sk-proj-test"
     #[tokio::test]
     async fn a_warm_lane_with_no_pin_is_routed_and_pinned_by_the_active_revision() {
         // The revision activates for new lanes only, and the lane has just
-        // been used, so under the old rule it stayed on the legacy resolver.
+        // been used, but a lane with no pin has no revision to stay on.
         let (server, upstream) = policy_chat_server().await;
         let store = server.store.clone();
         let address = serve(server).await;

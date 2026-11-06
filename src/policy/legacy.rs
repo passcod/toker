@@ -1,7 +1,7 @@
 //! Pure conversion of resolved legacy configuration into revision-one policy.
 //!
 //! This module translates routing vocabulary only. It does not persist a
-//! policy, consult the ledger, or make policy authoritative in handlers.
+//! policy or consult the ledger.
 
 use std::collections::BTreeMap;
 

@@ -57,12 +57,12 @@ pub(crate) struct RecordCtx {
     pub(crate) server: Server,
     /// The selected backend owns route identity and cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
-    /// The exact legacy-selected backend binding. This identifies the wire
-    /// dialect without implying a policy revision or candidate selection.
+    /// The backend binding the send went to. This identifies the wire
+    /// dialect without implying a candidate selection.
     pub(crate) binding_id: BindingId,
     /// The actual upstream send this response completes.
     pub(crate) attempt: Option<AttemptProvenance>,
-    /// The authoritative policy route that selected this send.
+    /// The policy route that selected this send.
     pub(crate) policy_routing: Option<PolicyRouteProvenance>,
     /// One successful attempt's already-decided lane-pin transition.
     pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,

@@ -2767,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_state_starts_non_authoritative_and_revisions_round_trip() {
+    fn routing_state_starts_without_an_active_revision_and_revisions_round_trip() {
         let store = mem_store();
         let state = store.load_routing_policy_state().expect("state");
         assert_eq!(state.active_revision_id, None);

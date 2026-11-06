@@ -178,7 +178,7 @@ pub struct PolicyDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingPolicyState {
-    /// Non-NULL only in raw cutover fixtures in this changeset.
+    /// NULL until the server first establishes revision one.
     pub active_revision_id: Option<i64>,
     pub draft_generation: i64,
     pub draft: Option<PolicyDraft>,

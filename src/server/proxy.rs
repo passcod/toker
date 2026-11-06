@@ -6,8 +6,8 @@
 //! 1. Buffer the request body fully.
 //! 2. Parse the frontend wire into canonical IR. An invalid Chat body gets a
 //!    typed local compatibility error and never reaches a backend.
-//! 3. Routing: a known provider prefix selects that backend and is
-//!    stripped; bare models go to the protocol default.
+//! 3. Routing: the active policy revision resolves the model to a binding
+//!    and the effective model to send.
 //! 4. The selected backend adapter renders the request deterministically.
 //! 5. **The cold-cache notice** (plan: Middleware — cold gate): the
 //!    OpenRouter Chat binding's gate, on the lane the request itself keys (session ×

@@ -217,9 +217,9 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE allowances ADD COLUMN release TEXT NOT NULL DEFAULT 'overage';
     "#,
-    // v7 — non-authoritative live-routing storage. The singleton active
-    // pointer starts NULL and this migration never changes it. Policy runtime
-    // does not read these tables until the later atomic-cutover changeset.
+    // v7 — live-routing storage. The singleton active pointer starts NULL
+    // and this migration never changes it; the server establishes revision
+    // one from the config's routing fields the first time it starts.
     r#"
     CREATE TABLE routing_policy_revisions (
         revision_id              INTEGER PRIMARY KEY AUTOINCREMENT,

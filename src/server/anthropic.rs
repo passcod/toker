@@ -19,13 +19,14 @@
 //!   body parses into canonical IR and the selected Messages binding renders
 //!   it. Provider bytes feed observation before canonical response rendering.
 //! - `POST /v1/messages/count_tokens`, `POST /v1/messages/batches` — the
-//!   legacy pipeline (buffer → IR parse → routing → forward → tee →
+//!   same pipeline (buffer → IR parse → routing → forward → tee →
 //!   record), but they are **never gated**
 //!   (blocking them protects no quota, only breaks the client). Their
 //!   responses carry no usage, so they record nothing in
 //!   practice — their error rows remain real.
-//! - The batch-result GETs and cancel — transparent forwarding, like the
-//!   openai path's `/v1/models`: no recording, no observation.
+//! - The batch-result GETs and cancel — transparent forwarding to the
+//!   binding the active revision's default route names: no recording, no
+//!   observation.
 //! - Every path the route table does not match — the router's fallback,
 //!   transparent forwarding the same way ([`unmatched`]), except the
 //!   `/_toker/` namespace, which never leaves the proxy.
@@ -299,7 +300,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // BEFORE any transform, because the blocked answer renders the model
     // the client named and in the shape it asked for.
     let mut client_model: Option<String> = None;
-    // A body that cannot be parsed keeps the legacy SSE fallback because its
+    // A body that cannot be parsed keeps the SSE fallback because its
     // requested response shape is unknowable. Every parsed request below uses
     // the protocol default (`stream` absent means false).
     let mut client_wants_json = false;
@@ -1316,7 +1317,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // ── the legacy served-model mark, BEFORE the request goes ──
+    // ── the served-model mark, BEFORE the request goes ──
     //
     // Not after: a lane deciding while this one is still in flight must see
     // the final effective model as in use. The response may later name a
