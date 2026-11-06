@@ -88,6 +88,25 @@ Changeset 12 left legacy routing reachable in production:
       `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
       `middleware/mod.rs`, `middleware/model_map.rs`)
 
+### Regressions the test port surfaced
+
+Recorded in `port-notes.md` ("Findings"); each is a gap between the live
+policy path and what the legacy path did.
+
+- [ ] Model-less requests cannot route under revision one (batch results,
+      cancel, every unmatched Anthropic path answer 503 on the live config):
+      add the exact-profile-then-protocol default resolution the design
+      describes for model-free administrative paths
+- [ ] A pinned lane on a binding with no cache domain (anthropic_sub, api,
+      codex) is never `Cold`, so force-newest never fires for it: derive
+      coldness from the lane's recorded TTL for a lane pinned to that binding
+- [ ] Compaction retarget rows record no `downgraded_from`/`downgraded_to`
+      because policy picks the cheaper model first; derive them from the plan
+- [ ] `/model` switch on a warm pinned lane answers 502 "could not resolve":
+      route it as the existing `ExplicitUserChange` transition cause
+- [ ] Untranslatable body on a streaming request: decide SSE shape and row
+      (currently plain JSON 400, no row)
+
 ### Other outstanding work
 
 - [ ] Policy's not-configured answers lost `x-toker-not-configured`, which
