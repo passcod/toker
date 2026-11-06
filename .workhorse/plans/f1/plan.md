@@ -37,7 +37,7 @@ Changeset 12 left legacy routing reachable in production:
 
 ### Make policy routing total
 
-- [ ] Unpinned existing lanes resolve under the active revision; a lane
+- [x] Unpinned existing lanes resolve under the active revision; a lane
       mismatch is an error path, not a legacy fallback
 - [ ] Drop the legacy-default gate on administrative Anthropic paths; resolve
       count_tokens, batches, unmatched and batch GET/cancel from policy only

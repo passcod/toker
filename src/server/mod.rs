@@ -150,6 +150,11 @@ pub(crate) enum PolicyAttemptError {
         revision_id: i64,
         reason: crate::policy::TransitionDenied,
     },
+    /// The caller built lane facts for a lane it had not loaded, or the other
+    /// way round. That is a handler bug, and routing on half a lane would
+    /// guess its cache temperature.
+    #[error("the stored lane and the policy lane facts disagreed")]
+    LaneFactsMismatch,
 }
 
 #[allow(dead_code)]
@@ -1276,6 +1281,11 @@ impl Server {
         Ok(Some(plans))
     }
 
+    /// Resolve one inference attempt under the active policy revision.
+    ///
+    /// `Ok(None)` means only that no revision is active, which is a
+    /// test-only server still owned by the legacy resolver; under an active
+    /// revision every request resolves or fails with a [`PolicyAttemptError`].
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,
@@ -1296,8 +1306,7 @@ impl Server {
             .activation_scope()
             .expect("a persisted current revision has an activation scope");
         if stored_lane.is_some() != lane.is_some() {
-            tracing::error!("stored lane and policy lane facts disagreed");
-            return Ok(None);
+            return Err(crate::server::PolicyAttemptError::LaneFactsMismatch);
         }
         let temperature = lane
             .map(|lane| lane.temperature)
@@ -1306,26 +1315,29 @@ impl Server {
         let pinned_revision = stored_lane
             .and_then(|lane| lane.pin.as_ref())
             .map(|pin| pin.policy_revision_id);
+        // A lane with no pin predates policy routing and resolves under the
+        // active revision like a new lane, whatever the activation scope:
+        // its cache cannot be attributed to a binding, so there is nothing a
+        // pinned revision could preserve. The one thing kept from it is a
+        // proven-cold temperature, which the compaction route needs.
+        let lane = lane.filter(|lane| {
+            pinned_revision.is_some() || lane.temperature == crate::policy::CacheTemperature::Cold
+        });
 
-        let use_active = match (stored_lane, pinned_revision, scope) {
-            (None, _, _) => true,
-            (Some(_), None, crate::policy::ActivationScope::NewLanes) => return Ok(None),
-            (Some(_), None, _) if temperature != crate::policy::CacheTemperature::Cold => {
-                return Ok(None);
-            }
-            (Some(_), None, _) => true,
-            (_, Some(revision), _) if revision > current_revision_id => {
+        let use_active = match (pinned_revision, scope) {
+            (None, _) => true,
+            (Some(revision), _) if revision > current_revision_id => {
                 return Err(PolicyAttemptError::Transition {
                     revision_id: revision,
                     reason: crate::policy::TransitionDenied::StaleRevision,
                 });
             }
-            (_, Some(revision), _) if revision == current_revision_id => true,
-            (_, Some(_), crate::policy::ActivationScope::NewLanes) => false,
-            (_, Some(_), crate::policy::ActivationScope::NewAndColdLanes) => {
+            (Some(revision), _) if revision == current_revision_id => true,
+            (Some(_), crate::policy::ActivationScope::NewLanes) => false,
+            (Some(_), crate::policy::ActivationScope::NewAndColdLanes) => {
                 temperature == crate::policy::CacheTemperature::Cold
             }
-            (_, Some(_), crate::policy::ActivationScope::Immediate) => true,
+            (Some(_), crate::policy::ActivationScope::Immediate) => true,
         };
         let snapshot = if use_active {
             current
@@ -3674,24 +3686,8 @@ api_key = "sk-proj-test"
         assert_eq!(next.plan.effective_model, "backup-model");
     }
 
-    #[test]
-    fn new_lanes_activation_preserves_an_existing_unpinned_lane() {
-        let (server, _) = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
-            ProtocolId::OpenAiChat,
-            None,
-            Some("policy-alias".to_owned()),
-            Some("lane".to_owned()),
-            1,
-            Some(1),
-            0,
-            Default::default(),
-            None,
-            crate::policy::RequestClass::Inference,
-        );
-        let stored_lane = crate::store::Lane {
+    fn unpinned_lane() -> crate::store::Lane {
+        crate::store::Lane {
             key: "lane".to_owned(),
             session_id: Some("session".to_owned()),
             tools_hash: Some("tools".to_owned()),
@@ -3702,27 +3698,95 @@ api_key = "sk-proj-test"
             noticed_at: None,
             forced_from: None,
             forced_to: None,
-            pin_generation: 0,
+            pin_generation: 3,
             pin: None,
-        };
-        let lane = crate::policy::LaneFacts {
-            temperature: crate::policy::CacheTemperature::Unknown,
-            pinned: None,
-            forced_from: None,
-            forced_to: None,
-        };
-        assert!(
-            server
+        }
+    }
+
+    fn chat_facts(server: &Server) -> crate::policy::RequestFacts {
+        server.shadow_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        )
+    }
+
+    #[test]
+    fn an_existing_unpinned_lane_resolves_under_the_active_revision_like_a_new_lane() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        // The server's revision activates for new lanes only. A lane with no
+        // pin is not preserved on the legacy resolver for it: it takes the
+        // active revision, and is pinned at the lane's own generation.
+        let facts = chat_facts(&server);
+        let stored_lane = unpinned_lane();
+        for temperature in [
+            crate::policy::CacheTemperature::Warm,
+            crate::policy::CacheTemperature::Unknown,
+            crate::policy::CacheTemperature::Cold,
+        ] {
+            let lane = crate::policy::LaneFacts {
+                temperature,
+                pinned: None,
+                forced_from: None,
+                forced_to: None,
+            };
+            let resolved = server
                 .resolve_policy_attempt(
                     &facts,
                     &crate::policy::CredentialSnapshot::new(),
                     Some(&stored_lane),
                     Some(&lane),
                 )
-                .expect("preservation is not a resolver failure")
-                .is_none(),
-            "an existing unpinned lane stays on legacy authority"
-        );
+                .expect("an unpinned lane resolves")
+                .expect("an active policy resolves every lane");
+            assert_eq!(resolved.plan.policy_revision, Some(1), "{temperature:?}");
+            assert_eq!(resolved.plan.effective_model, "policy-effective");
+            assert!(
+                matches!(
+                    resolved.pin_transition,
+                    crate::policy::LaneTransitionDecision::FirstPin {
+                        expected_generation: 3,
+                        source: crate::policy::TransitionSource::NewLane,
+                        ..
+                    }
+                ),
+                "{temperature:?}: {:?}",
+                resolved.pin_transition
+            );
+        }
+    }
+
+    #[test]
+    fn lane_facts_that_disagree_with_the_stored_lane_are_an_error_not_a_legacy_fallback() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = chat_facts(&server);
+        let stored_lane = unpinned_lane();
+        let lane = crate::policy::LaneFacts {
+            temperature: crate::policy::CacheTemperature::Unknown,
+            pinned: None,
+            forced_from: None,
+            forced_to: None,
+        };
+        let credentials = crate::policy::CredentialSnapshot::new();
+        assert!(matches!(
+            server.resolve_policy_attempt(&facts, &credentials, Some(&stored_lane), None),
+            Err(crate::server::PolicyAttemptError::LaneFactsMismatch)
+        ));
+        assert!(matches!(
+            server.resolve_policy_attempt(&facts, &credentials, None, Some(&lane)),
+            Err(crate::server::PolicyAttemptError::LaneFactsMismatch)
+        ));
     }
 
     #[test]
@@ -3974,6 +4038,61 @@ api_key = "sk-proj-test"
             "policy-forced"
         );
         assert!(forced > unforced);
+    }
+
+    #[tokio::test]
+    async fn a_warm_lane_with_no_pin_is_routed_and_pinned_by_the_active_revision() {
+        // The revision activates for new lanes only, and the lane has just
+        // been used, so under the old rule it stayed on the legacy resolver.
+        let (server, upstream) = policy_chat_server().await;
+        let store = server.store.clone();
+        let address = serve(server).await;
+        let send = || async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat/completions"))
+                .header("x-toker-session", "unpinned-session")
+                .json(&serde_json::json!({
+                    "model": "policy-alias",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false
+                }))
+                .send()
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+
+        send().await;
+        let pinned = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("unpinned-session"))
+            .expect("first request pinned the lane");
+        // Strip the pin, leaving the lane as an older version recorded it.
+        store
+            .compare_and_swap_lane_pin(
+                &pinned.key,
+                pinned.pin_generation,
+                pinned.pin.as_ref(),
+                None,
+            )
+            .expect("unpin");
+        assert_eq!(store.load_lane(&pinned.key).unwrap().unwrap().pin, None);
+
+        send().await;
+        let repinned = store.load_lane(&pinned.key).expect("lane").expect("lane");
+        assert_eq!(
+            repinned.pin.as_ref().map(|pin| pin.policy_revision_id),
+            Some(1),
+            "the unpinned lane took the active revision"
+        );
+        assert_eq!(repinned.pin_generation, pinned.pin_generation + 2);
+        assert_eq!(
+            upstream.seen.lock().unwrap().last().unwrap()["model"],
+            "policy-effective",
+            "and was routed by policy, not by the legacy default"
+        );
     }
 
     #[tokio::test]
