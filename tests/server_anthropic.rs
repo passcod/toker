@@ -43,8 +43,9 @@ use toker::middleware::quota::{Blocking, GateDecision, Meter, Meters, Rendering,
 use toker::policy::{
     ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
     CandidateEdge, CandidateId, CandidateModel, DefaultRoute, FailureClass, FallbackPermission,
-    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
-    REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument, Presentation,
+    PresentationId, PresentationSource, REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId,
+    RouteReference, RouteStep,
 };
 use toker::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES};
 use toker::server::Server;
@@ -676,7 +677,7 @@ fn messages_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
 fn messages_fallback_policy_with_model(
     primary_model: &str,
 ) -> toker::policy::ValidatedPolicyDocument {
-    messages_fallback_policy_document(primary_model, true)
+    messages_fallback_policy_document(primary_model, true, vec![])
 }
 
 /// `with_requested_model` binds the client's model into the route as a
@@ -685,6 +686,7 @@ fn messages_fallback_policy_with_model(
 fn messages_fallback_policy_document(
     primary_model: &str,
     with_requested_model: bool,
+    presentations: Vec<Presentation>,
 ) -> toker::policy::ValidatedPolicyDocument {
     let parameters: Vec<toker::policy::StableId> = with_requested_model
         .then(|| REQUESTED_MODEL_PARAMETER.parse().unwrap())
@@ -706,7 +708,7 @@ fn messages_fallback_policy_document(
                     .collect(),
             },
         }],
-        presentations: vec![],
+        presentations,
         routes: vec![Route {
             id: route_id,
             display_name: "Messages fallback".to_owned(),
@@ -3843,7 +3845,7 @@ async fn spawn_policy_with_a_model_map(
     config.db_path = common::tempdir(name).join("toker.db");
     let (addr, store) = spawn_toker_with_policy_document(
         config,
-        messages_fallback_policy_document("pol-model", false),
+        messages_fallback_policy_document("pol-model", false, vec![]),
     )
     .await;
     (mock, addr, store)
@@ -3947,6 +3949,67 @@ async fn an_administrative_body_that_is_not_json_has_nothing_for_policy_to_route
     let response = post_messages(addr, "/v1/messages/count_tokens", &[], b"not json").await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(mock.captured().is_empty(), "nothing reaches an upstream");
+}
+
+#[tokio::test]
+async fn models_for_an_anthropic_profile_come_from_the_active_revision() {
+    let (_mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-ant-test".to_owned()), "anthropic_sub");
+    config.anthropic_sub.as_mut().unwrap().oauth_token = Some("held-token".to_owned());
+    config.db_path = common::tempdir("server-anthropic-policy-models-").join("toker.db");
+    let route_id = RouteId::new("messages-fallback").unwrap();
+    let presentation = Presentation {
+        id: PresentationId::new("fast").unwrap(),
+        scope: FrontendScope::Protocol {
+            protocol: FrontendProtocol::AnthropicMessages,
+        },
+        slug: "toker-fast".to_owned(),
+        label: None,
+        description: None,
+        enabled: true,
+        shadow_native: false,
+        source: PresentationSource::Virtual {
+            target: RouteReference {
+                route_id,
+                parameters: Default::default(),
+            },
+        },
+        metadata: None,
+    };
+    let (addr, _store) = spawn_toker_with_policy_document(
+        config,
+        messages_fallback_policy_document("pol-model", false, vec![presentation]),
+    )
+    .await;
+
+    let listed: Value = client()
+        .get(toker_url(addr, "/f/claude/v1/models"))
+        .send()
+        .await
+        .expect("models request")
+        .json()
+        .await
+        .expect("models JSON");
+    assert_eq!(
+        listed,
+        json!({
+            "data": [{"type": "model", "id": "toker-fast", "display_name": "toker-fast"}],
+            "has_more": false,
+            "first_id": "toker-fast",
+            "last_id": "toker-fast",
+        })
+    );
+
+    // A profile that names no protocol is answered from the same revision,
+    // in the Chat shape, rather than forwarded to a default backend.
+    let response = client()
+        .get(toker_url(addr, "/f/invented-client/v1/models"))
+        .send()
+        .await
+        .expect("models request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: Value = response.json().await.expect("models JSON");
+    assert_eq!(listed["object"], "list");
 }
 
 #[tokio::test]

@@ -168,9 +168,45 @@ pub fn render_policy(
         }
         crate::policy::FrontendProtocol::OpenaiResponses => PolicyPublication::Unresolved,
         crate::policy::FrontendProtocol::AnthropicMessages => {
-            PolicyPublication::Ready(Value::Array(Vec::new()))
+            let mut data: Vec<Value> = exact
+                .iter()
+                .map(|offer| anthropic_entry(&offer.routed_model_id, &offer.raw))
+                .collect();
+            data.extend(
+                virtual_slugs
+                    .into_iter()
+                    .map(|slug| anthropic_entry(&slug, &Value::Null)),
+            );
+            data.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            let first = data.first().map(|entry| entry["id"].clone());
+            let last = data.last().map(|entry| entry["id"].clone());
+            PolicyPublication::Ready(json!({
+                "data": data,
+                "has_more": false,
+                "first_id": first,
+                "last_id": last,
+            }))
         }
     }
+}
+
+/// One entry of Anthropic's models list. `display_name` and `created_at`
+/// are the provider's own when its listing carried them; a published slug
+/// with no listing entry (a virtual model) names itself and has no creation
+/// time rather than a made-up one.
+fn anthropic_entry(slug: &str, raw: &Value) -> Value {
+    let mut entry = Map::new();
+    entry.insert("type".to_owned(), json!("model"));
+    entry.insert("id".to_owned(), json!(slug));
+    let display = raw
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or(slug);
+    entry.insert("display_name".to_owned(), json!(display));
+    if let Some(created) = raw.get("created_at").and_then(Value::as_str) {
+        entry.insert("created_at".to_owned(), json!(created));
+    }
+    Value::Object(entry)
 }
 
 /// Project canonical offers into the legacy frontend aliases. Equal slugs on

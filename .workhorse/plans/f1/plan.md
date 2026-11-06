@@ -43,7 +43,7 @@ Changeset 12 left legacy routing reachable in production:
       count_tokens, batches, unmatched and batch GET/cancel from policy only
 - [x] Stop applying provider model maps after policy resolution (count_tokens,
       batches) and stop passing them into cold-gate compaction pricing
-- [ ] `/v1/models` for every profile from the active revision
+- [x] `/v1/models` for every profile from the active revision
 - [ ] `toker promote` and `toker status` read the active revision; drop the
       "legacy-authoritative" wording and the `serve` default-backend log line
 
