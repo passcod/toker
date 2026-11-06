@@ -291,7 +291,7 @@ fn scope_label(scope: &FrontendScope) -> String {
     match scope {
         FrontendScope::Profile { profile, protocol } => {
             format!(
-                "{}:{}",
+                "{}/{}",
                 profile.as_str(),
                 super::routing::protocol_name(*protocol)
             )

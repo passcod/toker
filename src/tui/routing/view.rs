@@ -50,10 +50,28 @@ pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
         master,
     );
 
+    let lines = detail_lines(state, entries.get(state.selected()));
+    // `Paragraph` does not report its wrapped height, so estimate it: a line
+    // wider than the pane takes its ceiling in rows, plus one for the word
+    // wrap that can push a word onto the next row. Over-counting only lets
+    // the pane scroll a row past the end.
+    let width = usize::from(detail.width.saturating_sub(2).max(1));
+    let wrapped: usize = lines
+        .iter()
+        .map(|line| match line.width() {
+            columns if columns <= width => 1,
+            columns => columns.div_ceil(width) + 1,
+        })
+        .sum();
+    let furthest = u16::try_from(wrapped)
+        .unwrap_or(u16::MAX)
+        .saturating_sub(detail.height.saturating_sub(2));
+    state.set_detail_furthest(furthest);
+    let pane = Paragraph::new(lines)
+        .block(Block::bordered().title("DETAIL"))
+        .wrap(Wrap { trim: false });
     frame.render_widget(
-        Paragraph::new(detail_lines(state, entries.get(state.selected())))
-            .block(Block::bordered().title("DETAIL"))
-            .wrap(Wrap { trim: false }),
+        pane.scroll((state.detail_scroll().min(furthest), 0)),
         detail,
     );
     frame.render_widget(
@@ -148,20 +166,28 @@ fn entry_summary(entry: &Entry<'_>) -> String {
             short(value)
         );
     }
-    let name = ["slug", "id", "name", "revision", "adapter", "provider"]
-        .into_iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_owned))
-        .or_else(|| {
-            ["id", "revision", "revision_id"]
-                .into_iter()
-                .find_map(|key| {
-                    value
-                        .get(key)
-                        .and_then(Value::as_i64)
-                        .map(|number| number.to_string())
-                })
-        })
-        .unwrap_or_else(|| entry.key.to_owned());
+    let name = [
+        "slug",
+        "id",
+        "name",
+        "revision",
+        "adapter",
+        "binding_id",
+        "provider",
+    ]
+    .into_iter()
+    .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_owned))
+    .or_else(|| {
+        ["id", "revision", "revision_id"]
+            .into_iter()
+            .find_map(|key| {
+                value
+                    .get(key)
+                    .and_then(Value::as_i64)
+                    .map(|number| number.to_string())
+            })
+    })
+    .unwrap_or_else(|| entry.key.to_owned());
     format!("{name}  {}", short(value))
 }
 
@@ -173,10 +199,13 @@ fn detail_lines(state: &State, selected: Option<&Entry<'_>>) -> Vec<Line<'static
         )];
     }
     let mut lines = match selected {
-        Some(entry) => pretty(entry.value)
-            .lines()
-            .map(|line| Line::raw(line.to_owned()))
-            .collect(),
+        Some(entry) => match state.snapshot() {
+            Some(snapshot) => super::detail::lines(snapshot, entry),
+            None => pretty(entry.value).lines().map(str::to_owned).collect(),
+        }
+        .into_iter()
+        .map(Line::raw)
+        .collect(),
         None if state.loading() => vec![Line::raw("loading routing snapshot…")],
         None => vec![Line::raw("routing snapshot has no entries for this view")],
     };
@@ -353,7 +382,7 @@ fn render_legend(frame: &mut Frame) {
         "ROUTING HELP",
         "Tab  return to dashboard",
         "1–4, ←/→  change routing view",
-        "↑/↓, j/k  select an item",
+        "↑/↓, j/k  select an item; PgUp/PgDn scroll the detail",
         "n  add a record from a template (asks which kind where a view has several)",
         "e  edit typed record; Ctrl+Enter saves JSON, in an add too",
         "d  confirm removal; m orders route candidates",
@@ -430,6 +459,16 @@ mod tests {
                     "active_revision": {"policy": {"routes": []}},
                     "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
                     "publications": [{"adapter": "claude", "state": "failed"}],
+                    "derived": {
+                        "active": {"routes": [
+                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "deny", "from_cost": "subscription", "to_cost": "billed"}]},
+                            {"id": "gone", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow"}]},
+                        ]},
+                        "draft": {"routes": [
+                            {"id": "kept", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "billed"}]},
+                            {"id": "new-route", "edges": [{"from": "a", "to": "b", "crosses_cost_boundary": true, "billed_boundary": "allow", "from_cost": "subscription", "to_cost": "unknown"}]},
+                        ]},
+                    },
                 }),
             }),
         ));
@@ -449,6 +488,20 @@ mod tests {
         let text = modal_text(&state).join("\n");
         assert!(text.contains("+route new-route"), "{text}");
         assert!(text.contains("2 warm"), "{text}");
+        assert!(
+            text.contains("cost boundary: kept: a -> b consent allow (was deny)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "cost boundary: new-route: a -> b now crosses subscription to unknown (consent allow)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("cost boundary: gone: a -> b removed"),
+            "{text}"
+        );
         assert!(text.contains("publication claude: failed"), "{text}");
         assert!(text.contains("forced_cache_transition_required"), "{text}");
         assert!(
@@ -484,6 +537,7 @@ mod tests {
             "d  confirm removal",
             "defaults (routes view)",
             "i  import",
+            "PgUp/PgDn scroll the detail",
         ] {
             assert!(text.contains(key_help), "{key_help}: {text}");
         }
@@ -510,5 +564,219 @@ mod tests {
         let text = modal_text(&state).join("\n");
         assert!(text.contains("1 route"), "{text}");
         assert!(text.contains("2 default"), "{text}");
+    }
+
+    /// A snapshot with every kind of record and the derived facts for them,
+    /// so each view's frame shows the page as it reads with a real policy.
+    fn page_snapshot() -> serde_json::Value {
+        let route = serde_json::json!({
+            "id": "mixed", "display_name": "Subscription then billed",
+            "lane_transition": "move_when_cold",
+            "chain": {
+                "first": {"id": "sub", "binding_id": "codex_sub.codex_responses",
+                          "model": {"kind": "exact", "model_id": "gpt-example"}, "enabled": true},
+                "steps": [{
+                    "edge": {"preflight": "enabled", "post_send": ["rate_limit"],
+                             "billed_boundary": "allow", "ambiguous_transport": "deny",
+                             "cache_transition": "allow_cache_loss"},
+                    "candidate": {"id": "billed", "binding_id": "openrouter.openrouter_responses",
+                                  "model": {"kind": "requested_model"}, "enabled": true},
+                }],
+            },
+        });
+        let policy = serde_json::json!({
+            "description": "example draft",
+            "presentations": [
+                {"id": "p-mixed", "slug": "mixed", "label": "Mixed",
+                 "scope": {"kind": "protocol", "protocol": "openai_responses"},
+                 "source": {"kind": "virtual", "target": {"route_id": "mixed"}}, "enabled": true},
+            ],
+            "routes": [route],
+            "defaults": [{"scope": {"kind": "protocol", "protocol": "openai_responses"},
+                          "target": {"route_id": "mixed"}}],
+            "rewrites": [{"id": "r-sonnet", "scope": {"kind": "protocol", "protocol": "openai_responses"},
+                          "priority": 5, "model_matcher": {"kind": "glob", "value": "gpt-*"},
+                          "target": {"route_id": "mixed"}}],
+            "classifiers": [{"id": "gpt-family", "binding_id": "codex_sub.codex_responses",
+                             "model_matcher": {"kind": "regex", "value": "^gpt-(?P<family>[a-z]+)-(?P<version>[0-9.]+)$"},
+                             "family_template": "${family}", "version_template": "${version}",
+                             "version_parser": {"kind": "numeric_tuple", "components": 2, "separator": "."}}],
+            "upgrades": [{"id": "newest", "classifier_id": "gpt-family", "enabled": true,
+                          "lane_transition": "move_when_cold"}],
+        });
+        let derived_policy = serde_json::json!({
+            "routes": [{
+                "id": "mixed",
+                "pinned_lanes": {"warm": 2, "cold": 1, "unknown": 0},
+                "candidates": [
+                    {"id": "sub", "binding_id": "codex_sub.codex_responses", "cost_class": "subscription",
+                     "upgrade_policy_id": "newest",
+                     "upgrade": {"baseline": "gpt-example-1.0", "winner": "gpt-example-1.2",
+                                 "rejected": [{"model": "gpt-example-1.1", "reason": "not_newer"},
+                                              {"model": "gpt-other-2.0", "reason": "family_mismatch"}]}},
+                    {"id": "billed", "binding_id": "openrouter.openrouter_responses", "cost_class": "billed",
+                     "upgrade_policy_id": null, "upgrade": null},
+                ],
+                "edges": [{"from": "sub", "to": "billed", "from_cost": "subscription", "to_cost": "billed",
+                           "crosses_cost_boundary": true, "billed_boundary": "allow"}],
+            }],
+            "classifiers": [{"id": "gpt-family", "binding_id": "codex_sub.codex_responses",
+                             "parsed": [{"model": "gpt-example-1.0", "family": "example", "version": "1.0"}],
+                             "unparsed": [{"model": "gpt-example-latest"}]}],
+            "presentations": [{"scope": "openai_responses", "slug": "mixed",
+                               "adapter": "dynamic_responses_models",
+                               "desired": "left_out", "reason": "no_codex_record", "applied": null}],
+        });
+        serde_json::json!({
+            "draft_generation": 4,
+            "draft": {"policy": policy},
+            "active_revision": {"revision_id": 3, "policy": {}},
+            "draft_diagnostics": [
+                {"code": "virtual-presentation-unlisted-in-responses", "severity": "info",
+                 "record_id": "p-mixed", "path": "/presentations/0/metadata"},
+            ],
+            "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
+            "publications": [{"adapter": "dynamic_responses_models", "state": "applied",
+                              "scope": {"kind": "protocol", "protocol": "openai_responses"},
+                              "applied_revision_id": 3, "desired_revision_id": 3,
+                              "applied_inventory_generation": 7, "desired_inventory_generation": 7}],
+            "derived": {
+                "availability": [{
+                    "binding_id": "codex_sub.codex_responses", "provider": "codex_sub",
+                    "configured": {"state": "yes", "reason": "configured"},
+                    "enabled": {"state": "yes", "reason": "enabled"},
+                    "credential": {"state": "unknown"}, "catalogue": {"state": "fresh"},
+                    "capabilities": {"sampling": "supported", "tools": "supported", "images": "unknown"},
+                    "cost_class": "subscription",
+                }, {
+                    "binding_id": "openrouter.openrouter_responses", "provider": "openrouter",
+                    "configured": {"state": "no", "reason": "unconfigured"},
+                    "enabled": {"state": "no", "reason": "disabled"},
+                    "credential": {"state": "no", "reason": "provider-unconfigured"},
+                    "catalogue": {"state": "absent"}, "capabilities": {}, "cost_class": "billed",
+                }],
+                "circuits": [],
+                "draft": derived_policy,
+                "active": null,
+            },
+        })
+    }
+
+    fn frame(state: &State) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, state, false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn page_in(view: super::View) -> State {
+        let mut state = State::default();
+        state.receive(Reply::Command(
+            Command::snapshot(),
+            Ok(Response {
+                status: 200,
+                body: page_snapshot(),
+            }),
+        ));
+        state.set_view(view);
+        state
+    }
+
+    #[test]
+    fn the_presentations_page() {
+        insta::assert_snapshot!(frame(&page_in(super::View::Presentations)));
+    }
+
+    #[test]
+    fn the_routes_page() {
+        insta::assert_snapshot!(frame(&page_in(super::View::Routes)));
+    }
+
+    #[test]
+    fn the_rewrites_page_on_a_classifier() {
+        let mut state = page_in(super::View::Rewrites);
+        state.move_selection(1);
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_rewrites_page_on_an_upgrade() {
+        let mut state = page_in(super::View::Rewrites);
+        state.move_selection(2);
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_status_page_on_a_binding() {
+        let mut state = page_in(super::View::Status);
+        // active revision, draft, publication, then the bindings
+        state.move_selection(3);
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_activation_form() {
+        let mut state = page_in(super::View::Routes);
+        state.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_detail_pane_scrolls_to_its_last_line_and_no_further() {
+        let mut state = page_in(super::View::Routes);
+        // A short terminal so the route's detail does not fit.
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("terminal");
+        let draw = |terminal: &mut Terminal<TestBackend>, state: &State| {
+            terminal
+                .draw(|frame| {
+                    render(frame, state, false);
+                })
+                .expect("draw");
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(!draw(&mut terminal, &state).contains("model: the requested model"));
+        for _ in 0..5 {
+            state.key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            draw(&mut terminal, &state);
+        }
+        let scrolled = state.detail_scroll();
+        assert!(draw(&mut terminal, &state).contains("model: the requested model"));
+        assert!(
+            scrolled > 0 && scrolled < 50,
+            "stops at the end: {scrolled}"
+        );
+        state.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(state.detail_scroll() < scrolled);
+        // Moving to another item starts it at the top.
+        state.move_selection(1);
+        assert_eq!(state.detail_scroll(), 0);
     }
 }

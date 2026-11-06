@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: frame(&state)
+---
+ ?  ⇄
+1 PRESENTATIONS  2 ROUTES, CANDIDATES & DEFAULTS  3 REWRITES, FAMILIES, UPGRADES & COMPACTION  4 PREVIEW, REVISIONS & AC
+
+┌REWRITES, FAMILIES, UPGRADES & COMPACTION───────┐┌DETAIL──────────────────────────────────────────────────────────────┐
+│r-sonnet  {"id":"r-sonnet","scope":{"kind":"prot││draft generation 4                                                  │
+│gpt-family  {"id":"gpt-family","binding_id":"cod││newest  classifier gpt-family                                       │
+│newest  {"id":"newest","classifier_id":"gpt-fami││lane transition: move_when_cold                                     │
+│                                                ││                                                                    │
+│                                                ││STANDING FOR A NEW LANE                                             │
+│                                                ││mixed / sub                                                         │
+│                                                ││  baseline gpt-example-1.0 -> gpt-example-1.2                       │
+│                                                ││    not gpt-example-1.1: not newer                                  │
+│                                                ││    not gpt-other-2.0: family mismatch                              │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+│                                                ││                                                                    │
+└────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

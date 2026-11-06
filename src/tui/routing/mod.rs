@@ -1,6 +1,7 @@
 //! Routing policy page with draft-led controls.
 
 mod client;
+mod detail;
 mod import;
 mod model;
 mod reconcile;
@@ -20,6 +21,8 @@ pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
         crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p' | 'i')
+            | crossterm::event::KeyCode::PageUp
+            | crossterm::event::KeyCode::PageDown
     )
 }
 
@@ -120,6 +123,9 @@ mod tests {
     fn every_key_the_legend_documents_reaches_the_page() {
         for key in ['e', 'n', 'd', 'm', 'v', 'V', 'a', 'x', 'p', 'i'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
+        }
+        for key in [KeyCode::PageUp, KeyCode::PageDown] {
+            assert!(owns_key(key), "{key:?}");
         }
         assert!(!owns_key(KeyCode::Char('q')), "q still quits");
     }

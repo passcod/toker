@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 
 use super::client::{Command, Reply, Response};
 
+/// Lines a page key moves the detail pane.
+const DETAIL_PAGE: i32 = 10;
+
 /// The routing page's four master/detail views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum View {
@@ -136,6 +139,10 @@ pub(super) struct State {
     loading: bool,
     in_flight: bool,
     modal: Modal,
+    /// How far the detail pane is scrolled, and how far it can be; the view
+    /// owns the second because only it knows the pane's height and wrapping.
+    detail_scroll: u16,
+    detail_furthest: std::cell::Cell<u16>,
     /// The exact typed edit batch that received a 409.  It remains intact until
     /// the user explicitly reloads or reapplies it against the daemon copy.
     conflicted_edits: Vec<Value>,
@@ -157,6 +164,8 @@ impl Default for State {
             loading: false,
             in_flight: false,
             modal: Modal::None,
+            detail_scroll: 0,
+            detail_furthest: std::cell::Cell::new(0),
             conflicted_edits: Vec::new(),
             legacy_policy: super::import::legacy_policy,
         }
@@ -170,6 +179,30 @@ impl State {
 
     pub(super) fn generation(&self) -> Option<u64> {
         self.generation
+    }
+
+    /// What the daemon last sent, for the detail pane to lay out.
+    pub(super) fn snapshot(&self) -> Option<&Value> {
+        self.snapshot.as_ref()
+    }
+
+    pub(super) fn detail_scroll(&self) -> u16 {
+        self.detail_scroll
+    }
+
+    /// Scroll the detail pane. The view reports how far it can go, so the
+    /// offset never runs past the last line and a key back always shows
+    /// movement.
+    pub(super) fn scroll_detail(&mut self, delta: i32) {
+        let furthest = self.detail_furthest.get();
+        self.detail_scroll =
+            (i32::from(self.detail_scroll) + delta).clamp(0, i32::from(furthest)) as u16;
+    }
+
+    /// Called by the view each draw with the last offset that still shows a
+    /// line.
+    pub(super) fn set_detail_furthest(&self, furthest: u16) {
+        self.detail_furthest.set(furthest);
     }
 
     pub(super) fn error(&self) -> Option<&str> {
@@ -190,6 +223,7 @@ impl State {
         } else {
             lines.push(format!("changed records: {}", changes.join(", ")));
         }
+        lines.extend(cost_boundary_changes(snapshot));
         match snapshot.get("lane_impacts") {
             Some(impacts) => {
                 let count = |key: &str| impacts.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -246,6 +280,7 @@ impl State {
     pub(super) fn set_view(&mut self, view: View) {
         self.view = view;
         self.selected = 0;
+        self.detail_scroll = 0;
     }
 
     pub(super) fn move_selection(&mut self, delta: isize) {
@@ -255,6 +290,7 @@ impl State {
         } else {
             self.selected = self.selected.saturating_add_signed(delta).min(count - 1);
         }
+        self.detail_scroll = 0;
     }
 
     pub(super) fn selected(&self) -> usize {
@@ -326,6 +362,15 @@ impl State {
                     key: "publications",
                     value,
                 });
+                let availability = snapshot
+                    .get("derived")
+                    .map(|derived| array(derived, "availability"))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|value| Entry {
+                        key: "availability",
+                        value,
+                    });
                 let lane_impacts = snapshot.get("lane_impacts").into_iter().map(|value| Entry {
                     key: "lane_impacts",
                     value,
@@ -344,6 +389,7 @@ impl State {
                     .chain(draft)
                     .chain(revisions)
                     .chain(publications)
+                    .chain(availability)
                     .chain(lane_impacts)
                     .chain(diagnostics)
                     .chain(offers)
@@ -559,6 +605,14 @@ impl State {
             }
             KeyCode::Char('i') if self.view == View::Status => {
                 self.modal = Modal::Import;
+                None
+            }
+            KeyCode::PageDown => {
+                self.scroll_detail(DETAIL_PAGE);
+                None
+            }
+            KeyCode::PageUp => {
+                self.scroll_detail(-DETAIL_PAGE);
                 None
             }
             _ => None,
@@ -1330,6 +1384,72 @@ pub(super) fn scope_label(record: &Value) -> String {
         Some("profile") => format!("{}/{}", text("profile"), text("protocol")),
         _ => text("protocol").to_owned(),
     }
+}
+
+/// The route edges whose crossing from subscription to billed spend, or the
+/// consent that allows it, differ between the draft and the active revision.
+/// Spend is the one thing an activation can change that the changed-record
+/// list does not make plain.
+fn cost_boundary_changes(snapshot: &Value) -> Vec<String> {
+    let Some(derived) = snapshot.get("derived") else {
+        return Vec::new();
+    };
+    let edges = |key: &str| -> Vec<(String, &Value)> {
+        derived
+            .get(key)
+            .map(|policy| array(policy, "routes"))
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|route| {
+                let route_id = route.get("id").and_then(Value::as_str).unwrap_or("?");
+                array(route, "edges").iter().map(move |edge| {
+                    let text = |name: &str| edge.get(name).and_then(Value::as_str).unwrap_or("?");
+                    (
+                        format!("{route_id}: {} -> {}", text("from"), text("to")),
+                        edge,
+                    )
+                })
+            })
+            .collect()
+    };
+    let (active, draft) = (edges("active"), edges("draft"));
+    let crosses = |edge: &Value| edge.get("crosses_cost_boundary") == Some(&Value::Bool(true));
+    let consent = |edge: &Value| {
+        edge.get("billed_boundary")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_owned()
+    };
+    let mut lines = Vec::new();
+    for (name, edge) in &draft {
+        let before = active
+            .iter()
+            .find(|(active_name, _)| active_name == name)
+            .map(|(_, edge)| *edge);
+        match (before.is_some_and(crosses), crosses(edge)) {
+            (false, true) => lines.push(format!(
+                "cost boundary: {name} now crosses {} to {} (consent {})",
+                edge["from_cost"].as_str().unwrap_or("?"),
+                edge["to_cost"].as_str().unwrap_or("?"),
+                consent(edge),
+            )),
+            (true, true) if before.map(consent) != Some(consent(edge)) => {
+                lines.push(format!(
+                    "cost boundary: {name} consent {} (was {})",
+                    consent(edge),
+                    before.map(consent).unwrap_or_default(),
+                ));
+            }
+            (true, false) => lines.push(format!("cost boundary: {name} no longer crosses")),
+            _ => {}
+        }
+    }
+    for (name, edge) in &active {
+        if crosses(edge) && !draft.iter().any(|(draft_name, _)| draft_name == name) {
+            lines.push(format!("cost boundary: {name} removed"));
+        }
+    }
+    lines
 }
 
 /// The records the draft adds (`+`), removes (`-`) or changes (`~`) relative
