@@ -954,19 +954,16 @@ async fn spawn_toker_with_policy(
         .expect("activate policy fixture");
     // Policy fixtures intentionally use exact fake model ids. Do not let the
     // host's cached provider listings turn them into fresh-catalogue misses.
-    let server = Server::new_authoritative_with_catalogs(
-        config,
-        store.clone(),
-        toker::catalog::FetchedCatalogs::default(),
-    )
-    .expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     serve_toker(server, store, dir).await
 }
 
 async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     serve_toker(server, store, dir).await
 }
 
@@ -976,14 +973,8 @@ async fn spawn_toker_cataloged(
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     let observer = Arc::new(CollectingObserver::default());
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer.clone(),
-    )
-    .expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     let raw = json!({
         "models": [{
             "slug": "gpt-5.6-sol",

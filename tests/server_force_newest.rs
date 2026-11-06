@@ -242,7 +242,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
 }
 
 async fn spawn_toker(config: Config, store: Arc<Store>) -> SocketAddr {
-    let server = Server::new(config, store).expect("build server");
+    let server =
+        Server::with_seams(config, store, toker::server::Seams::isolated()).expect("build server");
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

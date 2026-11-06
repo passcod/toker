@@ -772,7 +772,8 @@ async fn spawn_toker_with_policy_document(
     store
         .activate_revision_one(&policy, 1, 0, &[])
         .expect("activate policy fixture");
-    let server = Server::new_authoritative(config, store.clone()).expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -791,7 +792,8 @@ async fn spawn_toker_idle(
     idle: Option<std::time::Duration>,
 ) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let mut server = Server::new(config, store.clone()).expect("build server");
+    let mut server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     if let Some(idle) = idle {
         server
             .set_upstream_idle_timeout(idle)

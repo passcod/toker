@@ -102,7 +102,6 @@ mod tests {
     use std::time::Instant;
 
     use crate::config::{Config, OpenRouterConfig};
-    use crate::middleware::awake::ProcessSpawner;
     use crate::policy::{
         BindingId, CandidateId, LaneState, LaneTransitionDecision, PinIdentity, RouteFingerprint,
         RouteId, TransitionCause, decide_transition,
@@ -126,13 +125,8 @@ mod tests {
         config.openrouter = Some(OpenRouterConfig::default());
         config.default_backend_openai_chat = Some("openrouter".to_owned());
         let store = Arc::new(Store::open(&config.db_path).expect("store"));
-        let server = Server::with_seams(
-            config,
-            store.clone(),
-            Box::new(ProcessSpawner),
-            Arc::new(crate::secrets::MemoryStore::new()),
-        )
-        .expect("server");
+        let server = Server::with_seams(config, store.clone(), crate::server::Seams::isolated())
+            .expect("server");
         let backend: Arc<dyn Provider> = Arc::new(OpenRouter::new(
             "http://127.0.0.1:9/v1".parse().expect("url"),
             None,

@@ -171,9 +171,12 @@ struct Toker {
 async fn spawn_toker(config: Config, port: u16) -> Toker {
     let probe = AwakeProbe::default();
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server =
-        Server::with_awake_spawner(config, store.clone(), Box::new(ProbeSpawner(probe.clone())))
-            .expect("build server");
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_spawner(Box::new(ProbeSpawner(probe.clone()))),
+    )
+    .expect("build server");
     let instance = server.instance().to_owned();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await

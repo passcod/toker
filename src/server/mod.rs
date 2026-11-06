@@ -92,7 +92,7 @@ use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
     LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
-    RequestFacts, ShadowObserver, TracingObserver,
+    RequestFacts,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
@@ -185,10 +185,55 @@ struct ResolvedPolicySnapshot {
     circuits: crate::policy::CircuitSnapshot,
 }
 
-#[derive(Clone, Copy)]
-enum RoutingOwnership {
-    LegacyShadow,
-    Policy,
+/// The injectable edges of a [`Server`]: what a test replaces so it touches
+/// nothing of the host it runs on.
+pub struct Seams {
+    /// Takes the idle-sleep lock. The real one runs systemd-inhibit or the
+    /// like, so tests never hand it to a server with `awake` on.
+    pub spawner: Box<dyn LockSpawner>,
+    /// Where stored API keys are read, once, at startup.
+    pub secrets: Arc<dyn SecretStore>,
+    /// The model catalogues the server starts with. `None` loads the host's
+    /// cache, which only the service wants: a test's inventory would then
+    /// depend on whichever machine runs it.
+    pub catalogs: Option<FetchedCatalogs>,
+}
+
+impl Seams {
+    /// The service's own: process spawner, OS keyring, cached catalogues.
+    pub fn host() -> Seams {
+        Seams {
+            spawner: Box::new(awake::ProcessSpawner),
+            secrets: Arc::new(OsKeyring),
+            catalogs: None,
+        }
+    }
+
+    /// Touches nothing of the host: no sleep lock, an empty in-memory
+    /// keyring, no catalogues. Add what a test needs with the `with_*`
+    /// methods.
+    pub fn isolated() -> Seams {
+        Seams {
+            spawner: Box::new(awake::RefusingSpawner),
+            secrets: Arc::new(secrets::MemoryStore::new()),
+            catalogs: Some(FetchedCatalogs::default()),
+        }
+    }
+
+    pub fn with_spawner(mut self, spawner: Box<dyn LockSpawner>) -> Seams {
+        self.spawner = spawner;
+        self
+    }
+
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Seams {
+        self.secrets = secrets;
+        self
+    }
+
+    pub fn with_catalogs(mut self, catalogs: FetchedCatalogs) -> Seams {
+        self.catalogs = Some(catalogs);
+        self
+    }
 }
 
 /// The upstream client: a connect timeout and the between-reads idle
@@ -294,108 +339,28 @@ pub struct Server {
 }
 
 impl Server {
-    /// Build the server: resolve the provider credentials once, validate
-    /// the routing table, build the upstream client, and arm the
-    /// idle-sleep lock over this host's platform command.
+    /// Build the production server: this host's keyring, idle-sleep lock and
+    /// cached model catalogues. Tests never come through here; they use
+    /// [`Server::with_seams`] with [`Seams::isolated`], so the host's state
+    /// cannot leak into a fixture.
     pub fn new(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
-        Self::with_awake_spawner(config, store, Box::new(awake::ProcessSpawner))
+        Self::with_seams(config, store, Seams::host())
     }
 
-    pub fn new_authoritative(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
-            Box::new(awake::ProcessSpawner),
-            Arc::new(OsKeyring),
-            Arc::new(TracingObserver),
-            RoutingOwnership::Policy,
-            None,
-        )
-    }
-
-    /// Build an authoritative server with an explicit initial fetched-model
-    /// catalogue snapshot. The normal constructor keeps loading the host's
-    /// cached catalogues; this seam lets embedders and integration tests make
-    /// their startup inventory deterministic.
-    pub fn new_authoritative_with_catalogs(
-        config: Config,
-        store: Arc<Store>,
-        catalogs: FetchedCatalogs,
-    ) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
-            Box::new(awake::ProcessSpawner),
-            Arc::new(OsKeyring),
-            Arc::new(TracingObserver),
-            RoutingOwnership::Policy,
-            Some(catalogs),
-        )
-    }
-
-    /// [`Server::new`], with the sleep-lock spawner injected. The real
-    /// spawner takes a REAL idle-sleep lock via systemd-inhibit /
-    /// gnome-session-inhibit, so tests inject a fake through here and
-    /// never arm a real inhibitor on the host they run on.
-    pub fn with_awake_spawner(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-    ) -> anyhow::Result<Server> {
-        Self::with_seams(config, store, spawner, Arc::new(OsKeyring))
-    }
-
-    /// [`Server::with_awake_spawner`], with the keyring injected too: the
-    /// stored API keys are read from it here, once, in the service — the
-    /// only process that ever reads the keyring. Tests pass a
-    /// [`crate::secrets::MemoryStore`] and never touch the real one.
-    pub fn with_seams(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-    ) -> anyhow::Result<Server> {
-        Self::with_shadow_observer(config, store, spawner, secrets, Arc::new(TracingObserver))
-    }
-
-    /// [`Server::with_seams`], with the read-only shadow observer injected.
-    /// The observer is one-way and cannot affect a handler result.
-    pub fn with_shadow_observer(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-        shadow_observer: Arc<dyn ShadowObserver>,
-    ) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
+    /// Build the server: resolve the provider credentials once, validate
+    /// the routing table, build the upstream client, arm the idle-sleep
+    /// lock, and take the active routing revision, establishing revision one
+    /// from the config's routing fields when the ledger has none. Every
+    /// server routes by policy; there is no other mode.
+    pub fn with_seams(config: Config, store: Arc<Store>, seams: Seams) -> anyhow::Result<Server> {
+        let Seams {
             spawner,
             secrets,
-            shadow_observer,
-            RoutingOwnership::LegacyShadow,
-            None,
-        )
-    }
-
-    fn with_routing_ownership(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-        shadow_observer: Arc<dyn ShadowObserver>,
-        routing_ownership: RoutingOwnership,
-        initial_catalogs: Option<FetchedCatalogs>,
-    ) -> anyhow::Result<Server> {
-        // The config's own validation, again: a Config built by hand (the
-        // tests, any embedder) must not reach the registry with a default
-        // that names a disabled backend. Under policy ownership the legacy
-        // defaults are not routing input, so only establishing revision one
-        // from them checks them.
-        match routing_ownership {
-            RoutingOwnership::LegacyShadow => config.validate()?,
-            RoutingOwnership::Policy => config.validate_retained()?,
-        }
+            catalogs: initial_catalogs,
+        } = seams;
+        // The legacy routing fields are only input to establishing revision
+        // one, which validates them itself.
+        config.validate_retained()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
@@ -501,86 +466,47 @@ impl Server {
             store.clone(),
             &seed,
         ));
-        let (initial_catalogs, initial_catalog_dir) = match routing_ownership {
-            RoutingOwnership::LegacyShadow => (FetchedCatalogs::default(), None),
-            RoutingOwnership::Policy => match initial_catalogs {
-                Some(catalogs) => (catalogs, None),
-                None => {
-                    let cache_dir = fetched::cache_dir().ok();
-                    let catalogs = cache_dir
-                        .as_deref()
-                        .map(fetched::load_cached)
-                        .unwrap_or_default();
-                    (catalogs, cache_dir)
-                }
-            },
+        let (initial_catalogs, initial_catalog_dir) = match initial_catalogs {
+            Some(catalogs) => (catalogs, None),
+            None => {
+                let cache_dir = fetched::cache_dir().ok();
+                let catalogs = cache_dir
+                    .as_deref()
+                    .map(fetched::load_cached)
+                    .unwrap_or_default();
+                (catalogs, cache_dir)
+            }
         };
         let inventory = offers::inventory(&registry, &initial_catalogs);
         let availability = Arc::new(availability_for(&registry, &initial_catalogs));
-        let (policy_runtime, policy_shadow) = match routing_ownership {
-            RoutingOwnership::LegacyShadow => {
-                let policy_runtime = match crate::policy::legacy::compile(
-                    &config, &registry, &inventory,
-                )
-                .and_then(|compilation| {
-                    compilation
-                        .into_policy()
-                        .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
-                }) {
-                    Ok(policy) => Some(Arc::new(crate::policy::PolicyRuntime::new(
-                        store.clone(),
-                        registry.clone(),
-                        Arc::new(policy),
-                        Arc::new(inventory),
-                        availability,
-                    ))),
-                    Err(error) => {
-                        tracing::warn!(code = "policy-shadow-startup-disabled", %error);
-                        None
-                    }
-                };
-                let policy_shadow = policy_runtime.as_ref().map(|runtime| {
-                    Arc::new(PolicyShadow::new(
-                        runtime.clone(),
-                        Arc::new(LegacyLearningView::new(models.clone())),
-                        shadow_observer,
-                    ))
-                });
-                (policy_runtime, policy_shadow)
+        let publication_generation = fetched::snapshot_generation(&initial_catalogs);
+        let state = store.load_routing_policy_state()?;
+        let (revision, policy) = match state.active_revision_id {
+            Some(revision_id) => {
+                let revision = store.load_policy_revision(revision_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("active policy revision {revision_id} is missing")
+                })?;
+                let policy = compile_stored_policy(&revision, &registry, &inventory)?;
+                (revision, policy)
             }
-            RoutingOwnership::Policy => {
-                let publication_generation = fetched::snapshot_generation(&initial_catalogs);
-                let state = store.load_routing_policy_state()?;
-                let (revision, policy) = match state.active_revision_id {
-                    Some(revision_id) => {
-                        let revision =
-                            store.load_policy_revision(revision_id)?.ok_or_else(|| {
-                                anyhow::anyhow!("active policy revision {revision_id} is missing")
-                            })?;
-                        let policy = compile_stored_policy(&revision, &registry, &inventory)?;
-                        (revision, policy)
-                    }
-                    None => crate::policy::legacy::establish_revision_one(
-                        &store,
-                        &config,
-                        &registry,
-                        &inventory,
-                        publication_generation,
-                        now_ms(),
-                    )?,
-                };
-                let runtime = crate::policy::PolicyRuntime::new_active_at_generation(
-                    store.clone(),
-                    registry.clone(),
-                    &revision,
-                    Arc::new(policy),
-                    Arc::new(inventory),
-                    availability,
-                    0,
-                );
-                (Some(Arc::new(runtime)), None)
-            }
+            None => crate::policy::legacy::establish_revision_one(
+                &store,
+                &config,
+                &registry,
+                &inventory,
+                publication_generation,
+                now_ms(),
+            )?,
         };
+        let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new_active_at_generation(
+            store.clone(),
+            registry.clone(),
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            availability,
+            0,
+        ));
         let catalog_dir = Arc::new(std::sync::OnceLock::new());
         if let Some(initial_catalog_dir) = initial_catalog_dir {
             let _ = catalog_dir.set(initial_catalog_dir);
@@ -605,8 +531,8 @@ impl Server {
             force: Arc::default(),
             quota_events: Arc::default(),
             routing_control: Arc::default(),
-            policy_runtime,
-            policy_shadow,
+            policy_runtime: Some(policy_runtime),
+            policy_shadow: None,
         })
     }
 
@@ -2982,7 +2908,7 @@ fn anthropic_catalog_source(
 
 #[cfg(test)]
 mod tests {
-    use super::Server;
+    use super::{Seams, Server};
     use crate::config::Config;
     use crate::routing::ProtocolId;
     use crate::store::Store;
@@ -3030,7 +2956,7 @@ version_probe = false
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        Server::new(config, store).expect("server builds")
+        Server::with_seams(config, store, Seams::isolated()).expect("server builds")
     }
 
     #[test]
@@ -3052,7 +2978,7 @@ api_key = "sk-test"
         let mut config = Config::load_from(&path).unwrap();
         config.db_path = dir.join("toker.db");
         let store = Arc::new(Store::open(&config.db_path).unwrap());
-        let first = Server::new_authoritative(config.clone(), store.clone()).unwrap();
+        let first = Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
         let first_revision = first
             .policy_runtime
             .as_ref()
@@ -3078,7 +3004,7 @@ api_key = "sk-test"
         );
 
         config.gates.force_newest = !config.gates.force_newest;
-        let restarted = Server::new_authoritative(config, store.clone()).unwrap();
+        let restarted = Server::with_seams(config, store.clone(), Seams::isolated()).unwrap();
         assert_eq!(
             restarted
                 .policy_runtime
@@ -3098,14 +3024,14 @@ api_key = "sk-test"
         let mut config = Config::load_from(&path).unwrap();
         config.db_path = dir.join("toker.db");
         let store = Arc::new(Store::open(&config.db_path).unwrap());
-        Server::new_authoritative(config.clone(), store.clone()).unwrap();
+        Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
         store
             .execute_for_test(
                 "PRAGMA ignore_check_constraints = ON;
                  UPDATE routing_policy_revisions SET document_json = '{' WHERE revision_id = 1;",
             )
             .unwrap();
-        let error = Server::new_authoritative(config, store)
+        let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
         assert!(
@@ -3129,7 +3055,7 @@ api_key = "sk-test"
         let config = (*server.config).clone();
         let store = server.store.clone();
         drop(server);
-        let error = Server::new_authoritative(config, store)
+        let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
         assert!(
@@ -3318,7 +3244,8 @@ api_key = "sk-ant-test"
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server = Server::new(config, store.clone()).expect("server builds");
+        let mut server =
+            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
         let mut document = crate::policy::legacy::document(&server.config, &server.registry)
             .expect("legacy document");
         let route_id =
@@ -3446,7 +3373,8 @@ api_key = "sk-proj-test"
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server = Server::new(config, store.clone()).expect("server builds");
+        let mut server =
+            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
         let mut document = crate::policy::legacy::document(&server.config, &server.registry)
             .expect("legacy document");
         let openai_route =

@@ -28,7 +28,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let config = Config::load()?;
     let store = Arc::new(Store::open(&config.db_path)?);
     tracing::info!(db = %config.db_path.display(), "serving");
-    Server::new_authoritative(config, store)?.serve().await
+    Server::new(config, store)?.serve().await
 }
 
 /// `setup`: the interactive wizard (plan: "Setup wizard") — the ONLY

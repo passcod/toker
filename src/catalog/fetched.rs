@@ -259,6 +259,31 @@ impl FetchedCatalogs {
         self.by_source.retain(|source, _| sources.contains(source));
     }
 
+    /// Catalogues that list exactly these model ids per source, with no
+    /// windows or prices: presence and nothing else. What an embedder or a
+    /// test hands the server to make its startup inventory deterministic.
+    pub fn listing<'a>(sources: impl IntoIterator<Item = (&'static str, &'a [&'a str])>) -> Self {
+        let mut catalogs = Self::default();
+        for (source, ids) in sources {
+            catalogs.set(
+                source,
+                FetchedCatalog {
+                    fetched_at_ms: 1,
+                    models: ids
+                        .iter()
+                        .map(|id| FetchedModel {
+                            id: (*id).to_owned(),
+                            context_window: None,
+                            chronology: None,
+                            raw: json!({ "id": id }),
+                        })
+                        .collect(),
+                },
+            );
+        }
+        catalogs
+    }
+
     /// Replace (or first install) one source's catalogue.
     pub fn set(&mut self, source: &'static str, catalog: FetchedCatalog) {
         self.by_source.insert(source, catalog);

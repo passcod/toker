@@ -139,7 +139,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
 async fn spawn_toker(upstream: reqwest::Url) -> (SocketAddr, Arc<Store>) {
     let config = test_config(upstream);
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

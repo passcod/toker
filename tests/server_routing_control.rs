@@ -43,7 +43,8 @@ fn server() -> (Server, Arc<Store>) {
     let config = config();
     let store = Arc::new(Store::open(&config.db_path).unwrap());
     (
-        Server::new_authoritative(config, store.clone()).expect("authoritative server"),
+        Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+            .expect("authoritative server"),
         store,
     )
 }

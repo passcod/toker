@@ -252,14 +252,8 @@ async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
 async fn spawn_toker_observed(config: Config) -> (SocketAddr, Arc<Store>, Arc<CollectingObserver>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     let observer = Arc::new(CollectingObserver::default());
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer.clone(),
-    )
-    .expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -281,7 +275,8 @@ async fn spawn_toker_cataloged(
     catalog: toker::catalog::FetchedCatalog,
 ) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     server.install_catalog(source, catalog);
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

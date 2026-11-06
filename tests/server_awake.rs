@@ -278,9 +278,12 @@ async fn spawn_toker_idle(
 ) -> (SocketAddr, Arc<Store>, AwakeProbe) {
     let probe = AwakeProbe::default();
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let mut server =
-        Server::with_awake_spawner(config, store.clone(), Box::new(ProbeSpawner(probe.clone())))
-            .expect("build server");
+    let mut server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_spawner(Box::new(ProbeSpawner(probe.clone()))),
+    )
+    .expect("build server");
     if let Some(idle) = idle {
         server
             .set_upstream_idle_timeout(idle)
