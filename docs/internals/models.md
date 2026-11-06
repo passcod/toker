@@ -18,18 +18,19 @@ is two models for every question asked here (served days, largest prompt, cache,
 price), and an observation on one must not license a move onto the other.
 
 `learned_models_by_binding` is keyed by binding and exact model id and holds the
-distinct local days the model was served, the largest prompt seen, an optional
-declared context window, and the `explicitly_promoted` bit. A completed response
+distinct local days the model was served, the largest prompt seen, and the
+`explicitly_promoted` bit. A completed response
 merges its observation in (`BindingLearningView::note_observed`, which calls
 `Store::merge_binding_learning`): the day is added to the set, the prompt size
 keeps the maximum, and the promotion bit, once set, stays. The identity is the
 provider-reported one, exactly as the response named it (`raw_model`), never
 what was asked for. A response that names no model teaches nothing.
 
-Nothing rebuilds this table from history. Ledger rows from before policy routing
-carry no binding, so there is nothing to attribute them to, and a row imported
-from ctp has none either. A machine that moved to policy routing therefore
-starts with empty learning. That is cheap because of the scaled bar below: it
+Nothing rebuilds this table from history, and the older `models` table is not
+imported into it. Ledger rows from before policy routing carry no binding, so
+there is nothing to attribute them to, and a row imported from ctp has none
+either. A machine that moved to policy routing therefore starts with empty
+learning. That is cheap because of the scaled bar below: it
 accepts what is present on day one, and tightens as days accumulate.
 
 The older `models` table, which was keyed by model alone, is no longer written
@@ -159,8 +160,7 @@ all over again.
   (`fits_context`) it is the routed binding's fetched models listing, looked up
   by the identity the upgrade would send. When the listing names a window it
   decides, both ways: a prompt over it declines whatever was learned, and a
-  prompt within it fits whatever was not. A stored declaration on the learned
-  record comes next.
+  prompt within it fits whatever was not.
 - `max_prompt` is the largest prompt toker has actually watched that model serve
   on that binding. It decides a fit only when no window is named at all, and
   there an unproven model declines, which costs an upgrade where the alternative
@@ -223,8 +223,7 @@ identity it is inferred; otherwise `--binding <provider>.<dialect>` is required.
 The CLI also checks the model against the active revision's upgrade policies,
 refusing one that none classifies or that several do, and has a `--dry-run`.
 All of them refuse a pair that has never been served and change only the sticky
-bit: observed days, prompt ceilings and context declarations remain provider
-evidence.
+bit: observed days and prompt ceilings remain provider evidence.
 
 The CLI writes the ledger directly and does not talk to the running service. The
 control operation also refreshes the service's published learning snapshot.

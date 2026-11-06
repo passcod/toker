@@ -39,12 +39,11 @@ pub use ledger::{
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
-    BindingLearningReplay, BindingLearningUpdate, DraftCasResult, InitialPublication, Lane,
-    LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
-    PingRecord, PolicyCompilerOrigin, PolicyDraft, PolicyRevision, PolicyRevisionSource,
-    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication, local_day,
-    publication_targets,
+    BindingLearningUpdate, DraftCasResult, InitialPublication, Lane, LanePin, LanePinCasResult,
+    MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord, PolicyCompilerOrigin,
+    PolicyDraft, PolicyRevision, PolicyRevisionSource, PublicationAdapter, PublicationCasResult,
+    PublicationKey, PublicationResultUpdate, PublicationState, RevisionOneActivation,
+    RoutingPolicyState, RoutingPublication, local_day, publication_targets,
 };
 
 use std::env;
@@ -572,15 +571,6 @@ impl Store {
         state::merge_binding_learning(&mut *self.conn()?, update)
     }
 
-    /// Idempotently merge learning from ledger rows whose binding attribution
-    /// and provider-reported model are both explicit.
-    pub fn replay_attributable_binding_learning(
-        &self,
-        local_time_zone: &jiff::tz::TimeZone,
-    ) -> Result<BindingLearningReplay> {
-        state::replay_attributable_binding_learning(&mut *self.conn()?, local_time_zone)
-    }
-
     pub fn promote_binding_learning(
         &self,
         binding_id: &crate::policy::BindingId,
@@ -774,7 +764,6 @@ mod tests {
         SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
         StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
     };
-    use crate::catalog::DeclaredWindow;
     use crate::ir::Release;
     use crate::policy::{
         ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateEvidence, CandidateId,
@@ -3395,62 +3384,39 @@ mod tests {
     }
 
     #[test]
-    fn binding_learning_merge_unions_maxes_replaces_and_promotes() {
+    fn binding_learning_merge_unions_maxes_and_promotes() {
         let store = mem_store();
         let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
         let update =
-            |days: &[&str], max_prompt, context_window, explicitly_promoted, updated_ms| {
-                BindingLearningUpdate {
-                    binding_id: binding.clone(),
-                    model_id: "model-x".to_owned(),
-                    days: days
-                        .iter()
-                        .map(|day| (*day).to_owned())
-                        .collect::<BTreeSet<_>>(),
-                    max_prompt,
-                    context_window,
-                    explicitly_promoted,
-                    updated_ms,
-                }
+            |days: &[&str], max_prompt, explicitly_promoted, updated_ms| BindingLearningUpdate {
+                binding_id: binding.clone(),
+                model_id: "model-x".to_owned(),
+                days: days
+                    .iter()
+                    .map(|day| (*day).to_owned())
+                    .collect::<BTreeSet<_>>(),
+                max_prompt,
+                explicitly_promoted,
+                updated_ms,
             };
         store
-            .merge_binding_learning(&update(
-                &["2026-10-02"],
-                Some(100),
-                DeclaredWindow::new(100, 200),
-                false,
-                20,
-            ))
+            .merge_binding_learning(&update(&["2026-10-02"], Some(100), false, 20))
             .unwrap();
-        let stored: String = store
-            .conn()
-            .unwrap()
-            .query_row(
-                "SELECT context_window_json FROM learned_models_by_binding",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, r#"{"default":100,"max":200}"#);
         let merged = store
-            .merge_binding_learning(&update(&["2026-10-01"], Some(50), None, true, 10))
+            .merge_binding_learning(&update(&["2026-10-01"], Some(50), true, 10))
             .unwrap();
         assert_eq!(
             merged.days.into_iter().collect::<Vec<_>>(),
             ["2026-10-01", "2026-10-02"]
         );
         assert_eq!(merged.max_prompt, Some(100));
-        assert_eq!(merged.context_window, DeclaredWindow::new(100, 200));
         assert!(merged.explicitly_promoted);
         assert_eq!(merged.updated_ms, 20);
-        let replaced = store
-            .merge_binding_learning(&update(&[], None, DeclaredWindow::new(200, 300), false, 30))
+        let later = store
+            .merge_binding_learning(&update(&[], Some(300), false, 30))
             .unwrap();
-        assert_eq!(replaced.context_window, DeclaredWindow::new(200, 300));
-        assert_eq!(
-            store.load_binding_learnings(&binding).unwrap(),
-            vec![replaced]
-        );
+        assert_eq!(later.max_prompt, Some(300));
+        assert_eq!(store.load_binding_learnings(&binding).unwrap(), vec![later]);
     }
 
     #[test]
@@ -3465,7 +3431,6 @@ mod tests {
                     model_id: "same-model".to_owned(),
                     days: ["2026-10-01".to_owned()].into_iter().collect(),
                     max_prompt: Some(100),
-                    context_window: DeclaredWindow::new(100, 200),
                     explicitly_promoted: false,
                     updated_ms: 10,
                 })
@@ -3491,7 +3456,6 @@ mod tests {
             ["2026-10-01".to_owned()].into_iter().collect()
         );
         assert_eq!(promoted.max_prompt, Some(100));
-        assert_eq!(promoted.context_window, DeclaredWindow::new(100, 200));
         assert_eq!(promoted.updated_ms, 20);
         assert!(
             !store
@@ -3510,33 +3474,6 @@ mod tests {
             store.load_binding_learning(&first, "never-served").unwrap(),
             None,
         );
-    }
-
-    #[test]
-    fn binding_learning_errors_on_malformed_stored_declaration() {
-        let store = mem_store();
-        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-        store
-            .execute_for_test("PRAGMA ignore_check_constraints = ON;")
-            .unwrap();
-        for (model, value) in [
-            ("bad-json", "{"),
-            ("bad-shape", r#"{"default":200,"max":100}"#),
-            ("extra-field", r#"{"default":100,"max":200,"extra":1}"#),
-        ] {
-            store
-                .execute_for_test(&format!(
-                    "INSERT INTO learned_models_by_binding
-                     (binding_id, model_id, context_window_json, updated_ms)
-                     VALUES ('openrouter.openrouter_messages', '{model}',
-                             '{value}', 1);"
-                ))
-                .unwrap();
-            assert!(matches!(
-                store.load_binding_learning(&binding, model),
-                Err(Error::InvalidRoutingState(_))
-            ));
-        }
     }
 
     #[test]
@@ -4456,132 +4393,6 @@ mod tests {
         ));
     }
     #[test]
-    fn attributable_learning_replay_is_idempotent_and_skips_ambiguous_history() {
-        let store = mem_store();
-        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-        let mut attributable = bare_row(1_760_000_000_000);
-        attributable.provider = Some("openrouter".to_owned());
-        attributable.raw_model = Some("Model-X-20261001".to_owned());
-        attributable.binding_id = Some(binding.clone());
-        attributable.input = Some(40);
-        attributable.cache_read = Some(60);
-        store.record_request(&attributable).unwrap();
-
-        let mut ambiguous = attributable.clone();
-        ambiguous.ts_ms += 1;
-        ambiguous.raw_model = Some("model-ambiguous".to_owned());
-        ambiguous.binding_id = None;
-        store.record_request(&ambiguous).unwrap();
-
-        let first = store
-            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
-            .unwrap();
-        assert_eq!(first.attributable_rows, 1);
-        assert_eq!(first.merged_models, 1);
-        let learned = store
-            .load_binding_learning(&binding, "Model-X-20261001")
-            .unwrap()
-            .unwrap();
-        assert_eq!(learned.max_prompt, Some(100));
-        assert_eq!(
-            store
-                .load_binding_learning(&binding, "model-ambiguous")
-                .unwrap(),
-            None,
-        );
-        let second = store
-            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
-            .unwrap();
-        assert_eq!(second, first);
-        assert_eq!(
-            store
-                .load_binding_learning(&binding, "Model-X-20261001")
-                .unwrap()
-                .unwrap(),
-            learned,
-        );
-    }
-    #[test]
-    fn replay_preserves_unknown_prompt_and_sums_partial_buckets() {
-        let store = mem_store();
-        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-        let mut unknown = bare_row(1_760_000_000_000);
-        unknown.raw_model = Some("unknown-prompt".to_owned());
-        unknown.binding_id = Some(binding.clone());
-        store.record_request(&unknown).unwrap();
-        let mut partial = bare_row(1_760_086_400_000);
-        partial.raw_model = Some("partial-prompt".to_owned());
-        partial.binding_id = Some(binding.clone());
-        partial.input = Some(40);
-        partial.cache_write_total = Some(2);
-        store.record_request(&partial).unwrap();
-
-        store
-            .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
-            .unwrap();
-        let unknown = store
-            .load_binding_learning(&binding, "unknown-prompt")
-            .unwrap()
-            .unwrap();
-        assert_eq!(unknown.max_prompt, None);
-        assert_eq!(unknown.days.len(), 1, "the day is evidence without a bound");
-        let partial = store
-            .load_binding_learning(&binding, "partial-prompt")
-            .unwrap()
-            .unwrap();
-        assert_eq!(partial.max_prompt, Some(42));
-    }
-
-    #[test]
-    fn replay_bad_attributable_rows_name_the_row_and_roll_back() {
-        fn assert_bad(row: RequestRow, expected: &str) {
-            let store = mem_store();
-            let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-            store
-                .merge_binding_learning(&BindingLearningUpdate {
-                    binding_id: binding.clone(),
-                    model_id: "existing".to_owned(),
-                    days: ["2026-10-01".to_owned()].into_iter().collect(),
-                    max_prompt: Some(10),
-                    context_window: None,
-                    explicitly_promoted: false,
-                    updated_ms: 1,
-                })
-                .unwrap();
-            store.record_request(&row).unwrap();
-            let error = store
-                .replay_attributable_binding_learning(&jiff::tz::TimeZone::UTC)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("request row 1"), "{error}");
-            assert!(error.contains(expected), "{error}");
-            assert_eq!(
-                store.load_binding_learnings(&binding).unwrap().len(),
-                1,
-                "failed replay rolls back every merge",
-            );
-        }
-
-        let binding = BindingId::new("openrouter.openrouter_messages").unwrap();
-        let mut blank = bare_row(1_760_000_000_000);
-        blank.binding_id = Some(binding.clone());
-        blank.raw_model = Some("   ".to_owned());
-        assert_bad(blank, "blank raw_model");
-
-        let mut timestamp = bare_row(i64::MAX);
-        timestamp.binding_id = Some(binding.clone());
-        timestamp.raw_model = Some("model".to_owned());
-        assert_bad(timestamp, "unrepresentable ts_ms");
-
-        let mut overflow = bare_row(1_760_000_000_000);
-        overflow.binding_id = Some(binding);
-        overflow.raw_model = Some("model".to_owned());
-        overflow.input = Some(i64::MAX);
-        overflow.cache_read = Some(1);
-        assert_bad(overflow, "overflow i64");
-    }
-
-    #[test]
     fn binding_learning_merge_is_atomic_across_store_connections() {
         let dir = test_dir("learning-atomic");
         let db = dir.join("toker.db");
@@ -4598,7 +4409,6 @@ mod tests {
                 model_id: "model".to_owned(),
                 days: ["2026-10-01".to_owned()].into_iter().collect(),
                 max_prompt: Some(100),
-                context_window: DeclaredWindow::new(100, 200),
                 explicitly_promoted: true,
                 updated_ms: 20,
             })
@@ -4611,7 +4421,6 @@ mod tests {
                 model_id: "model".to_owned(),
                 days: ["2026-10-02".to_owned()].into_iter().collect(),
                 max_prompt: Some(50),
-                context_window: None,
                 explicitly_promoted: false,
                 updated_ms: 10,
             })
@@ -4628,7 +4437,6 @@ mod tests {
             ["2026-10-01", "2026-10-02"]
         );
         assert_eq!(merged.max_prompt, Some(100));
-        assert_eq!(merged.context_window, DeclaredWindow::new(100, 200));
         assert!(merged.explicitly_promoted);
         assert_eq!(merged.updated_ms, 20);
     }

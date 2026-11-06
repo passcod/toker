@@ -324,7 +324,6 @@ fn learn(store: &Store, binding: &BackendBinding, model_id: &str, max_prompt: i6
             model_id: model_id.to_owned(),
             days: D.iter().map(|day| (*day).to_owned()).collect(),
             max_prompt: Some(max_prompt),
-            context_window: None,
             explicitly_promoted: false,
             updated_ms: 1,
         })

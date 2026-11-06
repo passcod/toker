@@ -12,7 +12,6 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use crate::catalog::DeclaredWindow;
 use crate::ir::Release;
 use crate::policy::{
     ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
@@ -387,28 +386,19 @@ pub struct BindingLearning {
     pub model_id: String,
     pub days: BTreeSet<String>,
     pub max_prompt: Option<i64>,
-    pub context_window: Option<DeclaredWindow>,
     pub explicitly_promoted: bool,
     pub updated_ms: i64,
 }
 
-/// Merge input. `context_window` replaces stored context only when supplied.
+/// Merge input.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingLearningUpdate {
     pub binding_id: BindingId,
     pub model_id: String,
     pub days: BTreeSet<String>,
     pub max_prompt: Option<i64>,
-    pub context_window: Option<DeclaredWindow>,
     pub explicitly_promoted: bool,
     pub updated_ms: i64,
-}
-
-/// Summary of one idempotent replay from attributable request rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BindingLearningReplay {
-    pub attributable_rows: u64,
-    pub merged_models: u64,
 }
 
 /// One learned-model row: days served and max prompt observed for an exact
@@ -1657,9 +1647,6 @@ fn merge_binding_learning_in_transaction(
         (Some(a), Some(b)) => Some(a.max(b)),
         (some, None) | (None, some) => some,
     };
-    let context_window = update
-        .context_window
-        .or_else(|| existing.as_ref().and_then(|v| v.context_window));
     let explicitly_promoted =
         update.explicitly_promoted || existing.as_ref().is_some_and(|v| v.explicitly_promoted);
     let updated_ms = existing
@@ -1670,25 +1657,18 @@ fn merge_binding_learning_in_transaction(
     } else {
         Some(serde_json::to_string(&days.iter().collect::<Vec<_>>())?)
     };
-    let context_json = match context_window {
-        Some(value) => Some(serde_json::to_string(&value)?),
-        None => None,
-    };
     conn.execute(
         "INSERT INTO learned_models_by_binding
-         (binding_id, model_id, days_json, max_prompt, context_window_json,
-          explicitly_promoted, updated_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         (binding_id, model_id, days_json, max_prompt, explicitly_promoted, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(binding_id, model_id) DO UPDATE SET
            days_json = excluded.days_json, max_prompt = excluded.max_prompt,
-           context_window_json = excluded.context_window_json,
            explicitly_promoted = excluded.explicitly_promoted, updated_ms = excluded.updated_ms",
         rusqlite::params![
             update.binding_id.as_str(),
             update.model_id,
             days_json,
             max_prompt,
-            context_json,
             explicitly_promoted,
             updated_ms
         ],
@@ -1698,127 +1678,8 @@ fn merge_binding_learning_in_transaction(
         model_id: update.model_id.clone(),
         days,
         max_prompt,
-        context_window,
         explicitly_promoted,
         updated_ms,
-    })
-}
-
-/// Replay only rows that already carry an exact binding and provider-reported
-/// model identity. Provider-only and legacy model rows remain unattributable
-/// and are deliberately ignored rather than copied into every possible binding.
-pub(super) fn replay_attributable_binding_learning(
-    conn: &mut Connection,
-    local_time_zone: &jiff::tz::TimeZone,
-) -> Result<BindingLearningReplay> {
-    struct Observation {
-        row_id: i64,
-        binding: String,
-        model: String,
-        ts_ms: i64,
-        buckets: [Option<i64>; 3],
-    }
-
-    struct Accumulated {
-        days: BTreeSet<String>,
-        max_prompt: Option<i64>,
-        updated_ms: i64,
-    }
-
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let observations = rows_of(
-        &tx,
-        "SELECT id, binding_id, raw_model, ts_ms, input, cache_read, cache_write_total
-         FROM requests
-         WHERE kind IS NULL AND binding_id IS NOT NULL AND raw_model IS NOT NULL
-         ORDER BY id",
-        [],
-        |row| {
-            Ok(Observation {
-                row_id: row.get("id")?,
-                binding: row.get("binding_id")?,
-                model: row.get("raw_model")?,
-                ts_ms: row.get("ts_ms")?,
-                buckets: [
-                    row.get("input")?,
-                    row.get("cache_read")?,
-                    row.get("cache_write_total")?,
-                ],
-            })
-        },
-    )?;
-    let attributable_rows = observations.len() as u64;
-    let mut merged: std::collections::BTreeMap<(BindingId, String), Accumulated> =
-        std::collections::BTreeMap::new();
-    for observation in observations {
-        let binding: BindingId = observation.binding.parse().map_err(|error| {
-            Error::InvalidRoutingState(format!(
-                "request row {} has invalid binding_id {:?}: {error}",
-                observation.row_id, observation.binding
-            ))
-        })?;
-        let model = (!observation.model.trim().is_empty())
-            .then_some(observation.model)
-            .ok_or_else(|| {
-                Error::InvalidRoutingState(format!(
-                    "request row {} has blank raw_model",
-                    observation.row_id
-                ))
-            })?;
-        let day = local_day(observation.ts_ms, local_time_zone).ok_or_else(|| {
-            Error::InvalidRoutingState(format!(
-                "request row {} has unrepresentable ts_ms {}",
-                observation.row_id, observation.ts_ms
-            ))
-        })?;
-        let held = if observation.buckets.iter().all(Option::is_none) {
-            None
-        } else {
-            Some(
-                observation
-                    .buckets
-                    .into_iter()
-                    .flatten()
-                    .try_fold(0_i64, i64::checked_add)
-                    .ok_or_else(|| {
-                        Error::InvalidRoutingState(format!(
-                            "request row {} token buckets overflow i64",
-                            observation.row_id
-                        ))
-                    })?,
-            )
-        };
-        let entry = merged
-            .entry((binding, model))
-            .or_insert_with(|| Accumulated {
-                days: BTreeSet::new(),
-                max_prompt: None,
-                updated_ms: observation.ts_ms,
-            });
-        entry.days.insert(day);
-        if let Some(held) = held {
-            entry.max_prompt = Some(entry.max_prompt.map_or(held, |prior| prior.max(held)));
-        }
-        entry.updated_ms = entry.updated_ms.max(observation.ts_ms);
-    }
-    for ((binding_id, model_id), accumulated) in &merged {
-        merge_binding_learning_in_transaction(
-            &tx,
-            &BindingLearningUpdate {
-                binding_id: binding_id.clone(),
-                model_id: model_id.clone(),
-                days: accumulated.days.clone(),
-                max_prompt: accumulated.max_prompt,
-                context_window: None,
-                explicitly_promoted: false,
-                updated_ms: accumulated.updated_ms,
-            },
-        )?;
-    }
-    tx.commit()?;
-    Ok(BindingLearningReplay {
-        attributable_rows,
-        merged_models: merged.len() as u64,
     })
 }
 
@@ -1850,8 +1711,8 @@ pub(super) fn load_binding_learning(
 ) -> Result<Option<BindingLearning>> {
     row_of(
         conn,
-        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
-                explicitly_promoted, updated_ms
+        "SELECT binding_id, model_id, days_json, max_prompt, explicitly_promoted,
+                updated_ms
          FROM learned_models_by_binding WHERE binding_id = ?1 AND model_id = ?2",
         [binding_id.as_str(), model_id],
         read_binding_learning,
@@ -1864,8 +1725,8 @@ pub(super) fn load_binding_learnings_for_model(
 ) -> Result<Vec<BindingLearning>> {
     rows_of(
         conn,
-        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
-                explicitly_promoted, updated_ms
+        "SELECT binding_id, model_id, days_json, max_prompt, explicitly_promoted,
+                updated_ms
          FROM learned_models_by_binding WHERE model_id = ?1 ORDER BY binding_id",
         [model_id],
         read_binding_learning,
@@ -1875,8 +1736,8 @@ pub(super) fn load_binding_learnings_for_model(
 pub(super) fn load_all_binding_learnings(conn: &Connection) -> Result<Vec<BindingLearning>> {
     rows_of(
         conn,
-        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
-                explicitly_promoted, updated_ms
+        "SELECT binding_id, model_id, days_json, max_prompt, explicitly_promoted,
+                updated_ms
          FROM learned_models_by_binding ORDER BY binding_id, model_id",
         [],
         read_binding_learning,
@@ -1889,8 +1750,8 @@ pub(super) fn load_binding_learnings(
 ) -> Result<Vec<BindingLearning>> {
     rows_of(
         conn,
-        "SELECT binding_id, model_id, days_json, max_prompt, context_window_json,
-                explicitly_promoted, updated_ms
+        "SELECT binding_id, model_id, days_json, max_prompt, explicitly_promoted,
+                updated_ms
          FROM learned_models_by_binding WHERE binding_id = ?1 ORDER BY model_id",
         [binding_id.as_str()],
         read_binding_learning,
@@ -1914,12 +1775,6 @@ fn read_binding_learning(row: &rusqlite::Row<'_>) -> Result<BindingLearning> {
             set
         }
     };
-    let context_window = match row.get::<_, Option<String>>("context_window_json")? {
-        None => None,
-        Some(json) => Some(serde_json::from_str::<DeclaredWindow>(&json).map_err(|_| {
-            Error::InvalidRoutingState("stored learned context window is invalid".into())
-        })?),
-    };
     let max_prompt: Option<i64> = row.get("max_prompt")?;
     if max_prompt.is_some_and(|value: i64| value < 0) {
         return Err(Error::InvalidRoutingState(
@@ -1934,7 +1789,6 @@ fn read_binding_learning(row: &rusqlite::Row<'_>) -> Result<BindingLearning> {
         model_id: row.get("model_id")?,
         days,
         max_prompt,
-        context_window,
         explicitly_promoted: row.get("explicitly_promoted")?,
         updated_ms: row.get("updated_ms")?,
     })

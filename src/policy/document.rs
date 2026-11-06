@@ -1019,6 +1019,10 @@ pub struct UpgradePolicy {
     #[serde(default)]
     pub inventory_sources: Vec<InventorySource>,
     pub lane_transition: LaneTransitionPolicy,
+    /// Nothing reads this and revision one no longer sets it. It stays so a
+    /// stored revision one that carries it still decodes and keeps the
+    /// fingerprint it was activated under; the compiler refuses it from an
+    /// authored document.
     #[serde(default)]
     pub allow_revision_one_legacy_learning: bool,
 }

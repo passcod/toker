@@ -1662,12 +1662,7 @@ fn fits_context<L: LearningView>(
     Ok(learning
         .learned(binding, model)
         .map_err(|_| ResolveFailure::LearningUnavailable)?
-        .and_then(|evidence| {
-            evidence
-                .declared_window()
-                .map(|window| window.max_tokens())
-                .or_else(|| evidence.max_prompt())
-        })
+        .and_then(|evidence| evidence.max_prompt())
         .is_some_and(|max| prompt <= max))
 }
 
@@ -1736,7 +1731,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::catalog::DeclaredWindow;
     use crate::catalog::offers::{BackendOffer, OfferInventory};
     use crate::policy::*;
     use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, RouteRegistry};
@@ -1953,7 +1947,6 @@ mod tests {
         LearnedEvidence::new(
             (0..days).map(|day| format!("2026-10-{day:02}")).collect(),
             Some(max_prompt),
-            None,
             false,
         )
     }
@@ -2136,7 +2129,6 @@ mod tests {
                 model_id: "claude-opus-5".to_owned(),
                 days: Default::default(),
                 max_prompt: Some(100),
-                context_window: None,
                 explicitly_promoted: true,
                 updated_ms: 1,
             })
@@ -2166,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn context_fit_prefers_inventory_then_declaration_then_empirical_maximum() {
+    fn context_fit_prefers_inventory_then_empirical_maximum() {
         let store = Arc::new(Store::open(":memory:").unwrap());
         store
             .merge_binding_learning(&crate::store::BindingLearningUpdate {
@@ -2174,7 +2166,6 @@ mod tests {
                 model_id: "model".to_owned(),
                 days: Default::default(),
                 max_prompt: Some(300),
-                context_window: DeclaredWindow::new(100, 200),
                 explicitly_promoted: false,
                 updated_ms: 1,
             })
@@ -2217,7 +2208,7 @@ mod tests {
                 &learning,
                 ANTHROPIC_SUB_MESSAGES.id(),
                 "model",
-                250,
+                350,
             )
             .unwrap()
         );
@@ -2232,7 +2223,6 @@ mod tests {
                 model_id: "same-model".to_owned(),
                 days: Default::default(),
                 max_prompt: Some(300),
-                context_window: None,
                 explicitly_promoted: false,
                 updated_ms: 1,
             })

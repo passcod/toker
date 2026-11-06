@@ -532,7 +532,6 @@ fn seed_sonnet(store: &Store) {
             .map(str::to_owned)
             .collect(),
             max_prompt: Some(1_000_000),
-            context_window: None,
             explicitly_promoted: false,
             updated_ms: 1,
         })

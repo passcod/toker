@@ -1084,7 +1084,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{PromoteOpts, promote_run};
-    use crate::catalog::DeclaredWindow;
     use crate::config::Config;
     use crate::policy::BindingId;
     use crate::store::{BindingLearningUpdate, ModelEntry, Store};
@@ -1127,7 +1126,6 @@ mod tests {
                 model_id: model_id.to_owned(),
                 days: BTreeSet::from(["2026-10-01".to_owned()]),
                 max_prompt: Some(123),
-                context_window: DeclaredWindow::new(100, 200),
                 explicitly_promoted: false,
                 updated_ms: 1,
             })
@@ -1171,7 +1169,6 @@ mod tests {
         assert!(learned.explicitly_promoted);
         assert_eq!(learned.days, BTreeSet::from(["2026-10-01".to_owned()]));
         assert_eq!(learned.max_prompt, Some(123));
-        assert_eq!(learned.context_window, DeclaredWindow::new(100, 200));
         assert_eq!(
             store
                 .load_model("claude-opus-5")

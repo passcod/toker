@@ -849,6 +849,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     CREATE INDEX lanes_session_idx ON lanes (session_id, updated_ms);
     "#,
+    // v17 — drop the declared context window from binding learning. Its only
+    // writer was the retired merge endpoint, so no production row carries one.
+    // The context-fit check reads the inventory window, then the largest
+    // prompt served.
+    r#"
+    ALTER TABLE learned_models_by_binding DROP COLUMN context_window_json;
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

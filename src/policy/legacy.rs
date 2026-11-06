@@ -240,7 +240,7 @@ impl<'a> LegacyBuilder<'a> {
                 allow_manual_promotion: true,
                 inventory_sources: vec![InventorySource::Learned, InventorySource::Served],
                 lane_transition: LaneTransitionPolicy::MoveWhenCold,
-                allow_revision_one_legacy_learning: true,
+                allow_revision_one_legacy_learning: false,
             });
         }
         Ok(())
@@ -837,7 +837,7 @@ mod tests {
                     .upgrades
                     .iter()
                     .all(|upgrade| upgrade.enabled == expected
-                        && upgrade.allow_revision_one_legacy_learning)
+                        && !upgrade.allow_revision_one_legacy_learning)
             );
             let compilation = compile(&config, &topology, &OfferInventory::default()).unwrap();
             let policy = compilation

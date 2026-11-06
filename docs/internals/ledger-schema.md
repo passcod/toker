@@ -326,8 +326,6 @@ prices.
 - `days_json`: the sorted set of local days (`YYYY-MM-DD`, in the machine's
   time zone when the response arrived) on which the binding served this model.
 - `max_prompt`: the largest prompt (input, cache read and cache write) seen.
-- `context_window_json`: a declared window, replaced only by a caller supplying
-  one; observation never writes it.
 - `explicitly_promoted`: set by `toker promote`, never cleared.
 - A merge unions days, takes the larger `max_prompt`, ORs the promotion and
   keeps the later `updated_ms`. NULL stays NULL.
@@ -341,11 +339,11 @@ send, and is rebuilt at startup from the newest 20,000 ledger rows that carry
 both `binding_id` and `effective_model`. `error` rows count, conservatively: a
 provider may have answered, and forgetting a send could lose a live cache.
 
-`Store::replay_attributable_binding_learning` can rebuild this table from rows
-with `kind` NULL and both `binding_id` and `raw_model`. The service does not
-call it; learning starts empty on a ledger that predates binding attribution and
-grows from live responses. Rows without a binding are deliberately not copied
-into every possible binding.
+Nothing rebuilds this table from earlier ledger rows: ones without a binding
+cannot be attributed to one, and are deliberately not copied into every possible
+binding. Learning starts empty on a ledger that predates binding attribution and
+grows from live responses. The model's declared window is not stored here; the
+context-fit check reads the offer inventory, then `max_prompt`.
 
 ### Lane pins
 
@@ -382,6 +380,7 @@ kind. Routing storage is v7 onwards, and each entry is there for a reason:
 | v14 | A publication that was `applied` before v13 has no ownership record, and treating unknown as empty would let the next reconciliation delete a user's row. It becomes `pending` with detail `legacy_applied_identities_unknown`, until the adapter applies again and records an exact set. |
 | v15 | `compiler_origin`. Existing revision-one lineage (revision one and reactivations descending from it) is marked `generated_revision_one`. |
 | v16 | `lanes_session_idx`. |
+| v17 | Drops `learned_models_by_binding.context_window_json`: nothing wrote it. |
 
 The ledger is insert-only, so a migration never rewrites a request row. Where a
 constraint is added to existing history (v10 and v12), the validation runs first

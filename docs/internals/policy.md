@@ -154,9 +154,11 @@ published snapshot aliases and reads the family split in `policy/family.rs`),
 the `legacy_hyphenated` classifier (the same split instead of an authored
 regex, because it was measured on real traffic and an unpublished dated id has
 no family), the `legacy_numeric_tuple` parser, the `revision_one_adaptive`
-learning bar, `allow_revision_one_legacy_learning`, and the legacy compaction
-target. The compiler refuses all of them from an authored document
-(`legacy-*-forbidden`). The origin is stored on each revision
+learning bar, and the legacy compaction target. The compiler refuses all of them
+from an authored document (`legacy-*-forbidden`), and also
+`allow_revision_one_legacy_learning`: a field nothing reads and revision one no
+longer sets, which stays in the document type only so a stored revision one that
+has it still decodes and keeps its fingerprint. The origin is stored on each revision
 (`compiler_origin`) and inherited: an edit of revision one, and a reactivation
 of it, keep compiling with the legacy semantics. A first activation also fills
 the draft with the new document and records `legacy_imported_ms`, so a ledger
