@@ -14,6 +14,12 @@ it (`cold::fit_quota_model`, `QuotaFit::quota_for`). ctp's `--quota` diagnostics
 surface (the worst window, the unattributed bound) is not ported, and there is
 no `toker report`.
 
+The fit reads each attempt's own row and only the rows of the backend whose
+meters it prices (`cold::outlook_over` filters on `provider`), never a group
+total. A request that failed over from the subscription to another provider
+therefore contributes the attempts the subscription served and nothing the other
+provider did; see [attempts.md](attempts.md).
+
 ## Two traps in fitting it
 
 Both were paid for in ctp:
