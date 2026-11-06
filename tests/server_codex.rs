@@ -33,6 +33,13 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
 use toker::middleware::model_map;
+use toker::policy::{
+    ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
+    CandidateEdge, CandidateId, CandidateModel, DefaultRoute, FailureClass, FallbackPermission,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
+    REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
+};
+use toker::routing::{ANTHROPIC_API_MESSAGES, CODEX_SUB_RESPONSES, OPENROUTER_RESPONSES};
 use toker::server::Server;
 use toker::store::{RequestRow, RowKind, Store};
 
@@ -204,6 +211,16 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
                 br#"{"error":{"type":"authentication_error","message":"bad token"}}"#,
             ),
         ),
+        "malformed-error" => raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(br#"{"unexpected":true}"#),
+        ),
+        "wrong-mode" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"id":"response_wrong_mode","status":"completed"}"#),
+        ),
         // The turn's opening events, then the connection dies (a reset
         // mid-turn) or closes cleanly before `response.completed`.
         "drop-mid" | "eof-mid" => {
@@ -237,6 +254,16 @@ async fn mock_responses(State(mock): State<MockState>, request: Request) -> Resp
             StatusCode::OK,
             "text/event-stream",
             fixture("03_failed.sse"),
+        ),
+        "failed-precommit" => raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                br#"event: response.failed
+data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"failed before acceptance"}}}
+
+"#,
+            ),
         ),
         other => {
             return raw_response(
@@ -297,6 +324,29 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
                 br#"{"type":"error","error":{"type":"authentication_error","message":"bad upstream key"}}"#,
             ),
         ),
+        "overloaded" => raw_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            Bytes::from_static(
+                br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+            ),
+        ),
+        "compressed" => {
+            let mut response = raw_response(
+                StatusCode::OK,
+                "application/json",
+                Bytes::from_static(br#"{"type":"message"}"#),
+            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            response
+        }
+        "malformed" => raw_response(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from_static(br#"{"type":"message"}"#),
+        ),
         "stream" | "failed" | "eof" => {
             let mut body = concat!(
                 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_api\",\"usage\":{\"input_tokens\":7}}}\n\n",
@@ -344,6 +394,35 @@ async fn mock_anthropic_messages(State(mock): State<MockState>, request: Request
     }
 }
 
+async fn mock_openrouter_chat(State(mock): State<MockState>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    mock.requests.lock().unwrap().push(CapturedRequest {
+        path: parts.uri.path().to_owned(),
+        headers: parts.headers,
+        body,
+    });
+    raw_response(
+        StatusCode::OK,
+        "application/json",
+        Bytes::from(
+            json!({
+                "id": "chatcmpl-final",
+                "object": "chat.completion",
+                "model": value["model"],
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            })
+            .to_string(),
+        ),
+    )
+}
+
 async fn mock_openrouter_responses(State(mock): State<MockState>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
     let body = axum::body::to_bytes(body, 64 * 1024 * 1024).await.unwrap();
@@ -369,6 +448,13 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
             Bytes::from_static(br#"{"error":{"code":400,"message":"invalid model"}}"#),
         );
     }
+    if value["model"] == "malformed-error" {
+        return raw_response(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            Bytes::from_static(br#"{"unexpected":true}"#),
+        );
+    }
     if value["model"] == "numeric-failed" {
         return raw_response(
             StatusCode::OK,
@@ -387,6 +473,17 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
 "#),
         );
     }
+    if value["model"] == "model-only" {
+        return raw_response(
+            StatusCode::OK,
+            "text/event-stream",
+            Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_model_only\",\"model\":\"reported-model-only\"}}\n\n\
+                  data: {\"type\":\"response.completed\",\"response\":{\"id\":\"gen_model_only\",\"end_turn\":true}}\n\n\
+                  data: [DONE]\n\n",
+            ),
+        );
+    }
     if value["model"] == "cut" {
         return raw_response(
             StatusCode::OK,
@@ -399,7 +496,7 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
         );
     }
     let mut body = concat!(
-        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"gen_test\",\"model\":\"OPENAI/GPT-4.1-MINI[1m]\",\"status\":\"in_progress\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n",
         "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"text\\\":\\\"hello\\\"}\"}\n\n",
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}}\n\n",
@@ -410,7 +507,7 @@ async fn mock_openrouter_responses(State(mock): State<MockState>, request: Reque
         "response.completed"
     };
     body.push_str(&format!(
-        "data: {{\"type\":\"{terminal}\",\"response\":{{\"id\":\"gen_test\",\"model\":\"openai/gpt-4.1-mini\",\"provider\":\"Example Router\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"input_tokens\":60,\"output_tokens\":6,\"total_tokens\":66,\"cost\":0.0000336}}}}}}\n\n"
+        "data: {{\"type\":\"{terminal}\",\"response\":{{\"id\":\"gen_test\",\"model\":\"OPENAI/GPT-4.1-MINI[1m]\",\"provider\":\"Example Router\",\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}},\"usage\":{{\"input_tokens\":60,\"output_tokens\":6,\"total_tokens\":66,\"cost\":0.0000336}}}}}}\n\n"
     ));
     body.push_str("data: [DONE]\n\n");
     raw_response(StatusCode::OK, "text/event-stream", Bytes::from(body))
@@ -542,6 +639,7 @@ async fn spawn_mock() -> (reqwest::Url, MockState) {
         .route("/backend-api/codex/responses", post(mock_responses))
         .route("/backend-api/codex/models", get(mock_models))
         .route("/v1/messages", post(mock_anthropic_messages))
+        .route("/v1/chat/completions", post(mock_openrouter_chat))
         .route("/v1/responses", post(mock_openrouter_responses))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -600,10 +698,238 @@ fn openrouter_responses_config(tag: &str, upstream: reqwest::Url) -> TestConfig 
     fixture
 }
 
-async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
-    let TestConfig { config, dir } = fixture;
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+fn id<T: std::str::FromStr>(value: &str) -> T
+where
+    T::Err: std::fmt::Debug,
+{
+    value.parse().unwrap()
+}
+
+fn chat_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    let mut policy = messages_codex_fallback_policy_with_model("failed-precommit").into_document();
+    policy.description = Some("Chat Codex fallback fixture".to_owned());
+    policy.defaults[0].scope = FrontendScope::Protocol {
+        protocol: FrontendProtocol::OpenaiChat,
+    };
+    policy.routes[0].chain.steps[0].candidate.model = CandidateModel::Exact {
+        model_id: "overloaded".to_owned(),
+    };
+    policy.routes[0].chain.steps.push(RouteStep {
+        edge: CandidateEdge {
+            preflight: FallbackPermission::Enabled,
+            post_send: vec![FailureClass::Overload],
+            billed_boundary: BoundaryConsent::Deny,
+            ambiguous_transport: BoundaryConsent::Deny,
+            cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+        },
+        candidate: Candidate {
+            id: CandidateId::new("last").unwrap(),
+            binding_id: toker::routing::OPENROUTER_CHAT.id().clone(),
+            model: CandidateModel::Exact {
+                model_id: "final".to_owned(),
+            },
+            upgrade_policy_id: None,
+            alias_policy: None,
+            required_capabilities: Default::default(),
+            enabled: true,
+            health_circuits: vec![],
+        },
+    });
+    policy.validate().unwrap()
+}
+
+fn messages_codex_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    messages_codex_fallback_policy_with_model("failed-precommit")
+}
+
+fn messages_codex_fallback_policy_with_model(
+    primary_model: &str,
+) -> toker::policy::ValidatedPolicyDocument {
+    let route_id = RouteId::new("messages-codex-fallback").unwrap();
+    PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("Messages Codex fallback fixture".to_owned()),
+        defaults: vec![DefaultRoute {
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            target: RouteReference {
+                route_id: route_id.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        }],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id,
+            display_name: "Messages Codex fallback".to_owned(),
+            description: None,
+            parameters: vec![REQUESTED_MODEL_PARAMETER.parse().unwrap()],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("codex").unwrap(),
+                    binding_id: CODEX_SUB_RESPONSES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: primary_model.to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![RouteStep {
+                    edge: CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![FailureClass::ServerError],
+                        billed_boundary: BoundaryConsent::Allow,
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    },
+                    candidate: Candidate {
+                        id: CandidateId::new("anthropic").unwrap(),
+                        binding_id: ANTHROPIC_API_MESSAGES.id().clone(),
+                        model: CandidateModel::Exact {
+                            model_id: "backup".to_owned(),
+                        },
+                        upgrade_policy_id: None,
+                        alias_policy: None,
+                        required_capabilities: Default::default(),
+                        enabled: true,
+                        health_circuits: vec![],
+                    },
+                }],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap()
+}
+
+fn responses_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
+    responses_fallback_chain(false, false)
+}
+
+fn responses_fallback_chain(
+    multi_hop: bool,
+    codex_middle: bool,
+) -> toker::policy::ValidatedPolicyDocument {
+    let route_id: RouteId = id("responses-fallback");
+    PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("Responses fallback fixture".to_owned()),
+        defaults: vec![DefaultRoute {
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiResponses,
+            },
+            target: RouteReference {
+                route_id: route_id.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    id(REQUESTED_MODEL_PARAMETER),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        }],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id,
+            display_name: "Responses fallback".to_owned(),
+            description: None,
+            parameters: vec![id(REQUESTED_MODEL_PARAMETER)],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("primary").unwrap(),
+                    binding_id: OPENROUTER_RESPONSES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "failed".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: {
+                    let edge = || CandidateEdge {
+                        preflight: FallbackPermission::Enabled,
+                        post_send: vec![FailureClass::ServerError, FailureClass::Overload],
+                        billed_boundary: if codex_middle {
+                            BoundaryConsent::Allow
+                        } else {
+                            BoundaryConsent::Deny
+                        },
+                        ambiguous_transport: BoundaryConsent::Deny,
+                        cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                    };
+                    let mut steps = vec![RouteStep {
+                        edge: edge(),
+                        candidate: Candidate {
+                            id: CandidateId::new("backup").unwrap(),
+                            binding_id: if codex_middle {
+                                CODEX_SUB_RESPONSES.id().clone()
+                            } else {
+                                ANTHROPIC_API_MESSAGES.id().clone()
+                            },
+                            model: CandidateModel::Exact {
+                                model_id: if codex_middle {
+                                    "failed-precommit"
+                                } else if multi_hop {
+                                    "overloaded"
+                                } else {
+                                    "backup"
+                                }
+                                .to_owned(),
+                            },
+                            upgrade_policy_id: None,
+                            alias_policy: None,
+                            required_capabilities: Default::default(),
+                            enabled: true,
+                            health_circuits: vec![],
+                        },
+                    }];
+                    if multi_hop {
+                        steps.push(RouteStep {
+                            edge: edge(),
+                            candidate: Candidate {
+                                id: CandidateId::new("last").unwrap(),
+                                binding_id: OPENROUTER_RESPONSES.id().clone(),
+                                model: CandidateModel::Exact {
+                                    model_id: "final".to_owned(),
+                                },
+                                upgrade_policy_id: None,
+                                alias_policy: None,
+                                required_capabilities: Default::default(),
+                                enabled: true,
+                                health_circuits: vec![],
+                            },
+                        });
+                    }
+                    steps
+                },
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap()
+}
+
+async fn serve_toker(
+    server: Server,
+    store: Arc<Store>,
+    dir: common::TestDir,
+) -> (SocketAddr, Arc<Store>) {
     let app = server.router();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -616,10 +942,33 @@ async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     (addr, store)
 }
 
+async fn spawn_toker_with_policy(
+    fixture: TestConfig,
+    policy: toker::policy::ValidatedPolicyDocument,
+) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    store
+        .activate_revision_one(&policy, 1, 0, &[])
+        .expect("activate policy fixture");
+    // Policy fixtures intentionally use exact fake model ids. Do not let the
+    // host's cached provider listings turn them into fresh-catalogue misses.
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
+    serve_toker(server, store, dir).await
+}
+
+async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
+    serve_toker(server, store, dir).await
+}
+
 async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
     let raw = json!({
         "models": [{
             "slug": "gpt-5.6-sol",
@@ -627,20 +976,18 @@ async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) 
             "max_context_window": 872000
         }]
     });
-    server.install_catalog(
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(
         "codex_sub",
         toker::catalog::fetched::parse_codex(&raw, 1).expect("catalog"),
     );
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        let _dir = dir;
-        axum::serve(listener, app).await.expect("toker serves");
-    });
-    (addr, store)
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_catalogs(catalogs),
+    )
+    .expect("build server");
+    serve_toker(server, store, dir).await
 }
 
 /// A claude-shaped streaming Messages request for `model`, with a system
@@ -699,6 +1046,107 @@ async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     assert!(mock.requests.lock().unwrap().is_empty());
 }
 
+/// A virtual presentation used to make the whole Responses listing answer 503.
+/// It is listed from its `codex` record, left out without one, and the exact
+/// offers around it are listed either way.
+#[tokio::test]
+async fn a_virtual_responses_presentation_is_listed_or_left_out_without_failing_the_list() {
+    use toker::policy::{
+        AdapterMetadata, CodexModelRecord, Presentation, PresentationId, PresentationSource,
+    };
+
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = test_config("virtual-models", upstream, false);
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+
+    let mut document = messages_codex_fallback_policy().into_document();
+    let route = document.routes[0].id.clone();
+    let scope = FrontendScope::Protocol {
+        protocol: FrontendProtocol::OpenaiResponses,
+    };
+    document.defaults[0].scope = scope.clone();
+    document.routes[0].chain.steps.clear();
+    document.routes[0].chain.first.model = CandidateModel::Exact {
+        model_id: "gpt-5.6-sol".to_owned(),
+    };
+    let presentation = |name: &str, metadata| Presentation {
+        id: PresentationId::new(name).unwrap(),
+        scope: scope.clone(),
+        slug: name.to_owned(),
+        label: None,
+        description: None,
+        enabled: true,
+        shadow_native: false,
+        source: PresentationSource::Virtual {
+            target: RouteReference {
+                route_id: route.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        },
+        metadata,
+    };
+    let record: CodexModelRecord = serde_json::from_value(json!({"priority": 7})).unwrap();
+    document.presentations = vec![
+        presentation(
+            "with-record",
+            Some(AdapterMetadata::Codex {
+                model: Some(record),
+            }),
+        ),
+        presentation("without-record", None),
+        Presentation {
+            id: PresentationId::new("exact").unwrap(),
+            slug: "exact".to_owned(),
+            source: PresentationSource::ExactOffer {
+                binding_id: CODEX_SUB_RESPONSES.id().clone(),
+                model_id: "gpt-5.6-sol".to_owned(),
+            },
+            ..presentation("exact", None)
+        },
+    ];
+    store
+        .activate_revision_one(&document.validate().unwrap(), 1, 0, &[])
+        .expect("activate policy fixture");
+
+    let raw = json!({"models": [{"slug": "gpt-5.6-sol", "display_name": "Sol", "context_window": 272000}]});
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(
+        "codex_sub",
+        toker::catalog::fetched::parse_codex(&raw, 1).expect("catalog"),
+    );
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_catalogs(catalogs),
+    )
+    .expect("build server");
+    let (addr, _store) = serve_toker(server, store, dir).await;
+
+    let response = client()
+        .get(format!("http://{addr}/f/codex/v1/models"))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("catalogue JSON");
+    let slugs: Vec<_> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["slug"].as_str().unwrap())
+        .collect();
+    // The generated `codex_sub/` alias is listed too; the virtual slug without
+    // a record is the one left out.
+    assert_eq!(slugs, ["codex_sub/gpt-5.6-sol", "exact", "with-record"]);
+    assert_eq!(body["models"][2]["priority"], 7);
+    assert_eq!(body["models"][2]["shell_type"], "unified_exec");
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;
@@ -746,6 +1194,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert!(response_text.contains("event: response.created"));
     assert!(response_text.contains("event: response.output_text.delta"));
     assert!(response_text.contains("event: response.completed"));
+    assert!(response_text.contains(r#""model":"codex_sub/gpt-5.6-sol""#));
     assert!(response_text.contains(r#""id":"rs_1""#));
     assert!(response_text.contains(r#""encrypted_content":"opaque-encrypted-reasoning""#));
 
@@ -819,12 +1268,22 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     assert_eq!(row.frontend.as_deref(), Some("openai_responses"));
     assert_eq!(row.route.as_deref(), Some("openai_responses:codex_sub"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
+    assert_eq!(
+        row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("codex_sub.codex_responses")
+    );
     assert_eq!(row.session_id.as_deref(), Some("codex-session-1"));
+    let attempt = row.attempt.as_ref().expect("initial attempt provenance");
+    assert_eq!(attempt.attempt_index.get(), 0);
+    assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
+    assert!(row.policy_routing.is_some());
     assert_eq!(
         row.requested_model.as_deref(),
         Some("codex_sub/gpt-5.6-sol")
     );
     assert_eq!(row.effective_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(row.model.as_deref(), Some("gpt-5.2-codex"));
+    assert_eq!(row.raw_model.as_deref(), Some("gpt-5.2-codex"));
     assert_eq!(row.req_messages, Some(5));
     assert_eq!(row.req_tools, Some(1));
     assert_eq!(row.system_chars, Some(20));
@@ -914,6 +1373,7 @@ async fn responses_to_anthropic_api_render_json_and_replace_foreign_auth() {
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("Responses JSON");
+    assert_eq!(body["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(body["output"][0]["content"][0]["text"], "hello");
     assert_eq!(body["usage"]["input_tokens"], 7);
 
@@ -936,6 +1396,10 @@ async fn responses_to_anthropic_api_render_json_and_replace_foreign_auth() {
         Some("openai_responses:anthropic_api")
     );
     assert_eq!(rows[0].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
 }
 
 #[tokio::test]
@@ -960,13 +1424,18 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await.expect("Responses SSE");
         assert!(body.contains(expected), "{body}");
+        assert!(
+            body.contains(&format!(r#""model":"anthropic_api/{model}""#)),
+            "{body}"
+        );
         assert!(body.contains("response.output_item.done"), "{body}");
     }
-    assert_eq!(
-        wait_for_rows(&store, 1).await.len(),
-        1,
-        "failed stream unledgered"
-    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].kind, None);
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].status, Some(200));
+    assert_eq!(rows[1].error_type.as_deref(), Some("overloaded_error"));
+    assert!(rows[1].attempt.is_some());
     assert_eq!(mock.requests.lock().unwrap().len(), 2);
 
     let eof = client()
@@ -985,11 +1454,44 @@ async fn responses_to_anthropic_api_stream_tools_errors_and_eof() {
         eof.bytes().await.is_err(),
         "a premature close aborts the response"
     );
-    assert_eq!(
-        wait_for_rows(&store, 1).await.len(),
-        1,
-        "truncated stream unledgered"
-    );
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows[2].attempt.is_some());
+}
+
+#[tokio::test]
+async fn responses_to_anthropic_api_complete_protocol_failures_are_ledgered() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-protocol", upstream)).await;
+
+    for (index, model) in ["compressed", "malformed"].into_iter().enumerate() {
+        let response = client()
+            .post(format!("http://{addr}/v1/responses"))
+            .json(&json!({
+                "model": format!("anthropic_api/{model}"),
+                "input": "hello",
+                "max_output_tokens": 128,
+                "stream": false,
+            }))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(rows[index].status, Some(200));
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert_eq!(
+            rows[index]
+                .attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_index.get()),
+            Some(0)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1005,7 +1507,95 @@ async fn responses_to_anthropic_api_reject_missing_limit_without_upstream() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(response.text().await.unwrap().contains("max_output_tokens"));
     assert!(mock.requests.lock().unwrap().is_empty());
-    assert!(wait_for_rows(&store, 0).await.is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(
+        &rows[0],
+        "openai_responses",
+        Some("anthropic_api/claude-sonnet-5"),
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_responses_request_without_a_limit_gets_the_wires_error_event() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-limit-stream", upstream)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"anthropic_api/claude-sonnet-5", "input":"hello", "stream":true}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error event");
+    let data = text
+        .strip_prefix("event: error\ndata: ")
+        .and_then(|rest| rest.strip_suffix("\n\n"))
+        .unwrap_or_else(|| panic!("a Responses error event: {text:?}"));
+    let event: Value = serde_json::from_str(data).expect("event payload");
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(
+        &rows[0],
+        "openai_responses",
+        Some("anthropic_api/claude-sonnet-5"),
+    );
+}
+
+#[tokio::test]
+async fn an_untranslatable_responses_body_gets_the_wires_error_event_and_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("bad-responses", upstream, false)).await;
+    // `input` is neither text nor a list of items, so there is no canonical
+    // form for any backend.
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": 7, "stream": true}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error event");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], "openai_responses", Some("gpt-5.6-sol"));
+
+    // The same body without `stream` is the JSON error, and the same row.
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": 7}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("JSON error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    wait_for_rows(&store, 2).await;
+}
+
+/// The row of a request toker refused before any send: an error of the local
+/// preparation type with the client's own request and nothing a send adds.
+fn assert_local_preparation_row(row: &RequestRow, frontend: &str, requested_model: Option<&str>) {
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.error_type.as_deref(), Some("local_preparation"));
+    assert_eq!(row.status, Some(400));
+    assert_eq!(row.frontend.as_deref(), Some(frontend));
+    assert_eq!(row.requested_model.as_deref(), requested_model);
+    assert!(
+        row.attempt.is_none() && row.policy_routing.is_none() && row.binding_id.is_none(),
+        "{row:?}"
+    );
+    assert!(row.provider.is_none() && row.route.is_none());
 }
 
 #[tokio::test]
@@ -1075,9 +1665,121 @@ async fn foreign_subscription_route_without_credential_stops_locally() {
         .send()
         .await
         .expect("local answer");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // The foreign bearer is not an Anthropic credential and there is no
+    // other, so policy finds no available candidate and toker answers itself.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(mock.requests.lock().unwrap().is_empty());
-    assert!(wait_for_rows(&store, 0).await.is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    assert!(rows[0].status.is_none(), "no upstream attempt behind it");
+}
+
+#[tokio::test]
+async fn chat_to_subscription_obeys_the_request_global_quota_gate() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = subscription_responses_config("chat-sub-gated", upstream, Some("held-token"));
+    fixture.config.gates.quota_enabled = true;
+    let (addr, store) = spawn_toker(fixture).await;
+    let reset = jiff::Timestamp::now().as_second() + 3600;
+    store
+        .save_meters(
+            "anthropic_sub",
+            &toker::store::MetersSnapshot {
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+                snapshot: json!({
+                    "util5h": 1.0,
+                    "reset5h": reset,
+                    "util7d": 0.2,
+                    "reset7d": reset + 3600,
+                    "overageInUse": false,
+                }),
+            },
+        )
+        .expect("save spent meters");
+
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-toker-session", "gated-chat")
+        .json(&json!({
+            "model":"anthropic_sub/claude-sonnet-5",
+            "messages":[{"role":"user","content":"hello"}],
+            "max_completion_tokens":128,
+            "stream":false,
+        }))
+        .send()
+        .await
+        .expect("local block answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("Chat block JSON");
+    assert_eq!(body["model"], "anthropic_sub/claude-sonnet-5");
+    assert_eq!(body["usage"]["total_tokens"], 0);
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("Stopped by"))
+    );
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let row = wait_for_rows(&store, 1).await.remove(0);
+    assert_eq!(row.kind, Some(RowKind::Blocked));
+    assert_eq!(row.frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(row.route.as_deref(), Some("openai_chat:anthropic_sub"));
+    assert_eq!(row.attempt, None);
+    assert_eq!(row.policy_routing, None);
+}
+
+#[tokio::test]
+async fn chat_subscription_release_marker_grants_strips_and_forwards() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture =
+        subscription_responses_config("chat-sub-release", upstream, Some("held-token"));
+    fixture.config.gates.quota_enabled = true;
+    let (addr, store) = spawn_toker(fixture).await;
+    let reset = jiff::Timestamp::now().as_second() + 3600;
+    store
+        .save_meters(
+            "anthropic_sub",
+            &toker::store::MetersSnapshot {
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+                snapshot: json!({
+                    "util5h": 1.0,
+                    "reset5h": reset,
+                    "util7d": 0.2,
+                    "reset7d": reset + 3600,
+                    "overageInUse": false,
+                }),
+            },
+        )
+        .expect("save spent meters");
+
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-toker-session", "released-chat")
+        .json(&json!({
+            "model":"anthropic_sub/claude-sonnet-5",
+            "messages":[{"role":"user","content":"$#$BURN$#$ continue"}],
+            "max_completion_tokens":128,
+            "stream":false,
+        }))
+        .send()
+        .await
+        .expect("released request answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let rendered: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(rendered["messages"][0]["content"][0]["text"], " continue");
+    assert!(
+        !requests[0]
+            .body
+            .windows(b"$#$BURN$#$".len())
+            .any(|window| window == b"$#$BURN$#$")
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Released));
+    assert_eq!(rows[0].frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(rows[0].route.as_deref(), Some("openai_chat:anthropic_sub"));
+    assert_eq!(rows[1].route.as_deref(), Some("openai_chat:anthropic_sub"));
 }
 
 #[tokio::test]
@@ -1097,6 +1799,7 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .expect("chat request answers");
     assert_eq!(complete.status(), StatusCode::OK);
     let body: Value = complete.json().await.unwrap();
+    assert_eq!(body["model"], "anthropic_api/claude-sonnet-5");
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
 
     let (sub_addr, sub_store) = spawn_toker(subscription_responses_config(
@@ -1118,6 +1821,7 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         .expect("chat stream answers");
     assert_eq!(streaming.status(), StatusCode::OK);
     let sse = streaming.text().await.unwrap();
+    assert!(sse.contains(r#""model":"anthropic_sub/stream""#), "{sse}");
     assert!(sse.contains("tool_calls"), "{sse}");
     assert!(sse.contains("[DONE]"), "{sse}");
 
@@ -1134,13 +1838,18 @@ async fn chat_to_anthropic_bindings_renders_complete_and_streaming_turns() {
         requests[1].headers.get(header::AUTHORIZATION).unwrap(),
         "Bearer held-token"
     );
+    let api_row = wait_for_rows(&store, 1).await.remove(0);
+    assert_eq!(api_row.route.as_deref(), Some("openai_chat:anthropic_api"));
     assert_eq!(
-        wait_for_rows(&store, 1).await[0].route.as_deref(),
-        Some("openai_chat:anthropic_api")
+        api_row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages"),
+        "Chat→Anthropic retains the selected Messages binding"
     );
+    let sub_row = wait_for_rows(&sub_store, 1).await.remove(0);
+    assert_eq!(sub_row.route.as_deref(), Some("openai_chat:anthropic_sub"));
     assert_eq!(
-        wait_for_rows(&sub_store, 1).await[0].route.as_deref(),
-        Some("openai_chat:anthropic_sub")
+        sub_row.binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_sub.anthropic_messages")
     );
 }
 
@@ -1168,6 +1877,338 @@ async fn explicit_anthropic_chat_route_needs_no_chat_default() {
 }
 
 #[tokio::test]
+async fn active_chat_policy_falls_back_from_codex_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("chat-codex-fallback", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) = spawn_toker_with_policy(fixture, chat_codex_fallback_policy()).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-toker-session", "chat-codex-fallback")
+        .json(&json!({
+            "model": "asked-model",
+            "messages": [{"role":"user","content":"hello"}],
+            "max_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Chat fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    assert_eq!(requests[2].path, "/v1/chat/completions");
+    let rows = wait_for_rows(&store, 3).await;
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        attempts
+            .windows(2)
+            .all(|pair| { pair[0].attempt_group_id == pair[1].attempt_group_id })
+    );
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(rows[2].provider.as_deref(), Some("openrouter"));
+}
+
+#[tokio::test]
+async fn active_messages_policy_falls_back_from_codex_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = anthropic_responses_config("messages-codex-fallback", upstream);
+    let (addr, store) = spawn_toker_with_policy(fixture, messages_codex_fallback_policy()).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .header("x-toker-session", "messages-codex-fallback")
+        .body(messages_body("asked-model", false))
+        .send()
+        .await
+        .expect("Messages fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    let rows = wait_for_rows(&store, 2).await;
+    let first = rows[0].attempt.as_ref().unwrap();
+    let second = rows[1].attempt.as_ref().unwrap();
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(second.attempt_index.get(), 1);
+    assert_eq!(second.reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[0].status, Some(StatusCode::OK.as_u16().into()));
+    assert_eq!(rows[0].error_type.as_deref(), Some("server_error"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("messages-codex-fallback"))
+        .expect("fallback success pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
+        Some("anthropic")
+    );
+}
+
+#[tokio::test]
+async fn committed_codex_messages_failure_does_not_fall_back() {
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = anthropic_responses_config("messages-codex-committed", upstream);
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, messages_codex_fallback_policy_with_model("failed")).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .body(messages_body("asked-model", false))
+        .send()
+        .await
+        .expect("Messages failure answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].attempt.as_ref().unwrap().attempt_index.get(), 0);
+}
+
+#[tokio::test]
+async fn active_responses_policy_falls_back_from_openrouter_to_anthropic() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-fallback", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) = spawn_toker_with_policy(fixture, responses_fallback_policy()).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-fallback")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    let primary: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let backup: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(primary["model"], "failed");
+    assert_eq!(backup["model"], "backup");
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(store.count_logical_requests().unwrap(), 1);
+    let first = rows[0].attempt.as_ref().unwrap();
+    let second = rows[1].attempt.as_ref().unwrap();
+    assert_eq!(first.attempt_group_id, second.attempt_group_id);
+    assert_eq!(first.attempt_index.get(), 0);
+    assert_eq!(first.reason, toker::store::AttemptReason::Initial);
+    assert_eq!(second.attempt_index.get(), 1);
+    assert_eq!(second.reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].kind, None);
+    assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
+    assert_eq!(rows[1].provider.as_deref(), Some("anthropic_api"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_responses")
+    );
+    assert_eq!(
+        rows[1].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
+    let candidate = |row: &RequestRow| {
+        row.policy_routing
+            .as_ref()
+            .and_then(|routing| match &routing.outcome {
+                toker::store::PolicyRoutingOutcome::Attempt { candidate_id, .. } => {
+                    Some(candidate_id.as_str().to_owned())
+                }
+                toker::store::PolicyRoutingOutcome::RouteUnavailable { .. } => None,
+            })
+    };
+    assert_eq!(candidate(&rows[0]).as_deref(), Some("primary"));
+    assert_eq!(candidate(&rows[1]).as_deref(), Some("backup"));
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("responses-fallback"))
+        .expect("fallback success pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.binding_id.as_str()),
+        Some("anthropic_api.anthropic_messages")
+    );
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
+        Some("backup")
+    );
+    assert_eq!(lane.pin.as_ref().map(|pin| pin.policy_revision_id), Some(1));
+}
+
+#[tokio::test]
+async fn active_responses_policy_continues_after_crossing_adapters() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-multi-hop", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, responses_fallback_chain(true, false)).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-multi-hop")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["model"], "asked-model");
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/v1/messages");
+    assert_eq!(requests[2].path, "/v1/responses");
+    let models = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models, ["failed", "overloaded", "final"]);
+
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(store.count_logical_requests().unwrap(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].kind, None);
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        attempts
+            .windows(2)
+            .all(|pair| pair[0].attempt_group_id == pair[1].attempt_group_id)
+    );
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[1].reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(attempts[2].reason, toker::store::AttemptReason::Overload);
+    let lane = store
+        .load_lanes()
+        .unwrap()
+        .into_iter()
+        .find(|lane| lane.session_id.as_deref() == Some("responses-multi-hop"))
+        .expect("last successful target pins the lane");
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.candidate_id.as_str()),
+        Some("last")
+    );
+    assert_eq!(
+        lane.pin.as_ref().map(|pin| pin.effective_model.as_str()),
+        Some("final")
+    );
+}
+
+#[tokio::test]
+async fn active_responses_policy_continues_after_codex() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = anthropic_responses_config("responses-codex-hop", upstream.clone());
+    let router = fixture.config.openrouter.as_mut().unwrap();
+    router.upstream = format!("{}/v1", upstream.origin().ascii_serialization())
+        .parse()
+        .unwrap();
+    router.api_key = Some("sk-or-test".to_owned());
+    let (addr, store) =
+        spawn_toker_with_policy(fixture, responses_fallback_chain(true, true)).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-toker-session", "responses-codex-hop")
+        .json(&json!({
+            "model": "asked-model",
+            "input": "hello",
+            "max_output_tokens": 128,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .expect("Responses fallback answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[1].path, "/backend-api/codex/responses");
+    assert_eq!(requests[2].path, "/v1/responses");
+    let rows = wait_for_rows(&store, 3).await;
+    let attempts = rows
+        .iter()
+        .map(|row| row.attempt.as_ref().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(attempts[0].attempt_index.get(), 0);
+    assert_eq!(attempts[1].attempt_index.get(), 1);
+    assert_eq!(attempts[2].attempt_index.get(), 2);
+    assert_eq!(attempts[2].reason, toker::store::AttemptReason::ServerError);
+    assert_eq!(rows[1].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(rows[2].provider.as_deref(), Some("openrouter"));
+    assert_eq!(
+        store
+            .load_meters("codex_sub")
+            .expect("load Codex meters")
+            .expect("failed Codex attempt updates meters")
+            .snapshot,
+        expected_meters()
+    );
+}
+
+#[tokio::test]
 async fn openrouter_responses_streams_tools_and_records_attested_cost() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) =
@@ -1188,6 +2229,10 @@ async fn openrouter_responses_streams_tools_and_records_attested_cost() {
         .send().await.expect("router answers");
     assert_eq!(response.status(), StatusCode::OK);
     let sse = response.text().await.unwrap();
+    assert!(
+        sse.contains(r#""model":"openrouter/openai/gpt-4.1-mini""#),
+        "{sse}"
+    );
     assert!(sse.contains("response.output_item.done"), "{sse}");
     assert!(sse.contains("response.completed"), "{sse}");
 
@@ -1207,6 +2252,15 @@ async fn openrouter_responses_streams_tools_and_records_attested_cost() {
     assert_eq!(
         rows[0].route.as_deref(),
         Some("openai_responses:openrouter")
+    );
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("openrouter.openrouter_responses")
+    );
+    assert_eq!(rows[0].model.as_deref(), Some("openai/gpt-4.1-mini"));
+    assert_eq!(
+        rows[0].raw_model.as_deref(),
+        Some("OPENAI/GPT-4.1-MINI[1m]")
     );
     assert_eq!(rows[0].cost_usd, Some(0.0000336));
     assert_eq!(rows[0].cost_kind, Some(toker::store::CostKind::Billed));
@@ -1229,6 +2283,7 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
     let status = complete.status();
     let body: Value = complete.json().await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model"], "openrouter/short");
     assert_eq!(body["status"], "incomplete");
     assert_eq!(wait_for_rows(&store, 1).await[0].cost_usd, Some(0.0000336));
 
@@ -1253,10 +2308,22 @@ async fn openrouter_responses_incomplete_usage_and_errors() {
     assert_eq!(body["error"]["message"], "invalid model");
     let rows = wait_for_rows(&store, 3).await;
     assert_eq!(rows[2].kind, Some(RowKind::Error));
+
+    let malformed = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"openrouter/malformed-error","input":"hello","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_GATEWAY);
+    let rows = wait_for_rows(&store, 4).await;
+    assert_eq!(rows[3].kind, Some(RowKind::Error));
+    assert_eq!(rows[3].status, Some(400));
+    assert_eq!(rows[3].error_type.as_deref(), Some("response_protocol"));
 }
 
 #[tokio::test]
-async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet() {
+async fn openrouter_responses_failed_and_cut_turns_record_errors() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(openrouter_responses_config("router-failures", upstream)).await;
     let failed = client()
@@ -1288,7 +2355,75 @@ async fn openrouter_responses_failed_turn_records_error_but_cut_turn_stays_quiet
         .unwrap();
     assert_eq!(cut.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(mock.requests.lock().unwrap().len(), 3);
-    assert_eq!(wait_for_rows(&store, 2).await.len(), 2);
+    let rows = wait_for_rows(&store, 3).await;
+    assert_eq!(rows[2].kind, Some(RowKind::Error));
+    assert_eq!(rows[2].status, Some(200));
+    assert_eq!(rows[2].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows[2].attempt.is_some());
+}
+
+#[tokio::test]
+async fn codex_guardian_lineage_requires_the_exact_profile_header_and_child_identity() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("guardian-lineage", upstream, false)).await;
+    let send = |path: &'static str, header: Option<&'static str>, body_key: &'static str| {
+        let client = client();
+        async move {
+            let mut request = client
+                .post(format!("http://{addr}{path}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(header) = header {
+                request = request.header("x-toker-session", header);
+            }
+            request
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "prompt_cache_key": body_key,
+                    "input": "private prompt",
+                    "stream": false
+                }))
+                .send()
+                .await
+                .expect("toker answers")
+                .bytes()
+                .await
+                .expect("response body");
+        }
+    };
+
+    send(
+        "/f/codex/v1/responses",
+        Some("guardian:parent-session"),
+        "guardian:parent-session",
+    )
+    .await;
+    send(
+        "/v1/responses",
+        Some("guardian:not-codex-profile"),
+        "guardian:not-codex-profile",
+    )
+    .await;
+    send(
+        "/f/codex/v1/responses",
+        Some("guardian:header-parent"),
+        "body-child-wins",
+    )
+    .await;
+    send("/f/codex/v1/responses", Some("guardian:"), "guardian:").await;
+
+    let rows = wait_for_rows(&store, 4).await;
+    let linked = rows
+        .iter()
+        .find(|row| row.session_id.as_deref() == Some("guardian:parent-session"))
+        .unwrap();
+    let lineage = linked.lineage.as_ref().expect("verified lineage");
+    assert_eq!(lineage.parent_session_id(), "parent-session");
+    assert!(
+        rows.iter()
+            .filter(|row| row.session_id.as_deref() != Some("guardian:parent-session"))
+            .all(|row| row.lineage.is_none()),
+        "no other route/body/header shape proves guardian lineage",
+    );
 }
 
 #[tokio::test]
@@ -1357,6 +2492,7 @@ async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("chat SSE");
     assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains(r#""model":"codex_sub/gpt-5.6-sol""#));
     assert!(body.contains("\"tool_calls\""));
     assert!(body.contains("data: [DONE]"));
 
@@ -1370,6 +2506,10 @@ async fn chat_frontend_routes_to_codex_and_translates_both_ways() {
     assert_eq!(rows[0].frontend.as_deref(), Some("openai_chat"));
     assert_eq!(rows[0].route.as_deref(), Some("openai_chat:codex_sub"));
     assert_eq!(rows[0].provider.as_deref(), Some("codex_sub"));
+    assert_eq!(
+        rows[0].binding_id.as_ref().map(|binding| binding.as_str()),
+        Some("codex_sub.codex_responses")
+    );
     assert_eq!(rows[0].session_id.as_deref(), Some("chat-codex-session"));
 }
 
@@ -1457,6 +2597,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
         sse.contains("event: message_start"),
         "no message_start:\n{sse}"
     );
+    assert!(sse.contains(r#""model":"codex_sub/claude-opus-5""#));
     assert!(sse.contains("event: content_block_delta"));
     assert!(
         sse.contains(r#""type":"tool_use""#),
@@ -1512,6 +2653,7 @@ async fn a_streaming_turn_translates_both_ways_and_records() {
     assert_eq!(row.frontend.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("codex_sub"));
     assert_eq!(row.model.as_deref(), Some("gpt-5.2-codex"));
+    assert_eq!(row.raw_model.as_deref(), Some("gpt-5.2-codex"));
     assert_eq!(
         row.requested_model.as_deref(),
         Some("codex_sub/claude-opus-5")
@@ -1680,6 +2822,55 @@ async fn thinking_disabled_filters_codex_reasoning_from_both_response_shapes() {
 }
 
 #[tokio::test]
+async fn missing_responses_model_is_rejected_locally_without_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("missing-model", upstream, true)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&json!({"input": "Hi"}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("typed local error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(store.requests_since(0, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_streaming_messages_get_the_wires_error_event_and_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("malformed", upstream, true)).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": "not an array",
+        "stream": true,
+    }))
+    .unwrap();
+
+    let response = client()
+        .post(format!("http://{addr}/v1/messages"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error event");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(text.contains("invalid_request_error"), "{text:?}");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], "anthropic", Some("claude-opus-5"));
+}
+
+#[tokio::test]
 async fn an_untranslatable_body_never_reaches_the_upstream() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("ut", upstream, true)).await;
@@ -1703,29 +2894,26 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
         .await
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    // The client asked to stream, so the error rides an SSE error event.
-    let sse = response.text().await.expect("body");
-    assert!(sse.contains("event: error"), "the SSE error shape: {sse}");
-    assert!(
-        sse.contains("invalid_request_error"),
-        "the mapped type: {sse}"
+    // The client asked to stream, so the refusal is Messages' own stream
+    // error rather than a JSON body its stream reader would choke on.
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
     );
+    let text = response.text().await.expect("body");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(text.contains("invalid_request_error"), "{text}");
     assert!(
-        sse.to_ascii_lowercase().contains("image"),
-        "the error names the unsupported thing: {sse}"
+        text.to_ascii_lowercase().contains("image"),
+        "the error names the unsupported thing: {text}"
     );
     assert!(
         mock.requests.lock().unwrap().is_empty(),
         "nothing forwarded"
     );
+    // No backend answered, so the row names the request and no backend.
     let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows[0].kind, Some(RowKind::Error));
-    assert_eq!(rows[0].status, Some(400));
-    assert_eq!(rows[0].error_type.as_deref(), Some("invalid_request_error"));
-    assert_eq!(
-        rows[0].req_messages, None,
-        "unsupported input has no canonical shape"
-    );
+    assert_local_preparation_row(&rows[0], "anthropic", Some("claude-opus-5"));
 }
 
 #[tokio::test]
@@ -1758,6 +2946,32 @@ async fn an_http_error_maps_through_the_error_table() {
     // The meters still fed from the error response (every response feeds
     // them).
     assert!(store.load_meters("codex_sub").expect("load").is_some());
+}
+
+#[tokio::test]
+async fn malformed_http_error_and_wrong_mode_record_protocol_failures() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("protocol-errors", upstream, false)).await;
+
+    for (index, model) in ["malformed-error", "wrong-mode"].into_iter().enumerate() {
+        let response = client()
+            .post(format!("http://{addr}/v1/messages"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(messages_body(model, false))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{model}");
+
+        let rows = wait_for_rows(&store, index + 1).await;
+        assert_eq!(rows[index].kind, Some(RowKind::Error));
+        assert_eq!(
+            rows[index].status,
+            Some(if model == "malformed-error" { 400 } else { 200 })
+        );
+        assert_eq!(rows[index].error_type.as_deref(), Some("response_protocol"));
+        assert!(rows[index].attempt.is_some());
+    }
 }
 
 #[tokio::test]
@@ -1830,29 +3044,41 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("unmatched", upstream, false)).await;
 
-    // An unmatched path: the codex backend serves no anthropic paths, so
-    // the answer is anthropic's own 404 shape, not a forward.
-    let response = client()
-        .get(format!("http://{addr}/v1/files?limit=2"))
-        .send()
-        .await
-        .expect("toker answers");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let error: Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
-    assert_eq!(error["error"]["type"], "not_found_error");
-
-    // A batch GET: the same typed error as batch creation on this
-    // backend.
-    let response = client()
-        .get(format!("http://{addr}/v1/messages/batches/batch_123"))
-        .send()
-        .await
-        .expect("toker answers");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
-    assert_eq!(error["error"]["type"], "invalid_request_error");
+    // The codex backend serves no anthropic administrative paths. Policy
+    // resolves these model-free requests to the codex default, and toker
+    // answers in anthropic's error shape instead of forwarding: a 404 for an
+    // unmatched path, a 400 for batch management.
+    for (path, status, error_type, message) in [
+        (
+            "/v1/files?limit=2",
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "serves only the Messages API",
+        ),
+        (
+            "/v1/messages/batches/batch_123",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "does not support count_tokens or batch requests",
+        ),
+    ] {
+        let response = client()
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), status, "{path}");
+        let error: Value =
+            serde_json::from_str(&response.text().await.expect("body")).expect("error json");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], error_type, "{path}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains(message)),
+            "{path}: {error}"
+        );
+    }
 
     assert!(
         mock.requests.lock().unwrap().is_empty(),
@@ -1860,6 +3086,73 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(store.requests_since(0, 100).expect("rows").is_empty());
+}
+
+#[tokio::test]
+async fn responses_with_no_codex_backend_are_answered_locally_and_marked() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = test_config("no-codex", upstream, false);
+    fixture.config.codex_sub = None;
+    fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
+    let (addr, store) = spawn_toker(fixture).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": "hello", "stream": false}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-toker-not-configured")
+            .and_then(|value| value.to_str().ok()),
+        Some("openai_responses"),
+        "the setup check reads the marker"
+    );
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "nothing forwarded"
+    );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    assert_eq!(rows[0].requested_model.as_deref(), Some("gpt-5.6-sol"));
+    let routing = rows[0].policy_routing.as_ref().expect("revision recorded");
+    assert_eq!(routing.route, None);
+    assert_eq!(
+        routing.trace.events,
+        [toker::store::StoredRoutingTraceEvent::NoRoute]
+    );
+}
+
+/// A codex guardian request that cannot be routed still records whose child it
+/// was, since the lineage is known before routing starts.
+#[tokio::test]
+async fn an_unroutable_guardian_request_keeps_its_lineage() {
+    let (upstream, _mock) = spawn_mock().await;
+    let mut fixture = test_config("unroutable-guardian", upstream, false);
+    fixture.config.codex_sub = None;
+    fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
+    let (addr, store) = spawn_toker(fixture).await;
+
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header("x-toker-session", "guardian:parent-session")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "guardian:parent-session",
+            "input": "hello",
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    let lineage = rows[0].lineage.as_ref().expect("lineage on the terminal");
+    assert_eq!(lineage.parent_session_id(), "parent-session");
 }
 
 /// Read a response body to its end: `Err` when the transfer was
@@ -1873,7 +3166,7 @@ async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest
 }
 
 #[tokio::test]
-async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_no_row() {
+async fn upstream_failure_mid_turn_aborts_and_records_each_attempt() {
     let (upstream, _mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("drop-mid", upstream, false)).await;
 
@@ -1898,6 +3191,10 @@ async fn an_upstream_failure_mid_turn_aborts_the_translated_stream_and_records_n
         );
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(store.count_requests().expect("count"), 0, "no row");
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Error));
+    assert_eq!(rows[0].error_type.as_deref(), Some("ambiguous_transport"));
+    assert_eq!(rows[1].kind, Some(RowKind::Error));
+    assert_eq!(rows[1].error_type.as_deref(), Some("response_protocol"));
+    assert!(rows.iter().all(|row| row.attempt.is_some()));
 }

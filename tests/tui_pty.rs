@@ -86,6 +86,10 @@ fn bare_row(ts_ms: i64) -> RequestRow {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     }
 }
 

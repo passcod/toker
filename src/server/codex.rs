@@ -9,8 +9,8 @@
 //! Every other pipeline stage ran before this branch: the release
 //! marker, the quota gate (anthropic_sub-only, never here), the cold
 //! gate, the compaction retarget, force-newest, and the model routing
-//! map — so [`CodexTurn::served_model`] is the final effective model,
-//! the one the codex request carries.
+//! map — so the prepared attempt carries the final effective model used by
+//! the codex request.
 //!
 //! Recording: a measurement row on a completed turn (usage from
 //! [`crate::providers::codex::TurnCapture`], the usage object verbatim
@@ -20,62 +20,34 @@
 //! on EVERY response — the "not just accounted ones" rule.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::Value;
 
 use super::Server;
 use crate::ir::AnthropicShape;
-use crate::ir::canonical::{CanonicalRequest, ResponseProjection};
+use crate::ir::canonical::ResponseProjection;
 use crate::middleware::lanes;
 use crate::observe::SseEvent;
+use crate::policy::BindingId;
 use crate::providers::Provider;
 use crate::providers::codex::{ResponseError, ResponseEvent, ResponsesSse, TurnCapture};
-use crate::routing::{BackendAdapterId, ProtocolId};
+use crate::routing::ProtocolId;
 use crate::server::InFlightGuard;
 use crate::server::proxy::{
-    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, plain_status, session_id,
-    transport_failure, truncated_body, upstream_failure,
+    ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, is_event_stream,
+    plain_status, session_id, transport_failure, truncated_body, upstream_failure,
 };
-use crate::server::record::now_ms;
+use crate::server::record::{now_ms, record_unroutable};
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_responses_measurement};
+use crate::store::SessionLineage;
 use crate::translate::{self, TranslateError};
-
-/// Everything the branch needs from a translated frontend pipeline,
-/// moved in.
-pub(crate) struct CodexTurn {
-    pub(crate) server: Server,
-    /// The routed backend (`codex_sub`), for endpoint + meter parsing.
-    pub(crate) backend: Arc<dyn Provider>,
-    /// The parsed, middleware-transformed request.
-    pub(crate) canonical: Option<Result<CanonicalRequest, TranslateError>>,
-    /// The request's own shape, pre-transform (the row's shape fields).
-    pub(crate) gate_shape: Option<AnthropicShape>,
-    /// The record context, when the pipeline built one.
-    pub(crate) record: Option<AnthropicRecordCtx>,
-    /// The in-flight guard: rides the response stream when streaming,
-    /// drops at return otherwise — a request being served holds the
-    /// machine awake, and no early return may leak the count.
-    pub(crate) in_flight: Option<InFlightGuard>,
-    /// Session identity — the prompt-cache key when present.
-    pub(crate) session_id: Option<String>,
-    /// Provider-binding request identities. Native Responses clients supply
-    /// these; other frontends leave them absent and the binding derives them.
-    pub(crate) thread_id: Option<String>,
-    pub(crate) request_id: Option<String>,
-    /// The final effective model (routing, retarget, force-newest, map).
-    pub(crate) served_model: Option<String>,
-    /// Whether the frontend expects one complete JSON response rather than SSE.
-    pub(crate) client_wants_json: bool,
-    pub(crate) frontend_wire: CodexFrontendWire,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFrontendWire {
@@ -142,6 +114,14 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         .and_then(Value::as_str)
         .map(str::to_owned);
     let request_session = body_session.clone().or_else(|| header_session.clone());
+    let lineage = (super::frontend_of(&parts.extensions) == Some("codex")
+        && request_session == header_session)
+        .then(|| {
+            header_session
+                .as_deref()
+                .and_then(SessionLineage::codex_guardian)
+        })
+        .flatten();
     let requested_model = canonical
         .as_ref()
         .and_then(|result| result.as_ref().ok())
@@ -153,40 +133,201 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
-    let target = match server
-        .registry
-        .resolve(ProtocolId::OpenAiResponses, requested_model.as_deref())
-    {
-        Ok(target) => target,
-        Err(_) => return super::responses_not_configured(),
+    let Some(requested_model) = requested_model.filter(|model| !model.is_empty()) else {
+        return frontend_error_response(
+            CodexFrontendWire::OpenAiResponses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "model is missing, empty, or not a string",
+            false,
+        );
     };
-    let backend = target.provider().clone();
-    let effective_model = target.effective_model().map(str::to_owned);
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
-    let record = parsed.as_ref().map(|request| AnthropicRecordCtx {
+    let canonical_request = canonical.as_ref().and_then(|result| result.as_ref().ok());
+    let shape = canonical_request.map(|canonical| {
+        AnthropicShape::from_canonical_responses(
+            canonical,
+            original.len() as u64,
+            parsed
+                .as_ref()
+                .and_then(|request| request.get("input"))
+                .and_then(Value::as_array)
+                .map(|input| input.len() as u64),
+        )
+    });
+    let lane_reference = shape.as_ref().and_then(|shape| {
+        lanes::lane_key(request_session.as_deref(), Some(shape.tools_hash.as_str()))
+    });
+    let stored_lane = lane_reference.as_deref().and_then(|key| {
+        server
+            .store
+            .load_lane(key)
+            .inspect_err(|error| tracing::error!(%error, lane_key = key, "lane load failed"))
+            .ok()
+            .flatten()
+    });
+    let pinned_binding = stored_lane
+        .as_ref()
+        .and_then(|lane| lane.pin.as_ref())
+        .map(|pin| pin.binding_id.clone());
+
+    // A body that does not canonicalise names nothing for policy to route.
+    let (Some(canonical_request), Some(shape)) = (canonical_request, shape.as_ref()) else {
+        return super::record::RefusalCtx::new(
+            started,
+            frontend.as_deref(),
+            RESPONSES_FRONTEND,
+            request_session.as_deref(),
+            Some(requested_model.as_str()),
+            lineage.clone(),
+        )
+        .settle(
+            &server,
+            super::record::refused(super::inference::invalid_responses_body(client_wants_json)),
+        );
+    };
+    let (target, policy_attempt) = {
+        let binding_affinity = if canonical_request.requires_binding_affinity() {
+            // Provider-owned state belongs to the binding that produced it,
+            // which only a pin records.
+            let Some(binding) = pinned_binding.clone() else {
+                return frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "the request contains provider-owned state with unknown binding affinity",
+                    false,
+                );
+            };
+            Some(binding)
+        } else {
+            None
+        };
+        let facts = server.request_facts(
+            ProtocolId::OpenAiResponses,
+            frontend.as_deref(),
+            Some(requested_model.clone()),
+            lane_reference.clone(),
+            crate::policy::force_newest::prompt_bound(original.len() as u64),
+            shape.req_messages,
+            shape.req_tools,
+            super::anthropic::required_capabilities(canonical_request),
+            binding_affinity,
+            crate::policy::RequestClass::Inference,
+        );
+        let credentials =
+            server.credential_snapshot(&parts.headers, ProtocolId::OpenAiResponses, facts.now_ms);
+        let lane = server.lane_facts(
+            stored_lane.as_ref(),
+            pinned_binding
+                .as_ref()
+                .and_then(|binding| server.registry.binding(binding)),
+            facts.now_ms,
+            false,
+        );
+        match server.resolve_policy_attempt(
+            &facts,
+            &credentials,
+            stored_lane.as_ref(),
+            lane.as_ref(),
+        ) {
+            Ok(resolved) => {
+                let target = match server.registry.resolve_binding(
+                    ProtocolId::OpenAiResponses,
+                    &resolved.plan.binding_id,
+                    Some(requested_model.as_str()),
+                    &resolved.plan.effective_model,
+                ) {
+                    Ok(target) => target,
+                    Err(_) => {
+                        tracing::error!(
+                            binding_id = %resolved.plan.binding_id,
+                            "active policy selected an unconfigured Responses binding"
+                        );
+                        return frontend_error_response(
+                            CodexFrontendWire::OpenAiResponses,
+                            StatusCode::BAD_GATEWAY,
+                            "server_error",
+                            "the active routing policy selected an unavailable backend",
+                            !client_wants_json,
+                        );
+                    }
+                };
+                (target, resolved)
+            }
+            Err(error) if error.is_route_unavailable() => {
+                record_unroutable(
+                    &server,
+                    started,
+                    frontend.as_deref(),
+                    RESPONSES_FRONTEND,
+                    request_session.as_deref(),
+                    Some(requested_model.as_str()),
+                    lineage.clone(),
+                    &error,
+                );
+                return frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    "the active routing policy has no available backend for this request",
+                    !client_wants_json,
+                );
+            }
+            Err(error) => {
+                record_unroutable(
+                    &server,
+                    started,
+                    frontend.as_deref(),
+                    RESPONSES_FRONTEND,
+                    request_session.as_deref(),
+                    Some(requested_model.as_str()),
+                    lineage.clone(),
+                    &error,
+                );
+                tracing::error!(%error, "active Responses policy resolution failed");
+                let response = frontend_error_response(
+                    CodexFrontendWire::OpenAiResponses,
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "the active routing policy could not resolve this request",
+                    !client_wants_json,
+                );
+                return if error.is_no_default_route() {
+                    super::mark_not_configured(response, RESPONSES_FRONTEND)
+                } else {
+                    response
+                };
+            }
+        }
+    };
+    let backend = target.provider().clone();
+    let effective_model = Some(policy_attempt.plan.effective_model.clone());
+    let pin_transition = Some(policy_attempt.pin_transition.clone());
+    let policy_record = Some(std::sync::Arc::new(policy_attempt.clone()));
+    let Some(Ok(canonical)) = canonical else {
+        unreachable!("a body that canonicalised was routed above");
+    };
+    let inference = super::inference::InferenceRequest::new(requested_model.clone(), canonical);
+    let attempt = inference.prepare_policy(target.clone(), policy_attempt.plan.clone());
+
+    let record = parsed.as_ref().map(|_| AnthropicRecordCtx {
         server: server.clone(),
         started,
         path: "/v1/responses",
         session_id: request_session.clone(),
-        requested_model: requested_model.clone(),
+        lineage: lineage.clone(),
+        requested_model: Some(requested_model.clone()),
         effective_model: effective_model.clone(),
         backend: backend.clone(),
+        binding_id: target.binding().id().clone(),
+        attempt: None,
+        policy_routing: None,
+        pin_transition,
         betas: None,
-        shape: canonical
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .map(|canonical| {
-                AnthropicShape::from_canonical_responses(
-                    canonical,
-                    original.len() as u64,
-                    request
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .map(|input| input.len() as u64),
-                )
-            }),
+        shape: Some(shape.clone()),
         ping,
         downgraded_from: None,
         downgraded_to: None,
@@ -196,240 +337,485 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         forced_to: None,
         model_mappings: None,
         frontend,
-        thinking_rewritten: false,
         translation_report: None,
+        policy_attempt: policy_record,
     });
 
-    if target
+    let adapter = target
         .binding()
         .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::AnthropicMessages)
-    {
-        let Some(Ok(canonical)) = canonical else {
-            return frontend_error_response(
-                CodexFrontendWire::OpenAiResponses,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "the request body could not be parsed for translation to this backend",
-                !client_wants_json,
-            );
-        };
-        return super::anthropic_target::turn(
-            server,
+        .map(|backend| backend.adapter());
+    super::inference::coordinate_responses(
+        server,
+        adapter,
+        attempt,
+        policy_attempt,
+        inference,
+        super::inference::ResponsesAttemptInput {
             parts,
-            super::anthropic_target::AnthropicInput {
-                canonical,
-                limit_field: parsed
-                    .as_ref()
-                    .and_then(|request| request.get("max_output_tokens").cloned()),
-            },
-            target,
-            record,
-            in_flight,
-            super::anthropic_target::FrontendWire::Responses,
-        )
-        .await;
-    }
-
-    if target
-        .binding()
-        .canonical_backend()
-        .is_some_and(|binding| binding.adapter() == BackendAdapterId::OpenRouterResponses)
-    {
-        let Some(Ok(canonical)) = canonical else {
-            return frontend_error_response(
-                CodexFrontendWire::OpenAiResponses,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "the request body could not be parsed for translation to this backend",
-                !client_wants_json,
-            );
-        };
-        return super::openrouter_responses::turn(
-            server,
-            parts,
-            canonical,
-            parsed
+            max_output_tokens: parsed
+                .as_ref()
+                .and_then(|request| request.get("max_output_tokens").cloned()),
+            had_prompt_cache_key: parsed
                 .as_ref()
                 .is_some_and(|request| request.get("prompt_cache_key").is_some()),
-            target,
             record,
             in_flight,
-        )
-        .await;
-    }
-
-    turn(CodexTurn {
-        server,
-        backend,
-        canonical,
-        gate_shape: None,
-        record,
-        in_flight,
-        session_id: request_session,
-        thread_id,
-        request_id,
-        served_model: effective_model,
-        client_wants_json,
-        frontend_wire: CodexFrontendWire::OpenAiResponses,
-    })
+            session_id: request_session,
+            thread_id,
+            request_id,
+            client_wants_json,
+        },
+    )
     .await
 }
 
-/// One turn: translate, send, translate back, record.
-pub(crate) async fn turn(args: CodexTurn) -> Response {
-    let CodexTurn {
-        server,
-        backend,
-        canonical,
-        gate_shape,
+pub(crate) enum FailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadyOutcome {
+    Accepted {
+        ready: ReadyAttempt,
+        upstream: reqwest::Response,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        ready: ReadyAttempt,
+        failure: super::attempt::AttemptFailure,
+        response: FailureResponse,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
+pub(crate) struct ReadyAttempt {
+    parts: axum::http::request::Parts,
+    backend: std::sync::Arc<dyn Provider>,
+    binding_id: BindingId,
+    effective_model: String,
+    response_model: String,
+    response_projection: ResponseProjection,
+    meter_snapshot: Option<Value>,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    client_wants_json: bool,
+    frontend_wire: CodexFrontendWire,
+}
+
+impl ReadyAttempt {
+    pub(crate) fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
+    pub(crate) fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    pub(crate) async fn execute_precommit(
+        mut self,
+        server: &Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> ReadyOutcome {
+        if let Some(ctx) = self.record.as_mut() {
+            ctx.attempt = Some(provenance);
+        }
+        let cancellation = super::cancel::PrecommitCancellationGuard::responses(
+            self.record.as_ref(),
+            self.frontend_wire.protocol(),
+        );
+        let url = self.backend.endpoint("/responses");
+        let upstream = match server
+            .http
+            .post(url)
+            .headers(std::mem::take(&mut self.headers))
+            .body(std::mem::take(&mut self.body))
+            .send()
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(%error, "codex upstream request failed");
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: FailureResponse::Local(transport_failure(
+                        self.frontend_wire.error_wire(),
+                        &error,
+                    )),
+                    ready: self,
+                    cancellation,
+                };
+            }
+        };
+        note_meters(server, self.backend.as_ref(), upstream.headers());
+        self.meter_snapshot = self.backend.meters(upstream.headers());
+        let response_status = upstream.status();
+        match super::attempt::precommit_responses(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyOutcome::Accepted {
+                    ready: self,
+                    upstream: response,
+                    cancellation,
+                }
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyOutcome::Failure {
+                ready: self,
+                failure,
+                response: FailureResponse::Upstream(response),
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyOutcome::Failure {
+                response: FailureResponse::Local(upstream_failure(
+                    self.frontend_wire.error_wire(),
+                    "toker could not interpret the upstream response before commitment",
+                )),
+                ready: self,
+                failure,
+                cancellation,
+            },
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: FailureResponse::Local(truncated_body(
+                        self.frontend_wire.error_wire(),
+                    )),
+                    ready: self,
+                    cancellation,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn frontend_wire(&self) -> CodexFrontendWire {
+        self.frontend_wire
+    }
+
+    pub(crate) fn attempt_provenance(&self) -> Option<&crate::store::AttemptProvenance> {
+        self.record.as_ref()?.attempt.as_ref()
+    }
+
+    pub(crate) fn record(&self) -> &Option<AnthropicRecordCtx> {
+        &self.record
+    }
+
+    pub(crate) fn parts(&self) -> &axum::http::request::Parts {
+        &self.parts
+    }
+
+    pub(crate) fn take_retry_state(
+        &mut self,
+    ) -> (
+        axum::http::request::Parts,
+        Option<AnthropicRecordCtx>,
+        Option<InFlightGuard>,
+    ) {
+        (
+            self.parts.clone(),
+            self.record.take(),
+            self.in_flight.take(),
+        )
+    }
+
+    pub(crate) fn restore_terminal_state(
+        &mut self,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+    ) {
+        self.record = record;
+        self.in_flight = in_flight;
+    }
+}
+
+pub(crate) async fn finish(outcome: ReadyOutcome, server: Server) -> Response {
+    match outcome {
+        ReadyOutcome::Accepted {
+            ready,
+            upstream,
+            mut cancellation,
+        } => {
+            let response = forward(ready, server, upstream).await;
+            cancellation.disarm();
+            response
+        }
+        ReadyOutcome::Failure {
+            ready,
+            failure,
+            response,
+            mut cancellation,
+        } => {
+            let response = match response {
+                FailureResponse::Upstream(upstream) => forward(ready, server, upstream).await,
+                FailureResponse::Local(response) => {
+                    record_failure(ready.record.as_ref(), ready.frontend_wire, &failure);
+                    response
+                }
+            };
+            cancellation.disarm();
+            response
+        }
+    }
+}
+
+pub(crate) fn record_failure(
+    record: Option<&AnthropicRecordCtx>,
+    frontend_wire: CodexFrontendWire,
+    failure: &super::attempt::AttemptFailure,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    record_codex_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        error_type,
+        "upstream Responses attempt failed before commitment",
+        None,
+        frontend_wire.protocol(),
+    );
+}
+
+pub(crate) struct AttemptInput {
+    pub(crate) parts: axum::http::request::Parts,
+    pub(crate) attempt: Result<super::inference::InferenceAttempt, TranslateError>,
+    pub(crate) record: Option<AnthropicRecordCtx>,
+    pub(crate) in_flight: Option<InFlightGuard>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) client_wants_json: bool,
+    pub(crate) frontend_wire: CodexFrontendWire,
+}
+
+pub(crate) async fn prepare(
+    server: &Server,
+    input: AttemptInput,
+) -> Result<ReadyAttempt, Box<Response>> {
+    let AttemptInput {
+        parts,
+        attempt,
         mut record,
         in_flight,
         session_id,
         thread_id,
         request_id,
-        served_model,
         client_wants_json,
         frontend_wire,
-    } = args;
-
-    // A shape with no messages is untranslatable chat-wise (count_tokens
-    // and batches never reach this branch — the pipeline intercepts
-    // them with a typed error before here).
-    let _ = gate_shape;
-
-    let Some(canonical) = canonical else {
-        // An untranslatable body on a translated route: the honest
-        // answer names the problem; nothing reached the upstream, and
-        // there is no row (no measurement, no provider response).
-        return frontend_error_response(
-            frontend_wire,
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "the request body could not be parsed for translation to this backend",
-            !client_wants_json,
-        );
+    } = input;
+    let attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(Box::new(translation_error_response(
+                &error,
+                frontend_wire,
+                client_wants_json,
+            )));
+        }
     };
-    let response_projection = canonical
-        .as_ref()
-        .ok()
-        .map(ResponseProjection::for_request)
-        .unwrap_or_default();
-
-    let model = served_model.clone().unwrap_or_default();
-    let prompt_cache_key = session_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let backend = attempt.backend().clone();
+    let binding_id = attempt.binding().id().clone();
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt.requested_model().to_owned();
+    let canonical = attempt.canonical();
+    let response_projection = ResponseProjection::for_request(&canonical);
+    let prompt_cache_key = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let thread_id = thread_id.unwrap_or_else(|| prompt_cache_key.clone());
     let request_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // The translation itself — pure; a typed failure never reaches the
-    // upstream and answers in the frontend's error shape.
-    let rendering = canonical.and_then(|mut canonical| {
-        canonical.model = Some(model.clone());
-        translate::render_codex(&canonical, &prompt_cache_key)
-    });
-    let rendered = match rendering {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            let (status, message) = translate_failure(&error);
-            if let Some(ctx) = record.as_ref() {
-                record_codex_error(
-                    ctx,
-                    status.as_u16(),
-                    "invalid_request_error",
-                    &message,
-                    None,
-                    frontend_wire.protocol(),
-                );
-            }
-            return frontend_error_response(
-                frontend_wire,
-                status,
-                "invalid_request_error",
-                &message,
-                !client_wants_json,
-            );
-        }
-    };
+    let rendered = translate::render_codex(&canonical, &prompt_cache_key).map_err(|error| {
+        Box::new(translation_error_response(
+            &error,
+            frontend_wire,
+            client_wants_json,
+        ))
+    })?;
     if !rendered.report.is_empty()
         && let Some(ctx) = record.as_mut()
     {
         ctx.translation_report = Some(rendered.report);
     }
-    let request = rendered.value;
-    let body = match serde_json::to_vec(&request) {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::error!(%error, "codex request serialisation failed");
-            return plain_status(StatusCode::INTERNAL_SERVER_ERROR, "translation failed\n");
-        }
-    };
+    let body = serde_json::to_vec(&rendered.value).map_err(|error| {
+        tracing::error!(%error, "codex request serialisation failed");
+        Box::new(plain_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "translation failed\n",
+        ))
+    })?;
 
-    // Auth for this turn (refreshing first when the login says so). A
-    // refresh failure is a toker-side failure: no upstream response, no
-    // row, 502 — the same shape the byte-forward paths give.
+    // Refreshing is local preparation. A failure does not start an attempt and
+    // must therefore precede the coordinator's sent-target observation.
     let now = now_ms() / 1000;
-    // Only the codex backend routes here, and it exists only when its
-    // block does; the check keeps a broken invariant a typed answer.
     let Some(codex) = server.codex_turn.clone() else {
-        return match frontend_wire {
+        return Err(Box::new(match frontend_wire {
             CodexFrontendWire::Anthropic => super::anthropic_not_configured(),
             CodexFrontendWire::OpenAiChat => super::openai_not_configured(),
             CodexFrontendWire::OpenAiResponses => super::responses_not_configured(),
-        };
+        }));
     };
-    let auth = match codex.auth_for_turn(&server.http, now).await {
-        Ok(auth) => auth,
-        Err(error) => {
+    let auth = codex
+        .auth_for_turn(&server.http, now)
+        .await
+        .map_err(|error| {
             tracing::warn!(%error, "codex auth refresh failed");
-            // A fixed message, not the error's: it names local paths, and
-            // the log line above already has the detail.
-            return upstream_failure(
+            Box::new(upstream_failure(
                 frontend_wire.error_wire(),
                 "toker upstream error: the codex login could not be refreshed",
+            ))
+        })?;
+    let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
+
+    Ok(ReadyAttempt {
+        parts,
+        backend,
+        binding_id,
+        effective_model,
+        response_model,
+        response_projection,
+        meter_snapshot: None,
+        headers,
+        body,
+        record,
+        in_flight,
+        client_wants_json,
+        frontend_wire,
+    })
+}
+
+fn note_meters(server: &Server, backend: &dyn Provider, headers: &HeaderMap) {
+    let Some(snapshot) = backend.meters(headers) else {
+        return;
+    };
+    server.note_quota(backend.id(), &snapshot);
+    let row = crate::store::MetersSnapshot {
+        updated_ms: now_ms(),
+        snapshot,
+    };
+    if let Err(error) = server.store.save_meters(backend.id(), &row) {
+        tracing::error!(%error, "codex meter snapshot save failed");
+    }
+}
+
+async fn forward(ready: ReadyAttempt, _server: Server, upstream: reqwest::Response) -> Response {
+    let ReadyAttempt {
+        response_model,
+        response_projection,
+        meter_snapshot,
+        record,
+        in_flight,
+        client_wants_json,
+        frontend_wire,
+        ..
+    } = ready;
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+
+    if is_compressed(&headers) {
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                "upstream Responses response was compressed",
+                None,
+                frontend_wire.protocol(),
             );
         }
-    };
-
-    let headers = codex.turn_headers(auth.as_ref(), &prompt_cache_key, &thread_id, &request_id);
-    let url = backend.endpoint("/responses");
-    let upstream = match server
-        .http
-        .post(url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            tracing::warn!(%error, "codex upstream request failed");
-            return transport_failure(frontend_wire.error_wire(), &error);
-        }
-    };
-
-    let status = upstream.status();
-    let meter_snapshot = backend.meters(upstream.headers());
-    if let Some(snapshot) = &meter_snapshot {
-        server.note_quota(backend.id(), snapshot);
-        let row = crate::store::MetersSnapshot {
-            updated_ms: now_ms(),
-            snapshot: snapshot.clone(),
-        };
-        if let Err(error) = server.store.save_meters(backend.id(), &row) {
-            tracing::error!(%error, "codex meter snapshot save failed");
-        }
+        return upstream_failure(
+            frontend_wire.error_wire(),
+            "toker could not interpret a compressed upstream response",
+        );
     }
 
     if !status.is_success() {
-        // A provider error, translated: the client sees its protocol's
-        // error naming the mapped type; the row records the real
-        // upstream status with the same mapping.
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "ambiguous_transport",
+                    "upstream response body failed after commitment",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
             return truncated_body(frontend_wire.error_wire());
         };
-        let error = parse_upstream_error(&buffered.bytes);
+        if buffered.rest.is_some() {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "response_protocol",
+                    "upstream error response was too large",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
+            return upstream_failure(
+                frontend_wire.error_wire(),
+                "toker could not interpret an oversized upstream error",
+            );
+        }
+        let Some(error) = parse_upstream_error(&buffered.bytes) else {
+            if let Some(ctx) = record.as_ref() {
+                record_codex_error(
+                    ctx,
+                    status.as_u16(),
+                    "response_protocol",
+                    "upstream error response could not be interpreted",
+                    None,
+                    frontend_wire.protocol(),
+                );
+            }
+            return upstream_failure(
+                frontend_wire.error_wire(),
+                "toker could not interpret the upstream error response",
+            );
+        };
         let kind = translate::anthropic_error_type(&error);
         let message = error
             .message
@@ -450,11 +836,28 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         return frontend_error_response(frontend_wire, status, kind, &message, !client_wants_json);
     }
 
+    if !is_event_stream(&headers) {
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                status.as_u16(),
+                "response_protocol",
+                "upstream Responses response used the wrong streaming mode",
+                None,
+                frontend_wire.protocol(),
+            );
+        }
+        return upstream_failure(
+            frontend_wire.error_wire(),
+            "toker could not interpret a non-streaming upstream response",
+        );
+    }
+
     if client_wants_json {
         aggregated_turn(
             record,
             in_flight,
-            model,
+            response_model,
             upstream,
             meter_snapshot,
             frontend_wire,
@@ -465,7 +868,7 @@ pub(crate) async fn turn(args: CodexTurn) -> Response {
         streamed_turn(
             record,
             in_flight,
-            model,
+            response_model,
             upstream,
             meter_snapshot,
             frontend_wire,
@@ -498,6 +901,16 @@ async fn aggregated_turn(
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(%error, "codex stream failed mid-turn");
+                if let Some(ctx) = record.as_ref() {
+                    record_codex_error(
+                        ctx,
+                        200,
+                        "ambiguous_transport",
+                        "upstream response body failed after commitment",
+                        None,
+                        frontend_wire.protocol(),
+                    );
+                }
                 return upstream_failure(
                     frontend_wire.error_wire(),
                     "toker upstream error: the stream failed before the turn ended",
@@ -536,6 +949,16 @@ async fn aggregated_turn(
         // The stream closed before a terminator event (the codex client
         // treats this as an error; so does toker — never a partial row).
         tracing::warn!("codex stream closed before response.completed");
+        if let Some(ctx) = record.as_ref() {
+            record_codex_error(
+                ctx,
+                200,
+                "response_protocol",
+                "upstream Responses stream ended before completion",
+                None,
+                frontend_wire.protocol(),
+            );
+        }
         return upstream_failure(
             frontend_wire.error_wire(),
             "toker upstream error: the stream failed before the turn ended",
@@ -565,9 +988,9 @@ async fn aggregated_turn(
 
 /// The streaming shape: translate-through, one client event per upstream
 /// event, the in-flight guard riding the stream (dropped when the client
-/// goes away or the turn completes, whichever comes first). The row
-/// lands when the turn completes — a hung-up stream records nothing,
-/// like every other path. An upstream that fails mid-turn (a reset, the
+/// goes away or the turn completes, whichever comes first). The attempt
+/// records its terminal state: completion, client cancellation, or upstream
+/// failure. An upstream that fails mid-turn (a reset, the
 /// idle timeout, or a close before the turn's terminator) aborts the
 /// client's response after the events already translated: the
 /// translation must not end cleanly on a turn the upstream never
@@ -733,17 +1156,31 @@ impl StreamState {
     /// One upstream event through both observers: the frontend renderer
     /// emits the client's events, the capture latches the ledger's.
     fn observe(&mut self, event: &ResponseEvent) {
+        self.capture.observe(event);
         for emitted in self.frontend.feed(event, self.response_projection) {
             self.pending.push_back(sse_bytes(&emitted));
         }
-        self.capture.observe(event);
     }
 
-    /// The upstream failed mid-turn: no row (no usage arrived), the
-    /// in-flight hold released now, and the error queued for the client.
+    /// The upstream failed mid-turn: record the physical attempt, release the
+    /// in-flight hold now, and queue the error for the client.
     fn fail(&mut self, error: std::io::Error) {
         self.done = true;
-        self.record = None;
+        if let Some(ctx) = self.record.take() {
+            let error_type = if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                "response_protocol"
+            } else {
+                "ambiguous_transport"
+            };
+            record_codex_error(
+                &ctx,
+                200,
+                error_type,
+                "upstream Responses stream ended before completion",
+                None,
+                self.frontend_wire.protocol(),
+            );
+        }
         self.failure = Some(error);
         drop(self.in_flight.take());
     }
@@ -780,8 +1217,22 @@ impl StreamState {
                 None,
             );
         }
-        // A stream that died without a terminator never reaches here
-        // ([`StreamState::fail`]), and a hung-up client produces no row.
+        self.record.take();
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.record.take() {
+            record_codex_error(
+                &ctx,
+                200,
+                "client_cancelled",
+                "client disconnected before the Responses turn completed",
+                None,
+                self.frontend_wire.protocol(),
+            );
+        }
     }
 }
 
@@ -806,31 +1257,45 @@ fn sse_bytes(event: &SseEvent) -> Bytes {
 /// mapping table. Two shapes exist on the wire (both verified live): the
 /// `{"error": {...}}` wrapper the SSE error events carry, and the
 /// FastAPI-style `{"detail": "..."}` the backend's request-validation
-/// 400s use. An unparseable body degrades to a generic error with no
-/// invented fields.
-fn parse_upstream_error(body: &[u8]) -> ResponseError {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|wrapper| {
-            if let Some(error) = wrapper.get("error") {
-                return serde_json::from_value::<ResponseError>(error.clone()).ok();
-            }
-            if let Some(detail) = wrapper.get("detail").cloned() {
-                // {"detail": "..."} — the message is the whole payload.
-                if let Some(message) = detail.as_str() {
-                    return Some(ResponseError {
-                        kind: None,
-                        code: None,
-                        message: Some(message.to_owned()),
-                        resets_at: None,
-                    });
-                }
-                // A structured detail object still names a message.
-                return serde_json::from_value::<ResponseError>(detail).ok();
-            }
-            None
-        })
-        .unwrap_or_default()
+/// 400s use. An unparseable or unrecognised body is a protocol failure;
+/// it must not become a fabricated generic provider error.
+fn parse_upstream_error(body: &[u8]) -> Option<ResponseError> {
+    let wrapper = serde_json::from_slice::<Value>(body).ok()?;
+    let value = if let Some(error) = wrapper.get("error") {
+        error.clone()
+    } else {
+        let detail = wrapper.get("detail")?.clone();
+        // FastAPI's string detail is itself a recognised error shape.
+        if let Some(message) = detail.as_str() {
+            return Some(ResponseError {
+                kind: None,
+                code: None,
+                message: Some(message.to_owned()),
+                resets_at: None,
+            });
+        }
+        detail
+    };
+    let error = serde_json::from_value::<ResponseError>(value).ok()?;
+    (error.kind.is_some() || error.code.is_some()).then_some(error)
+}
+
+/// The refusal for a request that cannot be translated for this backend. It
+/// is marked, so the coordinator of the first attempt writes the ledger row
+/// (the request has no attempt to attach it to).
+fn translation_error_response(
+    error: &TranslateError,
+    frontend_wire: CodexFrontendWire,
+    client_wants_json: bool,
+) -> Response {
+    let (status, message) = translate_failure(error);
+    super::record::refused(frontend_error_response(
+        frontend_wire,
+        status,
+        "invalid_request_error",
+        &message,
+        !client_wants_json,
+    ))
 }
 
 /// A translation failure → the HTTP status and message the client sees.
@@ -881,6 +1346,9 @@ pub(crate) fn anthropic_error_response(
     }
 }
 
+/// A local error in the shape of the wire the client speaks, which for a
+/// stream is that wire's own error frame: Messages and Responses send an
+/// `event: error`, Chat a bare `data:` chunk.
 pub(crate) fn frontend_error_response(
     wire: CodexFrontendWire,
     status: StatusCode,
@@ -888,17 +1356,38 @@ pub(crate) fn frontend_error_response(
     message: &str,
     stream: bool,
 ) -> Response {
-    if wire == CodexFrontendWire::Anthropic {
-        return anthropic_error_response(status, kind, message, stream);
-    }
-    let value = serde_json::json!({
-        "error": {"type": kind, "message": message}
-    });
-    let json = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+    let (json, frame) = match wire {
+        CodexFrontendWire::Anthropic => {
+            return anthropic_error_response(status, kind, message, stream);
+        }
+        CodexFrontendWire::OpenAiChat => {
+            let json = serde_json::json!({
+                "error": {"message": message, "type": kind, "param": null, "code": null}
+            });
+            (json.clone(), json)
+        }
+        CodexFrontendWire::OpenAiResponses => (
+            serde_json::json!({"error": {"type": kind, "message": message}}),
+            serde_json::json!({
+                "type": "error",
+                "sequence_number": 0,
+                "error": {"type": kind, "code": kind, "message": message},
+            }),
+        ),
+    };
     let (content_type, body) = if stream {
-        ("text/event-stream", format!("data: {json}\n\n"))
+        let frame = serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_owned());
+        let event = if wire == CodexFrontendWire::OpenAiResponses {
+            "event: error\n"
+        } else {
+            ""
+        };
+        ("text/event-stream", format!("{event}data: {frame}\n\n"))
     } else {
-        ("application/json", json)
+        (
+            "application/json",
+            serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_owned()),
+        )
     };
     Response::builder()
         .status(status)

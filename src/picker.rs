@@ -1,35 +1,35 @@
-//! Claude Code's `/model` picker rows for openrouter models, built from
-//! openrouter's live models listing by configured rules.
+//! Claude Code's `/model` picker rows, published from the active routing
+//! policy and the cached catalogues.
 //!
 //! Claude Code reads extra picker rows from `modelPicker` in
 //! `~/.claude/settings.json` (user settings only; a project's settings
-//! cannot carry it). Picking a row sends its `model` verbatim, so a row's
-//! model is `openrouter/<id>`, which toker routes to openrouter's
-//! Anthropic-compatible endpoint (see `docs/internals/routing.md`, which
-//! also records why this is not `/v1/models` discovery).
+//! cannot carry it). Picking a row sends its `model` verbatim, so the rows
+//! are the policy's Claude presentations: what the policy offers is edited
+//! in `toker tui`, and a new model replaces an old one on the next sync
+//! without anyone editing anything. [`sync`] compiles the active revision
+//! against the cached catalogues and reconciles the settings file. The
+//! service never runs it: it may not write outside the state dir, so
+//! `toker picker sync` runs as the user, from setup, after an activation
+//! in the routing TUI, and from the daily picker timer.
 //!
-//! The rows are not a fixed list: each rule names globs over openrouter
-//! ids and keeps the newest matches, so a new version of a model replaces
-//! the old one on the next sync without anyone editing anything. The
-//! rule matching is pure (listing in, rows out); [`sync`] wraps it with
-//! the fetch and the settings write
-//! (`setup::patchers::patch_model_picker`). The service never runs it:
-//! it may not write outside the state dir, so `toker picker sync` runs
-//! as the user, from setup and from the daily picker timer.
+//! [`PickerRule`] and [`default_rules`] are not picker behaviour any more:
+//! they are the legacy `[[providers.openrouter.picker]]` vocabulary that the
+//! revision-one compiler and the legacy import turn into presentations.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use anyhow::{Context, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::catalog::windows::verified_ids;
 use crate::catalog::{fetched, offers};
-use crate::middleware::models::{family_of, newest_in_family};
-use crate::providers::{OpenRouter, Provider};
-use crate::routing::{ProtocolId, RouteRegistry};
-use crate::store::ModelEntry;
+use crate::policy::{AdapterMetadata, FrontendProtocol, ProfileId};
+use crate::routing::RouteRegistry;
+use crate::store::{
+    PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
+    PublicationState, RoutingPublication, Store,
+};
 
 /// The prefix that routes a model to openrouter on the Anthropic wire,
 /// and marks a picker row as toker's: rows whose `model` starts with it
@@ -152,111 +152,6 @@ pub fn default_rules(with_anthropic: bool) -> Vec<PickerRule> {
     rules
 }
 
-/// The built-in rules as `toker.toml` text, to copy and edit
-/// (`toker picker defaults`). Both sets are printed, the anthropic one
-/// marked, because which applies depends on the config they land in.
-pub fn defaults_toml() -> String {
-    #[derive(Serialize)]
-    struct Block<'a> {
-        picker: &'a [PickerRule],
-    }
-    #[derive(Serialize)]
-    struct Providers<'a> {
-        openrouter: Block<'a>,
-    }
-    #[derive(Serialize)]
-    struct File<'a> {
-        providers: Providers<'a>,
-    }
-    let render = |rules: &[PickerRule]| {
-        toml::to_string(&File {
-            providers: Providers {
-                openrouter: Block { picker: rules },
-            },
-        })
-        .expect("picker rules serialise")
-    };
-    let all = default_rules(true);
-    let without = default_rules(false);
-    format!(
-        "# The built-in picker rules. A `picker` list in toker.toml replaces\n\
-         # them wholesale; `picker = []` offers nothing.\n\n{}\n\
-         # Only when neither anthropic_sub nor anthropic_api is enabled:\n\n{}",
-        render(&without),
-        render(&all[without.len()..])
-    )
-}
-
-/// One model from openrouter's listing, as far as the picker reads it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Listed {
-    pub id: String,
-    pub name: String,
-    pub created: i64,
-    pub context_length: Option<u64>,
-    /// USD per token, as listed; `-1` for a router's variable price.
-    pub prompt_price: Option<f64>,
-    pub completion_price: Option<f64>,
-}
-
-/// The listing cut to what Claude Code can use: models that take tools
-/// (it is unusable without them) and text input. Ids already carrying a
-/// `:variant` are dropped, because the variant is a rule's choice; a
-/// listed variant would otherwise compete with its own base model.
-pub fn eligible(listing: &Value) -> anyhow::Result<Vec<Listed>> {
-    let data = listing
-        .get("data")
-        .and_then(Value::as_array)
-        .context("openrouter models listing has no `data` array")?;
-    Ok(data.iter().filter_map(listed_from_raw).collect())
-}
-
-/// Picker candidates are the OpenRouter Messages offers from the same
-/// catalogue/route join used by `/v1/models`. Bare aliases and models with
-/// no verified Messages route never enter the Claude picker.
-pub fn eligible_offers(offers: &[offers::ModelOffer]) -> Vec<Listed> {
-    offers
-        .iter()
-        .filter(|offer| offer.provider == "openrouter")
-        .filter(|offer| offer.routed_model_id.starts_with(ROW_PREFIX))
-        .filter_map(|offer| listed_from_raw(&offer.raw))
-        .collect()
-}
-
-fn listed_from_raw(model: &Value) -> Option<Listed> {
-    let has = |field: &str, item: &str| {
-        model
-            .pointer(field)
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().any(|value| value.as_str() == Some(item)))
-    };
-    if !has("/supported_parameters", "tools") || !has("/architecture/input_modalities", "text") {
-        return None;
-    }
-    let id = model.get("id")?.as_str()?;
-    if id.contains(':') {
-        return None;
-    }
-    let price = |field: &str| {
-        model
-            .pointer(field)
-            .and_then(Value::as_str)
-            .and_then(|price| price.parse::<f64>().ok())
-    };
-    Some(Listed {
-        id: id.to_owned(),
-        name: model
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(id)
-            .to_owned(),
-        created: model.get("created").and_then(Value::as_i64).unwrap_or(0),
-        context_length: model.get("context_length").and_then(Value::as_u64),
-        prompt_price: price("/pricing/prompt"),
-        completion_price: price("/pricing/completion"),
-    })
-}
-
 /// One `modelPicker.options` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -278,397 +173,475 @@ impl Row {
     }
 }
 
-/// The rows the rules produce from the eligible models, with a warning
-/// per rule that offered nothing. A model matched by two rules is the
-/// first one's. `behaves_as` maps a rule's value to the id Claude Code
-/// gets; `None` skips the rule's rows (a family nothing knows).
-pub fn rows(
-    rules: &[PickerRule],
-    models: &[Listed],
-    behaves_as: &dyn Fn(&str) -> Option<String>,
-) -> anyhow::Result<(Vec<Row>, Vec<String>)> {
-    let mut taken = HashSet::new();
-    let mut out = Vec::new();
-    let mut warnings = Vec::new();
-    for rule in rules {
-        let include = globs(&rule.matches)?;
-        let exclude = globs(&rule.exclude)?;
-        let mut candidates: Vec<&Listed> = models
-            .iter()
-            .filter(|model| {
-                include.is_match(&model.id)
-                    && !exclude.is_match(&model.id)
-                    && !taken.contains(model.id.as_str())
+fn claude_publication_key() -> anyhow::Result<PublicationKey> {
+    Ok(PublicationKey::new(
+        crate::policy::FrontendScope::Protocol {
+            protocol: FrontendProtocol::AnthropicMessages,
+        },
+        PublicationAdapter::new("claude_settings")?,
+    ))
+}
+
+pub(crate) fn configured_bindings(
+    config: &crate::config::Config,
+) -> BTreeSet<crate::policy::BindingId> {
+    let enabled = config.enabled_backends();
+    crate::routing::BACKEND_BINDINGS
+        .iter()
+        .filter(|binding| enabled.contains(&binding.provider()))
+        .filter(|binding| binding.canonical_backend().is_some())
+        .map(|binding| binding.id().clone())
+        .collect()
+}
+
+/// The cached catalogues of the backends `config` enables: what the publication
+/// generation of a Claude picker sync is computed over.
+pub(crate) fn configured_catalogs(
+    config: &crate::config::Config,
+    dir: Option<&std::path::Path>,
+) -> fetched::FetchedCatalogs {
+    let mut catalogs = dir.map(fetched::load_cached).unwrap_or_default();
+    catalogs.retain_sources(configured_catalogue_sources(config));
+    catalogs
+}
+
+fn configured_catalogue_sources(config: &crate::config::Config) -> BTreeSet<&'static str> {
+    config
+        .enabled_backends()
+        .into_iter()
+        .filter_map(fetched::FetchedCatalogs::source_of)
+        .collect()
+}
+
+fn rows_for_profile(
+    policy: &crate::policy::CompiledPolicy,
+    profile: Option<&ProfileId>,
+) -> anyhow::Result<Vec<Row>> {
+    policy
+        .publication(profile, FrontendProtocol::AnthropicMessages)
+        .into_values()
+        .filter_map(|presentation| {
+            let AdapterMetadata::Claude { behaves_as } = presentation.metadata()? else {
+                return None;
+            };
+            let behaves_as = behaves_as.as_ref()?;
+            Some(Row {
+                model: presentation.slug().to_owned(),
+                label: presentation
+                    .label()
+                    .unwrap_or_else(|| presentation.slug())
+                    .to_owned(),
+                description: presentation.description().unwrap_or_default().to_owned(),
+                behaves_as: behaves_as.to_owned(),
             })
-            .collect();
-        // Newest first; the id breaks a tie so the order never depends on
-        // the listing's.
-        candidates.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
-        candidates.truncate(rule.keep);
-        if candidates.is_empty() {
-            warnings.push(format!(
-                "picker rule {:?} matches no openrouter model",
-                rule.matches
-            ));
-            continue;
-        }
-        let Some(behaves) = behaves_as(&rule.behaves_as) else {
-            warnings.push(format!(
-                "picker rule {:?}: no known model for behaves_as {:?}; set a full model id",
-                rule.matches, rule.behaves_as
-            ));
-            continue;
-        };
-        for model in candidates {
-            taken.insert(model.id.as_str());
-            let variant = rule.variant.as_deref().unwrap_or("");
-            out.push(Row {
-                model: format!("{ROW_PREFIX}{}{variant}", model.id),
-                label: match variant.strip_prefix(':') {
-                    Some(name) => format!("{} ({name})", model.name),
-                    None => model.name.clone(),
-                },
-                description: description(model),
-                behaves_as: behaves.clone(),
-            });
-        }
-    }
-    Ok((out, warnings))
+        })
+        .map(|row| {
+            if row.model.is_empty() {
+                bail!("policy generated an empty Claude picker model")
+            }
+            Ok(row)
+        })
+        .collect()
 }
 
-/// `OpenRouter · 262k ctx · $0.60/$2.50 per Mtok`, from the listing's
-/// own figures: provider facts shown as given, never a toker estimate.
-fn description(model: &Listed) -> String {
-    let mut parts = vec!["OpenRouter".to_owned()];
-    if let Some(context) = model.context_length.filter(|context| *context > 0) {
-        parts.push(format!("{} ctx", tokens(context)));
-    }
-    match (model.prompt_price, model.completion_price) {
-        (Some(input), Some(output)) if input < 0.0 || output < 0.0 => {
-            parts.push("variable price".to_owned());
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Claude settings cannot represent the incompatible picker presentation for profile {profile:?}"
+)]
+struct IncompatibleClaudeProfile {
+    profile: String,
+}
+
+/// Claude Code has one user settings file even when toker serves several
+/// Anthropic profiles. A profile-local presentation is publishable only when
+/// every profile projects the same rows as the unprefixed/protocol view.
+fn policy_rows(policy: &crate::policy::CompiledPolicy) -> anyhow::Result<Vec<Row>> {
+    let claude = ProfileId::new("claude")?;
+    let shared = rows_for_profile(policy, Some(&claude))?;
+    for profile in policy.anthropic_profiles() {
+        let rows = rows_for_profile(policy, Some(&profile))?;
+        if rows != shared {
+            return Err(IncompatibleClaudeProfile {
+                profile: profile.as_str().to_owned(),
+            }
+            .into());
         }
-        (Some(input), Some(output)) if input == 0.0 && output == 0.0 => {
-            parts.push("free".to_owned());
-        }
-        (Some(input), Some(output)) => parts.push(format!(
-            "${}/${} per Mtok",
-            per_million(input),
-            per_million(output)
-        )),
-        _ => {}
     }
-    parts.join(" \u{b7} ")
+    Ok(shared)
 }
 
-fn tokens(count: u64) -> String {
-    if count >= 1_000_000 {
-        // Two places, trimmed: one would round 1,050,000 up to "1.1M".
-        let millions = format!("{:.2}", count as f64 / 1_000_000.0);
-        format!("{}M", millions.trim_end_matches('0').trim_end_matches('.'))
-    } else {
-        format!("{}k", (count as f64 / 1000.0).round() as u64)
+fn cached_policy_rows(
+    config: &crate::config::Config,
+    store: &Store,
+    publication: RoutingPublication,
+) -> anyhow::Result<(Vec<Row>, RoutingPublication)> {
+    let revision = store
+        .load_policy_revision(publication.desired_revision_id)?
+        .context("Claude settings publication references no policy revision")?;
+    let catalogs = configured_catalogs(config, fetched::cache_dir().ok().as_deref());
+    if catalogs.is_empty()
+        && publication.desired_inventory_generation != fetched::EMPTY_SNAPSHOT_GENERATION
+    {
+        bail!("Claude picker catalogue is unavailable; run `toker picker sync` again");
     }
-}
-
-fn per_million(per_token: f64) -> String {
-    format!("{:.2}", per_token * 1_000_000.0)
-}
-
-/// A `behaves_as` value as Claude Code should get it. A value with no
-/// `-` is a family, resolved to the newest model of it that the ledger
-/// has learned (a model Claude Code itself has sent, so one it knows),
-/// else the newest the hand-verified catalogue names. Anything else is
-/// a model id, passed through.
-pub fn resolve_behaves_as(value: &str, learned: &[ModelEntry]) -> Option<String> {
-    let value = value.trim();
-    if value.contains('-') {
-        return Some(value.to_owned());
+    if fetched::snapshot_generation(&catalogs) != publication.desired_inventory_generation {
+        bail!("Claude picker catalogue changed while synchronising; run `toker picker sync` again");
     }
-    newest_in_family(learned, value).or_else(|| {
-        verified_ids()
-            .filter_map(|id| {
-                let family = family_of(id)?;
-                (family.name == value).then_some((family.version, id))
-            })
-            .max()
-            .map(|(_, id)| id.to_owned())
-    })
+    let registry = RouteRegistry::configured_bindings(configured_bindings(config));
+    let inventory = offers::inventory(&registry, &catalogs);
+    let policy = crate::policy::runtime::compile_stored_revision(&revision, &registry, &inventory)
+        .into_policy()
+        .map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "active policy revision {} has {} compilation diagnostics",
+                revision.revision_id,
+                diagnostics.len()
+            )
+        })?;
+    Ok((policy_rows(&policy)?, publication))
 }
 
 /// What one sync did.
 #[derive(Debug)]
 pub struct SyncReport {
     pub rows: Vec<Row>,
-    pub warnings: Vec<String>,
     /// Whether the settings file changed (always `false` on a dry run).
     pub changed: bool,
 }
 
-/// Fetch openrouter's listing, apply the configured rules (or the
-/// built-in set), and put the rows into claude's settings at `settings`.
-/// With no openrouter block there is nothing to route the rows to, so
-/// toker's rows are removed and nothing is fetched. A failed fetch
-/// returns the error before the settings are touched: a listing that
-/// could not be read must not empty the picker.
-pub async fn sync(
+/// Reconcile Claude Code's `/model` rows in `settings` with the active routing
+/// policy and the cached catalogues. A machine whose database has no active
+/// revision has nothing to publish: that is an error, raised before the
+/// settings are touched, because empty rows would empty the picker.
+pub fn sync(
     config: &crate::config::Config,
     settings: &std::path::Path,
-    http: &reqwest::Client,
     dry_run: bool,
 ) -> anyhow::Result<SyncReport> {
-    let (rows, warnings) = match &config.openrouter {
-        None => (Vec::new(), Vec::new()),
-        Some(openrouter) => {
-            let url = format!(
-                "{}/models",
-                openrouter.upstream.as_str().trim_end_matches('/')
-            );
-            let listing: Value = http
-                .get(&url)
-                .timeout(crate::catalog::fetched::FETCH_TIMEOUT)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .with_context(|| format!("fetching {url}"))?
-                .json()
-                .await
-                .with_context(|| format!("reading {url}"))?;
-            let with_anthropic = config.anthropic_sub.is_none() && config.anthropic_api.is_none();
-            let rules = openrouter
-                .picker
-                .clone()
-                .unwrap_or_else(|| default_rules(with_anthropic));
-            let mut warnings = Vec::new();
-            // Read-only, and only for the learned families: a ledger that
-            // cannot be read costs the learned answer, never the sync.
-            let learned = crate::store::Store::open_read_only(&config.db_path)
-                .and_then(|store| store.load_models())
-                .unwrap_or_else(|error| {
-                    warnings.push(format!(
-                        "learned models unavailable ({error}); families resolve from the verified catalogue"
-                    ));
-                    Vec::new()
-                });
-            let catalog = fetched::parse_openrouter(&listing, 0)?;
-            let mut catalogs = fetched::FetchedCatalogs::default();
-            catalogs.set("openrouter", catalog);
-            let provider: std::sync::Arc<dyn Provider> =
-                std::sync::Arc::new(OpenRouter::new(openrouter.upstream.clone(), None));
-            let registry = RouteRegistry::new([provider], []);
-            let joined = offers::for_frontend(&registry, &catalogs, ProtocolId::AnthropicMessages);
-            let (rows, mut rule_warnings) = rows(&rules, &eligible_offers(&joined), &|value| {
-                resolve_behaves_as(value, &learned)
-            })?;
-            warnings.append(&mut rule_warnings);
-            (rows, warnings)
+    let no_revision = || {
+        anyhow::anyhow!(
+            "no active routing revision in {}: run `toker setup`, or start the service",
+            config.db_path.display()
+        )
+    };
+    let store = if dry_run {
+        match Store::open_read_only(&config.db_path) {
+            Ok(store) => store,
+            Err(crate::store::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(no_revision());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        Store::open(&config.db_path)?
+    };
+    if store
+        .load_routing_policy_state()?
+        .active_revision_id
+        .is_none()
+    {
+        return Err(no_revision());
+    }
+    sync_active_policy(config, &store, settings, dry_run)
+}
+
+fn legacy_picker_identities(settings: &std::path::Path) -> BTreeSet<String> {
+    std::fs::read_to_string(settings)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| {
+            settings
+                .pointer("/modelPicker/options")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            row.get("model")
+                .and_then(Value::as_str)
+                .filter(|model| model.starts_with(ROW_PREFIX))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn sync_active_policy(
+    config: &crate::config::Config,
+    store: &Store,
+    settings: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<SyncReport> {
+    let key = claude_publication_key()?;
+    let publication = store
+        .load_publication(&key)?
+        .context("active policy has no Claude settings publication")?;
+    let (rows, publication) = match cached_policy_rows(config, store, publication.clone()) {
+        Ok(result) => result,
+        Err(error) => {
+            if !dry_run {
+                let (state, detail_code) = publication_error_state(&error);
+                record_publication_result(store, &key, &publication, state, detail_code);
+            }
+            return Err(error);
         }
     };
-    let changed = if dry_run {
-        false
-    } else {
-        let json: Vec<Value> = rows.iter().map(Row::to_json).collect();
-        crate::setup::patchers::patch_model_picker(settings, &json)?
+    if dry_run {
+        return Ok(SyncReport {
+            rows,
+            changed: false,
+        });
+    }
+
+    let json: Vec<_> = rows.iter().map(Row::to_json).collect();
+    let legacy_unknown = publication
+        .detail_code
+        .as_ref()
+        .is_some_and(|code| code.as_str() == "legacy_applied_identities_unknown");
+    let legacy_identities = legacy_unknown.then(|| legacy_picker_identities(settings));
+    let prior_identities = publication
+        .applied_identities
+        .as_ref()
+        .or(legacy_identities.as_ref());
+    let (changed, identities) =
+        match crate::setup::patchers::reconcile_model_picker(settings, prior_identities, &json) {
+            Ok(result) => result,
+            Err(error) => {
+                record_publication_result(
+                    store,
+                    &key,
+                    &publication,
+                    PublicationState::Failed,
+                    "settings_write_failed",
+                );
+                return Err(error);
+            }
+        };
+    let update = PublicationResultUpdate {
+        state: PublicationState::Applied,
+        applied_identities: Some(identities.clone()),
+        detail_code: None,
+        updated_ms: jiff::Timestamp::now().as_millisecond(),
     };
-    Ok(SyncReport {
-        rows,
-        warnings,
-        changed,
-    })
+    match store.compare_and_swap_publication_result(
+        &key,
+        publication.desired_revision_id,
+        publication.desired_inventory_generation,
+        &update,
+    )? {
+        PublicationCasResult::Updated => Ok(SyncReport { rows, changed }),
+        PublicationCasResult::Conflict {
+            current: Some(current),
+        } if current.state == PublicationState::Applied
+            && current.desired_revision_id == publication.desired_revision_id
+            && current.desired_inventory_generation == publication.desired_inventory_generation =>
+        {
+            Ok(SyncReport { rows, changed })
+        }
+        PublicationCasResult::Conflict {
+            current: Some(current),
+        } => {
+            // This process wrote `identities`, but a new desired snapshot won
+            // the state race before it could record them. Take those exact
+            // rows into the immediate retry so the newer policy can converge
+            // without mistaking the prior write for a user collision.
+            let (rows, publication) = cached_policy_rows(config, store, current.clone())?;
+            if publication.desired_revision_id != current.desired_revision_id
+                || publication.desired_inventory_generation != current.desired_inventory_generation
+            {
+                bail!("Claude picker changed while synchronising; run `toker picker sync` again");
+            }
+            let mut prior = publication.applied_identities.clone().unwrap_or_default();
+            prior.extend(identities);
+            let json: Vec<_> = rows.iter().map(Row::to_json).collect();
+            let (retry_changed, identities) =
+                match crate::setup::patchers::reconcile_model_picker(settings, Some(&prior), &json)
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        record_publication_result(
+                            store,
+                            &key,
+                            &publication,
+                            PublicationState::Failed,
+                            "settings_write_failed",
+                        );
+                        return Err(error);
+                    }
+                };
+            let update = PublicationResultUpdate {
+                state: PublicationState::Applied,
+                applied_identities: Some(identities),
+                detail_code: None,
+                updated_ms: jiff::Timestamp::now().as_millisecond(),
+            };
+            match store.compare_and_swap_publication_result(
+                &key,
+                publication.desired_revision_id,
+                publication.desired_inventory_generation,
+                &update,
+            )? {
+                PublicationCasResult::Updated => Ok(SyncReport {
+                    rows,
+                    changed: changed || retry_changed,
+                }),
+                PublicationCasResult::Conflict { .. } => {
+                    bail!(
+                        "Claude picker changed while synchronising; run `toker picker sync` again"
+                    )
+                }
+            }
+        }
+        PublicationCasResult::Conflict { current: None } => {
+            bail!("Claude picker publication disappeared while synchronising")
+        }
+    }
+}
+
+fn publication_error_state(error: &anyhow::Error) -> (PublicationState, &'static str) {
+    if error.downcast_ref::<IncompatibleClaudeProfile>().is_some() {
+        (
+            PublicationState::Unsupported,
+            "incompatible_profile_presentation",
+        )
+    } else {
+        (PublicationState::Failed, "settings_render_failed")
+    }
+}
+
+fn record_publication_result(
+    store: &Store,
+    key: &PublicationKey,
+    publication: &RoutingPublication,
+    state: PublicationState,
+    detail_code: &str,
+) {
+    let update = PublicationResultUpdate {
+        state,
+        applied_identities: None,
+        detail_code: Some(
+            crate::policy::StableId::new(detail_code).expect("static publication failure code"),
+        ),
+        updated_ms: jiff::Timestamp::now().as_millisecond(),
+    };
+    if let Err(error) = store.compare_and_swap_publication_result(
+        key,
+        publication.desired_revision_id,
+        publication.desired_inventory_generation,
+        &update,
+    ) {
+        tracing::error!(%error, "could not record Claude picker publication result");
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
-    fn listing() -> Value {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/openrouter/models-2026-10-06.json"
-        );
-        serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("json")
-    }
-
-    fn verified_only(value: &str) -> Option<String> {
-        resolve_behaves_as(value, &[])
-    }
-
-    fn render(rows: &[Row]) -> String {
-        rows.iter()
-            .map(|row| {
-                format!(
-                    "{} | {} | {} | {}",
-                    row.model, row.label, row.description, row.behaves_as
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
-    fn the_default_rules_against_the_vendored_listing() {
-        let models = eligible(&listing()).expect("eligible");
-        let (rows, warnings) = rows(&default_rules(true), &models, &verified_only).expect("rows");
-        assert_eq!(warnings, Vec::<String>::new());
-        insta::assert_snapshot!(render(&rows));
-    }
-
-    #[test]
-    fn picker_candidates_are_the_joined_messages_offers() {
-        let listing = listing();
-        let mut catalogs = fetched::FetchedCatalogs::default();
-        catalogs.set(
-            "openrouter",
-            fetched::parse_openrouter(&listing, 42).expect("catalog"),
-        );
-        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(OpenRouter::new(
-            "https://openrouter.ai/api/v1".parse().expect("url"),
-            None,
-        ));
-        let registry = RouteRegistry::new([provider], []);
-        let offers = offers::for_frontend(&registry, &catalogs, ProtocolId::AnthropicMessages);
+    fn legacy_picker_identity_adoption_is_limited_to_the_old_prefix() {
+        let dir = crate::test_support::tempdir("picker-legacy-ownership-");
+        let settings = dir.join("settings.json");
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"modelPicker": {"options": [
+                {"model": "openrouter/old"},
+                {"model": "claude-user"},
+                {"model": 42}
+            ]}}))
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            eligible_offers(&offers),
-            eligible(&listing).expect("eligible")
+            legacy_picker_identities(&settings),
+            BTreeSet::from(["openrouter/old".to_owned()])
         );
-        assert!(offers.iter().all(|offer| offer.fetched_at_ms == 42));
     }
 
     #[test]
-    fn the_anthropic_rules_join_only_when_asked() {
-        let models = eligible(&listing()).expect("eligible");
-        let (rows, _) = rows(&default_rules(false), &models, &verified_only).expect("rows");
-        assert!(
-            rows.iter()
-                .all(|row| !row.model.starts_with("openrouter/anthropic/"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.model == "openrouter/openrouter/auto")
-        );
-    }
+    fn incompatible_anthropic_profile_presentations_are_rejected() {
+        use crate::policy::{
+            ArgumentBinding, CURRENT_FORMAT_VERSION, Candidate, CandidateId, CandidateModel,
+            LaneTransitionPolicy, PolicyDocument, PolicyOrigin, Presentation, PresentationId,
+            PresentationSource, Route, RouteChain, RouteId, RouteReference,
+        };
+        use crate::routing::ANTHROPIC_SUB_MESSAGES;
 
-    fn model(id: &str, created: i64) -> Listed {
-        Listed {
-            id: id.to_owned(),
-            name: id.to_owned(),
-            created,
-            context_length: Some(262_144),
-            prompt_price: Some(0.000_000_6),
-            completion_price: Some(0.000_002_5),
+        let requested_model = crate::policy::StableId::new("requested_model").unwrap();
+        let route = Route {
+            id: RouteId::new("route").unwrap(),
+            display_name: "Route".to_owned(),
+            description: None,
+            parameters: vec![requested_model.clone()],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("candidate").unwrap(),
+                    binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "model".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        };
+        let reference = RouteReference {
+            route_id: route.id.clone(),
+            parameters: BTreeMap::from([(requested_model, ArgumentBinding::RequestedModel)]),
+        };
+        let presentation = |id: &str, profile: &str, slug: &str| Presentation {
+            id: PresentationId::new(id).unwrap(),
+            scope: crate::policy::FrontendScope::Profile {
+                profile: ProfileId::new(profile).unwrap(),
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            slug: slug.to_owned(),
+            label: None,
+            description: None,
+            enabled: true,
+            shadow_native: false,
+            source: PresentationSource::Virtual {
+                target: reference.clone(),
+            },
+            metadata: Some(AdapterMetadata::Claude {
+                behaves_as: Some("claude-sonnet-5".to_owned()),
+            }),
+        };
+        let policy = PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![],
+            presentations: vec![
+                presentation("claude", "claude", "claude-model"),
+                presentation("workhorse", "workhorse", "workhorse-model"),
+            ],
+            routes: vec![route],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
         }
-    }
+        .validate()
+        .unwrap();
+        let topology = RouteRegistry::configured_bindings([ANTHROPIC_SUB_MESSAGES.id().clone()]);
+        let compiled = crate::policy::compile(
+            policy,
+            &topology,
+            &offers::OfferInventory::default(),
+            PolicyOrigin::Authored,
+        )
+        .into_policy()
+        .unwrap();
 
-    #[test]
-    fn keep_takes_the_newest_and_a_variant_rides_the_id_and_label() {
-        let models = [
-            model("lab/m-1", 1),
-            model("lab/m-3", 3),
-            model("lab/m-2", 2),
-        ];
-        let mut rule = PickerRule::new(&["lab/m-*"], &[], "claude-sonnet-5");
-        rule.keep = 2;
-        rule.variant = Some(":floor".to_owned());
-        let (rows, _) = rows(&[rule], &models, &verified_only).expect("rows");
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.model.as_str())
-                .collect::<Vec<_>>(),
-            ["openrouter/lab/m-3:floor", "openrouter/lab/m-2:floor"]
-        );
-        assert_eq!(rows[0].label, "lab/m-3 (floor)");
-        assert_eq!(
-            rows[0].description,
-            "OpenRouter \u{b7} 262k ctx \u{b7} $0.60/$2.50 per Mtok"
-        );
-        assert_eq!(
-            rows[0].behaves_as, "claude-sonnet-5",
-            "a full id passes through"
-        );
-    }
-
-    #[test]
-    fn a_model_is_the_first_matching_rule_s() {
-        let models = [model("lab/m-1", 1), model("lab/m-2", 2)];
-        let first = PickerRule::new(&["lab/*"], &[], "claude-opus-5");
-        let second = PickerRule::new(&["lab/m-*"], &[], "claude-haiku-4-5");
-        let (rows, _) = rows(&[first, second], &models, &verified_only).expect("rows");
-        assert_eq!(rows[0].model, "openrouter/lab/m-2");
-        assert_eq!(rows[0].behaves_as, "claude-opus-5");
-        assert_eq!(
-            rows[1].model, "openrouter/lab/m-1",
-            "the second rule's next newest"
-        );
-    }
-
-    #[test]
-    fn a_rule_that_matches_nothing_warns_and_offers_nothing() {
-        let models = [model("lab/m-1", 1)];
-        let rule = PickerRule::new(&["other/*"], &[], "sonnet");
-        let (rows, warnings) = rows(&[rule], &models, &verified_only).expect("rows");
-        assert!(rows.is_empty());
-        assert_eq!(warnings.len(), 1);
-    }
-
-    #[test]
-    fn an_unknown_family_skips_its_rows_rather_than_guessing() {
-        let models = [model("lab/m-1", 1)];
-        let rule = PickerRule::new(&["lab/*"], &[], "nonesuch");
-        let (rows, warnings) = rows(&[rule], &models, &verified_only).expect("rows");
-        assert!(rows.is_empty());
-        assert!(warnings[0].contains("nonesuch"), "{warnings:?}");
-    }
-
-    #[test]
-    fn prices_read_as_listed() {
-        let mut router = model("openrouter/auto", 1);
-        router.prompt_price = Some(-1.0);
-        router.completion_price = Some(-1.0);
-        router.context_length = Some(2_000_000);
-        assert_eq!(
-            description(&router),
-            "OpenRouter \u{b7} 2M ctx \u{b7} variable price"
-        );
-        let mut free = model("lab/free", 1);
-        free.prompt_price = Some(0.0);
-        free.completion_price = Some(0.0);
-        free.context_length = Some(1_048_576);
-        assert_eq!(
-            description(&free),
-            "OpenRouter \u{b7} 1.05M ctx \u{b7} free"
-        );
-    }
-
-    #[test]
-    fn the_listing_is_cut_to_tool_taking_text_models_without_variants() {
-        let listing = json!({"data": [
-            {"id": "a/tools", "supported_parameters": ["tools"],
-             "architecture": {"input_modalities": ["text"]}},
-            {"id": "a/no-tools", "supported_parameters": ["temperature"],
-             "architecture": {"input_modalities": ["text"]}},
-            {"id": "a/image-only", "supported_parameters": ["tools"],
-             "architecture": {"input_modalities": ["image"]}},
-            {"id": "a/tools:free", "supported_parameters": ["tools"],
-             "architecture": {"input_modalities": ["text"]}},
-        ]});
-        let ids: Vec<String> = eligible(&listing)
-            .expect("eligible")
-            .into_iter()
-            .map(|model| model.id)
-            .collect();
-        assert_eq!(ids, ["a/tools"]);
-    }
-
-    #[test]
-    fn families_resolve_learned_first_then_verified() {
-        assert_eq!(
-            resolve_behaves_as("opus", &[]).as_deref(),
-            Some("claude-opus-5-5"),
-            "the newest verified opus"
-        );
-        assert_eq!(
-            resolve_behaves_as("claude-opus-4-8", &[]).as_deref(),
-            Some("claude-opus-4-8")
-        );
+        let error = policy_rows(&compiled).unwrap_err();
+        assert!(error.downcast_ref::<IncompatibleClaudeProfile>().is_some());
     }
 
     #[test]
@@ -683,30 +656,5 @@ mod tests {
         rule.variant = None;
         rule.matches = vec!["lab/[".to_owned()];
         assert!(rule.validate().is_err(), "an unparseable glob");
-    }
-
-    #[test]
-    fn the_printed_defaults_parse_back_as_rules() {
-        #[derive(Deserialize)]
-        struct File {
-            providers: Providers,
-        }
-        #[derive(Deserialize)]
-        struct Providers {
-            openrouter: Block,
-        }
-        #[derive(Deserialize)]
-        struct Block {
-            picker: Vec<PickerRule>,
-        }
-        let text = defaults_toml();
-        let (first, second) = text
-            .split_once("# Only when")
-            .expect("the anthropic set is marked");
-        let parsed: File = toml::from_str(first).expect("the main set parses");
-        assert_eq!(parsed.providers.openrouter.picker, default_rules(false));
-        let second = second.split_once('\n').expect("marker line").1;
-        let parsed: File = toml::from_str(second).expect("the anthropic set parses");
-        assert_eq!(parsed.providers.openrouter.picker.len(), 4);
     }
 }

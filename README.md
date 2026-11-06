@@ -38,37 +38,34 @@ New models come out regularly, but harnesses don't always follow suit. Toker lea
 
 When using opencode, a custom sidebar and footer plugin augments the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and shows the provider breakdown when using a router.
 
-## OpenRouter models in Claude Code
+## Routing
 
-With an OpenRouter backend set up, `toker setup` adds OpenRouter models to Claude Code's `/model` picker, beside the models your Anthropic login gives you. Picking one routes that session through OpenRouter on your OpenRouter key; everything else stays on your subscription. A daily timer keeps the list current, so a new version of a model replaces the old one without you doing anything. Run `toker picker sync --dry-run` to see what it would offer.
+Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of toker's routing live in the database, not in `toker.toml`. Edit them in the routing page of `toker tui`: changes go into a draft, which you validate, preview and then activate, without restarting anything. `toker.toml` keeps the providers, their credentials, and the listener.
 
-Which models appear is decided by rules matched against OpenRouter's model list. The built-in rules offer one flagship and one fast model from the well-known labs, plus OpenRouter's Auto Router (and Anthropic's own models, when you have no Anthropic backend). To choose your own, print the built-in rules with `toker picker defaults`, copy them into `~/.config/toker/toker.toml`, and edit:
+`toker setup` writes that file and, the first time, compiles your routing choices (and any routing fields an older `toker.toml` carried: protocol defaults, model maps, picker rules) into the first active revision. After that it never replaces the active routing. If you edit those fields in `toker.toml` by hand afterwards, use the routing page's status view to import them: `i` replaces the draft with the compiled file, and you activate it like any other draft.
 
-```toml
-[[providers.openrouter.picker]]
-match = ["moonshotai/kimi-k*"]        # OpenRouter model ids, as globs
-exclude = ["*-code", "*-thinking"]
-behaves_as = "sonnet"                 # opus, sonnet, haiku, fable, or a Claude model id
-variant = ":floor"                    # optional OpenRouter variant
-keep = 1                              # how many of the newest matches to offer
-```
-
-Your list replaces the built-in one; `picker = []` offers nothing. `behaves_as` tells Claude Code which of its own models to treat the row like (its prompting and effort settings); pick the closest in cost and capability. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
+Claude Code's `/model` picker follows the active routing. Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each activation. Run `toker picker sync --dry-run` to see what it would offer. Rows for OpenRouter models route that session through OpenRouter on your OpenRouter key; everything else stays on your subscription. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
 
 ## Direct OpenAI API
 
 The setup wizard can enable `openai_api` and place its key in the OS keyring,
 read it from `OPENAI_API_KEY`, or leave authentication to the frontend. To
-configure it by hand:
+configure it by hand, add the provider block:
 
 ```toml
-default_backend_openai_chat = "openai_api"
-
 [providers.openai_api]
 ```
 
-Bare Chat model names then use `https://api.openai.com/v1`; with several Chat
-backends enabled, `openai_api/<model>` selects it for one request. Toker asks
+Make it the Chat default in the routing page: in the routes view (`2`), select
+the default whose scope is `openai_chat`, press `e`, set its route to
+`legacy-route-openai_api-openai_chat_completions` (Tab completes it) and save
+with Ctrl+S.
+Setup writes a second default for the `unprefixed` profile, which is what a
+frontend without a `/f/<name>` prefix uses and which wins over the protocol
+default, so change that one the same way. If there is no default to change,
+`n` adds one. Then `V` validates and `a` activates. Bare Chat model names then
+use `https://api.openai.com/v1`; with several Chat backends enabled,
+`openai_api/<model>` selects it for one request. Toker asks
 streaming completions to include terminal usage and estimates cost only when
 the exact model, service tier, and every required token category are known.
 Unknown pricing evidence leaves the cost blank. `/v1/models` is authenticated
@@ -77,14 +74,15 @@ with the same key and feeds the shared model catalogue.
 ## Codex subscription from OpenAI Chat clients
 
 An OpenAI Chat frontend such as opencode can use the Codex subscription
-backend through the canonical mux. Set it as that protocol's default:
+backend through the canonical mux. Enable the provider:
 
 ```toml
-default_backend_openai_chat = "codex_sub"
-
 [providers.codex_sub]
 ```
 
+Then make it the Chat default in the routing page the same way as above, with
+`legacy-route-codex_sub-codex_responses` as the route (`e` on the
+`openai_chat` and `unprefixed/openai_chat` defaults, or `n` to add one).
 Bare Chat model names then route to the subscription. With several Chat
 backends enabled, a single request can instead select it with a
 `codex_sub/<model>` model id. Streaming, tools, usage, errors and plain JSON

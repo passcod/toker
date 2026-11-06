@@ -26,6 +26,27 @@ use serde_json::Value;
 
 use crate::routing::{BackendBinding, ProtocolId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialAvailability {
+    PassingNative,
+    Held,
+    Refreshable,
+    KnownMissingOrExpired,
+    UnknownUntilAttempt,
+}
+
+impl CredentialAvailability {
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::PassingNative => "passing_native",
+            Self::Held => "held",
+            Self::Refreshable => "refreshable",
+            Self::KnownMissingOrExpired => "known_missing_or_expired",
+            Self::UnknownUntilAttempt => "unknown_until_attempt",
+        }
+    }
+}
+
 /// A backend provider: identity, upstream endpoint mapping, credential
 /// injection, and (when the provider is a meter source) meter parsing.
 /// A binding separately declares its nominal protocol, concrete dialect, and
@@ -108,15 +129,23 @@ pub trait Provider: Send + Sync {
         true
     }
 
-    /// The operator's model routing map for this backend, when one is
-    /// configured (`[providers.<id>.model_map]`, the same
-    /// env-typed pattern the predecessor used):
-    /// the final routing stage consults it, and force-newest
-    /// previews through it (recency reads the identity a request would be
-    /// mapped to, never the asked model). `None` — the default — for
-    /// providers without a map.
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        None
+    /// Content-free credential evidence after destination-specific stripping.
+    /// Providers that cannot prove held/refreshable/missing state stay unknown;
+    /// only a proven miss may preflight-skip a candidate.
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        now_unix_seconds: i64,
+    ) -> CredentialAvailability {
+        let _ = now_unix_seconds;
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            CredentialAvailability::PassingNative
+        } else {
+            CredentialAvailability::UnknownUntilAttempt
+        }
     }
 
     /// Whether `model` on this backend accepts a mid-conversation effort

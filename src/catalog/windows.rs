@@ -12,6 +12,7 @@
 //! selected a different limit for historical rows; they are source
 //! capability, not persisted observation data.
 
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// The date this catalogue was last verified against the providers' pages.
@@ -242,28 +243,55 @@ static ALIASES: &[(&str, &str)] = &[
 /// A provider's context-window declaration as stored alongside a learned
 /// model (`{default, max}` JSON; validated
 /// before it counts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeclaredWindow {
-    pub default_tokens: u64,
-    pub max_tokens: u64,
+    #[serde(rename = "default")]
+    default_tokens: u64,
+    #[serde(rename = "max")]
+    max_tokens: u64,
+}
+
+impl<'de> Deserialize<'de> for DeclaredWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredWindow {
+            #[serde(rename = "default")]
+            default_tokens: u64,
+            #[serde(rename = "max")]
+            max_tokens: u64,
+        }
+
+        let stored = StoredWindow::deserialize(deserializer)?;
+        Self::new(stored.default_tokens, stored.max_tokens)
+            .ok_or_else(|| serde::de::Error::custom("invalid declared context window"))
+    }
 }
 
 impl DeclaredWindow {
+    pub fn new(default_tokens: u64, max_tokens: u64) -> Option<Self> {
+        if default_tokens == 0 || max_tokens == 0 || default_tokens > max_tokens {
+            return None;
+        }
+        Some(Self {
+            default_tokens,
+            max_tokens,
+        })
+    }
+
+    pub fn max_tokens(self) -> u64 {
+        self.max_tokens
+    }
+
     /// Read a stored declaration, rejecting every shape that is not a valid
     /// range: non-objects, missing or fractional or non-positive bounds,
     /// and a default above the maximum all read as absent (a dropped
     /// declaration costs a ceiling; a fabricated one would be a lie).
     pub fn from_json(value: &Value) -> Option<DeclaredWindow> {
-        let object = value.as_object()?;
-        let default_tokens = integer_at(object, "default")?;
-        let max_tokens = integer_at(object, "max")?;
-        if default_tokens == 0 || max_tokens == 0 || default_tokens > max_tokens {
-            return None;
-        }
-        Some(DeclaredWindow {
-            default_tokens,
-            max_tokens,
-        })
+        Self::deserialize(value).ok()
     }
 }
 
@@ -366,7 +394,7 @@ pub fn resolve_context_window(
         }
         return match declared.and_then(DeclaredWindow::from_json) {
             Some(declared) => ContextWindow::Declared {
-                tokens: declared.max_tokens,
+                tokens: declared.max_tokens(),
             },
             None => ContextWindow::Unknown,
         };
@@ -454,13 +482,6 @@ fn iso_day(at: &str) -> Option<&str> {
         && bytes[7] == b'-'
         && digits(&bytes[8..]))
     .then_some(day)
-}
-
-/// A strictly-integer positive field, JS `Number.isInteger` semantics:
-/// fractional, negative, and string numbers
-/// are all invalid.
-fn integer_at(object: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
-    object.get(key).and_then(Value::as_u64).filter(|&v| v > 0)
 }
 
 /// The bracket strip, shared with pricing: remove
@@ -802,6 +823,7 @@ mod tests {
             json!({"default": -1, "max": 128_000}),       // negative
             json!("200000"),                              // not an object
             json!({"default": "32000", "max": "128000"}), // string numbers
+            json!({"default": 32_000, "max": 128_000, "extra": true}),
         ];
         for value in invalid {
             assert_eq!(
@@ -811,6 +833,27 @@ mod tests {
             );
             assert_eq!(DeclaredWindow::from_json(&value), None, "{value}");
         }
+    }
+
+    #[test]
+    fn declaration_construction_and_deserialization_enforce_invariants() {
+        assert_eq!(DeclaredWindow::new(0, 100), None);
+        assert_eq!(DeclaredWindow::new(200, 100), None);
+        assert!(
+            serde_json::from_value::<DeclaredWindow>(json!({
+                "default": 100,
+                "max": 200,
+                "extra": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DeclaredWindow>(json!({
+                "default": 200,
+                "max": 100,
+            }))
+            .is_err()
+        );
     }
 
     #[test]

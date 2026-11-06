@@ -7,7 +7,15 @@
 //! builder, so callers must spell out every field and a new column is a
 //! compile error at every call site.
 
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::policy::{
+    BindingId, CandidateId, PresentationId, RewriteId, RouteFingerprint, RouteId, TraceEvent,
+};
 
 use super::{Error, Result, rows_of};
 use rusqlite::Connection;
@@ -33,6 +41,8 @@ pub enum RowKind {
     Awake,
     /// Non-2xx on a usage path; `status`/`error_type`/`retry_after_ms` set, never priced.
     Error,
+    /// Every policy candidate failed preflight, so no upstream send occurred.
+    RouteUnavailable,
     /// Re-serialisation drifted from the request bytes (invariant 5); `drift_digest` set.
     FidelityDrift,
     /// A session's allowances were deleted from the TUI: its gate applies again.
@@ -50,6 +60,7 @@ impl RowKind {
             Self::ColdRecap => "cold-recap",
             Self::Awake => "awake",
             Self::Error => "error",
+            Self::RouteUnavailable => "route-unavailable",
             Self::FidelityDrift => "fidelity-drift",
             Self::Revoked => "revoked",
         }
@@ -65,6 +76,7 @@ impl RowKind {
             "cold-recap" => Some(Self::ColdRecap),
             "awake" => Some(Self::Awake),
             "error" => Some(Self::Error),
+            "route-unavailable" => Some(Self::RouteUnavailable),
             "fidelity-drift" => Some(Self::FidelityDrift),
             "revoked" => Some(Self::Revoked),
             _ => None,
@@ -121,6 +133,761 @@ impl std::str::FromStr for CostKind {
 /// one place so every consumer (TUI, export) classifies identically.
 pub fn is_api_measurement(kind: Option<RowKind>) -> bool {
     kind.is_none()
+}
+
+/// Lowercase random 128-bit identity shared by one logical request's attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttemptGroupId(String);
+
+impl AttemptGroupId {
+    pub fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    pub fn new(value: impl Into<String>) -> std::result::Result<Self, String> {
+        let value = value.into();
+        if value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(value))
+        } else {
+            Err("attempt group id must be exactly 32 lowercase hexadecimal characters".into())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AttemptGroupId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AttemptGroupId {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRole {
+    Guardian,
+}
+
+impl ChildRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Guardian => "guardian",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        (value == "guardian").then_some(Self::Guardian)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationSource {
+    CodexGuardian,
+}
+
+impl RelationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexGuardian => "codex_guardian",
+        }
+    }
+    fn parse(value: &str) -> Option<Self> {
+        (value == "codex_guardian").then_some(Self::CodexGuardian)
+    }
+}
+
+/// One validated explicit parent relation. Missing parents remain valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLineage {
+    parent_session_id: String,
+    child_role: ChildRole,
+    relation_source: RelationSource,
+}
+
+impl SessionLineage {
+    pub fn codex_guardian(raw_session_id: &str) -> Option<Self> {
+        let parent_session_id = raw_session_id.strip_prefix("guardian:")?;
+        if parent_session_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            parent_session_id: parent_session_id.to_owned(),
+            child_role: ChildRole::Guardian,
+            relation_source: RelationSource::CodexGuardian,
+        })
+    }
+
+    pub fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+
+    pub const fn child_role(&self) -> ChildRole {
+        self.child_role
+    }
+
+    pub const fn relation_source(&self) -> RelationSource {
+        self.relation_source
+    }
+}
+
+pub const ROUTING_TRACE_VERSION: u8 = 2;
+pub const MAX_ROUTING_TRACE_EVENTS: usize = 128;
+pub const MAX_ROUTING_TRACE_BYTES: usize = 64 * 1024;
+pub const MAX_ROUTING_TRACE_MODEL_BYTES: usize = 1_024;
+
+/// Versioned, bounded, content-free routing provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredRoutingTrace {
+    pub version: u8,
+    pub events: Vec<StoredRoutingTraceEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredLookupSource {
+    ProfilePresentation,
+    ProtocolPresentation,
+    ProfileRewrite,
+    ProtocolRewrite,
+    ProfileDefault,
+    ProtocolDefault,
+    Compaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredCandidateState {
+    Available,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredSkipReason {
+    Disabled,
+    BindingUnknown,
+    ProviderUnconfigured,
+    BindingDisabled,
+    CredentialUnavailable,
+    MissingRequiredCapability,
+    BindingAffinity,
+    ModelMissingFromFreshCatalogue,
+    ModelUnknown,
+    SelectorUnresolved,
+    HealthCircuitOpen,
+    PreflightFallbackDisabled,
+    BilledBoundaryDenied,
+    WarmCacheTransitionDenied,
+    WarmLaneTransitionDenied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoredRoutingTraceEvent {
+    Lookup {
+        source: StoredLookupSource,
+        presentation_id: Option<PresentationId>,
+        rewrite_id: Option<RewriteId>,
+    },
+    Candidate {
+        candidate_id: CandidateId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crossed_from: Option<CandidateId>,
+        binding_id: BindingId,
+        model: Option<String>,
+        state: StoredCandidateState,
+        reason: Option<StoredSkipReason>,
+    },
+    Upgrade {
+        from: String,
+        to: String,
+    },
+    Alias {
+        from: String,
+        to: String,
+    },
+    /// Terminal: no route matched the request, so there was no lookup to
+    /// record. Only a route-unavailable row carries it, and then as its only
+    /// event.
+    NoRoute,
+    /// Terminal: a route was chosen (or, for a stale revision, could not be)
+    /// and the lane's pin refused the move. It closes the trace of a
+    /// route-unavailable row.
+    TransitionDenied {
+        reason: StoredTransitionDenied,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredTransitionDenied {
+    StaleRevision,
+    LanePinned,
+    LaneNotCold,
+    CacheNotCold,
+    WarmCacheLoss,
+    InvalidCauseIdentity,
+}
+
+impl From<crate::policy::TransitionDenied> for StoredTransitionDenied {
+    fn from(reason: crate::policy::TransitionDenied) -> Self {
+        use crate::policy::TransitionDenied;
+        match reason {
+            TransitionDenied::StaleRevision => Self::StaleRevision,
+            TransitionDenied::LanePinned => Self::LanePinned,
+            TransitionDenied::LaneNotCold => Self::LaneNotCold,
+            TransitionDenied::CacheNotCold => Self::CacheNotCold,
+            TransitionDenied::WarmCacheLoss => Self::WarmCacheLoss,
+            TransitionDenied::InvalidCauseIdentity => Self::InvalidCauseIdentity,
+        }
+    }
+}
+
+impl StoredRoutingTrace {
+    pub fn from_resolver(events: &[TraceEvent]) -> Result<Self> {
+        if events.len() > MAX_ROUTING_TRACE_EVENTS {
+            return Err(Error::InvalidRoutingState(
+                "routing trace has too many events".into(),
+            ));
+        }
+        let events = events
+            .iter()
+            .filter_map(StoredRoutingTraceEvent::from_resolver)
+            .collect();
+        let mut trace = Self {
+            version: ROUTING_TRACE_VERSION,
+            events,
+        };
+        if serde_json::to_vec(&trace)?.len() > MAX_ROUTING_TRACE_BYTES {
+            // Candidate identity and its closed verdict are the durable
+            // decision. Model spellings are optional trace detail and may be
+            // omitted when a maximum-sized valid route would otherwise exceed
+            // the independent ledger bound.
+            for event in &mut trace.events {
+                if let StoredRoutingTraceEvent::Candidate { model, .. } = event {
+                    *model = None;
+                }
+            }
+        }
+        trace.validate()?;
+        Ok(trace)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !matches!(self.version, 1 | ROUTING_TRACE_VERSION) {
+            return Err(Error::InvalidRoutingState(
+                "unsupported routing trace version".into(),
+            ));
+        }
+        if self.events.len() > MAX_ROUTING_TRACE_EVENTS {
+            return Err(Error::InvalidRoutingState(
+                "routing trace has too many events".into(),
+            ));
+        }
+        let mut previous_candidate = None;
+        let last = self.events.len().saturating_sub(1);
+        for (position, event) in self.events.iter().enumerate() {
+            event.validate()?;
+            if event.is_terminal() && position != last {
+                return Err(Error::InvalidRoutingState(
+                    "routing trace continues past its terminal event".into(),
+                ));
+            }
+            if let StoredRoutingTraceEvent::Candidate {
+                candidate_id,
+                crossed_from,
+                ..
+            } = event
+            {
+                if self.version == 1 && crossed_from.is_some() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace v1 carries crossed-edge evidence".into(),
+                    ));
+                }
+                if let Some(source) = crossed_from
+                    && (previous_candidate.as_ref() != Some(source) || source == candidate_id)
+                {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace crossed edge is inconsistent".into(),
+                    ));
+                }
+                previous_candidate = Some(candidate_id.clone());
+            }
+        }
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_ROUTING_TRACE_BYTES {
+            return Err(Error::InvalidRoutingState(
+                "routing trace exceeds its byte limit".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl StoredRoutingTraceEvent {
+    fn from_resolver(event: &TraceEvent) -> Option<Self> {
+        use crate::policy::{RouteProvenance, SkipReason};
+        let event = match event {
+            TraceEvent::Lookup(provenance) => {
+                let (source, presentation_id, rewrite_id) = match provenance {
+                    RouteProvenance::ProfilePresentation(id) => (
+                        StoredLookupSource::ProfilePresentation,
+                        Some(id.clone()),
+                        None,
+                    ),
+                    RouteProvenance::ProtocolPresentation(id) => (
+                        StoredLookupSource::ProtocolPresentation,
+                        Some(id.clone()),
+                        None,
+                    ),
+                    RouteProvenance::ProfileRewrite(id) => {
+                        (StoredLookupSource::ProfileRewrite, None, Some(id.clone()))
+                    }
+                    RouteProvenance::ProtocolRewrite(id) => {
+                        (StoredLookupSource::ProtocolRewrite, None, Some(id.clone()))
+                    }
+                    RouteProvenance::ProfileDefault => {
+                        (StoredLookupSource::ProfileDefault, None, None)
+                    }
+                    RouteProvenance::ProtocolDefault => {
+                        (StoredLookupSource::ProtocolDefault, None, None)
+                    }
+                    RouteProvenance::Compaction => (StoredLookupSource::Compaction, None, None),
+                };
+                Self::Lookup {
+                    source,
+                    presentation_id,
+                    rewrite_id,
+                }
+            }
+            TraceEvent::Candidate(evidence) => {
+                let (state, reason) = match &evidence.result {
+                    Ok(()) => (StoredCandidateState::Available, None),
+                    Err(reason) => (
+                        StoredCandidateState::Skipped,
+                        Some(match reason {
+                            SkipReason::Disabled => StoredSkipReason::Disabled,
+                            SkipReason::BindingUnknown => StoredSkipReason::BindingUnknown,
+                            SkipReason::ProviderUnconfigured => {
+                                StoredSkipReason::ProviderUnconfigured
+                            }
+                            SkipReason::BindingDisabled => StoredSkipReason::BindingDisabled,
+                            SkipReason::CredentialUnavailable => {
+                                StoredSkipReason::CredentialUnavailable
+                            }
+                            SkipReason::MissingRequiredCapability => {
+                                StoredSkipReason::MissingRequiredCapability
+                            }
+                            SkipReason::BindingAffinity => StoredSkipReason::BindingAffinity,
+                            SkipReason::ModelMissingFromFreshCatalogue => {
+                                StoredSkipReason::ModelMissingFromFreshCatalogue
+                            }
+                            SkipReason::ModelUnknown => StoredSkipReason::ModelUnknown,
+                            SkipReason::SelectorUnresolved => StoredSkipReason::SelectorUnresolved,
+                            SkipReason::HealthCircuitOpen => StoredSkipReason::HealthCircuitOpen,
+                            SkipReason::PreflightFallbackDisabled => {
+                                StoredSkipReason::PreflightFallbackDisabled
+                            }
+                            SkipReason::BilledBoundaryDenied => {
+                                StoredSkipReason::BilledBoundaryDenied
+                            }
+                            SkipReason::WarmCacheTransitionDenied => {
+                                StoredSkipReason::WarmCacheTransitionDenied
+                            }
+                            SkipReason::WarmLaneTransitionDenied => {
+                                StoredSkipReason::WarmLaneTransitionDenied
+                            }
+                        }),
+                    ),
+                };
+                Self::Candidate {
+                    candidate_id: evidence.candidate_id.clone(),
+                    crossed_from: evidence.crossed_from.clone(),
+                    binding_id: evidence.binding_id.clone(),
+                    model: evidence
+                        .model
+                        .as_ref()
+                        .filter(|model| model.len() <= MAX_ROUTING_TRACE_MODEL_BYTES)
+                        .cloned(),
+                    state,
+                    reason,
+                }
+            }
+            TraceEvent::Upgrade { from, to } => {
+                if from.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                    || to.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                {
+                    return None;
+                }
+                Self::Upgrade {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+            TraceEvent::Alias { from, to } => {
+                if from.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                    || to.len() > MAX_ROUTING_TRACE_MODEL_BYTES
+                {
+                    return None;
+                }
+                Self::Alias {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+        };
+        Some(event)
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::NoRoute | Self::TransitionDenied { .. })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let bounded = |value: &str| {
+            if value.len() > MAX_ROUTING_TRACE_MODEL_BYTES {
+                Err(Error::InvalidRoutingState(
+                    "routing trace model identity exceeds its byte limit".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            Self::Lookup {
+                source,
+                presentation_id,
+                rewrite_id,
+            } => {
+                let valid = match source {
+                    StoredLookupSource::ProfilePresentation
+                    | StoredLookupSource::ProtocolPresentation => {
+                        presentation_id.is_some() && rewrite_id.is_none()
+                    }
+                    StoredLookupSource::ProfileRewrite | StoredLookupSource::ProtocolRewrite => {
+                        presentation_id.is_none() && rewrite_id.is_some()
+                    }
+                    StoredLookupSource::ProfileDefault
+                    | StoredLookupSource::ProtocolDefault
+                    | StoredLookupSource::Compaction => {
+                        presentation_id.is_none() && rewrite_id.is_none()
+                    }
+                };
+                if !valid {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace lookup identity is inconsistent".into(),
+                    ));
+                }
+            }
+            Self::Candidate {
+                model,
+                state,
+                reason,
+                ..
+            } => {
+                if model.as_deref().is_some_and(str::is_empty) {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace model identity is empty".into(),
+                    ));
+                }
+                if let Some(model) = model {
+                    bounded(model)?;
+                }
+                if (*state == StoredCandidateState::Available) != reason.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace candidate state is inconsistent".into(),
+                    ));
+                }
+            }
+            Self::Upgrade { from, to } | Self::Alias { from, to } => {
+                if from.is_empty() || to.is_empty() {
+                    return Err(Error::InvalidRoutingState(
+                        "routing trace transition model is empty".into(),
+                    ));
+                }
+                bounded(from)?;
+                bounded(to)?;
+            }
+            Self::NoRoute | Self::TransitionDenied { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttemptIndex(i64);
+
+impl AttemptIndex {
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl TryFrom<i64> for AttemptIndex {
+    type Error = String;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        (value >= 0)
+            .then_some(Self(value))
+            .ok_or_else(|| "attempt index must be non-negative".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptProvenance {
+    pub attempt_group_id: AttemptGroupId,
+    pub attempt_index: AttemptIndex,
+    pub reason: AttemptReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptReason {
+    Initial,
+    ThinkingNegotiation,
+    Authentication,
+    ModelNotFound,
+    RateLimit,
+    ProviderQuota,
+    Overload,
+    ServerError,
+    TransportBeforeAccept,
+    AmbiguousTransport,
+}
+
+impl From<crate::policy::FailureClass> for AttemptReason {
+    fn from(failure: crate::policy::FailureClass) -> Self {
+        match failure {
+            crate::policy::FailureClass::Authentication => Self::Authentication,
+            crate::policy::FailureClass::ModelNotFound => Self::ModelNotFound,
+            crate::policy::FailureClass::RateLimit => Self::RateLimit,
+            crate::policy::FailureClass::ProviderQuota => Self::ProviderQuota,
+            crate::policy::FailureClass::Overload => Self::Overload,
+            crate::policy::FailureClass::ServerError => Self::ServerError,
+            crate::policy::FailureClass::TransportBeforeAccept => Self::TransportBeforeAccept,
+            crate::policy::FailureClass::AmbiguousTransport => Self::AmbiguousTransport,
+        }
+    }
+}
+
+impl AttemptReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ThinkingNegotiation => "thinking_negotiation",
+            Self::Authentication => "authentication",
+            Self::ModelNotFound => "model_not_found",
+            Self::RateLimit => "rate_limit",
+            Self::ProviderQuota => "provider_quota",
+            Self::Overload => "overload",
+            Self::ServerError => "server_error",
+            Self::TransportBeforeAccept => "transport_before_accept",
+            Self::AmbiguousTransport => "ambiguous_transport",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "initial" => Self::Initial,
+            "thinking_negotiation" => Self::ThinkingNegotiation,
+            "authentication" => Self::Authentication,
+            "model_not_found" => Self::ModelNotFound,
+            "rate_limit" => Self::RateLimit,
+            "provider_quota" => Self::ProviderQuota,
+            "overload" => Self::Overload,
+            "server_error" => Self::ServerError,
+            "transport_before_accept" => Self::TransportBeforeAccept,
+            "ambiguous_transport" => Self::AmbiguousTransport,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestLookupProvenance {
+    ProfilePresentation(PresentationId),
+    ProtocolPresentation(PresentationId),
+    ProfileRewrite(RewriteId),
+    ProtocolRewrite(RewriteId),
+    ProfileDefault,
+    ProtocolDefault,
+    Compaction,
+}
+
+impl From<&crate::policy::RouteProvenance> for RequestLookupProvenance {
+    fn from(provenance: &crate::policy::RouteProvenance) -> Self {
+        use crate::policy::RouteProvenance;
+        match provenance {
+            RouteProvenance::ProfilePresentation(id) => Self::ProfilePresentation(id.clone()),
+            RouteProvenance::ProtocolPresentation(id) => Self::ProtocolPresentation(id.clone()),
+            RouteProvenance::ProfileRewrite(id) => Self::ProfileRewrite(id.clone()),
+            RouteProvenance::ProtocolRewrite(id) => Self::ProtocolRewrite(id.clone()),
+            RouteProvenance::ProfileDefault => Self::ProfileDefault,
+            RouteProvenance::ProtocolDefault => Self::ProtocolDefault,
+            RouteProvenance::Compaction => Self::Compaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRouteProvenance {
+    pub policy_revision_id: i64,
+    /// The route the request resolved to. A request that matched no route, or
+    /// whose lane was pinned to a revision the service cannot see yet, has
+    /// none; only a route-unavailable row may lack it.
+    pub route: Option<ResolvedRoute>,
+    pub trace: StoredRoutingTrace,
+    pub outcome: PolicyRoutingOutcome,
+}
+
+/// How a request found its route: the lookup that matched, and the route's
+/// identity at that revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRoute {
+    pub lookup: RequestLookupProvenance,
+    pub route_id: RouteId,
+    pub route_fingerprint: RouteFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRoutingOutcome {
+    Attempt {
+        candidate_id: CandidateId,
+        baseline_model: String,
+    },
+    RouteUnavailable {
+        attempt_group_id: AttemptGroupId,
+    },
+}
+
+impl PolicyRouteProvenance {
+    pub fn from_route_unavailable(
+        policy_revision_id: i64,
+        route_id: RouteId,
+        route_fingerprint: RouteFingerprint,
+        provenance: &crate::policy::RouteProvenance,
+        trace: &[TraceEvent],
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        Ok(Self {
+            policy_revision_id,
+            route: Some(ResolvedRoute {
+                lookup: provenance.into(),
+                route_id,
+                route_fingerprint,
+            }),
+            trace: StoredRoutingTrace::from_resolver(trace)?,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
+    /// No route matched the request under this revision.
+    pub fn from_no_route(
+        policy_revision_id: i64,
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        let trace = StoredRoutingTrace {
+            version: ROUTING_TRACE_VERSION,
+            events: vec![StoredRoutingTraceEvent::NoRoute],
+        };
+        trace.validate()?;
+        Ok(Self {
+            policy_revision_id,
+            route: None,
+            trace,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
+    /// The lane's pin refused the move. `route` is what the resolver chose
+    /// before the refusal, which a stale revision never reaches.
+    pub fn from_transition_denied(
+        policy_revision_id: i64,
+        route: Option<(
+            RouteId,
+            RouteFingerprint,
+            &crate::policy::RouteProvenance,
+            &[TraceEvent],
+        )>,
+        reason: crate::policy::TransitionDenied,
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        let denied = StoredRoutingTraceEvent::TransitionDenied {
+            reason: reason.into(),
+        };
+        let (route, mut trace) = match route {
+            Some((route_id, route_fingerprint, provenance, events)) => (
+                Some(ResolvedRoute {
+                    lookup: provenance.into(),
+                    route_id,
+                    route_fingerprint,
+                }),
+                StoredRoutingTrace::from_resolver(events)?,
+            ),
+            None => (
+                None,
+                StoredRoutingTrace {
+                    version: ROUTING_TRACE_VERSION,
+                    events: Vec::new(),
+                },
+            ),
+        };
+        trace.events.push(denied);
+        trace.validate()?;
+        Ok(Self {
+            policy_revision_id,
+            route,
+            trace,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
+    pub fn from_attempt_plan(plan: &crate::policy::AttemptPlan) -> Result<Option<Self>> {
+        let Some(policy_revision_id) = plan.policy_revision else {
+            return Ok(None);
+        };
+        let route_id = plan.route_id.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its route id".into())
+        })?;
+        let route_fingerprint = plan.route_fingerprint.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its route fingerprint".into())
+        })?;
+        let candidate_id = plan.candidate_id.clone().ok_or_else(|| {
+            Error::InvalidRoutingState("policy attempt is missing its candidate id".into())
+        })?;
+        Ok(Some(Self {
+            policy_revision_id,
+            route: Some(ResolvedRoute {
+                lookup: (&plan.provenance).into(),
+                route_id,
+                route_fingerprint,
+            }),
+            trace: StoredRoutingTrace::from_resolver(&plan.trace)?,
+            outcome: PolicyRoutingOutcome::Attempt {
+                candidate_id,
+                baseline_model: plan.baseline_model.clone(),
+            },
+        }))
+    }
 }
 
 /// One `requests` row: the complete column list as a single struct. Field
@@ -268,6 +1035,210 @@ pub struct RequestRow {
     pub geo: Option<String>,
     /// Provider's fast/low-latency tier flag, when reported.
     pub fast: Option<bool>,
+    /// Selected backend binding. Rows written before policy routing may carry
+    /// it without policy provenance; a policy actual attempt must carry the
+    /// selected binding while a preflight terminal must not.
+    pub binding_id: Option<BindingId>,
+    /// One actual upstream send's identity. Preflight-only terminals have no
+    /// attempt.
+    pub attempt: Option<AttemptProvenance>,
+    /// Closed policy-routing provenance, absent on non-routing rows and on
+    /// rows written before policy routing.
+    pub policy_routing: Option<PolicyRouteProvenance>,
+    pub lineage: Option<SessionLineage>,
+}
+
+struct FlatPolicyRouting<'a> {
+    policy_revision_id: i64,
+    presentation_id: Option<&'a PresentationId>,
+    rewrite_id: Option<&'a RewriteId>,
+    policy_route_id: Option<&'a RouteId>,
+    route_fingerprint: Option<&'a RouteFingerprint>,
+    candidate_id: Option<&'a CandidateId>,
+    baseline_model: Option<&'a str>,
+    terminal_group_id: Option<&'a AttemptGroupId>,
+    trace: &'a StoredRoutingTrace,
+}
+
+impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
+    fn from(routing: &'a PolicyRouteProvenance) -> Self {
+        let (presentation_id, rewrite_id) = match routing.route.as_ref().map(|route| &route.lookup)
+        {
+            Some(
+                RequestLookupProvenance::ProfilePresentation(id)
+                | RequestLookupProvenance::ProtocolPresentation(id),
+            ) => (Some(id), None),
+            Some(
+                RequestLookupProvenance::ProfileRewrite(id)
+                | RequestLookupProvenance::ProtocolRewrite(id),
+            ) => (None, Some(id)),
+            Some(
+                RequestLookupProvenance::ProfileDefault
+                | RequestLookupProvenance::ProtocolDefault
+                | RequestLookupProvenance::Compaction,
+            )
+            | None => (None, None),
+        };
+        let (candidate_id, baseline_model, terminal_group_id) = match &routing.outcome {
+            PolicyRoutingOutcome::Attempt {
+                candidate_id,
+                baseline_model,
+            } => (Some(candidate_id), Some(baseline_model.as_str()), None),
+            PolicyRoutingOutcome::RouteUnavailable { attempt_group_id } => {
+                (None, None, Some(attempt_group_id))
+            }
+        };
+        Self {
+            policy_revision_id: routing.policy_revision_id,
+            presentation_id,
+            rewrite_id,
+            policy_route_id: routing.route.as_ref().map(|route| &route.route_id),
+            route_fingerprint: routing.route.as_ref().map(|route| &route.route_fingerprint),
+            candidate_id,
+            baseline_model,
+            terminal_group_id,
+            trace: &routing.trace,
+        }
+    }
+}
+
+impl PolicyRouteProvenance {
+    /// The route, the lookup it came from, the trace and the outcome agree.
+    /// The row-level checks (kind, binding, attempt) are the caller's.
+    fn validate_shape(&self) -> Result<()> {
+        self.trace.validate()?;
+        let terminal = self.trace.events.last().filter(|event| event.is_terminal());
+        match &self.route {
+            Some(route) => {
+                let expected_lookup = match &route.lookup {
+                    RequestLookupProvenance::ProfilePresentation(id) => {
+                        (StoredLookupSource::ProfilePresentation, Some(id), None)
+                    }
+                    RequestLookupProvenance::ProtocolPresentation(id) => {
+                        (StoredLookupSource::ProtocolPresentation, Some(id), None)
+                    }
+                    RequestLookupProvenance::ProfileRewrite(id) => {
+                        (StoredLookupSource::ProfileRewrite, None, Some(id))
+                    }
+                    RequestLookupProvenance::ProtocolRewrite(id) => {
+                        (StoredLookupSource::ProtocolRewrite, None, Some(id))
+                    }
+                    RequestLookupProvenance::ProfileDefault => {
+                        (StoredLookupSource::ProfileDefault, None, None)
+                    }
+                    RequestLookupProvenance::ProtocolDefault => {
+                        (StoredLookupSource::ProtocolDefault, None, None)
+                    }
+                    RequestLookupProvenance::Compaction => {
+                        (StoredLookupSource::Compaction, None, None)
+                    }
+                };
+                let actual_lookup = self.trace.events.first().and_then(|event| match event {
+                    StoredRoutingTraceEvent::Lookup {
+                        source,
+                        presentation_id,
+                        rewrite_id,
+                    } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+                    _ => None,
+                });
+                if actual_lookup != Some(expected_lookup) {
+                    return Err(Error::InvalidRoutingState(
+                        "policy lookup disagrees with its trace".into(),
+                    ));
+                }
+                if matches!(terminal, Some(StoredRoutingTraceEvent::NoRoute)) {
+                    return Err(Error::InvalidRoutingState(
+                        "a trace that found a route cannot say none matched".into(),
+                    ));
+                }
+            }
+            None => {
+                // Nothing was looked up, so the trace is the one reason.
+                if !matches!(self.trace.events.len(), 1) || terminal.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "a routeless policy trace is exactly its terminal event".into(),
+                    ));
+                }
+            }
+        }
+        match &self.outcome {
+            PolicyRoutingOutcome::Attempt { .. } => {
+                if self.route.is_none() || terminal.is_some() {
+                    return Err(Error::InvalidRoutingState(
+                        "an actual attempt has a route and no terminal trace event".into(),
+                    ));
+                }
+            }
+            PolicyRoutingOutcome::RouteUnavailable { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_request_provenance(row: &RequestRow) -> Result<()> {
+    if let Some(routing) = &row.policy_routing {
+        routing.validate_shape()?;
+        match &routing.outcome {
+            PolicyRoutingOutcome::Attempt { baseline_model, .. } => {
+                if baseline_model.is_empty() || row.binding_id.is_none() || row.attempt.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "invalid policy routing attempt".into(),
+                    ));
+                }
+                if row.kind == Some(RowKind::RouteUnavailable) {
+                    return Err(Error::InvalidRoutingState(
+                        "actual attempt cannot be route-unavailable".into(),
+                    ));
+                }
+            }
+            PolicyRoutingOutcome::RouteUnavailable { .. } => {
+                if row.kind != Some(RowKind::RouteUnavailable)
+                    || row.binding_id.is_some()
+                    || row.attempt.is_some()
+                {
+                    return Err(Error::InvalidRoutingState(
+                        "invalid route-unavailable terminal".into(),
+                    ));
+                }
+            }
+        }
+    } else if row.kind == Some(RowKind::RouteUnavailable) {
+        return Err(Error::InvalidRoutingState(
+            "route-unavailable requires policy routing provenance".into(),
+        ));
+    }
+    if let Some(attempt) = &row.attempt {
+        if row.binding_id.is_none() {
+            return Err(Error::InvalidRoutingState(
+                "actual attempt requires a selected binding".into(),
+            ));
+        }
+        let index = attempt.attempt_index.get();
+        if (index == 0) != (attempt.reason == AttemptReason::Initial) {
+            return Err(Error::InvalidRoutingState(
+                "attempt index disagrees with its reason".into(),
+            ));
+        }
+    }
+    if let Some(lineage) = &row.lineage {
+        if row
+            .session_id
+            .as_deref()
+            .is_none_or(|child| child == lineage.parent_session_id)
+        {
+            return Err(Error::InvalidRoutingState(
+                "lineage requires a distinct child session id".into(),
+            ));
+        }
+        if (lineage.child_role, lineage.relation_source)
+            != (ChildRole::Guardian, RelationSource::CodexGuardian)
+        {
+            return Err(Error::InvalidRoutingState(
+                "unsupported lineage evidence".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Insert one row. The only writer to `requests`; named parameters keep the
@@ -282,6 +1253,12 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
     let system_change = super::opt_json_to_text(&row.system_change)?;
     let model_mappings = super::opt_json_to_text(&row.model_mappings)?;
     let extra = super::opt_json_to_text(&row.extra)?;
+    validate_request_provenance(row)?;
+    let flattened = row.policy_routing.as_ref().map(FlatPolicyRouting::from);
+    let routing_trace = flattened
+        .as_ref()
+        .map(|routing| serde_json::to_string(routing.trace))
+        .transpose()?;
     let kind = row.kind.map(RowKind::as_str);
     let cost_kind = row.cost_kind.map(CostKind::as_str);
 
@@ -297,7 +1274,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             compact_generations, summarising, system_change, system_ladder, system_tail,
             gate_on, cold_on, forced_from, forced_to, downgraded_from, downgraded_to,
             cache_stripped, system_merged, model_mappings, drift_digest,
-            status, error_type, retry_after_ms, extra, betas, geo, fast
+            status, error_type, retry_after_ms, extra, betas, geo, fast,
+            policy_revision_id, presentation_id, rewrite_id, policy_route_id,
+            route_fingerprint, candidate_id, binding_id, baseline_model,
+            attempt_group_id, attempt_index, fallback_reason, routing_trace,
+            parent_session_id, child_role, relation_source
         ) VALUES (
             :ts_ms, :duration_ms, :kind, :frontend, :provider, :route, :session_id, :ping,
             :model, :raw_model, :requested_model, :effective_model,
@@ -309,7 +1290,11 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
             :compact_generations, :summarising, :system_change, :system_ladder, :system_tail,
             :gate_on, :cold_on, :forced_from, :forced_to, :downgraded_from, :downgraded_to,
             :cache_stripped, :system_merged, :model_mappings, :drift_digest,
-            :status, :error_type, :retry_after_ms, :extra, :betas, :geo, :fast
+            :status, :error_type, :retry_after_ms, :extra, :betas, :geo, :fast,
+            :policy_revision_id, :presentation_id, :rewrite_id, :policy_route_id,
+            :route_fingerprint, :candidate_id, :binding_id, :baseline_model,
+            :attempt_group_id, :attempt_index, :fallback_reason, :routing_trace,
+            :parent_session_id, :child_role, :relation_source
         )",
     )?;
     stmt.execute(rusqlite::named_params! {
@@ -371,6 +1356,21 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":betas": row.betas,
         ":geo": row.geo,
         ":fast": row.fast,
+        ":policy_revision_id": flattened.as_ref().map(|routing| routing.policy_revision_id),
+        ":presentation_id": flattened.as_ref().and_then(|routing| routing.presentation_id).map(PresentationId::as_str),
+        ":rewrite_id": flattened.as_ref().and_then(|routing| routing.rewrite_id).map(RewriteId::as_str),
+        ":policy_route_id": flattened.as_ref().and_then(|routing| routing.policy_route_id).map(RouteId::as_str),
+        ":route_fingerprint": flattened.as_ref().and_then(|routing| routing.route_fingerprint).map(ToString::to_string),
+        ":candidate_id": flattened.as_ref().and_then(|routing| routing.candidate_id).map(CandidateId::as_str),
+        ":binding_id": row.binding_id.as_ref().map(BindingId::as_str),
+        ":baseline_model": flattened.as_ref().and_then(|routing| routing.baseline_model),
+        ":attempt_group_id": row.attempt.as_ref().map(|attempt| attempt.attempt_group_id.as_str()).or_else(|| flattened.as_ref().and_then(|routing| routing.terminal_group_id).map(AttemptGroupId::as_str)),
+        ":attempt_index": row.attempt.as_ref().map(|attempt| attempt.attempt_index.get()),
+        ":fallback_reason": row.attempt.as_ref().map(|attempt| attempt.reason.as_str()),
+        ":routing_trace": routing_trace,
+        ":parent_session_id": row.lineage.as_ref().map(|value| value.parent_session_id.as_str()),
+        ":child_role": row.lineage.as_ref().map(|value| value.child_role.as_str()),
+        ":relation_source": row.lineage.as_ref().map(|value| value.relation_source.as_str()),
     })?;
     Ok(())
 }
@@ -443,57 +1443,6 @@ pub(super) fn requests_since(conn: &Connection, ts_ms: i64, limit: i64) -> Resul
         [ts_ms, limit],
         read_row,
     )
-}
-
-/// The learned model store's reseed input: one [`ModelObservation`] per
-/// served model string and [`OBSERVATION_BUCKET_MS`] bucket, over the
-/// whole ledger.
-///
-/// Over the whole ledger because the store reseeded from the newest
-/// 20,000 rows only, and the rows that proved `claude-sonnet-5` at 398k
-/// (imported from ctp) sat further back, so its learned ceiling stayed at
-/// 248k. Bucketed rather than per row so the read stays small as the
-/// ledger grows: every UTC offset in use is a whole number of quarter
-/// hours, so a bucket never straddles a local midnight and its start
-/// names the same local day as every row in it.
-///
-/// API measurements only (`kind IS NULL`): proxy-written rows are not
-/// observations. The served identity is `raw_model`, falling back to
-/// `model` for rows that carry only the normalised form.
-pub(super) fn model_observations(conn: &Connection) -> Result<Vec<ModelObservation>> {
-    rows_of(
-        conn,
-        "SELECT COALESCE(raw_model, model) AS served,
-                (ts_ms / ?1) * ?1 AS bucket_ms,
-                MAX(COALESCE(input, 0) + COALESCE(cache_read, 0)
-                    + COALESCE(cache_write_total, 0)) AS held
-         FROM requests
-         WHERE kind IS NULL AND COALESCE(raw_model, model) IS NOT NULL
-         GROUP BY served, bucket_ms",
-        [OBSERVATION_BUCKET_MS],
-        |row| {
-            Ok(ModelObservation {
-                model: row.get("served")?,
-                bucket_ms: row.get("bucket_ms")?,
-                held: row.get("held")?,
-            })
-        },
-    )
-}
-
-/// The width of a [`model_observations`] bucket: a quarter hour.
-pub const OBSERVATION_BUCKET_MS: i64 = 15 * 60 * 1000;
-
-/// One served model's largest prompt within one bucket
-/// ([`model_observations`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelObservation {
-    /// The served model string as the row recorded it, unnormalised.
-    pub model: String,
-    /// The bucket's start, epoch milliseconds.
-    pub bucket_ms: i64,
-    /// The largest fresh input + cache read + cache write in the bucket.
-    pub held: i64,
 }
 
 /// The meter lookback's narrow read ([`MeterRow`]s): rows within the
@@ -644,8 +1593,16 @@ pub struct DisplayRow {
     pub ts_ms: i64,
     /// Proxy-written kind; `None` marks a real API measurement.
     pub kind: Option<RowKind>,
-    /// Frontend-provided session identity, when known.
+    /// Attempt identity for logical request counts. Historical rows have neither.
+    pub attempt_group_id: Option<AttemptGroupId>,
+    pub attempt_index: Option<AttemptIndex>,
+    /// Frontend-provided raw session identity, when known. This remains the
+    /// lane and cache key even when [`DisplayRow::lineage`] groups it under a
+    /// display parent.
     pub session_id: Option<String>,
+    /// Explicit display-only parent relation. Absence means the raw session
+    /// stays separate; aggregation must never infer a relation from traffic.
+    pub lineage: Option<SessionLineage>,
     /// The request's tool-set digest — with the session, the lane key.
     /// `None` rows share one lane, as the rebuild walk's do.
     pub tools_hash: Option<String>,
@@ -710,7 +1667,9 @@ pub(super) fn display_rows_since(
     rows_of(
         conn,
         "SELECT * FROM (
-            SELECT id, ts_ms, kind, session_id, tools_hash, model, provider,
+            SELECT id, ts_ms, kind, attempt_group_id, attempt_index,
+                   session_id, parent_session_id, child_role, relation_source,
+                   tools_hash, model, provider,
                    input, cache_read, cache_write_5m, cache_write_1h, output,
                    reasoning,
                    cost_usd, cost_kind, req_messages, compact_generations, forced_to,
@@ -738,7 +1697,17 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
             row.get::<_, Option<String>>("kind")?,
             RowKind::parse,
         )?,
+        attempt_group_id: parse_optional_id(
+            "requests.attempt_group_id",
+            row.get("attempt_group_id")?,
+        )?,
+        attempt_index: row
+            .get::<_, Option<i64>>("attempt_index")?
+            .map(AttemptIndex::try_from)
+            .transpose()
+            .map_err(Error::InvalidRoutingState)?,
         session_id: row.get("session_id")?,
+        lineage: read_lineage(row)?,
         tools_hash: row.get("tools_hash")?,
         model: row.get("model")?,
         provider: row.get("provider")?,
@@ -1077,6 +2046,20 @@ pub(super) fn count_requests(conn: &Connection) -> Result<i64> {
     Ok(count)
 }
 
+/// Logical requests: one per explicit attempt group, while ungrouped historical
+/// and proxy rows remain independent. Physical row counts stay available through
+/// [`count_requests`] for import checkpoints and bounded tail reads.
+pub(super) fn count_logical_requests(conn: &Connection) -> Result<i64> {
+    let count = conn.query_row(
+        "SELECT COUNT(DISTINCT attempt_group_id)
+              + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END)
+         FROM requests",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(count.unwrap_or(0))
+}
+
 /// One session's newest API measurement row (kind NULL), whole: the
 /// TUI's session detail reads the models a request asked for and was
 /// served on from it. `None` when the session has no measurement. The
@@ -1090,6 +2073,23 @@ pub(super) fn latest_session_row(
         conn,
         "SELECT * FROM requests
          WHERE session_id = ?1 AND kind IS NULL
+         ORDER BY ts_ms DESC, id DESC LIMIT 1",
+        [session_id],
+        read_row,
+    )
+}
+
+/// The newest measurement for one display session: its raw parent rows plus
+/// rows that explicitly name it as their display parent. This is attribution
+/// only; lane state and request identities remain raw in the returned row.
+pub(super) fn latest_display_session_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<RequestRow>> {
+    super::row_of(
+        conn,
+        "SELECT * FROM requests
+         WHERE (session_id = ?1 OR parent_session_id = ?1) AND kind IS NULL
          ORDER BY ts_ms DESC, id DESC LIMIT 1",
         [session_id],
         read_row,
@@ -1130,9 +2130,8 @@ pub struct SessionCostGroup {
 /// when no row was billed — a real zero sum reads back as `Some(0.0)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummary {
-    /// The session's API-measurement rows (kind `None`) — proxy-written
-    /// kinds (a blocked gate, an error) are not requests the provider
-    /// measured.
+    /// The session's logical API measurements: explicit attempt groups count
+    /// once, while ungrouped historical measurement rows remain independent.
     pub requests: i64,
     /// Earliest/latest measurement timestamps; `None` when there are no
     /// rows.
@@ -1159,12 +2158,26 @@ pub struct SessionSummary {
     pub per_model: Vec<SessionCostGroup>,
 }
 
-/// The session's totals in one row: `COUNT`/`MIN`/`MAX` and the token /
-/// billed-cost sums over its measurement rows. `SUM` skips NULLs and
+/// The session's totals in one row: a logical request count, `MIN`/`MAX`,
+/// and token/billed-cost sums over every physical measurement attempt. `SUM`
+/// skips NULLs and
 /// yields NULL when no row carried the metric — exactly the absence ≠
 /// zero rule, so the sums need no post-processing.
+const DISPLAY_SESSION_TOTALS_SQL: &str = concat!(
+    "SELECT COALESCE(COUNT(DISTINCT attempt_group_id)",
+    " + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END), 0) AS requests,",
+    " MIN(ts_ms) AS first_ts_ms, MAX(ts_ms) AS last_ts_ms,",
+    " SUM(input) AS input, SUM(output) AS output,",
+    " SUM(reasoning) AS reasoning, SUM(cache_read) AS cache_read,",
+    " SUM(cache_write_total) AS cache_write_total,",
+    " SUM(CASE WHEN cost_kind = 'billed' THEN cost_usd END) AS billed_total",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1) AND kind IS NULL",
+);
+
 const SESSION_TOTALS_SQL: &str = concat!(
-    "SELECT COUNT(*) AS requests,",
+    "SELECT COALESCE(COUNT(DISTINCT attempt_group_id)",
+    " + SUM(CASE WHEN attempt_group_id IS NULL THEN 1 ELSE 0 END), 0) AS requests,",
     " MIN(ts_ms) AS first_ts_ms, MAX(ts_ms) AS last_ts_ms,",
     " SUM(input) AS input, SUM(output) AS output,",
     " SUM(reasoning) AS reasoning, SUM(cache_read) AS cache_read,",
@@ -1180,6 +2193,17 @@ const SESSION_TOTALS_SQL: &str = concat!(
 /// also a column name, and resolution by alias is a rule not worth
 /// leaning on. The name ASC tiebreaker keeps equal-cost groups in a
 /// deterministic order.
+const DISPLAY_SESSION_PROVIDER_SQL: &str = concat!(
+    "SELECT COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1)",
+    " AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC,",
+    " COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') ASC",
+);
+
 const SESSION_PROVIDER_SQL: &str = concat!(
     "SELECT COALESCE(json_extract(extra, '$.serving_provider'), provider, 'unknown') AS label,",
     " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
@@ -1192,6 +2216,16 @@ const SESSION_PROVIDER_SQL: &str = concat!(
 
 /// The billed cost by model, same shape and ordering as the provider
 /// breakdown.
+const DISPLAY_SESSION_MODEL_SQL: &str = concat!(
+    "SELECT COALESCE(model, 'unknown') AS label,",
+    " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
+    " FROM requests",
+    " WHERE (session_id = ?1 OR parent_session_id = ?1)",
+    " AND kind IS NULL AND cost_kind = 'billed'",
+    " GROUP BY COALESCE(model, 'unknown')",
+    " ORDER BY SUM(cost_usd) DESC, COALESCE(model, 'unknown') ASC",
+);
+
 const SESSION_MODEL_SQL: &str = concat!(
     "SELECT COALESCE(model, 'unknown') AS label,",
     " COUNT(*) AS requests, SUM(cost_usd) AS cost_usd",
@@ -1216,6 +2250,37 @@ fn read_cost_group(row: &rusqlite::Row<'_>) -> Result<SessionCostGroup> {
 /// all — the endpoint cannot tell them apart, by design) answers
 /// `requests: 0` with `None` everywhere else.
 pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<SessionSummary> {
+    session_summary_with(
+        conn,
+        session_id,
+        SESSION_TOTALS_SQL,
+        SESSION_PROVIDER_SQL,
+        SESSION_MODEL_SQL,
+    )
+}
+
+/// The TUI detail aggregate for a display parent. It includes only rows that
+/// explicitly name the parent relation, never guessed neighbours.
+pub(super) fn display_session_summary(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionSummary> {
+    session_summary_with(
+        conn,
+        session_id,
+        DISPLAY_SESSION_TOTALS_SQL,
+        DISPLAY_SESSION_PROVIDER_SQL,
+        DISPLAY_SESSION_MODEL_SQL,
+    )
+}
+
+fn session_summary_with(
+    conn: &Connection,
+    session_id: &str,
+    totals_sql: &str,
+    provider_sql: &str,
+    model_sql: &str,
+) -> Result<SessionSummary> {
     // COUNT(*) always yields exactly one row, even over an empty set, so
     // the only failure mode here is a genuine SQLite error.
     let (
@@ -1228,7 +2293,7 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
         cache_read,
         cache_write_total,
         billed_total,
-    ) = conn.query_row(SESSION_TOTALS_SQL, [session_id], |row| {
+    ) = conn.query_row(totals_sql, [session_id], |row| {
         Ok((
             row.get::<_, i64>("requests")?,
             row.get::<_, Option<i64>>("first_ts_ms")?,
@@ -1241,8 +2306,8 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
             row.get::<_, Option<f64>>("billed_total")?,
         ))
     })?;
-    let per_provider = rows_of(conn, SESSION_PROVIDER_SQL, [session_id], read_cost_group)?;
-    let per_model = rows_of(conn, SESSION_MODEL_SQL, [session_id], read_cost_group)?;
+    let per_provider = rows_of(conn, provider_sql, [session_id], read_cost_group)?;
+    let per_model = rows_of(conn, model_sql, [session_id], read_cost_group)?;
     Ok(SessionSummary {
         requests,
         first_ts_ms,
@@ -1263,15 +2328,19 @@ pub(super) fn session_summary(conn: &Connection, session_id: &str) -> Result<Ses
 /// `None` — a corrupted enum value must never reclassify a row as an API
 /// measurement (invariant 3).
 fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
+    let kind = parse_stored(
+        "kind",
+        row.get::<_, Option<String>>("kind")?,
+        RowKind::parse,
+    )?;
+    let binding_id = parse_optional_id("requests.binding_id", row.get("binding_id")?)?;
+    let attempt = read_attempt_provenance(row)?;
+    let policy_routing = read_policy_routing(row, kind, binding_id.as_ref(), attempt.as_ref())?;
     Ok(RequestRow {
         id: row.get("id")?,
         ts_ms: row.get("ts_ms")?,
         duration_ms: row.get("duration_ms")?,
-        kind: parse_stored(
-            "kind",
-            row.get::<_, Option<String>>("kind")?,
-            RowKind::parse,
-        )?,
+        kind,
         frontend: row.get("frontend")?,
         provider: row.get("provider")?,
         route: row.get("route")?,
@@ -1331,7 +2400,236 @@ fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
         betas: row.get("betas")?,
         geo: row.get("geo")?,
         fast: row.get("fast")?,
+        binding_id,
+        attempt,
+        policy_routing,
+        lineage: read_lineage(row)?,
     })
+}
+
+fn read_attempt_provenance(row: &rusqlite::Row<'_>) -> Result<Option<AttemptProvenance>> {
+    let group = parse_optional_id("requests.attempt_group_id", row.get("attempt_group_id")?)?;
+    let index: Option<i64> = row.get("attempt_index")?;
+    let reason = parse_stored(
+        "requests.fallback_reason",
+        row.get("fallback_reason")?,
+        AttemptReason::parse,
+    )?;
+    match (group, index, reason) {
+        (None, None, None) | (Some(_), None, None) => Ok(None),
+        (Some(attempt_group_id), Some(index), Some(reason)) => {
+            let attempt_index =
+                AttemptIndex::try_from(index).map_err(Error::InvalidRoutingState)?;
+            Ok(Some(AttemptProvenance {
+                attempt_group_id,
+                attempt_index,
+                reason,
+            }))
+        }
+        _ => Err(Error::InvalidRoutingState(
+            "stored attempt provenance is partial".into(),
+        )),
+    }
+}
+
+fn read_policy_routing(
+    row: &rusqlite::Row<'_>,
+    kind: Option<RowKind>,
+    binding_id: Option<&BindingId>,
+    attempt: Option<&AttemptProvenance>,
+) -> Result<Option<PolicyRouteProvenance>> {
+    let revision: Option<i64> = row.get("policy_revision_id")?;
+    let presentation: Option<PresentationId> =
+        parse_optional_id("requests.presentation_id", row.get("presentation_id")?)?;
+    let rewrite: Option<RewriteId> =
+        parse_optional_id("requests.rewrite_id", row.get("rewrite_id")?)?;
+    let route: Option<RouteId> =
+        parse_optional_id("requests.policy_route_id", row.get("policy_route_id")?)?;
+    let fingerprint: Option<RouteFingerprint> =
+        parse_optional_id("requests.route_fingerprint", row.get("route_fingerprint")?)?;
+    let candidate: Option<CandidateId> =
+        parse_optional_id("requests.candidate_id", row.get("candidate_id")?)?;
+    let baseline: Option<String> = row.get("baseline_model")?;
+    let group: Option<AttemptGroupId> =
+        parse_optional_id("requests.attempt_group_id", row.get("attempt_group_id")?)?;
+    let trace = match row.get::<_, Option<String>>("routing_trace")? {
+        Some(json) => {
+            let trace: StoredRoutingTrace = serde_json::from_str(&json)?;
+            trace.validate()?;
+            Some(trace)
+        }
+        None => None,
+    };
+    let values_present = [
+        revision.is_some(),
+        presentation.is_some(),
+        rewrite.is_some(),
+        route.is_some(),
+        fingerprint.is_some(),
+        candidate.is_some(),
+        baseline.is_some(),
+        trace.is_some(),
+    ];
+    if values_present.iter().all(|present| !present) {
+        return Ok(None);
+    }
+    let (Some(policy_revision_id), Some(trace)) = (revision, trace) else {
+        return Err(Error::InvalidRoutingState(
+            "stored policy routing provenance is partial".into(),
+        ));
+    };
+    let route = match (route, fingerprint) {
+        (Some(route_id), Some(route_fingerprint)) => {
+            let trace_lookup = trace.events.first().and_then(|event| match event {
+                StoredRoutingTraceEvent::Lookup {
+                    source,
+                    presentation_id,
+                    rewrite_id,
+                } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+                _ => None,
+            });
+            let lookup = match (presentation, rewrite, trace_lookup) {
+                (
+                    Some(id),
+                    None,
+                    Some((StoredLookupSource::ProfilePresentation, Some(trace_id), None)),
+                ) if id == *trace_id => RequestLookupProvenance::ProfilePresentation(id),
+                (
+                    Some(id),
+                    None,
+                    Some((StoredLookupSource::ProtocolPresentation, Some(trace_id), None)),
+                ) if id == *trace_id => RequestLookupProvenance::ProtocolPresentation(id),
+                (
+                    None,
+                    Some(id),
+                    Some((StoredLookupSource::ProfileRewrite, None, Some(trace_id))),
+                ) if id == *trace_id => RequestLookupProvenance::ProfileRewrite(id),
+                (
+                    None,
+                    Some(id),
+                    Some((StoredLookupSource::ProtocolRewrite, None, Some(trace_id))),
+                ) if id == *trace_id => RequestLookupProvenance::ProtocolRewrite(id),
+                (None, None, Some((StoredLookupSource::ProfileDefault, None, None))) => {
+                    RequestLookupProvenance::ProfileDefault
+                }
+                (None, None, Some((StoredLookupSource::ProtocolDefault, None, None))) => {
+                    RequestLookupProvenance::ProtocolDefault
+                }
+                (None, None, Some((StoredLookupSource::Compaction, None, None))) => {
+                    RequestLookupProvenance::Compaction
+                }
+                _ => {
+                    return Err(Error::InvalidRoutingState(
+                        "stored policy lookup disagrees with its trace".into(),
+                    ));
+                }
+            };
+            Some(ResolvedRoute {
+                lookup,
+                route_id,
+                route_fingerprint,
+            })
+        }
+        // A routeless terminal names no lookup either.
+        (None, None) if presentation.is_none() && rewrite.is_none() => None,
+        _ => {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing provenance is partial".into(),
+            ));
+        }
+    };
+    let outcome = if kind == Some(RowKind::RouteUnavailable) {
+        let Some(attempt_group_id) = group else {
+            return Err(Error::InvalidRoutingState(
+                "stored route-unavailable terminal has no group".into(),
+            ));
+        };
+        if candidate.is_some() || baseline.is_some() || binding_id.is_some() || attempt.is_some() {
+            return Err(Error::InvalidRoutingState(
+                "stored route-unavailable terminal carries attempt fields".into(),
+            ));
+        }
+        PolicyRoutingOutcome::RouteUnavailable { attempt_group_id }
+    } else {
+        let (Some(candidate_id), Some(baseline_model), Some(_)) = (candidate, baseline, attempt)
+        else {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing attempt is partial".into(),
+            ));
+        };
+        if binding_id.is_none() {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing attempt is invalid".into(),
+            ));
+        }
+        PolicyRoutingOutcome::Attempt {
+            candidate_id,
+            baseline_model,
+        }
+    };
+    let provenance = PolicyRouteProvenance {
+        policy_revision_id,
+        route,
+        trace,
+        outcome,
+    };
+    provenance.validate_shape()?;
+    Ok(Some(provenance))
+}
+
+fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    value
+        .map(|value| {
+            value.parse().map_err(|error| {
+                Error::InvalidRoutingState(format!("invalid {column} {value:?}: {error}"))
+            })
+        })
+        .transpose()
+}
+
+fn read_lineage(row: &rusqlite::Row<'_>) -> Result<Option<SessionLineage>> {
+    let parent: Option<String> = row.get("parent_session_id")?;
+    let role: Option<String> = row.get("child_role")?;
+    let source: Option<String> = row.get("relation_source")?;
+    match (parent, role, source) {
+        (None, None, None) => Ok(None),
+        (Some(parent_session_id), Some(role), Some(source)) => {
+            let child_role = ChildRole::parse(&role).ok_or(Error::UnknownDbValue {
+                column: "requests.child_role",
+                value: role,
+            })?;
+            let relation_source = RelationSource::parse(&source).ok_or(Error::UnknownDbValue {
+                column: "requests.relation_source",
+                value: source,
+            })?;
+            let child: Option<String> = row.get("session_id")?;
+            if child
+                .as_deref()
+                .is_none_or(|child| child == parent_session_id)
+            {
+                return Err(Error::InvalidRoutingState(
+                    "stored lineage has no distinct child".into(),
+                ));
+            }
+            let lineage = SessionLineage::codex_guardian(&format!("guardian:{parent_session_id}"))
+                .ok_or_else(|| {
+                    Error::InvalidRoutingState("stored lineage has an empty parent".into())
+                })?;
+            if lineage.child_role != child_role || lineage.relation_source != relation_source {
+                return Err(Error::InvalidRoutingState(
+                    "stored lineage evidence is unsupported".into(),
+                ));
+            }
+            Ok(Some(lineage))
+        }
+        _ => Err(Error::InvalidRoutingState(
+            "lineage fields must be all NULL or all present".into(),
+        )),
+    }
 }
 
 /// Parse a stored enum column, rejecting unknown values instead of silently
@@ -1439,6 +2737,7 @@ pub const JSON_TEXT_COLUMNS: &[&str] = &[
     "system_tail",
     "model_mappings",
     "extra",
+    "routing_trace",
     "betas",
 ];
 

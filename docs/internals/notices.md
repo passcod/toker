@@ -67,9 +67,15 @@ session's context size is stated when the lane table knows it (the largest lane,
 `lanes::session_prompt`) and dropped when it does not, rather than printed as a
 zero that would read as a measurement.
 
-The cold notice names a cheaper compaction model only when the retarget has
-actually resolved one, since an unarmed proxy promising a cheap compaction would
-be the feature lying about its own configuration. It states the re-read's
-cache-write multiple only when the lane recorded its tier. The openai path's
-cold notice names no compaction target at all, because that path never retargets
-one.
+The cold notice names a compaction model only when the active policy has one,
+since a proxy promising a cheap compaction it has not resolved would be the
+feature lying about its configuration. The plan for the turn the notice is
+stopping is an ordinary turn's, so the handler asks the resolver again with the
+compaction class and the same facts (profile, protocol, requested model, the
+lane), and names the model that plan moves the compaction to
+(`AttemptPlan::compaction_move`). That is a different model from the one the
+session is on: a policy with no compaction target, or one that would keep the
+model, leaves the notice without the sentence. The question is answered by
+resolution alone and changes no lane state. It states the re-read's cache-write
+multiple only when the lane recorded its tier. The openai path's cold notice
+names no compaction target at all, because that path never retargets one.

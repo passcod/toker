@@ -1,33 +1,22 @@
-//! The `/_toker/*` control endpoints (plan: frontend adapters —
-//! "localhost only, gated by a custom header (a cross-origin web page
-//! cannot drive it without an unanswered preflight)").
+//! The `/_toker/*` control endpoints.
 //!
 //! Gate: the `x-toker-control` header must carry the operation's verb
-//! (`status`, `models-merge`, `session`, `shutdown`). A page that cannot set a custom
-//! header without an unanswered CORS preflight can never pass the gate. A
-//! wrong or missing gate is a 403 naming what is missing — loopback-only, no
-//! discovery value to suppress.
+//! (`status`, `session`, `shutdown`, and one per routing operation). A page
+//! cannot set a custom header without a CORS preflight nothing answers, so
+//! none can pass the gate. A wrong or missing gate is a 403 naming what is
+//! missing: loopback-only, so there is no discovery value to suppress.
 //!
-//! `/_toker/session` is the attribution plugin's query (plan: "the
-//! attribution plugin's queries"): opencode sends its session id on every
-//! request, toker records it per ledger row, so the plugin asks for one
-//! session's aggregate and the answer is exact — the predecessor-era
-//! token-vector join is retired. The reply is counts, sums, and labels the rows already
-//! carry: no content, no credentials (invariants 1-2).
-//!
-//! `/_toker/models/merge` is the promote-model handover
-//! (the predecessor's control-merge semantics, made real):
-//! the promote-model tool grants days to
-//! a model the proxy has already served, so a promotion applies to the
-//! running process instead of waiting for a restart. It can only add to
-//! what the store already knows, and only for models it has served — the
-//! worst it can do is what promote-model does on purpose. The custom
-//! header and the JSON content type are what keep a web page out.
+//! `/_toker/session` is the attribution plugin's query: opencode sends its
+//! session id on every request, toker records it per ledger row, so the
+//! plugin asks for one session's aggregate and the answer is exact. The reply
+//! is counts, sums, and labels the rows already carry: no content, no
+//! credentials (invariants 1-2).
 //!
 //! `/_toker/shutdown` is `toker restart`'s second step: the CLI waits
 //! for a quiet moment on `status`, then asks this instance, by the id
 //! `status` gave it, to drain and exit; systemd starts the next one. It
-//! is gated exactly like `models/merge`. The worst a caller can do with
+//! is gated exactly like the other mutating endpoints (verb header and a JSON
+//! content type). The worst a caller can do with
 //! it is what `systemctl --user restart` does: by default the drain lets
 //! every response under way finish, and with `force` they are cut, but
 //! the exit is the normal one either way.
@@ -38,14 +27,17 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+pub(crate) mod derived;
+pub(super) mod routing;
+
 use super::Server;
-use crate::middleware::models::{MergeIncoming, MergeOutcome};
-use crate::store::SessionSummary;
+use crate::middleware::cold::ttl_of;
+use crate::store::{Lane, SessionSummary};
 
 const CONTROL_HEADER: &str = "x-toker-control";
 
-/// A control body larger than this is a client bug, not a promotion —
-/// the handover carries one model's days and ceiling.
+/// A control body larger than this is a client bug: the largest one is a
+/// routing policy document.
 const MAX_CONTROL_BODY: usize = 1024 * 1024;
 
 /// `GET /_toker/status` — the resolved config (sans secrets), ledger row
@@ -54,7 +46,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
     if !control_token_ok(request.headers(), "status") {
         return forbidden();
     }
-    let rows = match server.store.count_requests() {
+    let rows = match server.store.count_logical_requests() {
         Ok(rows) => rows,
         Err(error) => return store_error(error),
     };
@@ -130,8 +122,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
         "port": config.port,
         "db_path": config.db_path.display().to_string(),
         "session_header_names": config.session_header_names,
-        "default_backend_openai_chat": config.default_backend_openai_chat,
-        "default_backend_anthropic": config.default_backend_anthropic,
+        "policy_revision_id": server.policy_runtime.capture().revision_id(),
         "providers": providers,
         "requests": rows,
         "last_request_ts_ms": last_request_ts_ms,
@@ -162,6 +153,11 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
 /// with `null`s — the endpoint cannot distinguish "absent session" from
 /// "session that measured nothing", and the plugin renders nothing
 /// either way. No content and no credentials leave (invariants 1-2).
+///
+/// `lanes` is the session's rows from the lane table (exact session id,
+/// newest first), each with a state computed now (see `lane_body`). A
+/// session the table does not know, or has pruned, answers `[]`, never an
+/// invented cold lane.
 pub(crate) async fn session(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "session") {
         return forbidden();
@@ -177,15 +173,26 @@ pub(crate) async fn session(State(server): State<Server>, request: Request) -> R
         )
             .into_response();
     };
-    match server.store.session_summary(&session_id) {
-        Ok(summary) => Json(session_body(&session_id, &summary)).into_response(),
-        Err(error) => store_error(error),
-    }
+    let summary = match server.store.session_summary(&session_id) {
+        Ok(summary) => summary,
+        Err(error) => return store_error(error),
+    };
+    let lanes = match server.store.load_session_lanes(&session_id) {
+        Ok(lanes) => lanes,
+        Err(error) => return store_error(error),
+    };
+    Json(session_body(
+        &session_id,
+        &summary,
+        &lanes,
+        super::record::now_ms(),
+    ))
+    .into_response()
 }
 
-/// The `/_toker/session` reply body. The breakdowns are arrays — empty
-/// when there is nothing to break down, never `null`.
-fn session_body(session_id: &str, summary: &SessionSummary) -> Value {
+/// The `/_toker/session` reply body. The breakdowns and `lanes` are arrays
+/// — empty when there is nothing to break down, never `null`.
+fn session_body(session_id: &str, summary: &SessionSummary, lanes: &[Lane], now_ms: i64) -> Value {
     let per_provider: Vec<Value> = summary
         .per_provider
         .iter()
@@ -225,6 +232,60 @@ fn session_body(session_id: &str, summary: &SessionSummary) -> Value {
             "per_provider": per_provider,
             "per_model": per_model,
         },
+        "lanes": lanes.iter().map(|lane| lane_body(lane, now_ms)).collect::<Vec<_>>(),
+    })
+}
+
+/// How many leading characters of a lane's tool-set digest identify it in
+/// the reply. The digest is already a one-way hash of the tool list; the
+/// reply carries a short prefix so a client can tell lanes apart without
+/// holding the lane key.
+const TOOLS_ID_CHARS: usize = 6;
+
+/// One lane as the session reply shows it: the operational metadata the
+/// `lanes` row already keeps, plus a state computed at query time. Never
+/// content (invariant 1), and a field the lane never recorded is `null`,
+/// not zero (invariant 3's absence rule).
+///
+/// - `state`: `ping` for a ping lane (its cache is not the conversation's,
+///   so it is never called warm or cold), else `cold` once the idle time
+///   has reached the cache's lifetime (`cold::ttl_of`, the gate's own
+///   reading, so an unrecorded tier is the long one) and `warm` before.
+///   A lane stamped in the future (a clock that moved) has no idle time
+///   to measure: `null`, as the cold gate treats it.
+/// - `warm_remaining_ms`: only for a warm lane whose TTL was actually
+///   recorded. An unrecorded tier gives the gate a long default but
+///   gives this view nothing to count down from.
+/// - `forced`: the sticky model transition, `null` when the lane has none.
+fn lane_body(lane: &Lane, now_ms: i64) -> Value {
+    let idle_ms = (now_ms >= lane.updated_ms).then(|| now_ms - lane.updated_ms);
+    let ttl_ms = ttl_of(lane);
+    let state = match idle_ms {
+        _ if lane.ping == Some(true) => Some("ping"),
+        None => None,
+        Some(idle) if idle >= ttl_ms => Some("cold"),
+        Some(_) => Some("warm"),
+    };
+    let warm_remaining_ms = match (state, idle_ms, lane.ttl) {
+        (Some("warm"), Some(idle), Some(_)) => Some(ttl_ms - idle),
+        _ => None,
+    };
+    let forced = (lane.forced_from.is_some() || lane.forced_to.is_some())
+        .then(|| json!({"from": lane.forced_from, "to": lane.forced_to}));
+    json!({
+        "tools_id": lane
+            .tools_hash
+            .as_ref()
+            .map(|hash| hash.chars().take(TOOLS_ID_CHARS).collect::<String>()),
+        "state": state,
+        "ping": lane.ping == Some(true),
+        "updated_ms": lane.updated_ms,
+        "idle_ms": idle_ms,
+        "prompt_tokens": lane.prompt_tokens,
+        "ttl_ms": lane.ttl,
+        "warm_remaining_ms": warm_remaining_ms,
+        "noticed_ms": lane.noticed_at,
+        "forced": forced,
     })
 }
 
@@ -273,136 +334,6 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `POST /_toker/models/merge` — the promote-model handover
-/// (replaces the phase-1
-/// 501 stub).
-///
-/// Body: one entry, `{"model": id, "days": [...], "maxPrompt": n}` — the
-/// single-model shape of the store merge, with the
-/// day-list validation: `days` must be an array of day strings (non-strings and
-/// empties dropped, the rest deduped and sorted), `maxPrompt` a finite
-/// number when present. Validation failures answer 400 (`unparseable
-/// store`, the frozen wording); a wrong control verb, method, or content type
-/// answers 403 (`not a control request`).
-///
-/// The semantics are `mergeSeen(into, from, {only: true})`: days union and
-/// the higher `maxPrompt` for a model **already served**, nothing for one
-/// the store has never seen (never invents). The predecessor answered 200
-/// with the unknown model on its `refused` list; toker answers **404** with
-/// the `known` list, so the caller learns the typo instead of a silent
-/// no-op.
-///
-/// Every granted day must be one the store already holds for some model.
-/// The predecessor's promote tool only ever sent such days, but its
-/// endpoint took any strings; here a day outside the store answers **400**
-/// `invented days` naming them, and nothing is written. An invented day
-/// enlarges the bar's denominator for every family at once.
-///
-/// The reply carries the effect, not the intent: `target` is what the
-/// family's election now names, because a promotion does not guarantee the
-/// slot — a newer version may already hold it, and saying so beats leaving
-/// the caller to discover it. The path is never forwarded, whatever the
-/// outcome.
-pub(crate) async fn models_merge(State(server): State<Server>, request: Request) -> Response {
-    if !control_token_ok(request.headers(), "models-merge") {
-        return forbidden();
-    }
-    let (parts, body) = request.into_parts();
-    // All three are checked up front and answered alike: method, verb,
-    // content type. The verb check already ran above.
-    if parts.method != Method::POST || !json_content_type(&parts.headers) {
-        return forbidden();
-    }
-    let bytes = match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
-        Ok(bytes) => bytes,
-        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
-    };
-
-    // The incoming entry is validated before anything else: a store that
-    // does not
-    // validate is a store that does not apply, never a best-effort guess.
-    let incoming: Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
-    };
-    let Some(model) = incoming.get("model").and_then(Value::as_str) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let Some(model) = crate::catalog::windows::model_identity(model) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let Some(days) = incoming.get("days").and_then(Value::as_array) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let days: Vec<String> = {
-        let mut days: Vec<String> = days
-            .iter()
-            .filter_map(|day| day.as_str().map(str::to_owned))
-            .filter(|day| !day.is_empty())
-            .collect();
-        days.sort();
-        days.dedup();
-        days
-    };
-    // A non-finite or absent maxPrompt reads as 0 — the
-    // merge then simply cannot raise the ceiling, only the days.
-    let max_prompt = incoming
-        .get("maxPrompt")
-        .and_then(Value::as_f64)
-        .filter(|prompt| prompt.is_finite())
-        .map(|prompt| prompt.max(0.0) as i64);
-
-    match server.models.merge(&MergeIncoming {
-        model_id: model,
-        days,
-        max_prompt,
-    }) {
-        Ok(MergeOutcome::Merged { entry, target }) => {
-            let family = crate::middleware::models::family_of(&entry.model_id)
-                .map(|family| family.name)
-                .unwrap_or_default();
-            Json(json!({
-                "toker": "models-merge",
-                "ok": true,
-                "merged": [entry.model_id],
-                "refused": [],
-                // The `targets` map, one family touched: what the election
-                // names now, so the caller reports the effect.
-                "targets": {family: target},
-            }))
-            .into_response()
-        }
-        Ok(MergeOutcome::Unseen) => {
-            // The frozen reason word ("unseen") and the `known` list, on
-            // a status that cannot be mistaken for success.
-            let known = server.models.known_models().unwrap_or_default();
-            let mut reply = json!({
-                "toker": "models-merge",
-                "ok": false,
-                "error": "unseen",
-            });
-            reply["known"] = json!(known);
-            (StatusCode::NOT_FOUND, Json(reply)).into_response()
-        }
-        Ok(MergeOutcome::InventedDays(invented)) => {
-            // A grant may only hand over days the store already holds:
-            // an invented one enlarges every family's bar denominator.
-            // Refused whole, so a caller never half-applies a promotion.
-            let mut reply = json!({
-                "toker": "models-merge",
-                "ok": false,
-                "error": "invented days",
-            });
-            reply["days"] = json!(invented);
-            (StatusCode::BAD_REQUEST, Json(reply)).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, "models merge store failure");
-            merge_error(StatusCode::INTERNAL_SERVER_ERROR, "store failure")
-        }
-    }
-}
-
 /// `POST /_toker/shutdown` — drain and exit, for `toker restart`.
 ///
 /// Body: `{"instance": id}`, the id `/_toker/status` reported, and
@@ -410,7 +341,7 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
 /// under way (see [`Server::serve_listener`]): the restart's second
 /// request, once the drain it asked for first has had its time. Any other
 /// `force` is a 400. The gate is
-/// `models/merge`'s: a wrong verb, method, or content type is a 403. A body
+/// the other mutating endpoints': a wrong verb, method, or content type is a 403. A body
 /// that is not that object is a 400; an id that is not this instance's is
 /// a 409 carrying the current one, so a restart that raced another never
 /// stops an instance it did not see. Otherwise the answer is 202 and the
@@ -486,20 +417,6 @@ fn json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.starts_with("application/json"))
 }
 
-/// The error replies: `{toker: "models-merge", ok: false, error}` — the
-/// reply signed with the proxy's own name.
-fn merge_error(status: StatusCode, error: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "toker": "models-merge",
-            "ok": false,
-            "error": error,
-        })),
-    )
-        .into_response()
-}
-
 /// The gate check: the control header's value names the operation.
 fn control_token_ok(headers: &HeaderMap, verb: &str) -> bool {
     headers
@@ -552,5 +469,106 @@ mod tests {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("%2"), "%2");
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use serde_json::{Value, json};
+
+    use super::lane_body;
+    use crate::store::Lane;
+
+    const NOW: i64 = 10_000_000;
+    const MIN: i64 = 60_000;
+
+    fn lane(updated_ms: i64, ttl: Option<i64>) -> Lane {
+        Lane {
+            key: "ses|0123456789ab".to_owned(),
+            session_id: Some("ses".to_owned()),
+            tools_hash: Some("0123456789ab".to_owned()),
+            updated_ms,
+            prompt_tokens: Some(180_000),
+            ttl,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        }
+    }
+
+    #[test]
+    fn a_warm_lane_counts_down_its_recorded_ttl() {
+        let body = lane_body(&lane(NOW - 2 * MIN, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "warm");
+        assert_eq!(body["idle_ms"], 2 * MIN);
+        assert_eq!(body["warm_remaining_ms"], 3 * MIN);
+        assert_eq!(body["ttl_ms"], 5 * MIN);
+        assert_eq!(body["tools_id"], "012345", "a short prefix, not the digest");
+        assert_eq!(body["prompt_tokens"], 180_000);
+        assert_eq!(body["forced"], Value::Null);
+        assert_eq!(body["noticed_ms"], Value::Null);
+    }
+
+    #[test]
+    fn a_lane_is_cold_at_exactly_its_ttl() {
+        let body = lane_body(&lane(NOW - 5 * MIN, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "cold");
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        let body = lane_body(&lane(NOW - 5 * MIN + 1, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "warm");
+        assert_eq!(body["warm_remaining_ms"], 1);
+    }
+
+    #[test]
+    fn an_unrecorded_ttl_reads_the_gates_long_tier_but_counts_nothing_down() {
+        let body = lane_body(&lane(NOW - 20 * MIN, None), NOW);
+        assert_eq!(body["state"], "warm", "ttl_of's long default, as the gate");
+        assert_eq!(body["ttl_ms"], Value::Null);
+        assert_eq!(
+            body["warm_remaining_ms"],
+            Value::Null,
+            "no recorded tier, no invented countdown"
+        );
+        let body = lane_body(&lane(NOW - 61 * MIN, None), NOW);
+        assert_eq!(body["state"], "cold");
+    }
+
+    #[test]
+    fn a_ping_lane_is_never_warm_or_cold() {
+        let mut ping = lane(NOW - MIN, Some(5 * MIN));
+        ping.ping = Some(true);
+        let body = lane_body(&ping, NOW);
+        assert_eq!(body["state"], "ping");
+        assert_eq!(body["ping"], true);
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        ping.updated_ms = NOW - 3 * 3_600_000;
+        assert_eq!(lane_body(&ping, NOW)["state"], "ping", "idle or not");
+    }
+
+    #[test]
+    fn a_future_stamp_has_no_state_and_missing_fields_stay_null() {
+        let mut future = lane(NOW + MIN, Some(5 * MIN));
+        future.prompt_tokens = None;
+        future.tools_hash = None;
+        let body = lane_body(&future, NOW);
+        assert_eq!(body["state"], Value::Null);
+        assert_eq!(body["idle_ms"], Value::Null);
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        assert_eq!(body["prompt_tokens"], Value::Null, "not zero");
+        assert_eq!(body["tools_id"], Value::Null);
+    }
+
+    #[test]
+    fn the_sticky_model_transition_and_notice_time_ride_along_when_present() {
+        let mut moved = lane(NOW - MIN, Some(5 * MIN));
+        moved.noticed_at = Some(NOW - 30_000);
+        moved.forced_from = Some("model-a".to_owned());
+        moved.forced_to = Some("model-b".to_owned());
+        let body = lane_body(&moved, NOW);
+        assert_eq!(body["forced"], json!({"from": "model-a", "to": "model-b"}));
+        assert_eq!(body["noticed_ms"], NOW - 30_000);
     }
 }

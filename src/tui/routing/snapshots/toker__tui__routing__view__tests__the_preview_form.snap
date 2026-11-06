@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: frame(&state)
+---
+ ?  ⇄
+1 PRE┌ROUTING PREVIEW─────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │> protocol: < anthropic_messages >                                                                          │
+┌PREV│  profile: (none)                                                                                           │────┐
+│3  {│  model: (none)                                                                                             │    │
+│draf│  lane key: (none)                                                                                          │    │
+│dyna│  prompt bound: 0                                                                                           │    │
+│code│  message count: (none)                                                                                     │    │
+│open│  tool count: 0                                                                                             │    │
+│lane│                                                                                                            │    │
+│diag│                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │Content-free request facts only · Enter previews · Esc cancels                                              │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

@@ -34,14 +34,10 @@ use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 
 use super::Provider;
-use crate::routing::{BackendAdapterId, BackendBinding, Capabilities, DialectId, ProtocolId};
+use crate::routing::{ANTHROPIC_API_MESSAGES, ANTHROPIC_SUB_MESSAGES, BackendBinding, ProtocolId};
 
-const BINDINGS: &[BackendBinding] = &[BackendBinding::canonical(
-    ProtocolId::AnthropicMessages,
-    DialectId::AnthropicMessages,
-    BackendAdapterId::AnthropicMessages,
-    Capabilities::MESSAGES,
-)];
+const ANTHROPIC_SUB_BINDINGS: &[BackendBinding] = &[ANTHROPIC_SUB_MESSAGES];
+const ANTHROPIC_API_BINDINGS: &[BackendBinding] = &[ANTHROPIC_API_MESSAGES];
 
 /// The header carrying the API key (Anthropic's API auth is `x-api-key`,
 /// not a bearer).
@@ -54,10 +50,6 @@ pub struct AnthropicSub {
     upstream: Url,
     oauth_token: Option<String>,
     claude_credentials_path: Option<PathBuf>,
-    /// The operator's model routing map, when one is configured
-    /// (`[providers.anthropic_sub.model_map]`) — the routing map this
-    /// backend applies, ported from the predecessor's env-typed knob.
-    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicSub {
@@ -65,13 +57,11 @@ impl AnthropicSub {
     /// frontend paths carry their own, unlike openrouter's base).
     pub fn new(
         upstream: Url,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
         oauth_token: Option<String>,
         claude_credentials_path: Option<PathBuf>,
     ) -> AnthropicSub {
         AnthropicSub {
             upstream,
-            model_map,
             oauth_token,
             claude_credentials_path,
         }
@@ -122,22 +112,12 @@ pub struct AnthropicApi {
     /// literal — see [`crate::config::AnthropicApiConfig::api_key`]). Never
     /// logged, never in the ledger (invariant 2).
     api_key: Option<String>,
-    /// The operator's model routing map (see [`AnthropicSub::model_map`]).
-    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicApi {
     /// Build the provider. `api_key` is the already-resolved key.
-    pub fn new(
-        upstream: Url,
-        api_key: Option<String>,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
-    ) -> AnthropicApi {
-        AnthropicApi {
-            upstream,
-            api_key,
-            model_map,
-        }
+    pub fn new(upstream: Url, api_key: Option<String>) -> AnthropicApi {
+        AnthropicApi { upstream, api_key }
     }
 }
 
@@ -159,11 +139,7 @@ impl Provider for AnthropicSub {
     }
 
     fn bindings(&self) -> &'static [BackendBinding] {
-        BINDINGS
-    }
-
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
+        ANTHROPIC_SUB_BINDINGS
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -187,6 +163,23 @@ impl Provider for AnthropicSub {
 
     fn foreign_auth_available(&self) -> bool {
         self.token_for_turn().is_some()
+    }
+
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.token_for_turn().is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
+        }
     }
 
     fn strip_foreign_credentials_for(&self, outgoing: &mut HeaderMap, frontend: ProtocolId) {
@@ -219,11 +212,7 @@ impl Provider for AnthropicApi {
     }
 
     fn bindings(&self) -> &'static [BackendBinding] {
-        BINDINGS
-    }
-
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
+        ANTHROPIC_API_BINDINGS
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -249,6 +238,23 @@ impl Provider for AnthropicApi {
         outgoing
             .entry("anthropic-version")
             .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+
+    fn credential_availability(
+        &self,
+        incoming: &HeaderMap,
+        frontend: ProtocolId,
+        _now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let mut cleaned = incoming.clone();
+        self.strip_foreign_credentials_for(&mut cleaned, frontend);
+        if self.credential_present(&cleaned) {
+            super::CredentialAvailability::PassingNative
+        } else if self.api_key.is_some() {
+            super::CredentialAvailability::Held
+        } else {
+            super::CredentialAvailability::KnownMissingOrExpired
+        }
     }
 
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
@@ -381,7 +387,6 @@ mod tests {
             "https://api.anthropic.com".parse().expect("upstream url"),
             None,
             None,
-            None,
         )
     }
 
@@ -389,7 +394,6 @@ mod tests {
         AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
             Some("sk-ant-test-key".to_owned()),
-            None,
         )
     }
 
@@ -456,7 +460,6 @@ mod tests {
         }
         let slashed = AnthropicSub::new(
             "http://localhost:9/".parse().expect("upstream url"),
-            None,
             None,
             None,
         );
@@ -532,7 +535,6 @@ mod tests {
 
         let keyless = AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
-            None,
             None,
         );
         let mut outgoing = HeaderMap::new();

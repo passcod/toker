@@ -43,18 +43,31 @@ use crate::ir::Shape;
 use crate::middleware::awake;
 use crate::middleware::lanes;
 use crate::observe::UsageCapture;
+use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{CostKind, RequestRow, RowKind};
+use crate::store::{
+    AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind, SessionLineage,
+};
 
 use super::Server;
 
 /// Everything a completion point knows about one request, minus the
 /// response itself.
+#[derive(Clone)]
 pub(crate) struct RecordCtx {
     /// The server (for the store and the route/backend id).
     pub(crate) server: Server,
     /// The selected backend owns route identity and cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
+    /// The backend binding the send went to. This identifies the wire
+    /// dialect without implying a candidate selection.
+    pub(crate) binding_id: BindingId,
+    /// The actual upstream send this response completes.
+    pub(crate) attempt: Option<AttemptProvenance>,
+    /// The policy route that selected this send.
+    pub(crate) policy_routing: Option<PolicyRouteProvenance>,
+    /// One successful attempt's already-decided lane-pin transition.
+    pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
     /// Request start, for `duration_ms` — the only clock use (invariant 4).
     pub(crate) started: Instant,
     /// Session identity, read by header name only (invariant 2).
@@ -74,6 +87,8 @@ pub(crate) struct RecordCtx {
     /// The frontend's name from its `/f/<frontend>` prefix, recorded in
     /// `extra` ([`with_frontend`]).
     pub(crate) frontend: Option<String>,
+    /// Clears matching health circuits only after canonical success completes.
+    pub(crate) policy_attempt: Option<Arc<super::PolicyAttempt>>,
 }
 
 /// Note the frontend a row's request came through, from its
@@ -116,12 +131,17 @@ pub(crate) fn i64_of(value: u64) -> i64 {
 /// Record a completed usage-path response: the measurement row (when usage
 /// was observed — a completed stream with nothing usage-bearing records no
 /// row, like a hung-up one). `status` is the upstream status the client saw.
-pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>, status: u16) {
+pub(crate) fn record_measurement(
+    ctx: &RecordCtx,
+    capture: Option<&UsageCapture>,
+    reported_model: Option<&str>,
+    status: u16,
+) {
     let ts_ms = now_ms();
     let duration_ms = elapsed_ms(ctx.started);
     let route = route_of(ctx.backend.id());
 
-    let model = capture.and_then(UsageCapture::model);
+    let model = reported_model.or_else(|| capture.and_then(UsageCapture::model));
     if let Some(capture) = capture {
         insert(
             ctx,
@@ -140,6 +160,16 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
             .unwrap_or(0)
             .saturating_add(buckets.cache_read.unwrap_or(0))
             .saturating_add(buckets.cache_write_total.unwrap_or(0));
+        let held_observed = (buckets.input.is_some()
+            || buckets.cache_read.is_some()
+            || buckets.cache_write_total.is_some())
+        .then_some(held);
+        ctx.server.note_binding_observed(
+            &ctx.binding_id,
+            model,
+            ts_ms,
+            held_observed.and_then(|held| u64::try_from(held).ok()),
+        );
         if ctx.backend.id() == "openrouter"
             && let Err(error) = lanes::note_lane_response(
                 &ctx.server.store,
@@ -159,6 +189,15 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
         {
             tracing::error!(%error, "lane table update failed");
         }
+    } else {
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, model, ts_ms, None);
+    }
+    persist_successful_pin(ctx, ts_ms);
+    if status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
     }
 
     tracing::info!(
@@ -176,9 +215,299 @@ pub(crate) fn record_measurement(ctx: &RecordCtx, capture: Option<&UsageCapture>
     ctx.server.evaluate_awake();
 }
 
-/// Record a non-2xx usage-path response (plan: Server core): an error row
-/// with status, error type, and retry-after — never priced, no usage
-/// buckets.
+fn persist_successful_pin(ctx: &RecordCtx, ts_ms: i64) {
+    persist_lane_pin(
+        &ctx.server,
+        ctx.session_id.as_deref(),
+        ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+        ctx.ping,
+        ctx.pin_transition.as_ref(),
+        ts_ms,
+    );
+}
+
+pub(super) fn persist_lane_pin(
+    server: &Server,
+    session_id: Option<&str>,
+    tools_hash: Option<&str>,
+    ping: bool,
+    decision: Option<&crate::policy::LaneTransitionDecision>,
+    ts_ms: i64,
+) {
+    let Some(decision) = decision else {
+        return;
+    };
+    let Some(key) = lanes::lane_key(session_id, tools_hash) else {
+        return;
+    };
+    let activation_revision = match decision {
+        crate::policy::LaneTransitionDecision::FirstPin {
+            new_pin,
+            source:
+                crate::policy::TransitionSource::NewLane | crate::policy::TransitionSource::Activation,
+            ..
+        }
+        | crate::policy::LaneTransitionDecision::Replace {
+            new_pin,
+            source: crate::policy::TransitionSource::Activation,
+            ..
+        } => Some(new_pin.policy_revision_id),
+        _ => None,
+    };
+    let persist = || {
+        server.store.insert_lane_if_absent(&crate::store::Lane {
+            key: key.clone(),
+            session_id: session_id.map(str::to_owned),
+            tools_hash: tools_hash.map(str::to_owned),
+            updated_ms: ts_ms,
+            prompt_tokens: None,
+            ttl: None,
+            ping: ping.then_some(true),
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        })?;
+        crate::policy::persist_transition(&server.store, &key, decision)
+    };
+    let result = if let Some(revision_id) = activation_revision {
+        let Some(result) = server
+            .policy_runtime
+            .with_activation_fence(revision_id, persist)
+        else {
+            tracing::debug!(
+                lane_key = key,
+                "lane activation pin lost to a newer active revision"
+            );
+            return;
+        };
+        result
+    } else {
+        persist()
+    };
+    match result {
+        Ok(crate::policy::PinPersistence::Conflict) => {
+            tracing::debug!(
+                lane_key = key,
+                "lane pin CAS lost to a concurrent completion"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(%error, lane_key = key, "lane pin update failed"),
+    }
+}
+
+/// Write the route-unavailable row for a request the policy refused to route,
+/// if that is what `error` is: no route matched, every candidate was skipped,
+/// or the lane's pin refused the move. Any other failure writes nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_unroutable(
+    server: &Server,
+    started: Instant,
+    frontend: Option<&str>,
+    frontend_protocol: &'static str,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
+    error: &super::PolicyAttemptError,
+) {
+    match error.unroutable_provenance() {
+        Some(Ok(policy_routing)) => record_route_unavailable(
+            server,
+            started,
+            frontend,
+            frontend_protocol,
+            session_id,
+            requested_model,
+            lineage,
+            policy_routing,
+        ),
+        Some(Err(error)) => tracing::error!(%error, "route-unavailable provenance omitted"),
+        None => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_route_unavailable(
+    server: &Server,
+    started: Instant,
+    frontend: Option<&str>,
+    frontend_protocol: &'static str,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
+    policy_routing: PolicyRouteProvenance,
+) {
+    let mut row = unsent_row(
+        RowKind::RouteUnavailable,
+        started,
+        frontend_protocol,
+        session_id,
+        requested_model,
+        lineage,
+    );
+    row.policy_routing = Some(policy_routing);
+    let row = with_frontend(row, frontend);
+    if let Err(error) = server.store.record_request(&row) {
+        tracing::error!(%error, "route-unavailable ledger insert failed");
+    }
+}
+
+/// A row for a request toker refused before choosing or contacting any
+/// backend: no provider, route, binding, usage or cost, only what the client
+/// asked for. The caller sets whatever its kind adds.
+fn unsent_row(
+    kind: RowKind,
+    started: Instant,
+    frontend_protocol: &'static str,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
+) -> RequestRow {
+    RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(kind),
+        frontend: Some(frontend_protocol.to_owned()),
+        provider: None,
+        route: None,
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: None,
+        cold_on: None,
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: None,
+        betas: None,
+        geo: None,
+        fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage,
+    }
+}
+
+/// Set on a response toker answered itself because the request could not be
+/// turned into a body for any backend, so [`RefusalCtx::settle`] knows to
+/// leave the ledger row. Only the first attempt settles it: a fallback
+/// candidate that cannot be prepared follows an attempt that already has its
+/// own error row, and its group's final outcome is that one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalPreparationRefusal;
+
+/// Mark `response` as a local-preparation refusal.
+pub(crate) fn refused(mut response: axum::response::Response) -> axum::response::Response {
+    response.extensions_mut().insert(LocalPreparationRefusal);
+    response
+}
+
+/// What the ledger row of a refused request knows, captured before the
+/// request is consumed.
+pub(crate) struct RefusalCtx {
+    started: Instant,
+    frontend: Option<String>,
+    frontend_protocol: &'static str,
+    session_id: Option<String>,
+    requested_model: Option<String>,
+    lineage: Option<SessionLineage>,
+}
+
+impl RefusalCtx {
+    pub(crate) fn new(
+        started: Instant,
+        frontend: Option<&str>,
+        frontend_protocol: &'static str,
+        session_id: Option<&str>,
+        requested_model: Option<&str>,
+        lineage: Option<SessionLineage>,
+    ) -> Self {
+        Self {
+            started,
+            frontend: frontend.map(str::to_owned),
+            frontend_protocol,
+            session_id: session_id.map(str::to_owned),
+            requested_model: requested_model.map(str::to_owned),
+            lineage,
+        }
+    }
+
+    /// Write the `local_preparation` error row when `response` is a marked
+    /// refusal, and pass the response through either way. The row has no
+    /// attempt provenance, since nothing was attempted.
+    pub(crate) fn settle(
+        &self,
+        server: &Server,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        if response
+            .extensions()
+            .get::<LocalPreparationRefusal>()
+            .is_some()
+        {
+            let mut row = unsent_row(
+                RowKind::Error,
+                self.started,
+                self.frontend_protocol,
+                self.session_id.as_deref(),
+                self.requested_model.as_deref(),
+                self.lineage.clone(),
+            );
+            row.status = Some(i64::from(response.status().as_u16()));
+            row.error_type = Some("local_preparation".to_owned());
+            let row = with_frontend(row, self.frontend.as_deref());
+            if let Err(error) = server.store.record_request(&row) {
+                tracing::error!(%error, "local-preparation ledger insert failed");
+            }
+        }
+        response
+    }
+}
+
 pub(crate) fn record_error(
     ctx: &RecordCtx,
     status: u16,
@@ -315,6 +644,10 @@ pub(crate) fn record_openai_cold(record: ColdOpenaiRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -419,6 +752,10 @@ pub(crate) fn record_openai_cold_quiet(record: ColdOpenaiRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -543,6 +880,10 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
@@ -555,23 +896,12 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 6) — it is logged as the visible breakage it is.
-///
-/// Every row the API answered also marks its model served, on the
-/// identity the RESPONSE named (the predecessor's `appendRow` did this
-/// for every row). The mark before sending covers a lane deciding while
-/// this request is in flight; this one covers what the upstream actually
-/// served, which a host-side alias or an upstream substitution can make
-/// differ from what was sent — and recency must follow the served
-/// identity. In-memory and infallible, so it cannot cost the row.
+/// (invariant 3) — it is logged as the visible breakage it is.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
-    ctx.server
-        .models
-        .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
 }
 
 /// The normalized token buckets from one capture (see the module docs for
@@ -736,6 +1066,10 @@ fn measurement_row(
         betas: None,
         geo: None,
         fast: None,
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: None,
     }
 }
 
@@ -812,6 +1146,10 @@ fn error_row(
         betas: None,
         geo: None,
         fast: None,
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: None,
     }
 }
 

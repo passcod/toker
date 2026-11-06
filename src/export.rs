@@ -103,7 +103,8 @@ pub fn kind_arg(text: &str) -> Result<KindFilter, String> {
         other => RowKind::parse(other).map(KindFilter::Is).ok_or_else(|| {
             format!(
                 "unknown kind {other:?} (expected all, measurement, proxy, blocked, \
-                 released, cold, cold-quiet, awake, error, or fidelity-drift)"
+                 released, cold, cold-quiet, cold-recap, awake, error, route-unavailable, \
+                 fidelity-drift, or revoked)"
             )
         }),
     }
@@ -112,11 +113,51 @@ pub fn kind_arg(text: &str) -> Result<KindFilter, String> {
 #[cfg(test)]
 mod tests {
     use super::{is_broken_pipe, kind_arg, parse_instant, write_jsonl};
-    use crate::store::{CostKind, KindFilter, RequestFilter, RequestRow, RowKind, Store};
+    use crate::policy::{
+        ActivationScope, BindingId, CURRENT_FORMAT_VERSION, CandidateId, PolicyDocument,
+        PresentationId, RewriteId, RouteFingerprint, RouteId,
+    };
+    use crate::store::{
+        AttemptGroupId, AttemptReason, CostKind, KindFilter, NewPolicyRevision,
+        PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RequestFilter,
+        RequestLookupProvenance, RequestRow, ResolvedRoute, RowKind, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
+    };
     use serde_json::{Value, json};
 
     /// 2026-10-05T00:00:00Z.
     const T0: i64 = 1_791_158_400_000;
+
+    fn store_with_revision(path: impl AsRef<std::path::Path>) -> Store {
+        let store = Store::open(path).expect("open");
+        let document = PolicyDocument {
+            format_version: CURRENT_FORMAT_VERSION,
+            description: None,
+            defaults: vec![],
+            presentations: vec![],
+            routes: vec![],
+            rewrites: vec![],
+            classifiers: vec![],
+            upgrades: vec![],
+            compaction: None,
+        }
+        .validate()
+        .unwrap();
+        store
+            .insert_policy_revision(&NewPolicyRevision {
+                created_ms: T0,
+                activated_ms: T0,
+                description: None,
+                activation_scope: ActivationScope::NewLanes,
+                forced_cache_transition: false,
+                source: PolicyRevisionSource::Draft,
+                compiler_origin: None,
+                parent_revision_id: None,
+                document: &document,
+            })
+            .unwrap();
+        store
+    }
 
     fn bare(ts_ms: i64) -> RequestRow {
         RequestRow {
@@ -179,6 +220,10 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
+            binding_id: None,
+            attempt: None,
+            policy_routing: None,
+            lineage: None,
         }
     }
 
@@ -244,13 +289,60 @@ mod tests {
             betas: Some(r#"["claude-code-20250219"]"#.to_owned()),
             geo: Some("us".to_owned()),
             fast: Some(false),
+            binding_id: Some(BindingId::new("openrouter.openrouter_messages").unwrap()),
+            attempt: Some(crate::store::AttemptProvenance {
+                attempt_group_id: AttemptGroupId::new("abcdefabcdefabcdefabcdefabcdefab").unwrap(),
+                attempt_index: crate::store::AttemptIndex::zero(),
+                reason: AttemptReason::Initial,
+            }),
+            policy_routing: Some(PolicyRouteProvenance {
+                policy_revision_id: 1,
+                route: Some(ResolvedRoute {
+                    lookup: RequestLookupProvenance::ProfilePresentation(
+                        PresentationId::new("presented").unwrap(),
+                    ),
+                    route_id: RouteId::new("route").unwrap(),
+                    route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
+                }),
+                trace: StoredRoutingTrace {
+                    version: 2,
+                    events: vec![
+                        StoredRoutingTraceEvent::Lookup {
+                            source: crate::store::StoredLookupSource::ProfilePresentation,
+                            presentation_id: Some(PresentationId::new("presented").unwrap()),
+                            rewrite_id: None,
+                        },
+                        StoredRoutingTraceEvent::Candidate {
+                            candidate_id: CandidateId::new("first").unwrap(),
+                            crossed_from: None,
+                            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                            model: Some("claude-opus-4".to_owned()),
+                            state: StoredCandidateState::Skipped,
+                            reason: Some(crate::store::StoredSkipReason::HealthCircuitOpen),
+                        },
+                        StoredRoutingTraceEvent::Candidate {
+                            candidate_id: CandidateId::new("candidate").unwrap(),
+                            crossed_from: Some(CandidateId::new("first").unwrap()),
+                            binding_id: BindingId::new("openrouter.openrouter_messages").unwrap(),
+                            model: Some("claude-opus-5".to_owned()),
+                            state: StoredCandidateState::Available,
+                            reason: None,
+                        },
+                    ],
+                },
+                outcome: PolicyRoutingOutcome::Attempt {
+                    candidate_id: CandidateId::new("candidate").unwrap(),
+                    baseline_model: "claude-opus-5".to_owned(),
+                },
+            }),
+            lineage: Some(SessionLineage::codex_guardian("guardian:parent-session").unwrap()),
         }
     }
 
     /// The fixture: a full measurement, a bare one, a blocked row, an
     /// error row on another session, inserted out of time order.
     fn fixture() -> Store {
-        let store = Store::open(":memory:").expect("open");
+        let store = store_with_revision(":memory:");
         let mut blocked = bare(T0 + 2_000);
         blocked.kind = Some(RowKind::Blocked);
         blocked.session_id = Some("5a1e0c2d-0000-4000-8000-000000000001".to_owned());
@@ -285,21 +377,67 @@ mod tests {
     }
 
     #[test]
+    fn legacy_attempt_exports_without_policy_provenance() {
+        let store = store_with_revision(":memory:");
+        let mut row = bare(T0);
+        row.binding_id = Some(BindingId::new("anthropic_sub.anthropic_messages").unwrap());
+        row.attempt = Some(crate::store::AttemptProvenance {
+            attempt_group_id: AttemptGroupId::new("feedfeedfeedfeedfeedfeedfeedfeed").unwrap(),
+            attempt_index: crate::store::AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        });
+        store.record_request(&row).unwrap();
+
+        let exported = lines(&export(&store, &RequestFilter::default()));
+        let object = exported[0].as_object().unwrap();
+        assert_eq!(
+            object["attempt_group_id"],
+            "feedfeedfeedfeedfeedfeedfeedfeed"
+        );
+        assert_eq!(object["attempt_index"], 0);
+        assert_eq!(object["fallback_reason"], "initial");
+        for key in [
+            "policy_revision_id",
+            "presentation_id",
+            "rewrite_id",
+            "policy_route_id",
+            "route_fingerprint",
+            "candidate_id",
+            "baseline_model",
+            "routing_trace",
+        ] {
+            assert!(!object.contains_key(key), "unexpected policy field {key}");
+        }
+    }
+
+    #[test]
     fn every_column_is_exported_under_its_own_name() {
         // A file ledger, so a second connection can ask SQLite for the
         // columns: a later migration's column fails here until the full
         // fixture sets it.
         let dir = crate::test_support::tempdir("toker-export-cols-");
         let path = dir.join("toker.db");
-        let store = Store::open(&path).expect("open");
-        store.record_request(&full(T0)).expect("full");
-        let row = lines(&export(&store, &RequestFilter::default())).remove(0);
-        let keys: Vec<&str> = row
-            .as_object()
-            .expect("object")
-            .keys()
-            .map(String::as_str)
-            .collect();
+        let store = store_with_revision(&path);
+        store.record_request(&full(T0)).expect("presentation row");
+        let mut rewrite = full(T0 + 1);
+        let Some(routing) = rewrite.policy_routing.as_mut() else {
+            panic!("fixture provenance")
+        };
+        routing.route.as_mut().unwrap().lookup =
+            RequestLookupProvenance::ProfileRewrite(RewriteId::new("rewrite").unwrap());
+        rewrite.attempt.as_mut().unwrap().attempt_group_id =
+            AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();
+        routing.trace.events[0] = StoredRoutingTraceEvent::Lookup {
+            source: crate::store::StoredLookupSource::ProfileRewrite,
+            presentation_id: None,
+            rewrite_id: Some(RewriteId::new("rewrite").unwrap()),
+        };
+        store.record_request(&rewrite).expect("rewrite row");
+        let rows = lines(&export(&store, &RequestFilter::default()));
+        let mut keys = std::collections::BTreeSet::new();
+        for row in &rows {
+            keys.extend(row.as_object().expect("object").keys().map(String::as_str));
+        }
         let conn = rusqlite::Connection::open(&path).expect("second connection");
         let mut stmt = conn
             .prepare("SELECT name FROM pragma_table_info('requests')")
@@ -311,9 +449,9 @@ mod tests {
             .expect("columns");
         // `kind` is the one column a measurement leaves NULL: its
         // absence is what makes the row a measurement.
-        let mut expected = vec!["ts"];
+        let mut expected = std::collections::BTreeSet::from(["ts"]);
         expected.extend(columns.iter().map(String::as_str).filter(|c| *c != "kind"));
-        assert_eq!(keys, expected, "ts, then every column of requests in order");
+        assert_eq!(keys, expected, "the fixtures cover every requests column");
         for column in crate::store::JSON_TEXT_COLUMNS {
             assert!(
                 columns.iter().any(|c| c == column),
@@ -336,7 +474,7 @@ mod tests {
 
     #[test]
     fn json_text_columns_nest_and_usage_raw_stays_on_one_line() {
-        let store = Store::open(":memory:").expect("open");
+        let store = store_with_revision(":memory:");
         store.record_request(&full(T0)).expect("full");
         let text = export(&store, &RequestFilter::default());
         assert_eq!(

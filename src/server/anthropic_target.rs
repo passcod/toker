@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -16,9 +17,10 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::ir::canonical::CanonEvent;
-use crate::ir::canonical::CanonicalRequest;
 use crate::observe::{AnthropicObserver, SseEvent, SseSplitter};
-use crate::routing::{ModelTarget, ProtocolId};
+use crate::policy::BindingId;
+use crate::providers::Provider;
+use crate::routing::ProtocolId;
 use crate::translate::{
     self, AnthropicResponseStream, OpenAiChatRenderer, OpenAiResponsesRenderer,
 };
@@ -63,93 +65,338 @@ impl FrontendWire {
     }
 }
 
-pub(crate) struct AnthropicInput {
-    pub(crate) canonical: CanonicalRequest,
-    pub(crate) limit_field: Option<Value>,
+pub(crate) enum FailureResponse {
+    Upstream(reqwest::Response),
+    Local(Response),
 }
 
-pub(crate) async fn turn(
-    server: Server,
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ReadyOutcome {
+    Accepted {
+        upstream: reqwest::Response,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        frontend: FrontendWire,
+        stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+    Failure {
+        failure: super::attempt::AttemptFailure,
+        response: FailureResponse,
+        parts: Parts,
+        record: Option<AnthropicRecordCtx>,
+        in_flight: Option<InFlightGuard>,
+        response_model: String,
+        frontend: FrontendWire,
+        stream: bool,
+        cancellation: super::cancel::PrecommitCancellationGuard,
+    },
+}
+
+pub(crate) struct ReadyAttempt {
     parts: Parts,
-    input: AnthropicInput,
-    target: ModelTarget,
+    backend: Arc<dyn Provider>,
+    binding_id: BindingId,
+    effective_model: String,
+    response_model: String,
+    body: Bytes,
+    record: Option<AnthropicRecordCtx>,
+    in_flight: Option<InFlightGuard>,
+    frontend: FrontendWire,
+    stream: bool,
+}
+
+impl ReadyAttempt {
+    pub(crate) fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
+    pub(crate) fn effective_model(&self) -> &str {
+        &self.effective_model
+    }
+
+    pub(crate) async fn execute_precommit(
+        &mut self,
+        server: &Server,
+        provenance: crate::store::AttemptProvenance,
+    ) -> ReadyOutcome {
+        if let Some(ctx) = self.record.as_mut() {
+            ctx.attempt = Some(provenance);
+        }
+        let record = self.record.take();
+        let in_flight = self.in_flight.take();
+        let cancellation = super::cancel::PrecommitCancellationGuard::anthropic(record.as_ref());
+        let upstream = match send_upstream_to(
+            server,
+            self.backend.as_ref(),
+            &self.parts,
+            self.body.clone(),
+            &server.config.session_header_names,
+            self.frontend.protocol(),
+            "/v1/messages",
+        )
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let class = if error.is_connect() {
+                    crate::policy::FailureClass::TransportBeforeAccept
+                } else {
+                    crate::policy::FailureClass::AmbiguousTransport
+                };
+                return ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(class),
+                        mechanism: if error.is_connect() {
+                            super::attempt::FailureMechanism::TransportBeforeAccept
+                        } else {
+                            super::attempt::FailureMechanism::AmbiguousTransport
+                        },
+                        status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    },
+                    response: FailureResponse::Local(transport_failure(ErrorWire::Openai, &error)),
+                    parts: self.parts.clone(),
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
+                };
+            }
+        };
+        super::anthropic::note_meters(server, self.backend.as_ref(), upstream.headers());
+        let response_status = upstream.status();
+        match super::attempt::precommit_anthropic(upstream).await {
+            Ok(super::attempt::PrecommitOutcome::Accepted { response, .. }) => {
+                ReadyOutcome::Accepted {
+                    upstream: response,
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
+                }
+            }
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: Some(response),
+            }) => ReadyOutcome::Failure {
+                failure,
+                response: FailureResponse::Upstream(response),
+                parts: self.parts.clone(),
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
+                frontend: self.frontend,
+                stream: self.stream,
+                cancellation,
+            },
+            Ok(super::attempt::PrecommitOutcome::Failure {
+                failure,
+                response: None,
+            }) => ReadyOutcome::Failure {
+                failure,
+                response: FailureResponse::Local(upstream_failure(
+                    ErrorWire::Openai,
+                    "toker could not interpret the upstream response before commitment",
+                )),
+                parts: self.parts.clone(),
+                record,
+                in_flight,
+                response_model: self.response_model.clone(),
+                frontend: self.frontend,
+                stream: self.stream,
+                cancellation,
+            },
+            Err(error) => {
+                tracing::warn!(%error, "upstream response failed before commitment");
+                ReadyOutcome::Failure {
+                    failure: super::attempt::AttemptFailure {
+                        class: Some(crate::policy::FailureClass::AmbiguousTransport),
+                        mechanism: super::attempt::FailureMechanism::AmbiguousTransport,
+                        status: Some(response_status.as_u16()),
+                    },
+                    response: FailureResponse::Local(truncated_body(ErrorWire::Openai)),
+                    parts: self.parts.clone(),
+                    record,
+                    in_flight,
+                    response_model: self.response_model.clone(),
+                    frontend: self.frontend,
+                    stream: self.stream,
+                    cancellation,
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn finish(outcome: ReadyOutcome) -> Response {
+    match outcome {
+        ReadyOutcome::Accepted {
+            upstream,
+            record,
+            in_flight,
+            response_model,
+            frontend,
+            stream,
+            mut cancellation,
+        } => {
+            let response = forward(
+                upstream,
+                record,
+                in_flight,
+                &response_model,
+                frontend,
+                stream,
+            )
+            .await;
+            cancellation.disarm();
+            response
+        }
+        ReadyOutcome::Failure {
+            failure,
+            response,
+            parts: _,
+            record,
+            in_flight,
+            response_model,
+            frontend,
+            stream,
+            mut cancellation,
+        } => {
+            let response = match response {
+                FailureResponse::Upstream(response) => {
+                    forward(
+                        response,
+                        record,
+                        in_flight,
+                        &response_model,
+                        frontend,
+                        stream,
+                    )
+                    .await
+                }
+                FailureResponse::Local(response) => {
+                    record_failure(record.as_ref(), &failure);
+                    response
+                }
+            };
+            cancellation.disarm();
+            response
+        }
+    }
+}
+
+pub(crate) fn record_failure(
+    record: Option<&AnthropicRecordCtx>,
+    failure: &super::attempt::AttemptFailure,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    let error_type = match failure.class {
+        Some(crate::policy::FailureClass::Authentication) => "authentication",
+        Some(crate::policy::FailureClass::ModelNotFound) => "model_not_found",
+        Some(crate::policy::FailureClass::RateLimit) => "rate_limit",
+        Some(crate::policy::FailureClass::ProviderQuota) => "provider_quota",
+        Some(crate::policy::FailureClass::Overload) => "overload",
+        Some(crate::policy::FailureClass::ServerError) => "server_error",
+        Some(crate::policy::FailureClass::TransportBeforeAccept) => "transport_before_accept",
+        Some(crate::policy::FailureClass::AmbiguousTransport) => "ambiguous_transport",
+        None => match failure.mechanism {
+            super::attempt::FailureMechanism::ResponseProtocol => "response_protocol",
+            super::attempt::FailureMechanism::LocalPreparation => "local_preparation",
+            super::attempt::FailureMechanism::HttpStatus
+            | super::attempt::FailureMechanism::InBandEvent => "upstream_error",
+            super::attempt::FailureMechanism::TransportBeforeAccept => "transport_before_accept",
+            super::attempt::FailureMechanism::AmbiguousTransport => "ambiguous_transport",
+        },
+    };
+    record_anthropic_error(
+        record,
+        failure.status.unwrap_or(StatusCode::BAD_GATEWAY.as_u16()),
+        Some(error_type.to_owned()),
+        None,
+        None,
+        None,
+    );
+}
+
+pub(crate) fn prepare(
+    server: &Server,
+    parts: Parts,
+    mut attempt: super::inference::InferenceAttempt,
+    limit_field: Option<Value>,
     mut record: Option<AnthropicRecordCtx>,
     in_flight: Option<InFlightGuard>,
     frontend: FrontendWire,
-) -> Response {
-    let AnthropicInput {
-        mut canonical,
-        limit_field,
-    } = input;
-    let model = target.effective_model().unwrap_or_default().to_owned();
+) -> Result<ReadyAttempt, Box<Response>> {
+    let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
+    let response_model = attempt.requested_model().to_owned();
     let stream = match frontend {
-        FrontendWire::Chat => canonical.stream == Some(true),
-        FrontendWire::Responses => canonical.stream != Some(false),
+        FrontendWire::Chat => attempt.stream() == Some(true),
+        FrontendWire::Responses => attempt.stream() != Some(false),
     };
-    canonical.model = Some(model.clone());
-    canonical.stream = Some(stream);
 
     // Responses makes this limit optional; Messages requires one. Prefer
     // the caller's positive bound. Otherwise use the model's own declared
     // maximum from the fetched Anthropic catalogue, never a guessed limit.
     let limit = match limit_field.as_ref() {
         Some(Value::Number(number)) => number.as_u64().filter(|limit| *limit > 0),
-        None | Some(Value::Null) => declared_output_limit(&server, &model),
+        None | Some(Value::Null) => declared_output_limit(server, &effective_model),
         Some(_) => None,
     };
     let Some(limit) = limit else {
-        return invalid_request(
+        return Err(Box::new(invalid_request(
             "an output token limit is required: supply a positive max_output_tokens/max_tokens or fetch an Anthropic catalogue with max_tokens",
             stream,
             frontend,
-        );
+        )));
     };
-    canonical.sampling.max_tokens = Some(limit);
-    canonical
-        .extensions
-        .retain(|extension| extension.wire_path() != "$.max_output_tokens");
+    attempt.prepare_messages_transport(stream, limit);
 
-    let rendered = match translate::render_anthropic(&canonical, target.binding().dialect()) {
-        Ok(rendered) => rendered,
-        Err(error) => return invalid_request(&error.to_string(), stream, frontend),
-    };
+    let rendered = attempt
+        .render_json()
+        .map_err(|error| Box::new(invalid_request(&error.to_string(), stream, frontend)))?;
     if !rendered.report.is_empty()
         && let Some(ctx) = record.as_mut()
     {
         ctx.translation_report = Some(rendered.report);
     }
-    let body = match serde_json::to_vec(&rendered.value) {
-        Ok(body) => Bytes::from(body),
-        Err(error) => {
+    let body = serde_json::to_vec(&rendered.value)
+        .map(Bytes::from)
+        .map_err(|error| {
             tracing::error!(%error, "Messages backend serialisation failed");
-            return upstream_failure(ErrorWire::Openai, "toker could not render the request");
-        }
-    };
-    let backend = target.provider();
+            Box::new(upstream_failure(
+                ErrorWire::Openai,
+                "toker could not render the request",
+            ))
+        })?;
+    let backend = attempt.backend().clone();
     if !backend.foreign_auth_available() {
-        return frontend_error_response(
+        return Err(Box::new(frontend_error_response(
             frontend.codex_wire(),
             StatusCode::UNAUTHORIZED,
             "authentication_error",
             "the selected backend has no usable subscription credential",
             stream,
-        );
+        )));
     }
-    let upstream = match send_upstream_to(
-        &server,
-        backend.as_ref(),
-        &parts,
+    Ok(ReadyAttempt {
+        parts,
+        backend,
+        binding_id: attempt.binding().id().clone(),
+        effective_model,
+        response_model,
         body,
-        &server.config.session_header_names,
-        frontend.protocol(),
-        "/v1/messages",
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => return transport_failure(ErrorWire::Openai, &error),
-    };
-    forward(upstream, record, in_flight, &model, frontend, stream).await
+        record,
+        in_flight,
+        frontend,
+        stream,
+    })
 }
 
 fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
@@ -169,13 +416,13 @@ fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
 }
 
 fn invalid_request(message: &str, stream: bool, frontend: FrontendWire) -> Response {
-    frontend_error_response(
+    super::record::refused(frontend_error_response(
         frontend.codex_wire(),
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
         message,
         stream,
-    )
+    ))
 }
 
 async fn forward(
@@ -189,6 +436,7 @@ async fn forward(
     let status = upstream.status();
     let headers = upstream.headers().clone();
     if is_compressed(&headers) {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "toker could not interpret a compressed Messages response",
@@ -196,9 +444,11 @@ async fn forward(
     }
     if !status.is_success() {
         let Ok(buffered) = buffer_up_to(upstream, MAX_ERROR_BODY).await else {
+            record_terminal_failure(record.as_ref(), status, "ambiguous_transport");
             return truncated_body(ErrorWire::Openai);
         };
         if buffered.rest.is_some() {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "upstream error was too large");
         }
         let parsed = serde_json::from_slice::<Value>(&buffered.bytes).ok();
@@ -206,6 +456,7 @@ async fn forward(
             .as_ref()
             .and_then(|body| translate::canonical_turn_from_anthropic(body).ok())
         else {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
             return upstream_failure(ErrorWire::Openai, "invalid upstream error response");
         };
         if let Some(ctx) = record.as_ref() {
@@ -215,6 +466,7 @@ async fn forward(
         return json_response(status, &headers, &frontend.render_complete(model, &turn));
     }
     if is_event_stream(&headers) != expected_stream {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(
             ErrorWire::Openai,
             "upstream Messages response used the wrong streaming mode",
@@ -243,9 +495,11 @@ async fn forward(
             .expect("valid streaming response");
     }
     let Ok(buffered) = buffer_up_to(upstream, MAX_RESPONSE_BUFFER).await else {
+        record_terminal_failure(record.as_ref(), status, "ambiguous_transport");
         return truncated_body(ErrorWire::Openai);
     };
     if buffered.rest.is_some() {
+        record_terminal_failure(record.as_ref(), status, "response_protocol");
         return upstream_failure(ErrorWire::Openai, "upstream response was too large");
     }
     let turn = match serde_json::from_slice::<Value>(&buffered.bytes)
@@ -253,15 +507,41 @@ async fn forward(
         .and_then(|body| translate::canonical_turn_from_anthropic(&body).ok())
     {
         Some(turn) => turn,
-        None => return upstream_failure(ErrorWire::Openai, "invalid upstream response"),
+        None => {
+            record_terminal_failure(record.as_ref(), status, "response_protocol");
+            return upstream_failure(ErrorWire::Openai, "invalid upstream response");
+        }
     };
     if let Some(ctx) = record.as_ref() {
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&buffered.bytes);
-        let capture = observer.finish();
-        record_anthropic_measurement(ctx, capture.as_ref(), None, status.as_u16());
+        let (reported_model, capture) = observer.finish_parts();
+        record_anthropic_measurement(
+            ctx,
+            capture.as_ref(),
+            reported_model.as_deref(),
+            None,
+            status.as_u16(),
+        );
     }
     json_response(status, &headers, &frontend.render_complete(model, &turn))
+}
+
+fn record_terminal_failure(
+    record: Option<&AnthropicRecordCtx>,
+    status: StatusCode,
+    error_type: &str,
+) {
+    if let Some(ctx) = record {
+        record_anthropic_error(
+            ctx,
+            status.as_u16(),
+            Some(error_type.to_owned()),
+            None,
+            None,
+            None,
+        );
+    }
 }
 
 fn error_pair(body: Option<&Value>) -> (Option<String>, Option<String>) {
@@ -357,8 +637,15 @@ fn stream_events(
             }
             if state.ended {
                 if let Some(ctx) = state.record.take().filter(|_| state.succeeded) {
-                    let capture = std::mem::take(&mut state.observer).finish();
-                    record_anthropic_measurement(&ctx, capture.as_ref(), None, 200);
+                    let (reported_model, capture) =
+                        std::mem::take(&mut state.observer).finish_parts();
+                    record_anthropic_measurement(
+                        &ctx,
+                        capture.as_ref(),
+                        reported_model.as_deref(),
+                        None,
+                        200,
+                    );
                 }
                 drop(state.in_flight.take());
                 return None;
@@ -376,7 +663,7 @@ fn stream_events(
                     if state.frontend.turn_ended() {
                         state.ended = true;
                     } else {
-                        state.record.take();
+                        state.record_failure("response_protocol");
                         state.ended = true;
                         return Some((
                             Err(std::io::Error::new(
@@ -388,7 +675,7 @@ fn stream_events(
                     }
                 }
                 Err(error) => {
-                    state.record.take();
+                    state.record_failure("ambiguous_transport");
                     state.ended = true;
                     return Some((Err(std::io::Error::other(error)), state));
                 }
@@ -398,19 +685,48 @@ fn stream_events(
 }
 
 impl StreamState {
+    fn record_failure(&mut self, error_type: &str) {
+        if let Some(ctx) = self.record.take() {
+            record_anthropic_error(&ctx, 200, Some(error_type.to_owned()), None, None, None);
+        }
+    }
+
     fn feed(&mut self, event: SseEvent) {
         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.observer.observe_event(&event);
         }));
         for canonical in self.backend.feed_sse(&event) {
-            match canonical {
+            match &canonical {
                 CanonEvent::TurnEnded { .. } => self.succeeded = true,
-                CanonEvent::TurnFailed { .. } => self.succeeded = false,
+                CanonEvent::TurnFailed { error } => {
+                    self.succeeded = false;
+                    if let Some(ctx) = self.record.take() {
+                        record_anthropic_error(
+                            &ctx,
+                            200,
+                            Some(
+                                translate::anthropic_frontend::anthropic_error_type(error)
+                                    .to_owned(),
+                            ),
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
                 _ => {}
             }
             for emitted in self.frontend.feed(&canonical) {
                 self.pending.push_back(sse_bytes(&emitted));
             }
+        }
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if self.record.is_some() {
+            self.record_failure("client_cancelled");
         }
     }
 }

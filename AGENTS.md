@@ -1,5 +1,11 @@
 # Working on toker
 
+toker is a hobby project: one user, running it on a couple of machines. Prefer
+the simplest change that does the job, and don't build compatibility layers,
+options or abstractions for users or deployments that don't exist. The ledgers
+on those machines are real history, though, so migrations stay append-only and
+never lose rows.
+
 A local proxy and ledger for LLM traffic: Claude Code, opencode and the codex
 CLI talk to it on loopback, and it forwards to the configured backends
 (anthropic subscription or API, OpenAI API, openrouter, codex subscription)
@@ -14,14 +20,16 @@ it in claude-token-proxy (ctp), the Node proxy toker replaces.
 
 State lives in the SQLite ledger at the config's `db_path` (default
 `$XDG_DATA_HOME/toker/toker.db`); its directory is the state dir, and the only
-path the installed service may write. Lanes, learned models, allowances, pings
-and meter snapshots are tables there, not files. Config is
+path the installed service may write. Lanes, learned models, allowances, pings,
+meter snapshots and the routing policy are tables there, not files. Config is
 `~/.config/toker/toker.toml` (`$XDG_CONFIG_HOME`, or `TOKER_CONFIG`), written by
-`toker setup` and read by the service. Anything new the service writes goes in
-the state dir, and tests get a temp directory, never the real ledger. The one
-write outside it is the codex login refresh, which rewrites the codex CLI's own
-`~/.codex/auth.json`; setup makes that directory writable in the unit only when
-codex_sub is enabled (see [routing.md](docs/internals/routing.md)).
+`toker setup` and read by the service. It holds providers, credential sources
+and the listener; model routing lives in the ledger and is edited from
+`toker tui`. Anything new the service writes goes in the state dir, and tests
+get a temp directory, never the real ledger. The one write outside it is the
+codex login refresh, which rewrites the codex CLI's own `~/.codex/auth.json`;
+setup makes that directory writable in the unit only when codex_sub is enabled
+(see [routing.md](docs/internals/routing.md)).
 
 ## Invariants
 
@@ -47,12 +55,13 @@ The full text and the incidents behind them are in
    one. Do not add one without the same gate.
 5. **Never guess prices.** Verify against the published page and move
    `catalog::pricing::VERIFIED_ON`. Store cache-read rates explicitly.
-6. **Every inference body is canonical-rendered; a legacy administrative body
-   is the client's.** Before Messages rendering, only `strip_release`, the
-   `provider/model` prefix strip, force-newest `set_model`,
-   `retarget_compaction`, `strip_message_effort`, `thinking_between_tools`, and
-   `rewrite_mapped_models` may alter semantics. Editing it anywhere else is a
-   bug.
+6. **Every inference body is canonical-rendered; administrative bodies retain
+   the client's bytes except documented model tokens.** Before Messages
+   rendering, only `strip_release`, policy-selected `set_model`,
+   `retarget_compaction`, `strip_message_effort`, and `thinking_between_tools`
+   may alter semantics. `count_tokens` and batch creation may splice only their
+   documented model positions from policy results. Editing any other body
+   position is a bug.
 7. **Never pin a quota weight.** Weights are fitted from the ledger on every run
    and carry their spread; one the data cannot separate from zero is no weight.
 8. **Gate notices are model-visible and byte-stable.** A notice enters the
@@ -87,12 +96,13 @@ the same by hand.
 
 ## Verification
 
-Run `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check` before
-committing. The server tests drive the real router against mock upstreams and
-spend no quota. Rendered output is pinned by assertions, and increasingly by
-insta snapshots: review a changed snapshot with `cargo insta review`, or accept
-all with `INSTA_UPDATE=always cargo test`, and only once you have read the diff.
-A changed notice snapshot is a changed model-visible byte.
+Run `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check` at the
+end of a batch of changes and before pushing; there is no CI. The server tests
+drive the real router against mock upstreams and spend no quota. Rendered output
+is pinned by assertions, and increasingly by insta snapshots: review a changed
+snapshot with `cargo insta review`, or accept all with
+`INSTA_UPDATE=always cargo test`, and only once you have read the diff. A
+changed notice snapshot is a changed model-visible byte.
 
 A green run is not enough on its own. Bugs have shipped past it because the
 tests confirmed the code did what had been written. So:
@@ -109,8 +119,9 @@ tests confirmed the code did what had been written. So:
 
 ## Conventions
 
-- Use **jj**, not git. Commit as you work; bookmark `main` at the tip and leave
-  an empty working commit on top.
+- Commit as you work, one logical change per commit, with conventional-commit
+  subjects (`feat(scope): …`, `fix`, `refactor`, `test`, `docs`). No `!`
+  breaking-change marker.
 - Comments explain *why*, especially where something was learned the hard way.
   Comments that record a specific bug stay.
 - Prose lines wrap at 80 columns; tables and code blocks may exceed it.

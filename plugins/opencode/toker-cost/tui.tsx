@@ -11,9 +11,27 @@ import os from "node:os"
 // requests are auxiliary LLM calls with no transcript step, but they carry
 // the session header too, so they are attributed exactly like steps.
 
+// One entry of the reply's `lanes`: a tool-set lane of this session, with a
+// state toker worked out at query time. `state` is "ping" for a ping lane
+// (never conversation cache state), else "warm" or "cold", and null when
+// toker could not tell. Every other null is a field the lane never recorded.
+type TokerLane = {
+  tools_id: string | null
+  state: "warm" | "cold" | "ping" | null
+  ping: boolean
+  updated_ms: number
+  idle_ms: number | null
+  prompt_tokens: number | null
+  ttl_ms: number | null
+  warm_remaining_ms: number | null
+  noticed_ms: number | null
+  forced: { from: string | null; to: string | null } | null
+}
+
 // The `/_toker/session` reply shape. Nulls are toker's absence rule — "no
 // row carried the metric", never a zero — and a missing cost kind is the
 // difference between a subscription the plan already covers and spend.
+// `lanes` is empty when toker holds no lane for the session.
 type TokerSession = {
   requests: number
   first_ts_ms: number | null
@@ -30,6 +48,7 @@ type TokerSession = {
     per_provider: Array<{ provider: string; requests: number; cost_usd: number | null }>
     per_model: Array<{ model: string; requests: number; cost_usd: number | null }>
   }
+  lanes: TokerLane[]
 }
 
 const TOKER_SESSION_URL = "http://127.0.0.1:18123/_toker/session"
@@ -98,6 +117,40 @@ const formatMoney = (value) =>
         ? `$${value.toFixed(3)}`
         : `$${value.toFixed(4)}`
 
+// A span as one short unit pair: "45s", "4m12s", "2h05m".
+function formatSpan(ms: number) {
+  const seconds = Math.max(0, Math.floor(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`
+}
+
+const formatTokens = (value: number) =>
+  value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}M` : value >= 1_000 ? `${Math.round(value / 1_000)}k` : `${value}`
+
+// One lane as the sidebar's compact row. A ping lane is labelled as one and
+// shows neither prompt size nor a warm countdown, so it cannot pass for the
+// conversation's cache. Anything toker did not know is left out, not zeroed.
+function laneRow(lane: TokerLane, index: number) {
+  const id = lane.tools_id ?? `lane ${index + 1}`
+  const idle = lane.idle_ms === null ? undefined : formatSpan(lane.idle_ms)
+  const parts =
+    lane.state === "ping"
+      ? [`ping ${id}`, idle === undefined ? undefined : `${idle} ago`]
+      : [
+          id,
+          lane.state ?? "unknown",
+          lane.prompt_tokens === null ? undefined : formatTokens(lane.prompt_tokens),
+          lane.state === "warm" && lane.warm_remaining_ms !== null
+            ? `${formatSpan(lane.warm_remaining_ms)} left`
+            : idle === undefined
+              ? undefined
+              : `idle ${idle}`,
+        ]
+  return parts.filter((part) => part !== undefined).join(" · ")
+}
+
 // Current context = the last assistant message with usage before the revert
 // boundary; its per-category tokens are exactly what sits in context now.
 function lastUsage(messages, boundary) {
@@ -138,6 +191,12 @@ function sessionAttribution(context, sessionID) {
       provider: row.provider,
       requests: row.requests,
       cost: row.cost_usd,
+    })),
+    // Absent or empty renders no block: toker down, an older toker without
+    // the field, and a session it holds no lane for all read the same.
+    lanes: (toker?.lanes ?? []).map((lane, index) => ({
+      row: laneRow(lane, index),
+      moved: lane.forced && lane.forced.from && lane.forced.to ? `${lane.forced.from} → ${lane.forced.to}` : undefined,
     })),
     context: last
       ? {
@@ -223,7 +282,14 @@ function SidebarContext(props) {
 
   return (
     <Show
-      when={info() && (info().context || info().total > 0 || info().providers.length > 0 || (info().requests ?? 0) > 0)}
+      when={
+        info() &&
+        (info().context ||
+          info().total > 0 ||
+          info().providers.length > 0 ||
+          info().lanes.length > 0 ||
+          (info().requests ?? 0) > 0)
+      }
     >
       <box>
         <text fg={theme.text.base}>
@@ -254,6 +320,21 @@ function SidebarContext(props) {
               <text fg={theme.text.muted}>
                 {row.provider} · {row.requests} · {formatMoney(row.cost)}
               </text>
+            )}
+          </For>
+        </Show>
+        <Show when={info().lanes.length > 0}>
+          <text fg={theme.text.base}>
+            <b>Lanes</b>
+          </text>
+          <For each={info().lanes}>
+            {(lane) => (
+              <>
+                <text fg={theme.text.muted}>{lane.row}</text>
+                <Show when={lane.moved}>
+                  <text fg={theme.text.muted}>{`  ${lane.moved}`}</text>
+                </Show>
+              </>
             )}
           </For>
         </Show>

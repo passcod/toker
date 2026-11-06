@@ -27,6 +27,7 @@ pub mod ir;
 pub mod middleware;
 pub mod observe;
 pub mod picker;
+pub mod policy;
 pub mod proto;
 pub mod providers;
 pub mod release;

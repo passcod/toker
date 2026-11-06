@@ -385,6 +385,7 @@ mod tests {
             ResponseEvent::Completed {
                 response: CompletedResponse {
                     id: Some("resp_1".to_owned()),
+                    model: None,
                     usage: None,
                     end_turn: None,
                 },
@@ -611,6 +612,7 @@ mod tests {
             ResponseEvent::Incomplete {
                 reason: Some("content_filter".to_owned()),
                 usage: None,
+                model: None,
             },
         ] {
             for emitted in stream.feed(&event) {
@@ -625,10 +627,12 @@ mod tests {
         stream.feed(&ResponseEvent::Incomplete {
             reason: None,
             usage: None,
+            model: None,
         });
         stream.feed(&ResponseEvent::Incomplete {
             reason: Some("something_new".to_owned()),
             usage: None,
+            model: None,
         });
         // (only the first incomplete matters; the stream has ended)
         assert!(stream.turn_ended());

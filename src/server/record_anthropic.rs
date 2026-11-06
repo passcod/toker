@@ -25,7 +25,7 @@
 //!   predecessor's did: a 429 carries no usage, and its meters are the
 //!   only evidence of throttling the ledger gets (an earlier port left
 //!   them off as "lean", which erased exactly that). The *blocked* rows
-//!   carry a stale copy instead — [`record_anthropic_blocked`] ports
+//!   carry a stale copy instead — [`record_quota_blocked`] ports
 //!   that, since the stale snapshot is the block's own provenance.
 //! - **`model` is the normalised identity, `raw_model` the wire form**
 //!   (the normalise/raw pair, as the predecessor named them).
@@ -52,15 +52,19 @@ use crate::middleware::lanes;
 use crate::middleware::quota::{Grant, Meter, group};
 use crate::middleware::system_change::{self, SystemCapture};
 use crate::observe::AnthropicCapture;
+use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{CostKind, RequestRow, RowKind};
+use crate::store::{
+    AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind, SessionLineage,
+};
 use crate::translate::TranslationReport;
 
 use super::Server;
-use super::record::{elapsed_ms, i64_of, now_ms, with_frontend};
+use super::record::{elapsed_ms, i64_of, now_ms, persist_lane_pin, with_frontend};
 
 /// Everything a completion point knows about one anthropic request,
 /// minus the response itself.
+#[derive(Clone)]
 pub(crate) struct AnthropicRecordCtx {
     /// The server (for the store).
     pub(crate) server: Server,
@@ -70,12 +74,24 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) path: &'static str,
     /// Session identity, read by header name only (invariant 2).
     pub(crate) session_id: Option<String>,
+    /// Verified frontend-derived lineage; never inferred from backend routing.
+    pub(crate) lineage: Option<SessionLineage>,
     /// The model the frontend asked for, `provider/model` routing included.
     pub(crate) requested_model: Option<String>,
     /// The model that served, after the routing rewrite.
     pub(crate) effective_model: Option<String>,
     /// The selected backend — provider column, route, cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
+    /// The backend binding the send went to. This identifies the wire
+    /// dialect without implying a candidate selection.
+    pub(crate) binding_id: BindingId,
+    /// The actual upstream send this response completes: every send has
+    /// group/index/reason identity.
+    pub(crate) attempt: Option<AttemptProvenance>,
+    /// The policy route that selected this send.
+    pub(crate) policy_routing: Option<PolicyRouteProvenance>,
+    /// One successful attempt's already-decided lane-pin transition.
+    pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
     /// The request's `anthropic-beta` flags as a JSON array; `None` when
     /// the header was absent.
     pub(crate) betas: Option<Value>,
@@ -108,13 +124,10 @@ pub(crate) struct AnthropicRecordCtx {
     /// The frontend's name from its `/f/<frontend>` prefix, recorded in
     /// `extra` ([`with_frontend`]).
     pub(crate) frontend: Option<String>,
-    /// The upstream refused this request's `thinking: disabled` and it was
-    /// sent again as `between_tools` (the server's thinking retry), so the
-    /// row describes the second attempt. Recorded in `extra` as
-    /// `thinkingRewrite`; the refused first attempt has no row of its own.
-    pub(crate) thinking_rewritten: bool,
     /// Content-free semantic omissions made by canonical rendering.
     pub(crate) translation_report: Option<TranslationReport>,
+    /// Clears matching health circuits only after canonical success completes.
+    pub(crate) policy_attempt: Option<Arc<super::PolicyAttempt>>,
 }
 
 /// Record a completed anthropic usage-path response: the measurement row
@@ -127,6 +140,7 @@ pub(crate) struct AnthropicRecordCtx {
 pub(crate) fn record_anthropic_measurement(
     ctx: &AnthropicRecordCtx,
     capture: Option<&AnthropicCapture>,
+    reported_model: Option<&str>,
     rate_limits: Option<&Value>,
     status: u16,
 ) {
@@ -162,9 +176,19 @@ pub(crate) fn record_anthropic_measurement(
         }
         _ => false,
     };
+    if !ledgered {
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, reported_model, ts_ms, None);
+    }
+    persist_successful_pin(ctx, ts_ms);
+    if status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
+    }
 
-    let model = capture
-        .and_then(AnthropicCapture::model)
+    let model = reported_model
+        .or_else(|| capture.and_then(AnthropicCapture::model))
         .or(ctx.effective_model.as_deref());
     tracing::info!(
         "POST {} → {} ledgered={} model={} provider={} ({:.1}s)",
@@ -239,38 +263,11 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 6) — it is logged as the visible breakage it is.
-///
-/// Every row the API answered also marks its model served, on the
-/// identity the RESPONSE named (the predecessor's `appendRow` did this
-/// for every row). The mark before sending covers a lane deciding while
-/// this request is in flight; this one covers what the upstream actually
-/// served, which a host-side alias or an upstream substitution can make
-/// differ from what was sent — and recency must follow the served
-/// identity. In-memory and infallible, so it cannot cost the row.
-fn insert(ctx: &AnthropicRecordCtx, mut row: RequestRow) {
-    if ctx.thinking_rewritten {
-        mark_thinking_rewrite(&mut row);
-    }
+/// (invariant 3) — it is logged as the visible breakage it is.
+fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
-    }
-    ctx.server
-        .models
-        .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
-}
-
-/// Mark a row whose request went out the second time with `thinking`
-/// rewritten to `between_tools`, the same way [`with_frontend`] adds its
-/// key: into an object `extra`, or as a new one.
-fn mark_thinking_rewrite(row: &mut RequestRow) {
-    match &mut row.extra {
-        Some(Value::Object(extra)) => {
-            extra.insert("thinkingRewrite".to_owned(), json!("between_tools"));
-        }
-        Some(_) => {}
-        None => row.extra = Some(json!({ "thinkingRewrite": "between_tools" })),
     }
 }
 
@@ -291,6 +288,17 @@ fn usage_bearing(capture: &AnthropicCapture) -> bool {
         || presence.code_execs
 }
 
+pub(super) fn persist_successful_pin(ctx: &AnthropicRecordCtx, ts_ms: i64) {
+    persist_lane_pin(
+        &ctx.server,
+        ctx.session_id.as_deref(),
+        ctx.shape.as_ref().map(|shape| shape.tools_hash.as_str()),
+        ctx.ping,
+        ctx.pin_transition.as_ref(),
+        ts_ms,
+    );
+}
+
 /// What this response taught the lane table and the learned model store,
 /// after the API actually served it.
 ///
@@ -309,15 +317,14 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
     let held = capture.input().unwrap_or(0)
         + capture.cache_read().unwrap_or(0)
         + capture.cache_write_total().unwrap_or(0);
+    let presence = capture.presence();
+    let held_observed =
+        (presence.input || presence.cache_read || presence.cache_write_total).then_some(held);
 
-    // A model is "seen" when a response named it. Days
-    // are local calendar days; the system zone is the server's, read once
-    // per response.
+    // A model is "seen" when a response named it.
     if let Some(model) = capture.model() {
-        let tz = jiff::tz::TimeZone::system();
-        if let Err(error) = ctx.server.models.note_seen(model, ts_ms, held, &tz) {
-            tracing::error!(%error, "learned model update failed");
-        }
+        ctx.server
+            .note_binding_observed(&ctx.binding_id, Some(model), ts_ms, held_observed);
     }
 
     // The lane keyed by session × tools-hash, moved
@@ -541,6 +548,10 @@ fn measurement_row(
         betas: ctx.betas.as_ref().map(|betas| betas.to_string()),
         geo: capture.geo().map(str::to_owned),
         fast: capture.speed().map(|speed| speed == "fast"),
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: ctx.lineage.clone(),
     }
 }
 
@@ -663,6 +674,10 @@ fn error_row(
         betas: None,
         geo: None,
         fast: None,
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: ctx.lineage.clone(),
     }
 }
 
@@ -683,16 +698,18 @@ fn error_row(
 /// (row parity: the last-seen meters). No duration, no
 /// usage, never priced — a proxy-written row, excluded from API
 /// measurements by its kind.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_anthropic_released(
     server: &Server,
     session_id: &str,
     backend_id: &str,
+    frontend_protocol: &'static str,
     release: Release,
     grant: &Grant,
     stale_meters: Option<&Value>,
     frontend: Option<&str>,
 ) {
-    let row = crate::release::released_row(
+    let mut row = crate::release::released_row(
         session_id,
         backend_id,
         release,
@@ -701,22 +718,29 @@ pub(crate) fn record_anthropic_released(
         &server.config.gates,
         now_ms(),
     );
+    row.frontend = Some(frontend_protocol.to_owned());
+    row.route = Some(format!("{frontend_protocol}:{backend_id}"));
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
     tracing::info!(
-        "POST /v1/messages → released {} ({release:?}) five_hour={:?} seven_day={:?}",
+        "POST {} → released {} ({release:?}) five_hour={:?} seven_day={:?}",
+        if frontend_protocol == "anthropic" {
+            "/v1/messages"
+        } else {
+            "/v1/chat/completions"
+        },
         session_id,
         grant.five_hour,
         grant.seven_day,
     );
 }
 
-/// The inputs of one blocked row (see [`record_anthropic_blocked`]) —
+/// The inputs of one blocked row (see [`record_quota_blocked`]) —
 /// a struct because the pieces are exactly the row's own fields, and
 /// a nine-argument call site would be positional-number soup.
-pub(crate) struct BlockedRecord<'a> {
+pub(crate) struct QuotaBlockedRecord<'a> {
     /// The server (for the store).
     pub(crate) server: &'a Server,
     /// Request start, for `duration_ms`.
@@ -727,6 +751,8 @@ pub(crate) struct BlockedRecord<'a> {
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached (the gate's own).
     pub(crate) backend_id: &'a str,
+    /// The client protocol stopped by the gate.
+    pub(crate) frontend_protocol: &'static str,
     /// Which meter hit its limit.
     pub(crate) meter: Meter,
     /// When that meter's window resets, epoch seconds.
@@ -752,13 +778,14 @@ pub(crate) struct BlockedRecord<'a> {
 /// No model columns (the predecessor's blocked row carries none), no
 /// usage, never
 /// priced; a proxy-written row, excluded from API measurements by its kind.
-pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
-    let BlockedRecord {
+pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
+    let QuotaBlockedRecord {
         server,
         started,
         path,
         session_id,
         backend_id,
+        frontend_protocol,
         meter,
         resets_at,
         context_tokens,
@@ -770,9 +797,9 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         ts_ms: now_ms(),
         duration_ms: Some(elapsed_ms(started)),
         kind: Some(RowKind::Blocked),
-        frontend: Some("anthropic".to_owned()),
+        frontend: Some(frontend_protocol.to_owned()),
         provider: Some(backend_id.to_owned()),
-        route: Some(format!("anthropic:{backend_id}")),
+        route: Some(format!("{frontend_protocol}:{backend_id}")),
         session_id: session_id.map(str::to_owned),
         ping: None,
         model: None,
@@ -833,6 +860,10 @@ pub(crate) fn record_anthropic_blocked(record: BlockedRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -964,6 +995,10 @@ fn write_cold_row(record: ColdRecord<'_>, kind: RowKind, verb: &str) {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -1120,6 +1155,10 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
         betas: None,
         geo: None,
         fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage: None,
     };
     let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
@@ -1171,7 +1210,7 @@ pub(crate) fn record_responses_measurement(
     ctx: &AnthropicRecordCtx,
     capture: &crate::providers::codex::TurnCapture,
     meters: Option<Value>,
-    _status: u16,
+    status: u16,
     frontend_protocol: &'static str,
     serving_provider: Option<&str>,
 ) {
@@ -1242,13 +1281,11 @@ pub(crate) fn record_responses_measurement(
         route: Some(route),
         session_id: ctx.session_id.clone(),
         ping: ctx.ping.then_some(true),
-        // The response's own slug is authoritative (the routing unit's
-        // `model` capture); the effective model — map and all — is the
-        // fallback when the response did not name itself.
-        model: capture
-            .model()
-            .map(str::to_owned)
-            .or_else(|| ctx.effective_model.clone()),
+        // Missing provider-reported identity remains absent; the attempted
+        // target already has its own effective_model column. Keep the exact
+        // wire identity beside the same normalised model identity used by
+        // native Messages rows.
+        model: capture.model().and_then(normalise_model_id),
         raw_model: capture.model().map(str::to_owned),
         requested_model: ctx.requested_model.clone(),
         effective_model: ctx.effective_model.clone(),
@@ -1308,6 +1345,10 @@ pub(crate) fn record_responses_measurement(
         betas: ctx.betas.clone().map(|betas| betas.to_string()),
         geo: None,
         fast: None,
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);
 
@@ -1326,20 +1367,12 @@ pub(crate) fn record_responses_measurement(
     let held = held_input.unwrap_or(0)
         + i64::try_from(cached.unwrap_or(0)).unwrap_or(i64::MAX)
         + i64::try_from(written.unwrap_or(0)).unwrap_or(i64::MAX);
-    let model = capture
-        .model()
-        .map(str::to_owned)
-        .or_else(|| ctx.effective_model.clone());
-    if let Some(model) = model.as_deref() {
-        let tz = jiff::tz::TimeZone::system();
-        if let Err(error) =
-            ctx.server
-                .models
-                .note_seen(model, ts_ms, u64::try_from(held).unwrap_or(u64::MAX), &tz)
-        {
-            tracing::error!(%error, "learned model update failed");
-        }
-    }
+    ctx.server.note_binding_observed(
+        &ctx.binding_id,
+        capture.model(),
+        ts_ms,
+        usage.map(|_| u64::try_from(held).unwrap_or(u64::MAX)),
+    );
     let compaction = ctx
         .shape
         .as_ref()
@@ -1361,13 +1394,19 @@ pub(crate) fn record_responses_measurement(
     ) {
         tracing::error!(%error, "lane update failed");
     }
+    persist_successful_pin(ctx, ts_ms);
+    if status < 400
+        && let Some(attempt) = ctx.policy_attempt.as_deref()
+    {
+        ctx.server.clear_policy_target_circuits(attempt);
+    }
     ctx.server.evaluate_awake();
 
     let model = capture.model().unwrap_or("?");
     tracing::info!(
         "POST {} → {} ledgered=yes model={} provider={} ({:.1}s)",
         ctx.path,
-        _status,
+        status,
         model,
         ctx.backend.id(),
         ctx.started.elapsed().as_secs_f64(),
@@ -1457,6 +1496,10 @@ pub(crate) fn record_codex_error(
         betas: None,
         geo: None,
         fast: None,
+        binding_id: Some(ctx.binding_id.clone()),
+        attempt: ctx.attempt.clone(),
+        policy_routing: ctx.policy_routing.clone(),
+        lineage: ctx.lineage.clone(),
     };
     insert(ctx, row);
     tracing::info!(

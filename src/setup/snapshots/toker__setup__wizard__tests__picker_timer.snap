@@ -3,7 +3,7 @@ source: src/setup/wizard.rs
 expression: unit
 ---
 [Unit]
-Description=toker picker timer (refreshes Claude Code's openrouter /model rows daily)
+Description=toker picker timer (refreshes Claude Code's /model rows daily)
 
 [Timer]
 OnCalendar=daily

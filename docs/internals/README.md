@@ -29,7 +29,8 @@ topic says that too.
 | `src/main.rs` | The CLI surface (clap). Every subcommand is a call into `cmds`. |
 | `src/cmds.rs` | Subcommand wiring: `serve`, `setup`, `status`, `tui`, `import`, `export`, `watch-context-window`, `promote`, `restart` (with its wait loop), `picker sync`, and the hidden timer verbs. |
 | `src/config.rs` | `toker.toml` load: providers, protocol defaults, `[gates]`, `[notices]`, env overrides. |
-| `src/routing.rs` | Protocol identities, frontend profiles, and providers' verified native-wire bindings. |
+| `src/routing.rs` | Protocol identities, frontend profiles, and providers' verified native-wire bindings: topology only, never a model choice. |
+| `src/policy/` | Authoritative model routing: the revision store's document and compiler, the resolver, lane pins and transitions, the learning and family inputs, force-newest, and the revision-one compiler from legacy config. See [policy.md](policy.md). |
 | `src/secrets.rs` | API keys in the OS keyring, behind a seam tests replace. |
 | `src/server/mod.rs` | The axum listener: socket activation, routes, the `/f/<frontend>` strip, the upstream idle timeout, the sleep-lock tick, the drain on shutdown. |
 | `src/server/anthropic.rs` | The Anthropic Messages frontend: release marker, quota gate, cold gate, compaction retarget, force-newest, model map, in that order. |
@@ -46,15 +47,13 @@ topic says that too.
 | `src/middleware/cold.rs` | The cold gate, the compaction retarget, the burn ladder and the quota weight fit the outlook prices with. Pure apart from two store conveniences. |
 | `src/middleware/lanes.rs` | The lane table: key, TTL stickiness, response merge, restart reseed, prune policy, ping tag. |
 | `src/middleware/system_change.rs` | Capture-time system-prompt change localisation against the lane's previous ledger row, and which rows keep the ladders. |
-| `src/middleware/models.rs` | The learned model store: family election, days served, `max_prompt`, promotion. |
-| `src/middleware/force_newest.rs` | Moving a request onto its family's newest model where no cache can be lost. |
-| `src/middleware/model_map.rs` | The configured model routing map: model positions only, untouched bytes elsewhere. |
+| `src/middleware/model_map.rs` | Parsing a model position and rewriting model positions in a body; untouched bytes elsewhere. |
 | `src/middleware/notice.rs` | Rendering a notice in the frontend's style. Pure. |
 | `src/middleware/awake.rs` | The idle-sleep lock: what counts as live, the platform command, the detached child. |
 | `src/providers/` | Backends: `anthropic.rs` (sub and API, and the meter-header parser), `openrouter.rs`, `openai.rs`, `codex/` (login, wire types, SSE, meters). |
 | `src/catalog/` | Hand-verified Anthropic-compatible and direct OpenAI prices (`pricing.rs`, `openai_pricing.rs`) and context windows (`windows.rs`), each with a `VERIFIED_ON`; fetched listings (`fetched.rs`) and routable frontend offers (`offers.rs`). |
 | `src/store/` | The SQLite ledger (`ledger.rs`), the state tables (`state.rs`), and the append-only migrations (`schema.rs`). |
-| `src/picker.rs` | Claude Code `/model` rows for OpenRouter Messages offers: the rules, the built-in set, and `toker picker sync`. |
+| `src/picker.rs` | `toker picker sync`: Claude Code `/model` rows for OpenRouter Messages offers. |
 | `src/import.rs` | `toker import`: ctp's `usage.jsonl` into the ledger, with a checkpoint. |
 | `src/export.rs` | `toker export`: the ledger as JSONL, and the strict `--since`/`--until`/`--kind` parsers. |
 | `src/watch.rs` | `toker watch-context-window`: one pass printing each new proof of a context window, with its seen-set state file. |

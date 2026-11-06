@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&adding(super::View::Presentations, '1'))"
+---
+ ?  ⇄
+1 PRE┌ADD PRESENTATION────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │> id: new-presentation▏                                                                                     │
+┌PRES│  SCOPE                                                                                                     │────┐
+│mixe│    kind: < protocol >                                                                                      │    │
+│    │    protocol: < anthropic_messages >                                                                        │    │
+│    │  slug: new-model                                                                                           │    │
+│    │  label: New model                                                                                          │    │
+│    │  description: (none)                                                                                       │    │
+│    │  [x] enabled                                                                                               │    │
+│    │  [ ] shadows a native model                                                                                │    │
+│    │  SOURCE                                                                                                    │    │
+│    │    kind: < exact_offer >                                                                                   │    │
+│    │    binding: anthropic_sub.anthropic_messages                                                               │    │
+│    │    model: model-id                                                                                         │    │
+│    │  [ ] adapter metadata                                                                                      │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

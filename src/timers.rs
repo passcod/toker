@@ -1412,6 +1412,10 @@ mod tests {
             betas: None,
             geo: None,
             fast: None,
+            binding_id: None,
+            attempt: None,
+            policy_routing: None,
+            lineage: None,
         }
     }
 

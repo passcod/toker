@@ -58,6 +58,14 @@ Each is one of the repo's existing mistakes in new clothes:
   ahead, which sailed past the cutoff. Fixture timestamps are relative to the
   run's own now.
 
+**The ping is routed like any other request.** It names a model, and the active
+policy revision decides where that goes. Only a ping-tagged row from
+`anthropic_sub` counts as landing (`Store::ping_landed`), so a revision that
+sends the ping's model to another backend, or fails over from the subscription,
+opens no window and the run is recorded with no observed boundary. That is the
+readback working: a ping the router sent elsewhere really did nothing for the
+schedule.
+
 Each run is recorded in the `pings` table with the boundary it predicted, the
 boundary the ledger then reported, and whether they matched, so whether the
 schedule actually held is a query, not a memory.

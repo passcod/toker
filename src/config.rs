@@ -15,6 +15,7 @@
 //! ([`crate::secrets::read_key`]), never at load.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -114,18 +115,21 @@ pub struct Config {
     /// request carried it is recorded but excluded from liveness (plan:
     /// Ping tagging).
     pub ping_header_name: String,
-    /// The default backend for the openai_chat protocol, always one of
-    /// the enabled providers; `None` when the protocol has no backend
-    /// (its routes then answer a not-configured error).
+    /// The default backend for the openai_chat protocol, always one of the
+    /// enabled providers; `None` when the protocol has no backend. Read only
+    /// to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it, because the active revision owns
+    /// routing.
     pub default_backend_openai_chat: Option<String>,
     /// The openrouter provider block; `None` when absent, which is the
     /// disabled state: a `[providers.X]` block's presence enables X.
     pub openrouter: Option<OpenRouterConfig>,
     /// The OpenAI API provider block (`None`: disabled).
     pub openai_api: Option<OpenAiApiConfig>,
-    /// The default backend for the anthropic protocol (plan: Routing —
-    /// bare model names go to the protocol default), always one of the
-    /// enabled providers; `None` when no anthropic backend is enabled.
+    /// The default backend for the anthropic protocol, always one of the
+    /// enabled providers; `None` when no anthropic backend is enabled. Read
+    /// only to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it.
     pub default_backend_anthropic: Option<String>,
     /// The anthropic subscription provider block (`None`: disabled).
     pub anthropic_sub: Option<AnthropicSubConfig>,
@@ -312,7 +316,16 @@ impl OpenRouterConfig {
     /// openrouter's 401 body passes through, which verifies the wiring
     /// (ledger-proxy lesson).
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.api_key_with_env(&ProcessEnvironment, keyring)
+    }
+
+    fn api_key_with_env(
+        &self,
+        environment: &impl Environment,
+        keyring: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
         resolve_api_key(
+            environment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -323,7 +336,16 @@ impl OpenRouterConfig {
     /// Which key sources are set, for status reporting (invariant 2: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        self.key_sources_with_env(&ProcessEnvironment)
+    }
+
+    fn key_sources_with_env(&self, environment: &impl Environment) -> KeySources {
+        key_sources_of(
+            environment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -343,6 +365,7 @@ pub struct OpenAiApiConfig {
 impl OpenAiApiConfig {
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
         resolve_api_key(
+            &ProcessEnvironment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -351,7 +374,12 @@ impl OpenAiApiConfig {
     }
 
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        key_sources_of(
+            &ProcessEnvironment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -360,10 +388,10 @@ impl OpenAiApiConfig {
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
-    /// The model routing map (plan: Middleware — "Model routing map"):
-    /// `[providers.anthropic_sub.model_map]`, an optional operator policy
-    /// applied as the pipeline's final routing stage on this backend.
-    /// `None` when the table is absent (the default — no mapping).
+    /// The model routing map: `[providers.anthropic_sub.model_map]`, an
+    /// optional operator policy. Revision one's generator compiles it into an
+    /// alias policy on this backend's candidate; it is not read at request
+    /// time. `None` when the table is absent (the default: no mapping).
     pub model_map: Option<ModelMap>,
     /// Toker-held OAuth token sources, preferred to Claude's local login
     /// when both are available for a foreign frontend.
@@ -392,6 +420,7 @@ impl std::fmt::Debug for AnthropicSubConfig {
 impl AnthropicSubConfig {
     pub fn oauth_token(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
         resolve_api_key(
+            &ProcessEnvironment,
             &self.oauth_token_env,
             self.oauth_token_keyring,
             keyring,
@@ -401,6 +430,7 @@ impl AnthropicSubConfig {
 
     pub fn oauth_sources(&self) -> KeySources {
         key_sources_of(
+            &ProcessEnvironment,
             &self.oauth_token_env,
             self.oauth_token_keyring,
             &self.oauth_token,
@@ -433,7 +463,16 @@ impl AnthropicApiConfig {
     /// only the frontend's own credential, or unauthenticated, and
     /// anthropic's 401 body passes through.
     pub fn api_key(&self, keyring: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.api_key_with_env(&ProcessEnvironment, keyring)
+    }
+
+    fn api_key_with_env(
+        &self,
+        environment: &impl Environment,
+        keyring: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
         resolve_api_key(
+            environment,
             &self.api_key_env,
             self.api_key_keyring,
             keyring,
@@ -443,7 +482,16 @@ impl AnthropicApiConfig {
 
     /// Which key sources are set, for status reporting (invariant 2).
     pub fn key_sources(&self) -> KeySources {
-        key_sources_of(&self.api_key_env, self.api_key_keyring, &self.api_key)
+        self.key_sources_with_env(&ProcessEnvironment)
+    }
+
+    fn key_sources_with_env(&self, environment: &impl Environment) -> KeySources {
+        key_sources_of(
+            environment,
+            &self.api_key_env,
+            self.api_key_keyring,
+            &self.api_key,
+        )
     }
 }
 
@@ -616,12 +664,16 @@ fn toml_type_of(value: &toml::Value) -> &'static str {
 /// consulted only when configured, so a config without it never touches
 /// the secret service.
 fn resolve_api_key(
+    environment: &impl Environment,
     api_key_env: &str,
     keyring_configured: bool,
     keyring: impl FnOnce() -> Option<String>,
     literal: &Option<String>,
 ) -> Option<String> {
-    if let Some(key) = env::var_os(api_key_env).filter(|key| !key.is_empty()) {
+    if let Some(key) = environment
+        .var_os(api_key_env)
+        .filter(|key| !key.is_empty())
+    {
         return key.into_string().ok();
     }
     if keyring_configured && let Some(key) = keyring().filter(|key| !key.is_empty()) {
@@ -633,9 +685,16 @@ fn resolve_api_key(
 /// Which key sources are set — the whole of what status may report about
 /// credentials (invariant 2). The keyring is reported as configured, not
 /// read: only the service reads it.
-fn key_sources_of(api_key_env: &str, keyring: bool, literal: &Option<String>) -> KeySources {
+fn key_sources_of(
+    environment: &impl Environment,
+    api_key_env: &str,
+    keyring: bool,
+    literal: &Option<String>,
+) -> KeySources {
     KeySources {
-        env_set: env::var_os(api_key_env).is_some_and(|key| !key.is_empty()),
+        env_set: environment
+            .var_os(api_key_env)
+            .is_some_and(|key| !key.is_empty()),
         keyring_configured: keyring,
         literal_set: literal.is_some(),
     }
@@ -651,17 +710,33 @@ pub struct KeySources {
     pub literal_set: bool,
 }
 
+trait Environment {
+    fn var_os(&self, name: &str) -> Option<OsString>;
+}
+
+struct ProcessEnvironment;
+
+impl Environment for ProcessEnvironment {
+    fn var_os(&self, name: &str) -> Option<OsString> {
+        env::var_os(name)
+    }
+}
+
 impl Config {
     /// Load the resolved configuration: defaults ← `toker.toml` ← env.
     /// A missing file is the defaults, not an error; a present file that
     /// does not parse is an error — a hand-edited typo must not silently
     /// read as default.
     pub fn load() -> anyhow::Result<Config> {
-        let path = config_path()?;
+        Self::load_with_env(&ProcessEnvironment)
+    }
+
+    fn load_with_env(environment: &impl Environment) -> anyhow::Result<Config> {
+        let path = config_path_with_env(environment)?;
         let mut config = Self::load_from(&path)?;
 
         // Env overrides (config file loses).
-        if let Some(port) = env::var_os("TOKER_PORT") {
+        if let Some(port) = environment.var_os("TOKER_PORT") {
             let port = port
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("TOKER_PORT is not valid UTF-8"))?
@@ -669,10 +744,10 @@ impl Config {
                 .context("TOKER_PORT must be a port number")?;
             config.port = port;
         }
-        if let Some(db) = env::var_os("TOKER_DB") {
+        if let Some(db) = environment.var_os("TOKER_DB") {
             config.db_path = PathBuf::from(db);
         }
-        if let Some(upstream) = env::var_os("TOKER_UPSTREAM") {
+        if let Some(upstream) = environment.var_os("TOKER_UPSTREAM") {
             let upstream = upstream
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
@@ -688,7 +763,7 @@ impl Config {
             }
         }
 
-        config.validate()?;
+        config.validate_retained()?;
         Ok(config)
     }
 
@@ -700,6 +775,12 @@ impl Config {
     /// file by a rewrite. A missing file is the defaults; a present
     /// file that does not parse or validate is an error — a
     /// hand-edited typo must not be silently clobbered.
+    ///
+    /// Loading does not check the legacy routing fields (the protocol
+    /// defaults) against the enabled backends: once the database owns
+    /// routing the file need not carry them, and every command that only
+    /// wants the providers and the listener must still load it. Whatever
+    /// reads them as routing input calls [`Config::validate`] first.
     pub fn load_from(path: &Path) -> anyhow::Result<Config> {
         let file = match fs::read_to_string(path) {
             Ok(text) => toml::from_str::<FileConfig>(&text)
@@ -710,7 +791,7 @@ impl Config {
             }
         };
         let config = Self::resolve_file(file)?;
-        config.validate()?;
+        config.validate_retained()?;
         Ok(config)
     }
 
@@ -725,14 +806,27 @@ impl Config {
     /// slash), `~`-leading paths already expanded at load, model-map
     /// selectors canonical; comments and hand formatting are not
     /// carried.
+    #[cfg(test)]
     pub(crate) fn to_file(&self) -> FileConfig {
+        self.to_file_with_routing(true)
+    }
+
+    pub(crate) fn to_owned_file(&self) -> FileConfig {
+        self.to_file_with_routing(false)
+    }
+
+    fn to_file_with_routing(&self, include_routing: bool) -> FileConfig {
         FileConfig {
             port: Some(self.port),
             db_path: Some(self.db_path.to_string_lossy().into_owned()),
             session_header_names: Some(self.session_header_names.clone()),
             ping_header_name: Some(self.ping_header_name.clone()),
-            default_backend_openai_chat: self.default_backend_openai_chat.clone(),
-            default_backend_anthropic: self.default_backend_anthropic.clone(),
+            default_backend_openai_chat: include_routing
+                .then(|| self.default_backend_openai_chat.clone())
+                .flatten(),
+            default_backend_anthropic: include_routing
+                .then(|| self.default_backend_anthropic.clone())
+                .flatten(),
             awake: Some(self.awake),
             transcript_roots: Some(
                 self.transcript_roots
@@ -748,7 +842,7 @@ impl Config {
                     api_key_env: Some(openrouter.api_key_env.clone()),
                     api_key_keyring: openrouter.api_key_keyring.then_some(true),
                     api_key: openrouter.api_key.clone(),
-                    picker: openrouter.picker.clone(),
+                    picker: include_routing.then(|| openrouter.picker.clone()).flatten(),
                 }),
                 openai_api: self.openai_api.as_ref().map(|api| FileOpenAiApi {
                     upstream: Some(api.upstream.to_string()),
@@ -765,14 +859,18 @@ impl Config {
                         .claude_credentials_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned()),
-                    model_map: sub.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| sub.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
                 anthropic_api: self.anthropic_api.as_ref().map(|api| FileAnthropicApi {
                     upstream: Some(api.upstream.to_string()),
                     api_key_env: Some(api.api_key_env.clone()),
                     api_key_keyring: api.api_key_keyring.then_some(true),
                     api_key: api.api_key.clone(),
-                    model_map: api.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| api.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
                 codex_sub: self.codex_sub.as_ref().map(|codex| FileCodexSub {
                     upstream: Some(codex.upstream.to_string()),
@@ -781,7 +879,9 @@ impl Config {
                     refresh_url: Some(codex.refresh_url.to_string()),
                     client_version: codex.client_version.clone(),
                     version_probe: Some(codex.version_probe),
-                    model_map: codex.model_map.as_ref().map(model_map_table),
+                    model_map: include_routing
+                        .then(|| codex.model_map.as_ref().map(model_map_table))
+                        .flatten(),
                 }),
             },
             notices: std::iter::once(("default".to_owned(), self.notices.default))
@@ -801,8 +901,10 @@ impl Config {
                 cold_outlook: Some(self.gates.cold_outlook),
                 cold_min_tokens: Some(self.gates.cold_min_tokens),
                 cold_idle_min: self.gates.cold_idle_min,
-                compact_model: self.gates.compact_model.clone(),
-                force_newest: Some(self.gates.force_newest),
+                compact_model: include_routing
+                    .then(|| self.gates.compact_model.clone())
+                    .flatten(),
+                force_newest: include_routing.then_some(self.gates.force_newest),
             },
         }
     }
@@ -981,7 +1083,6 @@ impl Config {
                 .ping_header_name
                 .unwrap_or_else(|| DEFAULT_PING_HEADER.to_owned()),
             default_backend_openai_chat: default_backend(
-                "default_backend_openai_chat",
                 file.default_backend_openai_chat.clone(),
                 if file.default_backend_openai_chat.is_some() {
                     &enabled_openai
@@ -989,15 +1090,14 @@ impl Config {
                     &enabled_openai_legacy
                 },
                 Some("openrouter"),
-            )?,
+            ),
             openrouter,
             openai_api,
             default_backend_anthropic: default_backend(
-                "default_backend_anthropic",
                 file.default_backend_anthropic,
                 &enabled_anthropic,
                 Some("anthropic_sub"),
-            )?,
+            ),
             anthropic_sub,
             anthropic_api,
             codex_sub,
@@ -1029,6 +1129,11 @@ impl Config {
     /// the wizard's gate: [`crate::setup::config_writer`] re-runs it
     /// over the wizard's changes before anything is written.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.validate_retained()?;
+        self.validate_routing()
+    }
+
+    pub(crate) fn validate_retained(&self) -> anyhow::Result<()> {
         // Session header names must be usable as header names, or the
         // per-request lookup by name would silently never match.
         for name in &self.session_header_names {
@@ -1057,9 +1162,20 @@ impl Config {
         {
             bail!("cold_idle_min must be a non-negative number of minutes");
         }
-        // Each protocol default must name an enabled backend of that
-        // protocol: anything else cannot route anywhere. The load already
-        // checks this; the wizard's edits are re-checked here.
+        // The codex originator rides on every request header: an
+        // unusable value would silently never reach the upstream.
+        if let Some(codex) = &self.codex_sub
+            && let Err(error) = axum::http::HeaderValue::from_str(&codex.originator)
+        {
+            bail!(
+                "providers.codex_sub originator {:?} is not a valid header value: {error}",
+                codex.originator
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_routing(&self) -> anyhow::Result<()> {
         check_default(
             "default_backend_anthropic",
             self.default_backend_anthropic.as_deref(),
@@ -1081,18 +1197,7 @@ impl Config {
                 &legacy_chat_enabled
             },
             OPENAI_CHAT_BACKENDS,
-        )?;
-        // The codex originator rides on every request header: an
-        // unusable value would silently never reach the upstream.
-        if let Some(codex) = &self.codex_sub
-            && let Err(error) = axum::http::HeaderValue::from_str(&codex.originator)
-        {
-            bail!(
-                "providers.codex_sub originator {:?} is not a valid header value: {error}",
-                codex.originator
-            );
-        }
-        Ok(())
+        )
     }
 }
 
@@ -1170,28 +1275,23 @@ fn resolve_notices(
 /// A protocol's default backend: the named one when the file names it
 /// (checked against the enabled set by [`check_default`]), else the only
 /// enabled backend, else the historical default when it is among several
-/// enabled ones. Several enabled backends and no way to choose is an
-/// error rather than a guess: bare model names would otherwise route
-/// somewhere the operator never picked.
+/// enabled ones. Several enabled backends and no way to choose leaves it
+/// unset, and [`Config::validate`] refuses that rather than guess: bare
+/// model names would otherwise route somewhere the operator never picked.
 fn default_backend(
-    key: &str,
     named: Option<String>,
     enabled: &[&str],
     historical: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+) -> Option<String> {
     if named.is_some() {
-        return Ok(named);
+        return named;
     }
     match enabled {
-        [] => Ok(None),
-        [only] => Ok(Some((*only).to_owned())),
+        [only] => Some((*only).to_owned()),
         several if historical.is_some_and(|name| several.contains(&name)) => {
-            Ok(historical.map(str::to_owned))
+            historical.map(str::to_owned)
         }
-        several => bail!(
-            "{key} is not set and several backends are enabled ({}): name one",
-            several.join(", ")
-        ),
+        _ => None,
     }
 }
 
@@ -1401,13 +1501,21 @@ pub(crate) struct FileCodexSub {
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
 /// `~/.config/toker/toker.toml`.
 pub fn config_path() -> anyhow::Result<PathBuf> {
-    if let Some(path) = env::var_os("TOKER_CONFIG") {
+    config_path_with_env(&ProcessEnvironment)
+}
+
+fn config_path_with_env(environment: &impl Environment) -> anyhow::Result<PathBuf> {
+    if let Some(path) = environment.var_os("TOKER_CONFIG") {
         return Ok(PathBuf::from(path));
     }
-    let config_home = match env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+    let config_home = match environment
+        .var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+    {
         Some(dir) => PathBuf::from(dir),
         None => {
-            let home = env::var_os("HOME")
+            let home = environment
+                .var_os("HOME")
                 .filter(|home| !home.is_empty())
                 .context("no config home: set XDG_CONFIG_HOME or HOME")?;
             PathBuf::from(home).join(".config")
@@ -1455,25 +1563,26 @@ mod tests {
         DEFAULT_OPENAI_API_KEY_ENV, DEFAULT_OPENAI_API_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM,
         DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources, OpenRouterConfig,
     };
-    use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
 
-    /// Env-reading tests share process-global env vars, so they serialise
-    /// on this lock (RUST_TEST_THREADS-style parallelism would race
-    /// otherwise).
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    #[derive(Default)]
+    struct TestEnvironment(HashMap<String, OsString>);
+
+    impl TestEnvironment {
+        fn with(mut self, name: &str, value: impl Into<OsString>) -> Self {
+            self.0.insert(name.to_owned(), value.into());
+            self
+        }
     }
 
-    fn set_env(name: &str, value: Option<&str>) {
-        match value {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
+    impl super::Environment for TestEnvironment {
+        fn var_os(&self, name: &str) -> Option<OsString> {
+            self.0.get(name).cloned()
         }
     }
 
@@ -1482,18 +1591,15 @@ mod tests {
         crate::test_support::tempdir(&format!("config-{name}-"))
     }
 
-    /// A config pointing at a scratch db, loadable without touching the
-    /// user's real config or env.
+    /// Load the scratch config without process-global mutation or ambient
+    /// `TOKER_*` overrides.
+    fn load_result(dir: &std::path::Path) -> anyhow::Result<super::Config> {
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", dir.join("toker.toml"));
+        super::Config::load_with_env(&environment)
+    }
+
     fn load_from(dir: &std::path::Path) -> super::Config {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
-        set_env("OPENROUTER_API_KEY", None);
-        super::Config::load().expect("load config")
+        load_result(dir).expect("load config")
     }
 
     #[test]
@@ -1664,12 +1770,8 @@ mod tests {
     fn a_default_must_name_an_enabled_backend() {
         let dir = test_dir("default-enabled");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir).and_then(|config| config.validate().map(|()| config))
         };
 
         // A known backend whose block is absent: the error says the block
@@ -1705,7 +1807,7 @@ mod tests {
         // error rather than a guess.
         let error = load("[providers.anthropic_api]\n[providers.codex_sub]\n")
             .expect_err("an ambiguous default must fail");
-        assert!(format!("{error:#}").contains("name one"));
+        assert!(format!("{error:#}").contains("must name one"));
         let config = load(
             "default_backend_anthropic = \"codex_sub\"\n\
              [providers.anthropic_api]\n[providers.codex_sub]\n",
@@ -1816,12 +1918,7 @@ api_key = "ak-literal-test"
         )
         .expect("write config");
 
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
-        let config = super::Config::load().expect("load config");
+        let config = load_result(&dir).expect("load config");
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
             Some("anthropic_api")
@@ -1859,34 +1956,26 @@ api_key = "ak-literal-test"
         );
 
         // The shared KeySources resolution, mirroring openrouter's.
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", Some("ak-from-env"));
+        let api = config.anthropic_api.as_ref().expect("enabled");
+        let environment =
+            TestEnvironment::default().with("TOKER_TEST_ANTHROPIC_KEY_FILE", "ak-from-env");
         assert_eq!(
-            config
-                .anthropic_api
-                .as_ref()
-                .expect("enabled")
-                .api_key(|| None)
-                .as_deref(),
+            api.api_key_with_env(&environment, || None).as_deref(),
             Some("ak-from-env")
         );
         assert_eq!(
-            config
-                .anthropic_api
-                .as_ref()
-                .expect("enabled")
-                .key_sources(),
+            api.key_sources_with_env(&environment),
             KeySources {
                 env_set: true,
                 keyring_configured: false,
                 literal_set: true
             }
         );
-        set_env("TOKER_TEST_ANTHROPIC_KEY_FILE", None);
 
         // A config with no anthropic keys at all (a phase-1 toker.toml)
         // still parses, and enables no anthropic backend.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert_eq!(config.default_backend_anthropic, None);
         assert_eq!(config.anthropic_sub, None);
     }
@@ -1905,11 +1994,7 @@ refresh_url = "http://localhost:10/oauth/token"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(
             config
                 .codex_sub
@@ -1946,7 +2031,7 @@ auth_path = "~/.codex/auth.json"
 "#,
         )
         .expect("rewrite config");
-        let config = super::Config::load().expect("load config");
+        let config = load_result(&dir).expect("load config");
         assert_eq!(
             config.codex_sub.as_ref().expect("enabled").auth_path,
             super::expand_tilde("~/.codex/auth.json")
@@ -1955,7 +2040,7 @@ auth_path = "~/.codex/auth.json"
         // A phase-1 toker.toml (no codex block at all) parses with codex
         // disabled, and a typo'd key is an error, not a silent default.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert_eq!(config.codex_sub, None);
 
         fs::write(
@@ -1964,7 +2049,7 @@ auth_path = "~/.codex/auth.json"
         )
         .expect("rewrite config");
         assert!(
-            super::Config::load().is_err(),
+            load_result(&dir).is_err(),
             "a typo'd codex key must fail to load"
         );
 
@@ -1976,7 +2061,7 @@ auth_path = "~/.codex/auth.json"
             "[providers.codex_sub]\noriginator = \"codex\\ncli\"\n",
         )
         .expect("rewrite config");
-        let error = super::Config::load().expect_err("invalid originator must fail");
+        let error = load_result(&dir).expect_err("invalid originator must fail");
         assert!(format!("{error:#}").contains("originator"));
     }
 
@@ -1999,11 +2084,7 @@ auth_path = "~/.codex/auth.json"
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
 
         // Parsed into the committed policy: exact identity ahead of
         // family, published snapshots folding to their identities.
@@ -2015,18 +2096,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("codex map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-5"),
-            Some("gpt-5.6-sol")
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-4-5-20251101"),
-            Some("special-opus"),
-            "the exact selector beats the family one"
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-sonnet-5"),
-            Some("claude-sonnet-5"),
-            "an unmatched model is the identity"
+            codex_map.entries().collect::<Vec<_>>(),
+            vec![
+                ("model:claude-opus-4-5", "special-opus"),
+                ("family:haiku", "gpt-5.6-luna"),
+                ("family:opus", "gpt-5.6-sol"),
+            ]
         );
         let sub_map = config
             .anthropic_sub
@@ -2036,16 +2111,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("sub map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(sub_map), "claude-opus-4-5"),
-            Some("claude-opus-4-8")
+            sub_map.entries().collect::<Vec<_>>(),
+            vec![("family:opus", "claude-opus-4-8")]
         );
         // A backend with no block carries no policy, and one backend's
         // map never answers for another's.
         assert_eq!(config.anthropic_api, None);
-        assert_eq!(
-            model_map::preview_mapped_model(None, "claude-opus-5"),
-            Some("claude-opus-5")
-        );
 
         // A present table with bad selector syntax fails the load naming
         // its provider block — a typo'd policy must not silently read as
@@ -2071,7 +2142,7 @@ auth_path = "~/.codex/auth.json"
         ];
         for (text, message) in cases {
             fs::write(dir.join("toker.toml"), text).expect("rewrite config");
-            let error = super::Config::load().expect_err("bad policy must fail");
+            let error = load_result(&dir).expect_err("bad policy must fail");
             let chain = format!("{error:#}");
             assert!(
                 chain.contains("model_map") && chain.contains(message),
@@ -2083,7 +2154,7 @@ auth_path = "~/.codex/auth.json"
         // not an error.
         fs::write(dir.join("toker.toml"), "[providers.codex_sub.model_map]\n")
             .expect("rewrite config");
-        let config = super::Config::load().expect("empty table parses");
+        let config = load_result(&dir).expect("empty table parses");
         assert!(
             config
                 .codex_sub
@@ -2094,16 +2165,16 @@ auth_path = "~/.codex/auth.json"
             "an empty table is an explicitly empty policy"
         );
         assert_eq!(
-            model_map::preview_mapped_model(
-                config
-                    .codex_sub
-                    .as_ref()
-                    .expect("enabled")
-                    .model_map
-                    .as_ref(),
-                "claude-opus-5"
-            ),
-            Some("claude-opus-5")
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .model_map
+                .as_ref()
+                .expect("empty policy")
+                .entries()
+                .count(),
+            0
         );
     }
 
@@ -2117,11 +2188,7 @@ auth_path = "~/.codex/auth.json"
             "default_backend_anthropic = \"codex_sub\"\n[providers.codex_sub]\n",
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
             Some("codex_sub")
@@ -2139,24 +2206,20 @@ quota_enabled = false
 "#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert!(!config.gates.quota_enabled, "the file value is read");
 
         // A phase-1 toker.toml (no [gates] block at all) parses with the
         // default — and an unknown gates key is an error, not a silent
         // default, like every other block.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let config = super::Config::load().expect("phase-1 config parses");
+        let config = load_result(&dir).expect("phase-1 config parses");
         assert!(config.gates.quota_enabled, "absent block = default = on");
         assert!(config.gates.cold_enabled, "the cold gate defaults on too");
 
         fs::write(dir.join("toker.toml"), "[gates]\nquota_on = true\n").expect("rewrite config");
         assert!(
-            super::Config::load().is_err(),
+            load_result(&dir).is_err(),
             "a typo'd gates key must fail to load"
         );
     }
@@ -2165,12 +2228,8 @@ quota_enabled = false
     fn the_cold_gate_block_is_read_and_validated() {
         let dir = test_dir("gates-cold");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Every knob reads: the toggles, the bar, the fractional idle
@@ -2208,12 +2267,8 @@ quota_enabled = false
     fn the_notices_table_is_read_over_the_defaults() {
         let dir = test_dir("notices");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Named styles load whatever their casing; unnamed frontends keep
@@ -2279,11 +2334,9 @@ quota_enabled = false
             r#"default_backend_anthropic = "not-a-backend""#,
         )
         .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let error = super::Config::load().expect_err("unroutable default must fail");
+        let error = load_result(&dir)
+            .and_then(|config| config.validate())
+            .expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
     }
 
@@ -2291,12 +2344,8 @@ quota_enabled = false
     fn the_awake_toggle_reads_the_file_and_defaults_on() {
         let dir = test_dir("awake-toggle");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         // Off is the only way to disable the idle-sleep lock.
@@ -2318,12 +2367,8 @@ quota_enabled = false
         // expands at lookup, against whatever home is running the view.
         let dir = test_dir("transcript-roots");
         let load = |text: &str| {
-            let _guard = env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            super::Config::load()
+            load_result(&dir)
         };
 
         let config = load(r#"transcript_roots = ["/harness/repos/.claude", "~/elsewhere"]"#)
@@ -2358,11 +2403,7 @@ quota_enabled = false
         let dir = test_dir("ping-file");
         fs::write(dir.join("toker.toml"), r#"ping_header_name = "x-my-ping""#)
             .expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        let config = super::Config::load().expect("load config");
+        let config = load_from(&dir);
         assert_eq!(config.ping_header_name, "x-my-ping");
 
         // An unusable name is a load error, not a silent no-match.
@@ -2371,25 +2412,40 @@ quota_enabled = false
             r#"ping_header_name = "not a header!""#,
         )
         .expect("rewrite config");
-        let error = super::Config::load().expect_err("an invalid header name must fail");
+        let error = load_result(&dir).expect_err("an invalid header name must fail");
         assert!(error.to_string().contains("ping_header_name"));
 
         fs::write(dir.join("toker.toml"), r#"ping_header_name = """#).expect("rewrite config");
-        assert!(super::Config::load().is_err(), "the empty name fails too");
+        assert!(load_result(&dir).is_err(), "the empty name fails too");
     }
 
     #[test]
     fn unknown_file_keys_are_errors_not_silent_defaults() {
         let dir = test_dir("unknown-key");
         fs::write(dir.join("toker.toml"), "prot = 1\n").expect("write config");
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        assert!(
-            super::Config::load().is_err(),
-            "a typo'd key must fail to load"
+        assert!(load_result(&dir).is_err(), "a typo'd key must fail to load");
+    }
+
+    #[test]
+    fn load_leaves_the_routing_defaults_to_validate() {
+        let dir = test_dir("owned-service-config");
+        let path = dir.join("toker.toml");
+        fs::write(
+            &path,
+            r#"
+default_backend_anthropic = "codex_sub"
+[providers.openrouter]
+"#,
+        )
+        .unwrap();
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
+        let config = super::Config::load_with_env(&environment).unwrap();
+        assert!(config.openrouter.is_some());
+        assert_eq!(
+            config.default_backend_anthropic.as_deref(),
+            Some("codex_sub")
         );
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -2400,22 +2456,17 @@ quota_enabled = false
         // by a rewrite (see `crate::setup::config_writer`) — while
         // `load()` still layers the env over the same file for the
         // running daemon.
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("load-from");
         fs::write(
             dir.join("toker.toml"),
             "port = 19999\n[providers.openrouter]\n",
         )
         .expect("write config");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("20000"));
-        set_env(
-            "TOKER_DB",
-            Some(&dir.join("elsewhere.db").to_string_lossy()),
-        );
-        set_env("TOKER_UPSTREAM", Some("http://from-env/v1"));
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "20000")
+            .with("TOKER_DB", dir.join("elsewhere.db"))
+            .with("TOKER_UPSTREAM", "http://from-env/v1");
 
         let config = super::Config::load_from(&dir.join("toker.toml")).expect("loads");
         assert_eq!(config.port, 19_999, "no env override applies to load_from");
@@ -2434,7 +2485,7 @@ quota_enabled = false
             "http://from-env/v1"
         );
 
-        let loaded = super::Config::load().expect("loads");
+        let loaded = super::Config::load_with_env(&environment).expect("loads");
         assert_eq!(loaded.port, 20_000);
         assert_eq!(loaded.db_path, dir.join("elsewhere.db"));
         assert_eq!(
@@ -2450,32 +2501,26 @@ quota_enabled = false
         // The upstream override moves an enabled backend and never
         // enables a disabled one.
         fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let loaded = super::Config::load().expect("a stray override does not fail the load");
+        let loaded = super::Config::load_with_env(&environment)
+            .expect("a stray override does not fail the load");
         assert_eq!(loaded.openrouter, None);
-
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
     }
 
     #[test]
     fn env_overrides_the_file() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("env");
         fs::write(
             dir.join("toker.toml"),
             "port = 19999\n[providers.openrouter]\nupstream = \"http://from-file/v1\"\n",
         )
         .expect("write config");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("20000"));
-        set_env("TOKER_DB", Some(&dir.join("env.db").to_string_lossy()));
-        set_env("TOKER_UPSTREAM", Some("http://from-env/v1"));
-        set_env("OPENROUTER_API_KEY", None);
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "20000")
+            .with("TOKER_DB", dir.join("env.db"))
+            .with("TOKER_UPSTREAM", "http://from-env/v1");
 
-        let config = super::Config::load().expect("load config");
+        let config = super::Config::load_with_env(&environment).expect("load config");
         assert_eq!(config.port, 20000);
         assert_eq!(config.db_path, dir.join("env.db"));
         assert_eq!(
@@ -2488,31 +2533,22 @@ quota_enabled = false
             "http://from-env/v1"
         );
 
-        set_env("TOKER_PORT", None);
-        set_env("TOKER_DB", None);
-        set_env("TOKER_UPSTREAM", None);
-
         let _ = Store::open(&config.db_path).expect("the env db path is openable");
     }
 
     #[test]
     fn bad_env_port_is_an_error() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = test_dir("bad-port");
-        set_env("TOKER_CONFIG", dir.join("toker.toml").to_str());
-        set_env("TOKER_PORT", Some("not-a-port"));
-        let error = super::Config::load().expect_err("TOKER_PORT must be numeric");
+        let environment = TestEnvironment::default()
+            .with("TOKER_CONFIG", dir.join("toker.toml"))
+            .with("TOKER_PORT", "not-a-port");
+        let error =
+            super::Config::load_with_env(&environment).expect_err("TOKER_PORT must be numeric");
         assert!(error.to_string().contains("TOKER_PORT"));
-        set_env("TOKER_PORT", None);
     }
 
     #[test]
     fn api_key_env_wins_over_the_keyring_over_the_literal_then_none() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut config = OpenRouterConfig {
             upstream: super::parse_upstream(DEFAULT_OPENROUTER_UPSTREAM).unwrap(),
             api_key_env: "TOKER_TEST_KEY_PRECEDENCE".to_owned(),
@@ -2524,10 +2560,13 @@ quota_enabled = false
         let no_entry = || None;
         let untouched = || -> Option<String> { panic!("the keyring must not be read") };
 
-        set_env("TOKER_TEST_KEY_PRECEDENCE", Some("from-env"));
-        assert_eq!(config.api_key(untouched).as_deref(), Some("from-env"));
+        let with_key = TestEnvironment::default().with("TOKER_TEST_KEY_PRECEDENCE", "from-env");
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&with_key, untouched).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            config.key_sources_with_env(&with_key),
             KeySources {
                 env_set: true,
                 keyring_configured: true,
@@ -2535,16 +2574,25 @@ quota_enabled = false
             }
         );
 
-        set_env("TOKER_TEST_KEY_PRECEDENCE", None);
-        assert_eq!(config.api_key(keyring).as_deref(), Some("from-keyring"));
+        let empty = TestEnvironment::default();
+        assert_eq!(
+            config.api_key_with_env(&empty, keyring).as_deref(),
+            Some("from-keyring")
+        );
         // A keyring read that yields nothing falls to the literal.
-        assert_eq!(config.api_key(no_entry).as_deref(), Some("literal-key"));
+        assert_eq!(
+            config.api_key_with_env(&empty, no_entry).as_deref(),
+            Some("literal-key")
+        );
 
         // Not configured: never read, whatever it holds.
         config.api_key_keyring = false;
-        assert_eq!(config.api_key(untouched).as_deref(), Some("literal-key"));
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&empty, untouched).as_deref(),
+            Some("literal-key")
+        );
+        assert_eq!(
+            config.key_sources_with_env(&empty),
             KeySources {
                 env_set: false,
                 keyring_configured: false,
@@ -2553,9 +2601,13 @@ quota_enabled = false
         );
 
         config.api_key = None;
-        assert_eq!(config.api_key(untouched), None, "no source set");
         assert_eq!(
-            config.key_sources(),
+            config.api_key_with_env(&empty, untouched),
+            None,
+            "no source set"
+        );
+        assert_eq!(
+            config.key_sources_with_env(&empty),
             KeySources {
                 env_set: false,
                 keyring_configured: false,

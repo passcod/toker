@@ -23,8 +23,10 @@ keyring = "4.2.0"
 listenfd = "1.0.2"
 nix = { version = "0.31.3", features = ["signal"] }
 ratatui = "0.30.2"
+regex = "1.13.1"
 reqwest = { version = "0.13.5", features = ["json", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
 sha2 = "0.11.0"
@@ -40,3 +42,4 @@ uuid = { version = "1.27.0", features = ["v4"] }
 [dev-dependencies]
 insta = { version = "1.49.0", features = ["filters"] }
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

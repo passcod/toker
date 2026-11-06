@@ -171,9 +171,12 @@ struct Toker {
 async fn spawn_toker(config: Config, port: u16) -> Toker {
     let probe = AwakeProbe::default();
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server =
-        Server::with_awake_spawner(config, store.clone(), Box::new(ProbeSpawner(probe.clone())))
-            .expect("build server");
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_spawner(Box::new(ProbeSpawner(probe.clone()))),
+    )
+    .expect("build server");
     let instance = server.instance().to_owned();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -359,6 +362,10 @@ async fn a_stream_under_way_finishes_while_new_connections_are_refused() {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         })
         .expect("lane");
 
@@ -367,6 +374,7 @@ async fn a_stream_under_way_finishes_while_new_connections_are_refused() {
         .header("x-claude-code-session-id", "ses-1")
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test")
         .body(body)
         .send()
         .await
@@ -466,6 +474,10 @@ async fn a_forced_shutdown_does_not_wait_for_a_stream_but_exits_cleanly() {
             noticed_at: None,
             forced_from: None,
             forced_to: None,
+
+            pin_generation: 0,
+
+            pin: None,
         })
         .expect("lane");
 
@@ -474,6 +486,7 @@ async fn a_forced_shutdown_does_not_wait_for_a_stream_but_exits_cleanly() {
         .header("x-claude-code-session-id", "ses-1")
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test")
         .body(body)
         .send()
         .await

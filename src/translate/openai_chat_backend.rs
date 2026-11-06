@@ -647,6 +647,22 @@ impl OpenAiChatResponseStream {
 /// Interpret one complete non-streaming Chat Completions response.
 pub fn canonical_turn_from_openai_chat(body: &Value) -> Result<CanonTurn, TranslateError> {
     if let Some(error) = body.get("error") {
+        if !error.is_object()
+            || !["type", "code"].into_iter().any(|field| {
+                error
+                    .get(field)
+                    .and_then(|value| match value {
+                        Value::String(value) => Some(!value.is_empty()),
+                        Value::Number(_) => Some(true),
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+            })
+        {
+            return Err(TranslateError::Malformed {
+                reason: "chat error response has no typed error object".to_owned(),
+            });
+        }
         return Ok(CanonTurn {
             turn_id: None,
             stop_reason: CanonStopReason::EndTurn,
@@ -957,5 +973,25 @@ mod tests {
         assert_eq!(turn.tool_calls[0].arguments, "{\"id\":1}");
         assert_eq!(turn.blocks.as_ref().unwrap().len(), 2);
         assert_eq!(turn.usage.unwrap().input, Some(20));
+    }
+
+    #[test]
+    fn complete_chat_errors_require_a_typed_envelope() {
+        let valid = serde_json::json!({
+            "error": {"type": "invalid_request_error", "message": "bad request"}
+        });
+        assert!(canonical_turn_from_openai_chat(&valid).is_ok());
+
+        for malformed in [
+            serde_json::json!({"error": null}),
+            serde_json::json!({"error": "bad"}),
+            serde_json::json!({"error": {}}),
+            serde_json::json!({"error": {"message": "untrusted"}}),
+        ] {
+            assert!(
+                canonical_turn_from_openai_chat(&malformed).is_err(),
+                "malformed envelope: {malformed}"
+            );
+        }
     }
 }

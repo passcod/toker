@@ -93,9 +93,6 @@ const FRESH_SECS: i64 = 30;
 /// fixed leaves a predictable strip where more page actions can sit.
 const HEADER_ACTION_WIDTH: u16 = 3;
 
-/// The status text does not run into the header actions.
-const HEADER_ACTION_GAP: u16 = 1;
-
 /// Past this the proxy has been quiet long enough to look dead: the
 /// freshness turns red and counts in minutes.
 const STALE_SECS: i64 = 300;
@@ -306,6 +303,8 @@ pub(crate) struct Scroll {
 pub(crate) struct Drawn {
     /// The inverse-video `?` in the header, which toggles the legend.
     pub legend_button: Rect,
+    /// The `⇄` chip beside the legend, which opens the routing page.
+    pub routing_button: Rect,
     pub sessions: DrawnList,
     pub context: DrawnList,
     /// CACHE REBUILDS' causes and details; not clickable either.
@@ -381,8 +380,11 @@ pub(crate) fn render(
         height: layout.header.height.max(frame.area().height.min(1)),
         ..layout.header
     };
-    let (legend_button, header) = header_actions(action_header);
+    let (legend_button, routing_button, header) = header_actions(action_header);
     render_header(frame, header, snap, clock);
+    // At narrow widths the existing status needs every cell; below 80 columns
+    // `Tab` remains the route action.
+    let visible_routing_button = (routing_button.width > 0).then_some(routing_button);
     let (sessions_offset, sessions_rows) = render_sessions(
         frame,
         layout.sessions,
@@ -395,6 +397,7 @@ pub(crate) fn render(
         render_context(frame, layout.context, chrome, snap, fmt, ui.scroll.context);
     let mut drawn = Drawn {
         legend_button,
+        routing_button,
         sessions: DrawnList {
             area: layout.sessions,
             max_offset: sessions_offset,
@@ -432,9 +435,9 @@ pub(crate) fn render(
         );
     }
     render_rate(frame, layout.bottom, chrome, snap, tz, fmt);
-    // Short layouts can make the bottom panel share the header row;
-    // keep the discoverability control above the page's data.
-    render_header_action(frame, legend_button);
+    // Short layouts can make the bottom panel share the header row; keep the
+    // discoverability controls above page data after that final render.
+    render_header_action(frame, legend_button, visible_routing_button);
     // The overlays are exclusive (the loop opens one by closing the
     // other); the legend wins if both are ever set.
     if ui.legend {
@@ -457,37 +460,56 @@ pub(crate) fn render(
     drawn
 }
 
-/// Header actions at the far left, followed by the remaining status
-/// area. The chip narrows with the terminal, so even a one-cell frame
-/// still renders and hit-tests safely. Future page actions belong
-/// immediately after this one, before the gutter.
-fn header_actions(area: Rect) -> (Rect, Rect) {
-    let button_width = area.width.min(HEADER_ACTION_WIDTH);
-    let gap = (area.width - button_width).min(HEADER_ACTION_GAP);
-    let button = Rect::new(area.x, area.y, button_width, area.height.min(1));
-    let header = Rect::new(
-        area.x + button_width + gap,
+/// Header actions: the established `?` at the far left and a one-cell blue
+/// `⇄` in its old gutter. The dashboard status keeps its exact responsive
+/// layout; the action overpaints only that gutter, and yields before the
+/// legend's one-cell escape on tiny terminals.
+fn header_actions(area: Rect) -> (Rect, Rect, Rect) {
+    let legend_width = area.width.min(HEADER_ACTION_WIDTH);
+    let legend = Rect::new(area.x, area.y, legend_width, area.height.min(1));
+    // One cell in the gutter after the legend; below 80 columns the status
+    // needs every cell and `Tab` is the way across.
+    let routing_width = u16::from(area.width >= 80);
+    let routing = Rect::new(
+        area.x + legend_width,
         area.y,
-        area.width - button_width - gap,
+        routing_width,
+        area.height.min(1),
+    );
+    let header_x = area.x + legend_width + (area.width > legend_width) as u16;
+    let header = Rect::new(
+        header_x,
+        area.y,
+        area.width.saturating_sub(header_x - area.x),
         area.height,
     );
-    (button, header)
+    (legend, routing, header)
 }
 
-fn render_header_action(frame: &mut Frame, button: Rect) {
-    let label = if button.width >= HEADER_ACTION_WIDTH {
+fn render_header_action(frame: &mut Frame, legend: Rect, routing: Option<Rect>) {
+    let legend_label = if legend.width >= HEADER_ACTION_WIDTH {
         " ? "
     } else {
         "?"
     };
     frame.render_widget(
-        Paragraph::new(label).style(
+        Paragraph::new(legend_label).style(
             Style::new()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::REVERSED),
         ),
-        button,
+        legend,
     );
+    if let Some(routing) = routing {
+        frame.render_widget(
+            Paragraph::new("⇄").style(
+                Style::new()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            routing,
+        );
+    }
 }
 
 /// Every colour off the finished frame, modifiers kept: `NO_COLOR` is
@@ -2162,7 +2184,8 @@ fn render_rate(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` and
+/// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` (attempts),
+/// `N failed` (requests whose final attempt failed) and
 /// `N drift` in red only when there are any — a zero would be a line of
 /// noise on every quiet frame. The sparkline spans the WHOLE window at
 /// any width: the minute buckets fold into fewer, wider ones (at most
@@ -2178,6 +2201,12 @@ fn requests_line(snap: &Snapshot, width: usize) -> Line<'static> {
     if snap.errors > 0 {
         let s = if snap.errors == 1 { "" } else { "s" };
         tail.push(Span::styled(format!("  {} error{s}", snap.errors), red));
+    }
+    if snap.failed_requests > 0 {
+        tail.push(Span::styled(
+            format!("  {} failed", snap.failed_requests),
+            red,
+        ));
     }
     if snap.drift > 0 {
         tail.push(Span::styled(format!("  {} drift", snap.drift), red));
@@ -3140,7 +3169,12 @@ mod tests {
                     .contains(ratatui::layout::Position::new(x, 0))
             );
         }
-        assert_eq!(buffer[(3, 0)].symbol(), " ", "a gutter follows the action");
+        assert_eq!(
+            drawn.routing_button,
+            ratatui::layout::Rect::new(3, 0, 1, 1),
+            "the routing chip fills the gutter"
+        );
+        assert_eq!(buffer[(3, 0)].symbol(), "⇄");
         assert_eq!(
             buffer[(4, 0)].symbol(),
             "l",
@@ -4740,5 +4774,24 @@ mod tests {
                 })
                 .expect("draw");
         }
+    }
+
+    #[test]
+    fn the_routing_chip_sits_in_the_legend_gutter_from_80_columns() {
+        let wide = super::header_actions(ratatui::layout::Rect::new(0, 0, 100, 24));
+        assert_eq!(wide.1, ratatui::layout::Rect::new(3, 0, 1, 1));
+        assert_eq!(wide.2.x, 4, "the status starts after the gutter");
+        assert_eq!(
+            super::header_actions(ratatui::layout::Rect::new(0, 0, 80, 24))
+                .1
+                .width,
+            1
+        );
+        assert_eq!(
+            super::header_actions(ratatui::layout::Rect::new(0, 0, 79, 24))
+                .1
+                .width,
+            0
+        );
     }
 }

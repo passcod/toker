@@ -78,6 +78,7 @@ use reqwest::Url;
 use serde_json::Value;
 
 use super::Provider;
+use crate::routing::ProtocolId;
 
 /// The `version` header: toker's own crate version (the codex client
 /// sends its version the same way).
@@ -118,10 +119,6 @@ pub struct CodexSub {
     /// a second turn that waited adopts the refreshed login instead of
     /// refreshing again with an already-rotated token.
     refresh_lock: tokio::sync::Mutex<()>,
-    /// The operator's model routing map
-    /// (`[providers.codex_sub.model_map]`): claude asks for
-    /// `claude-opus-5`, the codex backend receives `gpt-5.6-sol`.
-    model_map: Option<crate::middleware::model_map::ModelMap>,
     /// The codex client version to identify as (see
     /// [`DEFAULT_CLIENT_VERSION`]) — resolved at construction from the
     /// local sources (config override → the installed CLI's own
@@ -142,7 +139,6 @@ impl CodexSub {
         originator: String,
         auth_path: PathBuf,
         refresh_url: Url,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
         client_version: Option<String>,
         version_probe: bool,
     ) -> anyhow::Result<CodexSub> {
@@ -163,7 +159,6 @@ impl CodexSub {
             refresh_url,
             auth: Mutex::new(auth),
             refresh_lock: tokio::sync::Mutex::new(()),
-            model_map,
             client_version: std::sync::RwLock::new(client_version),
         };
         // A pinned version wins absolutely (the operator chose it);
@@ -488,18 +483,8 @@ impl Provider for CodexSub {
     }
 
     fn bindings(&self) -> &'static [crate::routing::BackendBinding] {
-        const BINDINGS: &[crate::routing::BackendBinding] =
-            &[crate::routing::BackendBinding::canonical(
-                crate::routing::ProtocolId::OpenAiResponses,
-                crate::routing::DialectId::CodexResponses,
-                crate::routing::BackendAdapterId::CodexResponses,
-                crate::ir::canonical::Capabilities::CODEX,
-            )];
+        const BINDINGS: &[crate::routing::BackendBinding] = &[crate::routing::CODEX_SUB_RESPONSES];
         BINDINGS
-    }
-
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -517,6 +502,29 @@ impl Provider for CodexSub {
 
     /// The codex bearer + account id + FedRAMP marker, over a stripped
     /// `authorization` — [`auth_headers`].
+    fn credential_availability(
+        &self,
+        _incoming: &HeaderMap,
+        _frontend: ProtocolId,
+        now_unix_seconds: i64,
+    ) -> super::CredentialAvailability {
+        let Some(auth) = self.auth() else {
+            return super::CredentialAvailability::KnownMissingOrExpired;
+        };
+        if auth.access_token().is_none()
+            || auth
+                .expires_at()
+                .is_some_and(|expires_at| expires_at <= now_unix_seconds)
+                && auth.refresh_token().is_none()
+        {
+            super::CredentialAvailability::KnownMissingOrExpired
+        } else if auth.needs_refresh(now_unix_seconds) {
+            super::CredentialAvailability::Refreshable
+        } else {
+            super::CredentialAvailability::Held
+        }
+    }
+
     fn inject_auth(&self, outgoing: &mut HeaderMap) {
         auth_headers(self.auth().as_ref(), outgoing);
     }
@@ -556,7 +564,6 @@ mod tests {
                 .parse()
                 .expect("refresh url"),
             None,
-            None,
             false,
         )
         .expect("provider builds")
@@ -590,7 +597,6 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
-            None,
             false,
         )
         .expect("provider builds");
@@ -598,6 +604,33 @@ mod tests {
             slashed.endpoint("/responses").as_str(),
             "http://localhost:9/backend-api/codex/responses",
             "a trailing slash on the base never doubles up"
+        );
+    }
+
+    #[test]
+    fn credential_evidence_distinguishes_missing_held_and_refreshable() {
+        let missing = provider(std::path::Path::new("/nonexistent/auth.json"));
+        assert_eq!(
+            missing.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiResponses, 0),
+            crate::providers::CredentialAvailability::KnownMissingOrExpired
+        );
+
+        let fresh = auth_file("credential-evidence-fresh", None);
+        let held = provider(&fresh);
+        assert_eq!(
+            held.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiResponses, 0),
+            crate::providers::CredentialAvailability::Held
+        );
+
+        let expiring = auth_file("credential-evidence-refresh", Some(100));
+        let refreshable = provider(&expiring);
+        assert_eq!(
+            refreshable.credential_availability(
+                &HeaderMap::new(),
+                ProtocolId::OpenAiResponses,
+                100,
+            ),
+            crate::providers::CredentialAvailability::Refreshable
         );
     }
 
@@ -752,7 +785,6 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
-            None,
             false,
         )
         .expect("provider builds");
@@ -813,7 +845,6 @@ mod tests {
             "codex_cli_rs".to_owned(),
             dir.to_path_buf(),
             url,
-            None,
             None,
             false,
         )

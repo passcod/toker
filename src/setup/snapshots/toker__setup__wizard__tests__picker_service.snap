@@ -3,7 +3,7 @@ source: src/setup/wizard.rs
 expression: unit
 ---
 [Unit]
-Description=toker picker sync (Claude Code's openrouter /model rows)
+Description=toker picker sync (Claude Code's /model rows)
 
 [Service]
 Type=oneshot

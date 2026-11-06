@@ -4,6 +4,7 @@ expression: out
 ---
 toker setup — the state of this machine
   config      : none (fresh setup)
+  routing     : not in the database yet — setup activates it from the answers
   systemd     : toker.socket is not active
   frontends:
     claude ([ROOT]/.claude/settings.json): points at https://api.anthropic.com
@@ -20,7 +21,7 @@ toker setup — the state of this machine
 [2/6] write toker.toml
 wrote [ROOT]/.config/toker/toker.toml
   port [PORT], awake on, backends anthropic_sub, openrouter
-  anthropic → anthropic_sub; openai_chat → openrouter
+  routing: activated revision 1 from these choices — edit it in `toker tui`
   openrouter key: env OPENROUTER_API_KEY (systemd user environment) when set, else the frontend's own key
 
 [3/6] install + start the units
@@ -59,6 +60,7 @@ systemctl --user start toker-picker.service — ok
 
 [6/6] done
   config    : wrote [ROOT]/.config/toker/toker.toml
+  routing   : activated revision 1 from this setup
   units     : [ROOT]/.config/systemd/user: toker.socket, toker.service installed; daemon-reload + enable --now ok
   verified  : answered (200/401/401/401)
   frontends : 3 patched, 0 left as is
@@ -67,5 +69,5 @@ systemctl --user start toker-picker.service — ok
     patched: shell rc ([ROOT]/.bashrc)
   ledger    : not imported
   timers    : none — NOT fully removed — finish by hand: sudo systemctl disable --now toker-wake.timer toker-wake.service && sudo rm -f /etc/systemd/system/toker-wake.timer /etc/systemd/system/toker-wake.service && sudo systemctl daemon-reload
-  picker    : openrouter rows synced; toker-picker.timer refreshes them daily
+  picker    : Claude /model rows synced; toker-picker.timer refreshes them daily
 re-run `toker setup` any time to change anything.

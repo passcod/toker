@@ -29,8 +29,11 @@ use crate::store::{Allowance, RequestRow, SessionSummary, Store};
 /// One session's detail, as of its last read.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Detail {
-    /// The session id.
+    /// The display session id.
     pub session: String,
+    /// Explicit child accounting by role. Their raw lanes remain distinct
+    /// elsewhere in the dashboard.
+    pub child_roles: Vec<super::model::ChildRoleAgg>,
     /// The session's row in the dashboard snapshot; `None` once it has
     /// aged out of the display window while the popup stayed open.
     pub agg: Option<SessionAgg>,
@@ -57,11 +60,11 @@ impl Detail {
             errors.push(format!("{what}: {error}"));
         };
         let summary = store
-            .session_summary(session)
+            .display_session_summary(session)
             .map_err(|error| keep("totals", error))
             .ok();
         let latest = store
-            .latest_session_row(session)
+            .latest_display_session_row(session)
             .map_err(|error| keep("latest request", error))
             .ok()
             .flatten();
@@ -77,6 +80,7 @@ impl Detail {
             .map(|meters| meters.snapshot);
         Detail {
             session: session.to_owned(),
+            child_roles: agg.map(|agg| agg.child_roles.clone()).unwrap_or_default(),
             agg: agg.cloned(),
             summary,
             latest,
@@ -246,9 +250,21 @@ pub(crate) fn lines(
             Span::styled(", sent ", dim),
             model(latest.and_then(|row| row.effective_model.as_ref())),
             Span::styled(", reported ", dim),
-            model(latest.and_then(|row| row.model.as_ref())),
+            match latest.and_then(|row| row.raw_model.as_deref()) {
+                Some(model) => Span::raw(model.to_owned()),
+                None => Span::styled("-", dim),
+            },
         ],
     ));
+    if !detail.child_roles.is_empty() {
+        let roles = detail
+            .child_roles
+            .iter()
+            .map(|aggregate| format!("{} {}", aggregate.requests, aggregate.role.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(field("children", vec![Span::raw(roles)]));
+    }
     for (name, from, to) in [
         (
             "forced",
@@ -593,7 +609,8 @@ mod tests {
             row.provider = Some("anthropic_sub".to_owned());
             row.requested_model = Some("claude-opus-5".to_owned());
             row.effective_model = Some("claude-opus-5-5".to_owned());
-            row.model = Some("claude-opus-5-5".to_owned());
+            row.model = Some("normalised-claude-opus-5-5".to_owned());
+            row.raw_model = Some("claude-opus-5-5-wire".to_owned());
             row.forced_from = Some("claude-opus-5".to_owned());
             row.forced_to = Some("claude-opus-5-5".to_owned());
             row.input = Some(prompt);
@@ -716,7 +733,9 @@ mod tests {
         assert!(all.contains("ses-detail-0001"), "{all}");
         assert!(all.contains("via     claude → anthropic_sub"), "{all}");
         assert!(
-            all.contains("asked claude-opus-5, sent claude-opus-5-5, reported claude-opus-5-5"),
+            all.contains(
+                "asked claude-opus-5, sent claude-opus-5-5, reported claude-opus-5-5-wire"
+            ),
             "{all}"
         );
         assert!(
@@ -734,6 +753,64 @@ mod tests {
         assert!(all.contains("no requests in the display window"), "{all}");
         // No title: said so.
         assert!(text[0] == "untitled", "{all}");
+    }
+
+    #[test]
+    fn a_missing_provider_model_displays_a_dash() {
+        let (_, mut detail) = fixture(None);
+        detail.latest.as_mut().expect("latest row").raw_model = None;
+        let text = lines(&detail, false, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("reported -"), "{text}");
+        assert!(
+            !text.contains("reported normalised-claude-opus-5-5"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn linked_children_are_named_by_role_beneath_the_display_session() {
+        let (_, mut detail) = fixture(None);
+        detail.child_roles = vec![super::super::model::ChildRoleAgg {
+            role: crate::store::ChildRole::Guardian,
+            requests: 3,
+        }];
+        let text = lines(&detail, false, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("ses-detail-0001"), "{text}");
+        assert!(text.contains("children"), "{text}");
+        assert!(text.contains("3 guardian"), "{text}");
+        let (_, plain) = fixture(None);
+        let plain = lines(&plain, false, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !plain.contains("children"),
+            "unlinked sessions show no children: {plain}"
+        );
     }
 
     /// The popup draws over the frame with its controls on one row, and
