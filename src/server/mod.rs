@@ -716,6 +716,38 @@ impl Server {
             .is_some_and(|snapshot| snapshot.revision_id().is_some())
     }
 
+    /// What the pre-policy resolver (provider prefixes and the configured
+    /// default backends) would pick for `model`. A server with an active
+    /// revision has no such route, because policy is then the only router,
+    /// so this is `Err` there and handlers cannot fall back to it. Only the
+    /// test-only servers that run without a revision get an answer.
+    pub(crate) fn legacy_target(
+        &self,
+        protocol: ProtocolId,
+        model: Option<&str>,
+    ) -> Result<ModelTarget, crate::routing::RouteNotConfigured> {
+        if self.has_active_policy() {
+            return Err(crate::routing::RouteNotConfigured);
+        }
+        self.registry.resolve(protocol, model)
+    }
+
+    /// A Messages target standing in for a request that policy has not
+    /// routed yet: the context a body that never parses, or a gate that runs
+    /// before the route is known, needs. Under an active revision any
+    /// binding that serves Messages will do, since the placeholder carries no
+    /// routing decision; without one, the configured default.
+    pub(crate) fn pending_messages_target(&self) -> Option<ModelTarget> {
+        if !self.has_active_policy() {
+            return self.legacy_target(ProtocolId::AnthropicMessages, None).ok();
+        }
+        self.registry.bindings().find_map(|binding| {
+            self.registry
+                .resolve_binding(ProtocolId::AnthropicMessages, binding.id(), None, "pending")
+                .ok()
+        })
+    }
+
     /// Capture the active runtime policy and all evidence derived from one
     /// catalogue snapshot. Control handlers use this to compile, persist and
     /// swap a revision without mixing inventory generations.
