@@ -231,7 +231,12 @@ impl<'a> LegacyBuilder<'a> {
                     },
                     steps: vec![],
                 },
-                lane_transition: LaneTransitionPolicy::PreservePinned,
+                // A pinned lane may move once its cache is gone, which is
+                // what the force-newest upgrade and the compaction retarget
+                // need. The combination with their own policies is the
+                // stricter of the two, so PreservePinned here would deny
+                // both for every pinned lane however long it idled.
+                lane_transition: LaneTransitionPolicy::MoveWhenCold,
             });
         }
         Ok(())

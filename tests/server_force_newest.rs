@@ -627,6 +627,56 @@ async fn a_warm_lane_with_cache_to_lose_is_left_alone() {
     }
 }
 
+/// A lane pinned to a binding with no cache domain (anthropic_sub) reads as
+/// cold from the TTL it recorded, so a newer model learned while it idled
+/// past that TTL is taken: the cache is gone, nothing is lost by moving. A
+/// lane that recorded no TTL has no clock, and unknown is never cold.
+#[tokio::test]
+async fn an_idle_pinned_lane_moves_on_its_recorded_ttl_only() {
+    let body = tools_body("claude-opus-4-8", 5);
+    for (recorded_ttl, moved) in [(Some(300_000), true), (None, false)] {
+        let (mock, upstream) = spawn_mock().await;
+        let config = test_config(upstream);
+        let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+        seed_opus(&store, 200_000);
+        let addr = spawn_toker(config, store.clone()).await;
+
+        // The first turn pins the lane to the model asked for: five messages
+        // with nothing served is no new conversation, so it is not moved.
+        let response = post_messages(addr, "ccses-42", &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_for_rows(&store, 1).await;
+
+        // The lane then idles for twenty minutes.
+        let mut lane = store
+            .load_lane(&lane_key_of(&body))
+            .expect("load lane")
+            .expect("the lane exists");
+        lane.ttl = recorded_ttl;
+        lane.updated_ms = now_ms() - 20 * 60_000;
+        store.upsert_lane(&lane).expect("age the lane");
+
+        let response = post_messages(addr, "ccses-42", &body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = mock.captured();
+        assert_eq!(captured.len(), 2);
+        let rows = wait_for_rows(&store, 2).await;
+        let row = rows
+            .iter()
+            .max_by_key(|row| row.ts_ms)
+            .expect("the second turn's row");
+        if moved {
+            let expected = with_model(&body, "claude-opus-4-8", "claude-opus-5");
+            assert_canonical_request(&expected, &captured[1], "claude-opus-5");
+            assert_eq!(row.forced_to.as_deref(), Some("claude-opus-5"));
+        } else {
+            assert_canonical_request(&body, &captured[1], "claude-opus-4-8");
+            assert_eq!(row.forced_from, None);
+            assert_eq!(traced_upgrade(row), None);
+        }
+    }
+}
+
 /// The ceiling guard is empirical: a target never observed holding a
 /// prompt this size is not sent one. The same request moves once the target
 /// has been seen holding it.

@@ -2744,13 +2744,19 @@ fn cache_temperature(
     {
         return CacheTemperature::Unknown;
     }
-    let Some(domain) = binding.cache_domain() else {
-        return CacheTemperature::Unknown;
+    // Anthropic and codex bindings declare no cache domain, so the TTL their
+    // cache runs on is the one the lane itself recorded from the usage the
+    // provider reported, read the way the cold gate reads it. A lane that has
+    // recorded none stays unknown: absent evidence is never cold.
+    let ttl_ms = match binding.cache_domain() {
+        Some(domain) => domain.ttl_ms(),
+        None if lane.ttl.is_some() => crate::middleware::cold::ttl_of(lane),
+        None => return CacheTemperature::Unknown,
     };
     let idle_ms = now_ms.saturating_sub(lane.updated_ms);
     if now_ms < lane.updated_ms {
         CacheTemperature::Unknown
-    } else if idle_ms >= domain.ttl_ms() {
+    } else if idle_ms >= ttl_ms {
         CacheTemperature::Cold
     } else {
         CacheTemperature::Warm
@@ -4917,9 +4923,38 @@ api_key = "ak-literal-test"
             .find(|binding| binding.id_str() == "anthropic_sub.anthropic_messages")
             .unwrap();
         lane.pin.as_mut().unwrap().binding_id = no_ttl.id().clone();
+        lane.updated_ms = now - 5 * 60 * 1000;
         assert_eq!(
             super::cache_temperature(&lane, Some(no_ttl), now),
-            CacheTemperature::Unknown
+            CacheTemperature::Unknown,
+            "a binding with no cache domain and a lane that recorded no TTL \
+             has no clock, and an unknown clock is never cold"
+        );
+        // Anthropic bindings declare no cache domain; the lane's recorded TTL
+        // is the clock, as it is for the cold gate.
+        lane.ttl = Some(300_000);
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Cold,
+            "idle for exactly the recorded five-minute TTL"
+        );
+        lane.updated_ms = now - 60 * 1000;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Warm
+        );
+        lane.ttl = Some(3_600_000);
+        lane.updated_ms = now - 20 * 60 * 1000;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Warm,
+            "the one-hour TTL outlasts twenty idle minutes"
+        );
+        lane.pin = None;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Unknown,
+            "an unattributed lane cannot borrow a binding's TTL"
         );
     }
 
