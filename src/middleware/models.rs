@@ -556,9 +556,6 @@ pub struct ModelStore {
     /// entries, moved when a request is sent, so a request still in flight
     /// counts.
     served_on: Mutex<BTreeMap<String, i64>>,
-    /// Latest durable learning read by the authoritative legacy decisions.
-    /// Shadow clones this publication without touching SQLite.
-    learned_snapshot: Mutex<Vec<ModelEntry>>,
     /// How far back `served_on` vouches: `None` when it was seeded from the
     /// whole ledger; else the ts of the oldest seed row
     /// (the tail cut a beginning off, and silence before it counts for
@@ -588,13 +585,9 @@ impl ModelStore {
         let models = ModelStore {
             store,
             served_on: Mutex::new(served_on),
-            learned_snapshot: Mutex::new(Vec::new()),
             covered_since: covered,
         };
         models.reseed_days();
-        if let Ok(entries) = models.store.load_models() {
-            models.publish_learning(&entries);
-        }
         models
     }
 
@@ -701,13 +694,6 @@ impl ModelStore {
         self.covered_since
     }
 
-    fn publish_learning(&self, entries: &[ModelEntry]) {
-        *self
-            .learned_snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = entries.to_vec();
-    }
-
     /// Record that `model` served a request of `prompt` tokens at `at_ms`
     /// ("a model is *seen* when a
     /// response named it").
@@ -744,9 +730,6 @@ impl ModelStore {
         let prompt = i64::try_from(prompt).unwrap_or(i64::MAX);
         entry.max_prompt = Some(entry.max_prompt.map_or(prompt, |prev| prev.max(prompt)));
         self.store.upsert_model(&entry)?;
-        if let Ok(entries) = self.store.load_models() {
-            self.publish_learning(&entries);
-        }
         Ok(())
     }
 
@@ -756,7 +739,6 @@ impl ModelStore {
     /// `activeDays` the union of the days the whole store holds).
     pub fn family_newest(&self, family: &str) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
-        self.publish_learning(&entries);
         Ok(newest_in_family(&entries, family))
     }
 
@@ -773,7 +755,6 @@ impl ModelStore {
         declared: DeclaredWindows,
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
-        self.publish_learning(&entries);
         Ok(compaction_target_of(&entries, spec, prompt, map, declared))
     }
 
@@ -790,7 +771,6 @@ impl ModelStore {
         declared: DeclaredWindows,
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
-        self.publish_learning(&entries);
         Ok(crate::middleware::force_newest::force_target_of(
             &entries, model, prompt, declared,
         ))
