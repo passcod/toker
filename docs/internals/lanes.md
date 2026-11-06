@@ -10,9 +10,12 @@ request against whatever preceded it in wall-clock order compares unrelated
 conversations and invents rebuilds that never happened.
 
 Everything that compares consecutive requests must compare **within a tool-set
-lane** (`session_id` + `tools_hash`, `lanes::lane_key`). The lane table is the
-`lanes` table in the ledger, upserted on every response and pruned to 4000 lanes
-and 30 days on a 30-second timer, where ctp rewrote a JSON file. Related traps:
+lane** (`session_id` + `tools_hash`, `lanes::lane_key`). What a lane's cache
+actually lives on, which backend and model, is a separate fact the lane carries
+as its routing pin; see [lanes-and-cache.md](lanes-and-cache.md). The lane table
+is the `lanes` table in the ledger, upserted on every response and pruned to
+4000 lanes and 30 days on a 30-second timer, where ctp rewrote a JSON file.
+Related traps:
 
 - A lane's predecessor may fall outside your time window. Walk lanes over every
   row read, then filter to the window, or each window opens with phantom "new
@@ -39,10 +42,10 @@ the same gap.
 
 What the lane records is what *was* cached. Only the request says what this send
 would re-read, so `cold::decide_cold` also takes an upper bound on the request's
-own prompt (`force_newest::prompt_bound`: bytes over two, from the least
+own prompt (`policy::force_newest::prompt_bound`: bytes over two, from the least
 bytes-per-token observed above 200k). A request whose bound is under the
 threshold forwards whatever its lane held; an unknown bound decides nothing.
-Force-newest reads an unknown lane through the same bound. Anything else that
+The upgrade policy's context-fit check reads the same bound. Anything else that
 reads a lane to judge a request should ask whether the request could be the
 thing the lane describes.
 
@@ -54,7 +57,8 @@ newest first), not from the ledger and not by filtering every lane. Each entry
 is the lane's recorded metadata plus a state worked out at query time:
 `tools_id` (the first six characters of the tool-set digest), `state`,
 `prompt_tokens`, `ttl_ms`, `idle_ms`, `warm_remaining_ms`, `noticed_ms`, and
-`forced` (`{from, to}`, the sticky model transition).
+`forced` (`{from, to}`, the sticky upgrade the policy made, see
+[policy.md](policy.md)). The pin is not part of this view.
 
 - `state` is `ping` for a ping lane, which is never called warm or cold because
   its cache is not the conversation's. Otherwise it is `cold` once idle time
@@ -76,5 +80,9 @@ than a shared one.
 OpenRouter Chat lanes run on its 10-minute sticky window
 (`lanes::OPENAI_LANE_TTL_MS`), a recognised duration in `cold::ttl_of`. Reading
 it as the unrecognised long tier would hold the sleep lock for an hour after
-every OpenRouter request. Other Chat bindings have no lane until their cache
-lifetime is represented per binding; they must not borrow OpenRouter's clock.
+every OpenRouter request. Other Chat bindings record no clock, because their
+cache lifetime is not verified and they must not borrow OpenRouter's. When a
+request carries a session, their lane row exists to hold the routing pin, but
+it has no TTL and no prompt size: the cold gate cannot fire for it, and the
+policy reads its coldness as unknown, never cold
+([lanes-and-cache.md](lanes-and-cache.md)).
