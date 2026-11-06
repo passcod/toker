@@ -667,17 +667,12 @@ mod tests {
         if let Some(provider) = &config.anthropic_sub {
             providers.push(Arc::new(AnthropicSub::new(
                 provider.upstream.clone(),
-                provider.model_map.clone(),
                 None,
                 None,
             )));
         }
         if let Some(provider) = &config.anthropic_api {
-            providers.push(Arc::new(AnthropicApi::new(
-                provider.upstream.clone(),
-                None,
-                provider.model_map.clone(),
-            )));
+            providers.push(Arc::new(AnthropicApi::new(provider.upstream.clone(), None)));
         }
         RouteRegistry::new(providers)
     }

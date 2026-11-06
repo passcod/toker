@@ -386,7 +386,6 @@ impl Server {
         let anthropic_sub = config.anthropic_sub.as_ref().map(|sub| {
             Arc::new(AnthropicSub::new(
                 sub.upstream.clone(),
-                sub.model_map.clone(),
                 sub.oauth_token(|| {
                     secrets::read_key(secrets.clone(), "anthropic_sub", KEYRING_READ_TIMEOUT)
                 }),
@@ -399,7 +398,6 @@ impl Server {
                 api.api_key(|| {
                     secrets::read_key(secrets.clone(), "anthropic_api", KEYRING_READ_TIMEOUT)
                 }),
-                api.model_map.clone(),
             )) as Arc<dyn Provider>
         });
         let codex_turn = match &config.codex_sub {
@@ -408,7 +406,6 @@ impl Server {
                 codex.originator.clone(),
                 codex.auth_path.clone(),
                 codex.refresh_url.clone(),
-                codex.model_map.clone(),
                 codex.client_version.clone(),
                 codex.version_probe,
             )?)),
