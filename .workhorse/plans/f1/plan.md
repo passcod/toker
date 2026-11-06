@@ -142,11 +142,11 @@ policy path and what the legacy path did.
 - [x] Document policy lifecycle, resolver, fallback commitment, lane/cache
       domains, attempt read models, publication ownership, control operations,
       lineage evidence and migration recovery
-- [ ] Check `README.md` and `AGENTS.md` against the result
+- [x] Check `README.md` and `AGENTS.md` against the result
 
 ### Reconcile and unplan
 
-- [ ] Re-read both live-model-routing plans against the code, including the
+- [x] Re-read both live-model-routing plans against the code, including the
       auxiliary bare `claude-*` scenario with no Anthropic binding; record
       anything consciously dropped
-- [ ] `unplan:` the two live-model-routing plans
+- [x] `unplan:` the two live-model-routing plans
