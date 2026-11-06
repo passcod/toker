@@ -181,21 +181,7 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         // No active revision: only a test-only server, which still routes by
         // the configured default.
         Ok(None) => match server.legacy_target(ProtocolId::AnthropicMessages, None) {
-            Ok(default) => {
-                if let Some(legacy) = server.legacy_shadow_outcome(
-                    &facts,
-                    &default,
-                    default.effective_model().map(str::to_owned),
-                    None,
-                    None,
-                    None,
-                    default.effective_model().map(str::to_owned),
-                    false,
-                ) {
-                    server.observe_policy_shadow(facts, credentials, None, legacy);
-                }
-                default
-            }
+            Ok(default) => default,
             Err(_) => return super::anthropic_not_configured(),
         },
         Err(error) => {
@@ -233,7 +219,6 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
 async fn usage_path(server: Server, request: Request, path: &'static str) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
 
     // Session identity and betas, read by name only — request headers are
     // never captured wholesale: they carry credentials (invariant 2).
@@ -327,10 +312,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut client_wants_json = false;
     // The model about to be sent upstream, for the served-model mark.
     let mut served_model: Option<String> = None;
-    let mut shadow_baseline: Option<String> = None;
-    let mut shadow_upgraded: Option<String> = None;
-    let mut shadow_retargeted: Option<String> = None;
-    let mut shadow_compaction_applied = false;
     let mut policy_attempt: Option<super::PolicyAttempt> = None;
     let mut batch_model_mappings: Option<serde_json::Value> = None;
     let mut cold_lane_key = None;
@@ -351,9 +332,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             || ir.anthropic().wants_json_response(),
             |request| request.stream != Some(true),
         );
-        if path == "/v1/messages/batches" {
-            observe_batch_shadow(&server, &parts, ir.value(), original.len() as u64);
-        }
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
@@ -365,7 +343,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             });
             let facts = server.shadow_facts(
                 ProtocolId::AnthropicMessages,
-                shadow_profile.as_deref(),
+                frontend.as_deref(),
                 model.clone(),
                 None,
                 force_newest::prompt_bound(original.len() as u64),
@@ -464,7 +442,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .map(|model| {
                     server.shadow_facts(
                         ProtocolId::AnthropicMessages,
-                        shadow_profile.as_deref(),
+                        frontend.as_deref(),
                         Some(model.clone()),
                         None,
                         force_newest::prompt_bound(original.len() as u64),
@@ -613,7 +591,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             };
             let mut facts = server.shadow_facts(
                 ProtocolId::AnthropicMessages,
-                shadow_profile.as_deref(),
+                frontend.as_deref(),
                 model.clone(),
                 cold_lane_key.clone(),
                 force_newest::prompt_bound(original.len() as u64),
@@ -759,7 +737,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .as_ref()
             .map(|resolved| resolved.plan.effective_model.clone())
             .or_else(|| target.effective_model().map(str::to_owned));
-        shadow_baseline.clone_from(&effective_model);
         let mut transformed = false;
         // A batch has no top-level model: its per-request positions were
         // already rewritten above, and writing one here would add a body
@@ -964,23 +941,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 context_tokens: block.context_tokens,
                 stale_meters: block.stale_meters.as_ref(),
             });
-            observe_messages_shadow(
-                &server,
-                &parts.headers,
-                &target,
-                shadow_profile.as_deref(),
-                client_model.clone(),
-                session_id.as_deref(),
-                &original,
-                gate_shape.as_ref(),
-                canonical.as_ref(),
-                None,
-                shadow_baseline.clone(),
-                shadow_upgraded.clone(),
-                shadow_retargeted.clone(),
-                served_model.clone(),
-                shadow_compaction_applied,
-            );
             return build_response(StatusCode::OK, headers, Body::from(body));
         }
     }
@@ -1132,23 +1092,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         Rendering::Json => header::HeaderValue::from_static("application/json"),
                     },
                 );
-                observe_messages_shadow(
-                    &server,
-                    &parts.headers,
-                    &target,
-                    shadow_profile.as_deref(),
-                    client_model.clone(),
-                    session_id.as_deref(),
-                    &original,
-                    gate_shape.as_ref(),
-                    canonical.as_ref(),
-                    cold_lane.as_ref(),
-                    shadow_baseline.clone(),
-                    shadow_upgraded.clone(),
-                    shadow_retargeted.clone(),
-                    served_model.clone(),
-                    shadow_compaction_applied,
-                );
                 return build_response(StatusCode::OK, headers, Body::from(body));
             }
             cold::ColdDecision::Quiet {
@@ -1297,23 +1240,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                             Rendering::Json => header::HeaderValue::from_static("application/json"),
                         },
                     );
-                    observe_messages_shadow(
-                        &server,
-                        &parts.headers,
-                        &target,
-                        shadow_profile.as_deref(),
-                        client_model.clone(),
-                        session_id.as_deref(),
-                        &original,
-                        gate_shape.as_ref(),
-                        canonical.as_ref(),
-                        cold_lane.as_ref(),
-                        shadow_baseline.clone(),
-                        shadow_upgraded.clone(),
-                        shadow_retargeted.clone(),
-                        served_model.clone(),
-                        shadow_compaction_applied,
-                    );
                     return build_response(StatusCode::OK, headers, Body::from(body));
                 }
             }
@@ -1445,10 +1371,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ctx.cache_stripped = (outcome.stripped > 0).then_some(true);
                     ctx.system_merged = (outcome.merged > 0).then_some(true);
                 }
-                shadow_compaction_applied = true;
-                shadow_retargeted = (outcome.to != outcome.from)
-                    .then(|| outcome.to.clone())
-                    .flatten();
                 served_model = outcome.to.clone();
                 tracing::info!(
                     "compact: {} · {} breakpoint(s) dropped · {} system message(s) merged",
@@ -1544,7 +1466,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             }
             // The served-model mark
             // must see the model actually being sent.
-            shadow_upgraded = Some(forced.to.clone());
             served_model = Some(forced.to.clone());
             tracing::info!("model: {} → {}", forced.from, forced.to);
         }
@@ -1653,29 +1574,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // Compare only after all authoritative routing transforms have completed.
-    // The observer has no request body, headers, credentials, providers, or
-    // mutable state and its result is deliberately ignored.
-    if !authoritative {
-        observe_messages_shadow(
-            &server,
-            &parts.headers,
-            &target,
-            shadow_profile.as_deref(),
-            client_model.clone(),
-            session_id.as_deref(),
-            &original,
-            gate_shape.as_ref(),
-            canonical.as_ref(),
-            cold_lane.as_ref(),
-            shadow_baseline.clone(),
-            shadow_upgraded.clone(),
-            shadow_retargeted.clone(),
-            served_model.clone(),
-            shadow_compaction_applied,
-        );
-    }
-
     // ── mid-conversation effort, for models that reject it ──
     //
     // Claude Code moves the reasoning effort with an `output_config` on a
@@ -1777,159 +1675,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         },
     )
     .await
-}
-
-fn observe_batch_shadow(
-    server: &Server,
-    parts: &axum::http::request::Parts,
-    body: &serde_json::Value,
-    body_bytes: u64,
-) {
-    let Some(requests) = body.get("requests").and_then(serde_json::Value::as_array) else {
-        return;
-    };
-    let profile = super::frontend_of(&parts.extensions);
-    for request in requests {
-        let Some(model) = request
-            .get("params")
-            .and_then(|params| params.get("model"))
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        let Ok(target) = server
-            .registry
-            .resolve(ProtocolId::AnthropicMessages, Some(model))
-        else {
-            continue;
-        };
-        let baseline = target.effective_model().map(str::to_owned);
-        let effective = baseline.as_deref().and_then(|model| {
-            model_map::preview_mapped_model(target.provider().model_map(), model).map(str::to_owned)
-        });
-        let facts = server.shadow_facts(
-            ProtocolId::AnthropicMessages,
-            profile,
-            Some(model.to_owned()),
-            None,
-            force_newest::prompt_bound(body_bytes),
-            None,
-            0,
-            Default::default(),
-            None,
-            crate::policy::RequestClass::Inference,
-        );
-        if let Some(legacy) = server.legacy_shadow_outcome(
-            &facts,
-            &target,
-            baseline.clone(),
-            None,
-            None,
-            (effective != baseline).then(|| effective.clone()).flatten(),
-            effective,
-            false,
-        ) {
-            let credentials = server.shadow_credentials(
-                &parts.headers,
-                ProtocolId::AnthropicMessages,
-                facts.now_ms,
-            );
-            server.observe_policy_shadow(facts, credentials, None, legacy);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn observe_messages_shadow(
-    server: &Server,
-    headers: &HeaderMap,
-    target: &ModelTarget,
-    profile: Option<&str>,
-    requested_model: Option<String>,
-    session_id: Option<&str>,
-    original: &[u8],
-    shape: Option<&AnthropicShape>,
-    canonical: Option<&CanonicalRequest>,
-    lane: Option<&crate::store::Lane>,
-    baseline: Option<String>,
-    upgraded: Option<String>,
-    retargeted: Option<String>,
-    served: Option<String>,
-    compaction_applied: bool,
-) {
-    let Some(baseline) = baseline else { return };
-    let lane_reference = shape
-        .map(|shape| shape.tools_hash.as_str())
-        .and_then(|tools| lanes::lane_key(session_id, Some(tools)));
-    let required_capabilities = canonical.map(shadow_capabilities).unwrap_or_default();
-    let binding_affinity = canonical
-        .is_some_and(CanonicalRequest::requires_binding_affinity)
-        .then(|| {
-            lane.and_then(|lane| lane.pin.as_ref()).map_or_else(
-                || target.binding().id().clone(),
-                |pin| pin.binding_id.clone(),
-            )
-        });
-    let class = if shape.is_some_and(AnthropicShape::is_compaction) {
-        crate::policy::RequestClass::Compaction
-    } else {
-        crate::policy::RequestClass::Inference
-    };
-    let mut facts = server.shadow_facts(
-        ProtocolId::AnthropicMessages,
-        profile,
-        requested_model,
-        lane_reference,
-        force_newest::prompt_bound(original.len() as u64),
-        shape.and_then(|shape| shape.req_messages),
-        shape.map_or(0, |shape| shape.req_tools),
-        required_capabilities,
-        binding_affinity,
-        class,
-    );
-    if class == crate::policy::RequestClass::Compaction {
-        facts.legacy_compaction = Some(crate::policy::LegacyCompactionFacts {
-            lane_cold: cold::lane_is_cold(
-                lane,
-                server.config.gates.cold_min_tokens,
-                cold_idle_ms(&server.config.gates),
-                facts.now_ms,
-            ),
-            prompt_tokens: lane
-                .and_then(|lane| lane.prompt_tokens)
-                .and_then(|prompt| u64::try_from(prompt).ok())
-                .unwrap_or_default(),
-            transform_applied: compaction_applied,
-        });
-    }
-    let before_alias = retargeted
-        .as_ref()
-        .or(upgraded.as_ref())
-        .unwrap_or(&baseline);
-    let aliased = (served.as_ref() != Some(before_alias))
-        .then(|| served.clone())
-        .flatten();
-    let Some(legacy) = server.legacy_shadow_outcome(
-        &facts,
-        target,
-        Some(baseline),
-        upgraded,
-        retargeted,
-        aliased,
-        served,
-        compaction_applied,
-    ) else {
-        return;
-    };
-    let lane = server.shadow_lane(
-        lane,
-        Some(target.binding()),
-        facts.now_ms,
-        facts.class == crate::policy::RequestClass::Compaction,
-    );
-    let credentials =
-        server.shadow_credentials(headers, ProtocolId::AnthropicMessages, facts.now_ms);
-    server.observe_policy_shadow(facts, credentials, lane, legacy);
 }
 
 pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {

@@ -701,21 +701,6 @@ impl ModelStore {
         self.covered_since
     }
 
-    /// Copy the content-free recently-sent map for an immutable policy snapshot.
-    pub(crate) fn recently_served(&self) -> BTreeMap<String, i64> {
-        self.served_on
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    pub(crate) fn published_learning(&self) -> Vec<ModelEntry> {
-        self.learned_snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
     fn publish_learning(&self, entries: &[ModelEntry]) {
         *self
             .learned_snapshot
@@ -828,14 +813,6 @@ impl ModelStore {
             .into_iter()
             .map(|entry| entry.model_id)
             .collect())
-    }
-
-    /// Snapshot all legacy learned entries for revision-one policy evidence.
-    /// Authored routing policy must use a binding-scoped learning source.
-    pub(crate) fn learned_entries(&self) -> crate::store::Result<Vec<ModelEntry>> {
-        let entries = self.store.load_models()?;
-        self.publish_learning(&entries);
-        Ok(entries)
     }
 
     /// The models-merge semantics

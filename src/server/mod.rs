@@ -91,8 +91,7 @@ use crate::middleware::lanes;
 use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
-    LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
-    RequestFacts,
+    LaneFacts, ProfileId, RequestClass, RequestFacts,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
@@ -344,12 +343,9 @@ pub struct Server {
     /// persisted desired inventory generation always matches the snapshot the
     /// new runtime policy was compiled against.
     routing_control: Arc<Mutex<()>>,
-    /// Atomically captured candidate policy and live evidence. It remains
-    /// non-authoritative until the explicit routing cutover.
+    /// The active policy and the live evidence it resolves against, captured
+    /// atomically.
     pub(crate) policy_runtime: Option<Arc<crate::policy::PolicyRuntime>>,
-    /// In-memory revision-one resolver used only to compare decisions made by
-    /// the still-authoritative legacy path.
-    pub(crate) policy_shadow: Option<Arc<PolicyShadow<LegacyLearningView>>>,
 }
 
 impl Server {
@@ -546,7 +542,6 @@ impl Server {
             quota_events: Arc::default(),
             routing_control: Arc::default(),
             policy_runtime: Some(policy_runtime),
-            policy_shadow: None,
         })
     }
 
@@ -615,38 +610,6 @@ impl Server {
     pub fn set_upstream_idle_timeout(&mut self, idle: Duration) -> anyhow::Result<()> {
         self.http = upstream_client(idle)?;
         Ok(())
-    }
-
-    pub(crate) fn compare_publication_shadow(
-        &self,
-        protocol: ProtocolId,
-        profile: Option<&str>,
-        legacy_models: impl IntoIterator<Item = String>,
-    ) {
-        let Some(shadow) = &self.policy_shadow else {
-            return;
-        };
-        let profile = profile.and_then(|profile| ProfileId::new(profile).ok());
-        let legacy: std::collections::BTreeSet<_> = legacy_models.into_iter().collect();
-        let Some(compiled) = shadow.publication_slugs(profile.as_ref(), protocol.into()) else {
-            return;
-        };
-        let matched = legacy == compiled;
-        let record = crate::policy::ShadowRecord {
-            comparison: if matched {
-                crate::policy::ShadowComparison::Match
-            } else {
-                crate::policy::ShadowComparison::Mismatch
-            },
-            code: if matched {
-                "policy-shadow-publication-match"
-            } else {
-                "policy-shadow-publication-mismatch"
-            },
-            legacy: None,
-            shadow: None,
-        };
-        shadow.observe_record(record);
     }
 
     pub(crate) fn has_active_policy(&self) -> bool {
@@ -1588,19 +1551,6 @@ impl Server {
         })
     }
 
-    pub(crate) fn observe_policy_shadow(
-        &self,
-        facts: RequestFacts,
-        credentials: crate::policy::CredentialSnapshot,
-        lane: Option<LaneFacts>,
-        legacy: LegacyOutcome,
-    ) {
-        let Some(shadow) = &self.policy_shadow else {
-            return;
-        };
-        shadow.observe(facts, credentials, lane, legacy);
-    }
-
     pub(crate) fn shadow_credentials(
         &self,
         headers: &HeaderMap,
@@ -1708,39 +1658,6 @@ impl Server {
             }),
             forced_from: lane.forced_from.clone(),
             forced_to: lane.forced_to.clone(),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn legacy_shadow_outcome(
-        &self,
-        facts: &RequestFacts,
-        target: &ModelTarget,
-        baseline_model: Option<String>,
-        upgraded_model: Option<String>,
-        retargeted_model: Option<String>,
-        aliased_model: Option<String>,
-        effective_model: Option<String>,
-        compaction: bool,
-    ) -> Option<LegacyOutcome> {
-        let baseline_model =
-            baseline_model.or_else(|| target.effective_model().map(str::to_owned))?;
-        let route_source = legacy_route_source(facts, target);
-        Some(LegacyOutcome {
-            protocol: facts.protocol,
-            profile: facts.profile.clone(),
-            requested_model: facts.requested_model.clone(),
-            provider: target.provider().id().to_owned(),
-            binding_id: target.binding().id().clone(),
-            route_source,
-            baseline_model,
-            upgraded_model,
-            retargeted_model,
-            aliased_model,
-            effective_model: effective_model
-                .or_else(|| target.effective_model().map(str::to_owned))
-                .unwrap_or_default(),
-            compaction,
         })
     }
 
@@ -2147,8 +2064,8 @@ impl Server {
             );
         } else {
             tracing::warn!(
-                code = "policy-shadow-refresh-disabled",
-                "policy shadow disabled for catalogue generation"
+                code = "policy-candidate-refresh-disabled",
+                "policy candidate disabled for catalogue generation"
             );
             runtime.replace_evidence_and_clear_candidate(
                 Arc::new(inventory),
@@ -2792,40 +2709,6 @@ fn cache_temperature(
         CacheTemperature::Cold
     } else {
         CacheTemperature::Warm
-    }
-}
-
-fn legacy_route_source(facts: &RequestFacts, target: &ModelTarget) -> String {
-    if let Some(requested) = facts.requested_model.as_deref() {
-        if requested
-            .strip_prefix(target.provider().id())
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some()
-        {
-            return format!(
-                "protocol-rewrite:legacy-prefix-{}-{}",
-                match facts.protocol {
-                    FrontendProtocol::AnthropicMessages => "anthropic",
-                    FrontendProtocol::OpenaiChat => "openai-chat",
-                    FrontendProtocol::OpenaiResponses => "openai-responses",
-                },
-                target.provider().id()
-            );
-        }
-        if facts.protocol == FrontendProtocol::AnthropicMessages
-            && requested.starts_with("anthropic/")
-        {
-            return "protocol-rewrite:legacy-anthropic-protocol-alias".to_owned();
-        }
-    }
-    if facts
-        .profile
-        .as_ref()
-        .is_some_and(|profile| profile.as_str() == "unprefixed")
-    {
-        "profile-default".to_owned()
-    } else {
-        "protocol-default".to_owned()
     }
 }
 

@@ -1,15 +1,13 @@
 //! Read-only, binding-keyed learning input for policy resolution.
 //!
-//! The interface does not expose mutation. Revision-one legacy policy may use
-//! the adapter's unattributable rows; authored policy must use a future
-//! binding-scoped implementation instead.
+//! The interface does not expose mutation. Every piece of evidence belongs to
+//! one binding; the ledger's older rows carry no binding and are not read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::DeclaredWindow;
-use crate::middleware::models::{ModelStore, active_days_of, days_of};
-use crate::store::{BindingLearning, ModelEntry, Store};
+use crate::store::{BindingLearning, Store};
 
 use super::BindingId;
 
@@ -56,10 +54,10 @@ impl LearnedEvidence {
 
 #[derive(Debug, Clone, Default)]
 pub struct LearningSnapshot {
-    learned: BTreeMap<(Option<BindingId>, String), LearnedEvidence>,
-    recent: BTreeMap<(Option<BindingId>, String), i64>,
-    covered_since: BTreeMap<Option<BindingId>, Option<i64>>,
-    active_days: BTreeMap<Option<BindingId>, usize>,
+    learned: BTreeMap<(BindingId, String), LearnedEvidence>,
+    recent: BTreeMap<(BindingId, String), i64>,
+    covered_since: BTreeMap<BindingId, i64>,
+    active_days: BTreeMap<BindingId, usize>,
 }
 
 impl LearningView for LearningSnapshot {
@@ -74,24 +72,15 @@ impl LearningView for LearningSnapshot {
         binding_id: &BindingId,
         model_id: &str,
     ) -> Result<RecencyEvidence, Self::Error> {
-        let legacy_model =
-            crate::catalog::model_identity(model_id).unwrap_or_else(|| model_id.to_owned());
-        let scope = if self.covered_since.contains_key(&Some(binding_id.clone())) {
-            Some(binding_id.clone())
-        } else if self.covered_since.contains_key(&None) {
-            return Ok(RecencyEvidence::Covered {
-                last_sent: self.recent.get(&(None, legacy_model)).copied(),
-                covered_since: self.covered_since.get(&None).copied().flatten(),
-            });
-        } else {
+        let Some(covered_since) = self.covered_since.get(binding_id).copied() else {
             return Ok(RecencyEvidence::Unknown);
         };
         Ok(RecencyEvidence::Covered {
             last_sent: self
                 .recent
-                .get(&(scope.clone(), model_id.to_owned()))
+                .get(&(binding_id.clone(), model_id.to_owned()))
                 .copied(),
-            covered_since: self.covered_since.get(&scope).copied().flatten(),
+            covered_since: Some(covered_since),
         })
     }
 
@@ -100,32 +89,25 @@ impl LearningView for LearningSnapshot {
         binding_id: &BindingId,
         model_id: &str,
     ) -> Result<Option<LearnedEvidence>, Self::Error> {
-        let legacy_model =
-            crate::catalog::model_identity(model_id).unwrap_or_else(|| model_id.to_owned());
         Ok(self
             .learned
-            .get(&(Some(binding_id.clone()), model_id.to_owned()))
-            .or_else(|| self.learned.get(&(None, legacy_model)))
+            .get(&(binding_id.clone(), model_id.to_owned()))
             .cloned())
     }
 
     fn known_models(&self, binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
-        let scoped = self
+        Ok(self
             .learned
             .keys()
-            .filter_map(|(binding, model)| (binding.as_ref() == Some(binding_id)).then_some(model));
-        let legacy = self
-            .learned
-            .keys()
-            .filter_map(|(binding, model)| binding.is_none().then_some(model));
-        Ok(scoped.chain(legacy).cloned().collect())
+            .filter_map(|(binding, model)| (binding == binding_id).then_some(model))
+            .cloned()
+            .collect())
     }
 
     fn active_days(&self, binding_id: &BindingId) -> Result<usize, Self::Error> {
         Ok(self
             .active_days
-            .get(&Some(binding_id.clone()))
-            .or_else(|| self.active_days.get(&None))
+            .get(binding_id)
             .copied()
             .unwrap_or_default())
     }
@@ -151,8 +133,7 @@ pub trait LearningView {
     type Error;
 
     /// Clone the latest already-published content-free evidence. This method
-    /// must not perform I/O: request handlers use it before enqueueing shadow
-    /// work.
+    /// must not perform I/O: request handlers take it on the hot path.
     fn snapshot(&self) -> LearningSnapshot;
 
     /// Refresh the published snapshot outside the request handler. Failure
@@ -176,24 +157,11 @@ pub trait LearningView {
     fn known_models(&self, binding_id: &BindingId) -> Result<Vec<String>, Self::Error>;
 
     /// Number of distinct days carrying any evidence in this binding's
-    /// learning pool. Revision-one's adapter intentionally returns the legacy
-    /// table-wide pool because those rows cannot be attributed to bindings.
+    /// learning pool.
     fn active_days(&self, binding_id: &BindingId) -> Result<usize, Self::Error>;
 }
 
-/// Temporary revision-one adapter over the unattributable legacy model table.
-pub struct LegacyLearningView {
-    store: Arc<ModelStore>,
-}
-
-impl LegacyLearningView {
-    pub fn new(store: Arc<ModelStore>) -> Self {
-        Self { store }
-    }
-}
-
-/// Binding-local observation and recency, separate from revision-one's
-/// unattributable [`ModelStore`].
+/// Binding-local observation and recency.
 ///
 /// The recently-sent map is keyed by the selected binding and exact effective
 /// target. It is marked immediately before an inference send. Durable learning
@@ -393,64 +361,6 @@ impl LearningView for BindingLearningView {
     }
 }
 
-impl LearningView for LegacyLearningView {
-    type Error = crate::store::Error;
-
-    fn snapshot(&self) -> LearningSnapshot {
-        legacy_snapshot(&self.store)
-    }
-
-    fn recently_sent(
-        &self,
-        _binding_id: &BindingId,
-        model_id: &str,
-    ) -> Result<RecencyEvidence, Self::Error> {
-        Ok(self.store.last_served_record(model_id).map_or(
-            RecencyEvidence::Unknown,
-            |(last_sent, covered_since)| RecencyEvidence::Covered {
-                last_sent,
-                covered_since,
-            },
-        ))
-    }
-
-    fn learned(
-        &self,
-        _binding_id: &BindingId,
-        model_id: &str,
-    ) -> Result<Option<LearnedEvidence>, Self::Error> {
-        Ok(self.store.learned_entry(model_id)?.map(evidence))
-    }
-
-    fn known_models(&self, _binding_id: &BindingId) -> Result<Vec<String>, Self::Error> {
-        self.store.known_models()
-    }
-
-    fn active_days(&self, _binding_id: &BindingId) -> Result<usize, Self::Error> {
-        Ok(active_days_of(&self.store.learned_entries()?))
-    }
-}
-
-fn legacy_snapshot(store: &ModelStore) -> LearningSnapshot {
-    let entries = store.published_learning();
-    let active_days = active_days_of(&entries);
-    let learned = entries
-        .into_iter()
-        .map(|entry| ((None, entry.model_id.clone()), evidence(entry)))
-        .collect();
-    let recent = store
-        .recently_served()
-        .into_iter()
-        .map(|(model, at)| ((None, model), at))
-        .collect();
-    LearningSnapshot {
-        learned,
-        recent,
-        covered_since: BTreeMap::from([(None, store.covered_since())]),
-        active_days: BTreeMap::from([(None, active_days)]),
-    }
-}
-
 fn binding_snapshot(view: &BindingLearningView) -> crate::store::Result<LearningSnapshot> {
     let recency = view
         .recency
@@ -459,13 +369,9 @@ fn binding_snapshot(view: &BindingLearningView) -> crate::store::Result<Learning
     let recent = recency
         .sent_on
         .iter()
-        .map(|((binding, model), last_sent)| ((Some(binding.clone()), model.clone()), *last_sent))
+        .map(|((binding, model), last_sent)| ((binding.clone(), model.clone()), *last_sent))
         .collect();
-    let covered_since = recency
-        .covered_since
-        .iter()
-        .map(|(binding, since)| (Some(binding.clone()), Some(*since)))
-        .collect();
+    let covered_since = recency.covered_since.clone();
     let mut learned = BTreeMap::new();
     let mut days_by_binding = BTreeMap::<BindingId, BTreeSet<String>>::new();
     for entry in view.store.load_all_binding_learnings()? {
@@ -474,13 +380,13 @@ fn binding_snapshot(view: &BindingLearningView) -> crate::store::Result<Learning
             .or_default()
             .extend(entry.days.iter().cloned());
         learned.insert(
-            (Some(entry.binding_id.clone()), entry.model_id.clone()),
+            (entry.binding_id.clone(), entry.model_id.clone()),
             binding_evidence(entry),
         );
     }
     let active_days = days_by_binding
         .into_iter()
-        .map(|(binding, days)| (Some(binding), days.len()))
+        .map(|(binding, days)| (binding, days.len()))
         .collect();
     Ok(LearningSnapshot {
         learned,
@@ -499,17 +405,6 @@ fn binding_evidence(entry: BindingLearning) -> LearnedEvidence {
     }
 }
 
-fn evidence(entry: ModelEntry) -> LearnedEvidence {
-    LearnedEvidence {
-        distinct_days: days_of(&entry),
-        max_prompt: entry.max_prompt.and_then(|value| u64::try_from(value).ok()),
-        declared_window: None,
-        // Legacy grants are encoded by adding ordinary days, so the legacy
-        // table cannot distinguish an explicit grant from observations.
-        explicitly_promoted: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -518,7 +413,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::middleware::models::ModelStore;
     use crate::store::{BindingLearningUpdate, ModelEntry, RequestRow, Store};
 
     fn binding(value: &str) -> BindingId {
@@ -593,69 +487,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn legacy_adapter_accepts_binding_keys_but_reads_revision_one_rows() {
-        let store = Arc::new(Store::open(":memory:").unwrap());
-        store
-            .upsert_model(&ModelEntry {
-                model_id: "claude-sonnet-5".to_owned(),
-                days_json: Some(json!(["2026-10-01", "2026-10-01", "2026-10-02"])),
-                max_prompt: Some(123_456),
-                context_window_json: None,
-            })
-            .unwrap();
-        let models = ModelStore::seeded(store, &[row("claude-sonnet-5", 9_000)], Some(5_000));
-        let view = LegacyLearningView::new(Arc::new(models));
-        let first = binding("anthropic_sub.anthropic_messages");
-        let second = binding("anthropic_api.anthropic_messages");
-
-        assert_eq!(
-            view.recently_sent(&first, "claude-sonnet-5").unwrap(),
-            RecencyEvidence::Covered {
-                last_sent: Some(9_000),
-                covered_since: Some(5_000),
-            }
-        );
-        assert_eq!(
-            view.recently_sent(&second, "claude-sonnet-5").unwrap(),
-            RecencyEvidence::Covered {
-                last_sent: Some(9_000),
-                covered_since: Some(5_000),
-            }
-        );
-        let learned = view.learned(&first, "claude-sonnet-5").unwrap().unwrap();
-        assert_eq!(learned.distinct_days(), ["2026-10-01", "2026-10-02"]);
-        assert_eq!(learned.max_prompt(), Some(123_456));
-        assert_eq!(view.known_models(&second).unwrap(), ["claude-sonnet-5"]);
-        let snapshot = view.snapshot();
-        assert_eq!(
-            snapshot
-                .recently_sent(&first, "Claude-Sonnet-5[1m]")
-                .unwrap(),
-            view.recently_sent(&first, "Claude-Sonnet-5[1m]").unwrap()
-        );
-        assert_eq!(
-            snapshot.learned(&first, "Claude-Sonnet-5[1m]").unwrap(),
-            view.learned(&first, "Claude-Sonnet-5[1m]").unwrap()
-        );
-    }
-
-    #[test]
-    fn reads_do_not_create_unknown_learning() {
-        let store = Arc::new(Store::open(":memory:").unwrap());
-        let models = ModelStore::seeded(store, &[], None);
-        let view = LegacyLearningView::new(Arc::new(models));
-        let binding = binding("openrouter.openrouter_messages");
-        assert_eq!(
-            view.recently_sent(&binding, "unknown-model").unwrap(),
-            RecencyEvidence::Covered {
-                last_sent: None,
-                covered_since: None,
-            }
-        );
-        assert_eq!(view.learned(&binding, "unknown-model").unwrap(), None);
-        assert!(view.known_models(&binding).unwrap().is_empty());
-    }
     #[test]
     fn binding_adapter_isolates_bindings_and_never_falls_back_to_legacy_rows() {
         let store = Arc::new(Store::open(":memory:").unwrap());

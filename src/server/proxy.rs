@@ -88,7 +88,6 @@ pub(crate) const PRECOMMIT_BODY_CAP: usize = 64 * 1024;
 pub(crate) async fn chat_completions(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
 
     // Session identity, read by name only — request headers are never
     // captured wholesale: they carry credentials (invariant 2).
@@ -178,7 +177,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     };
     let facts = server.shadow_facts(
         ProtocolId::OpenAiChat,
-        shadow_profile.as_deref(),
+        frontend.as_deref(),
         Some(model.clone()),
         cold_lane_key.clone(),
         force_newest::prompt_bound(original.len() as u64),
@@ -306,7 +305,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         );
     }
     inference.strip_release(&original);
-    let authoritative = policy_plan.is_some();
     let pin_transition = policy_plan
         .as_ref()
         .map(|resolved| resolved.pin_transition.clone());
@@ -509,21 +507,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
     }
 
-    if !authoritative
-        && let Some(legacy) = server.legacy_shadow_outcome(
-            &facts,
-            &target,
-            gate_model.clone(),
-            None,
-            None,
-            None,
-            gate_model.clone(),
-            false,
-        )
-    {
-        server.observe_policy_shadow(facts, credentials, lane, legacy);
-    }
-
     let adapter = target
         .binding()
         .canonical_backend()
@@ -575,11 +558,6 @@ pub(crate) async fn models(State(server): State<Server>, request: Request) -> Re
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let models = offers::for_frontend(&server.registry, &catalogs, frontend);
-        server.compare_publication_shadow(
-            frontend,
-            super::frontend_of(request.extensions()),
-            models.iter().map(|model| model.routed_model_id.clone()),
-        );
         if models.is_empty() {
             return catalog_unavailable("No provider model catalogue is available yet");
         }

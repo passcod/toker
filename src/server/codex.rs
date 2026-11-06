@@ -81,7 +81,6 @@ const RESPONSES_FRONTEND: &str = "openai_responses";
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -200,7 +199,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         };
         let facts = server.shadow_facts(
             ProtocolId::OpenAiResponses,
-            shadow_profile.as_deref(),
+            frontend.as_deref(),
             Some(requested_model.clone()),
             lane_reference.clone(),
             crate::middleware::force_newest::prompt_bound(original.len() as u64),
@@ -256,19 +255,6 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                     Ok(target) => target,
                     Err(_) => return super::responses_not_configured(),
                 };
-                let effective_model = target.effective_model().map(str::to_owned);
-                if let Some(legacy) = server.legacy_shadow_outcome(
-                    &facts,
-                    &target,
-                    effective_model.clone(),
-                    None,
-                    None,
-                    None,
-                    effective_model,
-                    false,
-                ) {
-                    server.observe_policy_shadow(facts, credentials, lane, legacy);
-                }
                 (target, None)
             }
             Err(super::PolicyAttemptError::Resolve {
