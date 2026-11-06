@@ -713,8 +713,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             && effective_model.as_deref() != model.as_deref()
             && let Some(effective) = effective_model.as_deref()
         {
-            // A deliberate routing transform: the registry removed only
-            // toker's outer provider/protocol prefix.
+            // A deliberate routing transform: policy chose a different model
+            // than the client named (prefix, alias, upgrade or retarget).
             let routed_ir = ingress_canonical.as_mut().and_then(|canonical| {
                 canonical.model = Some(effective.to_owned());
                 translate::render_anthropic(canonical, crate::routing::DialectId::AnthropicMessages)

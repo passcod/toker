@@ -515,8 +515,7 @@ impl Server {
     }
 
     /// Mark one selected binding and effective target immediately before an
-    /// actual inference transport starts. This state is deliberately separate
-    /// from the legacy model store.
+    /// actual inference transport starts.
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,

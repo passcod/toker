@@ -1,5 +1,6 @@
-//! Frontend-visible models are a legacy projection of canonical backend offers
+//! Frontend-visible model lists are projected from canonical backend offers
 //! through the implemented route graph, never one upstream's raw listing.
+//! Revision one's generated Chat and Responses listings are this projection.
 
 use std::collections::BTreeMap;
 

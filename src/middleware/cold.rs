@@ -1130,9 +1130,9 @@ fn is_response_row(row: &RequestRow) -> bool {
 /// price signature rather than name needs no maintenance when a model is
 /// added. Routing aliases are not price evidence: the fit keys rows on the
 /// model the RESPONSE named, which is the identity the host served after
-/// any model map, and a caller asking [`QuotaFit::quota_for`] about a
-/// request must ask about the model the map will send, never the alias
-/// the client named.
+/// any alias, and a caller asking [`QuotaFit::quota_for`] about a request
+/// must ask about the effective model policy chose, never the alias the
+/// client named.
 fn price_key(model: &str) -> String {
     match price(model, false, None) {
         Some(priced) => format!(
@@ -1789,8 +1789,8 @@ pub fn outlook_of(
 /// 5-hour meter at all (the plain API, codex's differently-shaped limits)
 /// be quietened by the subscription's burn and weights. A backend that is
 /// not a 5-hour meter source has no such rows, so it has no burn and no
-/// fit — blind, and the notice fires. `model` must be the identity the
-/// backend's model map will send (see [`price_key`]).
+/// fit — blind, and the notice fires. `model` must be the effective model
+/// policy chose for the backend (see [`price_key`]).
 pub fn outlook_over(
     store: &Store,
     provider: &str,

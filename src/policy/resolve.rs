@@ -242,7 +242,8 @@ pub enum TraceEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptPlan {
     pub policy_fingerprint: PolicyFingerprint,
-    /// Legacy in-memory policy has no persisted revision yet.
+    /// The stored revision this plan resolved under; an in-memory policy
+    /// resolved directly has none.
     pub policy_revision: Option<i64>,
     pub route_id: Option<RouteId>,
     pub route_fingerprint: Option<RouteFingerprint>,
@@ -1155,9 +1156,8 @@ fn candidate_evidence(
         .or_else(|| match candidate.model() {
             // A fresh listing can disprove a policy-owned exact offer. Models
             // supplied by a compatibility default or template remain
-            // provider-owned strings, as they are on the legacy route: an
-            // incomplete catalogue must not turn the listing into an
-            // upstream allowlist.
+            // provider-owned strings: an incomplete catalogue must not turn
+            // the listing into an upstream allowlist.
             CompiledCandidateModel::Exact(_) => {
                 model_availability(candidate.binding_id(), model, live.catalogue, inventory)
             }

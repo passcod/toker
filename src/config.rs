@@ -115,18 +115,21 @@ pub struct Config {
     /// request carried it is recorded but excluded from liveness (plan:
     /// Ping tagging).
     pub ping_header_name: String,
-    /// The default backend for the openai_chat protocol, always one of
-    /// the enabled providers; `None` when the protocol has no backend
-    /// (its routes then answer a not-configured error).
+    /// The default backend for the openai_chat protocol, always one of the
+    /// enabled providers; `None` when the protocol has no backend. Read only
+    /// to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it, because the active revision owns
+    /// routing.
     pub default_backend_openai_chat: Option<String>,
     /// The openrouter provider block; `None` when absent, which is the
     /// disabled state: a `[providers.X]` block's presence enables X.
     pub openrouter: Option<OpenRouterConfig>,
     /// The OpenAI API provider block (`None`: disabled).
     pub openai_api: Option<OpenAiApiConfig>,
-    /// The default backend for the anthropic protocol (plan: Routing —
-    /// bare model names go to the protocol default), always one of the
-    /// enabled providers; `None` when no anthropic backend is enabled.
+    /// The default backend for the anthropic protocol, always one of the
+    /// enabled providers; `None` when no anthropic backend is enabled. Read
+    /// only to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it.
     pub default_backend_anthropic: Option<String>,
     /// The anthropic subscription provider block (`None`: disabled).
     pub anthropic_sub: Option<AnthropicSubConfig>,
@@ -385,10 +388,10 @@ impl OpenAiApiConfig {
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
-    /// The model routing map (plan: Middleware — "Model routing map"):
-    /// `[providers.anthropic_sub.model_map]`, an optional operator policy
-    /// applied as the pipeline's final routing stage on this backend.
-    /// `None` when the table is absent (the default — no mapping).
+    /// The model routing map: `[providers.anthropic_sub.model_map]`, an
+    /// optional operator policy. Revision one's generator compiles it into an
+    /// alias policy on this backend's candidate; it is not read at request
+    /// time. `None` when the table is absent (the default: no mapping).
     pub model_map: Option<ModelMap>,
     /// Toker-held OAuth token sources, preferred to Claude's local login
     /// when both are available for a foreign frontend.

@@ -914,14 +914,15 @@ pub struct RequestRow {
     pub geo: Option<String>,
     /// Provider's fast/low-latency tier flag, when reported.
     pub fast: Option<bool>,
-    /// Selected backend binding. Legacy-attributed rows may carry it without
-    /// policy provenance; a policy actual attempt must carry the selected
-    /// binding while a preflight terminal must not.
+    /// Selected backend binding. Rows written before policy routing may carry
+    /// it without policy provenance; a policy actual attempt must carry the
+    /// selected binding while a preflight terminal must not.
     pub binding_id: Option<BindingId>,
-    /// One actual upstream send's identity, independent of whether policy or
-    /// the legacy router selected it. Preflight-only terminals have no attempt.
+    /// One actual upstream send's identity. Preflight-only terminals have no
+    /// attempt.
     pub attempt: Option<AttemptProvenance>,
-    /// Closed policy-routing provenance, absent on legacy/non-routing rows.
+    /// Closed policy-routing provenance, absent on non-routing rows and on
+    /// rows written before policy routing.
     pub policy_routing: Option<PolicyRouteProvenance>,
     pub lineage: Option<SessionLineage>,
 }
