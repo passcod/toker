@@ -253,10 +253,7 @@ async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
 /// [`spawn_toker`] over a store the test seeded first. Revision one reads
 /// the binding's learning as published when the server is built, so a
 /// retarget target (see [`seed_sonnet`]) must be there before the server is.
-async fn spawn_toker_seeded(
-    config: Config,
-    seed: impl FnOnce(&Store),
-) -> (SocketAddr, Arc<Store>) {
+async fn spawn_toker_seeded(config: Config, seed: impl FnOnce(&Store)) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     seed(&store);
     let addr = common::serve(common::server(config, &store)).await;
@@ -874,8 +871,7 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     // stay empty; the provenance of the move is the policy outcome's
     // baseline. See the F1 port notes' findings.
     let policy = row.policy_routing.as_ref().expect("policy provenance");
-    let toker::store::PolicyRoutingOutcome::Attempt { baseline_model, .. } = &policy.outcome
-    else {
+    let toker::store::PolicyRoutingOutcome::Attempt { baseline_model, .. } = &policy.outcome else {
         panic!("a forwarded request records an attempt outcome");
     };
     assert_eq!(baseline_model, "claude-opus-5");

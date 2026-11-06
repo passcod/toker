@@ -193,7 +193,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
             upstream: openrouter_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
-            api_key: None,
+            // Policy refuses a backend it has no credential for.
+            api_key: Some("sk-or-test".to_owned()),
             picker: None,
         }),
         openai_api: None,
@@ -202,6 +203,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
             model_map: None,
             upstream: upstream.clone(),
             claude_credentials_path: None,
+            oauth_token_env: UNSET_KEY_ENV.to_owned(),
+            oauth_token: Some("sk-ant-oat-test".to_owned()),
             ..AnthropicSubConfig::default()
         }),
         anthropic_api: Some(AnthropicApiConfig {
@@ -492,6 +495,7 @@ async fn a_cold_lane_moves_to_the_learned_newest() {
 
     let response = post_messages(addr, "ccses-42", &body).await;
     assert_eq!(response.status(), StatusCode::OK);
+    { let rows = wait_for_rows(&store, 1).await; eprintln!("DBG {:#?}", rows[0].policy_routing); }
 
     // The middleware changed only the model semantics; canonical rendering
     // keeps every cache-control extension.
