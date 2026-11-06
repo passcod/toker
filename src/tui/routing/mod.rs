@@ -34,10 +34,8 @@ impl Page {
     }
 
     pub(super) fn refresh(&mut self) {
-        if self.state.begin_refresh() {
-            if !self.client.refresh() {
-                self.state.refresh_refused();
-            }
+        if self.state.begin_refresh() && !self.client.refresh() {
+            self.state.refresh_refused();
         }
     }
 
