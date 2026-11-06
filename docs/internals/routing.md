@@ -188,9 +188,11 @@ which the openrouter provider's `endpoint` already maps `/v1/messages` onto. So
 an `openrouter/<id>` model on the anthropic frontend is a same-protocol
 canonical route with the prefix stripped before deterministic rendering. The
 client's own credential is Claude's OAuth bearer, meant for Anthropic:
-`OpenRouter::strip_foreign_credentials` drops any `sk-ant-` bearer and
-`x-api-key`, and the stored openrouter key goes in its place. Nothing of the
-subscription's reaches openrouter.ai.
+`OpenRouter::strip_foreign_credentials` drops `x-api-key` and, when toker holds
+an openrouter key, every incoming bearer too (claude's settings carry a
+placeholder one); the stored key goes in its place. With no stored key, only
+`sk-ant-` bearers are dropped and a client's own `sk-or-` key passes through.
+Nothing of the subscription's reaches openrouter.ai.
 
 Two rewrites stay off this route (`picks_from_anthropic_catalogue`): the
 compaction retarget and force-newest both pick a bare `claude-*` id from the
