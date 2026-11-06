@@ -867,9 +867,10 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
         "the response model is the retarget's"
     );
     // Policy chose the retarget before the compaction transform ran, so the
-    // transform sees no model change and the legacy `downgraded_*` columns
-    // stay empty; the provenance of the move is the policy outcome's
-    // baseline. See the F1 port notes' findings.
+    // move is read off the plan: the model the lane was on and the one the
+    // compaction went to. The detail view shows exactly this pair.
+    assert_eq!(row.downgraded_from.as_deref(), Some("claude-opus-5"));
+    assert_eq!(row.downgraded_to.as_deref(), Some("claude-sonnet-5"));
     let policy = row.policy_routing.as_ref().expect("policy provenance");
     let toker::store::PolicyRoutingOutcome::Attempt { baseline_model, .. } = &policy.outcome else {
         panic!("a forwarded request records an attempt outcome");

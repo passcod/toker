@@ -1405,13 +1405,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 // A same-model strip is not a downgrade, and recording one
                 // would put a model in `downgradedFrom` that also served
                 // the request — only `cacheStripped` says it happened.
-                let downgraded_from = (outcome.to != outcome.from)
-                    .then(|| outcome.from.clone())
-                    .flatten();
-                let downgraded_to = downgraded_from
-                    .is_some()
-                    .then(|| outcome.to.clone())
-                    .flatten();
+                //
+                // Under policy the model was chosen before the transform, so
+                // `outcome` sees none and the plan holds the move.
+                let policy_move = policy_attempt
+                    .as_ref()
+                    .map(|resolved| resolved.plan.compaction_move());
+                let (downgraded_from, downgraded_to) = match policy_move {
+                    Some(moved) => moved.unzip(),
+                    None => {
+                        let from = (outcome.to != outcome.from)
+                            .then(|| outcome.from.clone())
+                            .flatten();
+                        let to = from.is_some().then(|| outcome.to.clone()).flatten();
+                        (from, to)
+                    }
+                };
                 if let Some(ctx) = record.as_mut() {
                     ctx.downgraded_from = downgraded_from;
                     ctx.downgraded_to = downgraded_to;

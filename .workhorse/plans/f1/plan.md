@@ -100,7 +100,7 @@ policy path and what the legacy path did.
 - [x] A pinned lane on a binding with no cache domain (anthropic_sub, api,
       codex) is never `Cold`, so force-newest never fires for it: derive
       coldness from the lane's recorded TTL for a lane pinned to that binding
-- [ ] Compaction retarget rows record no `downgraded_from`/`downgraded_to`
+- [x] Compaction retarget rows record no `downgraded_from`/`downgraded_to`
       because policy picks the cheaper model first; derive them from the plan
 - [ ] `/model` switch on a warm pinned lane answers 502 "could not resolve":
       route it as the existing `ExplicitUserChange` transition cause

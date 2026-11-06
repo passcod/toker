@@ -283,6 +283,26 @@ impl AttemptPlan {
             .map(|to| (self.baseline_model.clone(), to.clone()))
     }
 
+    /// The model a compaction was moved off and onto, as the `(from, to)`
+    /// pair a row records as its downgrade.
+    ///
+    /// Policy picks the cheaper model before the compaction body transform
+    /// runs, so the transform sees the request already on it and cannot report
+    /// the move; the plan still holds both ends. `None` when the plan made no
+    /// move: a compaction that kept its model only strips cache writes.
+    pub fn compaction_move(&self) -> Option<(String, String)> {
+        let from = if self.provenance == RouteProvenance::Compaction {
+            self.requested_model.clone()?
+        } else if self.retargeted_model.is_some() {
+            self.upgraded_model
+                .clone()
+                .unwrap_or_else(|| self.baseline_model.clone())
+        } else {
+            return None;
+        };
+        (from != self.effective_model).then(|| (from, self.effective_model.clone()))
+    }
+
     pub fn pin_identity(&self) -> Option<super::PinIdentity> {
         Some(super::PinIdentity {
             policy_revision_id: self.policy_revision?,
@@ -3963,5 +3983,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(failure, ResolveFailure::InvalidArgument));
+    }
+
+    #[test]
+    fn a_compaction_move_is_read_off_the_plan_and_only_when_there_is_one() {
+        let policy = compile(
+            document(route(
+                candidate(
+                    "first",
+                    &ANTHROPIC_SUB_MESSAGES,
+                    CandidateModel::RequestedModel,
+                ),
+                vec![],
+            )),
+            &OfferInventory::default(),
+        );
+        let mut plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("opus"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.compaction_move(),
+            None,
+            "an ordinary plan moves nothing"
+        );
+
+        plan.retargeted_model = Some("sonnet".to_owned());
+        plan.effective_model = "sonnet".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus".to_owned(), "sonnet".to_owned()))
+        );
+
+        plan.upgraded_model = Some("opus-2".to_owned());
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus-2".to_owned(), "sonnet".to_owned())),
+            "the lane's upgraded model is what it moved off"
+        );
+
+        plan.upgraded_model = None;
+        plan.effective_model = "opus".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            None,
+            "a retarget that lands on the model it started on is not a move"
+        );
+
+        plan.provenance = RouteProvenance::Compaction;
+        plan.retargeted_model = None;
+        plan.effective_model = "haiku".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus".to_owned(), "haiku".to_owned())),
+            "an explicit compaction route moves off what the client asked for"
+        );
     }
 }
