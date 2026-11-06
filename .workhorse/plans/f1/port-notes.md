@@ -135,3 +135,20 @@ server without an active revision (they compile and pass today).
   (`merge_binding_learning`), published as a snapshot when the server is built;
   seeding the legacy `ModelStore` (`upsert_model`) or seeding after
   construction has no effect. Tests seed the store before building the server.
+- Under revision one compiled from the legacy config, requests with no model
+  cannot route: the protocol default binds `RequestedModel`, and
+  `resolve_first_candidate` answers `InvalidArgument` when the facts carry
+  none. So batch results, batch cancel and every unmatched Anthropic path
+  (`/v1/files`, usage lookups, anything claude calls beyond Messages) answer
+  503 on the live config. Only an operator policy whose default route takes
+  no parameter routes them (server_anthropic ports those tests onto one).
+  Needs a decision: a model-less resolution path for administrative requests,
+  or revision one generating a default that does not need a model.
+- A request that names a different model on a warm, pinned lane is refused by
+  the lane transition (`WarmCacheLoss`) and answered 502 "could not resolve
+  this request". A user switching `/model` mid-session on a warm lane meets
+  that. Policy working as designed, but the answer names neither cause nor
+  remedy; decide whether it should be a notice or a cold move.
+- Unlike the legacy sub, a subscription with no held token, no login and no
+  client bearer is now refused locally (503, `route-unavailable` row) instead
+  of forwarded to a 401. server_anthropic covers it.

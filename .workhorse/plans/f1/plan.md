@@ -72,7 +72,8 @@ Changeset 12 left legacy routing reachable in production:
   - Done in the pilot: one authoritative constructor family (`Server::new`,
     `Server::with_seams` + `Seams`), `tests/common` helpers, `server_proxy.rs`;
     recipe in `port-notes.md`.
-  - [ ] tests/server_anthropic.rs
+  - [x] tests/server_anthropic.rs (three src fixes found on the way; see
+        Findings in `port-notes.md`)
   - [x] tests/server_awake.rs
   - [ ] tests/server_codex.rs
   - [x] tests/server_cold.rs

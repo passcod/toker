@@ -55,6 +55,9 @@ use toker::translate::from_anthropic;
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_ANTH_5C";
 
+/// The subscription token [`test_config`] holds for requests that bring none.
+const HELD_OAUTH_TOKEN: &str = "held-oauth-token";
+
 // ---------------------------------------------------------------------------
 // The mock upstream
 // ---------------------------------------------------------------------------
@@ -192,6 +195,9 @@ fn non_stream_body(model: &str) -> Vec<u8> {
     }))
     .expect("serialise non-stream body")
 }
+
+/// What a user turn says to make the mock answer with a 5-minute-tier write.
+const TIER_5M_TEXT: &str = "5m-tier";
 
 const ERROR_BODY: &str =
     r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
@@ -434,8 +440,15 @@ async fn mock_messages(State(mock): State<MockState>, request: Request) -> Respo
         }
         // A 5-minute-tier-only write (fixture 04): the lane-stickiness
         // probe — a warm follow-up whose writes landed on the short tier
-        // must not shorten what the lane already holds.
-        "5m-tier" if stream => {
+        // must not shorten what the lane already holds. Keyed on the turn's
+        // text rather than the model: policy refuses to move a warm lane to
+        // another model, so the follow-up has to name the same one.
+        // (Canonical rendering may spell the content as a block list.)
+        _ if stream
+            && json
+                .pointer("/messages/0")
+                .is_some_and(|message| message.to_string().contains(TIER_5M_TEXT)) =>
+        {
             let mut response = raw_response(
                 StatusCode::OK,
                 "text/event-stream",
@@ -626,10 +639,15 @@ fn test_config(
         }),
         openai_api: None,
         default_backend_anthropic: Some(default_backend.to_owned()),
+        // A held token, so a request that brings no credential of its own is
+        // still signed: policy refuses a candidate with nothing to sign
+        // with, and most tests here are about something else. Claude's own
+        // bearer, when sent, always wins over it.
         anthropic_sub: Some(AnthropicSubConfig {
             model_map: None,
             upstream: anthropic_upstream.clone(),
             claude_credentials_path: None,
+            oauth_token: Some(HELD_OAUTH_TOKEN.to_owned()),
             ..AnthropicSubConfig::default()
         }),
         anthropic_api: Some(AnthropicApiConfig {
@@ -881,6 +899,11 @@ fn assert_canonical_request(source: &[u8], actual: &[u8], model: &str) {
 /// there is no lane, just a session (the lane rule: a session is not a
 /// cache entry).
 fn tools_body(model: &str, stream: bool) -> Vec<u8> {
+    tools_body_saying(model, stream, "Hi")
+}
+
+/// [`tools_body`] whose user turn says `text`.
+fn tools_body_saying(model: &str, stream: bool, text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "model": model,
         "stream": stream,
@@ -888,7 +911,7 @@ fn tools_body(model: &str, stream: bool) -> Vec<u8> {
             {"name": "Read", "input_schema": {"type": "object"}},
             {"name": "Bash", "input_schema": {"type": "object"}},
         ],
-        "messages": [{"role": "user", "content": "Hi"}],
+        "messages": [{"role": "user", "content": text}],
     }))
     .expect("serialise tools body")
 }
@@ -1312,15 +1335,23 @@ async fn the_openrouter_prefix_without_its_block_is_answered_locally() {
     let mut config = test_config(upstream, None, "anthropic_sub");
     config.openrouter = None;
     config.default_backend_openai_chat = Some("codex_sub".to_owned());
-    let (addr, _store) = spawn_toker(config).await;
+    let (addr, store) = spawn_toker(config).await;
 
+    // The prefix still names openrouter's route, which is disabled without
+    // its block: policy refuses it rather than falling through to the
+    // default with the prefix still on.
     let body = messages_body("openrouter/moonshotai/kimi-k3", false);
     let response = post_messages(addr, "/v1/messages", &[], &body).await;
-    assert!(response.headers().contains_key("x-toker-not-configured"));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = response.json().await.expect("typed error");
+    assert_eq!(error["type"], json!("error"));
+    assert_eq!(error["error"]["type"], json!("api_error"));
     assert!(
         mock.captured().is_empty(),
         "never sent to the default with the prefix still on"
     );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
 }
 
 #[tokio::test]
@@ -1399,7 +1430,8 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
         "a request that brings its own x-api-key keeps it"
     );
 
-    // The sub never injects: no stored token exists yet.
+    // The sub signs with its held token when the request brings no bearer,
+    // and keeps a bearer the client did bring.
     let (mock, upstream) = spawn_mock().await;
     let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     assert_eq!(
@@ -1408,12 +1440,66 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
             .status(),
         StatusCode::OK
     );
-    let captured = mock.captured();
-    assert!(
-        !captured[0].headers.contains_key("x-api-key")
-            && !captured[0].headers.contains_key(header::AUTHORIZATION),
-        "the sub injects nothing when the request carries no bearer — the upstream 401s visibly"
+    assert_eq!(
+        post_messages(
+            addr,
+            "/v1/messages",
+            &[("authorization", "Bearer client-own-token")],
+            &body,
+        )
+        .await
+        .status(),
+        StatusCode::OK
     );
+    let captured = mock.captured();
+    assert_eq!(
+        captured[0]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {HELD_OAUTH_TOKEN}").as_str()),
+        "no client credential → the held subscription token signs"
+    );
+    assert!(!captured[0].headers.contains_key("x-api-key"));
+    assert_eq!(
+        captured[1]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer client-own-token"),
+        "the client's bearer wins over the held token"
+    );
+}
+
+#[tokio::test]
+async fn a_subscription_with_nothing_to_sign_with_is_refused_before_the_wire() {
+    // No held token, no login and no bearer from the client: policy will not
+    // send a request the upstream could only 401. The refusal is toker's own
+    // and leaves one row saying why.
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, None, "anthropic_sub");
+    config.anthropic_sub.as_mut().expect("enabled").oauth_token = None;
+    let (addr, store) = spawn_toker(config).await;
+    let body = messages_body("claude-opus-5", false);
+
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = response.json().await.expect("typed error");
+    assert_eq!(error["error"]["type"], json!("api_error"));
+    assert!(mock.captured().is_empty(), "nothing reaches the upstream");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+
+    // A client that brings its own bearer is signed by it.
+    let response = post_messages(
+        addr,
+        "/v1/messages",
+        &[("authorization", "Bearer client-own-token")],
+        &body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(mock.captured().len(), 1);
 }
 
 #[tokio::test]
@@ -1573,7 +1659,7 @@ async fn a_refused_thinking_off_is_sent_again_as_between_tools() {
             second_attempt.attempt_group_id
         );
         assert_eq!(first.binding_id, second.binding_id);
-        assert!(first.policy_routing.is_none() && second.policy_routing.is_none());
+        assert!(first.policy_routing.is_some() && second.policy_routing.is_some());
         assert_no_more_rows(&store, 2).await;
     }
 }
@@ -1713,7 +1799,7 @@ async fn count_tokens_forwards_unledgered_but_feeds_the_meters() {
 }
 
 #[tokio::test]
-async fn batch_paths_forward_transparently_and_feeds_the_meters() {
+async fn batch_creation_forwards_byte_identical_and_feeds_the_meters() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -1734,6 +1820,23 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
         "the batches body (params nested, no top-level model) forwards byte-identical"
     );
 
+    // Nothing recorded on any batch path.
+    assert_no_rows(&store).await;
+    // The meters fed from the response: the "not just accounted ones" rule.
+    let meters = store
+        .load_meters("anthropic_sub")
+        .expect("meters")
+        .expect("the batch response fed the meters");
+    assert_eq!(meters.snapshot, expected_rate_limits("0.55"));
+}
+
+#[tokio::test]
+async fn batch_results_and_cancel_forward_transparently_and_feed_the_meters() {
+    // These paths carry no model, so they are routed by a policy whose
+    // Messages default needs none.
+    let (mock, addr, store) =
+        spawn_policy_with_a_model_map("server-anthropic-batch-mgmt-", false, false).await;
+
     // Results GET: transparent forwarding.
     let response = client()
         .get(toker_url(addr, "/v1/messages/batches/batch_123/results"))
@@ -1748,9 +1851,9 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
         br#"{"id":"batch_123","object":"message_batch","status":"in_progress"}"#
     );
     let captured = mock.captured();
-    assert_eq!(captured[1].path, "/v1/messages/batches/batch_123/results");
+    assert_eq!(captured[0].path, "/v1/messages/batches/batch_123/results");
     assert_eq!(
-        captured[1]
+        captured[0]
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
@@ -1766,14 +1869,12 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
         .expect("cancel request");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        mock.captured()[2].path,
+        mock.captured()[1].path,
         "/v1/messages/batches/batch_123/cancel"
     );
 
-    // Nothing recorded on any batch path.
     assert_no_rows(&store).await;
-    // The meters fed from the background poll — the "not just accounted
-    // ones" rule.
+    // The meters fed from the background poll.
     let meters = store
         .load_meters("anthropic_sub")
         .expect("meters")
@@ -1783,8 +1884,10 @@ async fn batch_paths_forward_transparently_and_feeds_the_meters() {
 
 #[tokio::test]
 async fn unmatched_paths_pass_through_with_method_query_and_body() {
-    let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    // A path with no model is routed by a policy whose Messages default
+    // needs none.
+    let (mock, addr, store) =
+        spawn_policy_with_a_model_map("server-anthropic-unmatched-", false, false).await;
 
     // A method, path, and query toker's route table names nowhere, with
     // a body that is not JSON: all of it reaches the upstream unchanged.
@@ -2621,6 +2724,49 @@ async fn a_mapped_batch_records_which_requests_the_map_moved() {
 }
 
 #[tokio::test]
+async fn a_provider_model_map_moves_the_model_through_policy_and_the_row_says_so() {
+    // `model_map` compiles into an alias policy on the provider's candidate:
+    // the request is sent on the mapped model, and the row keeps what the
+    // client asked for beside what was sent.
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-test".to_owned()), "anthropic_api");
+    config.anthropic_api.as_mut().expect("enabled").model_map =
+        toker::middleware::model_map::parse_model_map(r#"{"family:haiku": "claude-sonnet-5"}"#)
+            .expect("the test map parses");
+    let (addr, store) = spawn_toker(config).await;
+
+    // Mapped, and unmapped alongside it, each in a session of its own: a
+    // warm lane is not moved to another model.
+    for (session, model) in [("map-a", "claude-haiku-4-5"), ("map-b", "claude-opus-5")] {
+        let body = messages_body(model, false);
+        let response =
+            post_messages(addr, "/v1/messages", &[("x-toker-session", session)], &body).await;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        response.bytes().await.expect("body");
+    }
+
+    let sent = mock
+        .captured()
+        .iter()
+        .map(|request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("sent JSON");
+            body["model"].as_str().expect("sent model").to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent, ["claude-sonnet-5", "claude-opus-5"]);
+
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows[0].requested_model.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(rows[0].effective_model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(rows[1].requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(
+        rows[1].effective_model.as_deref(),
+        Some("claude-opus-5"),
+        "an unmapped model is sent as asked"
+    );
+}
+
+#[tokio::test]
 async fn the_notice_style_follows_the_frontend_prefix() {
     // One spent meter, one decision: the frontend's base-URL prefix picks
     // the wrapping through the `[notices]` table, and an unprefixed or
@@ -3253,7 +3399,7 @@ async fn lane_rows_written_on_response_upsert_not_duplicate() {
         addr,
         "/v1/messages",
         &[("authorization", "Bearer claude-oauth-token")],
-        &tools_body("5m-tier", true),
+        &tools_body_saying("claude-opus-5", true, TIER_5M_TEXT),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3432,8 +3578,14 @@ async fn lanes_reseed_on_restart_from_the_requests_table() {
     let (addr, store) = spawn_toker(config.clone()).await;
 
     // Two responses in one lane: a 1h-tier write, then a 5m-tier one.
-    for model in ["claude-opus-5", "5m-tier"] {
-        let response = post_messages(addr, "/v1/messages", &[], &tools_body(model, true)).await;
+    for text in ["Hi", TIER_5M_TEXT] {
+        let response = post_messages(
+            addr,
+            "/v1/messages",
+            &[],
+            &tools_body_saying("claude-opus-5", true, text),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
     wait_for_rows(&store, 2).await;
