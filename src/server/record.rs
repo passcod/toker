@@ -45,7 +45,9 @@ use crate::middleware::lanes;
 use crate::observe::UsageCapture;
 use crate::policy::BindingId;
 use crate::providers::Provider;
-use crate::store::{AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind};
+use crate::store::{
+    AttemptProvenance, CostKind, PolicyRouteProvenance, RequestRow, RowKind, SessionLineage,
+};
 
 use super::Server;
 
@@ -296,13 +298,45 @@ pub(super) fn persist_lane_pin(
     }
 }
 
-pub(crate) fn record_route_unavailable(
+/// Write the route-unavailable row for a request the policy refused to route,
+/// if that is what `error` is: no route matched, every candidate was skipped,
+/// or the lane's pin refused the move. Any other failure writes nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_unroutable(
     server: &Server,
     started: Instant,
     frontend: Option<&str>,
     frontend_protocol: &'static str,
     session_id: Option<&str>,
     requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
+    error: &super::PolicyAttemptError,
+) {
+    match error.unroutable_provenance() {
+        Some(Ok(policy_routing)) => record_route_unavailable(
+            server,
+            started,
+            frontend,
+            frontend_protocol,
+            session_id,
+            requested_model,
+            lineage,
+            policy_routing,
+        ),
+        Some(Err(error)) => tracing::error!(%error, "route-unavailable provenance omitted"),
+        None => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_route_unavailable(
+    server: &Server,
+    started: Instant,
+    frontend: Option<&str>,
+    frontend_protocol: &'static str,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
     policy_routing: PolicyRouteProvenance,
 ) {
     let row = with_frontend(
@@ -369,7 +403,7 @@ pub(crate) fn record_route_unavailable(
             binding_id: None,
             attempt: None,
             policy_routing: Some(policy_routing),
-            lineage: None,
+            lineage,
         },
         frontend,
     );

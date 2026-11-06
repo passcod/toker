@@ -94,8 +94,8 @@ Serialisation purity and prefix stability are covered by
    Routing is not accounting, and it can also refuse: when the active revision
    cannot place a request (no candidate can serve it, no default route applies,
    a lane's transition is denied), the request is answered with an error before
-   any byte leaves, and a request that found a route but no usable candidate
-   leaves a `route-unavailable` row of ids and reason codes only (see
+   any byte leaves, and a request refused this way leaves a
+   `route-unavailable` row of ids and reason codes only (see
    [policy.md](policy.md)). That is the router's answer to a request it cannot
    place. It is not a licence to drop a request for any other reason.
 

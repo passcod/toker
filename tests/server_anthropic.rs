@@ -4035,7 +4035,8 @@ fn openrouter_only_config(openrouter: &reqwest::Url) -> Config {
 /// models. With no Anthropic or codex backend there is no model to send
 /// them to (OpenRouter has no model map), and routing never inspects their
 /// shape to guess one: the answer is the not-configured refusal, nothing
-/// reaches an upstream and no row is written.
+/// reaches an upstream, and the ledger gets a route-unavailable row that
+/// names no route because none matched.
 #[tokio::test]
 async fn a_bare_claude_model_with_only_openrouter_configured_is_refused() {
     let (openrouter, openrouter_upstream) = spawn_mock().await;
@@ -4052,7 +4053,15 @@ async fn a_bare_claude_model_with_only_openrouter_configured_is_refused() {
         Some("anthropic")
     );
     assert!(openrouter.captured().is_empty(), "nothing is sent upstream");
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    assert_eq!(rows[0].requested_model.as_deref(), Some("claude-haiku-4-5"));
+    let routing = rows[0].policy_routing.as_ref().expect("revision recorded");
+    assert_eq!(routing.route, None);
+    assert_eq!(
+        routing.trace.events,
+        [toker::store::StoredRoutingTraceEvent::NoRoute]
+    );
 }
 
 /// The same calls route to a configured backend when the policy says how:
@@ -4126,7 +4135,10 @@ async fn a_policy_rewrite_routes_bare_claude_models_to_openrouter() {
     assert_eq!(row.requested_model.as_deref(), Some("claude-haiku-4-5"));
     assert_eq!(row.effective_model.as_deref(), Some("z-ai/glm-5.3-flash"));
     assert_eq!(
-        row.policy_routing.as_ref().map(|routing| &routing.lookup),
+        row.policy_routing
+            .as_ref()
+            .and_then(|routing| routing.route.as_ref())
+            .map(|route| &route.lookup),
         Some(&toker::store::RequestLookupProvenance::ProtocolRewrite(
             RewriteId::new("bare-claude").unwrap()
         ))

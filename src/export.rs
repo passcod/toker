@@ -120,8 +120,8 @@ mod tests {
     use crate::store::{
         AttemptGroupId, AttemptReason, CostKind, KindFilter, NewPolicyRevision,
         PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome, RequestFilter,
-        RequestLookupProvenance, RequestRow, RowKind, SessionLineage, Store, StoredCandidateState,
-        StoredRoutingTrace, StoredRoutingTraceEvent,
+        RequestLookupProvenance, RequestRow, ResolvedRoute, RowKind, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent,
     };
     use serde_json::{Value, json};
 
@@ -297,11 +297,13 @@ mod tests {
             }),
             policy_routing: Some(PolicyRouteProvenance {
                 policy_revision_id: 1,
-                lookup: RequestLookupProvenance::ProfilePresentation(
-                    PresentationId::new("presented").unwrap(),
-                ),
-                route_id: RouteId::new("route").unwrap(),
-                route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
+                route: Some(ResolvedRoute {
+                    lookup: RequestLookupProvenance::ProfilePresentation(
+                        PresentationId::new("presented").unwrap(),
+                    ),
+                    route_id: RouteId::new("route").unwrap(),
+                    route_fingerprint: "11".repeat(32).parse::<RouteFingerprint>().unwrap(),
+                }),
                 trace: StoredRoutingTrace {
                     version: 2,
                     events: vec![
@@ -421,7 +423,7 @@ mod tests {
         let Some(routing) = rewrite.policy_routing.as_mut() else {
             panic!("fixture provenance")
         };
-        routing.lookup =
+        routing.route.as_mut().unwrap().lookup =
             RequestLookupProvenance::ProfileRewrite(RewriteId::new("rewrite").unwrap());
         rewrite.attempt.as_mut().unwrap().attempt_group_id =
             AttemptGroupId::new("0123456789abcdef0123456789abcdef").unwrap();

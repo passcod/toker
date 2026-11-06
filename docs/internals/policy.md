@@ -380,7 +380,8 @@ A route with no surviving candidate is `RouteUnavailable`, carrying the trace;
 the handler answers 503 in the frontend's own error shape and records a
 `route-unavailable` row. A revision with no default for the protocol is
 `NoRoute` and is answered as not configured (header `x-toker-not-configured`),
-because no backend was ever a candidate.
+because no backend was ever a candidate. It too leaves a `route-unavailable`
+row, with the revision and a `no_route` trace but no route.
 
 **First candidate versus traversal.** Inference resolves with traversal:
 unavailable candidates are skipped and a later one may be chosen, and the plan
@@ -525,7 +526,9 @@ most 128 events and 64 KiB, enforced in SQL) of events:
 When a route is large enough to exceed the byte bound, candidate model spellings
 are dropped first; the candidate identities and verdicts stay. A request no
 candidate could serve is a `route-unavailable` row with no send-only fields,
-carrying the trace and an attempt group of its own. A version 1 trace (no
+carrying the trace and an attempt group of its own, as is a request with no
+route and one whose lane pin refused the move (the `no_route` and
+`transition_denied` events). A version 1 trace (no
 crossed-edge evidence) is still valid history. The row kinds are in
 [ledger-schema.md](ledger-schema.md).
 

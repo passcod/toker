@@ -43,7 +43,7 @@ staleness back as the API's, which is how a 77-second observed lag first read as
 | `cold-recap` | A Claude Code recap on a cold lane was answered by the gate and never forwarded. `extra` carries the `cold` row's `idleMs`, `lastPrompt` and `reqMessages`. The lane is untouched, so the notice is still armed. Absent before 2026-10-06. |
 | `awake` | The sleep lock changed hands. No `rate_limits`, and no frontend, provider or route: the lock is not a route. |
 | `error` | A failed upstream attempt, or a non-2xx on a usage path: `status`, `error_type`, `retry_after_ms`. Never priced. On a policy-routed send it carries attempt identity like any attempt, and `error_type` is the failure class (`authentication`, `rate_limit`, `server_error`, ...), `upstream_error`, `response_protocol`, `local_preparation`, or `client_cancelled`; the refused half of a thinking negotiation keeps the upstream's own error type. Its `rate_limits` is the failed response's own snapshot. |
-| `route-unavailable` | Policy found no usable candidate, so nothing was sent. Carries the routing trace and a group id but no attempt index, provider, route, binding, candidate or reason. See [Route-unavailable rows](#route-unavailable-rows). |
+| `route-unavailable` | Policy would not route the request, so nothing was sent: no route matched, every candidate was skipped, or the lane's pin refused the move. Carries the routing trace and a group id but no attempt index, provider, binding, candidate or reason. See [Route-unavailable rows](#route-unavailable-rows). |
 | `fidelity-drift` | Historical only: before universal canonical inference rendering, re-serialisation diverged from the client's bytes; `drift_digest` identifies the divergence. The original bytes were forwarded. New inference rows do not emit this kind. |
 
 `blocked` rows' `context_tokens` is the size of the session's largest lane, the
@@ -119,7 +119,7 @@ flat on the row, grouped in Rust as `PolicyRouteProvenance`:
 | --- | --- |
 | `policy_revision_id` | The immutable revision whose compiled policy resolved this send. A lane pinned to an older revision resolves under that one, so this is not always the active revision. |
 | `presentation_id`, `rewrite_id` | Which record matched the client's model string: at most one is set, and neither when the profile or protocol default matched, or when the compaction route did. |
-| `policy_route_id`, `route_fingerprint` | The route and its semantic fingerprint (64 lowercase hex). The fingerprint changes when the route's meaning does, so a lane pin can tell an edited route from the one it was made under. |
+| `policy_route_id`, `route_fingerprint` | The route and its semantic fingerprint (64 lowercase hex). The fingerprint changes when the route's meaning does, so a lane pin can tell an edited route from the one it was made under. Absent, together with the lookup ids, only on a route-unavailable row that never reached a route. |
 | `candidate_id`, `binding_id` | The chain candidate that was chosen and the backend binding it names, as `provider.adapter`. Absent on a route-unavailable row. |
 | `baseline_model` | What the candidate named before any upgrade, compaction move or alias: the client's spelling for a requested-model candidate, the policy's own exact model otherwise. |
 | `routing_trace` | The content-free account of the lookup and of every candidate considered. |
@@ -147,6 +147,13 @@ crossed-edge evidence; the reader accepts both. Events are a closed vocabulary:
   `warm_lane_transition_denied`). `crossed_from` names the candidate before it
   when the chain stepped across an edge to reach this one.
 - `upgrade` and `alias`: the `from` and `to` models of each step.
+- `no_route`: no route matched the request. Only a route-unavailable row has
+  it, as its only event, and then the row has no lookup, route or fingerprint.
+- `transition_denied`: the lane's pin refused the move, with the closed reason
+  (`stale_revision`, `lane_pinned`, `lane_not_cold`, `cache_not_cold`,
+  `warm_cache_loss`, `invalid_cause_identity`). It closes the trace of a
+  route-unavailable row: after the events that chose the route, or alone when
+  the lane was pinned to a revision the service cannot see yet.
 
 Nothing in it is request content: ids, models, states and reasons only. When a
 maximum-sized trace would exceed the bound, candidate model spellings are
@@ -199,24 +206,33 @@ learning read each attempt's own evidence and never a group total.
 
 ## Route-unavailable rows
 
-When every candidate of the selected route is skipped before any send, toker
-answers the client with an error and writes one `route-unavailable` row, so the
-routing decision does not vanish from the ledger just because nothing was sent.
+When policy will not route a request before any send, toker answers the client
+with an error and writes one `route-unavailable` row, so the refusal does not
+vanish from the ledger just because nothing was sent. There are three causes,
+told apart by the trace:
+
+- every candidate of the selected route was skipped (the candidate events say
+  why);
+- no route matched (`no_route`): for a missing default the client gets a 502
+  marked not configured;
+- the lane's pin refused the move (`transition_denied`), answered like any
+  other failure to resolve, with a 502.
+
 The row has a group id but no `attempt_index` and no `fallback_reason` (the
 terminal shape, enforced by `requests_route_terminal_shape_check` and
-`requests_terminal_trace_check`): it has `policy_revision_id`,
-`policy_route_id`, `route_fingerprint`, the lookup ids and the trace, and it
+`requests_terminal_trace_check`): it has `policy_revision_id` and the trace, and
+the route, its fingerprint and the lookup ids whenever a route was chosen. It
 must not have a `candidate_id`, `binding_id` or `baseline_model`, because none
 was chosen. `provider`, `route`, `effective_model`, `model`, usage and cost are
-NULL and its `requested_model` is the client's. It is not an API measurement and
-is never priced.
+NULL and its `requested_model` is the client's. It carries session lineage
+where the handler knows it, which is the Responses path. It is not an API
+measurement and is never priced.
 
-A request that policy cannot resolve to a route at all (no presentation,
-rewrite or default matches, or the lane's pin denies the move) is not this: no
-route was selected, so there is nothing to put in the trace and no row is
-written. For a missing default the client gets a 502 marked not configured. That
-asymmetry is deliberate but easy to read as "no failures": a view counting
-unroutable requests must say it counts only the ones that selected a route.
+A failure of the policy or the service to resolve a request (a template that
+does not render, an unavailable learning snapshot, a selected binding that is
+not configured) is a fault, not a refusal, and writes no row. A pin refusing a
+fallback after an attempt already failed does not either: that group already
+has its error row, and its final outcome is that error.
 
 Only the inference paths write it. `count_tokens`, batch creation and the
 transparent administrative forwards leave no row either way.

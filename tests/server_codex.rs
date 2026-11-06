@@ -2905,7 +2905,7 @@ async fn responses_with_no_codex_backend_are_answered_locally_and_marked() {
     let mut fixture = test_config("no-codex", upstream, false);
     fixture.config.codex_sub = None;
     fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
-    let (addr, _store) = spawn_toker(fixture).await;
+    let (addr, store) = spawn_toker(fixture).await;
 
     let response = client()
         .post(format!("http://{addr}/v1/responses"))
@@ -2926,6 +2926,44 @@ async fn responses_with_no_codex_backend_are_answered_locally_and_marked() {
         mock.requests.lock().unwrap().is_empty(),
         "nothing forwarded"
     );
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    assert_eq!(rows[0].requested_model.as_deref(), Some("gpt-5.6-sol"));
+    let routing = rows[0].policy_routing.as_ref().expect("revision recorded");
+    assert_eq!(routing.route, None);
+    assert_eq!(
+        routing.trace.events,
+        [toker::store::StoredRoutingTraceEvent::NoRoute]
+    );
+}
+
+/// A codex guardian request that cannot be routed still records whose child it
+/// was, since the lineage is known before routing starts.
+#[tokio::test]
+async fn an_unroutable_guardian_request_keeps_its_lineage() {
+    let (upstream, _mock) = spawn_mock().await;
+    let mut fixture = test_config("unroutable-guardian", upstream, false);
+    fixture.config.codex_sub = None;
+    fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
+    let (addr, store) = spawn_toker(fixture).await;
+
+    let response = client()
+        .post(format!("http://{addr}/f/codex/v1/responses"))
+        .header("x-toker-session", "guardian:parent-session")
+        .json(&json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "guardian:parent-session",
+            "input": "hello",
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    let lineage = rows[0].lineage.as_ref().expect("lineage on the terminal");
+    assert_eq!(lineage.parent_session_id(), "parent-session");
 }
 
 /// Read a response body to its end: `Err` when the transfer was

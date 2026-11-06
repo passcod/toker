@@ -30,7 +30,9 @@ How a request is answered when policy cannot place it:
 - **No route at all** (no presentation, rewrite or default matches, which is a
   protocol with no enabled backend under the generated policy): a not-configured
   error in the protocol's own shape, with the `x-toker-not-configured` header,
-  reaching no upstream.
+  reaching no upstream, and a `route-unavailable` row with no route.
+- **A lane whose pin refuses the move**: a 502 in the protocol's shape and a
+  `route-unavailable` row that names the route refused.
 - **A route whose candidates are all unavailable** (a provider whose block is
   absent, a missing credential, an open circuit): a 503 in the protocol's shape
   and a `route-unavailable` row carrying the trace. Under the generated

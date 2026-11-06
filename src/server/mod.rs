@@ -147,6 +147,9 @@ pub(crate) enum PolicyAttemptError {
     Transition {
         revision_id: i64,
         reason: crate::policy::TransitionDenied,
+        /// What the resolver chose before the pin refused it. A lane pinned
+        /// to a revision newer than the one running never got that far.
+        route: Option<Box<DeniedRoute>>,
     },
     /// The caller built lane facts for a lane it had not loaded, or the other
     /// way round. That is a handler bug, and routing on half a lane would
@@ -155,7 +158,91 @@ pub(crate) enum PolicyAttemptError {
     LaneFactsMismatch,
 }
 
+/// The route a resolved plan chose, kept on a [`PolicyAttemptError`] so the
+/// ledger can say which route the lane's pin refused.
+#[derive(Debug)]
+pub(crate) struct DeniedRoute {
+    route_id: crate::policy::RouteId,
+    route_fingerprint: crate::policy::RouteFingerprint,
+    provenance: crate::policy::RouteProvenance,
+    trace: Vec<crate::policy::TraceEvent>,
+}
+
+impl DeniedRoute {
+    fn of(plan: &crate::policy::AttemptPlan) -> Option<Box<Self>> {
+        Some(Box::new(Self {
+            route_id: plan.route_id.clone()?,
+            route_fingerprint: plan.route_fingerprint.clone()?,
+            provenance: plan.provenance.clone(),
+            trace: plan.trace.clone(),
+        }))
+    }
+}
+
 impl PolicyAttemptError {
+    /// Every candidate was skipped, so the route had nothing to send to.
+    pub(crate) fn is_route_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolve {
+                failure: crate::policy::ResolveFailure::RouteUnavailable { .. },
+                ..
+            }
+        )
+    }
+
+    /// The ledger provenance for a request the policy refused to route: no
+    /// route matched, every candidate was skipped, or the lane's pin refused
+    /// the move. Any other failure is a fault in the policy or the service,
+    /// and gets no row.
+    pub(crate) fn unroutable_provenance(
+        &self,
+    ) -> Option<crate::store::Result<crate::store::PolicyRouteProvenance>> {
+        use crate::store::{AttemptGroupId, PolicyRouteProvenance};
+        let group = AttemptGroupId::fresh();
+        match self {
+            Self::Resolve {
+                revision_id,
+                failure:
+                    crate::policy::ResolveFailure::RouteUnavailable {
+                        route_id,
+                        route_fingerprint,
+                        provenance,
+                        trace,
+                    },
+            } => Some(PolicyRouteProvenance::from_route_unavailable(
+                *revision_id,
+                route_id.clone(),
+                route_fingerprint.clone(),
+                provenance,
+                trace,
+                group,
+            )),
+            Self::Resolve {
+                revision_id,
+                failure: crate::policy::ResolveFailure::NoRoute,
+            } => Some(PolicyRouteProvenance::from_no_route(*revision_id, group)),
+            Self::Transition {
+                revision_id,
+                reason,
+                route,
+            } => Some(PolicyRouteProvenance::from_transition_denied(
+                *revision_id,
+                route.as_deref().map(|route| {
+                    (
+                        route.route_id.clone(),
+                        route.route_fingerprint.clone(),
+                        &route.provenance,
+                        route.trace.as_slice(),
+                    )
+                }),
+                *reason,
+                group,
+            )),
+            _ => None,
+        }
+    }
+
     /// The revision has no default route for the request's protocol, so no
     /// backend was ever a candidate.
     pub(crate) fn is_no_default_route(&self) -> bool {
@@ -1196,6 +1283,7 @@ impl Server {
                 return Err(PolicyAttemptError::Transition {
                     revision_id: revision,
                     reason: crate::policy::TransitionDenied::StaleRevision,
+                    route: None,
                 });
             }
             (Some(revision), _) if revision == current_revision_id => true,
@@ -1267,6 +1355,7 @@ impl Server {
                     .policy_revision
                     .expect("a resolved plan carries its revision"),
                 reason,
+                route: DeniedRoute::of(&resolved.plan),
             });
         }
         let continuation = PolicyContinuation {
@@ -1394,6 +1483,7 @@ impl Server {
             return Err(PolicyAttemptError::Transition {
                 revision_id,
                 reason,
+                route: DeniedRoute::of(&plan),
             });
         }
         Ok(Some(PolicyAttempt {
@@ -3669,6 +3759,82 @@ api_key = "sk-proj-test"
     }
 
     #[test]
+    fn a_refused_pin_move_is_recorded_with_the_route_it_refused_and_the_lineage() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = server.request_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            None,
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let resolved = server
+            .resolve_policy_attempt(
+                &facts,
+                &crate::policy::CredentialSnapshot::new(),
+                None,
+                None,
+            )
+            .expect("resolution");
+        let lineage = crate::store::SessionLineage::codex_guardian("guardian:parent");
+        for (route, expect_route) in [
+            (super::DeniedRoute::of(&resolved.plan), true),
+            (None, false),
+        ] {
+            let error = super::PolicyAttemptError::Transition {
+                revision_id: 1,
+                reason: crate::policy::TransitionDenied::WarmCacheLoss,
+                route,
+            };
+            super::record::record_unroutable(
+                &server,
+                std::time::Instant::now(),
+                None,
+                "openai_chat",
+                Some("guardian:parent"),
+                Some("policy-alias"),
+                lineage.clone(),
+                &error,
+            );
+            let rows = server.store.requests_since(0, 10).unwrap();
+            let row = rows.last().expect("a row per refusal");
+            assert_eq!(row.kind, Some(crate::store::RowKind::RouteUnavailable));
+            assert_eq!(row.lineage, lineage);
+            let routing = row.policy_routing.as_ref().expect("provenance");
+            assert_eq!(routing.route.is_some(), expect_route);
+            assert!(matches!(
+                routing.trace.events.last(),
+                Some(crate::store::StoredRoutingTraceEvent::TransitionDenied {
+                    reason: crate::store::StoredTransitionDenied::WarmCacheLoss
+                })
+            ));
+        }
+        // Faults in the policy or the service are not refusals and write nothing.
+        let before = server.store.requests_since(0, 10).unwrap().len();
+        super::record::record_unroutable(
+            &server,
+            std::time::Instant::now(),
+            None,
+            "openai_chat",
+            None,
+            None,
+            None,
+            &super::PolicyAttemptError::Resolve {
+                revision_id: 1,
+                failure: crate::policy::ResolveFailure::InvalidTemplate,
+            },
+        );
+        assert_eq!(server.store.requests_since(0, 10).unwrap().len(), before);
+    }
+
+    #[test]
     fn an_old_first_pin_completion_cannot_cross_the_activation_fence() {
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
@@ -4251,7 +4417,7 @@ api_key = "sk-proj-test"
             .expect("authoritative provenance");
         assert_eq!(routing.policy_revision_id, 1);
         assert_eq!(
-            routing.route_id.as_str(),
+            routing.route.as_ref().unwrap().route_id.as_str(),
             "legacy-route-openai_api-openai_chat_completions"
         );
         assert!(rows[0].attempt.is_some());

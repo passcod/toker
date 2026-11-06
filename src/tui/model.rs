@@ -80,6 +80,11 @@ pub(crate) struct Snapshot {
     /// `kind = error` rows in the window (any row kind counts, not just
     /// measurements — proxy-written rows are the only source).
     pub errors: usize,
+    /// Logical requests in the window whose final outcome failed: the group's
+    /// row of greatest attempt index (or its terminal row, when it has no
+    /// attempt) is an `error` or a `route-unavailable`. A failure a fallback
+    /// recovered from is in `errors` and not here.
+    pub failed_requests: usize,
     /// `kind = fidelity-drift` rows in the window (invariant 5: drift is a
     /// visible metric, not a hoped-for absence).
     pub drift: usize,
@@ -446,7 +451,13 @@ pub(crate) fn aggregate(
     let mut errors = 0;
     let mut drift = 0;
     let mut window_requests = 0;
-    let mut counted_groups = std::collections::HashSet::new();
+    // Groups of measurement rows already counted into sessions and lanes.
+    let mut measured_groups = std::collections::HashSet::new();
+    // Every grouped row, of any kind, counts its group as one request, so a
+    // group that only failed is still a request. Its final row decides
+    // whether it failed: the greatest attempt index, or the terminal row of a
+    // group that never made an attempt.
+    let mut finals: HashMap<crate::store::AttemptGroupId, (Option<i64>, bool)> = HashMap::new();
 
     // Per session, whether its newest decision row was a gate notice.
     // Only measurements, releases and notices decide: an error, a
@@ -480,14 +491,30 @@ pub(crate) fn aggregate(
             Some(RowKind::FidelityDrift) => drift += 1,
             _ => {}
         }
+        if let Some(group) = &row.attempt_group_id {
+            let failed = matches!(row.kind, Some(RowKind::Error | RowKind::RouteUnavailable));
+            let index = row.attempt_index.map(crate::store::AttemptIndex::get);
+            match finals.entry(group.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    window_requests += 1;
+                    buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
+                    slot.insert((index, failed));
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if index >= slot.get().0 {
+                        slot.insert((index, failed));
+                    }
+                }
+            }
+        }
         if !is_api_measurement(row.kind) {
             continue; // every panel below is measurements-only
         }
         let counts_as_request = row
             .attempt_group_id
             .as_ref()
-            .is_none_or(|group| counted_groups.insert(group.clone()));
-        if counts_as_request {
+            .is_none_or(|group| measured_groups.insert(group.clone()));
+        if row.attempt_group_id.is_none() {
             window_requests += 1;
             buckets[bucket_of(row.ts_ms, now_ms, window_mins)].requests += 1;
         }
@@ -690,6 +717,7 @@ pub(crate) fn aggregate(
         // walk's 24 h read is far too heavy for the display tick.
         rebuilds,
         errors,
+        failed_requests: finals.values().filter(|(_, failed)| *failed).count(),
         drift,
         // Precomputed by the caller on the QUOTA cadence — the meter
         // lookback's 20k-row read and its aggregation are far too heavy
@@ -987,6 +1015,64 @@ mod tests {
         assert_eq!(snap.window_requests, 1);
         assert_eq!(snap.sessions[0].requests, 1);
         assert_eq!(snap.tokens.fresh_input.value, 8);
+    }
+
+    fn grouped(kind: Option<RowKind>, group: &str, index: Option<i64>, mins: i64) -> DisplayRow {
+        let mut row = match kind {
+            None => display_bare(mins_ago(mins)),
+            Some(kind) => display_kind_row(mins_ago(mins), kind),
+        };
+        row.attempt_group_id = Some(crate::store::AttemptGroupId::new(group).unwrap());
+        row.attempt_index = index.map(|index| crate::store::AttemptIndex::try_from(index).unwrap());
+        row
+    }
+
+    #[test]
+    fn a_request_a_fallback_recovered_has_attempt_errors_and_no_failure() {
+        let group = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let snap = agg(
+            &[
+                grouped(Some(RowKind::Error), group, Some(0), 3),
+                grouped(None, group, Some(1), 2),
+            ],
+            1,
+        );
+        assert_eq!(snap.window_requests, 1);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.failed_requests, 0);
+    }
+
+    #[test]
+    fn a_group_that_only_failed_is_still_a_request_and_a_failure() {
+        let failed_attempts = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let unroutable = "cccccccccccccccccccccccccccccccc";
+        let snap = agg(
+            &[
+                grouped(Some(RowKind::Error), failed_attempts, Some(0), 4),
+                grouped(Some(RowKind::Error), failed_attempts, Some(1), 3),
+                grouped(Some(RowKind::RouteUnavailable), unroutable, None, 2),
+            ],
+            1,
+        );
+        assert_eq!(snap.window_requests, 2);
+        assert_eq!(snap.errors, 2, "attempt errors are counted per row");
+        assert_eq!(snap.failed_requests, 2);
+        assert_eq!(snap.sessions.len(), 0, "failures are not measurements");
+    }
+
+    #[test]
+    fn the_final_row_decides_whatever_order_the_ledger_returned_it() {
+        let group = "dddddddddddddddddddddddddddddddd";
+        // The success is attempt 1 but older by timestamp than the error of
+        // attempt 0 after a clock step: the greatest index wins.
+        let snap = agg(
+            &[
+                grouped(None, group, Some(1), 5),
+                grouped(Some(RowKind::Error), group, Some(0), 2),
+            ],
+            1,
+        );
+        assert_eq!(snap.failed_requests, 0);
     }
 
     #[test]

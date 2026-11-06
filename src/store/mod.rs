@@ -33,9 +33,10 @@ pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
     MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow,
-    RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup,
-    SessionLineage, SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource,
-    StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+    RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, ResolvedRoute, RowKind,
+    SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState, StoredLadders,
+    StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
+    StoredTransitionDenied, is_api_measurement,
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
@@ -760,9 +761,10 @@ mod tests {
         MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction, PingRecord,
         PolicyCompilerOrigin, PolicyRevisionSource, PolicyRouteProvenance, PolicyRoutingOutcome,
         PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-        PublicationState, RequestLookupProvenance, RequestRow, RevisionOneActivation, RowKind,
-        SessionCostGroup, SessionLineage, Store, StoredCandidateState, StoredRoutingTrace,
-        StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+        PublicationState, RequestLookupProvenance, RequestRow, ResolvedRoute,
+        RevisionOneActivation, RowKind, SessionCostGroup, SessionLineage, Store,
+        StoredCandidateState, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
+        is_api_measurement,
     };
     use crate::ir::Release;
     use crate::policy::{
@@ -837,11 +839,13 @@ mod tests {
         });
         row.policy_routing = Some(PolicyRouteProvenance {
             policy_revision_id: revision_id,
-            lookup: RequestLookupProvenance::ProfilePresentation(
-                PresentationId::new("presented").unwrap(),
-            ),
-            route_id: RouteId::new("route").unwrap(),
-            route_fingerprint: "22".repeat(32).parse().unwrap(),
+            route: Some(ResolvedRoute {
+                lookup: RequestLookupProvenance::ProfilePresentation(
+                    PresentationId::new("presented").unwrap(),
+                ),
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "22".repeat(32).parse().unwrap(),
+            }),
             trace: StoredRoutingTrace {
                 version: 1,
                 events: vec![
@@ -1163,9 +1167,11 @@ mod tests {
                 let revision_id = revision(&store, "terminal-kind", None);
                 row.policy_routing = Some(PolicyRouteProvenance {
                     policy_revision_id: revision_id,
-                    lookup: RequestLookupProvenance::ProtocolDefault,
-                    route_id: RouteId::new("route").unwrap(),
-                    route_fingerprint: "33".repeat(32).parse().unwrap(),
+                    route: Some(ResolvedRoute {
+                        lookup: RequestLookupProvenance::ProtocolDefault,
+                        route_id: RouteId::new("route").unwrap(),
+                        route_fingerprint: "33".repeat(32).parse().unwrap(),
+                    }),
                     trace: StoredRoutingTrace {
                         version: 1,
                         events: vec![StoredRoutingTraceEvent::Lookup {
@@ -4139,9 +4145,11 @@ mod tests {
         });
         row.policy_routing = Some(PolicyRouteProvenance {
             policy_revision_id: revision_id,
-            lookup: RequestLookupProvenance::ProtocolDefault,
-            route_id: RouteId::new("route").unwrap(),
-            route_fingerprint: "44".repeat(32).parse().unwrap(),
+            route: Some(ResolvedRoute {
+                lookup: RequestLookupProvenance::ProtocolDefault,
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "44".repeat(32).parse().unwrap(),
+            }),
             trace: malformed,
             outcome: PolicyRoutingOutcome::Attempt {
                 candidate_id: CandidateId::new("candidate").unwrap(),
@@ -4304,9 +4312,11 @@ mod tests {
         fn routing(revision_id: i64) -> PolicyRouteProvenance {
             PolicyRouteProvenance {
                 policy_revision_id: revision_id,
-                lookup: RequestLookupProvenance::ProtocolDefault,
-                route_id: RouteId::new("route").unwrap(),
-                route_fingerprint: "55".repeat(32).parse().unwrap(),
+                route: Some(ResolvedRoute {
+                    lookup: RequestLookupProvenance::ProtocolDefault,
+                    route_id: RouteId::new("route").unwrap(),
+                    route_fingerprint: "55".repeat(32).parse().unwrap(),
+                }),
                 trace: StoredRoutingTrace {
                     version: 1,
                     events: vec![StoredRoutingTraceEvent::Lookup {
@@ -4360,9 +4370,11 @@ mod tests {
         terminal.kind = Some(RowKind::RouteUnavailable);
         terminal.policy_routing = Some(PolicyRouteProvenance {
             policy_revision_id: revision_id,
-            lookup: RequestLookupProvenance::ProtocolDefault,
-            route_id: RouteId::new("route").unwrap(),
-            route_fingerprint: "66".repeat(32).parse().unwrap(),
+            route: Some(ResolvedRoute {
+                lookup: RequestLookupProvenance::ProtocolDefault,
+                route_id: RouteId::new("route").unwrap(),
+                route_fingerprint: "66".repeat(32).parse().unwrap(),
+            }),
             trace: StoredRoutingTrace {
                 version: 1,
                 events: vec![StoredRoutingTraceEvent::Lookup {
@@ -4392,6 +4404,156 @@ mod tests {
             Err(Error::InvalidRoutingState(_))
         ));
     }
+
+    #[test]
+    fn routeless_terminals_round_trip_and_only_in_their_own_shape() {
+        use crate::policy::TransitionDenied;
+        let store = mem_store();
+        let revision_id = revision(&store, "routeless", None);
+        let group = |n: u8| AttemptGroupId::new(format!("{n:02x}").repeat(16)).unwrap();
+        let terminal = |ts_ms, routing| {
+            let mut row = bare_row(ts_ms);
+            row.kind = Some(RowKind::RouteUnavailable);
+            row.policy_routing = Some(routing);
+            row
+        };
+
+        let no_route = terminal(
+            1,
+            PolicyRouteProvenance::from_no_route(revision_id, group(1)).unwrap(),
+        );
+        store.record_request(&no_route).unwrap();
+        let denied = terminal(
+            2,
+            PolicyRouteProvenance::from_transition_denied(
+                revision_id,
+                None,
+                TransitionDenied::StaleRevision,
+                group(2),
+            )
+            .unwrap(),
+        );
+        store.record_request(&denied).unwrap();
+        let rows = store.requests_since(0, 10).unwrap();
+        assert_eq!(rows[0].policy_routing, no_route.policy_routing);
+        assert_eq!(rows[1].policy_routing, denied.policy_routing);
+        let columns: (Option<String>, Option<String>) = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT policy_route_id, route_fingerprint FROM requests WHERE ts_ms = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(columns, (None, None));
+
+        // A routeless trace is its one terminal event, and an attempt always
+        // has a route.
+        let mut routeless_lookup = no_route.clone();
+        routeless_lookup.ts_ms = 3;
+        routeless_lookup
+            .policy_routing
+            .as_mut()
+            .unwrap()
+            .trace
+            .events
+            .insert(
+                0,
+                StoredRoutingTraceEvent::Lookup {
+                    source: super::StoredLookupSource::ProtocolDefault,
+                    presentation_id: None,
+                    rewrite_id: None,
+                },
+            );
+        let mut routeless_attempt = bare_row(4);
+        routeless_attempt.binding_id =
+            Some(BindingId::new("openrouter.openrouter_messages").unwrap());
+        routeless_attempt.attempt = Some(AttemptProvenance {
+            attempt_group_id: group(3),
+            attempt_index: AttemptIndex::zero(),
+            reason: AttemptReason::Initial,
+        });
+        routeless_attempt.policy_routing = Some(PolicyRouteProvenance {
+            outcome: PolicyRoutingOutcome::Attempt {
+                candidate_id: CandidateId::new("candidate").unwrap(),
+                baseline_model: "model".to_owned(),
+            },
+            ..no_route.policy_routing.clone().unwrap()
+        });
+        let mut found_route_says_none = terminal(
+            5,
+            PolicyRouteProvenance::from_route_unavailable(
+                revision_id,
+                RouteId::new("route").unwrap(),
+                "77".repeat(32).parse().unwrap(),
+                &crate::policy::RouteProvenance::ProtocolDefault,
+                &[crate::policy::TraceEvent::Lookup(
+                    crate::policy::RouteProvenance::ProtocolDefault,
+                )],
+                group(4),
+            )
+            .unwrap(),
+        );
+        found_route_says_none
+            .policy_routing
+            .as_mut()
+            .unwrap()
+            .trace
+            .events
+            .push(StoredRoutingTraceEvent::NoRoute);
+        for row in [routeless_lookup, routeless_attempt, found_route_says_none] {
+            assert!(
+                matches!(
+                    store.record_request(&row),
+                    Err(Error::InvalidRoutingState(_))
+                ),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denied_move_keeps_the_route_it_refused() {
+        use crate::policy::TransitionDenied;
+        let store = mem_store();
+        let revision_id = revision(&store, "denied", None);
+        let routing = PolicyRouteProvenance::from_transition_denied(
+            revision_id,
+            Some((
+                RouteId::new("route").unwrap(),
+                "88".repeat(32).parse().unwrap(),
+                &crate::policy::RouteProvenance::ProtocolDefault,
+                &[crate::policy::TraceEvent::Lookup(
+                    crate::policy::RouteProvenance::ProtocolDefault,
+                )],
+            )),
+            TransitionDenied::WarmCacheLoss,
+            AttemptGroupId::fresh(),
+        )
+        .unwrap();
+        assert_eq!(
+            routing.trace.events.last(),
+            Some(&StoredRoutingTraceEvent::TransitionDenied {
+                reason: super::StoredTransitionDenied::WarmCacheLoss
+            })
+        );
+        let mut row = bare_row(1);
+        row.kind = Some(RowKind::RouteUnavailable);
+        row.policy_routing = Some(routing);
+        store.record_request(&row).unwrap();
+        let stored = &store.requests_since(0, 10).unwrap()[0];
+        assert_eq!(stored.policy_routing, row.policy_routing);
+        assert_eq!(
+            stored
+                .policy_routing
+                .as_ref()
+                .and_then(|routing| routing.route.as_ref())
+                .map(|route| route.route_id.as_str()),
+            Some("route")
+        );
+    }
+
     #[test]
     fn binding_learning_merge_is_atomic_across_store_connections() {
         let dir = test_dir("learning-atomic");

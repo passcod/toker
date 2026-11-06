@@ -318,6 +318,41 @@ pub enum StoredRoutingTraceEvent {
         from: String,
         to: String,
     },
+    /// Terminal: no route matched the request, so there was no lookup to
+    /// record. Only a route-unavailable row carries it, and then as its only
+    /// event.
+    NoRoute,
+    /// Terminal: a route was chosen (or, for a stale revision, could not be)
+    /// and the lane's pin refused the move. It closes the trace of a
+    /// route-unavailable row.
+    TransitionDenied {
+        reason: StoredTransitionDenied,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredTransitionDenied {
+    StaleRevision,
+    LanePinned,
+    LaneNotCold,
+    CacheNotCold,
+    WarmCacheLoss,
+    InvalidCauseIdentity,
+}
+
+impl From<crate::policy::TransitionDenied> for StoredTransitionDenied {
+    fn from(reason: crate::policy::TransitionDenied) -> Self {
+        use crate::policy::TransitionDenied;
+        match reason {
+            TransitionDenied::StaleRevision => Self::StaleRevision,
+            TransitionDenied::LanePinned => Self::LanePinned,
+            TransitionDenied::LaneNotCold => Self::LaneNotCold,
+            TransitionDenied::CacheNotCold => Self::CacheNotCold,
+            TransitionDenied::WarmCacheLoss => Self::WarmCacheLoss,
+            TransitionDenied::InvalidCauseIdentity => Self::InvalidCauseIdentity,
+        }
+    }
 }
 
 impl StoredRoutingTrace {
@@ -362,8 +397,14 @@ impl StoredRoutingTrace {
             ));
         }
         let mut previous_candidate = None;
-        for event in &self.events {
+        let last = self.events.len().saturating_sub(1);
+        for (position, event) in self.events.iter().enumerate() {
             event.validate()?;
+            if event.is_terminal() && position != last {
+                return Err(Error::InvalidRoutingState(
+                    "routing trace continues past its terminal event".into(),
+                ));
+            }
             if let StoredRoutingTraceEvent::Candidate {
                 candidate_id,
                 crossed_from,
@@ -510,6 +551,10 @@ impl StoredRoutingTraceEvent {
         Some(event)
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::NoRoute | Self::TransitionDenied { .. })
+    }
+
     fn validate(&self) -> Result<()> {
         let bounded = |value: &str| {
             if value.len() > MAX_ROUTING_TRACE_MODEL_BYTES {
@@ -575,6 +620,7 @@ impl StoredRoutingTraceEvent {
                 bounded(from)?;
                 bounded(to)?;
             }
+            Self::NoRoute | Self::TransitionDenied { .. } => {}
         }
         Ok(())
     }
@@ -705,11 +751,21 @@ impl From<&crate::policy::RouteProvenance> for RequestLookupProvenance {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRouteProvenance {
     pub policy_revision_id: i64,
+    /// The route the request resolved to. A request that matched no route, or
+    /// whose lane was pinned to a revision the service cannot see yet, has
+    /// none; only a route-unavailable row may lack it.
+    pub route: Option<ResolvedRoute>,
+    pub trace: StoredRoutingTrace,
+    pub outcome: PolicyRoutingOutcome,
+}
+
+/// How a request found its route: the lookup that matched, and the route's
+/// identity at that revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRoute {
     pub lookup: RequestLookupProvenance,
     pub route_id: RouteId,
     pub route_fingerprint: RouteFingerprint,
-    pub trace: StoredRoutingTrace,
-    pub outcome: PolicyRoutingOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,10 +790,73 @@ impl PolicyRouteProvenance {
     ) -> Result<Self> {
         Ok(Self {
             policy_revision_id,
-            lookup: provenance.into(),
-            route_id,
-            route_fingerprint,
+            route: Some(ResolvedRoute {
+                lookup: provenance.into(),
+                route_id,
+                route_fingerprint,
+            }),
             trace: StoredRoutingTrace::from_resolver(trace)?,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
+    /// No route matched the request under this revision.
+    pub fn from_no_route(
+        policy_revision_id: i64,
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        let trace = StoredRoutingTrace {
+            version: ROUTING_TRACE_VERSION,
+            events: vec![StoredRoutingTraceEvent::NoRoute],
+        };
+        trace.validate()?;
+        Ok(Self {
+            policy_revision_id,
+            route: None,
+            trace,
+            outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
+        })
+    }
+
+    /// The lane's pin refused the move. `route` is what the resolver chose
+    /// before the refusal, which a stale revision never reaches.
+    pub fn from_transition_denied(
+        policy_revision_id: i64,
+        route: Option<(
+            RouteId,
+            RouteFingerprint,
+            &crate::policy::RouteProvenance,
+            &[TraceEvent],
+        )>,
+        reason: crate::policy::TransitionDenied,
+        attempt_group_id: AttemptGroupId,
+    ) -> Result<Self> {
+        let denied = StoredRoutingTraceEvent::TransitionDenied {
+            reason: reason.into(),
+        };
+        let (route, mut trace) = match route {
+            Some((route_id, route_fingerprint, provenance, events)) => (
+                Some(ResolvedRoute {
+                    lookup: provenance.into(),
+                    route_id,
+                    route_fingerprint,
+                }),
+                StoredRoutingTrace::from_resolver(events)?,
+            ),
+            None => (
+                None,
+                StoredRoutingTrace {
+                    version: ROUTING_TRACE_VERSION,
+                    events: Vec::new(),
+                },
+            ),
+        };
+        trace.events.push(denied);
+        trace.validate()?;
+        Ok(Self {
+            policy_revision_id,
+            route,
+            trace,
             outcome: PolicyRoutingOutcome::RouteUnavailable { attempt_group_id },
         })
     }
@@ -757,9 +876,11 @@ impl PolicyRouteProvenance {
         })?;
         Ok(Some(Self {
             policy_revision_id,
-            lookup: (&plan.provenance).into(),
-            route_id,
-            route_fingerprint,
+            route: Some(ResolvedRoute {
+                lookup: (&plan.provenance).into(),
+                route_id,
+                route_fingerprint,
+            }),
             trace: StoredRoutingTrace::from_resolver(&plan.trace)?,
             outcome: PolicyRoutingOutcome::Attempt {
                 candidate_id,
@@ -931,8 +1052,8 @@ struct FlatPolicyRouting<'a> {
     policy_revision_id: i64,
     presentation_id: Option<&'a PresentationId>,
     rewrite_id: Option<&'a RewriteId>,
-    policy_route_id: &'a RouteId,
-    route_fingerprint: &'a RouteFingerprint,
+    policy_route_id: Option<&'a RouteId>,
+    route_fingerprint: Option<&'a RouteFingerprint>,
     candidate_id: Option<&'a CandidateId>,
     baseline_model: Option<&'a str>,
     terminal_group_id: Option<&'a AttemptGroupId>,
@@ -941,14 +1062,22 @@ struct FlatPolicyRouting<'a> {
 
 impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
     fn from(routing: &'a PolicyRouteProvenance) -> Self {
-        let (presentation_id, rewrite_id) = match &routing.lookup {
-            RequestLookupProvenance::ProfilePresentation(id)
-            | RequestLookupProvenance::ProtocolPresentation(id) => (Some(id), None),
-            RequestLookupProvenance::ProfileRewrite(id)
-            | RequestLookupProvenance::ProtocolRewrite(id) => (None, Some(id)),
-            RequestLookupProvenance::ProfileDefault
-            | RequestLookupProvenance::ProtocolDefault
-            | RequestLookupProvenance::Compaction => (None, None),
+        let (presentation_id, rewrite_id) = match routing.route.as_ref().map(|route| &route.lookup)
+        {
+            Some(
+                RequestLookupProvenance::ProfilePresentation(id)
+                | RequestLookupProvenance::ProtocolPresentation(id),
+            ) => (Some(id), None),
+            Some(
+                RequestLookupProvenance::ProfileRewrite(id)
+                | RequestLookupProvenance::ProtocolRewrite(id),
+            ) => (None, Some(id)),
+            Some(
+                RequestLookupProvenance::ProfileDefault
+                | RequestLookupProvenance::ProtocolDefault
+                | RequestLookupProvenance::Compaction,
+            )
+            | None => (None, None),
         };
         let (candidate_id, baseline_model, terminal_group_id) = match &routing.outcome {
             PolicyRoutingOutcome::Attempt {
@@ -963,8 +1092,8 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
             policy_revision_id: routing.policy_revision_id,
             presentation_id,
             rewrite_id,
-            policy_route_id: &routing.route_id,
-            route_fingerprint: &routing.route_fingerprint,
+            policy_route_id: routing.route.as_ref().map(|route| &route.route_id),
+            route_fingerprint: routing.route.as_ref().map(|route| &route.route_fingerprint),
             candidate_id,
             baseline_model,
             terminal_group_id,
@@ -973,43 +1102,82 @@ impl<'a> From<&'a PolicyRouteProvenance> for FlatPolicyRouting<'a> {
     }
 }
 
+impl PolicyRouteProvenance {
+    /// The route, the lookup it came from, the trace and the outcome agree.
+    /// The row-level checks (kind, binding, attempt) are the caller's.
+    fn validate_shape(&self) -> Result<()> {
+        self.trace.validate()?;
+        let terminal = self.trace.events.last().filter(|event| event.is_terminal());
+        match &self.route {
+            Some(route) => {
+                let expected_lookup = match &route.lookup {
+                    RequestLookupProvenance::ProfilePresentation(id) => {
+                        (StoredLookupSource::ProfilePresentation, Some(id), None)
+                    }
+                    RequestLookupProvenance::ProtocolPresentation(id) => {
+                        (StoredLookupSource::ProtocolPresentation, Some(id), None)
+                    }
+                    RequestLookupProvenance::ProfileRewrite(id) => {
+                        (StoredLookupSource::ProfileRewrite, None, Some(id))
+                    }
+                    RequestLookupProvenance::ProtocolRewrite(id) => {
+                        (StoredLookupSource::ProtocolRewrite, None, Some(id))
+                    }
+                    RequestLookupProvenance::ProfileDefault => {
+                        (StoredLookupSource::ProfileDefault, None, None)
+                    }
+                    RequestLookupProvenance::ProtocolDefault => {
+                        (StoredLookupSource::ProtocolDefault, None, None)
+                    }
+                    RequestLookupProvenance::Compaction => {
+                        (StoredLookupSource::Compaction, None, None)
+                    }
+                };
+                let actual_lookup = self.trace.events.first().and_then(|event| match event {
+                    StoredRoutingTraceEvent::Lookup {
+                        source,
+                        presentation_id,
+                        rewrite_id,
+                    } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+                    _ => None,
+                });
+                if actual_lookup != Some(expected_lookup) {
+                    return Err(Error::InvalidRoutingState(
+                        "policy lookup disagrees with its trace".into(),
+                    ));
+                }
+                if matches!(terminal, Some(StoredRoutingTraceEvent::NoRoute)) {
+                    return Err(Error::InvalidRoutingState(
+                        "a trace that found a route cannot say none matched".into(),
+                    ));
+                }
+            }
+            None => {
+                // Nothing was looked up, so the trace is the one reason.
+                if !matches!(self.trace.events.len(), 1) || terminal.is_none() {
+                    return Err(Error::InvalidRoutingState(
+                        "a routeless policy trace is exactly its terminal event".into(),
+                    ));
+                }
+            }
+        }
+        match &self.outcome {
+            PolicyRoutingOutcome::Attempt { .. } => {
+                if self.route.is_none() || terminal.is_some() {
+                    return Err(Error::InvalidRoutingState(
+                        "an actual attempt has a route and no terminal trace event".into(),
+                    ));
+                }
+            }
+            PolicyRoutingOutcome::RouteUnavailable { .. } => {}
+        }
+        Ok(())
+    }
+}
+
 fn validate_request_provenance(row: &RequestRow) -> Result<()> {
     if let Some(routing) = &row.policy_routing {
-        routing.trace.validate()?;
-        let expected_lookup = match &routing.lookup {
-            RequestLookupProvenance::ProfilePresentation(id) => {
-                (StoredLookupSource::ProfilePresentation, Some(id), None)
-            }
-            RequestLookupProvenance::ProtocolPresentation(id) => {
-                (StoredLookupSource::ProtocolPresentation, Some(id), None)
-            }
-            RequestLookupProvenance::ProfileRewrite(id) => {
-                (StoredLookupSource::ProfileRewrite, None, Some(id))
-            }
-            RequestLookupProvenance::ProtocolRewrite(id) => {
-                (StoredLookupSource::ProtocolRewrite, None, Some(id))
-            }
-            RequestLookupProvenance::ProfileDefault => {
-                (StoredLookupSource::ProfileDefault, None, None)
-            }
-            RequestLookupProvenance::ProtocolDefault => {
-                (StoredLookupSource::ProtocolDefault, None, None)
-            }
-            RequestLookupProvenance::Compaction => (StoredLookupSource::Compaction, None, None),
-        };
-        let actual_lookup = routing.trace.events.first().and_then(|event| match event {
-            StoredRoutingTraceEvent::Lookup {
-                source,
-                presentation_id,
-                rewrite_id,
-            } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
-            _ => None,
-        });
-        if actual_lookup != Some(expected_lookup) {
-            return Err(Error::InvalidRoutingState(
-                "policy lookup disagrees with its trace".into(),
-            ));
-        }
+        routing.validate_shape()?;
         match &routing.outcome {
             PolicyRoutingOutcome::Attempt { baseline_model, .. } => {
                 if baseline_model.is_empty() || row.binding_id.is_none() || row.attempt.is_none() {
@@ -1191,8 +1359,8 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
         ":policy_revision_id": flattened.as_ref().map(|routing| routing.policy_revision_id),
         ":presentation_id": flattened.as_ref().and_then(|routing| routing.presentation_id).map(PresentationId::as_str),
         ":rewrite_id": flattened.as_ref().and_then(|routing| routing.rewrite_id).map(RewriteId::as_str),
-        ":policy_route_id": flattened.as_ref().map(|routing| routing.policy_route_id.as_str()),
-        ":route_fingerprint": flattened.as_ref().map(|routing| routing.route_fingerprint.to_string()),
+        ":policy_route_id": flattened.as_ref().and_then(|routing| routing.policy_route_id).map(RouteId::as_str),
+        ":route_fingerprint": flattened.as_ref().and_then(|routing| routing.route_fingerprint).map(ToString::to_string),
         ":candidate_id": flattened.as_ref().and_then(|routing| routing.candidate_id).map(CandidateId::as_str),
         ":binding_id": row.binding_id.as_ref().map(BindingId::as_str),
         ":baseline_model": flattened.as_ref().and_then(|routing| routing.baseline_model),
@@ -2305,59 +2473,70 @@ fn read_policy_routing(
     if values_present.iter().all(|present| !present) {
         return Ok(None);
     }
-    let trace_lookup = trace
-        .as_ref()
-        .and_then(|trace| trace.events.first())
-        .and_then(|event| match event {
-            StoredRoutingTraceEvent::Lookup {
-                source,
-                presentation_id,
-                rewrite_id,
-            } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
-            _ => None,
-        });
-    let lookup = match (presentation, rewrite, trace_lookup) {
-        (Some(id), None, Some((StoredLookupSource::ProfilePresentation, Some(trace_id), None)))
-            if id == *trace_id =>
-        {
-            RequestLookupProvenance::ProfilePresentation(id)
-        }
-        (
-            Some(id),
-            None,
-            Some((StoredLookupSource::ProtocolPresentation, Some(trace_id), None)),
-        ) if id == *trace_id => RequestLookupProvenance::ProtocolPresentation(id),
-        (None, Some(id), Some((StoredLookupSource::ProfileRewrite, None, Some(trace_id))))
-            if id == *trace_id =>
-        {
-            RequestLookupProvenance::ProfileRewrite(id)
-        }
-        (None, Some(id), Some((StoredLookupSource::ProtocolRewrite, None, Some(trace_id))))
-            if id == *trace_id =>
-        {
-            RequestLookupProvenance::ProtocolRewrite(id)
-        }
-        (None, None, Some((StoredLookupSource::ProfileDefault, None, None))) => {
-            RequestLookupProvenance::ProfileDefault
-        }
-        (None, None, Some((StoredLookupSource::ProtocolDefault, None, None))) => {
-            RequestLookupProvenance::ProtocolDefault
-        }
-        (None, None, Some((StoredLookupSource::Compaction, None, None))) => {
-            RequestLookupProvenance::Compaction
-        }
-        _ => {
-            return Err(Error::InvalidRoutingState(
-                "stored policy lookup disagrees with its trace".into(),
-            ));
-        }
-    };
-    let (Some(policy_revision_id), Some(route_id), Some(route_fingerprint), Some(trace)) =
-        (revision, route, fingerprint, trace)
-    else {
+    let (Some(policy_revision_id), Some(trace)) = (revision, trace) else {
         return Err(Error::InvalidRoutingState(
             "stored policy routing provenance is partial".into(),
         ));
+    };
+    let route = match (route, fingerprint) {
+        (Some(route_id), Some(route_fingerprint)) => {
+            let trace_lookup = trace.events.first().and_then(|event| match event {
+                StoredRoutingTraceEvent::Lookup {
+                    source,
+                    presentation_id,
+                    rewrite_id,
+                } => Some((*source, presentation_id.as_ref(), rewrite_id.as_ref())),
+                _ => None,
+            });
+            let lookup = match (presentation, rewrite, trace_lookup) {
+                (
+                    Some(id),
+                    None,
+                    Some((StoredLookupSource::ProfilePresentation, Some(trace_id), None)),
+                ) if id == *trace_id => RequestLookupProvenance::ProfilePresentation(id),
+                (
+                    Some(id),
+                    None,
+                    Some((StoredLookupSource::ProtocolPresentation, Some(trace_id), None)),
+                ) if id == *trace_id => RequestLookupProvenance::ProtocolPresentation(id),
+                (
+                    None,
+                    Some(id),
+                    Some((StoredLookupSource::ProfileRewrite, None, Some(trace_id))),
+                ) if id == *trace_id => RequestLookupProvenance::ProfileRewrite(id),
+                (
+                    None,
+                    Some(id),
+                    Some((StoredLookupSource::ProtocolRewrite, None, Some(trace_id))),
+                ) if id == *trace_id => RequestLookupProvenance::ProtocolRewrite(id),
+                (None, None, Some((StoredLookupSource::ProfileDefault, None, None))) => {
+                    RequestLookupProvenance::ProfileDefault
+                }
+                (None, None, Some((StoredLookupSource::ProtocolDefault, None, None))) => {
+                    RequestLookupProvenance::ProtocolDefault
+                }
+                (None, None, Some((StoredLookupSource::Compaction, None, None))) => {
+                    RequestLookupProvenance::Compaction
+                }
+                _ => {
+                    return Err(Error::InvalidRoutingState(
+                        "stored policy lookup disagrees with its trace".into(),
+                    ));
+                }
+            };
+            Some(ResolvedRoute {
+                lookup,
+                route_id,
+                route_fingerprint,
+            })
+        }
+        // A routeless terminal names no lookup either.
+        (None, None) if presentation.is_none() && rewrite.is_none() => None,
+        _ => {
+            return Err(Error::InvalidRoutingState(
+                "stored policy routing provenance is partial".into(),
+            ));
+        }
     };
     let outcome = if kind == Some(RowKind::RouteUnavailable) {
         let Some(attempt_group_id) = group else {
@@ -2388,14 +2567,14 @@ fn read_policy_routing(
             baseline_model,
         }
     };
-    Ok(Some(PolicyRouteProvenance {
+    let provenance = PolicyRouteProvenance {
         policy_revision_id,
-        lookup,
-        route_id,
-        route_fingerprint,
+        route,
         trace,
         outcome,
-    }))
+    };
+    provenance.validate_shape()?;
+    Ok(Some(provenance))
 }
 
 fn parse_optional_id<T>(column: &'static str, value: Option<String>) -> Result<Option<T>>

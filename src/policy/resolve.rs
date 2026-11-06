@@ -2032,7 +2032,7 @@ mod tests {
             .unwrap()
             .expect("authoritative provenance");
         assert_eq!(stored.policy_revision_id, 7);
-        assert_eq!(stored.route_id, id("route"));
+        assert_eq!(stored.route.as_ref().unwrap().route_id, id("route"));
         assert_eq!(
             stored.outcome,
             crate::store::PolicyRoutingOutcome::Attempt {

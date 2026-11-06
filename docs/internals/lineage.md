@@ -47,8 +47,8 @@ suffix as `parent_session_id` (`SessionLineage::codex_guardian`, read in
 A parent that has no row of its own is fine: the relation is kept so the display
 can resolve it later, and until then the child shows under the parent's id.
 
-The relation rides the measurement and error rows of the Responses path. Rows
-toker writes about itself (gate notices, releases, `route-unavailable`) do not
+The relation rides the measurement, error and `route-unavailable` rows of the
+Responses path. Rows toker writes about itself (gate notices, releases) do not
 carry it, and nor do rows of the other frontends.
 
 ## Why nothing else counts

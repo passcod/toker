@@ -43,7 +43,7 @@ use crate::server::proxy::{
     ErrorWire, MAX_ERROR_BODY, MAX_REQUEST_BODY, buffer_up_to, is_compressed, is_event_stream,
     plain_status, session_id, transport_failure, truncated_body, upstream_failure,
 };
-use crate::server::record::{now_ms, record_route_unavailable};
+use crate::server::record::{now_ms, record_unroutable};
 use crate::server::record_anthropic::AnthropicRecordCtx;
 use crate::server::record_anthropic::{record_codex_error, record_responses_measurement};
 use crate::store::SessionLineage;
@@ -246,35 +246,17 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 };
                 (target, resolved)
             }
-            Err(super::PolicyAttemptError::Resolve {
-                revision_id,
-                failure:
-                    crate::policy::ResolveFailure::RouteUnavailable {
-                        route_id,
-                        route_fingerprint,
-                        provenance,
-                        trace,
-                    },
-            }) => {
-                match crate::store::PolicyRouteProvenance::from_route_unavailable(
-                    revision_id,
-                    route_id,
-                    route_fingerprint,
-                    &provenance,
-                    &trace,
-                    crate::store::AttemptGroupId::fresh(),
-                ) {
-                    Ok(routing) => record_route_unavailable(
-                        &server,
-                        started,
-                        frontend.as_deref(),
-                        RESPONSES_FRONTEND,
-                        request_session.as_deref(),
-                        Some(requested_model.as_str()),
-                        routing,
-                    ),
-                    Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
-                }
+            Err(error) if error.is_route_unavailable() => {
+                record_unroutable(
+                    &server,
+                    started,
+                    frontend.as_deref(),
+                    RESPONSES_FRONTEND,
+                    request_session.as_deref(),
+                    Some(requested_model.as_str()),
+                    lineage.clone(),
+                    &error,
+                );
                 return frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -284,6 +266,16 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                 );
             }
             Err(error) => {
+                record_unroutable(
+                    &server,
+                    started,
+                    frontend.as_deref(),
+                    RESPONSES_FRONTEND,
+                    request_session.as_deref(),
+                    Some(requested_model.as_str()),
+                    lineage.clone(),
+                    &error,
+                );
                 tracing::error!(%error, "active Responses policy resolution failed");
                 let response = frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,

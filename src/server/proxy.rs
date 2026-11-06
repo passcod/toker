@@ -66,7 +66,7 @@ use super::InFlightGuard;
 use super::Server;
 use super::record::{
     ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
-    record_openai_cold, record_openai_cold_quiet, record_route_unavailable, retry_after_ms,
+    record_openai_cold, record_openai_cold_quiet, record_unroutable, retry_after_ms,
 };
 use super::record_anthropic::{
     AnthropicRecordCtx, QuotaBlockedRecord, record_anthropic_released, record_quota_blocked,
@@ -217,35 +217,17 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             };
             (target, resolved)
         }
-        Err(super::PolicyAttemptError::Resolve {
-            revision_id,
-            failure:
-                crate::policy::ResolveFailure::RouteUnavailable {
-                    route_id,
-                    route_fingerprint,
-                    provenance,
-                    trace,
-                },
-        }) => {
-            match crate::store::PolicyRouteProvenance::from_route_unavailable(
-                revision_id,
-                route_id,
-                route_fingerprint,
-                &provenance,
-                &trace,
-                crate::store::AttemptGroupId::fresh(),
-            ) {
-                Ok(routing) => record_route_unavailable(
-                    &server,
-                    started,
-                    frontend.as_deref(),
-                    "openai_chat",
-                    session_id.as_deref(),
-                    Some(model.as_str()),
-                    routing,
-                ),
-                Err(error) => tracing::error!(%error, "route-unavailable provenance omitted"),
-            }
+        Err(error) if error.is_route_unavailable() => {
+            record_unroutable(
+                &server,
+                started,
+                frontend.as_deref(),
+                "openai_chat",
+                session_id.as_deref(),
+                Some(model.as_str()),
+                None,
+                &error,
+            );
             return error_response(
                 ErrorWire::Openai,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -258,6 +240,16 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             );
         }
         Err(error) => {
+            record_unroutable(
+                &server,
+                started,
+                frontend.as_deref(),
+                "openai_chat",
+                session_id.as_deref(),
+                Some(model.as_str()),
+                None,
+                &error,
+            );
             tracing::error!(%error, "active Chat policy resolution failed");
             let response = upstream_failure(
                 ErrorWire::Openai,

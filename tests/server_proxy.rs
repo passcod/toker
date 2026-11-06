@@ -1994,11 +1994,25 @@ async fn a_protocol_with_no_backend_is_answered_by_toker_and_reaches_no_upstream
     assert_eq!(response.status(), StatusCode::OK);
     assert!(mock.captured().is_empty(), "nothing reached any upstream");
 
-    // The disabled-prefix refusal is the one answer with a ledger row: a
-    // route-unavailable one, no upstream attempt behind it.
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    // Both refusals leave a route-unavailable row, with no upstream attempt
+    // behind it: the chat request matched no route, the prefixed one skipped
+    // its only candidate.
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| row.kind == Some(RowKind::RouteUnavailable))
+    );
+    let routeless: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.policy_routing
+                .as_ref()
+                .is_some_and(|r| r.route.is_none())
+        })
+        .collect();
+    assert_eq!(routeless.len(), 1, "only the chat request had no route");
+    assert_eq!(routeless[0].frontend.as_deref(), Some("openai_chat"));
 }
 
 #[tokio::test]

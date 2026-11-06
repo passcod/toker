@@ -104,8 +104,9 @@ the subscription and a successful one on the API are not one cost.
   cancelled attempt did not establish what the cache lives on.
 
 Nothing sums a group into a single synthetic row, and no reader should. The
-group's final outcome is its attempt of greatest index; nothing in toker
-currently collapses it.
+group's final outcome is its attempt of greatest index, or its
+`route-unavailable` row when it never made one. The TUI window reads it to say
+how many requests failed, as opposed to how many attempts did.
 
 ## How the read models group attempts
 
@@ -118,11 +119,13 @@ quantity of work or money sums the physical rows. In practice:
 | `Store::count_logical_requests` (the TUI header total, `toker status`, `/_toker/status`) | the ledger's rows by group, with ungrouped rows each counting, whatever their kind | |
 | `/_toker/session` and the TUI detail's totals (`SessionSummary`) | `requests`, over measurement rows only | token sums, `billed_total` |
 | the same summary's `per_provider` and `per_model` | | each group's `requests` is a count of billed rows, so it can exceed the logical count |
-| the TUI window (`tui/model.rs`) | `window_requests`, the per-minute rate and its buckets, a session's `requests`, a lane's request count, the child-role counts | the tokens panel (including its denominator, the number of measurement rows), spend and its breakdown, the error counter |
+| the TUI window (`tui/model.rs`) | `window_requests` and the per-minute rate and its buckets (any grouped row counts its group, so a group that only failed is a request), `failed_requests` (groups whose final row is an `error` or `route-unavailable`), a session's `requests`, a lane's request count, the child-role counts (measurement rows only) | the tokens panel (including its denominator, the number of measurement rows), spend and its breakdown, the error counter |
 
 Two details follow from counting in a window. A group is counted once, the first
 time any of its rows is seen in the window, so a group that straddles the
-window's start counts once and is never half a request. And the unit of the
+window's start counts once and is never half a request. A failure a fallback
+recovered from shows in the error counter and not in `failed_requests`, because
+the group's final row is the attempt that completed. And the unit of the
 averages is the row: a fallback that made two measurement rows contributes two
 rows to the cache hit rate, because each really was a prefix read or written.
 

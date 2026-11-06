@@ -2184,7 +2184,8 @@ fn render_rate(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` and
+/// The requests line: `requests ▁▂·▅█ 7.5/min`, then `N errors` (attempts),
+/// `N failed` (requests whose final attempt failed) and
 /// `N drift` in red only when there are any — a zero would be a line of
 /// noise on every quiet frame. The sparkline spans the WHOLE window at
 /// any width: the minute buckets fold into fewer, wider ones (at most
@@ -2200,6 +2201,12 @@ fn requests_line(snap: &Snapshot, width: usize) -> Line<'static> {
     if snap.errors > 0 {
         let s = if snap.errors == 1 { "" } else { "s" };
         tail.push(Span::styled(format!("  {} error{s}", snap.errors), red));
+    }
+    if snap.failed_requests > 0 {
+        tail.push(Span::styled(
+            format!("  {} failed", snap.failed_requests),
+            red,
+        ));
     }
     if snap.drift > 0 {
         tail.push(Span::styled(format!("  {} drift", snap.drift), red));

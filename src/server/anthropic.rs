@@ -88,7 +88,7 @@ use super::proxy::{
     buffered_body, build_response, is_compressed, is_event_stream, plain_status, response_headers,
     send_upstream, session_id, transport_failure, truncated_body,
 };
-use super::record::{now_ms, record_route_unavailable, retry_after_ms};
+use super::record::{now_ms, record_unroutable, retry_after_ms};
 use super::record_anthropic::{
     AnthropicRecordCtx, ColdRecord, QuotaBlockedRecord, error_pair, record_anthropic_cold,
     record_anthropic_cold_quiet, record_anthropic_cold_recap, record_anthropic_error,
@@ -640,37 +640,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     };
                     policy_attempt = Some(resolved);
                 }
-                Err(super::PolicyAttemptError::Resolve {
-                    revision_id,
-                    failure:
-                        crate::policy::ResolveFailure::RouteUnavailable {
-                            route_id,
-                            route_fingerprint,
-                            provenance,
-                            trace,
-                        },
-                }) => {
-                    match crate::store::PolicyRouteProvenance::from_route_unavailable(
-                        revision_id,
-                        route_id,
-                        route_fingerprint,
-                        &provenance,
-                        &trace,
-                        crate::store::AttemptGroupId::fresh(),
-                    ) {
-                        Ok(routing) => record_route_unavailable(
-                            &server,
-                            started,
-                            frontend.as_deref(),
-                            "anthropic",
-                            session_id.as_deref(),
-                            model.as_deref(),
-                            routing,
-                        ),
-                        Err(error) => {
-                            tracing::error!(%error, "route-unavailable provenance omitted")
-                        }
-                    }
+                Err(error) if error.is_route_unavailable() => {
+                    record_unroutable(
+                        &server,
+                        started,
+                        frontend.as_deref(),
+                        "anthropic",
+                        session_id.as_deref(),
+                        model.as_deref(),
+                        None,
+                        &error,
+                    );
                     return super::codex::anthropic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "api_error",
@@ -679,6 +659,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     );
                 }
                 Err(error) => {
+                    record_unroutable(
+                        &server,
+                        started,
+                        frontend.as_deref(),
+                        "anthropic",
+                        session_id.as_deref(),
+                        model.as_deref(),
+                        None,
+                        &error,
+                    );
                     tracing::error!(%error, "active Messages policy resolution failed");
                     let response = super::codex::anthropic_error_response(
                         StatusCode::BAD_GATEWAY,
