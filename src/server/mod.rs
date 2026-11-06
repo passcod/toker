@@ -543,6 +543,16 @@ impl Server {
                 .note_observed(binding_id, reported_model, at_ms, prompt, &tz)
         {
             tracing::error!(%error, "binding model observation update failed");
+            return;
+        }
+        // The resolver reads only the published snapshot (no I/O on the
+        // request path), so a response that taught something is where it
+        // gets republished; otherwise learning and recency would stay frozen
+        // at their startup values until a promote or a restart.
+        if let Err(error) =
+            crate::policy::LearningView::refresh_snapshot(self.binding_learning.as_ref())
+        {
+            tracing::error!(%error, "binding learning snapshot refresh failed");
         }
     }
 
@@ -4949,6 +4959,15 @@ api_key = "ak-literal-test"
         assert!(
             learned("claude-opus-5").is_none(),
             "the sent identity is not what the response teaches"
+        );
+        // The resolver reads the published snapshot, not the store.
+        let snapshot = server.binding_learning.snapshot();
+        assert!(
+            snapshot
+                .learned(&ctx.binding_id, "claude-sonnet-5")
+                .expect("snapshot readable")
+                .is_some(),
+            "a learned model reaches the snapshot the resolver reads"
         );
     }
 }
