@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::ir::canonical::CanonicalRequest;
 use crate::middleware::cold::RetargetOutcome;
-use crate::middleware::model_map::{MapTarget, ModelMap};
 use crate::policy::AttemptPlan;
 use crate::providers::{Provider, parse_rate_limits};
 use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
@@ -47,23 +46,6 @@ impl InferenceRequest {
         crate::middleware::canonical::strip_release(Arc::make_mut(&mut self.canonical), original)
     }
 
-    pub(crate) fn prepare(
-        &self,
-        target: ModelTarget,
-        baseline_model: Option<String>,
-    ) -> InferenceAttempt {
-        let mut canonical = self.canonical();
-        canonical.model.clone_from(&baseline_model);
-        InferenceAttempt {
-            target,
-            requested_model: self.requested_model.clone(),
-            effective_model: baseline_model,
-            policy_plan: None,
-            mapped: None,
-            canonical,
-        }
-    }
-
     pub(crate) fn prepare_policy(
         &self,
         target: ModelTarget,
@@ -75,8 +57,7 @@ impl InferenceRequest {
             target,
             requested_model: self.requested_model.clone(),
             effective_model: Some(plan.effective_model.clone()),
-            policy_plan: Some(plan),
-            mapped: None,
+            policy_plan: plan,
             canonical,
         }
     }
@@ -86,8 +67,7 @@ pub(crate) struct InferenceAttempt {
     target: ModelTarget,
     requested_model: String,
     effective_model: Option<String>,
-    policy_plan: Option<AttemptPlan>,
-    mapped: Option<MapTarget>,
+    policy_plan: AttemptPlan,
     canonical: CanonicalRequest,
 }
 
@@ -137,44 +117,24 @@ impl InferenceAttempt {
         self.effective_model.as_deref()
     }
 
-    pub(crate) fn mapped(&self) -> Option<&MapTarget> {
-        self.mapped.as_ref()
-    }
-
     pub(crate) fn policy_routing(
         &self,
     ) -> crate::store::Result<Option<crate::store::PolicyRouteProvenance>> {
-        self.policy_plan
-            .as_ref()
-            .map(crate::store::PolicyRouteProvenance::from_attempt_plan)
-            .transpose()
-            .map(Option::flatten)
+        crate::store::PolicyRouteProvenance::from_attempt_plan(&self.policy_plan)
     }
 
     pub(crate) fn apply_compaction(
         &mut self,
         compaction_model: Option<&str>,
-        model_map: Option<&ModelMap>,
     ) -> Option<RetargetOutcome> {
         let outcome = crate::middleware::canonical::retarget_compaction(
             &mut self.canonical,
             compaction_model,
             true,
-            model_map,
+            None,
         )?;
         self.effective_model.clone_from(&self.canonical.model);
         Some(outcome)
-    }
-
-    pub(crate) fn set_model(&mut self, model: Option<String>) {
-        self.canonical.model.clone_from(&model);
-        self.effective_model = model;
-        self.mapped = None;
-    }
-
-    pub(crate) fn apply_model_map(&mut self, model_map: Option<&ModelMap>) {
-        self.mapped = crate::middleware::canonical::map_model(&mut self.canonical, model_map);
-        self.effective_model.clone_from(&self.canonical.model);
     }
 
     pub(crate) fn strip_message_effort(&mut self, source: &serde_json::Value) -> bool {
@@ -1258,11 +1218,17 @@ pub(crate) async fn coordinate_messages(
         Err(response) => return *response,
     };
     let provenance = super::attempt::initial_provenance();
-    let Some(policy_attempt) = policy_attempt else {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        return ready.execute(server, provenance).await;
+    // An attempt only prepares from a body that policy routed, which also
+    // kept its baseline.
+    let (Some(policy_attempt), Some(inference)) = (policy_attempt, inference) else {
+        tracing::error!("a prepared Messages attempt has no policy attempt");
+        return super::codex::anthropic_error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "the request could not be routed",
+            false,
+        );
     };
-    let inference = inference.expect("an authoritative Messages attempt retains its baseline");
     coordinate_policy_messages(
         server,
         ready,
@@ -1497,8 +1463,7 @@ fn prepare_messages_fallback_attempt(
     let backend = target.provider().clone();
     let mut attempt = inference.prepare_policy(target, policy_attempt.plan.clone());
     if policy_attempt.plan.compaction
-        && let Some(outcome) =
-            attempt.apply_compaction(Some(&policy_attempt.plan.effective_model), None)
+        && let Some(outcome) = attempt.apply_compaction(Some(&policy_attempt.plan.effective_model))
         && let Some(record) = record
     {
         let moved = outcome.from != outcome.to;
@@ -1518,7 +1483,7 @@ pub(crate) async fn coordinate_chat(
     server: Server,
     adapter: Option<BackendAdapterId>,
     attempt: InferenceAttempt,
-    policy_attempt: Option<super::PolicyAttempt>,
+    policy_attempt: super::PolicyAttempt,
     inference: InferenceRequest,
     input: ChatAttemptInput,
 ) -> Response {
@@ -1557,10 +1522,6 @@ pub(crate) async fn coordinate_chat(
         Err(response) => return *response,
     };
     let provenance = super::attempt::initial_provenance();
-    let Some(policy_attempt) = policy_attempt else {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        return ready.execute(server, provenance).await;
-    };
     coordinate_policy_chat(
         server,
         ready,
@@ -1872,8 +1833,8 @@ async fn finish_chat_failure(
 pub(crate) async fn coordinate_responses(
     server: Server,
     adapter: Option<BackendAdapterId>,
-    attempt: Result<InferenceAttempt, TranslateError>,
-    policy_attempt: Option<super::PolicyAttempt>,
+    attempt: InferenceAttempt,
+    policy_attempt: super::PolicyAttempt,
     inference: InferenceRequest,
     input: ResponsesAttemptInput,
 ) -> Response {
@@ -1888,23 +1849,17 @@ pub(crate) async fn coordinate_responses(
         request_id,
         client_wants_json,
     } = input;
-    let policy_routing = attempt
-        .as_ref()
-        .ok()
-        .map(InferenceAttempt::policy_routing)
-        .transpose()
-        .unwrap_or_else(|error| {
-            tracing::error!(%error, "policy attempt provenance omitted");
-            None
-        })
-        .flatten();
+    let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
+        tracing::error!(%error, "policy attempt provenance omitted");
+        None
+    });
     if let Some(ctx) = record.as_mut() {
         ctx.policy_routing = policy_routing;
     }
     let prepared = prepare_responses_backend(
         &server,
         adapter,
-        attempt,
+        Ok(attempt),
         ResponsesAttemptInput {
             parts,
             max_output_tokens: max_output_tokens.clone(),
@@ -1923,10 +1878,6 @@ pub(crate) async fn coordinate_responses(
         Err(response) => return *response,
     };
     let provenance = super::attempt::initial_provenance();
-    let Some(policy_attempt) = policy_attempt else {
-        server.note_binding_sent(ready.binding_id(), Some(ready.effective_model()));
-        return ready.execute(server, provenance).await;
-    };
     coordinate_policy_responses(
         server,
         ready,
@@ -2327,26 +2278,66 @@ pub(crate) fn invalid_responses_body(client_wants_json: bool) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::middleware::model_map::parse_model_map;
-    use crate::providers::{OpenRouter, Provider};
-    use crate::routing::{ProtocolId, RouteRegistry};
+    use crate::routing::ProtocolId;
+    use crate::store::Store;
+
+    /// What the active revision resolves a Chat request for `model` to,
+    /// with the target it binds, over an OpenRouter-only config.
+    fn resolved(model: &str) -> (ModelTarget, AttemptPlan) {
+        let dir = crate::setup::test_dir("inference-attempt");
+        std::fs::write(
+            dir.join("toker.toml"),
+            r#"
+awake = false
+db_path = ":memory:"
+default_backend_openai_chat = "openrouter"
+
+[providers.openrouter]
+upstream = "http://127.0.0.1:9/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        let config = crate::config::Config::load_from(&dir.join("toker.toml")).unwrap();
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let server = Server::with_seams(config, store, super::super::Seams::isolated()).unwrap();
+        let facts = server.request_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some(model.to_owned()),
+            None,
+            0,
+            None,
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        );
+        let credentials = server.credential_snapshot(
+            &axum::http::HeaderMap::new(),
+            ProtocolId::OpenAiChat,
+            facts.now_ms,
+        );
+        let plan = server
+            .resolve_policy_attempt(&facts, &credentials, None, None)
+            .expect("the model resolves")
+            .plan;
+        let target = server
+            .registry
+            .resolve_binding(
+                ProtocolId::OpenAiChat,
+                &plan.binding_id,
+                Some(model),
+                &plan.effective_model,
+            )
+            .expect("the plan's binding is configured");
+        (target, plan)
+    }
 
     #[test]
     fn candidates_start_from_fresh_baseline_clones_with_separate_identities() {
-        let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(
-            "https://openrouter.ai/api/v1".parse().unwrap(),
-            None,
-        ));
-        let registry = RouteRegistry::new(
-            [provider],
-            [(ProtocolId::OpenAiChat, "openrouter".to_owned())],
-        );
-        let target = registry
-            .resolve(ProtocolId::OpenAiChat, Some("openrouter/invented-model"))
-            .unwrap();
+        let (target, plan) = resolved("openrouter/invented-model");
         let mut original = CanonicalRequest {
             model: Some("openrouter/invented-model".to_owned()),
             ..CanonicalRequest::default()
@@ -2361,7 +2352,7 @@ mod tests {
         let mut first = request.canonical();
         first.model = Some("mutated-by-first-candidate".to_owned());
         first.system.clear();
-        let attempt = request.prepare(target, Some("invented-model".to_owned()));
+        let attempt = request.prepare_policy(target, plan);
 
         assert_eq!(attempt.backend().id(), "openrouter");
         assert_eq!(attempt.binding().provider(), "openrouter");
@@ -2376,17 +2367,7 @@ mod tests {
 
     #[test]
     fn compaction_is_candidate_local_and_preserves_the_baseline() {
-        let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(
-            "https://openrouter.ai/api/v1".parse().unwrap(),
-            None,
-        ));
-        let registry = RouteRegistry::new(
-            [provider],
-            [(ProtocolId::OpenAiChat, "openrouter".to_owned())],
-        );
-        let target = registry
-            .resolve(ProtocolId::OpenAiChat, Some("openrouter/claude-opus-4-1"))
-            .unwrap();
+        let (target, plan) = resolved("openrouter/claude-opus-4-1");
         let mut canonical = CanonicalRequest {
             model: Some("claude-opus-4-1".to_owned()),
             ..CanonicalRequest::default()
@@ -2397,9 +2378,9 @@ mod tests {
             extensions: vec![],
         });
         let request = InferenceRequest::new("openrouter/claude-opus-4-1".to_owned(), canonical);
-        let mut attempt = request.prepare(target, Some("claude-opus-4-1".to_owned()));
+        let mut attempt = request.prepare_policy(target, plan);
         let outcome = attempt
-            .apply_compaction(Some("claude-haiku-3-5"), None)
+            .apply_compaction(Some("claude-haiku-3-5"))
             .expect("retargeted");
 
         assert_eq!(outcome.from.as_deref(), Some("claude-opus-4-1"));
@@ -2408,42 +2389,6 @@ mod tests {
         assert_eq!(
             request.canonical().model.as_deref(),
             Some("claude-opus-4-1")
-        );
-    }
-
-    #[test]
-    fn provider_mapping_is_candidate_local_and_keeps_baseline_identity() {
-        let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(
-            "https://openrouter.ai/api/v1".parse().unwrap(),
-            None,
-        ));
-        let registry = RouteRegistry::new(
-            [provider],
-            [(ProtocolId::OpenAiChat, "openrouter".to_owned())],
-        );
-        let target = registry
-            .resolve(ProtocolId::OpenAiChat, Some("openrouter/asked-model"))
-            .unwrap();
-        let request = InferenceRequest::new(
-            "openrouter/asked-model".to_owned(),
-            CanonicalRequest {
-                model: Some("openrouter/asked-model".to_owned()),
-                ..CanonicalRequest::default()
-            },
-        );
-        let map = parse_model_map(r#"{"model:asked-model":"served-model"}"#)
-            .unwrap()
-            .unwrap();
-        let mut mapped = request.prepare(target.clone(), Some("asked-model".to_owned()));
-        mapped.apply_model_map(Some(&map));
-        let plain = request.prepare(target, Some("asked-model".to_owned()));
-
-        assert_eq!(mapped.effective_model(), Some("served-model"));
-        assert_eq!(mapped.canonical().model.as_deref(), Some("served-model"));
-        assert_eq!(plain.effective_model(), Some("asked-model"));
-        assert_eq!(
-            request.canonical().model.as_deref(),
-            Some("openrouter/asked-model")
         );
     }
 }

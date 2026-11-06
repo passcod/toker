@@ -345,7 +345,7 @@ pub struct Server {
     routing_control: Arc<Mutex<()>>,
     /// The active policy and the live evidence it resolves against, captured
     /// atomically.
-    pub(crate) policy_runtime: Option<Arc<crate::policy::PolicyRuntime>>,
+    pub(crate) policy_runtime: Arc<crate::policy::PolicyRuntime>,
 }
 
 impl Server {
@@ -508,14 +508,13 @@ impl Server {
                 now_ms(),
             )?,
         };
-        let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new_active_at_generation(
+        let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new(
             store.clone(),
             registry.clone(),
             &revision,
             Arc::new(policy),
             Arc::new(inventory),
             availability,
-            0,
         ));
         let catalog_dir = Arc::new(std::sync::OnceLock::new());
         if let Some(initial_catalog_dir) = initial_catalog_dir {
@@ -541,7 +540,7 @@ impl Server {
             force: Arc::default(),
             quota_events: Arc::default(),
             routing_control: Arc::default(),
-            policy_runtime: Some(policy_runtime),
+            policy_runtime,
         })
     }
 
@@ -612,38 +611,11 @@ impl Server {
         Ok(())
     }
 
-    pub(crate) fn has_active_policy(&self) -> bool {
-        self.policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .is_some_and(|snapshot| snapshot.revision_id().is_some())
-    }
-
-    /// What the pre-policy resolver (provider prefixes and the configured
-    /// default backends) would pick for `model`. A server with an active
-    /// revision has no such route, because policy is then the only router,
-    /// so this is `Err` there and handlers cannot fall back to it. Only the
-    /// test-only servers that run without a revision get an answer.
-    pub(crate) fn legacy_target(
-        &self,
-        protocol: ProtocolId,
-        model: Option<&str>,
-    ) -> Result<ModelTarget, crate::routing::RouteNotConfigured> {
-        if self.has_active_policy() {
-            return Err(crate::routing::RouteNotConfigured);
-        }
-        self.registry.resolve(protocol, model)
-    }
-
     /// A Messages target standing in for a request that policy has not
     /// routed yet: the context a body that never parses, or a gate that runs
-    /// before the route is known, needs. Under an active revision any
-    /// binding that serves Messages will do, since the placeholder carries no
-    /// routing decision; without one, the configured default.
+    /// before the route is known, needs. Any binding that serves Messages
+    /// will do, since the placeholder carries no routing decision.
     pub(crate) fn pending_messages_target(&self) -> Option<ModelTarget> {
-        if !self.has_active_policy() {
-            return self.legacy_target(ProtocolId::AnthropicMessages, None).ok();
-        }
         self.registry.bindings().find_map(|binding| {
             self.registry
                 .resolve_binding(ProtocolId::AnthropicMessages, binding.id(), None, "pending")
@@ -663,16 +635,7 @@ impl Server {
     }
 
     fn routing_snapshot_locked(&self) -> anyhow::Result<RoutingControlSnapshot> {
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
-        let runtime_snapshot = runtime
-            .capture()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime has no active snapshot"))?;
-        let revision_id = runtime_snapshot
-            .revision_id()
-            .ok_or_else(|| anyhow::anyhow!("routing is not yet policy-owned"))?;
+        let revision_id = self.policy_runtime.capture().revision_id();
         let revision = self
             .store
             .load_policy_revision(revision_id)?
@@ -830,7 +793,7 @@ impl Server {
         let now = now_ms();
         let lane = lane.as_ref().and_then(|lane| {
             lane.as_ref().and_then(|lane| {
-                self.shadow_lane(
+                self.lane_facts(
                     Some(lane),
                     lane.pin
                         .as_ref()
@@ -1016,11 +979,7 @@ impl Server {
                 desired_inventory_generation: snapshot.inventory_generation,
                 publications: &crate::store::publication_targets()?,
             })?;
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
-        runtime.replace_active(
+        self.policy_runtime.replace_active(
             &activation.revision,
             Arc::new(policy),
             Arc::new(snapshot.inventory),
@@ -1127,32 +1086,25 @@ impl Server {
         &self,
         profile: Option<&str>,
         protocol: crate::policy::FrontendProtocol,
-    ) -> Option<crate::catalog::offers::PolicyPublication> {
-        let snapshot = self.policy_runtime.as_ref()?.capture()?;
-        snapshot.revision_id()?;
+    ) -> crate::catalog::offers::PolicyPublication {
+        let snapshot = self.policy_runtime.capture();
         let profile = profile.and_then(|profile| crate::policy::ProfileId::new(profile).ok());
-        Some(crate::catalog::offers::render_policy(
+        crate::catalog::offers::render_policy(
             snapshot.policy(),
             snapshot.inventory(),
             profile.as_ref(),
             protocol,
-        ))
+        )
     }
 
     pub(crate) fn resolve_policy_first_candidate(
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
-    ) -> Result<Option<crate::policy::AttemptPlan>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((snapshot, _, _)) = runtime.capture_shadow(None, facts.now_ms) else {
-            return Ok(None);
-        };
-        let Some(revision_id) = snapshot.revision_id() else {
-            return Ok(None);
-        };
+    ) -> Result<crate::policy::AttemptPlan, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let snapshot = runtime.capture();
+        let revision_id = snapshot.revision_id();
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
@@ -1167,7 +1119,7 @@ impl Server {
             &circuits,
             facts,
         )
-        .map(|plan| Some(plan.with_policy_revision(revision_id)))
+        .map(|plan| plan.with_policy_revision(revision_id))
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
@@ -1175,49 +1127,34 @@ impl Server {
     }
 
     /// The binding a model-free administrative request is forwarded to, under
-    /// the active revision. `Ok(None)` only when no revision is active.
+    /// the active revision.
     pub(crate) fn resolve_policy_model_free(
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
-    ) -> Result<Option<crate::policy::BindingId>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((snapshot, _, _)) = runtime.capture_shadow(None, facts.now_ms) else {
-            return Ok(None);
-        };
-        let Some(revision_id) = snapshot.revision_id() else {
-            return Ok(None);
-        };
+    ) -> Result<crate::policy::BindingId, PolicyAttemptError> {
+        let snapshot = self.policy_runtime.capture();
+        let revision_id = snapshot.revision_id();
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
             .with_credentials(credentials);
-        crate::policy::resolve_model_free(snapshot.policy(), &availability, facts)
-            .map(Some)
-            .map_err(|failure| PolicyAttemptError::Resolve {
+        crate::policy::resolve_model_free(snapshot.policy(), &availability, facts).map_err(
+            |failure| PolicyAttemptError::Resolve {
                 revision_id,
                 failure,
-            })
+            },
+        )
     }
 
     pub(crate) fn resolve_policy_first_candidates(
         &self,
         facts: &[RequestFacts],
         credentials: &crate::policy::CredentialSnapshot,
-    ) -> Result<Option<Vec<crate::policy::AttemptPlan>>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((snapshot, _, _)) =
-            runtime.capture_shadow(None, facts.first().map_or(0, |f| f.now_ms))
-        else {
-            return Ok(None);
-        };
-        let Some(revision_id) = snapshot.revision_id() else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<crate::policy::AttemptPlan>, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let snapshot = runtime.capture();
+        let revision_id = snapshot.revision_id();
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let mut plans = Vec::with_capacity(facts.len());
         for facts in facts {
@@ -1241,33 +1178,24 @@ impl Server {
             })?;
             plans.push(plan);
         }
-        Ok(Some(plans))
+        Ok(plans)
     }
 
-    /// Resolve one inference attempt under the active policy revision.
-    ///
-    /// `Ok(None)` means only that no revision is active, which is a
-    /// test-only server still owned by the legacy resolver; under an active
-    /// revision every request resolves or fails with a [`PolicyAttemptError`].
+    /// Resolve one inference attempt under the active policy revision, or
+    /// the revision its lane is pinned to: every request resolves or fails
+    /// with a [`PolicyAttemptError`].
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
         stored_lane: Option<&crate::store::Lane>,
         lane: Option<&LaneFacts>,
-    ) -> Result<Option<PolicyAttempt>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((current, evidence, _)) = runtime.capture_shadow(None, facts.now_ms) else {
-            return Ok(None);
-        };
-        let Some(current_revision_id) = current.revision_id() else {
-            return Ok(None);
-        };
-        let scope = current
-            .activation_scope()
-            .expect("a persisted current revision has an activation scope");
+    ) -> Result<PolicyAttempt, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let current = runtime.capture();
+        let evidence = current.evidence();
+        let current_revision_id = current.revision_id();
+        let scope = current.activation_scope();
         if stored_lane.is_some() != lane.is_some() {
             return Err(crate::server::PolicyAttemptError::LaneFactsMismatch);
         }
@@ -1362,7 +1290,7 @@ impl Server {
                 revision_id: resolved
                     .plan
                     .policy_revision
-                    .expect("an authoritative plan has a persisted revision"),
+                    .expect("a resolved plan carries its revision"),
                 reason,
             });
         }
@@ -1379,11 +1307,11 @@ impl Server {
                 .map(|(binding, _)| binding.clone())
                 .collect(),
         };
-        Ok(Some(PolicyAttempt {
+        Ok(PolicyAttempt {
             plan: resolved.plan,
             pin_transition: decision,
             continuation,
-        }))
+        })
     }
 
     pub(crate) fn open_policy_circuit(
@@ -1392,9 +1320,7 @@ impl Server {
         failure: crate::policy::FailureClass,
         now_ms: i64,
     ) {
-        let Some(runtime) = self.policy_runtime.as_ref() else {
-            return;
-        };
+        let runtime = &self.policy_runtime;
         if failure == crate::policy::FailureClass::Authentication
             && attempt
                 .continuation
@@ -1443,16 +1369,13 @@ impl Server {
     }
 
     pub(crate) fn clear_policy_target_circuits(&self, attempt: &PolicyAttempt) {
-        let Some(runtime) = self.policy_runtime.as_ref() else {
-            return;
-        };
         let (Some(route_id), Some(candidate_id)) = (
             attempt.plan.route_id.as_ref(),
             attempt.plan.candidate_id.as_ref(),
         ) else {
             return;
         };
-        runtime.clear_target_circuits(
+        self.policy_runtime.clear_target_circuits(
             &attempt.continuation.snapshot,
             route_id,
             candidate_id,
@@ -1469,7 +1392,7 @@ impl Server {
         let revision_id = failed
             .plan
             .policy_revision
-            .expect("an authoritative attempt has a persisted revision");
+            .expect("a resolved plan carries its revision");
         let plan = crate::policy::resolve_after_failure(
             failed.continuation.snapshot.policy(),
             failed.continuation.snapshot.inventory(),
@@ -1514,9 +1437,7 @@ impl Server {
         lane: Option<&LaneFacts>,
         activation_allows_cache_loss: bool,
     ) -> Result<ResolvedPolicySnapshot, PolicyAttemptError> {
-        let revision_id = snapshot
-            .revision_id()
-            .expect("an authoritative snapshot has a persisted revision");
+        let revision_id = snapshot.revision_id();
         let mut lane = lane.cloned();
         if let Some(pin) = lane.as_mut().and_then(|lane| lane.pinned.as_mut()) {
             pin.policy_fingerprint = Some(snapshot.policy().fingerprint().clone());
@@ -1551,7 +1472,7 @@ impl Server {
         })
     }
 
-    pub(crate) fn shadow_credentials(
+    pub(crate) fn credential_snapshot(
         &self,
         headers: &HeaderMap,
         frontend: ProtocolId,
@@ -1581,7 +1502,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn shadow_facts(
+    pub(crate) fn request_facts(
         &self,
         protocol: ProtocolId,
         profile: Option<&str>,
@@ -1612,7 +1533,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn shadow_lane(
+    pub(crate) fn lane_facts(
         &self,
         lane: Option<&crate::store::Lane>,
         binding: Option<&crate::routing::BackendBinding>,
@@ -1631,14 +1552,15 @@ impl Server {
                 now,
             );
         let temperature = if compaction_cold {
-            // This is the authoritative legacy proof used by the compaction
-            // transform itself. Once the lane's recorded TTL has expired, no
+            // Proof from the lane's own record, the same the compaction
+            // transform uses. Once the lane's recorded TTL has expired, no
             // binding-local cache remains to preserve; a policy pin is not
             // needed to make that positive cold fact safe.
             crate::policy::CacheTemperature::Cold
         } else if compaction {
-            // The legacy predicate can disprove eligibility without proving
-            // which binding owns a still-live cache.
+            // A lane that is not cold by its own record can disprove
+            // eligibility without proving which binding owns a still-live
+            // cache.
             crate::policy::CacheTemperature::Unknown
         } else {
             cache_temperature(lane, binding, now)
@@ -1647,8 +1569,7 @@ impl Server {
             temperature,
             pinned: lane.pin.as_ref().map(|pin| crate::policy::ProvisionalPin {
                 policy_revision_id: Some(pin.policy_revision_id),
-                // The shadow worker fills this after loading the pin's
-                // immutable revision.
+                // Filled once the pin's immutable revision is loaded.
                 policy_fingerprint: None,
                 route_fingerprint: pin.route_fingerprint.clone(),
                 candidate_id: pin.candidate_id.clone(),
@@ -1975,8 +1896,8 @@ impl Server {
         self.replace_catalogs(next);
     }
 
-    /// Replace catalogue state and every immutable shadow projection derived
-    /// from it as one update. In-flight observations retain the old snapshot.
+    /// Replace catalogue state and every immutable projection derived from it as
+    /// one update. In-flight observations retain the old snapshot.
     fn replace_catalogs(&self, next: FetchedCatalogs) {
         let _control = self
             .routing_control
@@ -1991,87 +1912,52 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed_catalogue_bindings =
             changed_catalogue_bindings(&self.registry, &catalogs, &next);
-        let Some(runtime) = &self.policy_runtime else {
-            *catalogs = next;
-            return;
-        };
+        let runtime = &self.policy_runtime;
         // Model-list readers retain this catalogue guard through their
         // comparison, so they can observe only the old pair or new pair.
-        if let Some(revision_id) = runtime
-            .capture()
-            .and_then(|snapshot| snapshot.revision_id())
-        {
-            let revision = match self.store.load_policy_revision(revision_id) {
-                Ok(Some(revision)) => revision,
-                Ok(None) => {
-                    tracing::error!(revision_id, "active policy refresh revision is missing");
-                    return;
-                }
-                Err(error) => {
-                    tracing::error!(%error, revision_id, "active policy refresh load failed");
-                    return;
-                }
-            };
-            match crate::policy::runtime::compile_stored_revision(
-                &revision,
-                &self.registry,
-                &inventory,
-            )
-            .into_policy()
-            {
-                Ok(policy) => {
-                    let generation = publication_generation;
-                    if let Err(error) = crate::store::publication_targets().and_then(|targets| {
-                        self.store
-                            .set_publications_desired(
-                                &targets,
-                                revision.revision_id,
-                                generation,
-                                now_ms(),
-                            )
-                            .map(|_| ())
-                    }) {
-                        tracing::error!(%error, revision_id, "active publication handoff failed");
-                        return;
-                    }
-                    runtime.replace_active(
-                        &revision,
-                        Arc::new(policy),
-                        Arc::new(inventory),
-                        Arc::new(availability),
-                        &changed_catalogue_bindings,
-                    );
-                    *catalogs = next;
-                }
-                Err(_) => tracing::error!(
-                    revision_id = revision.revision_id,
-                    "active policy refresh compilation failed"
-                ),
+        let revision_id = runtime.capture().revision_id();
+        let revision = match self.store.load_policy_revision(revision_id) {
+            Ok(Some(revision)) => revision,
+            Ok(None) => {
+                tracing::error!(revision_id, "active policy refresh revision is missing");
+                return;
             }
-            return;
-        }
-
-        *catalogs = next;
-        let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
-            .ok()
-            .and_then(|compilation| compilation.into_policy().ok());
-        if let Some(policy) = policy {
-            runtime.replace_candidate(
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(availability),
-                &changed_catalogue_bindings,
-            );
-        } else {
-            tracing::warn!(
-                code = "policy-candidate-refresh-disabled",
-                "policy candidate disabled for catalogue generation"
-            );
-            runtime.replace_evidence_and_clear_candidate(
-                Arc::new(inventory),
-                Arc::new(availability),
-                &changed_catalogue_bindings,
-            );
+            Err(error) => {
+                tracing::error!(%error, revision_id, "active policy refresh load failed");
+                return;
+            }
+        };
+        match crate::policy::runtime::compile_stored_revision(&revision, &self.registry, &inventory)
+            .into_policy()
+        {
+            Ok(policy) => {
+                let generation = publication_generation;
+                if let Err(error) = crate::store::publication_targets().and_then(|targets| {
+                    self.store
+                        .set_publications_desired(
+                            &targets,
+                            revision.revision_id,
+                            generation,
+                            now_ms(),
+                        )
+                        .map(|_| ())
+                }) {
+                    tracing::error!(%error, revision_id, "active publication handoff failed");
+                    return;
+                }
+                runtime.replace_active(
+                    &revision,
+                    Arc::new(policy),
+                    Arc::new(inventory),
+                    Arc::new(availability),
+                    &changed_catalogue_bindings,
+                );
+                *catalogs = next;
+            }
+            Err(_) => tracing::error!(
+                revision_id = revision.revision_id,
+                "active policy refresh compilation failed"
+            ),
         }
     }
 
@@ -2941,12 +2827,7 @@ api_key = "sk-test"
         config.db_path = dir.join("toker.db");
         let store = Arc::new(Store::open(&config.db_path).unwrap());
         let first = Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
-        let first_revision = first
-            .policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .and_then(|snapshot| snapshot.revision_id())
-            .expect("active revision");
+        let first_revision = first.policy_runtime.capture().revision_id();
         assert_eq!(
             store
                 .load_routing_policy_state()
@@ -2968,12 +2849,8 @@ api_key = "sk-test"
         config.gates.force_newest = !config.gates.force_newest;
         let restarted = Server::with_seams(config, store.clone(), Seams::isolated()).unwrap();
         assert_eq!(
-            restarted
-                .policy_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.capture())
-                .and_then(|snapshot| snapshot.revision_id()),
-            Some(first_revision)
+            restarted.policy_runtime.capture().revision_id(),
+            first_revision
         );
         assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
     }
@@ -3393,11 +3270,7 @@ api_key = "sk-proj-test"
             model_id: model.to_owned(),
         };
         let document = document.validate().expect("policy validates");
-        let parent_revision_id = server
-            .policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .and_then(|snapshot| snapshot.revision_id());
+        let parent_revision_id = server.policy_runtime.capture().revision_id();
         let revision = server
             .store
             .insert_policy_revision(&crate::store::NewPolicyRevision {
@@ -3408,7 +3281,7 @@ api_key = "sk-proj-test"
                 forced_cache_transition,
                 source: crate::store::PolicyRevisionSource::Legacy,
                 compiler_origin: None,
-                parent_revision_id,
+                parent_revision_id: Some(parent_revision_id),
                 document: &document,
             })
             .expect("insert revision");
@@ -3422,17 +3295,13 @@ api_key = "sk-proj-test"
         )
         .into_policy()
         .expect("policy compiles");
-        server
-            .policy_runtime
-            .as_ref()
-            .expect("active runtime")
-            .replace_active(
-                &revision,
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(super::availability_for(&server.registry, &catalogs)),
-                &std::collections::BTreeSet::new(),
-            );
+        server.policy_runtime.replace_active(
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            Arc::new(super::availability_for(&server.registry, &catalogs)),
+            &std::collections::BTreeSet::new(),
+        );
         revision.revision_id
     }
 
@@ -3461,8 +3330,8 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let runtime = server.policy_runtime.as_ref().expect("active runtime");
-        let snapshot = runtime.capture().expect("active snapshot");
+        let runtime = &server.policy_runtime;
+        let snapshot = runtime.capture();
         let route_id =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
         let mut document = crate::policy::legacy::document(&server.config, &server.registry)
@@ -3522,7 +3391,7 @@ api_key = "sk-proj-test"
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
                 compiler_origin: None,
-                parent_revision_id: snapshot.revision_id(),
+                parent_revision_id: Some(snapshot.revision_id()),
                 document: &document,
             })
             .expect("insert revision");
@@ -3542,7 +3411,7 @@ api_key = "sk-proj-test"
             snapshot.availability().clone(),
             &std::collections::BTreeSet::new(),
         );
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("asked".to_owned()),
@@ -3561,8 +3430,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("initial resolution")
-            .expect("active policy");
+            .expect("initial resolution");
         assert_eq!(first.plan.effective_model, "first-model");
 
         activate_chat_revision(
@@ -3599,7 +3467,7 @@ api_key = "sk-proj-test"
     }
 
     fn chat_facts(server: &Server) -> crate::policy::RequestFacts {
-        server.shadow_facts(
+        server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("policy-alias".to_owned()),
@@ -3641,8 +3509,7 @@ api_key = "sk-proj-test"
                     Some(&stored_lane),
                     Some(&lane),
                 )
-                .expect("an unpinned lane resolves")
-                .expect("an active policy resolves every lane");
+                .expect("an unpinned lane resolves");
             assert_eq!(resolved.plan.policy_revision, Some(1), "{temperature:?}");
             assert_eq!(resolved.plan.effective_model, "policy-effective");
             assert!(
@@ -3689,7 +3556,7 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("policy-alias".to_owned()),
@@ -3708,8 +3575,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("first resolution")
-            .expect("active policy");
+            .expect("first resolution");
         let mut lane = crate::store::Lane {
             key: "lane".to_owned(),
             session_id: Some("session".to_owned()),
@@ -3742,8 +3608,7 @@ api_key = "sk-proj-test"
                     Some(&lane),
                     Some(&lane_facts(&lane, temperature)),
                 )
-                .expect("pinned resolution")
-                .expect("active policy");
+                .expect("pinned resolution");
             assert_eq!(resolved.plan.policy_revision, Some(1));
             assert!(matches!(
                 resolved.pin_transition,
@@ -3757,8 +3622,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Cold)),
             )
-            .expect("cold activation resolution")
-            .expect("active policy");
+            .expect("cold activation resolution");
         assert_eq!(resolved.plan.policy_revision, Some(active_revision));
         assert_eq!(resolved.plan.effective_model, "policy-next");
         assert!(matches!(
@@ -3788,8 +3652,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Warm)),
             )
-            .expect("warm immediate resolution")
-            .expect("active policy");
+            .expect("warm immediate resolution");
         assert_eq!(preserved.plan.policy_revision, Some(active_revision));
         assert!(matches!(
             preserved.pin_transition,
@@ -3809,8 +3672,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Unknown)),
             )
-            .expect("forced immediate resolution")
-            .expect("active policy");
+            .expect("forced immediate resolution");
         assert_eq!(moved.plan.policy_revision, Some(newest_revision));
         assert_eq!(moved.plan.effective_model, "policy-forced");
         assert!(matches!(
@@ -3828,7 +3690,7 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("policy-alias".to_owned()),
@@ -3847,8 +3709,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("old resolution")
-            .expect("active policy");
+            .expect("old resolution");
         activate_chat_revision(
             &server,
             crate::policy::ActivationScope::NewLanes,
@@ -4079,12 +3940,7 @@ api_key = "sk-proj-test"
         let server = server(&dir);
         // Pins name the active revision: one the server did not activate
         // would not be the one its lanes are written under.
-        let revision_id = server
-            .policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .and_then(|snapshot| snapshot.revision_id())
-            .expect("the server has an active revision");
+        let revision_id = server.policy_runtime.capture().revision_id();
         let make_record = |session: &str, binding: &str, model: &str| {
             let binding_id = BindingId::new(binding).expect("binding");
             let target = server
@@ -4185,8 +4041,8 @@ api_key = "sk-proj-test"
     async fn active_chat_policy_falls_back_before_commitment() {
         let (server, primary, backup) = policy_chat_fallback_server().await;
         let store = server.store.clone();
-        let runtime = server.policy_runtime.as_ref().unwrap().clone();
-        let snapshot = runtime.capture().unwrap();
+        let runtime = server.policy_runtime.clone();
+        let snapshot = runtime.capture();
         let route = snapshot
             .policy()
             .route(
@@ -4196,7 +4052,7 @@ api_key = "sk-proj-test"
             .unwrap();
         let primary_candidate = &route.candidates()[0];
         let primary_circuit = crate::policy::HealthCircuitKey {
-            policy_revision_id: snapshot.revision_id().unwrap(),
+            policy_revision_id: snapshot.revision_id(),
             route_id: route.id().clone(),
             candidate_id: primary_candidate.id().clone(),
             binding_id: primary_candidate.binding_id().clone(),
@@ -4273,8 +4129,8 @@ api_key = "sk-proj-test"
         primary
             .response_mode
             .store(CHAT_AUTH_FAILURE, Ordering::Relaxed);
-        let runtime = server.policy_runtime.as_ref().unwrap().clone();
-        let snapshot = runtime.capture().unwrap();
+        let runtime = server.policy_runtime.clone();
+        let snapshot = runtime.capture();
         let route = snapshot
             .policy()
             .route(
@@ -4284,7 +4140,7 @@ api_key = "sk-proj-test"
             .unwrap();
         let primary_candidate = &route.candidates()[0];
         let auth_circuit = crate::policy::HealthCircuitKey {
-            policy_revision_id: snapshot.revision_id().unwrap(),
+            policy_revision_id: snapshot.revision_id(),
             route_id: route.id().clone(),
             candidate_id: primary_candidate.id().clone(),
             binding_id: primary_candidate.binding_id().clone(),
@@ -4361,12 +4217,8 @@ api_key = "sk-proj-test"
             },
         );
         assert_eq!(
-            server
-                .policy_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.capture())
-                .and_then(|snapshot| snapshot.revision_id()),
-            Some(1),
+            server.policy_runtime.capture().revision_id(),
+            1,
             "catalogue refresh preserves active routing authority"
         );
         let store = server.store.clone();
@@ -4735,11 +4587,11 @@ api_key = "ak-literal-test"
     }
 
     #[test]
-    fn compaction_shadow_uses_positive_legacy_cold_proof_without_a_pin() {
+    fn compaction_lane_uses_positive_cold_proof_without_a_pin() {
         use crate::policy::CacheTemperature;
         use crate::store::Lane;
 
-        let dir = crate::setup::test_dir("compaction-shadow-cold");
+        let dir = crate::setup::test_dir("compaction-lane-cold");
         let server = server(&dir);
         let binding = server
             .registry
@@ -4764,7 +4616,7 @@ api_key = "ak-literal-test"
 
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Cold
@@ -4772,7 +4624,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = now - 1_000;
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,
@@ -4782,7 +4634,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = 0;
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,
@@ -4887,7 +4739,7 @@ api_key = "ak-literal-test"
     }
 
     fn messages_facts(server: &Server, model: &str) -> crate::policy::RequestFacts {
-        server.shadow_facts(
+        server.request_facts(
             ProtocolId::AnthropicMessages,
             None,
             Some(model.to_owned()),
@@ -4918,9 +4770,7 @@ api_key = "ak-literal-test"
             )
         };
 
-        let first = resolve(None, "claude-opus-4-8")
-            .expect("a new lane resolves")
-            .expect("an active policy resolves every lane");
+        let first = resolve(None, "claude-opus-4-8").expect("a new lane resolves");
         let LaneTransitionDecision::FirstPin { new_pin, .. } = first.pin_transition else {
             panic!("a new lane is pinned: {:?}", first.pin_transition);
         };
@@ -4929,9 +4779,7 @@ api_key = "ak-literal-test"
         stored.pin = Some(new_pin.into());
 
         // Asking for the same model again changes nothing, warm or not.
-        let again = resolve(Some(&stored), "claude-opus-4-8")
-            .expect("the same model resolves")
-            .expect("active");
+        let again = resolve(Some(&stored), "claude-opus-4-8").expect("the same model resolves");
         assert!(
             matches!(again.pin_transition, LaneTransitionDecision::Keep { .. }),
             "{:?}",
@@ -4940,9 +4788,7 @@ api_key = "ak-literal-test"
 
         // Asking for another model is the user's choice: the warm cache it
         // leaves behind is theirs to give up.
-        let switched = resolve(Some(&stored), "claude-sonnet-5")
-            .expect("a model switch resolves")
-            .expect("active");
+        let switched = resolve(Some(&stored), "claude-sonnet-5").expect("a model switch resolves");
         assert!(
             matches!(
                 &switched.pin_transition,

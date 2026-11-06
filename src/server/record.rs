@@ -269,10 +269,11 @@ pub(super) fn persist_lane_pin(
         })?;
         crate::policy::persist_transition(&server.store, &key, decision)
     };
-    let result = if let (Some(runtime), Some(revision_id)) =
-        (server.policy_runtime.as_ref(), activation_revision)
-    {
-        let Some(result) = runtime.with_activation_fence(revision_id, persist) else {
+    let result = if let Some(revision_id) = activation_revision {
+        let Some(result) = server
+            .policy_runtime
+            .with_activation_fence(revision_id, persist)
+        else {
             tracing::debug!(
                 lane_key = key,
                 "lane activation pin lost to a newer active revision"

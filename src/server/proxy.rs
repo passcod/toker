@@ -141,7 +141,6 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
         return compatibility_error("model is missing, empty, or not a string");
     };
-    let legacy_target = server.legacy_target(ProtocolId::OpenAiChat, Some(model.as_str()));
     let mut inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let canonical = inference.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);
@@ -163,19 +162,18 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         .map(|pin| pin.binding_id.clone());
     let affinity_binding = pinned_binding_id
         .as_ref()
-        .and_then(|binding_id| server.registry.binding(binding_id))
-        .or_else(|| legacy_target.as_ref().ok().map(|target| target.binding()));
+        .and_then(|binding_id| server.registry.binding(binding_id));
     let binding_affinity = if canonical.requires_binding_affinity() {
-        let Some(binding) =
-            pinned_binding_id.or_else(|| affinity_binding.map(|binding| binding.id().clone()))
-        else {
+        // Provider-owned state belongs to the binding that produced it,
+        // which only a pin records.
+        let Some(binding) = pinned_binding_id else {
             return super::openai_not_configured();
         };
         Some(binding)
     } else {
         None
     };
-    let facts = server.shadow_facts(
+    let facts = server.request_facts(
         ProtocolId::OpenAiChat,
         frontend.as_deref(),
         Some(model.clone()),
@@ -183,20 +181,20 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         force_newest::prompt_bound(original.len() as u64),
         shape.req_messages,
         shape.req_tools,
-        super::anthropic::shadow_capabilities(&canonical),
+        super::anthropic::required_capabilities(&canonical),
         binding_affinity,
         crate::policy::RequestClass::Inference,
     );
     let credentials =
-        server.shadow_credentials(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
-    let lane = server.shadow_lane(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
-    let (target, policy_plan) = match server.resolve_policy_attempt(
+        server.credential_snapshot(&parts.headers, ProtocolId::OpenAiChat, facts.now_ms);
+    let lane = server.lane_facts(cold_lane.as_ref(), affinity_binding, facts.now_ms, false);
+    let (target, policy_attempt) = match server.resolve_policy_attempt(
         &facts,
         &credentials,
         cold_lane.as_ref(),
         lane.as_ref(),
     ) {
-        Ok(Some(resolved)) => {
+        Ok(resolved) => {
             let target = match server.registry.resolve_binding(
                 ProtocolId::OpenAiChat,
                 &resolved.plan.binding_id,
@@ -215,14 +213,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     );
                 }
             };
-            (target, Some(resolved))
-        }
-        Ok(None) => {
-            let target = match legacy_target {
-                Ok(target) => target,
-                Err(_) => return super::openai_not_configured(),
-            };
-            (target, None)
+            (target, resolved)
         }
         Err(super::PolicyAttemptError::Resolve {
             revision_id,
@@ -277,10 +268,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
             };
         }
     };
-    let gate_model = policy_plan
-        .as_ref()
-        .map(|resolved| resolved.plan.effective_model.clone())
-        .or_else(|| target.effective_model().map(str::to_owned));
+    let gate_model = Some(policy_attempt.plan.effective_model.clone());
     let backend = target.provider().clone();
     let meters = super::quota_gate::load_meters(&server, backend.id());
     let release = crate::middleware::canonical::release_marker(&inference.canonical());
@@ -305,13 +293,8 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         );
     }
     inference.strip_release(&original);
-    let pin_transition = policy_plan
-        .as_ref()
-        .map(|resolved| resolved.pin_transition.clone());
-    let attempt = match policy_plan.as_ref() {
-        Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan.clone()),
-        None => inference.prepare(target.clone(), gate_model.clone()),
-    };
+    let pin_transition = Some(policy_attempt.pin_transition.clone());
+    let attempt = inference.prepare_policy(target.clone(), policy_attempt.plan.clone());
     if let Some(block) = super::quota_gate::decide_block(
         &server,
         backend.id(),
@@ -364,7 +347,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         effective_model: gate_model.clone(),
         shape: Some(shape.clone()),
         system_messages,
-        policy_attempt: policy_plan.clone().map(Arc::new),
+        policy_attempt: Some(Arc::new(policy_attempt.clone())),
     });
 
     // 6. The cold-cache notice (see the module docs). Advisory like the
@@ -515,7 +498,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         server,
         adapter,
         attempt,
-        policy_plan,
+        policy_attempt,
         inference,
         super::inference::ChatAttemptInput {
             parts,
@@ -537,71 +520,12 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
 /// publication for the request's profile. A profile that names no protocol
 /// (an unfamiliar name, or none) gets the Chat shape, as the bare path
 /// always did. No model catalogue request is a usage path or ledger row.
-///
-/// A server with no active revision, which only the tests build, keeps the
-/// route-graph projection for OpenAI profiles and forwards the rest.
 pub(crate) async fn models(State(server): State<Server>, request: Request) -> Response {
     let profile = super::frontend_profile_of(request.extensions()).and_then(|p| p.protocol());
-    if server.has_active_policy() {
-        return active_models(&server, &request, profile.unwrap_or(ProtocolId::OpenAiChat));
-    }
-    if let Some(frontend @ (ProtocolId::OpenAiChat | ProtocolId::OpenAiResponses)) = profile {
-        if server.registry.resolve(frontend, None).is_err() {
-            return match frontend {
-                ProtocolId::OpenAiChat => super::openai_not_configured(),
-                ProtocolId::OpenAiResponses => super::responses_not_configured(),
-                ProtocolId::AnthropicMessages => unreachable!(),
-            };
-        }
-        let catalogs = server
-            .catalogs
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let models = offers::for_frontend(&server.registry, &catalogs, frontend);
-        if models.is_empty() {
-            return catalog_unavailable("No provider model catalogue is available yet");
-        }
-        let body = match frontend {
-            ProtocolId::OpenAiChat => offers::render_chat(&models),
-            ProtocolId::OpenAiResponses => offers::render_responses(&models),
-            ProtocolId::AnthropicMessages => unreachable!(),
-        };
-        return axum::Json(body).into_response();
-    }
-    let Some(provider) = server
-        .registry
-        .resolve(ProtocolId::OpenAiChat, None)
-        .ok()
-        .map(|target| target.provider().clone())
-    else {
-        return super::anthropic::unmatched(State(server), request).await;
-    };
-    let (parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(%error, "request body exceeded toker's cap");
-            return plain_status(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request body exceeds toker's 64 MiB cap\n",
-            );
-        }
-    };
-    match send_upstream(&server, provider.as_ref(), &parts, body, &[]).await {
-        Ok(upstream) => forward_upstream(upstream).await,
-        Err(error) => {
-            tracing::warn!(%error, "upstream request failed");
-            transport_failure(ErrorWire::Openai, &error)
-        }
-    }
-}
-
-fn active_models(server: &Server, request: &Request, protocol: ProtocolId) -> Response {
-    let publication =
-        server.active_publication(super::frontend_of(request.extensions()), protocol.into());
-    match publication {
-        Some(offers::PolicyPublication::Ready(body)) => axum::Json(body).into_response(),
-        Some(offers::PolicyPublication::Unresolved) | None => {
+    let protocol = profile.unwrap_or(ProtocolId::OpenAiChat);
+    match server.active_publication(super::frontend_of(request.extensions()), protocol.into()) {
+        offers::PolicyPublication::Ready(body) => axum::Json(body).into_response(),
+        offers::PolicyPublication::Unresolved => {
             catalog_unavailable("The active policy publication cannot be resolved yet")
         }
     }
@@ -681,26 +605,6 @@ pub(crate) async fn send_upstream_to(
         .body(body)
         .send()
         .await
-}
-
-/// Transparently forward one non-usage response such as a model catalogue.
-pub(crate) async fn forward_upstream(upstream: reqwest::Response) -> Response {
-    let status = upstream.status();
-    let upstream_headers = upstream.headers().clone();
-
-    // Unexpected compression — shouldn't happen, identity is forced —
-    // passes through untouched with no recording (ledger-proxy behavior:
-    // never mis-parse a compressed stream).
-    if is_compressed(&upstream_headers) {
-        tracing::debug!("compressed upstream response passed through unledgered");
-        let body = Body::from_stream(upstream.bytes_stream());
-        return build_response(status, response_headers(&upstream_headers, true), body);
-    }
-
-    // Catalogue and other non-usage paths remain transparent: no canonical
-    // inference adapter, observation, or recording applies to them.
-    let body = Body::from_stream(upstream.bytes_stream());
-    build_response(status, response_headers(&upstream_headers, false), body)
 }
 
 /// A Chat binding's live universal-canonical response path. Accounting

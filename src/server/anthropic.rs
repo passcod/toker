@@ -70,7 +70,7 @@ use crate::ir::AnthropicShape;
 use crate::ir::Request as IrRequest;
 use crate::ir::canonical::{CanonBlock, CanonToolChoice, CanonicalRequest, ResponseProjection};
 use crate::middleware::cold;
-use crate::middleware::force_newest::{self, ForceDecision};
+use crate::middleware::force_newest;
 use crate::middleware::lanes;
 use crate::middleware::quota::{Blocking, Meters, Rendering, grant_for};
 use crate::observe::{AnthropicObserver, SseSplitter};
@@ -153,7 +153,7 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     if path == "/_toker" || path.starts_with("/_toker/") {
         return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
     }
-    let facts = server.shadow_facts(
+    let facts = server.request_facts(
         ProtocolId::AnthropicMessages,
         super::frontend_of(request.extensions()),
         None,
@@ -165,23 +165,17 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         None,
         crate::policy::RequestClass::Inference,
     );
-    let credentials = server.shadow_credentials(
+    let credentials = server.credential_snapshot(
         request.headers(),
         ProtocolId::AnthropicMessages,
         facts.now_ms,
     );
     let default = match server.resolve_policy_model_free(&facts, &credentials) {
-        Ok(Some(binding_id)) => match server
+        Ok(binding_id) => match server
             .registry
             .resolve_binding_model_free(ProtocolId::AnthropicMessages, &binding_id)
         {
             Ok(target) => target,
-            Err(_) => return super::anthropic_not_configured(),
-        },
-        // No active revision: only a test-only server, which still routes by
-        // the configured default.
-        Ok(None) => match server.legacy_target(ProtocolId::AnthropicMessages, None) {
-            Ok(default) => default,
             Err(_) => return super::anthropic_not_configured(),
         },
         Err(error) => {
@@ -260,10 +254,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         );
     }
 
-    let policy_active = server.has_active_policy();
     // Administrative bodies are routed by their model, so a body that is not
     // JSON has nothing for the active policy to route on.
-    if policy_active && path != "/v1/messages" && parsed.is_err() {
+    if path != "/v1/messages" && parsed.is_err() {
         return super::codex::anthropic_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -335,13 +328,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
-        let legacy_target = server.legacy_target(ProtocolId::AnthropicMessages, model.as_deref());
         if path == "/v1/messages/count_tokens" {
             let canonical = translate::from_anthropic(ir.value()).ok();
             let shape = canonical.as_ref().map(|request| {
                 AnthropicShape::from_canonical_messages(request, original.len() as u64)
             });
-            let facts = server.shadow_facts(
+            let facts = server.request_facts(
                 ProtocolId::AnthropicMessages,
                 frontend.as_deref(),
                 model.clone(),
@@ -351,18 +343,18 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 shape.as_ref().map_or(0, |shape| shape.req_tools),
                 canonical
                     .as_ref()
-                    .map(shadow_capabilities)
+                    .map(required_capabilities)
                     .unwrap_or_default(),
                 None,
                 crate::policy::RequestClass::Inference,
             );
-            let credentials = server.shadow_credentials(
+            let credentials = server.credential_snapshot(
                 &parts.headers,
                 ProtocolId::AnthropicMessages,
                 facts.now_ms,
             );
             match server.resolve_policy_first_candidate(&facts, &credentials) {
-                Ok(Some(plan)) => {
+                Ok(plan) => {
                     target = match server.registry.resolve_binding(
                         ProtocolId::AnthropicMessages,
                         &plan.binding_id,
@@ -382,12 +374,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                                 false,
                             );
                         }
-                    };
-                }
-                Ok(None) => {
-                    target = match legacy_target {
-                        Ok(target) => target,
-                        Err(_) => return super::anthropic_not_configured(),
                     };
                 }
                 Err(error) => {
@@ -440,7 +426,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             let facts = models
                 .iter()
                 .map(|model| {
-                    server.shadow_facts(
+                    server.request_facts(
                         ProtocolId::AnthropicMessages,
                         frontend.as_deref(),
                         Some(model.clone()),
@@ -454,13 +440,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     )
                 })
                 .collect::<Vec<_>>();
-            let credentials = server.shadow_credentials(
+            let credentials = server.credential_snapshot(
                 &parts.headers,
                 ProtocolId::AnthropicMessages,
                 facts[0].now_ms,
             );
             match server.resolve_policy_first_candidates(&facts, &credentials) {
-                Ok(Some(plans)) => {
+                Ok(plans) => {
                     let Some(first) = plans.first() else {
                         unreachable!("a non-empty batch yields plans")
                     };
@@ -527,12 +513,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     ir = IrRequest::parse(&rewritten).expect("lexical rewrite preserves JSON");
                     forward = Bytes::from(rewritten);
                 }
-                Ok(None) => {
-                    target = match legacy_target {
-                        Ok(target) => target,
-                        Err(_) => return super::anthropic_not_configured(),
-                    };
-                }
                 Err(error) => {
                     tracing::error!(%error, "active batch policy resolution failed");
                     let response = super::codex::anthropic_error_response(
@@ -567,12 +547,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .as_ref()
                 .and_then(|lane| lane.pin.as_ref())
                 .map(|pin| pin.binding_id.clone());
-            let legacy_binding = legacy_target.as_ref().ok().map(|target| target.binding());
             let binding_affinity = if request.requires_binding_affinity() {
-                let Some(binding) = pinned_binding
-                    .clone()
-                    .or_else(|| legacy_binding.map(|binding| binding.id().clone()))
-                else {
+                // Provider-owned state belongs to the binding that produced
+                // it, which only a pin records.
+                let Some(binding) = pinned_binding.clone() else {
                     return super::codex::anthropic_error_response(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
@@ -589,7 +567,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             } else {
                 crate::policy::RequestClass::Inference
             };
-            let mut facts = server.shadow_facts(
+            let mut facts = server.request_facts(
                 ProtocolId::AnthropicMessages,
                 frontend.as_deref(),
                 model.clone(),
@@ -597,7 +575,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 force_newest::prompt_bound(original.len() as u64),
                 shape.req_messages,
                 shape.req_tools,
-                shadow_capabilities(request),
+                required_capabilities(request),
                 binding_affinity,
                 class,
             );
@@ -623,17 +601,16 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     },
                 });
             }
-            let credentials = server.shadow_credentials(
+            let credentials = server.credential_snapshot(
                 &parts.headers,
                 ProtocolId::AnthropicMessages,
                 facts.now_ms,
             );
-            let lane = server.shadow_lane(
+            let lane = server.lane_facts(
                 cold_lane.as_ref(),
                 pinned_binding
                     .as_ref()
-                    .and_then(|binding| server.registry.binding(binding))
-                    .or(legacy_binding),
+                    .and_then(|binding| server.registry.binding(binding)),
                 facts.now_ms,
                 class == crate::policy::RequestClass::Compaction,
             );
@@ -643,7 +620,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 cold_lane.as_ref(),
                 lane.as_ref(),
             ) {
-                Ok(Some(resolved)) => {
+                Ok(resolved) => {
                     target = match server.registry.resolve_binding(
                         ProtocolId::AnthropicMessages,
                         &resolved.plan.binding_id,
@@ -665,12 +642,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         }
                     };
                     policy_attempt = Some(resolved);
-                }
-                Ok(None) => {
-                    target = match legacy_target {
-                        Ok(target) => target,
-                        Err(_) => return super::anthropic_not_configured(),
-                    };
                 }
                 Err(super::PolicyAttemptError::Resolve {
                     revision_id,
@@ -725,8 +696,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     };
                 }
             }
-        } else if let Ok(legacy) = legacy_target {
-            target = legacy;
         }
         // Otherwise the body did not canonicalise, so policy has nothing to
         // route on. The placeholder target stands in until the translation
@@ -1010,18 +979,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         } else {
             match &fired {
                 cold::ColdDecision::Notice { prompt, .. } if gates.cold_outlook => {
-                    // Priced as what the backend's model map will send
-                    // (the predecessor's `previewMappedModel`): the fit's
-                    // weights are keyed on served identities, and the
-                    // client's alias is not one. Measured on the routed
-                    // backend's own meters only.
-                    let sent = served_model.as_deref().and_then(|model| {
-                        if policy_active {
-                            Some(model)
-                        } else {
-                            model_map::preview_mapped_model(backend.model_map(), model)
-                        }
-                    });
+                    // Priced as the model policy resolved: the fit's weights
+                    // are keyed on served identities, and the client's alias
+                    // is not one. Measured on the routed backend's own
+                    // meters only.
+                    let sent = served_model.as_deref();
                     cold::outlook_over(&server.store, backend.id(), sent, *prompt, gate_armed, now)
                 }
                 _ => None,
@@ -1155,29 +1117,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     // cheap `/compact` would actually run on, and stays
                     // silent about it when there is none.
                     //
-                    // Named as the identity the backend's model map will
-                    // send — what the compaction will actually run on.
-                    let compact_on = if policy_active {
-                        policy_attempt
-                            .as_ref()
-                            .filter(|resolved| resolved.plan.compaction)
-                            .map(|resolved| resolved.plan.effective_model.clone())
-                    } else {
-                        server
-                            .models
-                            .compaction_target(
-                                &compact_spec(gates),
-                                prompt,
-                                backend.model_map(),
-                                &|model: &str| declared_window(&server, backend.as_ref(), model),
-                            )
-                            .ok()
-                            .flatten()
-                            .and_then(|target| {
-                                model_map::preview_mapped_model(backend.model_map(), &target)
-                                    .map(str::to_owned)
-                            })
-                    };
+                    // Named as the model policy resolved for the compaction.
+                    let compact_on = policy_attempt
+                        .as_ref()
+                        .filter(|resolved| resolved.plan.compaction)
+                        .map(|resolved| resolved.plan.effective_model.clone());
                     let text = cold::ColdBlocking::notice_for(
                         // The re-read is written back at the lane's own
                         // tier; a lane with no recorded tier says nothing
@@ -1247,17 +1191,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    // Policy owns routing for every path under an active revision, including
-    // the administrative ones that never carry a `policy_attempt`: nothing
-    // below may re-route or re-map what policy chose.
-    let authoritative = policy_active;
-    // The provider's model map prices and rewrites only on the legacy
-    // resolver; policy's effective model is the model.
-    let legacy_map = if authoritative {
-        None
-    } else {
-        backend.model_map()
-    };
     let policy_compaction = policy_attempt
         .as_ref()
         .is_some_and(|resolved| resolved.plan.compaction);
@@ -1265,6 +1198,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // every candidate-local model, compaction, mapping, or capability transform.
     if path == "/v1/messages"
         && let Some(request) = canonical.as_ref()
+        && let Some(resolved) = policy_attempt.as_ref()
     {
         let inference = super::inference::InferenceRequest::new(
             client_model
@@ -1272,10 +1206,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 .expect("inference model validated before gates"),
             request.clone(),
         );
-        inference_attempt = Some(match policy_attempt.as_ref() {
-            Some(resolved) => inference.prepare_policy(target.clone(), resolved.plan.clone()),
-            None => inference.prepare(target.clone(), served_model.clone()),
-        });
+        inference_attempt = Some(inference.prepare_policy(target.clone(), resolved.plan.clone()));
         inference_request = Some(inference);
     }
 
@@ -1290,8 +1221,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // above exempted it by the summarising flag, so nothing has
     // interrupted it: the gate exists to advise this.
     if path == "/v1/messages"
-        && (!authoritative || policy_compaction)
-        && (authoritative || picks_from_anthropic_catalogue(backend.as_ref()))
+        && policy_compaction
         && gate_shape
             .as_ref()
             .is_some_and(AnthropicShape::is_compaction)
@@ -1302,35 +1232,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         let lane_cold =
             cold::lane_is_cold(cold_lane.as_ref(), gates.cold_min_tokens, min_idle_ms, now);
         if lane_cold {
-            // Resolved per request: a family spec follows what is actually
-            // in use, and the size guard needs the prompt this lane is
-            // carrying. `target` is optional — a compaction already on
-            // the cheapest sensible model has no move to make, but a cold
-            // lane still means its cache writes are bought and never
-            // read, so the strip goes ahead without one.
-            let prompt = cold_lane
+            // Policy chose the compaction model already; the transform only
+            // strips the cache writes a cold lane bought and never read.
+            let compaction_target = inference_attempt
                 .as_ref()
-                .and_then(|lane| lane.prompt_tokens)
-                .filter(|prompt| *prompt >= 0)
-                .unwrap_or_default() as u64;
-            let compaction_target = if authoritative {
-                inference_attempt
-                    .as_ref()
-                    .and_then(|attempt| attempt.effective_model().map(str::to_owned))
-            } else {
-                server
-                    .models
-                    .compaction_target(
-                        &compact_spec(gates),
-                        prompt,
-                        backend.model_map(),
-                        &|model: &str| declared_window(&server, backend.as_ref(), model),
-                    )
-                    .ok()
-                    .flatten()
-            };
+                .and_then(|attempt| attempt.effective_model().map(str::to_owned));
             let retargeted = inference_attempt.as_mut().and_then(|attempt| {
-                let outcome = attempt.apply_compaction(compaction_target.as_deref(), legacy_map)?;
+                let outcome = attempt.apply_compaction(compaction_target.as_deref())?;
                 let prepared = attempt.canonical();
                 let rendered = translate::render_anthropic(
                     &prepared,
@@ -1338,10 +1246,9 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 )
                 .ok()?;
                 let bytes = serde_json::to_vec(&rendered.value).ok()?;
-                Some((prepared, outcome, bytes))
+                Some((outcome, bytes))
             });
-            if let Some((prepared, outcome, bytes)) = retargeted {
-                canonical = Some(prepared);
+            if let Some((outcome, bytes)) = retargeted {
                 // The transformed serialised body IS the point: the model
                 // region changed and the breakpoints went, so the upstream
                 // sees bytes that never existed on the frontend's wire.
@@ -1352,19 +1259,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 //
                 // Under policy the model was chosen before the transform, so
                 // `outcome` sees none and the plan holds the move.
-                let policy_move = policy_attempt
+                let (downgraded_from, downgraded_to) = policy_attempt
                     .as_ref()
-                    .map(|resolved| resolved.plan.compaction_move());
-                let (downgraded_from, downgraded_to) = match policy_move {
-                    Some(moved) => moved.unzip(),
-                    None => {
-                        let from = (outcome.to != outcome.from)
-                            .then(|| outcome.from.clone())
-                            .flatten();
-                        let to = from.is_some().then(|| outcome.to.clone()).flatten();
-                        (from, to)
-                    }
-                };
+                    .and_then(|resolved| resolved.plan.compaction_move())
+                    .unzip();
                 if let Some(ctx) = record.as_mut() {
                     ctx.downgraded_from = downgraded_from;
                     ctx.downgraded_to = downgraded_to;
@@ -1382,194 +1280,6 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     outcome.stripped,
                     outcome.merged,
                 );
-            }
-        }
-    }
-
-    // ── the force-newest rewrite ──
-    //
-    // Use the newest version of whatever model was asked for — but only
-    // where no cache can be lost by it. A known lane that is cold has
-    // nothing to lose; an UNKNOWN lane is the awkward one (the table
-    // forgets lanes, so a session whose cache is warm upstream can look
-    // brand new here), and qualifies when the request itself shows a
-    // short conversation, or when nothing has been served on the model
-    // it asks for within a full TTL — no cache it could read exists.
-    // Once a lane has been moved it stays moved while its cache is warm:
-    // that cache is on the new model now, and sending the client's
-    // choice through would rebuild it on the old one.
-    //
-    // Never runs after a compaction retarget that moved the model
-    // (`!downgradedFrom`): that rewrite already chose the model this
-    // compaction will run on. The only body edit is set_model — every
-    // cache_control survives, unlike the retarget, because this rewrite
-    // STARTS a conversation that should cache its prefix on the model it
-    // is actually going to use.
-    if path == "/v1/messages"
-        && !authoritative
-        && server.config.gates.force_newest
-        && picks_from_anthropic_catalogue(backend.as_ref())
-        && record
-            .as_ref()
-            .is_none_or(|ctx| ctx.downgraded_from.is_none())
-        && canonical.is_some()
-    {
-        // The asked model: the model the body names as it
-        // stands at this point — after routing, after any retarget —
-        // which is `served_model`'s reading here. The lane is the same
-        // record the cold gate loaded; the shape is the request's own,
-        // pre-transform (the row's shape fields are).
-        // The map preview:
-        // recency reads the identity the request would be MAPPED to,
-        // never the asked model — without this, a claimed model (only
-        // ever served as its target) would always read as idle.
-        let asked = served_model.clone();
-        let served_as = match (backend.model_map(), asked.as_deref()) {
-            (Some(map), Some(model)) => model_map::preview_mapped_model(Some(map), model),
-            _ => None,
-        };
-        let decision = force_newest::decide(
-            &force_newest::ForceContext {
-                model: served_model.as_deref(),
-                served_as,
-                lane: cold_lane.as_ref(),
-                req_messages: gate_shape.as_ref().and_then(|shape| shape.req_messages),
-                compaction: gate_shape
-                    .as_ref()
-                    .is_some_and(AnthropicShape::is_compaction),
-                body_bytes: forward.len() as u64,
-                min_idle_ms: cold_idle_ms(&server.config.gates),
-                now_ms: now_ms(),
-                declared: &|model: &str| declared_window(&server, backend.as_ref(), model),
-            },
-            &server.models,
-        );
-        if let ForceDecision::Move(forced) = decision {
-            let canonical_rewrite = inference_attempt.as_mut().and_then(|attempt| {
-                attempt.set_model(Some(forced.to.clone()));
-                let prepared = attempt.canonical();
-                let body = translate::render_anthropic(
-                    &prepared,
-                    crate::routing::DialectId::AnthropicMessages,
-                )
-                .ok()
-                .and_then(|rendered| serde_json::to_vec(&rendered.value).ok())?;
-                Some((prepared, body))
-            });
-            if let Some((prepared, body)) = canonical_rewrite {
-                canonical = Some(prepared);
-                forward = Bytes::from(body);
-            }
-            if let Some(ctx) = record.as_mut() {
-                ctx.forced_from = Some(forced.from.clone());
-                ctx.forced_to = Some(forced.to.clone());
-            }
-            // The served-model mark
-            // must see the model actually being sent.
-            served_model = Some(forced.to.clone());
-            tracing::info!("model: {} → {}", forced.from, forced.to);
-        }
-    }
-
-    // ── the model routing map (the FINAL
-    // routing stage) ──
-    //
-    // A provider carrying `[providers.<id>.model_map]` rewrites the
-    // model positions in the serialised body: top-level on /v1/messages
-    // and /count_tokens, per-request in batches. A deliberate transform —
-    // the spliced bytes are the point. Matching is exact-identity first,
-    // then family; unmatched
-    // requests keep their exact bytes (the unchanged path). Applies AFTER
-    // force-newest (which previewed through the map above), and BEFORE
-    // the served-model mark — the mark must see what is actually sent.
-    if !authoritative && let Some(map) = backend.model_map() {
-        let canonical_rewrite = (path == "/v1/messages")
-            .then_some(inference_attempt.as_mut())
-            .flatten()
-            .and_then(|attempt| {
-                let before = attempt.effective_model()?.to_owned();
-                attempt.apply_model_map(Some(map));
-                let matched = attempt.mapped()?.clone();
-                let effective = attempt.effective_model()?.to_owned();
-                let prepared = attempt.canonical();
-                let rendered = translate::render_anthropic(
-                    &prepared,
-                    crate::routing::DialectId::AnthropicMessages,
-                )
-                .ok()?;
-                let body = serde_json::to_vec(&rendered.value).ok()?;
-                Some((
-                    prepared,
-                    model_map::MappedRewrite {
-                        changed: body != forward,
-                        body,
-                        mapped: true,
-                        pre_map_model: Some(before.clone()),
-                        effective_model: Some(effective.clone()),
-                        models: vec![model_map::MappedPosition {
-                            request_index: None,
-                            pre_map_model: before,
-                            effective_model: effective,
-                            matched: true,
-                            selector: Some(matched.selector),
-                        }],
-                    },
-                ))
-            });
-        let rewrite = if path == "/v1/messages" {
-            canonical_rewrite.map(|(prepared, rewrite)| {
-                canonical = Some(prepared);
-                rewrite
-            })
-        } else {
-            // Count-token and batch bodies are administrative and keep their
-            // lexical mapper. Invalid inference bodies get a local error.
-            Some(model_map::rewrite_mapped_models(
-                Some(map),
-                &forward,
-                "POST",
-                path,
-            ))
-        };
-        if let Some(rewrite) = rewrite.filter(|rewrite| rewrite.mapped) {
-            forward = Bytes::from(rewrite.body);
-            if let Some(effective) = rewrite.effective_model.clone() {
-                // Provenance (requested/effective pair): the
-                // row's requested model keeps its first reading (what the
-                // frontend asked, routing prefixes included); the
-                // effective one becomes the mapped target.
-                if let Some(ctx) = record.as_mut() {
-                    ctx.effective_model = Some(effective.clone());
-                }
-                served_model = Some(effective);
-                tracing::info!(
-                    "model map: {} → {}",
-                    rewrite.pre_map_model.as_deref().unwrap_or("?"),
-                    served_model.as_deref().unwrap_or("?")
-                );
-            } else {
-                // A batch has no single top-level model, so the map
-                // reports no effective one: its provenance is the
-                // per-request list of the entries the map matched (the
-                // predecessor's `modelMappings`). Without it a mapped
-                // batch's row could not say where its requests went.
-                let mappings: Vec<serde_json::Value> = rewrite
-                    .models
-                    .iter()
-                    .filter(|position| position.matched)
-                    .map(|position| {
-                        serde_json::json!({
-                            "requestIndex": position.request_index,
-                            "requestedModel": position.pre_map_model,
-                            "effectiveModel": position.effective_model,
-                        })
-                    })
-                    .collect();
-                if !mappings.is_empty()
-                    && let Some(ctx) = record.as_mut()
-                {
-                    ctx.model_mappings = Some(serde_json::Value::Array(mappings));
-                }
             }
         }
     }
@@ -1635,7 +1345,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         server.borrow_catalog_credential(backend.as_ref(), &parts.headers);
         return match send_upstream(&server, backend.as_ref(), &parts, forward, &[]).await {
             Ok(upstream) => {
-                forward_legacy_response(server, backend, upstream, record, in_flight).await
+                forward_administrative_response(server, backend, upstream, record, in_flight).await
             }
             Err(error) => {
                 tracing::warn!(%error, "upstream request failed");
@@ -1677,7 +1387,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     .await
 }
 
-pub(crate) fn shadow_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
+pub(crate) fn required_capabilities(request: &CanonicalRequest) -> crate::policy::CapabilityFlags {
     fn block_requirements(block: &CanonBlock) -> (bool, bool) {
         match block.semantic() {
             CanonBlock::Image { .. } => (true, false),
@@ -1883,16 +1593,6 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
 }
 
-/// Whether the rewrites that pick their target from the Anthropic model
-/// catalogue (the compaction retarget, force-newest) may run on this
-/// backend. Both write a bare `claude-*` id, which on openrouter would
-/// move a conversation off the model the user picked onto whatever
-/// openrouter makes of that id. Codex keeps them: its model map turns
-/// their `claude-*` targets into codex ids before the request leaves.
-fn picks_from_anthropic_catalogue(backend: &dyn Provider) -> bool {
-    backend.id() != "openrouter"
-}
-
 /// The cold gate's idle floor override, in ms
 /// (minutes, deliberately fractional — unset follows
 /// the TTL tier the lane was last seen writing). Config validation
@@ -1906,57 +1606,19 @@ fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
 /// Whether the backend's fetched catalogue says `model`'s cache writes
 /// are free — the cold gate's writes-free exemption, consulted only
 /// when a notice would otherwise fire. The model is the one about to
-/// be sent, previewed through the backend's model map (the map's own
-/// rewrite stage runs after the gate, so the exemption must see the
-/// identity the upstream will actually bill). Only a POSITIVE verdict
+/// be sent, as policy resolved it, which is the identity the upstream
+/// bills. Only a POSITIVE verdict
 /// exempts; unknown — no catalogue, no entry, a pricing-less entry —
 /// never does (invariant 3: a gate fires on ignorance).
 fn writes_free_of(server: &Server, backend: &dyn Provider, model: Option<&str>) -> bool {
     let Some(model) = model.filter(|model| !model.is_empty()) else {
         return false;
     };
-    let effective = if server.has_active_policy() {
-        Some(model)
-    } else {
-        match backend.model_map() {
-            Some(map) => model_map::preview_mapped_model(Some(map), model),
-            None => Some(model),
-        }
-    };
-    let Some(effective) = effective else {
-        return false;
-    };
     let catalogs = server
         .catalogs
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    catalogs.cache_writes_free(backend.id(), effective) == Some(true)
-}
-
-/// The backend's declared context window for `model`, from its fetched
-/// models listing: authoritative over the learned ceiling in the rewrites'
-/// fit check ([`crate::middleware::models::fits_context`]). Looked up as
-/// the identity the backend's model map will send, since the listing is
-/// keyed by what the provider serves. `None` when there is no listing or
-/// it names no window, which leaves the learned ceiling to decide.
-fn declared_window(server: &Server, backend: &dyn Provider, model: &str) -> Option<u64> {
-    let effective = model_map::preview_mapped_model(backend.model_map(), model)?;
-    let catalogs = server
-        .catalogs
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    catalogs.context_window_of(backend.id(), effective)
-}
-
-/// The compaction retarget's model spec:
-/// a family name resolved against what is actually in use (the default,
-/// "sonnet" — not Haiku: its window is 200k and the lanes this fires on
-/// routinely hold three times that), an explicit model id, or "off".
-fn compact_spec(gates: &GatesConfig) -> String {
-    gates
-        .compact_model
-        .clone()
-        .unwrap_or_else(|| "sonnet".to_owned())
+    catalogs.cache_writes_free(backend.id(), model) == Some(true)
 }
 
 /// Transparent forwarding (the batch-result paths and every unmatched
@@ -1967,7 +1629,7 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
 async fn transparent_administrative(server: Server, request: Request) -> Response {
-    let facts = server.shadow_facts(
+    let facts = server.request_facts(
         ProtocolId::AnthropicMessages,
         super::frontend_of(request.extensions()),
         None,
@@ -1979,20 +1641,16 @@ async fn transparent_administrative(server: Server, request: Request) -> Respons
         None,
         crate::policy::RequestClass::Inference,
     );
-    let credentials = server.shadow_credentials(
+    let credentials = server.credential_snapshot(
         request.headers(),
         ProtocolId::AnthropicMessages,
         facts.now_ms,
     );
     let target = match server.resolve_policy_model_free(&facts, &credentials) {
-        Ok(Some(binding_id)) => match server
+        Ok(binding_id) => match server
             .registry
             .resolve_binding_model_free(ProtocolId::AnthropicMessages, &binding_id)
         {
-            Ok(target) => target,
-            Err(_) => return super::anthropic_not_configured(),
-        },
-        Ok(None) => match server.legacy_target(ProtocolId::AnthropicMessages, None) {
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },
@@ -2041,7 +1699,9 @@ async fn transparent_to(server: Server, request: Request, target: ModelTarget) -
         }
     };
     match send_upstream(&server, backend.as_ref(), &parts, body, &[]).await {
-        Ok(upstream) => forward_legacy_response(server, backend, upstream, None, None).await,
+        Ok(upstream) => {
+            forward_administrative_response(server, backend, upstream, None, None).await
+        }
         Err(error) => {
             tracing::warn!(%error, "upstream request failed");
             transport_failure(ErrorWire::Anthropic, &error)
@@ -2459,14 +2119,14 @@ fn anthropic_sse_bytes(event: &crate::observe::sse::SseEvent) -> Bytes {
 
 /// Forward one upstream response to the client, branching on compression /
 /// status / content-type — the anthropic mirror of the openai
-/// `forward_upstream`, plus the meter feed. This remains for non-inference
-/// Messages surfaces. `record` is their optional completion context; `None`
+/// `forward_upstream`, plus the meter feed. This serves the administrative
+/// Messages surfaces, which policy routes but does not coordinate. `record` is their optional completion context; `None`
 /// means transparent forwarding. `in_flight` is
 /// the request's sleep-lock hold: it rides the SSE stream (dropping when
 /// axum drops the body — the close semantics, "however the exchange ends") and
 /// drops at the end of this function on every other branch, after
 /// whatever row was owed has landed.
-async fn forward_legacy_response(
+async fn forward_administrative_response(
     server: Server,
     backend: Arc<dyn Provider>,
     upstream: reqwest::Response,
@@ -2688,12 +2348,12 @@ fn observe_chunk(splitter: &mut SseSplitter, observer: &mut AnthropicObserver, c
 
 #[cfg(test)]
 mod tests {
-    use super::{request_betas, shadow_capabilities};
+    use super::{request_betas, required_capabilities};
     use axum::http::{HeaderMap, HeaderValue};
     use serde_json::json;
 
     #[test]
-    fn shadow_requires_only_semantics_without_a_canonical_degradation() {
+    fn required_capabilities_need_only_semantics_without_a_canonical_degradation() {
         let request = crate::translate::from_anthropic(&json!({
             "model": "claude-opus-5",
             "system": "instruction",
@@ -2717,7 +2377,7 @@ mod tests {
             "max_tokens": 10
         }))
         .expect("canonical request");
-        let required = shadow_capabilities(&request);
+        let required = required_capabilities(&request);
         assert!(!required.sampling);
         assert!(!required.system_in_messages);
         assert!(!required.thinking_replay);
@@ -2726,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_capabilities_include_tool_history_and_nested_images() {
+    fn required_capabilities_include_tool_history_and_nested_images() {
         use crate::ir::canonical::{
             CanonBlock, CanonMessage, CanonRole, CanonicalRequest, ToolResultContent,
         };
@@ -2743,7 +2403,7 @@ mod tests {
             }],
             ..CanonicalRequest::default()
         };
-        let required = shadow_capabilities(&request);
+        let required = required_capabilities(&request);
         assert!(required.images);
         assert!(required.tools);
 
@@ -2759,15 +2419,15 @@ mod tests {
             }],
             ..CanonicalRequest::default()
         };
-        assert!(shadow_capabilities(&history).tools);
+        assert!(required_capabilities(&history).tools);
     }
 
     #[test]
-    fn shadow_capabilities_distinguish_tool_choice_shapes() {
+    fn required_capabilities_distinguish_tool_choice_shapes() {
         use crate::ir::canonical::{CanonToolChoice, CanonicalRequest};
 
         let required = |tool_choice| {
-            shadow_capabilities(&CanonicalRequest {
+            required_capabilities(&CanonicalRequest {
                 tool_choice,
                 ..CanonicalRequest::default()
             })
