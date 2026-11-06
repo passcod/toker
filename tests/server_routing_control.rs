@@ -575,3 +575,190 @@ async fn stale_publication_acknowledgement_conflicts_and_generic_call_cannot_cla
         "adapter_owned_result_required"
     );
 }
+
+#[tokio::test]
+async fn the_snapshot_carries_derived_content_for_the_active_revision_without_a_draft() {
+    let (server, store) = server();
+    let app = server.router();
+    let derived = snapshot(&app).await["derived"].clone();
+
+    let availability = derived["availability"].as_array().expect("availability");
+    assert!(!availability.is_empty());
+    for binding in availability {
+        for key in [
+            "binding_id",
+            "provider",
+            "configured",
+            "enabled",
+            "credential",
+            "catalogue",
+            "capabilities",
+            "cost_class",
+        ] {
+            assert!(binding.get(key).is_some(), "{key}: {binding}");
+        }
+    }
+    assert!(derived["circuits"].as_array().unwrap().is_empty());
+
+    let active = &derived["active"];
+    let routes = active["routes"].as_array().expect("routes");
+    assert!(!routes.is_empty());
+    for route in routes {
+        let candidates = route["candidates"].as_array().unwrap();
+        let edges = route["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), candidates.len().saturating_sub(1), "{route}");
+        for edge in edges {
+            assert!(edge["crosses_cost_boundary"].is_boolean(), "{edge}");
+        }
+        assert_eq!(route["pinned_lanes"]["warm"], 0);
+    }
+    assert!(active["classifiers"].is_array());
+    // A fresh revision one authors no presentations; the rows carry their
+    // state when it has them.
+    for presentation in active["presentations"].as_array().unwrap() {
+        assert!(
+            ["listed", "left_out"].contains(&presentation["desired"].as_str().unwrap()),
+            "{presentation}"
+        );
+    }
+
+    // A lane pinned to a route counts under that route.
+    let route_id = routes[0]["id"].as_str().unwrap().to_owned();
+    store
+        .upsert_lane(&Lane {
+            key: "pinned-lane".to_owned(),
+            session_id: None,
+            tools_hash: None,
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        })
+        .unwrap();
+    // The upsert leaves pins alone; they only move by compare-and-swap.
+    let pin = LanePin {
+        policy_revision_id: 1,
+        policy_route_id: route_id.parse().unwrap(),
+        route_fingerprint: "11".repeat(32).parse().unwrap(),
+        candidate_id: "candidate".parse().unwrap(),
+        binding_id: "openrouter.openai_chat".parse().unwrap(),
+        baseline_model: "base".to_owned(),
+        effective_model: "effective".to_owned(),
+    };
+    store
+        .compare_and_swap_lane_pin("pinned-lane", 0, None, Some(&pin))
+        .unwrap();
+    let derived = snapshot(&app).await["derived"].clone();
+    let pinned = &derived["active"]["routes"][0]["pinned_lanes"];
+    let counted: u64 = ["warm", "cold", "unknown"]
+        .into_iter()
+        .map(|key| pinned[key].as_u64().unwrap())
+        .sum();
+    assert_eq!(counted, 1, "{pinned}");
+}
+
+#[tokio::test]
+async fn a_draft_with_a_billed_edge_and_a_virtual_presentation_derives_both() {
+    let (server, _) = server();
+    let app = server.router();
+    let initial = snapshot(&app).await;
+    let generation = initial["draft_generation"].as_i64().unwrap();
+    let mut policy = initial["draft"]["policy"].clone();
+    policy["routes"].as_array_mut().unwrap().push(json!({
+        "id": "mixed",
+        "display_name": "Mixed",
+        "chain": {
+            "first": {
+                "id": "sub",
+                "binding_id": "codex_sub.codex_responses",
+                "model": {"kind": "exact", "model_id": "gpt-model"},
+                "enabled": true,
+            },
+            "steps": [{
+                "edge": {
+                    "preflight": "enabled",
+                    "post_send": [],
+                    "billed_boundary": "allow",
+                    "ambiguous_transport": "deny",
+                    "cache_transition": "allow_cache_loss",
+                },
+                "candidate": {
+                    "id": "billed",
+                    "binding_id": "openrouter.openrouter_responses",
+                    "model": {"kind": "exact", "model_id": "vendor/model"},
+                    "enabled": true,
+                },
+            }],
+        },
+        "lane_transition": "move_when_cold",
+    }));
+    policy["presentations"].as_array_mut().unwrap().push(json!({
+        "id": "mixed-responses",
+        "scope": {"kind": "protocol", "protocol": "openai_responses"},
+        "slug": "mixed",
+        "enabled": true,
+        "source": {"kind": "virtual", "target": {"route_id": "mixed"}},
+    }));
+    let updated = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            "/_toker/routing/draft",
+            Some("routing-draft-replace"),
+            Some(json!({"expected_generation": generation, "policy": policy})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let snapshot = snapshot(&app).await;
+    assert!(
+        !snapshot["draft_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["severity"] == "error"),
+        "{}",
+        snapshot["draft_diagnostics"]
+    );
+    let draft = &snapshot["derived"]["draft"];
+    let route = draft["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["id"] == "mixed")
+        .expect("the draft route");
+    let edge = &route["edges"][0];
+    assert_eq!(edge["from_cost"], "subscription");
+    assert_eq!(edge["to_cost"], "billed");
+    assert_eq!(edge["crosses_cost_boundary"], true);
+    assert_eq!(edge["billed_boundary"], "allow");
+
+    // The active revision has no such route, so it is only in the draft.
+    assert!(
+        !snapshot["derived"]["active"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| route["id"] == "mixed")
+    );
+
+    // A virtual presentation with no codex record is left out of the
+    // Responses list, and says why.
+    let presentation = draft["presentations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|presentation| presentation["slug"] == "mixed")
+        .expect("the draft presentation");
+    assert_eq!(presentation["adapter"], "dynamic_responses_models");
+    assert_eq!(presentation["desired"], "left_out");
+    assert_eq!(presentation["reason"], "no_codex_record");
+    // It is not in the active revision, so nothing is applied for it.
+    assert_eq!(presentation["applied"], Value::Null);
+}

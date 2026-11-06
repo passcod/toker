@@ -27,6 +27,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+pub(crate) mod derived;
 pub(super) mod routing;
 
 use super::Server;

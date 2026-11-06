@@ -714,22 +714,39 @@ impl Server {
         let inventory = offers::inventory(&self.registry, &catalogs);
         let availability = availability_for(&self.registry, &catalogs);
         let state = self.store.load_routing_policy_state()?;
-        let draft_diagnostics = state
-            .draft
+        let draft_compilation = state.draft.as_ref().map(|draft| {
+            compile_control(
+                &draft.document,
+                revision.compiler_origin,
+                &self.registry,
+                &inventory,
+            )
+        });
+        let draft_diagnostics = draft_compilation
             .as_ref()
-            .map(|draft| {
-                compile_control(
-                    &draft.document,
-                    revision.compiler_origin,
-                    &self.registry,
-                    &inventory,
-                )
-                .diagnostics()
-                .to_vec()
-            })
+            .map(|compilation| compilation.diagnostics().to_vec())
             .unwrap_or_default();
-        let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
+        let now = now_ms();
+        let lane_impacts = self.routing_lane_impacts_locked(&state, now)?;
         let publications = self.store.load_publications()?;
+        let active_policy = compile_stored_policy(&revision, &self.registry, &inventory).ok();
+        let pinned = self.pinned_lanes_by_route(now)?;
+        let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
+        let circuits = self
+            .policy_runtime
+            .open_circuits(&self.policy_runtime.capture(), now);
+        let derived = control::derived::build(&control::derived::Inputs {
+            availability: &availability,
+            inventory: &inventory,
+            learning: &learning,
+            circuits: &circuits,
+            pinned: &pinned,
+            publications: &publications,
+            active: active_policy.as_ref(),
+            draft: draft_compilation
+                .as_ref()
+                .and_then(|compilation| compilation.policy()),
+        });
         Ok(RoutingControlSnapshot {
             active_revision: revision,
             state,
@@ -739,6 +756,7 @@ impl Server {
             availability,
             lane_impacts,
             publications,
+            derived,
         })
     }
 
@@ -1103,6 +1121,32 @@ impl Server {
             }
         }
         Ok(impacts)
+    }
+
+    /// Pinned lanes grouped by the route they are pinned to, by cache
+    /// temperature as activation consent reads it.
+    fn pinned_lanes_by_route(
+        &self,
+        now: i64,
+    ) -> Result<
+        std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts>,
+        crate::store::Error,
+    > {
+        let mut by_route: std::collections::BTreeMap<crate::policy::RouteId, RoutingLaneImpacts> =
+            std::collections::BTreeMap::new();
+        for lane in self.store.load_lanes()? {
+            let Some(pin) = lane.pin.as_ref() else {
+                continue;
+            };
+            let impacts = by_route.entry(pin.policy_route_id.clone()).or_default();
+            impacts.total += 1;
+            match cache_temperature(&lane, self.registry.binding(&pin.binding_id), now) {
+                crate::policy::CacheTemperature::Warm => impacts.warm += 1,
+                crate::policy::CacheTemperature::Cold => impacts.cold += 1,
+                crate::policy::CacheTemperature::Unknown => impacts.unknown += 1,
+            }
+        }
+        Ok(by_route)
     }
 
     pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
@@ -2306,6 +2350,9 @@ pub(crate) struct RoutingControlSnapshot {
     pub(crate) availability: AvailabilitySnapshot,
     pub(crate) lane_impacts: RoutingLaneImpacts,
     pub(crate) publications: Vec<RoutingPublication>,
+    /// What the routing page shows beyond the documents; see
+    /// `control::derived`.
+    pub(crate) derived: serde_json::Value,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

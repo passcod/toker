@@ -89,6 +89,35 @@ impl CompiledPolicy {
         self.routes.get(id)
     }
 
+    pub fn routes(&self) -> impl Iterator<Item = &CompiledRoute> {
+        self.routes.values()
+    }
+
+    pub fn classifiers(&self) -> impl Iterator<Item = &CompiledClassifier> {
+        self.classifiers.values()
+    }
+
+    /// Every presentation of every scope, in scope then slug order.
+    pub fn all_presentations(
+        &self,
+    ) -> impl Iterator<Item = (FrontendScope, &str, &CompiledPresentation)> {
+        self.presentations.iter().flat_map(|(key, items)| {
+            let scope = match &key.profile {
+                // Every ScopeKey profile came from a validated ProfileId.
+                Some(profile) => FrontendScope::Profile {
+                    profile: ProfileId::new(profile).expect("compiled profile id stays valid"),
+                    protocol: key.protocol,
+                },
+                None => FrontendScope::Protocol {
+                    protocol: key.protocol,
+                },
+            };
+            items
+                .iter()
+                .map(move |(slug, presentation)| (scope.clone(), slug.as_str(), presentation))
+        })
+    }
+
     pub fn presentation(&self, scope: &FrontendScope, slug: &str) -> Option<&CompiledPresentation> {
         self.presentations
             .get(&ScopeKey::from(scope))

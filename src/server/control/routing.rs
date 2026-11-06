@@ -578,6 +578,7 @@ fn routing_snapshot_response(operation: &str, snapshot: RoutingControlSnapshot) 
             "offers": snapshot.inventory.iter().map(offer_body).collect::<Vec<_>>(),
             "lane_impacts": lane_impacts_body(&snapshot.lane_impacts),
             "publications": snapshot.publications.into_iter().map(publication_body).collect::<Vec<_>>(),
+            "derived": snapshot.derived,
         })),
     )
         .into_response()
@@ -744,7 +745,7 @@ fn publication_body(publication: RoutingPublication) -> Value {
     })
 }
 
-fn protocol_name(protocol: FrontendProtocol) -> &'static str {
+pub(super) fn protocol_name(protocol: FrontendProtocol) -> &'static str {
     match protocol {
         FrontendProtocol::AnthropicMessages => "anthropic_messages",
         FrontendProtocol::OpenaiChat => "openai_chat",

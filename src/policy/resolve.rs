@@ -15,12 +15,12 @@ use crate::routing::Capabilities;
 
 use super::{
     ArgumentBinding, BindingId, BoundaryConsent, CacheTransitionPolicy, CandidateEdge, CandidateId,
-    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledCompaction, CompiledPolicy,
-    CompiledRoute, CompiledRouteReference, CostClass, FailureClass, FallbackPermission,
-    FrontendProtocol, FrontendScope, InventorySource, LaneTransitionPolicy, LearningView,
-    MatcherCaptures, MinimumLearning, ParsedVersion, PolicyFingerprint, PresentationId,
-    PresentationRoute, ProfileId, REQUESTED_MODEL_PARAMETER, RewriteId, RouteFingerprint, RouteId,
-    StableId,
+    CapabilityFlags, CompiledCandidate, CompiledCandidateModel, CompiledClassifier,
+    CompiledCompaction, CompiledPolicy, CompiledRoute, CompiledRouteReference, CostClass,
+    FailureClass, FallbackPermission, FrontendProtocol, FrontendScope, InventorySource,
+    LaneTransitionPolicy, LearningView, MatcherCaptures, MinimumLearning, ParsedVersion,
+    PolicyFingerprint, PresentationId, PresentationRoute, ProfileId, REQUESTED_MODEL_PARAMETER,
+    RewriteId, RouteFingerprint, RouteId, StableId, UpgradePolicy,
 };
 
 /// The kind of request being resolved. This is derived from fixed markers;
@@ -1428,11 +1428,85 @@ fn choose_upgrade<L: LearningView>(
         return Ok(None);
     }
 
+    Ok(elect_upgrade(
+        upgrade,
+        classifier,
+        inventory,
+        learning,
+        candidate.binding_id(),
+        baseline,
+        facts.prompt_bound,
+    )?
+    .winner)
+}
+
+/// Why a model in an upgrade policy's inventory did not win the election.
+/// A model the classifier does not parse is not a contender and is not
+/// listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeRejection {
+    FamilyMismatch,
+    NotNewer,
+    LearningMinimum,
+    ContextFit,
+}
+
+/// The newest model that may replace a baseline, with the contenders that
+/// lost and why.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpgradeElection {
+    pub winner: Option<String>,
+    pub rejected: Vec<(String, UpgradeRejection)>,
+}
+
+/// The election as a new lane with no prompt bound would see it for a
+/// candidate whose baseline is `baseline`. `None` when the candidate has no
+/// enabled upgrade policy. This is what the routing page shows; the resolver
+/// elects through the same function.
+pub fn upgrade_standing<L: LearningView>(
+    policy: &CompiledPolicy,
+    inventory: &OfferInventory,
+    learning: &L,
+    candidate: &CompiledCandidate,
+    baseline: &str,
+) -> Result<Option<UpgradeElection>, ResolveFailure> {
+    let Some(upgrade) = candidate
+        .upgrade_policy_id()
+        .and_then(|id| policy.upgrade(id))
+        .map(|upgrade| upgrade.policy())
+        .filter(|upgrade| upgrade.enabled)
+    else {
+        return Ok(None);
+    };
+    let classifier = policy
+        .classifier(&upgrade.classifier_id)
+        .ok_or(ResolveFailure::InvalidTemplate)?;
+    elect_upgrade(
+        upgrade,
+        classifier,
+        inventory,
+        learning,
+        candidate.binding_id(),
+        baseline,
+        0,
+    )
+    .map(Some)
+}
+
+fn elect_upgrade<L: LearningView>(
+    upgrade: &UpgradePolicy,
+    classifier: &CompiledClassifier,
+    inventory: &OfferInventory,
+    learning: &L,
+    binding: &BindingId,
+    baseline: &str,
+    prompt_bound: u64,
+) -> Result<UpgradeElection, ResolveFailure> {
     let Some(baseline_class) = classifier
         .classify(baseline)
         .map_err(|_| ResolveFailure::InvalidTemplate)?
     else {
-        return Ok(None);
+        return Ok(UpgradeElection::default());
     };
     let mut models = BTreeSet::new();
     for source in &upgrade.inventory_sources {
@@ -1441,20 +1515,21 @@ fn choose_upgrade<L: LearningView>(
                 models.extend(
                     inventory
                         .iter()
-                        .filter(|offer| offer.binding_id == *candidate.binding_id())
+                        .filter(|offer| offer.binding_id == *binding)
                         .map(|offer| offer.backend_model_id.clone()),
                 );
             }
             InventorySource::Served | InventorySource::Learned => {
                 models.extend(
                     learning
-                        .known_models(candidate.binding_id())
+                        .known_models(binding)
                         .map_err(|_| ResolveFailure::LearningUnavailable)?,
                 );
             }
         }
     }
     let mut best: Option<(String, ParsedVersion)> = None;
+    let mut rejected = Vec::new();
     for model in models {
         let Some(classified) = classifier
             .classify(&model)
@@ -1462,30 +1537,30 @@ fn choose_upgrade<L: LearningView>(
         else {
             continue;
         };
-        if classified.family != baseline_class.family
-            || classified
-                .version
-                .partial_cmp(&baseline_class.version)
-                .is_none_or(|order| !order.is_gt())
+        if classified.family != baseline_class.family {
+            rejected.push((model, UpgradeRejection::FamilyMismatch));
+            continue;
+        }
+        if classified
+            .version
+            .partial_cmp(&baseline_class.version)
+            .is_none_or(|order| !order.is_gt())
         {
+            rejected.push((model, UpgradeRejection::NotNewer));
             continue;
         }
         if !learning_minimum(
             upgrade.minimum_learning,
             upgrade.allow_manual_promotion,
             learning,
-            candidate.binding_id(),
+            binding,
             &model,
         )? {
+            rejected.push((model, UpgradeRejection::LearningMinimum));
             continue;
         }
-        if !fits_context(
-            inventory,
-            learning,
-            candidate.binding_id(),
-            &model,
-            facts.prompt_bound,
-        )? {
+        if !fits_context(inventory, learning, binding, &model, prompt_bound)? {
+            rejected.push((model, UpgradeRejection::ContextFit));
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, current)| {
@@ -1495,10 +1570,17 @@ fn choose_upgrade<L: LearningView>(
                 .is_some_and(|order| order.is_gt())
         });
         if replace {
-            best = Some((model, classified.version));
+            if let Some((beaten, _)) = best.replace((model, classified.version)) {
+                rejected.push((beaten, UpgradeRejection::NotNewer));
+            }
+        } else {
+            rejected.push((model, UpgradeRejection::NotNewer));
         }
     }
-    Ok(best.map(|(model, _)| model))
+    Ok(UpgradeElection {
+        winner: best.map(|(model, _)| model),
+        rejected,
+    })
 }
 
 fn choose_revision_one_compaction<L: LearningView>(
@@ -2041,6 +2123,109 @@ mod tests {
             }
         );
         assert_eq!(stored.trace.events.len(), plan.trace.len());
+    }
+
+    fn standing_inventory() -> OfferInventory {
+        let offer = |model: &str, window: Option<u64>| BackendOffer {
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            provider: "anthropic_sub".to_owned(),
+            backend_model_id: model.to_owned(),
+            binding: ANTHROPIC_SUB_MESSAGES.clone(),
+            context_window: window,
+            chronology: None,
+            fetched_at_ms: 1,
+            raw: serde_json::Value::Null,
+        };
+        OfferInventory::from_offers([
+            offer("claude-opus-4-1", Some(1_000_000)),
+            offer("claude-opus-4-8", Some(1_000_000)),
+            offer("claude-opus-4-9", Some(1_000_000)),
+            offer("claude-opus-5", None),
+            offer("claude-sonnet-9", Some(1_000_000)),
+        ])
+    }
+
+    /// The routing page shows why each rival lost, and the winner it names is
+    /// the one the resolver would elect for a new lane.
+    #[test]
+    fn the_upgrade_standing_says_why_each_rival_lost() {
+        let inventory = standing_inventory();
+        let policy = compile(upgrade_document(), &inventory);
+        let route = policy.route(&id("route")).unwrap();
+
+        let election = upgrade_standing(
+            &policy,
+            &inventory,
+            &NoLearning,
+            &route.candidates()[0],
+            "claude-opus-4-8",
+        )
+        .unwrap()
+        .expect("an enabled upgrade policy");
+
+        assert_eq!(election.winner.as_deref(), Some("claude-opus-4-9"));
+        let reason = |model: &str| {
+            election
+                .rejected
+                .iter()
+                .find(|(rejected, _)| rejected == model)
+                .map(|(_, reason)| *reason)
+        };
+        assert_eq!(
+            reason("claude-sonnet-9"),
+            Some(UpgradeRejection::FamilyMismatch)
+        );
+        assert_eq!(reason("claude-opus-4-1"), Some(UpgradeRejection::NotNewer));
+        assert_eq!(reason("claude-opus-4-8"), Some(UpgradeRejection::NotNewer));
+        // The newest model has no window the election can trust.
+        assert_eq!(reason("claude-opus-5"), Some(UpgradeRejection::ContextFit));
+        assert_eq!(reason("claude-opus-4-9"), None);
+    }
+
+    #[test]
+    fn the_upgrade_standing_names_the_learning_minimum() {
+        let inventory = standing_inventory();
+        let mut document = upgrade_document();
+        document.upgrades[0].minimum_learning = MinimumLearning::ExplicitPromotion;
+        let policy = compile(document, &inventory);
+        let route = policy.route(&id("route")).unwrap();
+
+        let election = upgrade_standing(
+            &policy,
+            &inventory,
+            &NoLearning,
+            &route.candidates()[0],
+            "claude-opus-4-8",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(election.winner, None);
+        assert!(election.rejected.contains(&(
+            "claude-opus-4-9".to_owned(),
+            UpgradeRejection::LearningMinimum
+        )));
+    }
+
+    #[test]
+    fn a_disabled_upgrade_policy_has_no_standing() {
+        let inventory = standing_inventory();
+        let mut document = upgrade_document();
+        document.upgrades[0].enabled = false;
+        let policy = compile(document, &inventory);
+        let route = policy.route(&id("route")).unwrap();
+
+        assert_eq!(
+            upgrade_standing(
+                &policy,
+                &inventory,
+                &NoLearning,
+                &route.candidates()[0],
+                "claude-opus-4-8",
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

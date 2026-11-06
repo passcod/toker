@@ -239,6 +239,21 @@ pub enum VersionError {
     EmptySeparator,
 }
 
+/// A numeric tuple prints dot-separated whatever separator it was parsed
+/// from, so the shown form is for reading, not for re-parsing.
+impl fmt::Display for ParsedVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Semver(version) => write!(formatter, "{version}"),
+            Self::Date(date) => write!(formatter, "{date}"),
+            Self::NumericTuple(NumericVersion(parts)) => {
+                let parts: Vec<String> = parts.iter().map(u64::to_string).collect();
+                write!(formatter, "{}", parts.join("."))
+            }
+        }
+    }
+}
+
 impl fmt::Display for ReleaseDate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
