@@ -170,13 +170,11 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         ProtocolId::AnthropicMessages,
         facts.now_ms,
     );
-    let default = match server.resolve_policy_first_candidate(&facts, &credentials) {
-        Ok(Some(plan)) => match server.registry.resolve_binding(
-            ProtocolId::AnthropicMessages,
-            &plan.binding_id,
-            None,
-            &plan.effective_model,
-        ) {
+    let default = match server.resolve_policy_model_free(&facts, &credentials) {
+        Ok(Some(binding_id)) => match server
+            .registry
+            .resolve_binding_model_free(ProtocolId::AnthropicMessages, &binding_id)
+        {
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },
@@ -2214,13 +2212,11 @@ async fn transparent_administrative(server: Server, request: Request) -> Respons
         ProtocolId::AnthropicMessages,
         facts.now_ms,
     );
-    let target = match server.resolve_policy_first_candidate(&facts, &credentials) {
-        Ok(Some(plan)) => match server.registry.resolve_binding(
-            ProtocolId::AnthropicMessages,
-            &plan.binding_id,
-            None,
-            &plan.effective_model,
-        ) {
+    let target = match server.resolve_policy_model_free(&facts, &credentials) {
+        Ok(Some(binding_id)) => match server
+            .registry
+            .resolve_binding_model_free(ProtocolId::AnthropicMessages, &binding_id)
+        {
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },

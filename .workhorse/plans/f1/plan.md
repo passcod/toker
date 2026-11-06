@@ -93,7 +93,7 @@ Changeset 12 left legacy routing reachable in production:
 Recorded in `port-notes.md` ("Findings"); each is a gap between the live
 policy path and what the legacy path did.
 
-- [ ] Model-less requests cannot route under revision one (batch results,
+- [x] Model-less requests cannot route under revision one (batch results,
       cancel, every unmatched Anthropic path answer 503 on the live config):
       add the exact-profile-then-protocol default resolution the design
       describes for model-free administrative paths

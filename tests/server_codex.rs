@@ -2902,24 +2902,34 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("unmatched", upstream, false)).await;
 
-    // The codex backend serves no anthropic administrative paths, so policy
-    // has no backend for them and toker answers in anthropic's error shape
-    // instead of forwarding. That holds for an unmatched path and for batch
-    // management alike.
-    for (path, message) in [
-        ("/v1/files?limit=2", "no backend for this path"),
-        ("/v1/messages/batches/batch_123", "no backend for batch"),
+    // The codex backend serves no anthropic administrative paths. Policy
+    // resolves these model-free requests to the codex default, and toker
+    // answers in anthropic's error shape instead of forwarding: a 404 for an
+    // unmatched path, a 400 for batch management.
+    for (path, status, error_type, message) in [
+        (
+            "/v1/files?limit=2",
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "serves only the Messages API",
+        ),
+        (
+            "/v1/messages/batches/batch_123",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "does not support count_tokens or batch requests",
+        ),
     ] {
         let response = client()
             .get(format!("http://{addr}{path}"))
             .send()
             .await
             .expect("toker answers");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.status(), status, "{path}");
         let error: Value =
             serde_json::from_str(&response.text().await.expect("body")).expect("error json");
         assert_eq!(error["type"], "error");
-        assert_eq!(error["error"]["type"], "api_error", "{path}");
+        assert_eq!(error["error"]["type"], error_type, "{path}");
         assert!(
             error["error"]["message"]
                 .as_str()

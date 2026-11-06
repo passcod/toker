@@ -1832,10 +1832,11 @@ async fn batch_creation_forwards_byte_identical_and_feeds_the_meters() {
 
 #[tokio::test]
 async fn batch_results_and_cancel_forward_transparently_and_feed_the_meters() {
-    // These paths carry no model, so they are routed by a policy whose
-    // Messages default needs none.
-    let (mock, addr, store) =
-        spawn_policy_with_a_model_map("server-anthropic-batch-mgmt-", false, false).await;
+    // These paths carry no model, so they are routed by the revision-one
+    // default without one: the compiled default binds the requested model,
+    // and a model-free request must still reach its first binding.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
     // Results GET: transparent forwarding.
     let response = client()
@@ -1884,10 +1885,10 @@ async fn batch_results_and_cancel_forward_transparently_and_feed_the_meters() {
 
 #[tokio::test]
 async fn unmatched_paths_pass_through_with_method_query_and_body() {
-    // A path with no model is routed by a policy whose Messages default
-    // needs none.
-    let (mock, addr, store) =
-        spawn_policy_with_a_model_map("server-anthropic-unmatched-", false, false).await;
+    // A path with no model is routed by the revision-one default, whose
+    // route binds the requested model there is none of.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
     // A method, path, and query toker's route table names nowhere, with
     // a body that is not JSON: all of it reaches the upstream unchanged.

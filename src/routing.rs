@@ -768,6 +768,18 @@ impl RouteRegistry {
         })
     }
 
+    /// Build a configured target for a request that names no model, such as a
+    /// batch result fetch: the binding alone, with neither model identity.
+    pub fn resolve_binding_model_free(
+        &self,
+        frontend: ProtocolId,
+        binding_id: &BindingId,
+    ) -> Result<ModelTarget, RouteNotConfigured> {
+        let mut target = self.resolve_binding(frontend, binding_id, None, "")?;
+        target.effective_model = None;
+        Ok(target)
+    }
+
     /// Resolve a frontend model spelling to its provider, backend binding, and
     /// two model identities. Unknown prefixes are provider-owned model ids and
     /// therefore remain intact on the protocol default.

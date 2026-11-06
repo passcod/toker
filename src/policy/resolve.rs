@@ -885,27 +885,87 @@ fn lookup<'a>(
     {
         return Ok(selected);
     }
-    if let Some(scope) = facts.profile_scope()
-        && let Some(reference) = policy.default_route(&scope)
-    {
-        return from_reference(
-            policy,
-            reference,
-            facts,
-            None,
-            RouteProvenance::ProfileDefault,
-        );
+    let (reference, provenance) =
+        default_reference(policy, facts).ok_or(ResolveFailure::NoRoute)?;
+    from_reference(policy, reference, facts, None, provenance)
+}
+
+/// The exact-profile default, else the protocol default.
+fn default_reference<'a>(
+    policy: &'a CompiledPolicy,
+    facts: &RequestFacts,
+) -> Option<(&'a CompiledRouteReference, RouteProvenance)> {
+    facts
+        .profile_scope()
+        .and_then(|scope| policy.default_route(&scope))
+        .map(|reference| (reference, RouteProvenance::ProfileDefault))
+        .or_else(|| {
+            policy
+                .default_route(&facts.protocol_scope())
+                .map(|reference| (reference, RouteProvenance::ProtocolDefault))
+        })
+}
+
+/// Resolve a request that carries no model, such as a batch result fetch or
+/// any Anthropic path toker does not itself serve, to the one binding it is
+/// forwarded to.
+///
+/// Only the default route can answer it: there is no model for a
+/// presentation or rewrite to match. The route's first candidate is the
+/// whole answer, with no fallback and no model, so none of the candidate's
+/// model-dependent steps (offer selection, upgrade, alias, circuits) apply.
+/// This is deliberately not a mode of [`resolve`]: an inference request
+/// without a model has nothing to send and still fails there, and a request
+/// that does carry a model is refused here rather than silently routed
+/// without it.
+pub fn resolve_model_free(
+    policy: &CompiledPolicy,
+    availability: &AvailabilitySnapshot,
+    facts: &RequestFacts,
+) -> Result<BindingId, ResolveFailure> {
+    if facts.requested_model.is_some() {
+        return Err(ResolveFailure::InvalidArgument);
     }
-    if let Some(reference) = policy.default_route(&protocol) {
-        return from_reference(
-            policy,
-            reference,
-            facts,
-            None,
-            RouteProvenance::ProtocolDefault,
-        );
+    let (reference, provenance) =
+        default_reference(policy, facts).ok_or(ResolveFailure::NoRoute)?;
+    let route = policy
+        .route(reference.route_id())
+        .ok_or(ResolveFailure::MissingRoute)?;
+    let candidate = route
+        .candidates()
+        .first()
+        .ok_or(ResolveFailure::MissingRoute)?;
+    let reason = if !candidate.enabled() {
+        Some(SkipReason::Disabled)
+    } else {
+        availability.get(candidate.binding_id()).and_then(|live| {
+            common_denial(
+                live,
+                merge_capabilities(
+                    candidate.required_capabilities(),
+                    facts.required_capabilities,
+                ),
+            )
+        })
+    };
+    match reason {
+        None => Ok(candidate.binding_id().clone()),
+        Some(reason) => Err(ResolveFailure::RouteUnavailable {
+            route_id: route.id().clone(),
+            route_fingerprint: route.fingerprint().clone(),
+            provenance: provenance.clone(),
+            trace: vec![
+                TraceEvent::Lookup(provenance),
+                TraceEvent::Candidate(CandidateEvidence {
+                    candidate_id: candidate.id().clone(),
+                    crossed_from: None,
+                    binding_id: candidate.binding_id().clone(),
+                    model: None,
+                    result: Err(reason),
+                }),
+            ],
+        }),
     }
-    Err(ResolveFailure::NoRoute)
 }
 
 fn first_rewrite<'a>(
@@ -3801,5 +3861,107 @@ mod tests {
             assert_eq!(plan.baseline_model, "original");
             assert_ne!(plan.provenance, RouteProvenance::Compaction);
         }
+    }
+
+    fn model_free_facts() -> RequestFacts {
+        RequestFacts {
+            requested_model: None,
+            ..facts("unused")
+        }
+    }
+
+    fn model_free_document() -> PolicyDocument {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        document(route(
+            first,
+            vec![RouteStep {
+                edge: CandidateEdge {
+                    preflight: FallbackPermission::Enabled,
+                    post_send: vec![],
+                    billed_boundary: BoundaryConsent::Allow,
+                    ambiguous_transport: BoundaryConsent::Deny,
+                    cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                },
+                candidate: second,
+            }],
+        ))
+    }
+
+    #[test]
+    fn a_model_free_request_takes_the_default_routes_first_binding() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let binding =
+            resolve_model_free(&policy, &availability(true, false), &model_free_facts()).unwrap();
+        assert_eq!(&binding, ANTHROPIC_SUB_MESSAGES.id());
+    }
+
+    #[test]
+    fn a_model_free_request_prefers_the_profile_default_to_the_protocol_one() {
+        let mut document = model_free_document();
+        let mut profile_route = route(
+            candidate(
+                "profile-first",
+                &ANTHROPIC_API_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        );
+        profile_route.id = id("profile-route");
+        document.routes.push(profile_route);
+        document.defaults.push(DefaultRoute {
+            scope: scope(Some("claude")),
+            target: reference("profile-route", ArgumentBinding::RequestedModel),
+        });
+        let policy = compile(document, &OfferInventory::default());
+        let binding =
+            resolve_model_free(&policy, &availability(true, false), &model_free_facts()).unwrap();
+        assert_eq!(&binding, ANTHROPIC_API_MESSAGES.id());
+    }
+
+    #[test]
+    fn a_model_free_request_does_not_fall_back_past_an_unavailable_first_binding() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let failure = resolve_model_free(&policy, &availability(false, false), &model_free_facts())
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace, .. }
+                if matches!(&trace[1], TraceEvent::Candidate(evidence)
+                    if evidence.candidate_id == id("first")
+                        && evidence.result == Err(SkipReason::ProviderUnconfigured))
+        ));
+    }
+
+    #[test]
+    fn model_free_resolution_refuses_a_request_that_names_a_model() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        assert!(matches!(
+            resolve_model_free(&policy, &availability(true, false), &facts("asked")),
+            Err(ResolveFailure::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn an_inference_request_without_a_model_still_fails_ordinary_resolution() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &model_free_facts(),
+        )
+        .unwrap_err();
+        assert!(matches!(failure, ResolveFailure::InvalidArgument));
     }
 }

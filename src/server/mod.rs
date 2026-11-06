@@ -1197,6 +1197,34 @@ impl Server {
         })
     }
 
+    /// The binding a model-free administrative request is forwarded to, under
+    /// the active revision. `Ok(None)` only when no revision is active.
+    pub(crate) fn resolve_policy_model_free(
+        &self,
+        facts: &RequestFacts,
+        credentials: &crate::policy::CredentialSnapshot,
+    ) -> Result<Option<crate::policy::BindingId>, PolicyAttemptError> {
+        let Some(runtime) = &self.policy_runtime else {
+            return Ok(None);
+        };
+        let Some((snapshot, _, _)) = runtime.capture_shadow(None, facts.now_ms) else {
+            return Ok(None);
+        };
+        let Some(revision_id) = snapshot.revision_id() else {
+            return Ok(None);
+        };
+        let availability = snapshot
+            .availability()
+            .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_credentials(credentials);
+        crate::policy::resolve_model_free(snapshot.policy(), &availability, facts)
+            .map(Some)
+            .map_err(|failure| PolicyAttemptError::Resolve {
+                revision_id,
+                failure,
+            })
+    }
+
     pub(crate) fn resolve_policy_first_candidates(
         &self,
         facts: &[RequestFacts],

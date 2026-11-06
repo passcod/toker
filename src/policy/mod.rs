@@ -52,7 +52,7 @@ pub use resolve::{
     CatalogueAvailability, CircuitSnapshot, CredentialSnapshot, Evidence, LaneFacts,
     LegacyCompactionFacts, NoLearning, OpenCircuitTarget, ProvisionalPin, RequestClass,
     RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, resolve,
-    resolve_after_failure, resolve_first_candidate, resolve_with_circuits,
+    resolve_after_failure, resolve_first_candidate, resolve_model_free, resolve_with_circuits,
 };
 pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
 pub use shadow::{
