@@ -3110,6 +3110,37 @@ mod tests {
     }
 
     #[test]
+    fn restating_the_applied_pair_keeps_a_publication_applied() {
+        let store = mem_store();
+        let revision_id = revision(&store, "restated publication", None);
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiChat,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
+        let target = |state| InitialPublication {
+            key: key.clone(),
+            state,
+        };
+        store
+            .set_publications_desired(&[target(PublicationState::Applied)], revision_id, 4, 100)
+            .unwrap();
+        let restated = store
+            .set_publications_desired(&[target(PublicationState::Pending)], revision_id, 4, 200)
+            .unwrap();
+        assert_eq!(restated[0].state, PublicationState::Applied);
+        let moved = store
+            .set_publications_desired(&[target(PublicationState::Pending)], revision_id, 5, 300)
+            .unwrap();
+        assert_eq!(
+            moved[0].state,
+            PublicationState::Pending,
+            "a new inventory generation is something left to apply"
+        );
+    }
+
+    #[test]
     fn publication_desired_handoff_updates_all_adapters_atomically() {
         let store = mem_store();
         let revision_id = revision(&store, "publication handoff", None);

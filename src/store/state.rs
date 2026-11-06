@@ -1328,6 +1328,8 @@ pub(super) fn set_publication_desired(
         ));
     }
     let scope_key = encode_publication_scope(&key.scope);
+    // Restating the pair an applied publication already carries (the daily
+    // catalogue refresh does) leaves it applied: nothing is left to apply.
     conn.execute(
         "INSERT INTO routing_publications
          (scope_key, adapter, desired_revision_id, desired_inventory_generation, state, updated_ms)
@@ -1335,7 +1337,17 @@ pub(super) fn set_publication_desired(
          ON CONFLICT(scope_key, adapter) DO UPDATE SET
            desired_revision_id = excluded.desired_revision_id,
            desired_inventory_generation = excluded.desired_inventory_generation,
-           state = 'pending', detail_code = NULL, updated_ms = excluded.updated_ms",
+           state = CASE WHEN state = 'applied'
+                         AND desired_revision_id = excluded.desired_revision_id
+                         AND desired_inventory_generation
+                             = excluded.desired_inventory_generation
+                        THEN state ELSE 'pending' END,
+           detail_code = CASE WHEN state = 'applied'
+                               AND desired_revision_id = excluded.desired_revision_id
+                               AND desired_inventory_generation
+                                   = excluded.desired_inventory_generation
+                              THEN detail_code ELSE NULL END,
+           updated_ms = excluded.updated_ms",
         rusqlite::params![
             scope_key,
             key.adapter.as_str(),
