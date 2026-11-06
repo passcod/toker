@@ -2,8 +2,10 @@
 
 `middleware/cold.rs` holds the decision and the notice; the sequencing is in
 `server/anthropic.rs` (and, without the outlook or the retarget, in
-`server/proxy.rs` for the openai path). Most of this was learned on ctp and
-ported as it stood.
+`server/proxy.rs` for the openai path). Policy routing runs first, so by the
+time a gate looks at a request the backend and the effective model are already
+decided ([policy.md](policy.md)); the gate reads them and never routes. Most of
+this was learned on ctp and ported as it stood.
 
 ## Only a request that could be the re-read is stopped
 
@@ -15,8 +17,8 @@ on its first request over a 484k re-read its predecessor had left four hours
 before. ctp had the same gap.
 
 So `decide_cold` takes `request_bound`, the request's own upper bound on its
-prompt (`force_newest::prompt_bound`: the body's bytes over two, two being below
-the least bytes-per-token observed on large requests). A bound under
+prompt (`policy::force_newest::prompt_bound`: the body's bytes over two, two
+being below the least bytes-per-token observed on large requests). A bound under
 `cold_min_tokens` forwards whatever the lane held, before the lane is consulted;
 an unknown bound decides nothing either way. A bound can only rule a request
 out, never in: the lane still has to be cold and large.
@@ -56,8 +58,9 @@ Three things keep it truthful, and removing any one breaks it invisibly:
   to about".
 
 The outlook reads only the routed backend's own meters, and prices the re-read
-as the identity the backend's model map will actually send, since the fit's
-weights are keyed on served identities and a client's alias is not one.
+as the effective model policy resolved (after any upgrade, compaction retarget
+and alias), since the fit's weights are keyed on served identities and a
+client's requested name is not one.
 
 The 7-day meter gets a veto but no estimate. The weights are fitted against
 5-hour windows and say nothing about a weekly one, but whether the weekly meter
@@ -174,7 +177,9 @@ advised, and the rewrite declined because the lane had been noticed, so a
 keystroke after the promise. Anything asking about the cache uses
 `lane_is_cold`; only the notice uses `decide_cold`. The retarget is gated on the
 compaction test and lane coldness alone, not on the notice's toggle, because the
-cold licence is the lane's.
+cold licence is the lane's. Which model a cold compaction moves to is the
+policy's compaction target; the cold gate keeps what it does to the body (the
+cache-write strip and the system merge, all or nothing).
 
 ## A lane's TTL is its longest-lived breakpoint
 
@@ -185,7 +190,10 @@ writes a small delta at the 5-minute tier on top of a prefix written at the
 notice at five and six minutes idle on caches that were plainly live. An
 unrecorded tier reads as the long one: guessing short fires on live caches (a
 false alarm costs the user a turn), guessing long only delays a true one. See
-[measuring.md](measuring.md).
+[measuring.md](measuring.md). The policy's lane transitions answer a different
+question and default the other way: a lane with no recorded TTL is unknown,
+never cold, because a wrong "cold" there loses a cache instead of costing a turn
+(see [lanes-and-cache.md](lanes-and-cache.md)).
 
 ## The notice is a record, not advice
 
