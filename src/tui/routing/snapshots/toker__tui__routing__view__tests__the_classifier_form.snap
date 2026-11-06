@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&adding(super::View::Rewrites, '2'))"
+---
+ ?  ⇄
+1 PRE┌ADD CLASSIFIER──────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │> id: new-classifier▏                                                                                       │
+┌REWR│  binding: anthropic_sub.anthropic_messages                                                                 │────┐
+│r-so│  MATCHES                                                                                                   │    │
+│gpt-│    kind: < regex >                                                                                         │    │
+│newe│    pattern: ^(?P<family>[a-z]+)-(?P<version>[0-9]+\.[0-9]+)$                                               │    │
+│    │  family template: ${family}                                                                                │    │
+│    │  version template: ${version}                                                                              │    │
+│    │  VERSION PARSER                                                                                            │    │
+│    │    kind: < numeric_tuple >                                                                                 │    │
+│    │    components: 2                                                                                           │    │
+│    │    separator: .                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

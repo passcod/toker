@@ -3,8 +3,9 @@
 //! Each template is the smallest record of its kind that the daemon accepts
 //! as an addition: it parses, passes the document's own checks, and carries a
 //! placeholder id. Anything that must name another record (a route behind a
-//! default, a classifier behind an upgrade) can still dangle, which the
-//! validate step reports, so the user edits the template before saving.
+//! default, a classifier behind an upgrade) can still dangle, which the form
+//! marks and the validate step reports, so the user fills the template in
+//! before saving.
 
 use serde_json::{Value, json};
 

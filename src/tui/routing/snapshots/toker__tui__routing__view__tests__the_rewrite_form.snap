@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&adding(super::View::Rewrites, '1'))"
+---
+ ?  ⇄
+1 PRE┌ADD REWRITE─────────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │> id: new-rewrite▏                                                                                          │
+┌REWR│  SCOPE                                                                                                     │────┐
+│r-so│    kind: < protocol >                                                                                      │    │
+│gpt-│    protocol: < openai_chat >                                                                               │    │
+│newe│  priority: 0                                                                                               │    │
+│    │  MATCHES                                                                                                   │    │
+│    │    kind: < exact >                                                                                         │    │
+│    │    value: model-name                                                                                       │    │
+│    │  ROUTE                                                                                                     │    │
+│    │    route: mixed                                                                                            │    │
+│    │    ARGUMENTS                                                                                               │    │
+│    │      + add argument                                                                                        │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

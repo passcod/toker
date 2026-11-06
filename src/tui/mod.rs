@@ -287,17 +287,23 @@ pub fn run(
         if let crossterm::event::Event::Mouse(mouse) = event {
             let at = ratatui::layout::Position::new(mouse.column, mouse.row);
             if page == Page::Routing {
-                // Both header actions remain available on both pages. The
-                // body stays keyboard-first until its editing forms land.
-                if mouse.kind
-                    == crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                {
-                    if drawn.legend_button.contains(at) {
-                        toggle_legend(&mut ui);
-                    } else if drawn.routing_button.contains(at) {
-                        page = Page::Dashboard;
-                        ui.legend = false;
+                // Both header actions remain available on both pages; the
+                // body takes clicks and the wheel for the list, the detail
+                // pane and an open form.
+                match mouse.kind {
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        if drawn.legend_button.contains(at) {
+                            toggle_legend(&mut ui);
+                        } else if drawn.routing_button.contains(at) {
+                            page = Page::Dashboard;
+                            ui.legend = false;
+                        } else {
+                            routing.click(at);
+                        }
                     }
+                    crossterm::event::MouseEventKind::ScrollDown => routing.wheel(at, 1),
+                    crossterm::event::MouseEventKind::ScrollUp => routing.wheel(at, -1),
+                    _ => {}
                 }
                 continue;
             }

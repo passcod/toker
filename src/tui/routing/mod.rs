@@ -2,6 +2,7 @@
 
 mod client;
 mod detail;
+mod form;
 mod import;
 mod model;
 mod reconcile;
@@ -20,7 +21,7 @@ pub use reconcile::SettingsSync;
 pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
     matches!(
         code,
-        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p' | 'i')
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'v' | 'V' | 'a' | 'x' | 'p' | 'i')
             | crossterm::event::KeyCode::PageUp
             | crossterm::event::KeyCode::PageDown
     )
@@ -31,6 +32,8 @@ pub(super) struct Page {
     client: Client,
     reconciler: Reconciler,
     state: State,
+    /// Where the last frame put things, for the mouse.
+    drawn: std::cell::RefCell<view::Drawn>,
 }
 
 impl Page {
@@ -40,6 +43,7 @@ impl Page {
             client,
             reconciler: Reconciler::new(settings),
             state: State::default(),
+            drawn: Default::default(),
         };
         page.refresh();
         // Revisions are independent data: load them eagerly, but never make an
@@ -109,7 +113,45 @@ impl Page {
     }
 
     pub(super) fn render(&self, frame: &mut ratatui::Frame, legend: bool) -> view::Drawn {
-        view::render(frame, &self.state, legend)
+        let drawn = view::render(frame, &self.state, legend);
+        self.drawn.replace(drawn.clone());
+        drawn
+    }
+
+    /// A left click in the body: focus the form field under it, or select
+    /// the entry. Both header buttons are the loop's.
+    pub(super) fn click(&mut self, at: ratatui::layout::Position) {
+        let drawn = self.drawn.borrow().clone();
+        if let Some(hit) = &drawn.form {
+            if hit.body.contains(at)
+                && let Some(Some(row)) = hit.rows.get(usize::from(at.y - hit.body.y))
+            {
+                self.state.focus_form_row(*row);
+            }
+            return;
+        }
+        if self.state.modal().active() {
+            return;
+        }
+        // Inside the list's border: one row down from its top edge.
+        if drawn.entries.contains(at) && at.y > drawn.entries.y {
+            self.state
+                .select(drawn.entries_offset + usize::from(at.y - drawn.entries.y - 1));
+        }
+    }
+
+    /// The wheel moves what is under the pointer: the form's focus, the
+    /// list's selection, or the detail pane.
+    pub(super) fn wheel(&mut self, at: ratatui::layout::Position, delta: i32) {
+        let drawn = self.drawn.borrow().clone();
+        if drawn.form.is_some() {
+            self.state.step_form(delta as isize);
+        } else if self.state.modal().active() {
+        } else if drawn.entries.contains(at) {
+            self.state.move_selection(delta as isize);
+        } else if drawn.detail.contains(at) {
+            self.state.scroll_detail(delta * 3);
+        }
     }
 }
 
@@ -121,7 +163,7 @@ mod tests {
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {
-        for key in ['e', 'n', 'd', 'm', 'v', 'V', 'a', 'x', 'p', 'i'] {
+        for key in ['e', 'n', 'd', 'v', 'V', 'a', 'x', 'p', 'i'] {
             assert!(owns_key(KeyCode::Char(key)), "{key}");
         }
         for key in [KeyCode::PageUp, KeyCode::PageDown] {

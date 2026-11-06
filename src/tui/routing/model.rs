@@ -1,10 +1,11 @@
 //! Content-free routing snapshot, draft editing, and navigation state.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use reqwest::Method;
 use serde_json::{Value, json};
 
 use super::client::{Command, Reply, Response};
+use super::form::{Context, Form, Outcome, Purpose};
 
 /// Lines a page key moves the detail pane.
 const DETAIL_PAGE: i32 = 10;
@@ -47,20 +48,9 @@ impl View {
 pub(super) enum Modal {
     #[default]
     None,
-    Description {
-        value: String,
-    },
-    /// Existing typed records serialize exactly as the daemon's typed DTOs.
-    /// This avoids lossy, path-addressed edits while still allowing every
-    /// current and future field to be changed from the terminal.
-    ///
-    /// `adding` marks a record that does not exist yet: it saves as an add
-    /// rather than a replacement, and the daemon refuses an id already taken.
-    Record {
-        key: String,
-        value: String,
-        adding: bool,
-    },
+    /// A typed form: a record's fields, the draft description, a promotion
+    /// or a preview's request facts.
+    Form(Box<Form>),
     /// Which kind of record to add, in a view that lists several.
     NewKind {
         kinds: &'static [&'static str],
@@ -69,14 +59,6 @@ pub(super) enum Modal {
     Remove {
         key: String,
         value: Value,
-    },
-    CandidateOrder {
-        route: Value,
-        selected: usize,
-    },
-    Preview {
-        field: usize,
-        values: Vec<String>,
     },
     PreviewResult(Value),
     Activate {
@@ -87,11 +69,6 @@ pub(super) enum Modal {
         revision_id: i64,
         scope: usize,
         force_cache_transition: bool,
-    },
-    Promote {
-        field: usize,
-        binding: String,
-        model: String,
     },
     /// Replace the draft with the compiled legacy `toker.toml` routing.
     Import,
@@ -109,16 +86,12 @@ impl Modal {
     pub(super) fn title(&self) -> &'static str {
         match self {
             Self::None => "",
-            Self::Description { .. } => "EDIT DRAFT DESCRIPTION",
-            Self::Record { adding: false, .. } => "EDIT TYPED POLICY RECORD",
-            Self::Record { adding: true, .. } => "ADD TYPED POLICY RECORD",
+            Self::Form(form) => form.title(),
             Self::NewKind { .. } => "ADD POLICY RECORD",
             Self::Remove { .. } => "REMOVE POLICY RECORD",
-            Self::CandidateOrder { .. } => "ORDER ROUTE CANDIDATES",
-            Self::Preview { .. } | Self::PreviewResult(_) => "ROUTING PREVIEW",
+            Self::PreviewResult(_) => "ROUTING PREVIEW",
             Self::Activate { .. } => "ACTIVATE DRAFT",
             Self::Reactivate { .. } => "REACTIVATE REVISION",
-            Self::Promote { .. } => "PROMOTE LEARNED MODEL",
             Self::Import => "IMPORT LEGACY CONFIG",
             Self::Conflict { .. } => "DRAFT CHANGED BY DAEMON",
         }
@@ -295,6 +268,29 @@ impl State {
 
     pub(super) fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// Select the entry at `index`, as a click does.
+    pub(super) fn select(&mut self, index: usize) {
+        let count = self.entries().len();
+        if index < count {
+            self.selected = index;
+            self.detail_scroll = 0;
+        }
+    }
+
+    /// Focus a field of the open form, as a click does.
+    pub(super) fn focus_form_row(&mut self, row: usize) {
+        if let Modal::Form(form) = &mut self.modal {
+            form.focus_row(row);
+        }
+    }
+
+    /// Move the open form's focus, as the wheel does.
+    pub(super) fn step_form(&mut self, delta: isize) {
+        if let Modal::Form(form) = &mut self.modal {
+            form.step(delta);
+        }
     }
 
     pub(super) fn entries(&self) -> Vec<Entry<'_>> {
@@ -582,10 +578,6 @@ impl State {
                 self.open_remove();
                 None
             }
-            KeyCode::Char('m') if self.view == View::Routes => {
-                self.open_candidate_order();
-                None
-            }
             KeyCode::Char('v') => {
                 self.open_preview();
                 None
@@ -627,10 +619,13 @@ impl State {
         if on_draft {
             let description = draft_policy(self.snapshot.as_ref().unwrap_or(&Value::Null))
                 .and_then(|policy| policy.get("description"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            self.modal = Modal::Description { value: description };
+                .cloned()
+                .unwrap_or(Value::Null);
+            self.modal = Modal::Form(Box::new(Form::new(
+                Purpose::Description,
+                json!({ "description": description }),
+                Context::default(),
+            )));
             return;
         }
         let selected = self
@@ -638,16 +633,69 @@ impl State {
             .get(self.selected)
             .map(|entry| (entry.key.to_owned(), entry.value.clone()));
         if let Some((record_key, value)) = selected {
-            if editable_key(&record_key) {
-                self.modal = Modal::Record {
-                    key: record_key,
-                    value: pretty(&value),
-                    adding: false,
-                };
-            } else {
-                self.error = Some("this item is not a draft policy record".to_owned());
+            match record_kind(&record_key) {
+                Some(kind) => {
+                    let context = self.form_context(kind, value.get("id").and_then(Value::as_str));
+                    self.modal = Modal::Form(Box::new(Form::new(
+                        Purpose::Record {
+                            kind,
+                            adding: false,
+                        },
+                        value,
+                        context,
+                    )));
+                }
+                None => self.error = Some("this item is not a draft policy record".to_owned()),
             }
         }
+    }
+
+    /// What a form completes from: the bindings toker implements, what the
+    /// catalogues offer, the draft's record ids, and the daemon's findings on
+    /// the record being edited, keyed by their path inside it.
+    fn form_context(&self, kind: &'static str, record_id: Option<&str>) -> Context {
+        let mut context = Context {
+            bindings: crate::routing::BACKEND_BINDINGS
+                .iter()
+                .map(|binding| binding.id_str().to_owned())
+                .collect(),
+            ..Context::default()
+        };
+        let Some(snapshot) = &self.snapshot else {
+            return context;
+        };
+        let text =
+            |value: &Value, name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);
+        context.offers = array(snapshot, "offers")
+            .iter()
+            .filter_map(|offer| Some((text(offer, "binding_id")?, text(offer, "model_id")?)))
+            .collect();
+        if let Some(policy) = draft_policy(snapshot) {
+            for collection in ["routes", "classifiers", "upgrades"] {
+                context.ids.insert(
+                    collection,
+                    array(policy, collection)
+                        .iter()
+                        .filter_map(|record| text(record, "id"))
+                        .collect(),
+                );
+            }
+        }
+        if let Some(record_id) = record_id {
+            // "/routes/7/chain/first/binding_id" is "chain/first/binding_id"
+            // inside the record.
+            let prefix = format!("/{kind}/");
+            context.diagnostics = array(snapshot, "draft_diagnostics")
+                .iter()
+                .filter(|diagnostic| text(diagnostic, "record_id").as_deref() == Some(record_id))
+                .filter_map(|diagnostic| {
+                    let path = text(diagnostic, "path")?;
+                    let inside = path.strip_prefix(&prefix)?.split_once('/')?.1.to_owned();
+                    Some((inside, text(diagnostic, "code")?))
+                })
+                .collect();
+        }
+        context
     }
 
     /// Start adding a record. A view that lists one kind goes straight to its
@@ -679,11 +727,12 @@ impl State {
             .and_then(|policy| array(policy, "routes").first())
             .and_then(|route| route.get("id"))
             .and_then(Value::as_str);
-        self.modal = Modal::Record {
-            key: kind.to_owned(),
-            value: pretty(&super::template::template(kind, route_id)),
-            adding: true,
-        };
+        let context = self.form_context(kind, None);
+        self.modal = Modal::Form(Box::new(Form::new(
+            Purpose::Record { kind, adding: true },
+            super::template::template(kind, route_id),
+            context,
+        )));
     }
 
     fn open_remove(&mut self) {
@@ -691,7 +740,7 @@ impl State {
             .entries()
             .get(self.selected)
             .map(|entry| (entry.key.to_owned(), entry.value.clone()));
-        if let Some((record_key, value)) = selected.filter(|(key, _)| editable_key(key)) {
+        if let Some((record_key, value)) = selected.filter(|(key, _)| record_kind(key).is_some()) {
             self.modal = Modal::Remove {
                 key: record_key,
                 value,
@@ -699,35 +748,12 @@ impl State {
         }
     }
 
-    fn open_candidate_order(&mut self) {
-        let selected = self
-            .entries()
-            .get(self.selected)
-            .filter(|entry| entry.key == "routes")
-            .map(|entry| entry.value.clone());
-        if let Some(route) = selected {
-            let count = candidate_count(&route);
-            if count > 1 {
-                self.modal = Modal::CandidateOrder { route, selected: 0 };
-            } else {
-                self.error = Some("a route needs at least two candidates to reorder".to_owned());
-            }
-        }
-    }
-
     fn open_preview(&mut self) {
-        self.modal = Modal::Preview {
-            field: 0,
-            values: vec![
-                "anthropic_messages".to_owned(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ],
-        };
+        self.modal = Modal::Form(Box::new(Form::new(
+            Purpose::Preview,
+            json!({ "protocol": "anthropic_messages", "prompt_bound": 0, "tool_count": 0 }),
+            Context::default(),
+        )));
     }
 
     fn open_activate(&mut self) {
@@ -760,91 +786,27 @@ impl State {
         }
     }
 
-    /// Fill the binding and model from the next daemon offer after the one
-    /// already entered (or the first), so a promotion names an offer that
-    /// exists rather than a typed guess.
-    fn complete_offer(&self, binding: &mut String, model: &mut String) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let offers = array(snapshot, "offers");
-        let current = offers.iter().position(|offer| {
-            offer.get("binding_id").and_then(Value::as_str) == Some(binding.as_str())
-                && offer.get("model_id").and_then(Value::as_str) == Some(model.as_str())
-        });
-        let next = current.map_or(0, |index| index + 1);
-        if let Some(offer) = offers.get(next % offers.len().max(1)) {
-            let text = |key: &str| offer.get(key).and_then(Value::as_str).unwrap_or_default();
-            *binding = text("binding_id").to_owned();
-            *model = text("model_id").to_owned();
-        }
-    }
-
     fn open_promote(&mut self) {
-        self.modal = Modal::Promote {
-            field: 0,
-            binding: String::new(),
-            model: String::new(),
-        };
+        let context = self.form_context("promote", None);
+        self.modal = Modal::Form(Box::new(Form::new(
+            Purpose::Promote,
+            json!({ "binding_id": "", "model_id": "" }),
+            context,
+        )));
     }
 
     fn modal_key(&mut self, key: KeyEvent) -> Option<Command> {
         let modal = std::mem::take(&mut self.modal);
         let (modal, action) = match modal {
             Modal::None => (Modal::None, ModalAction::None),
-            Modal::Description { mut value } => {
-                if key.code == KeyCode::Esc {
-                    return None;
+            Modal::Form(mut form) => match form.key(key) {
+                Outcome::Cancel => return None,
+                Outcome::Keep => (Modal::Form(form), ModalAction::None),
+                Outcome::Submit => {
+                    let action = form_action(&form);
+                    (Modal::Form(form), action)
                 }
-                if text_key(&mut value, key) {
-                    let description = if value.is_empty() {
-                        Value::Null
-                    } else {
-                        Value::String(value.clone())
-                    };
-                    (
-                        Modal::Description { value },
-                        ModalAction::Edit(vec![json!({
-                            "kind": "set_description", "description": description,
-                        })]),
-                    )
-                } else {
-                    (Modal::Description { value }, ModalAction::None)
-                }
-            }
-            Modal::Record {
-                key: record_key,
-                mut value,
-                adding,
-            } => {
-                let mut action = ModalAction::None;
-                if key.code == KeyCode::Esc {
-                    return None;
-                } else if key.code == KeyCode::Enter
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    match serde_json::from_str::<Value>(&value) {
-                        Ok(record) => {
-                            action = ModalAction::Edit(vec![if adding {
-                                add_edit(&record_key, record)
-                            } else {
-                                replace_edit(&record_key, record)
-                            }]);
-                        }
-                        Err(error) => self.error = Some(format!("record JSON: {error}")),
-                    }
-                } else {
-                    text_key(&mut value, key);
-                }
-                (
-                    Modal::Record {
-                        key: record_key,
-                        value,
-                        adding,
-                    },
-                    action,
-                )
-            }
+            },
             Modal::NewKind { kinds, preselected } => {
                 let chosen = match key.code {
                     KeyCode::Esc => return None,
@@ -884,58 +846,6 @@ impl State {
                     ModalAction::None,
                 ),
             },
-            Modal::CandidateOrder {
-                mut route,
-                mut selected,
-            } => {
-                let count = candidate_count(&route);
-                let action = match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
-                        ModalAction::None
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        selected = (selected + 1).min(count.saturating_sub(1));
-                        ModalAction::None
-                    }
-                    KeyCode::Char('h') => {
-                        move_candidate(&mut route, selected, -1);
-                        ModalAction::None
-                    }
-                    KeyCode::Char('l') => {
-                        move_candidate(&mut route, selected, 1);
-                        ModalAction::None
-                    }
-                    KeyCode::Enter | KeyCode::Char('y') => {
-                        ModalAction::Edit(vec![replace_edit("routes", route.clone())])
-                    }
-                    KeyCode::Esc => return None,
-                    _ => ModalAction::None,
-                };
-                (Modal::CandidateOrder { route, selected }, action)
-            }
-            Modal::Preview {
-                mut field,
-                mut values,
-            } => {
-                let action = match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
-                        field = (field + 1) % values.len();
-                        ModalAction::None
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        field = (field + values.len() - 1) % values.len();
-                        ModalAction::None
-                    }
-                    KeyCode::Enter => ModalAction::Preview(values.clone()),
-                    KeyCode::Esc => return None,
-                    _ => {
-                        text_key(&mut values[field], key);
-                        ModalAction::None
-                    }
-                };
-                (Modal::Preview { field, values }, action)
-            }
             Modal::PreviewResult(_) => (Modal::None, ModalAction::None),
             Modal::Activate {
                 mut scope,
@@ -1004,43 +914,6 @@ impl State {
                     action,
                 )
             }
-            Modal::Promote {
-                mut field,
-                mut binding,
-                mut model,
-            } => {
-                let action = match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
-                        field = (field + 1) % 2;
-                        ModalAction::None
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        field = (field + 1) % 2;
-                        ModalAction::None
-                    }
-                    KeyCode::Enter => ModalAction::Promote {
-                        binding: binding.clone(),
-                        model: model.clone(),
-                    },
-                    KeyCode::Esc => return None,
-                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.complete_offer(&mut binding, &mut model);
-                        ModalAction::None
-                    }
-                    _ => {
-                        text_key(if field == 0 { &mut binding } else { &mut model }, key);
-                        ModalAction::None
-                    }
-                };
-                (
-                    Modal::Promote {
-                        field,
-                        binding,
-                        model,
-                    },
-                    action,
-                )
-            }
             Modal::Import => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => (Modal::Import, ModalAction::Import),
                 KeyCode::Esc | KeyCode::Char('n') => return None,
@@ -1076,7 +949,7 @@ impl State {
         match action {
             ModalAction::None => None,
             ModalAction::Edit(edits) => self.edit(edits),
-            ModalAction::Preview(values) => self.preview(&values),
+            ModalAction::Preview(facts) => self.preview(&facts),
             ModalAction::Activate { scope, force } => self.activate(scope, force),
             ModalAction::Reactivate {
                 revision_id,
@@ -1152,21 +1025,25 @@ impl State {
         ))
     }
 
-    fn preview(&mut self, values: &[String]) -> Option<Command> {
+    /// The preview request from the form's facts: only what was filled in.
+    fn preview(&mut self, facts: &Value) -> Option<Command> {
         self.in_flight = true;
-        let optional_number = |index: usize| values[index].parse::<u64>().ok();
         let mut body = json!({
             "expected_generation": self.generation,
-            "protocol": values[0],
+            "protocol": facts.get("protocol").cloned().unwrap_or(Value::Null),
         });
-        for (key, index) in [("profile", 1), ("model", 2), ("lane_key", 3)] {
-            if !values[index].is_empty() {
-                body[key] = Value::String(values[index].clone());
+        for key in ["profile", "model", "lane_key"] {
+            if let Some(text) = facts
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                body[key] = Value::String(text.to_owned());
             }
         }
-        for (key, index) in [("prompt_bound", 4), ("message_count", 5), ("tool_count", 6)] {
-            if let Some(value) = optional_number(index) {
-                body[key] = Value::from(value);
+        for key in ["prompt_bound", "message_count", "tool_count"] {
+            if let Some(number) = facts.get(key).and_then(Value::as_u64) {
+                body[key] = Value::from(number);
             }
         }
         Some(command(
@@ -1231,7 +1108,7 @@ impl State {
 enum ModalAction {
     None,
     Edit(Vec<Value>),
-    Preview(Vec<String>),
+    Preview(Value),
     Activate {
         scope: usize,
         force: bool,
@@ -1304,17 +1181,19 @@ fn generation(snapshot: &Value) -> Option<u64> {
         .or_else(|| snapshot.get("generation").and_then(Value::as_u64))
 }
 
-fn editable_key(key: &str) -> bool {
-    matches!(
-        key,
-        "presentations"
-            | "routes"
-            | "defaults"
-            | "rewrites"
-            | "classifiers"
-            | "upgrades"
-            | "compaction"
-    )
+/// The collection a list entry belongs to, if it is a draft policy record.
+fn record_kind(key: &str) -> Option<&'static str> {
+    [
+        "presentations",
+        "routes",
+        "defaults",
+        "rewrites",
+        "classifiers",
+        "upgrades",
+        "compaction",
+    ]
+    .into_iter()
+    .find(|kind| *kind == key)
 }
 
 fn replace_edit(key: &str, value: Value) -> Value {
@@ -1520,75 +1399,37 @@ fn changed_records(snapshot: &Value) -> Vec<String> {
     changes
 }
 
-fn candidate_count(route: &Value) -> usize {
-    route
-        .get("chain")
-        .map(|chain| 1 + array(chain, "steps").len())
-        .unwrap_or(0)
+/// The edit a submitted form sends, or what it asks for.
+fn form_action(form: &Form) -> ModalAction {
+    let value = form.value();
+    match form.purpose() {
+        Purpose::Record { kind, adding } => ModalAction::Edit(vec![if adding {
+            add_edit(kind, value.clone())
+        } else {
+            replace_edit(kind, value.clone())
+        }]),
+        Purpose::Description => ModalAction::Edit(vec![json!({
+            "kind": "set_description",
+            "description": value.get("description").cloned().unwrap_or(Value::Null),
+        })]),
+        Purpose::Promote => ModalAction::Promote {
+            binding: text_of(value, "binding_id"),
+            model: text_of(value, "model_id"),
+        },
+        Purpose::Preview => ModalAction::Preview(value.clone()),
+    }
 }
 
-/// Reorders the candidates while every transition edge keeps its position in
-/// the chain.  The first candidate has no incoming edge, so a candidate moved
-/// to or from the front cannot carry one with it; keeping edges positional
-/// means every step always has the edge the daemon's step record requires,
-/// and the daemon stays the validator of whether the result is acceptable.
-fn move_candidate(route: &mut Value, selected: usize, delta: isize) {
-    let Some(chain) = route.get_mut("chain").and_then(Value::as_object_mut) else {
-        return;
-    };
-    let Some(steps) = chain.get("steps").and_then(Value::as_array) else {
-        return;
-    };
-    let Some(first) = chain.get("first") else {
-        return;
-    };
-    let mut candidates = vec![first.clone()];
-    let mut edges = Vec::with_capacity(steps.len());
-    for step in steps {
-        edges.push(step.get("edge").cloned().unwrap_or(Value::Null));
-        candidates.push(step.get("candidate").cloned().unwrap_or(Value::Null));
-    }
-    let destination = selected
-        .saturating_add_signed(delta)
-        .min(candidates.len().saturating_sub(1));
-    if selected >= candidates.len() || destination == selected {
-        return;
-    }
-    let candidate = candidates.remove(selected);
-    candidates.insert(destination, candidate);
-    let mut candidates = candidates.into_iter();
-    let first = candidates.next().unwrap_or(Value::Null);
-    let steps = edges
-        .into_iter()
-        .zip(candidates)
-        .map(|(edge, candidate)| json!({ "edge": edge, "candidate": candidate }))
-        .collect();
-    chain.insert("first".to_owned(), first);
-    chain.insert("steps".to_owned(), Value::Array(steps));
-}
-
-fn text_key(value: &mut String, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Enter => true,
-        KeyCode::Esc => false,
-        KeyCode::Backspace => {
-            value.pop();
-            false
-        }
-        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            value.push(character);
-            false
-        }
-        _ => false,
-    }
+fn text_of(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn activation_scope(index: usize) -> &'static str {
     ["new_lanes", "new_and_cold_lanes", "immediate"][index.min(2)]
-}
-
-fn pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
 }
 
 fn control_error(command: &Command, response: &Response) -> String {
@@ -1617,8 +1458,9 @@ fn control_error(command: &Command, response: &Response) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Modal, State, View, candidate_count, move_candidate};
+    use super::{Modal, State, View};
     use crate::tui::routing::client::{Command, Reply, Response};
+    use crate::tui::routing::form::Purpose;
     use reqwest::Method;
 
     fn snapshot() -> serde_json::Value {
@@ -1680,20 +1522,6 @@ mod tests {
         assert_eq!(body["edit"]["operations"][0]["description"], "mine");
     }
 
-    #[test]
-    fn candidate_reordering_keeps_every_explicit_transition_record() {
-        let mut route = snapshot()["draft"]["policy"]["routes"][0].clone();
-        assert_eq!(candidate_count(&route), 2);
-        move_candidate(&mut route, 1, -1);
-        assert_eq!(route["chain"]["first"]["id"], "two");
-        assert_eq!(route["chain"]["steps"][0]["candidate"]["id"], "one");
-        assert_eq!(
-            route["chain"]["steps"][0]["edge"],
-            serde_json::json!({"preflight": "enabled"}),
-            "every step keeps an edge, so the daemon can read the route back"
-        );
-    }
-
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(state: &mut State, code: KeyCode) -> Option<Command> {
@@ -1704,6 +1532,25 @@ mod tests {
         for character in text.chars() {
             assert!(press(state, KeyCode::Char(character)).is_none());
         }
+    }
+
+    /// The open form's purpose, if a form is open.
+    fn form_purpose(state: &State) -> Option<Purpose> {
+        match state.modal() {
+            Modal::Form(form) => Some(form.purpose()),
+            _ => None,
+        }
+    }
+
+    fn record_form(kind: &'static str, adding: bool) -> Option<Purpose> {
+        Some(Purpose::Record { kind, adding })
+    }
+
+    fn form_value(state: &State) -> serde_json::Value {
+        let Modal::Form(form) = state.modal() else {
+            panic!("a form is open");
+        };
+        form.value().clone()
     }
 
     fn loaded(body: serde_json::Value) -> State {
@@ -1883,14 +1730,14 @@ mod tests {
             assert!(!state.modal().active(), "{key} closes on Esc");
         }
         press(&mut state, KeyCode::Char('e'));
-        assert!(matches!(state.modal(), Modal::Record { .. }));
+        assert_eq!(form_purpose(&state), record_form("presentations", false));
         press(&mut state, KeyCode::Esc);
         assert!(!state.modal().active());
         state.set_view(View::Status);
         // Entry 0 is the active revision; the draft follows it.
         state.move_selection(1);
         press(&mut state, KeyCode::Char('e'));
-        assert!(matches!(state.modal(), Modal::Description { .. }));
+        assert_eq!(form_purpose(&state), Some(Purpose::Description));
         press(&mut state, KeyCode::Esc);
         assert!(
             !state.modal().active(),
@@ -1913,31 +1760,56 @@ mod tests {
     }
 
     #[test]
-    fn a_record_edit_sends_the_typed_replacement_and_rejects_bad_json() {
+    fn a_record_edit_sends_the_typed_replacement() {
         let mut state = loaded(full_snapshot());
         state.set_view(View::Routes);
         press(&mut state, KeyCode::Char('e'));
-        let Modal::Record { value, .. } = state.modal().clone() else {
-            panic!("record form");
-        };
-        assert!(value.contains("\"changed\""));
-        // Corrupt the JSON: the form stays open, shows why, sends nothing.
-        typed(&mut state, "}");
-        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert!(state.key(ctrl_enter).is_none());
-        assert!(
-            state
-                .error()
-                .is_some_and(|error| error.starts_with("record JSON"))
-        );
-        assert!(matches!(state.modal(), Modal::Record { .. }));
-        // A backspace restores valid JSON, which saves as a typed replace.
-        press(&mut state, KeyCode::Backspace);
-        let command = state.key(ctrl_enter).expect("edit command");
+        assert_eq!(form_purpose(&state), record_form("routes", false));
+        assert_eq!(form_value(&state)["id"], "changed");
+        // The id names the record the edit replaces, so it is fixed.
+        typed(&mut state, "x");
+        assert_eq!(form_value(&state)["id"], "changed");
+        // Move to the route's name and change it.
+        press(&mut state, KeyCode::Down);
+        typed(&mut state, "named");
+        let command = state.key(CTRL_ENTER).expect("edit command");
         assert_eq!(command.method, reqwest::Method::PATCH);
         let operation = &command.body.expect("body")["edit"]["operations"][0];
         assert_eq!(operation["kind"], "replace_route");
         assert_eq!(operation["id"], "changed");
+        assert_eq!(operation["route"]["display_name"], "named");
+        // What the schema does not name is carried through as it was.
+        assert_eq!(operation["route"]["chain"]["first"]["id"], "b");
+    }
+
+    /// Daemon diagnostics against the record being edited mark its fields.
+    #[test]
+    fn a_form_marks_the_fields_the_daemon_flagged() {
+        let mut body = full_snapshot();
+        body["draft_diagnostics"] = serde_json::json!([
+            {"code": "binding-unconfigured", "severity": "info", "record_id": "changed",
+             "path": "/routes/0/chain/first/binding_id"},
+            {"code": "other", "severity": "info", "record_id": "someone-else",
+             "path": "/routes/3/chain/first/binding_id"},
+        ]);
+        let mut state = loaded(body);
+        state.set_view(View::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        let Modal::Form(form) = state.modal() else {
+            panic!("a form");
+        };
+        let marked = form
+            .lines()
+            .into_iter()
+            .filter(|line| line.text.contains("! binding-unconfigured"))
+            .count();
+        assert_eq!(marked, 1);
+        assert!(
+            !form
+                .lines()
+                .iter()
+                .any(|line| line.text.contains("! other"))
+        );
     }
 
     #[test]
@@ -2046,21 +1918,43 @@ mod tests {
                 .error()
                 .is_some_and(|error| error.contains("both required"))
         );
-        let complete = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
-        assert!(state.key(complete).is_none());
-        let Modal::Promote { binding, model, .. } = state.modal().clone() else {
-            panic!("promote form");
-        };
-        assert_eq!(
-            (binding.as_str(), model.as_str()),
-            ("openrouter.chat", "vendor/one")
-        );
-        // A second completion moves to the next offer.
-        state.key(complete);
+        assert_eq!(form_purpose(&state), Some(Purpose::Promote));
+        // A binding is typed, or completed from the ones toker implements;
+        // a model completes from what that binding offers.
+        typed(&mut state, "openrouter.chat");
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(form_value(&state)["model_id"], "vendor/one");
+        // A second Tab moves to the next offer.
+        press(&mut state, KeyCode::Tab);
         let command = press(&mut state, KeyCode::Enter).expect("promotion");
         let body = command.body.expect("body");
         assert_eq!(body["binding_id"], "openrouter.chat");
         assert_eq!(body["model_id"], "vendor/two");
+    }
+
+    #[test]
+    fn the_preview_form_sends_only_the_facts_that_were_filled_in() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('v'));
+        assert_eq!(form_purpose(&state), Some(Purpose::Preview));
+        // protocol, then profile, model, lane key, prompt bound.
+        press(&mut state, KeyCode::Right);
+        assert_eq!(form_value(&state)["protocol"], "openai_chat");
+        press(&mut state, KeyCode::Down);
+        typed(&mut state, "work");
+        for _ in 0..3 {
+            press(&mut state, KeyCode::Down);
+        }
+        typed(&mut state, "5000");
+        let command = press(&mut state, KeyCode::Enter).expect("preview");
+        let body = command.body.expect("body");
+        assert_eq!(command.name, "preview");
+        assert_eq!(body["protocol"], "openai_chat");
+        assert_eq!(body["profile"], "work");
+        assert_eq!(body["prompt_bound"], 5000);
+        assert!(body.get("model").is_none());
+        assert!(body.get("message_count").is_none());
     }
 
     #[test]
@@ -2264,11 +2158,12 @@ mod tests {
     fn adding_a_presentation_sends_the_typed_addition_at_the_loaded_generation() {
         let mut state = loaded(full_snapshot());
         assert!(press(&mut state, KeyCode::Char('n')).is_none());
-        let Modal::Record { key, value, adding } = state.modal().clone() else {
-            panic!("a one-kind view opens the template directly");
-        };
-        assert_eq!((key.as_str(), adding), ("presentations", true));
-        assert!(value.contains("new-presentation"), "{value}");
+        assert_eq!(
+            form_purpose(&state),
+            record_form("presentations", true),
+            "a one-kind view opens the template directly"
+        );
+        assert_eq!(form_value(&state)["id"], "new-presentation");
         let command = state.key(CTRL_ENTER).expect("add command");
         assert_eq!(command.name, "draft-edit");
         assert_eq!(command.method, Method::PATCH);
@@ -2288,34 +2183,31 @@ mod tests {
     }
 
     #[test]
-    fn an_added_record_is_the_text_that_was_edited_not_the_template() {
+    fn an_added_record_is_what_was_typed_into_the_form() {
         let mut state = loaded(full_snapshot());
         press(&mut state, KeyCode::Char('n'));
-        let Modal::Record { value, .. } = state.modal().clone() else {
-            panic!("record form");
-        };
-        // Clear the template, then type a record of our own.
-        for _ in 0..value.chars().count() {
+        for _ in 0.."new-presentation".len() {
             press(&mut state, KeyCode::Backspace);
         }
-        typed(&mut state, r#"{"id":"mine","slug":"m"}"#);
+        typed(&mut state, "mine");
         let command = state.key(CTRL_ENTER).expect("add command");
         let operation = &command.body.expect("body")["edit"]["operations"][0];
         assert_eq!(operation["presentation"]["id"], "mine");
+        assert_eq!(operation["presentation"]["slug"], "new-model");
     }
 
     #[test]
-    fn a_bad_new_record_stays_open_and_sends_nothing() {
+    fn a_blank_id_stays_open_and_sends_nothing() {
         let mut state = loaded(full_snapshot());
         press(&mut state, KeyCode::Char('n'));
-        typed(&mut state, "}");
+        for _ in 0.."new-presentation".len() {
+            press(&mut state, KeyCode::Backspace);
+        }
         assert!(state.key(CTRL_ENTER).is_none());
-        assert!(
-            state
-                .error()
-                .is_some_and(|error| error.starts_with("record JSON"))
-        );
-        assert!(matches!(state.modal(), Modal::Record { adding: true, .. }));
+        let Modal::Form(form) = state.modal() else {
+            panic!("the form stays open");
+        };
+        assert_eq!(form.note(), Some("id is empty"));
         assert!(!state.in_flight());
         press(&mut state, KeyCode::Esc);
         assert!(!state.modal().active());
@@ -2348,8 +2240,9 @@ mod tests {
                 "detail": refusal.to_string(),
             }),
         ));
-        assert!(
-            matches!(state.modal(), Modal::Record { adding: true, .. }),
+        assert_eq!(
+            form_purpose(&state),
+            record_form("routes", true),
             "the form stays open so the id can be changed"
         );
         assert!(!state.in_flight());
@@ -2395,10 +2288,11 @@ mod tests {
         assert!(press(&mut state, KeyCode::Char('x')).is_none());
         assert!(matches!(state.modal(), Modal::NewKind { .. }));
         press(&mut state, KeyCode::Enter);
-        let Modal::Record { key, adding, .. } = state.modal().clone() else {
-            panic!("Enter picks the preselected kind");
-        };
-        assert_eq!((key.as_str(), adding), ("routes", true));
+        assert_eq!(
+            form_purpose(&state),
+            record_form("routes", true),
+            "Enter picks the preselected kind"
+        );
         press(&mut state, KeyCode::Esc);
 
         // With the cursor on a default, a default is the preselected kind.
@@ -2416,7 +2310,7 @@ mod tests {
         press(&mut state, KeyCode::Char('9'));
         assert!(matches!(state.modal(), Modal::NewKind { .. }));
         press(&mut state, KeyCode::Char('2'));
-        assert!(matches!(state.modal(), Modal::Record { key, .. } if key == "defaults"));
+        assert_eq!(form_purpose(&state), record_form("defaults", true));
     }
 
     #[test]
@@ -2431,7 +2325,7 @@ mod tests {
         ] {
             press(&mut state, KeyCode::Char('n'));
             press(&mut state, KeyCode::Char(digit));
-            assert!(matches!(state.modal(), Modal::Record { key, .. } if key == kind));
+            assert_eq!(form_purpose(&state), record_form(kind, true));
             let command = state.key(CTRL_ENTER).expect("add command");
             assert_eq!(
                 command.body.expect("body")["edit"]["operations"][0]["kind"],
@@ -2451,10 +2345,7 @@ mod tests {
         state.set_view(View::Routes);
         press(&mut state, KeyCode::Char('n'));
         press(&mut state, KeyCode::Char('2'));
-        let Modal::Record { value, .. } = state.modal().clone() else {
-            panic!("record form");
-        };
-        let template: serde_json::Value = serde_json::from_str(&value).expect("JSON template");
+        let template = form_value(&state);
         assert_eq!(template["target"]["route_id"], "route-a");
         let command = state.key(CTRL_ENTER).expect("add command");
         let operation = &command.body.expect("body")["edit"]["operations"][0];
@@ -2474,6 +2365,6 @@ mod tests {
         press(&mut state, KeyCode::Char('y'));
         assert!(state.in_flight());
         press(&mut state, KeyCode::Char('n'));
-        assert!(!matches!(state.modal(), Modal::Record { .. }));
+        assert!(form_purpose(&state).is_none());
     }
 }

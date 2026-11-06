@@ -5,20 +5,33 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
 
+use super::form::Form;
 use super::model::{Entry, Modal, State, View};
 use super::template::singular;
 
 /// The page areas that the loop needs for click handling.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Drawn {
     pub(crate) legend_button: Rect,
     pub(crate) routing_button: Rect,
     pub(super) tabs: Rect,
     pub(super) entries: Rect,
+    pub(super) detail: Rect,
+    /// How many entries are scrolled off the top of the list.
+    pub(super) entries_offset: usize,
+    /// Where an open form's fields are, for clicks.
+    pub(super) form: Option<FormHit>,
+}
+
+/// An open form's visible lines: the field each focuses, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FormHit {
+    pub(super) body: Rect,
+    pub(super) rows: Vec<Option<usize>>,
 }
 
 pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
@@ -45,9 +58,13 @@ pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
             .map(|(index, entry)| ListItem::new(entry_summary(entry)).style(selected(index, state)))
             .collect()
     };
-    frame.render_widget(
+    // The list scrolls to keep the selection in sight; the offset is kept
+    // so a click can name the entry it lands on.
+    let mut list_state = ListState::default().with_selected(Some(state.selected()));
+    frame.render_stateful_widget(
         List::new(rows).block(Block::bordered().title(state.view().title())),
         master,
+        &mut list_state,
     );
 
     let lines = detail_lines(state, entries.get(state.selected()));
@@ -81,14 +98,19 @@ pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
     if legend {
         render_legend(frame);
     }
-    if state.modal().active() {
-        render_modal(frame, state);
-    }
+    let form = if state.modal().active() {
+        render_modal(frame, state)
+    } else {
+        None
+    };
     Drawn {
         legend_button,
         routing_button,
         tabs,
         entries: master,
+        detail,
+        entries_offset: list_state.offset(),
+        form,
     }
 }
 
@@ -244,8 +266,11 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unrenderable>".to_owned())
 }
 
-fn render_modal(frame: &mut Frame, state: &State) {
+fn render_modal(frame: &mut Frame, state: &State) -> Option<FormHit> {
     let modal = state.modal();
+    if let Modal::Form(form) = modal {
+        return Some(render_form(frame, state, form));
+    }
     let lines = modal_text(state);
     let width = lines
         .iter()
@@ -269,6 +294,56 @@ fn render_modal(frame: &mut Frame, state: &State) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+    None
+}
+
+/// A form fills most of the screen: its fields in a window that follows the
+/// focus, then its key help and the last refusal.
+fn render_form(frame: &mut Frame, state: &State, form: &Form) -> FormHit {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).clamp(1, 110).min(area.width);
+    let height = area.height.saturating_sub(2).max(1).min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(form.title());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+
+    let lines = form.lines();
+    let visible = usize::from(body.height);
+    let focused = lines.iter().position(|line| line.focused).unwrap_or(0);
+    let start = focused
+        .saturating_sub(visible / 2)
+        .min(lines.len().saturating_sub(visible));
+    let shown: Vec<_> = lines.iter().skip(start).take(visible).collect();
+    let rendered: Vec<Line> = shown
+        .iter()
+        .map(|line| {
+            let style = if line.focused {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::new()
+            };
+            Line::styled(line.text.clone(), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rendered), body);
+
+    let mut notes = vec![Line::styled(form.help(), Style::new().dim())];
+    if let Some(note) = form.note().or_else(|| state.error()) {
+        notes.push(Line::styled(format!("! {note}"), Style::new().bold()));
+    }
+    frame.render_widget(Paragraph::new(notes), footer);
+    FormHit {
+        body,
+        rows: shown.iter().map(|line| line.row).collect(),
+    }
 }
 
 /// The modal's own lines, the impact summary an activation confirms against,
@@ -291,19 +366,8 @@ fn modal_text(state: &State) -> Vec<String> {
 fn modal_lines(modal: &Modal) -> Vec<String> {
     match modal {
         Modal::None => Vec::new(),
-        Modal::Description { value } => vec![
-            "Type a description; Enter saves, Esc cancels.".to_owned(),
-            value.clone(),
-        ],
-        Modal::Record { key, value, adding } => vec![
-            if *adding {
-                format!("{key}: fill in the new typed JSON record; its id must be unused.")
-            } else {
-                format!("{key}: edit its typed JSON record.")
-            },
-            "Ctrl+Enter saves; Esc cancels. The daemon validates all fields.".to_owned(),
-            value.clone(),
-        ],
+        // A form draws itself.
+        Modal::Form(_) => Vec::new(),
         Modal::NewKind { kinds, preselected } => {
             let mut lines = vec!["Add which kind of record? The number or Enter picks it.".to_owned()];
             lines.extend(kinds.iter().enumerate().map(|(index, kind)| {
@@ -318,22 +382,6 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             short(value),
             "y/Enter confirms · n/Esc cancels".to_owned(),
         ],
-        Modal::CandidateOrder { route, selected } => vec![
-            "j/k choose candidate · h/l moves it · Enter saves typed route edit.".to_owned(),
-            "Transition edges keep their positions; the daemon validates the result.".to_owned(),
-            format!("selected candidate {}", selected + 1),
-            pretty(route),
-        ],
-        Modal::Preview { field, values } => {
-            let labels = ["protocol", "profile", "model", "lane key", "prompt bound", "message count", "tool count"];
-            let mut lines = vec![
-                "Content-free request facts only. Tab selects; Enter previews; Esc cancels.".to_owned(),
-            ];
-            lines.extend(labels.into_iter().zip(values).enumerate().map(|(index, (label, value))| {
-                if index == *field { format!("> {label}: {value}") } else { format!("  {label}: {value}") }
-            }));
-            lines
-        }
         Modal::PreviewResult(result) => vec![
             "Press any key to close.".to_owned(),
             pretty(result),
@@ -344,12 +392,6 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             lines.insert(1, "The active pointer never moves backwards.".to_owned());
             lines
         }
-        Modal::Promote { field, binding, model } => vec![
-            "Promotion records a binding-specific learned model; it does not activate a draft.".to_owned(),
-            if *field == 0 { format!("> binding: {binding}") } else { format!("  binding: {binding}") },
-            if *field == 1 { format!("> model: {model}") } else { format!("  model: {model}") },
-            "Tab selects · Ctrl+O completes from a daemon offer · Enter records · Esc cancels".to_owned(),
-        ],
         Modal::Import => vec![
             "Replace the current draft with the routing in toker.toml?".to_owned(),
             "The active revision does not change until the draft is activated.".to_owned(),
@@ -384,11 +426,14 @@ fn render_legend(frame: &mut Frame) {
         "1–4, ←/→  change routing view",
         "↑/↓, j/k  select an item; PgUp/PgDn scroll the detail",
         "n  add a record from a template (asks which kind where a view has several)",
-        "e  edit typed record; Ctrl+Enter saves JSON, in an add too",
-        "d  confirm removal; m orders route candidates",
+        "e  edit typed record in a form; Ctrl+S saves, Esc cancels",
+        "   in a form: ↑/↓ field · ←/→ change · Tab complete · Ctrl+D remove item",
+        "   Alt+↑/↓ moves a list item or candidate · Space toggles",
+        "d  confirm removal",
         "defaults (routes view) and compaction (rewrites view) take n, e and d",
         "v preview; V validate; a activate; x reactivate; p promote",
         "i  import legacy toker.toml routing into the draft (status view)",
+        "mouse: click selects an item or focuses a form field; the wheel scrolls",
         "A missing daemon endpoint leaves the loaded read-only view usable",
         "? or Esc closes",
     ];
@@ -538,6 +583,10 @@ mod tests {
             "defaults (routes view)",
             "i  import",
             "PgUp/PgDn scroll the detail",
+            "Ctrl+S saves",
+            "Tab complete",
+            "Alt+↑/↓ moves",
+            "the wheel scrolls",
         ] {
             assert!(text.contains(key_help), "{key_help}: {text}");
         }
@@ -778,5 +827,159 @@ mod tests {
         // Moving to another item starts it at the top.
         state.move_selection(1);
         assert_eq!(state.detail_scroll(), 0);
+    }
+
+    fn press_in(state: &mut State, code: crossterm::event::KeyCode) {
+        state.key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    /// Open the add form for the `digit`th kind of `view`.
+    fn adding(view: super::View, digit: char) -> State {
+        let mut state = page_in(view);
+        press_in(&mut state, crossterm::event::KeyCode::Char('n'));
+        if state.modal().title() == "ADD POLICY RECORD" {
+            press_in(&mut state, crossterm::event::KeyCode::Char(digit));
+        }
+        state
+    }
+
+    #[test]
+    fn the_route_form() {
+        let mut state = page_in(super::View::Routes);
+        press_in(&mut state, crossterm::event::KeyCode::Char('e'));
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_route_form_scrolled_to_a_later_field() {
+        let mut state = page_in(super::View::Routes);
+        press_in(&mut state, crossterm::event::KeyCode::Char('e'));
+        for _ in 0..24 {
+            press_in(&mut state, crossterm::event::KeyCode::Down);
+        }
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    #[test]
+    fn the_presentation_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Presentations, '1')));
+    }
+
+    #[test]
+    fn the_default_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Routes, '2')));
+    }
+
+    #[test]
+    fn the_rewrite_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '1')));
+    }
+
+    #[test]
+    fn the_classifier_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '2')));
+    }
+
+    #[test]
+    fn the_upgrade_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '3')));
+    }
+
+    #[test]
+    fn the_compaction_form() {
+        insta::assert_snapshot!(frame(&adding(super::View::Rewrites, '4')));
+    }
+
+    #[test]
+    fn the_promotion_and_preview_forms() {
+        let mut state = page_in(super::View::Status);
+        press_in(&mut state, crossterm::event::KeyCode::Char('p'));
+        insta::assert_snapshot!("the_promotion_form", frame(&state));
+        press_in(&mut state, crossterm::event::KeyCode::Esc);
+        press_in(&mut state, crossterm::event::KeyCode::Char('v'));
+        insta::assert_snapshot!("the_preview_form", frame(&state));
+    }
+
+    #[test]
+    fn a_form_with_completions_and_a_refusal() {
+        let mut state = page_in(super::View::Rewrites);
+        press_in(&mut state, crossterm::event::KeyCode::Char('n'));
+        press_in(&mut state, crossterm::event::KeyCode::Char('2'));
+        // The classifier's binding, searched for.
+        press_in(&mut state, crossterm::event::KeyCode::Down);
+        for _ in 0..40 {
+            press_in(&mut state, crossterm::event::KeyCode::Backspace);
+        }
+        for character in "codex".chars() {
+            press_in(&mut state, crossterm::event::KeyCode::Char(character));
+        }
+        let mut command = Command::snapshot();
+        command.name = "draft-edit";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 422,
+                body: serde_json::json!({"error": "invalid_policy_edit", "detail": "id already exists"}),
+            }),
+        ));
+        insta::assert_snapshot!(frame(&state));
+    }
+
+    /// A click on a form line focuses that field, and a click on a line that
+    /// is only a heading or a completion focuses nothing.
+    #[test]
+    fn a_click_focuses_the_field_on_its_line() {
+        let mut state = adding(super::View::Presentations, '1');
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("terminal");
+        let mut hit = None;
+        terminal
+            .draw(|frame| hit = render(frame, &state, false).form)
+            .expect("draw");
+        let hit = hit.expect("a form is open");
+        let lines = frame(&state);
+        let rows: Vec<&str> = lines.lines().skip(usize::from(hit.body.y)).collect();
+        let on = |needle: &str| {
+            rows.iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}"))
+        };
+        let slug = hit.rows[on("slug:")].expect("the slug line is a field");
+        assert!(hit.rows[on("SCOPE")].is_none(), "a heading is not a field");
+        state.focus_form_row(slug);
+        let focused: Vec<String> = match state.modal() {
+            super::Modal::Form(form) => form
+                .lines()
+                .into_iter()
+                .filter(|line| line.focused)
+                .map(|line| line.text)
+                .collect(),
+            _ => panic!("a form is open"),
+        };
+        assert_eq!(focused.len(), 1);
+        assert!(focused[0].contains("slug"), "{focused:?}");
+    }
+
+    #[test]
+    fn clicking_an_entry_selects_it_and_the_list_scrolls_to_the_selection() {
+        let mut state = page_in(super::View::Status);
+        state.select(2);
+        assert_eq!(state.selected(), 2);
+        // Out of range is ignored rather than clamped to a different entry.
+        state.select(99);
+        assert_eq!(state.selected(), 2);
+        // A short list keeps the selection in view through an offset.
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).expect("terminal");
+        let mut offset = 0;
+        state.select(5);
+        terminal
+            .draw(|frame| offset = render(frame, &state, false).entries_offset)
+            .expect("draw");
+        assert!(
+            offset > 0,
+            "row 5 does not fit in a 8-line terminal: {offset}"
+        );
     }
 }

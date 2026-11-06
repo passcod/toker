@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: frame(&state)
+---
+ ?  ⇄
+1 PRE┌EDIT ROUTE──────────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │> id: mixed▏  (fixed)                                                                                       │
+┌ROUT│  name: Subscription then billed                                                                            │────┐
+│mixe│  description: (none)                                                                                       │    │
+│defa│  PARAMETERS                                                                                                │    │
+│    │    + add parameter                                                                                         │    │
+│    │  CANDIDATES                                                                                                │    │
+│    │    candidate 1 sub                                                                                         │    │
+│    │      id: sub                                                                                               │    │
+│    │      binding: codex_sub.codex_responses                                                                    │    │
+│    │      MODEL                                                                                                 │    │
+│    │        kind: < exact >                                                                                     │    │
+│    │        model: gpt-example                                                                                  │    │
+│    │      upgrade policy: (none)                                                                                │s   │
+│    │      [ ] alias rules                                                                                       │    │
+│    │      REQUIRED CAPABILITIES                                                                                 │    │
+│    │        [ ] sampling                                                                                        │    │
+│    │        [ ] system in messages                                                                              │    │
+│    │        [ ] thinking replay                                                                                 │    │
+│    │        [ ] images                                                                                          │    │
+│    │        [ ] tools                                                                                           │    │
+│    │        [ ] tool choice none                                                                                │    │
+│    │        [ ] tool choice named                                                                               │    │
+│    │        [ ] tool choice unnamed                                                                             │    │
+│    │        [ ] tool choice other                                                                               │    │
+│    │      [x] enabled                                                                                           │    │
+│    │      HEALTH CIRCUITS                                                                                       │    │
+│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r

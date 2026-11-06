@@ -88,6 +88,30 @@ generation and offers, lane impacts, and every publication row. The diagnostics
 are computed against the live inventory on each call, so a draft that was valid
 last week and names a model that has since left a catalogue shows it.
 
+The snapshot also carries `derived`, which is what the routing page shows
+beside the records, computed here because the page has no store, registry or
+learning view. It holds `availability` (per binding: configured, enabled,
+credential, catalogue freshness, capabilities and cost class) and `circuits`
+(the health circuits open now), and for the active revision and, when it
+compiles, the draft (`derived.draft` is null when the draft does not):
+
+- `routes`: each route's candidates with their cost class, the lanes pinned
+  to it by cache temperature, and the edges between candidates with the cost
+  classes either side, whether the edge crosses from a subscription to billed or
+  unknown spend (`crosses_cost_boundary`) and the consent it carries. A
+  candidate with an enabled upgrade policy and a fixed model also carries the
+  election as a new lane would see it: the winner and why each other model lost
+  (`family_mismatch`, `not_newer`, `learning_minimum`, `context_fit`). It is
+  computed by the function the resolver elects with, not a copy.
+- `classifiers`: a few catalogue models each classifier parses (family and
+  version), and a few its matcher accepts but whose version it cannot read.
+- `presentations`: for each presentation and its frontend's adapter, whether it
+  is `listed` or `left_out` and why (`disabled`, `not_published`,
+  `offer_missing`, `no_codex_record`), and whether the active revision's
+  publication holds it (`applied`, null when the adapter has recorded nothing
+  to compare). The listing is what `/v1/models` would render, so the two cannot
+  disagree.
+
 `revisions` returns each revision's id, timestamps, description, activation
 scope, whether a forced cache transition was recorded, source (`legacy`,
 `draft`, `reactivation`), parent, and fingerprint, but not its document.
@@ -227,15 +251,38 @@ the compaction policy; and a status view for preview, revisions and activation.
 It is built from the endpoints above and holds no state of its own beyond the
 last snapshot and the user's typed input.
 
+- The detail pane lays out the selected item from the snapshot: a route's
+  candidates in order with what each can take now, the cost class either side
+  of each edge with a mark where it crosses to billed spend, and its pinned
+  lanes; a presentation's desired and applied state per adapter; a
+  classifier's parse examples; an upgrade's winner and rejections; a binding's
+  availability and open circuits; and the daemon's diagnostics against the
+  record. PgUp and PgDn scroll it. Activation lists the edges whose
+  cost-boundary crossing or consent differs between the draft and the active
+  revision, beside the changed records and lane impact.
 - `n` adds a record, `e` edits the selected one and `d` removes it, for every
   kind the first three views list, defaults and the compaction policy included.
-  `n` opens the record's JSON as a template for the user to fill in (after
-  asking which kind, in a view that lists several), and an edit opens the
-  existing record. Ctrl+Enter saves either as one typed operation, `add_*` or
-  `replace_*`; a removal sends `remove_*` after a confirmation. A default is
-  addressed by its scope and the compaction policy by being the only one. A refused add (an id or scope already taken, say)
-  leaves the form open with the daemon's `detail`, and a 409 takes the conflict
-  path like any other edit.
+  Adding and editing open a form built from the record's shape: text fields
+  with a cursor, enum choices, a union's kind (a matcher's exact, glob or
+  regex; a presentation's source; a candidate's model) which keeps the fields
+  two kinds share, switches, optional groups, ordered lists, an argument map
+  and a route's candidate chain, where Alt+Up and Alt+Down move a candidate
+  while every fallback edge keeps its place. Binding, model and record-id
+  fields complete with Tab from the bindings toker implements, the offers of
+  the field's own binding and the draft's records; a value that is not offered
+  is kept and marked. `n` starts from a template (after asking which kind, in a
+  view that lists several). Ctrl+S saves as one typed operation, `add_*` or
+  `replace_*`; the form is the same record the daemon's types take, and keys
+  the form does not name pass through unchanged. An existing record's id (a
+  default's scope) is fixed, because the edit addresses the record by it. A
+  removal sends `remove_*` after a confirmation. A default is addressed by its
+  scope and the compaction policy by being the only one. A refused add (an id or
+  scope already taken, say) leaves the form open with the daemon's `detail`, and
+  a 409 takes the conflict path like any other edit. The draft's diagnostics
+  against the record mark the fields they name. Promotion, the draft
+  description and preview are short forms of the same kind.
+- The mouse selects an entry, focuses a form field and scrolls the pane under
+  the pointer.
 
 - All traffic runs on one worker thread with a small bounded queue. Key presses
   only enqueue; the terminal never waits on HTTP, and a daemon that is down or

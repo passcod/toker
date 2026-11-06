@@ -1,0 +1,36 @@
+---
+source: src/tui/routing/view.rs
+expression: "frame(&adding(super::View::Rewrites, '4'))"
+---
+ ?  ⇄
+1 PRE┌ADD COMPACTION──────────────────────────────────────────────────────────────────────────────────────────────┐ & AC
+     │  ROUTE                                                                                                     │
+┌REWR│>   route: mixed▏                                                                                           │────┐
+│r-so│    Tab: mixed                                                                                              │    │
+│gpt-│    ARGUMENTS                                                                                               │    │
+│newe│      + add argument                                                                                        │    │
+│    │  lane transition: < move_when_cold >                                                                       │    │
+│    │  cache transition: < allow_when_cold >                                                                     │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │                                                                                                            │    │
+│    │Up/Down field · Left/Right change · Tab complete · Ctrl+S saves · Esc cancels                               │    │
+│    │                                                                                                            │    │
+└────└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘────┘
+draft 4 · ←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r
