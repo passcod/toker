@@ -1560,7 +1560,6 @@ mod tests {
         DEFAULT_OPENAI_API_KEY_ENV, DEFAULT_OPENAI_API_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM,
         DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources, OpenRouterConfig,
     };
-    use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
     use std::collections::HashMap;
@@ -2094,18 +2093,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("codex map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-5"),
-            Some("gpt-5.6-sol")
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-4-5-20251101"),
-            Some("special-opus"),
-            "the exact selector beats the family one"
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-sonnet-5"),
-            Some("claude-sonnet-5"),
-            "an unmatched model is the identity"
+            codex_map.entries().collect::<Vec<_>>(),
+            vec![
+                ("model:claude-opus-4-5", "special-opus"),
+                ("family:haiku", "gpt-5.6-luna"),
+                ("family:opus", "gpt-5.6-sol"),
+            ]
         );
         let sub_map = config
             .anthropic_sub
@@ -2115,16 +2108,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("sub map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(sub_map), "claude-opus-4-5"),
-            Some("claude-opus-4-8")
+            sub_map.entries().collect::<Vec<_>>(),
+            vec![("family:opus", "claude-opus-4-8")]
         );
         // A backend with no block carries no policy, and one backend's
         // map never answers for another's.
         assert_eq!(config.anthropic_api, None);
-        assert_eq!(
-            model_map::preview_mapped_model(None, "claude-opus-5"),
-            Some("claude-opus-5")
-        );
 
         // A present table with bad selector syntax fails the load naming
         // its provider block — a typo'd policy must not silently read as
@@ -2173,16 +2162,16 @@ auth_path = "~/.codex/auth.json"
             "an empty table is an explicitly empty policy"
         );
         assert_eq!(
-            model_map::preview_mapped_model(
-                config
-                    .codex_sub
-                    .as_ref()
-                    .expect("enabled")
-                    .model_map
-                    .as_ref(),
-                "claude-opus-5"
-            ),
-            Some("claude-opus-5")
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .model_map
+                .as_ref()
+                .expect("empty policy")
+                .entries()
+                .count(),
+            0
         );
     }
 

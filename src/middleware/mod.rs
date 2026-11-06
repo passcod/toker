@@ -1,11 +1,12 @@
 //! Route-scoped middleware chain.
 //!
-//! Plan: "Middleware" — frontend×backend routes enable toggles: recording +
-//! costing, lane tracking + sleep lock, cold gate, compaction retarget,
-//! force-newest model rewrite, model routing map, quota gate + release marker
-//! stripping, ping tagging. Middleware transforms the IR; the backend adapter
-//! serialises the result. There is no passthrough code path — passthrough is
-//! what the IR produces when nothing transforms it.
+//! Recording and costing, lane tracking and the sleep lock, the cold gate and
+//! compaction retarget, the quota gate with release marker stripping, ping
+//! tagging. Middleware transforms the canonical request; the backend adapter
+//! serialises the result. There is no passthrough code path: passthrough is
+//! what the canonical form produces when nothing transforms it. Which model a
+//! request goes to is not decided here: policy (`crate::policy`) owns routing,
+//! aliases and force-newest upgrades.
 //!
 //! The decision middlewares, each a faithful port of the predecessor proxy:
 //!
@@ -24,10 +25,9 @@
 //!   Linux → `systemd-inhibit --what=idle --mode=block`), the detached
 //!   PID-watching child, the 5-minute retry backoff, and the held/want
 //!   flip bookkeeping — Linux v1, idle-only on purpose;
-//! - [`model_map`] — the model routing map: opaque
-//!   operator routing policy, the pure parse/match/rewrite interface the
-//!   `route-identity` parity case pins (config and server wiring are the
-//!   model-routing unit's);
+//! - [`model_map`] — the config's `model_map` tables, parsed once at load for
+//!   revision one's generator, and the lexical splice that writes policy's
+//!   effective models into `count_tokens` and batch bodies;
 //! - [`system_change`] — capture-time system-prompt change localisation:
 //!   the lane's previous row from the ledger, the change bounded to a
 //!   block, an 8 KiB step or a tail window, and the rule that keeps the

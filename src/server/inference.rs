@@ -131,7 +131,6 @@ impl InferenceAttempt {
             &mut self.canonical,
             compaction_model,
             true,
-            None,
         )?;
         self.effective_model.clone_from(&self.canonical.model);
         Some(outcome)

@@ -595,10 +595,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         .unwrap_or_default(),
                     transform_applied: {
                         let mut probe = request.clone();
-                        crate::middleware::canonical::retarget_compaction(
-                            &mut probe, None, true, None,
-                        )
-                        .is_some()
+                        crate::middleware::canonical::retarget_compaction(&mut probe, None, true)
+                            .is_some()
                     },
                 });
             }
