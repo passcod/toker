@@ -3178,6 +3178,36 @@ api_key = "sk-test"
         address
     }
 
+    /// Revision one's document for this config, from a throwaway server: the
+    /// route registry is the only thing it takes from one.
+    fn revision_one_document(config: &Config) -> crate::policy::PolicyDocument {
+        let scratch = Server::with_seams(
+            config.clone(),
+            Arc::new(Store::open(":memory:").expect("scratch store")),
+            Seams::isolated(),
+        )
+        .expect("scratch server builds");
+        crate::policy::legacy::document(&scratch.config, &scratch.registry)
+            .expect("legacy document")
+    }
+
+    /// A server whose revision one is this edited document rather than the
+    /// one its config generates. Activated before the server is built, so the
+    /// constructor loads it instead of establishing its own.
+    fn server_under_revision_one(
+        config: Config,
+        document: crate::policy::PolicyDocument,
+    ) -> (Server, Arc<Store>) {
+        let document = document.validate().expect("policy validates");
+        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
+        store
+            .activate_revision_one(&document, 2, 0, &[])
+            .expect("activate policy fixture");
+        let server =
+            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
+        (server, store)
+    }
+
     async fn policy_chat_fallback_server() -> (Server, ChatBodies, ChatBodies) {
         policy_chat_fallback_server_with_openrouter_key(true).await
     }
@@ -3243,11 +3273,7 @@ api_key = "sk-ant-test"
         )
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
-        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server =
-            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
-            .expect("legacy document");
+        let mut document = revision_one_document(&config);
         let route_id =
             crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
                 .unwrap();
@@ -3303,38 +3329,7 @@ api_key = "sk-ant-test"
                 health_circuits: vec![],
             },
         });
-        let document = document.validate().expect("policy validates");
-        let revision = store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("active Chat fallback test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("insert revision");
-        let catalogs = crate::catalog::FetchedCatalogs::default();
-        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
-        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
-            store,
-            server.registry.clone(),
-            &revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(super::availability_for(&server.registry, &catalogs)),
-        )));
+        let (server, _store) = server_under_revision_one(config, document);
         (server, primary, backup)
     }
 
@@ -3372,11 +3367,7 @@ api_key = "sk-proj-test"
         )
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
-        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server =
-            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
-            .expect("legacy document");
+        let mut document = revision_one_document(&config);
         let openai_route =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
         for default in &mut document.defaults {
@@ -3402,38 +3393,7 @@ api_key = "sk-proj-test"
             .model = crate::policy::CandidateModel::Exact {
             model_id: "policy-effective".to_owned(),
         };
-        let document = document.validate().expect("policy validates");
-        let revision = store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("active Chat test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("insert revision");
-        let catalogs = crate::catalog::FetchedCatalogs::default();
-        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
-        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
-            store,
-            server.registry.clone(),
-            &revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(super::availability_for(&server.registry, &catalogs)),
-        )));
+        let (server, _store) = server_under_revision_one(config, document);
         (server, seen)
     }
 
@@ -4155,33 +4115,14 @@ api_key = "sk-proj-test"
 
         let dir = crate::setup::test_dir("translated-chat-pin");
         let server = server(&dir);
-        let document = crate::policy::PolicyDocument {
-            format_version: crate::policy::CURRENT_FORMAT_VERSION,
-            description: None,
-            defaults: vec![],
-            presentations: vec![],
-            routes: vec![],
-            rewrites: vec![],
-            classifiers: vec![],
-            upgrades: vec![],
-            compaction: None,
-        }
-        .validate()
-        .expect("policy validates");
-        let revision = server
-            .store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("translated Chat pin test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Draft,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("revision");
+        // Pins name the active revision: one the server did not activate
+        // would not be the one its lanes are written under.
+        let revision_id = server
+            .policy_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.capture())
+            .and_then(|snapshot| snapshot.revision_id())
+            .expect("the server has an active revision");
         let make_record = |session: &str, binding: &str, model: &str| {
             let binding_id = BindingId::new(binding).expect("binding");
             let target = server
@@ -4189,7 +4130,7 @@ api_key = "sk-proj-test"
                 .resolve_binding(ProtocolId::OpenAiChat, &binding_id, Some(model), model)
                 .expect("configured translated Chat target");
             let pin = PinIdentity {
-                policy_revision_id: revision.revision_id,
+                policy_revision_id: revision_id,
                 policy_route_id: RouteId::new(format!("route-{session}")).expect("route"),
                 route_fingerprint: "11"
                     .repeat(32)
