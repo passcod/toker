@@ -147,6 +147,35 @@ pub fn render_policy(
             None => virtual_slugs.push(slug.to_owned()),
         }
     }
+    // Revision one authors presentations for the claude picker only. The
+    // other frontends list what the legacy projection listed, from the
+    // generated publication, under the slug a presentation does not hold.
+    let presented: std::collections::BTreeSet<String> = exact
+        .iter()
+        .map(|offer| offer.routed_model_id.clone())
+        .collect();
+    for (slug, binding_id, model_id) in policy.generated_publication(protocol) {
+        if presented.contains(slug)
+            || virtual_slugs
+                .iter()
+                .any(|virtual_slug| virtual_slug == slug)
+        {
+            continue;
+        }
+        let Some(offer) = inventory.get(binding_id, model_id) else {
+            return PolicyPublication::Unresolved;
+        };
+        exact.push(ModelOffer {
+            provider: offer.provider.clone(),
+            backend_model_id: offer.backend_model_id.clone(),
+            routed_model_id: slug.to_owned(),
+            binding: offer.binding.clone(),
+            context_window: offer.context_window,
+            chronology: offer.chronology,
+            fetched_at_ms: offer.fetched_at_ms,
+            raw: offer.raw.clone(),
+        });
+    }
     exact.sort_by(|left, right| left.routed_model_id.cmp(&right.routed_model_id));
     match protocol {
         crate::policy::FrontendProtocol::OpenaiChat => {

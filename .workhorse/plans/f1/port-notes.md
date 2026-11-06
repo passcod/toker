@@ -58,8 +58,8 @@ Seams::isolated())`; `FetchedCatalogs::listing` works there too.
 | Upstream got the stored key where the test expected the client's | A held key replaces whatever credential the client brought (openrouter, see `providers/openrouter.rs`). | Assert the stored key, or drop the stored key to test pass-through. Both directions are in `auth_passes_through_when_present_and_injects_when_absent`. |
 | `policy_routing.is_none()` assertions | Every row now carries policy provenance. | Assert `is_some()`; assert fields only when the test is about them. |
 | `store.load_lanes().is_empty()` | Policy pins a lane (`pin: Some(..)`) even for providers with no cache clock. | Assert the lane has no `ttl`/`prompt_tokens` instead of no lane. |
-| `GET /v1/models` forwarded to the upstream / byte-identical body | `/v1/models` is a local projection of the revision's publication; nothing is forwarded. | Assert local answer and that the mock saw nothing. Revision one publishes only the picker rows (`/f/claude/v1/models`, needs an openrouter catalogue matching the default picker rules, e.g. `z-ai/glm-5.3` gives `openrouter/z-ai/glm-5.3`). The Chat listing is empty under revision one. |
-| `x-toker-not-configured` marker / 404 not-configured expected | Policy answers its own way: no default for the protocol gives 502 "could not resolve", a disabled provider or no backend for an administrative path gives 503 `api_error`/server_error. The marker is no longer emitted on these paths. | Assert the policy answer and that nothing reached the upstream. A disabled-prefix refusal leaves one `route-unavailable` row. |
+| `GET /v1/models` forwarded to the upstream / byte-identical body | `/v1/models` is a local projection of the revision's publication; nothing is forwarded. | Assert local answer and that the mock saw nothing. Revision one publishes the picker rows for the claude profile (`/f/claude/v1/models`, needs an openrouter catalogue matching the default picker rules, e.g. `z-ai/glm-5.3` gives `openrouter/z-ai/glm-5.3`) and, from its generated publication, the legacy listing for Chat (`<provider>/<id>`, and `<id>` for the default provider) and Responses (codex slugs). |
+| `x-toker-not-configured` marker / 404 not-configured expected | Policy answers its own way: no default for the protocol gives 502 "could not resolve", a disabled provider or no backend for an administrative path gives 503 `api_error`/server_error. The marker is emitted again when the protocol has no default route (the 502 and the administrative 503), not for a route that exists but is unavailable. | Assert the policy answer and that nothing reached the upstream. A disabled-prefix refusal leaves one `route-unavailable` row. |
 | Unknown to `Server::with_shadow_observer` / `CollectingObserver` | Shadow mode is gone from construction (`policy_shadow` is always `None`). | Delete the observer assertions; see below. |
 | Revision id 2 where a test expects 1 | See Constructors. | Activate before building the server. |
 | Config rejected at construction | `establish_revision_one` runs `config.validate()`: a default naming a disabled backend fails. | Fix the config. |
@@ -117,6 +117,12 @@ proxy,record,record_anthropic,attempt,cancel,control}.rs` test modules,
 server without an active revision (they compile and pass today).
 
 ## Findings the pilot surfaced (decide, do not just port around)
+
+Resolved since: model-less administrative requests, the clockless pinned
+lane, compaction downgrade columns, the `/model` switch, the not-configured
+marker and the Chat and Responses listings. Still open: the untranslatable
+streaming body (plain 400, no row). The entries below are the original
+findings, kept for their reasoning.
 
 - Under revision one `/v1/models` for a Chat profile (opencode) lists nothing:
   `render_policy` renders presentations only, and revision one has none for

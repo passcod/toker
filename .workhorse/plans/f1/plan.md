@@ -111,9 +111,10 @@ policy path and what the legacy path did.
 
 - [x] Policy's not-configured answers lost `x-toker-not-configured`, which
       `setup/verify.rs` reads: restore it (or teach verify the new answers)
-- [ ] Revision one has no Chat presentations, so `/v1/models` on a Chat profile
-      (opencode) lists nothing and a missing catalogue reads as an empty
-      picker: decide whether revision-one generation should author them
+- [x] Revision one has no Chat presentations, so `/v1/models` on a Chat profile
+      (opencode) lists nothing: revision one's generated publication (the
+      legacy projection, listed but never routed) now renders for Chat and
+      Responses; no presentations were authored, see `port-notes.md`
 - [ ] Sessions mid-conversation with provider-owned state (signed thinking,
       codex reasoning items) on an unpinned lane at upgrade fail closed with
       unknown binding affinity until restarted; accepted under the no-seeding

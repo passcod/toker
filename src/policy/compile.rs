@@ -68,6 +68,10 @@ pub struct CompiledPolicy {
     routes: BTreeMap<RouteId, CompiledRoute>,
     presentations: BTreeMap<ScopeKey, BTreeMap<String, CompiledPresentation>>,
     publication: BTreeMap<ScopeKey, BTreeSet<String>>,
+    /// Revision one's inventory listing for the frontends it authors no
+    /// presentations for: slug to the offer it names. These are published
+    /// by `/v1/models` and never matched when routing a request.
+    generated_offers: BTreeMap<ScopeKey, BTreeMap<String, (BindingId, String)>>,
     rewrites: BTreeMap<ScopeKey, Vec<CompiledRewrite>>,
     defaults: BTreeMap<ScopeKey, CompiledRouteReference>,
     classifiers: BTreeMap<ClassifierId, CompiledClassifier>,
@@ -226,18 +230,45 @@ impl CompiledPolicy {
         expanded
     }
 
+    /// Publish `offers` (slug, binding, backend model) to every profile of
+    /// `protocol`. They are listed but never routed: a request naming one
+    /// still resolves through the rewrites and defaults, which keep the
+    /// upgrade and alias policy of the route they reach.
     pub(crate) fn add_generated_publication(
         &mut self,
         protocol: FrontendProtocol,
-        slugs: impl IntoIterator<Item = String>,
+        offers: impl IntoIterator<Item = (String, BindingId, String)>,
     ) {
-        self.publication
-            .entry(ScopeKey {
+        let key = ScopeKey {
+            profile: None,
+            protocol,
+        };
+        for (slug, binding_id, model_id) in offers {
+            self.publication
+                .entry(key.clone())
+                .or_default()
+                .insert(slug.clone());
+            self.generated_offers
+                .entry(key.clone())
+                .or_default()
+                .insert(slug, (binding_id, model_id));
+        }
+    }
+
+    /// The generated listing for one protocol. A slug a presentation also
+    /// publishes is the presentation's to render.
+    pub fn generated_publication(
+        &self,
+        protocol: FrontendProtocol,
+    ) -> impl Iterator<Item = (&str, &BindingId, &str)> {
+        self.generated_offers
+            .get(&ScopeKey {
                 profile: None,
                 protocol,
             })
-            .or_default()
-            .extend(slugs);
+            .into_iter()
+            .flatten()
+            .map(|(slug, (binding_id, model_id))| (slug.as_str(), binding_id, model_id.as_str()))
     }
 }
 
@@ -696,6 +727,7 @@ impl<'a> Compiler<'a> {
                 routes,
                 presentations,
                 publication,
+                generated_offers: BTreeMap::new(),
                 rewrites,
                 defaults,
                 classifiers,

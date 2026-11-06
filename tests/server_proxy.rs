@@ -996,6 +996,36 @@ async fn models_lists_the_active_revisions_publication_locally_and_unledgered() 
     assert_eq!(store.count_requests().expect("count"), 0);
 }
 
+/// A Chat frontend (opencode) lists what the Chat default can route: each
+/// model under its provider prefix, and bare because openrouter is the
+/// default. Revision one authors no Chat presentations; the listing is its
+/// generated publication, and publishing a slug does not route it.
+#[tokio::test]
+async fn a_chat_profile_lists_the_default_backends_models() {
+    let (mock, upstream) = spawn_mock().await;
+    let listing = serde_json::json!({"data": [{"id": "z-ai/glm-5.3", "created": 7}]});
+    let catalog = toker::catalog::fetched::parse_openrouter(&listing, 1).expect("catalog");
+    let (addr, _store) = spawn_toker_cataloged(keyed_config(upstream), "openrouter", catalog).await;
+
+    for path in ["/f/opencode/v1/models", "/v1/models"] {
+        let response = client()
+            .get(toker_url(addr, path))
+            .send()
+            .await
+            .expect("models request");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: Value = response.json().await.expect("models JSON");
+        let ids: Vec<_> = body["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(ids, ["openrouter/z-ai/glm-5.3", "z-ai/glm-5.3"], "{path}");
+    }
+    assert!(mock.captured().is_empty(), "never forwarded upstream");
+}
+
 #[tokio::test]
 async fn chat_never_carries_an_anthropic_credential_to_openrouter() {
     let (mock, upstream) = spawn_mock().await;

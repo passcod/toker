@@ -119,7 +119,13 @@ pub fn compile_document(
                 protocol.into(),
                 offers::for_frontend_inventory(topology, inventory, protocol)
                     .into_iter()
-                    .map(|offer| offer.routed_model_id),
+                    .map(|offer| {
+                        (
+                            offer.routed_model_id,
+                            offer.binding.id().clone(),
+                            offer.backend_model_id,
+                        )
+                    }),
             );
         }
     }
@@ -1035,6 +1041,56 @@ mod tests {
                 .all(|slug| policy.presentation(&scope, slug).is_none()),
             "inventory publication must not become request-routing presentations"
         );
+    }
+
+    #[test]
+    fn chat_listing_renders_the_generated_publication() {
+        let config = load_config(
+            "default_backend_openai_chat = \"openrouter\"\n\
+             [providers.openrouter]\n",
+        );
+        let topology = topology(&config);
+        let mut catalogs = FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: 7,
+                models: vec![FetchedModel {
+                    id: "lab/one".to_owned(),
+                    context_window: Some(100),
+                    chronology: None,
+                    raw: json!({"id": "lab/one", "created": 3}),
+                }],
+            },
+        );
+        let inventory = offers::inventory(&topology, &catalogs);
+        let compilation = compile(&config, &topology, &inventory).unwrap();
+        let policy = compilation.policy().expect("compiled");
+
+        // Prefixed, and bare because openrouter is the Chat default.
+        let offers::PolicyPublication::Ready(listing) =
+            offers::render_policy(policy, &inventory, None, FrontendProtocol::OpenaiChat)
+        else {
+            panic!("the inventory resolves every generated slug");
+        };
+        let ids: Vec<_> = listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["lab/one", "openrouter/lab/one"]);
+
+        // A Messages frontend has no generated listing to add.
+        let offers::PolicyPublication::Ready(messages) = offers::render_policy(
+            policy,
+            &inventory,
+            None,
+            FrontendProtocol::AnthropicMessages,
+        ) else {
+            panic!("an empty publication resolves");
+        };
+        assert!(messages["data"].as_array().unwrap().is_empty());
     }
 
     #[test]

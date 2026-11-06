@@ -36,9 +36,8 @@ use toker::middleware::model_map;
 use toker::policy::{
     ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
     CandidateEdge, CandidateId, CandidateModel, DefaultRoute, FailureClass, FallbackPermission,
-    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument, Presentation,
-    PresentationSource, REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference,
-    RouteStep,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
+    REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
 };
 use toker::routing::{ANTHROPIC_API_MESSAGES, CODEX_SUB_RESPONSES, OPENROUTER_RESPONSES};
 use toker::server::Server;
@@ -967,51 +966,9 @@ async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     serve_toker(server, store, dir).await
 }
 
-/// A Responses frontend that publishes the codex catalogue, under a custom
-/// revision: revision one authors presentations for the claude picker only,
-/// so a codex profile needs its own to list anything.
-fn codex_publication_policy() -> toker::policy::ValidatedPolicyDocument {
-    let mut policy = messages_codex_fallback_policy_with_model("gpt-5.6-sol").into_document();
-    // Only the codex model is in the catalogue, so a fallback to a model
-    // that is not would fail compilation.
-    policy.routes[0].chain.steps.clear();
-    let scope = FrontendScope::Profile {
-        profile: id("codex"),
-        protocol: FrontendProtocol::OpenaiResponses,
-    };
-    for (name, slug) in [
-        ("prefixed", "codex_sub/gpt-5.6-sol"),
-        ("bare", "gpt-5.6-sol"),
-    ] {
-        policy.presentations.push(Presentation {
-            id: id(name),
-            scope: scope.clone(),
-            slug: slug.to_owned(),
-            label: None,
-            description: None,
-            enabled: true,
-            // Both slugs are the provider's own spelling of the model, which
-            // a presentation may only publish with this consent.
-            shadow_native: true,
-            source: PresentationSource::ExactOffer {
-                binding_id: CODEX_SUB_RESPONSES.id().clone(),
-                model_id: "gpt-5.6-sol".to_owned(),
-            },
-            metadata: None,
-        });
-    }
-    policy.validate().unwrap()
-}
-
-async fn spawn_toker_cataloged(
-    fixture: TestConfig,
-    policy: toker::policy::ValidatedPolicyDocument,
-) -> (SocketAddr, Arc<Store>) {
+async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    store
-        .activate_revision_one(&policy, 1, 0, &[])
-        .expect("activate policy fixture");
     let raw = json!({
         "models": [{
             "slug": "gpt-5.6-sol",
@@ -1073,11 +1030,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, _store) = spawn_toker_cataloged(
-        test_config("models", upstream, false),
-        codex_publication_policy(),
-    )
-    .await;
+    let (addr, _store) = spawn_toker_cataloged(test_config("models", upstream, false)).await;
 
     let response = client()
         .get(format!("http://{addr}/f/codex/v1/models"))
