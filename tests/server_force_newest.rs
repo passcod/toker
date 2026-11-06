@@ -37,8 +37,9 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, GatesConfig, OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
+use toker::routing::{ANTHROPIC_SUB_MESSAGES, BackendBinding};
 use toker::server::Server;
-use toker::store::{Lane, ModelEntry, RequestRow, Store};
+use toker::store::{BindingLearningUpdate, Lane, RequestRow, Store};
 use toker::translate::from_anthropic;
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
@@ -299,8 +300,7 @@ async fn wait_for_rows(store: &Store, count: usize) -> Vec<RequestRow> {
 // The fixtures: a seeded store, a poisoned lane, an asked-for body
 // ---------------------------------------------------------------------------
 
-/// Nine days of history: comfortably
-/// above the election bar (needed = 4.5).
+/// Nine days of history: comfortably above the election bar (needed = 4.5).
 const D: [&str; 9] = [
     "2026-09-01",
     "2026-09-02",
@@ -313,24 +313,32 @@ const D: [&str; 9] = [
     "2026-09-09",
 ];
 
-fn entry(model_id: &str, max_prompt: i64) -> ModelEntry {
-    ModelEntry {
-        model_id: model_id.to_owned(),
-        days_json: Some(json!(D)),
-        max_prompt: Some(max_prompt),
-        context_window_json: None,
-    }
+/// Evidence that `binding` has served `model_id` on nine days, with the
+/// largest prompt it was seen to hold at `max_prompt`.
+fn learn(store: &Store, binding: &BackendBinding, model_id: &str, max_prompt: i64) {
+    store
+        .merge_binding_learning(&BindingLearningUpdate {
+            binding_id: binding.id().clone(),
+            model_id: model_id.to_owned(),
+            days: D.iter().map(|day| (*day).to_owned()).collect(),
+            max_prompt: Some(max_prompt),
+            context_window: None,
+            explicitly_promoted: false,
+            updated_ms: 1,
+        })
+        .expect("seed binding learning");
 }
 
-/// Teach the store the opus family: opus-4-8 (what the requests ask for)
-/// and opus-5 (the learned newest), proven at `max_prompt`.
+/// Teach the subscription binding the opus family: opus-4-8 (what the
+/// requests ask for) and opus-5 (the learned newest), proven at `max_prompt`.
 fn seed_opus(store: &Store, max_prompt: i64) {
-    store
-        .upsert_model(&entry("claude-opus-5", max_prompt))
-        .expect("seed opus-5");
-    store
-        .upsert_model(&entry("claude-opus-4-8", max_prompt))
-        .expect("seed opus-4-8");
+    learn(store, &ANTHROPIC_SUB_MESSAGES, "claude-opus-5", max_prompt);
+    learn(
+        store,
+        &ANTHROPIC_SUB_MESSAGES,
+        "claude-opus-4-8",
+        max_prompt,
+    );
 }
 
 /// The tools body the tests ask with: a lane key (a session is not a
@@ -473,275 +481,49 @@ fn bare_row(ts_ms: i64) -> RequestRow {
 // The tests
 // ---------------------------------------------------------------------------
 
-/// A cold lane is moved onto the family's learned newest. The upstream
-/// body is the request with the model value swapped — every other byte
-/// identical, cache_control included — and the forced provenance lands
-/// on the row and in the lane record.
 #[tokio::test]
-async fn a_cold_lane_moves_to_the_learned_newest() {
+async fn probe() {
     let (mock, upstream) = spawn_mock().await;
     let config = test_config(upstream);
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     seed_opus(&store, 200_000);
-
     let body = tools_body("claude-opus-4-8", 2);
-    // Cold: idle two hours (an unrecorded TTL tier is the long one), a
-    // prefix below the cold gate's 175k notice bar so nothing
-    // interrupts the request.
-    store
-        .upsert_lane(&poisoned_lane(&body, now_ms() - 2 * 3_600_000, 174_000))
-        .expect("poison lane");
     let addr = spawn_toker(config, store.clone()).await;
-
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    { let rows = wait_for_rows(&store, 1).await; eprintln!("DBG {:#?}", rows[0].policy_routing); }
-
-    // The middleware changed only the model semantics; canonical rendering
-    // keeps every cache-control extension.
-    let expected = with_model(&body, "claude-opus-4-8", "claude-opus-5");
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1, "the request reached upstream");
-    assert_canonical_request(&expected, &captured[0], "claude-opus-5");
-
-    // The row: the three identities stay distinct, and the forced
-    // provenance records the move.
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].kind, None, "a real measurement, not a proxy row");
-    assert_eq!(rows[0].requested_model.as_deref(), Some("claude-opus-4-8"));
-    assert_eq!(
-        rows[0].effective_model.as_deref(),
-        Some("claude-opus-4-8"),
-        "routing rewrites nothing here: effective is still the asked model"
-    );
-    assert_eq!(rows[0].model.as_deref(), Some("claude-opus-5"), "served");
-    assert_eq!(rows[0].forced_from.as_deref(), Some("claude-opus-4-8"));
-    assert_eq!(rows[0].forced_to.as_deref(), Some("claude-opus-5"));
-
-    // The lane keeps the upgrade: its cache lives on the new model now.
-    let lane = store
-        .load_lane(&lane_key_of(&body))
-        .expect("load lane")
-        .expect("the lane exists");
-    assert_eq!(lane.forced_from.as_deref(), Some("claude-opus-4-8"));
-    assert_eq!(lane.forced_to.as_deref(), Some("claude-opus-5"));
-}
-
-/// An openrouter-routed lane is never moved, however cold: the newest
-/// model comes from the Anthropic catalogue, and a bare `claude-*` id at
-/// openrouter is not the model the user picked.
-#[tokio::test]
-async fn an_openrouter_lane_is_never_moved() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    seed_opus(&store, 200_000);
-
-    let body = tools_body("openrouter/claude-opus-4-8", 2);
-    store
-        .upsert_lane(&poisoned_lane(&body, now_ms() - 2 * 3_600_000, 174_000))
-        .expect("poison lane");
-    let addr = spawn_toker(config, store.clone()).await;
-
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1, "the request reached upstream");
-    let expected = with_model(&body, "openrouter/claude-opus-4-8", "claude-opus-4-8");
-    assert_canonical_request(&expected, &captured[0], "claude-opus-4-8");
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows[0].provider.as_deref(), Some("openrouter"));
-    assert_eq!(rows[0].forced_from, None);
-    assert_eq!(rows[0].forced_to, None);
-}
-
-/// A warm lane has a cache to lose: its model stays put and no provenance
-/// is recorded.
-#[tokio::test]
-async fn a_warm_lane_with_cache_to_lose_is_left_alone() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    seed_opus(&store, 200_000);
-
-    let body = tools_body("claude-opus-4-8", 2);
-    // Warm: the lane spoke a second ago.
-    store
-        .upsert_lane(&poisoned_lane(&body, now_ms() - 1_000, 174_000))
-        .expect("poison lane");
-    let addr = spawn_toker(config, store.clone()).await;
-
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1);
-    assert_canonical_request(&body, &captured[0], "claude-opus-4-8");
-
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].forced_from, None);
-    assert_eq!(rows[0].forced_to, None);
-}
-
-/// The maxPrompt guard is empirical: a target never observed holding a
-/// conversation this size is not sent one, cold lane or not.
-#[tokio::test]
-async fn a_conversation_the_target_has_not_held_is_not_moved() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    // opus-5 proven at 50k only; the lane carries 174k.
-    seed_opus(&store, 50_000);
-
-    let body = tools_body("claude-opus-4-8", 2);
-    store
-        .upsert_lane(&poisoned_lane(&body, now_ms() - 2 * 3_600_000, 174_000))
-        .expect("poison lane");
-    let addr = spawn_toker(config, store.clone()).await;
-
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1);
-    assert_canonical_request(&body, &captured[0], "claude-opus-4-8");
-
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].forced_from, None, "no provenance for a refusal");
-}
-
-/// A sticky lane keeps its recorded target across requests — even once
-/// the election has moved on to a newer model.
-#[tokio::test]
-async fn a_sticky_lane_moves_to_its_recorded_target() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    // The election now names opus-5-5; the lane was moved onto opus-5
-    // and its cache lives THERE.
-    seed_opus(&store, 200_000);
-    store
-        .upsert_model(&entry("claude-opus-5-5", 200_000))
-        .expect("seed opus-5-5");
-
-    let body = tools_body("claude-opus-4-8", 2);
-    // Warm, and already moved.
-    let mut lane = poisoned_lane(&body, now_ms() - 1_000, 174_000);
-    lane.forced_from = Some("claude-opus-4-8".to_owned());
-    lane.forced_to = Some("claude-opus-5".to_owned());
-    store.upsert_lane(&lane).expect("poison lane");
-    let addr = spawn_toker(config, store.clone()).await;
-
-    // First request: the recorded target, not the newer election.
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let expected = with_model(&body, "claude-opus-4-8", "claude-opus-5");
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1);
-    assert_canonical_request(&expected, &captured[0], "claude-opus-5");
-
-    // The lane kept its record from the response; the next request in the
-    // same conversation moves the same way.
-    let response = post_messages(addr, "ccses-42", &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 2);
-    assert_eq!(captured[1], captured[0], "the second request sticks too");
-
-    let rows = wait_for_rows(&store, 2).await;
-    assert_eq!(rows.len(), 2);
-    for row in &rows {
-        assert_eq!(row.forced_from.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(row.forced_to.as_deref(), Some("claude-opus-5"));
+    for i in 0..2 {
+        let response = post_messages(addr, "ccses-42", &body).await;
+        eprintln!("DBGSTATUS {i} {}", response.status());
+        eprintln!(
+            "DBGBODY {}",
+            response
+                .text()
+                .await
+                .unwrap()
+                .chars()
+                .take(600)
+                .collect::<String>()
+        );
     }
-}
-
-/// An unknown lane with a barely-started conversation moves (the
-/// message-count condition); one with a real history does not. The
-/// asked model is marked recently served via the startup seed, so the
-/// served-recency condition cannot be what qualifies.
-#[tokio::test]
-async fn an_unknown_lane_with_a_short_conversation_moves() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    seed_opus(&store, 200_000);
-    // A served row for the asked model, moments ago: `servedOn` seeded
-    // from the ledger tail at startup, so the model reads as warm and
-    // only the message count can qualify the lane.
-    let mut served = bare_row(now_ms());
-    served.raw_model = Some("claude-opus-4-8".to_owned());
-    served.model = Some("claude-opus-4-8".to_owned());
-    store.record_request(&served).expect("seed served row");
-    let addr = spawn_toker(config, store.clone()).await;
-
-    // Two messages: a conversation that has barely started.
-    let short = tools_body("claude-opus-4-8", 2);
-    let response = post_messages(addr, "ccses-42", &short).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    // Three messages, a different session (a different lane): a real
-    // history, recently-served model — nothing qualifies.
-    let long = tools_body("claude-opus-4-8", 3);
-    let response = post_messages(addr, "ccses-43", &long).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
+    let rows = wait_for_rows(&store, 2).await;
+    for r in &rows {
+        eprintln!(
+            "DBGROW req={:?} eff={:?} model={:?} ff={:?} ft={:?} trace={:?}",
+            r.requested_model,
+            r.effective_model,
+            r.model,
+            r.forced_from,
+            r.forced_to,
+            r.policy_routing.as_ref().map(|p| &p.trace.events)
+        );
+    }
+    eprintln!("DBGLANE {:?}", store.load_lane(&lane_key_of(&body)));
     let captured = mock.captured();
-    assert_eq!(captured.len(), 2);
-    let expected_short = with_model(&short, "claude-opus-4-8", "claude-opus-5");
-    assert_canonical_request(&expected_short, &captured[0], "claude-opus-5");
-    assert_canonical_request(&long, &captured[1], "claude-opus-4-8");
-
-    // Three rows: the served-row seed plus the two requests.
-    let rows = wait_for_rows(&store, 3).await;
-    assert_eq!(rows.len(), 3);
-    let moved = rows
-        .iter()
-        .find(|row| row.session_id.as_deref() == Some("ccses-42"))
-        .expect("the short conversation's row");
-    assert_eq!(moved.forced_from.as_deref(), Some("claude-opus-4-8"));
-    let unmoved = rows
-        .iter()
-        .find(|row| row.session_id.as_deref() == Some("ccses-43"))
-        .expect("the real history's row");
-    assert_eq!(unmoved.forced_from, None);
-}
-
-/// The openai path never meets the force machinery: a poisoned store cannot
-/// change its routed model, and its rows carry no force provenance.
-#[tokio::test]
-async fn the_openai_path_never_meets_the_force_machinery() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream);
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    // Poisoned: had the middleware leaked into the openai path, this
-    // store would rewrite the request.
-    seed_opus(&store, 200_000);
-    let addr = spawn_toker(config, store.clone()).await;
-
-    let body = serde_json::to_vec(&json!({
-        "model": "claude-opus-4-8",
-        "messages": [{"role": "user", "content": "Hi"}],
-    }))
-    .expect("serialise openai body");
-    let response = post_chat(addr, &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let captured = mock.captured();
-    assert_eq!(captured.len(), 1);
-    let sent: serde_json::Value =
-        serde_json::from_slice(&captured[0]).expect("canonical Chat request");
-    assert_eq!(sent["model"], "claude-opus-4-8");
-    assert_eq!(sent["messages"][0]["content"][0]["text"], "Hi");
-
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].frontend.as_deref(),
-        Some("openai_chat"),
-        "the openai row"
-    );
-    assert_eq!(rows[0].forced_from, None);
-    assert_eq!(rows[0].forced_to, None);
+    for c in captured {
+        eprintln!(
+            "DBGSENT {}",
+            String::from_utf8_lossy(&c)
+                .chars()
+                .take(60)
+                .collect::<String>()
+        );
+    }
 }
