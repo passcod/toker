@@ -6,13 +6,14 @@
 //! error rows are never priced, hangups abort the upstream and record nothing,
 //! and the control endpoint stays gated and secret-free.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -29,8 +30,7 @@ use toker::config::{
     OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
-use toker::policy::{CollectingObserver, ShadowComparison, ShadowObserver, ShadowRecord};
-use toker::server::Server;
+use toker::server::Seams;
 use toker::store::{CostKind, RequestRow, RowKind, Store};
 
 /// An env name no test ever sets, so the default helper injects no key.
@@ -405,8 +405,15 @@ fn test_config(upstream: reqwest::Url, api_key_env: &str, api_key: Option<String
     }
 }
 
+/// An openrouter with a stored key, so a request that brings no credential of
+/// its own still has one to sign with. Without either, policy resolution
+/// rightly finds the backend unavailable (see `keyless_*` tests).
+fn keyed_config(upstream: reqwest::Url) -> Config {
+    test_config(upstream, UNSET_KEY_ENV, Some("sk-or-test".to_owned()))
+}
+
 fn openai_test_config(upstream: reqwest::Url) -> Config {
-    let mut config = test_config(upstream.clone(), UNSET_KEY_ENV, None);
+    let mut config = keyed_config(upstream.clone());
     config.default_backend_openai_chat = Some("openai_api".to_owned());
     config.openrouter = None;
     config.openai_api = Some(OpenAiApiConfig {
@@ -418,42 +425,14 @@ fn openai_test_config(upstream: reqwest::Url) -> Config {
     config
 }
 
-async fn spawn_toker_with_observer(
-    config: Config,
-    observer: Arc<dyn ShadowObserver>,
-) -> (SocketAddr, Arc<Store>) {
+async fn spawn_toker_seamed(config: Config, seams: Seams) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer,
-    )
-    .expect("build server");
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let addr = common::serve(common::server_with(config, &store, seams)).await;
     (addr, store)
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
-    (addr, store)
+    spawn_toker_seamed(config, Seams::isolated()).await
 }
 
 /// [`spawn_toker`], with one fetched catalogue installed before serving —
@@ -465,40 +444,9 @@ async fn spawn_toker_cataloged(
     source: &'static str,
     catalog: toker::catalog::FetchedCatalog,
 ) -> (SocketAddr, Arc<Store>) {
-    spawn_toker_cataloged_with_observer(
-        config,
-        source,
-        catalog,
-        Arc::new(CollectingObserver::default()),
-    )
-    .await
-}
-
-async fn spawn_toker_cataloged_with_observer(
-    config: Config,
-    source: &'static str,
-    catalog: toker::catalog::FetchedCatalog,
-    observer: Arc<dyn ShadowObserver>,
-) -> (SocketAddr, Arc<Store>) {
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer,
-    )
-    .expect("build server");
-    server.install_catalog(source, catalog);
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
-    (addr, store)
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(source, catalog);
+    spawn_toker_seamed(config, Seams::isolated().with_catalogs(catalogs)).await
 }
 
 fn client() -> reqwest::Client {
@@ -546,7 +494,7 @@ fn chat_body(model: &str, stream: bool) -> Vec<u8> {
 #[tokio::test]
 async fn missing_chat_model_is_rejected_before_routing_and_recording() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
     let response = post_chat(addr, br#"{"messages":[{"role":"user","content":"Hi"}]}"#).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: Value = response.json().await.expect("typed local error");
@@ -674,7 +622,10 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
         row.binding_id.as_ref().map(|binding| binding.as_str()),
         Some("openai_api.openai_chat_completions")
     );
-    assert_eq!(row.policy_routing, None);
+    assert!(
+        row.policy_routing.is_some(),
+        "routed by the active revision"
+    );
     let attempt = row.attempt.as_ref().expect("initial attempt provenance");
     assert_eq!(attempt.attempt_index.get(), 0);
     assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
@@ -691,10 +642,11 @@ async fn direct_openai_api_routes_authenticates_and_estimates_cost() {
     let expected = (800.0 * 2.0 + 100.0 * 0.1 + 200.0 * 2.5 + 50.0 * 10.0) / 1e6;
     assert!((row.cost_usd.expect("estimated cost") - expected).abs() < 1e-12);
     assert_eq!(row.cost_kind, Some(CostKind::Estimated));
-    assert!(
-        store.load_lanes().expect("lanes").is_empty(),
-        "direct OpenAI does not inherit OpenRouter's cache lifetime"
-    );
+    // The lane carries the routing pin, but no cache clock: direct OpenAI
+    // does not inherit OpenRouter's cache lifetime.
+    let lanes = store.load_lanes().expect("lanes");
+    assert_eq!(lanes.len(), 1);
+    assert!(lanes[0].ttl.is_none() && lanes[0].prompt_tokens.is_none());
 }
 
 #[tokio::test]
@@ -713,7 +665,7 @@ async fn direct_openai_streams_always_request_the_usage_chunk() {
 #[tokio::test]
 async fn sse_completions_cross_canonical_adapters_and_ledger() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let body = chat_body("z-ai/glm-5.3", true);
     let response = post_chat(addr, &body).await;
@@ -753,9 +705,10 @@ async fn sse_completions_cross_canonical_adapters_and_ledger() {
         !captured[0].headers.contains_key("x-toker-session"),
         "the session header is toker's, never forwarded"
     );
-    assert!(
-        !captured[0].headers.contains_key(header::AUTHORIZATION),
-        "no key configured → no auth injected, openrouter-shaped 401s verify the wiring"
+    assert_eq!(
+        captured[0].headers[header::AUTHORIZATION],
+        "Bearer sk-or-test",
+        "the stored key signs the request"
     );
     assert!(
         captured[0]
@@ -818,7 +771,7 @@ async fn sse_completions_cross_canonical_adapters_and_ledger() {
 #[tokio::test]
 async fn non_streaming_completions_buffer_observe_and_ledger() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let body = chat_body("z-ai/glm-5.3", false);
     let response = post_chat(addr, &body).await;
@@ -845,7 +798,7 @@ async fn non_streaming_completions_buffer_observe_and_ledger() {
 #[tokio::test]
 async fn the_openrouter_prefix_routes_and_the_canonical_request_strips_it() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let body = chat_body("openrouter/z-ai/glm-5.3", false);
     let response = post_chat(addr, &body).await;
@@ -934,7 +887,7 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
 #[tokio::test]
 async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let body = chat_body("err-401", false);
     let response = post_chat(addr, &body).await;
@@ -969,7 +922,7 @@ async fn non_2xx_renders_a_canonical_error_and_records_an_unpriced_error_row() {
 #[tokio::test]
 async fn malformed_http_error_records_a_protocol_failure() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, &chat_body("malformed-error", false)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -985,7 +938,7 @@ async fn malformed_http_error_records_a_protocol_failure() {
 #[tokio::test]
 async fn noncanonical_json_is_normalised_without_a_legacy_drift_row() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     // `\/` is legal JSON that deterministic canonical rendering normalises.
     let body = br#"{"model":"z-ai/glm-5.3","messages":[{"role":"user","content":"a\/b"}]}"#;
@@ -1012,20 +965,30 @@ async fn noncanonical_json_is_normalised_without_a_legacy_drift_row() {
     assert_eq!(measurement.cache_read, Some(16));
 }
 
+/// The claude profile's picker rows are the revision's own publication: the
+/// default picker rules matched against the openrouter listing.
 #[tokio::test]
-async fn models_passthrough_is_byte_identical_and_unledgered() {
+async fn models_lists_the_active_revisions_publication_locally_and_unledgered() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let listing = serde_json::json!({"data": [{"id": "z-ai/glm-5.3"}, {"id": "invented/one"}]});
+    let catalog = toker::catalog::fetched::parse_openrouter(&listing, 1).expect("catalog");
+    let (addr, store) = spawn_toker_cataloged(keyed_config(upstream), "openrouter", catalog).await;
 
     let response = client()
-        .get(toker_url(addr, "/v1/models"))
+        .get(toker_url(addr, "/f/claude/v1/models"))
         .send()
         .await
         .expect("models request");
     assert_eq!(response.status(), StatusCode::OK);
-    let bytes = response.bytes().await.expect("models bytes");
-    assert_eq!(bytes.as_ref(), MODELS_BODY.as_bytes());
-    assert_eq!(mock.captured()[0].path, "/v1/models");
+    let body: Value = response.json().await.expect("models JSON");
+    let ids: Vec<_> = body["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, ["openrouter/z-ai/glm-5.3"]);
+    assert!(mock.captured().is_empty(), "never forwarded upstream");
 
     // Not a usage path: nothing recorded. Give any racing write a moment
     // to prove its absence.
@@ -1034,138 +997,7 @@ async fn models_passthrough_is_byte_identical_and_unledgered() {
 }
 
 #[tokio::test]
-async fn unprefixed_models_uses_the_openai_default_and_its_auth() {
-    let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(openai_test_config(upstream)).await;
-
-    let response = client()
-        .get(toker_url(addr, "/v1/models"))
-        .header(header::AUTHORIZATION, "Bearer sk-or-foreign")
-        .send()
-        .await
-        .expect("models request");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.bytes().await.expect("models bytes"), MODELS_BODY);
-    let captured = mock.captured();
-    assert_eq!(captured[0].path, "/v1/models");
-    assert_eq!(
-        captured[0].headers[header::AUTHORIZATION],
-        "Bearer sk-proj-test"
-    );
-    assert_eq!(store.count_requests().expect("count"), 0);
-}
-
-#[tokio::test]
-async fn openai_catalogue_projects_bare_and_prefixed_models() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = openai_test_config(upstream);
-    let listing = serde_json::json!({
-        "data": [{"id": "gpt-invented", "created": 123, "owned_by": "openai"}]
-    });
-    let catalog = toker::catalog::fetched::parse_openai(&listing, 1).expect("catalog");
-    let (addr, store) = spawn_toker_cataloged(config, "openai_api", catalog).await;
-
-    let response = client()
-        .get(toker_url(addr, "/f/opencode/v1/models"))
-        .send()
-        .await
-        .expect("models request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("models JSON");
-    let ids: Vec<_> = body["data"]
-        .as_array()
-        .expect("data")
-        .iter()
-        .map(|entry| entry["id"].as_str().expect("id"))
-        .collect();
-    assert_eq!(ids, ["gpt-invented", "openai_api/gpt-invented"]);
-    assert_eq!(body["data"][0]["owned_by"], "openai_api");
-    assert!(mock.captured().is_empty());
-    assert_eq!(store.count_requests().expect("count"), 0);
-}
-
-#[tokio::test]
-async fn known_chat_profile_projects_routable_models_locally() {
-    let (mock, upstream) = spawn_mock().await;
-    let config = test_config(upstream, UNSET_KEY_ENV, None);
-    let listing = serde_json::json!({
-        "data": [
-            {"id": "invented/one", "created": 123, "context_length": 64000,
-             "pricing": {"prompt": "0.000001"}},
-            {"id": "invented/two"}
-        ]
-    });
-    let catalog = toker::catalog::fetched::parse_openrouter(&listing, 1).expect("catalog");
-    let observer = Arc::new(CollectingObserver::default());
-    let (addr, store) =
-        spawn_toker_cataloged_with_observer(config, "openrouter", catalog, observer.clone()).await;
-
-    let response = client()
-        .get(toker_url(addr, "/f/opencode/v1/models"))
-        .send()
-        .await
-        .expect("models request");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("models JSON");
-    let ids: Vec<_> = body["data"]
-        .as_array()
-        .expect("data")
-        .iter()
-        .map(|entry| entry["id"].as_str().expect("id"))
-        .collect();
-    assert_eq!(
-        ids,
-        [
-            "invented/one",
-            "invented/two",
-            "openrouter/invented/one",
-            "openrouter/invented/two"
-        ]
-    );
-    assert_eq!(body["data"][0]["object"], "model");
-    assert_eq!(body["data"][0]["owned_by"], "openrouter");
-    assert!(body["data"][0].get("pricing").is_none());
-    assert!(
-        mock.captured().is_empty(),
-        "discovery never reaches upstream"
-    );
-    assert_eq!(store.count_requests().expect("count"), 0);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while observer.records().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("publication observation");
-    assert_eq!(
-        observer.records(),
-        vec![ShadowRecord {
-            comparison: ShadowComparison::Match,
-            code: "policy-shadow-publication-match",
-            legacy: None,
-            shadow: None,
-        }]
-    );
-}
-
-#[tokio::test]
-async fn missing_local_catalogue_is_unavailable_not_an_empty_model_list() {
-    let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
-    let response = client()
-        .get(toker_url(addr, "/f/opencode/v1/models"))
-        .send()
-        .await
-        .expect("models request");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body: Value = response.json().await.expect("error JSON");
-    assert_eq!(body["error"]["type"], "catalog_unavailable");
-    assert!(mock.captured().is_empty());
-    assert_eq!(store.count_requests().expect("count"), 0);
-}
-
-#[tokio::test]
-async fn models_never_carries_an_anthropic_credential_to_openrouter() {
+async fn chat_never_carries_an_anthropic_credential_to_openrouter() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, _store) = spawn_toker(test_config(
         upstream,
@@ -1178,12 +1010,13 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
     // both are dropped, and the stored openrouter key takes the bearer's
     // place as if the request had carried none.
     let response = client()
-        .get(toker_url(addr, "/v1/models"))
+        .post(toker_url(addr, "/v1/chat/completions"))
         .header(header::AUTHORIZATION, "Bearer sk-ant-oat01-claude-oauth")
         .header("x-api-key", "sk-ant-api03-key")
+        .body(chat_body("z-ai/glm-5.3", false))
         .send()
         .await
-        .expect("models request");
+        .expect("chat request");
     assert_eq!(response.status(), StatusCode::OK);
     let captured = mock.captured();
     assert_eq!(
@@ -1202,11 +1035,12 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
     // Nothing the client sends is openrouter's to see while toker holds its
     // own key, the client's own openrouter key included.
     let response = client()
-        .get(toker_url(addr, "/v1/models"))
+        .post(toker_url(addr, "/v1/chat/completions"))
         .header(header::AUTHORIZATION, "Bearer sk-or-v1-client")
+        .body(chat_body("z-ai/glm-5.3", false))
         .send()
         .await
-        .expect("models request");
+        .expect("chat request");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         mock.captured()[1]
@@ -1220,7 +1054,7 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
 #[tokio::test]
 async fn non_json_bodies_are_rejected_before_the_backend() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, b"not json at all").await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1250,13 +1084,16 @@ async fn transport_before_headers_records_the_initial_attempt() {
     let attempt = row.attempt.as_ref().expect("attempt provenance");
     assert_eq!(attempt.attempt_index.get(), 0);
     assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
-    assert!(row.policy_routing.is_none());
+    assert!(
+        row.policy_routing.is_some(),
+        "routed by the active revision"
+    );
 }
 
 #[tokio::test]
 async fn unexpected_compression_records_a_protocol_failure() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, &chat_body("gzip-me", false)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -1278,7 +1115,7 @@ async fn unexpected_compression_records_a_protocol_failure() {
 #[tokio::test]
 async fn aborting_before_commitment_records_cancellation() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let request = tokio::spawn(async move {
         client()
@@ -1322,7 +1159,7 @@ async fn aborting_before_commitment_records_cancellation() {
 #[tokio::test]
 async fn client_hangup_aborts_upstream_and_records_cancellation() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let mut response = client()
         .post(toker_url(addr, "/v1/chat/completions"))
@@ -1373,7 +1210,7 @@ async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest
 #[tokio::test]
 async fn an_upstream_failure_mid_stream_aborts_and_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, &chat_body("drop-mid", true)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1394,7 +1231,7 @@ async fn an_upstream_failure_mid_stream_aborts_and_records_the_attempt() {
 #[tokio::test]
 async fn wrong_streaming_modes_record_protocol_failures() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     for (index, stream) in [false, true].into_iter().enumerate() {
         let response = post_chat(addr, &chat_body("wrong-mode", stream)).await;
@@ -1414,7 +1251,7 @@ async fn wrong_streaming_modes_record_protocol_failures() {
 #[tokio::test]
 async fn an_in_band_stream_failure_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, &chat_body("stream-failed", true)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1431,7 +1268,7 @@ async fn an_in_band_stream_failure_records_the_attempt() {
 #[tokio::test]
 async fn a_truncated_buffered_body_answers_502_and_records_the_attempt() {
     let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     let response = post_chat(addr, &chat_body("drop-mid", false)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -1550,7 +1387,7 @@ async fn poisoned_meters_state_never_blocks_the_openai_path() {
     // not stop a chat completion. The openai path never consults meters
     // at all: it forwards untouched and records normally.
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     // A spent 5-hour window with its reset comfortably in the future —
     // exactly the reading that blocks the anthropic_sub path.
@@ -1609,7 +1446,7 @@ async fn the_openai_path_grows_lanes_on_the_openrouter_clock_not_learned_models(
     // model store nothing (that stays anthropic-path middleware, and
     // the openai wire has no host model map to feed).
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
 
     // A session header, a ping header, and a tools-carrying body, so
     // the lane has everything to key on and the ping flag to record.
@@ -1664,7 +1501,7 @@ async fn a_cold_charged_writes_lane_gets_the_synthetic_turn_and_no_upstream() {
     // charged (the live gpt-5.6-sol figure), so the exemption does not
     // apply.
     let (addr, store) = spawn_toker_cataloged(
-        test_config(upstream, UNSET_KEY_ENV, None),
+        keyed_config(upstream),
         "openrouter",
         openrouter_catalog(vec![(
             "big/charged-model",
@@ -1798,7 +1635,7 @@ async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_cold_quiet(
     // The z-ai shape: the pricing object itemises prompt/completion/
     // cache-read and OMITS the write price — the documented free signal.
     let (addr, store) = spawn_toker_cataloged(
-        test_config(upstream, UNSET_KEY_ENV, None),
+        keyed_config(upstream),
         "openrouter",
         openrouter_catalog(vec![(
             "big/free-model",
@@ -1872,7 +1709,7 @@ async fn a_writes_free_model_is_exempt_the_gate_forwards_and_records_cold_quiet(
 #[tokio::test]
 async fn a_summarising_request_on_a_cold_lane_forwards_without_a_notice() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
     let body = cold_body("big/charged-model", false);
     seed_cold_lane(addr, &store, &body).await;
 
@@ -1910,7 +1747,7 @@ async fn a_model_unknown_to_the_catalogue_fires_conservatively() {
     // unknown is never free (absence ≠ zero, invariant 3), so the gate
     // applies exactly as it did before the exemption existed.
     let (addr, store) = spawn_toker_cataloged(
-        test_config(upstream, UNSET_KEY_ENV, None),
+        keyed_config(upstream),
         "openrouter",
         openrouter_catalog(vec![(
             "big/some-other-model",
@@ -1941,7 +1778,7 @@ async fn a_model_unknown_to_the_catalogue_fires_conservatively() {
 async fn a_warm_openai_lane_forwards_without_a_notice() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker_cataloged(
-        test_config(upstream, UNSET_KEY_ENV, None),
+        keyed_config(upstream),
         "openrouter",
         openrouter_catalog(vec![(
             "big/charged-model",
@@ -1982,7 +1819,7 @@ async fn a_warm_openai_lane_forwards_without_a_notice() {
 async fn the_openai_notice_renders_as_sse_for_stream_requests() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker_cataloged(
-        test_config(upstream, UNSET_KEY_ENV, None),
+        keyed_config(upstream),
         "openrouter",
         openrouter_catalog(vec![(
             "big/charged-model",
@@ -2059,7 +1896,7 @@ async fn spawn_catch_all() -> (MockState, reqwest::Url) {
 }
 
 #[tokio::test]
-async fn a_protocol_with_no_backend_answers_not_configured_and_reaches_no_upstream() {
+async fn a_protocol_with_no_backend_is_answered_by_toker_and_reaches_no_upstream() {
     let (mock, upstream) = spawn_catch_all().await;
 
     // Only the anthropic subscription block, like this machine's config:
@@ -2072,19 +1909,15 @@ async fn a_protocol_with_no_backend_answers_not_configured_and_reaches_no_upstre
     config.codex_sub = None;
     let (addr, store) = spawn_toker(config).await;
 
+    // The default table has no chat entry, so policy cannot resolve the
+    // request at all: toker's own answer, openai-shaped, nothing upstream.
     let response = post_chat(addr, &chat_body("z-ai/glm-5.3", false)).await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        response.headers()["x-toker-not-configured"],
-        "openai_chat",
-        "the probe-visible marker of toker's own answer"
-    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body: Value = response.json().await.expect("openai-shaped JSON");
-    assert_eq!(body["error"]["code"], "backend_not_configured");
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("openai_chat")),
+            .is_some_and(|message| message.contains("routing policy")),
         "{body}"
     );
 
@@ -2097,29 +1930,29 @@ async fn a_protocol_with_no_backend_answers_not_configured_and_reaches_no_upstre
         .send()
         .await
         .expect("messages request");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = response.json().await.expect("anthropic-shaped JSON");
     assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "not_found_error");
-    assert!(mock.captured().is_empty(), "nothing reached any upstream");
+    assert_eq!(body["error"]["type"], "api_error");
 
-    // `/v1/models` is the anthropic default's when there is no openai
-    // backend: claude asks for it too.
+    // `/v1/models` is toker's own listing of the revision, never forwarded.
     let response = client()
         .get(toker_url(addr, "/v1/models"))
         .send()
         .await
         .expect("models request");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(mock.captured().len(), 1);
-    assert_eq!(mock.captured()[0].path, "/v1/models");
+    assert!(mock.captured().is_empty(), "nothing reached any upstream");
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(store.count_requests().expect("count"), 0, "no rows either");
+    // The disabled-prefix refusal is the one answer with a ledger row: a
+    // route-unavailable one, no upstream attempt behind it.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
 }
 
 #[tokio::test]
-async fn no_anthropic_backend_answers_every_anthropic_path_not_configured() {
+async fn no_anthropic_backend_answers_every_anthropic_path_itself() {
     let (mock, upstream) = spawn_catch_all().await;
     let mut config = test_config(upstream.join("v1").expect("v1"), UNSET_KEY_ENV, None);
     config.anthropic_sub = None;
@@ -2128,89 +1961,44 @@ async fn no_anthropic_backend_answers_every_anthropic_path_not_configured() {
     config.default_backend_anthropic = None;
     let (addr, _store) = spawn_toker(config).await;
 
+    // With no anthropic default every anthropic path is answered by toker
+    // itself, in anthropic's error shape: a messages request has no route to
+    // resolve (502), the administrative paths have no backend (503).
     let requests = [
-        client()
-            .post(toker_url(addr, "/v1/messages"))
-            .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[]}"#),
-        client()
-            .post(toker_url(addr, "/v1/messages/count_tokens"))
-            .body("{}"),
-        client().get(toker_url(addr, "/v1/messages/batches")),
-        // The unmatched-path fallback forwards to the default anthropic
-        // backend; with none, it answers too.
-        client().get(toker_url(addr, "/v1/files")),
+        (
+            StatusCode::BAD_GATEWAY,
+            client()
+                .post(toker_url(addr, "/v1/messages"))
+                .body(r#"{"model":"claude-opus-5","max_tokens":1,"messages":[]}"#),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            client()
+                .post(toker_url(addr, "/v1/messages/count_tokens"))
+                .body("{}"),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            client().get(toker_url(addr, "/v1/messages/batches")),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            client().get(toker_url(addr, "/v1/files")),
+        ),
     ];
-    for request in requests {
+    for (status, request) in requests {
         let response = request.send().await.expect("request");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["x-toker-not-configured"], "anthropic");
+        assert_eq!(response.status(), status);
         let body: Value = response.json().await.expect("anthropic-shaped JSON");
-        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(body["error"]["type"], "api_error");
     }
     assert!(mock.captured().is_empty(), "nothing reached any upstream");
-}
-
-struct PanickingObserver;
-
-impl ShadowObserver for PanickingObserver {
-    fn observe(&self, _: ShadowRecord) {
-        panic!("shadow observer cannot affect traffic")
-    }
-}
-
-#[tokio::test]
-async fn shadow_observation_is_one_per_request_and_cannot_alter_chat_traffic() {
-    let (mock, upstream) = spawn_mock().await;
-    let observer = Arc::new(CollectingObserver::default());
-    let (addr, store) = spawn_toker_with_observer(
-        test_config(upstream.clone(), UNSET_KEY_ENV, None),
-        observer.clone(),
-    )
-    .await;
-
-    let body = chat_body("z-ai/glm-5.3", false);
-    let response = post_chat(addr, &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(mock.captured().len(), 1);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&mock.captured()[0].body).unwrap()["model"],
-        "z-ai/glm-5.3"
-    );
-    assert_eq!(store.count_requests().unwrap(), 1);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while observer.records().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("shadow observation");
-    let records = observer.records();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        records[0].comparison,
-        ShadowComparison::Match | ShadowComparison::Mismatch | ShadowComparison::InternalError
-    ));
-
-    let (panic_mock, panic_upstream) = spawn_mock().await;
-    let (panic_addr, panic_store) = spawn_toker_with_observer(
-        test_config(panic_upstream, UNSET_KEY_ENV, None),
-        Arc::new(PanickingObserver),
-    )
-    .await;
-    let response = post_chat(panic_addr, &body).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(panic_mock.captured().len(), 1);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&panic_mock.captured()[0].body).unwrap()["model"],
-        "z-ai/glm-5.3"
-    );
-    assert_eq!(panic_store.count_requests().unwrap(), 1);
 }
 
 #[tokio::test]
 async fn a_keyring_key_is_read_by_the_service_and_injected() {
     let (mock, upstream) = spawn_mock().await;
-    let mut config = test_config(upstream, UNSET_KEY_ENV, None);
+    let mut config = keyed_config(upstream);
     let openrouter = config.openrouter.as_mut().expect("enabled");
     openrouter.api_key_keyring = true;
     openrouter.api_key = Some("sk-literal-loses".to_owned());
@@ -2218,22 +2006,7 @@ async fn a_keyring_key_is_read_by_the_service_and_injected() {
     let secrets = Arc::new(toker::secrets::MemoryStore::new());
     toker::secrets::SecretStore::set(secrets.as_ref(), "openrouter", "sk-from-keyring")
         .expect("seed the fake keyring");
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::with_seams(
-        config,
-        store,
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        secrets,
-    )
-    .expect("build server");
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    let app = server.router();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let (addr, _store) = spawn_toker_seamed(config, Seams::isolated().with_secrets(secrets)).await;
 
     let body = chat_body("z-ai/glm-5.3", false);
     assert_eq!(post_chat(addr, &body).await.status(), StatusCode::OK);
@@ -2251,40 +2024,42 @@ async fn an_unavailable_keyring_reads_as_no_key() {
     let (mock, upstream) = spawn_mock().await;
     let mut config = test_config(upstream, UNSET_KEY_ENV, None);
     config.openrouter.as_mut().expect("enabled").api_key_keyring = true;
-    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
     // The service still starts: a keyring failure costs the key, never
     // the listener.
-    let server = Server::with_seams(
-        config,
-        store,
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::unavailable()),
-    )
-    .expect("build server");
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    let app = server.router();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let secrets = Arc::new(toker::secrets::MemoryStore::unavailable());
+    let (addr, _store) = spawn_toker_seamed(config, Seams::isolated().with_secrets(secrets)).await;
 
+    // With no key of its own and none on the request, the backend has no
+    // credential to sign with, so policy refuses it rather than forwarding
+    // the request unauthenticated.
     let body = chat_body("z-ai/glm-5.3", false);
-    assert_eq!(post_chat(addr, &body).await.status(), StatusCode::OK);
-    assert!(
+    let response = post_chat(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(mock.captured().is_empty(), "nothing reached the upstream");
+
+    // The client's own credential still passes through, and no key is made
+    // up to replace it.
+    let response = client()
+        .post(toker_url(addr, "/v1/chat/completions"))
+        .header(header::AUTHORIZATION, "Bearer client-own-token")
+        .body(body)
+        .send()
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
         mock.captured()[0]
             .headers
             .get(header::AUTHORIZATION)
-            .is_none(),
-        "no key, nothing injected"
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer client-own-token")
     );
 }
 
 #[tokio::test]
 async fn the_frontend_prefix_is_stripped_before_routing() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, _store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let (addr, _store) = spawn_toker(keyed_config(upstream)).await;
 
     // toker's own endpoint under a prefix: what setup's verify probes
     // before pointing a frontend at that prefix.
