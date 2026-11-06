@@ -60,7 +60,7 @@ Changeset 12 left legacy routing reachable in production:
       `policy/`; route compaction through classifier output
 - [x] Move `force_newest` constants and `prompt_bound` into `policy/`; delete
       `decide`, `ForceContext`, `force_target_of`, `ModelStore::force_target`
-- [ ] Remove `compact_spec` runtime reads; compaction comes from the compiled
+- [x] Remove `compact_spec` runtime reads; compaction comes from the compiled
       route only
   - No runtime `compact_spec`/`gates.compact_model` read remains (only the
     legacy compiler authors it). `RequestFacts::legacy_compaction` stays: it
@@ -71,7 +71,7 @@ Changeset 12 left legacy routing reachable in production:
 - [x] Remove shadow mode (`policy/shadow.rs`, `LegacyShadow` ownership, shadow
       observers and callers); rename the live `shadow_*` helpers and
       `capture_shadow`
-- [ ] Port server integration tests to an authoritative server with an active
+- [x] Port server integration tests to an authoritative server with an active
       revision
   - Done in the pilot: one authoritative constructor family (`Server::new`,
     `Server::with_seams` + `Seams`), `tests/common` helpers, `server_proxy.rs`;
@@ -111,7 +111,8 @@ policy path and what the legacy path did.
       because policy picks the cheaper model first; derive them from the plan
 - [x] `/model` switch on a warm pinned lane answers 502 "could not resolve":
       route it as the existing `ExplicitUserChange` transition cause
-- [ ] Untranslatable body on a streaming request: decide SSE shape and row
+- [x] Untranslatable body on a streaming request: decide SSE shape and row
+  - Moved to card H1 (plain 400, no row is the accepted behaviour here).
       (currently plain JSON 400, no row)
 
 ### Other outstanding work
@@ -122,23 +123,23 @@ policy path and what the legacy path did.
       (opencode) lists nothing: revision one's generated publication (the
       legacy projection, listed but never routed) now renders for Chat and
       Responses; no presentations were authored, see `port-notes.md`
-- [ ] Sessions mid-conversation with provider-owned state (signed thinking,
+- [x] Sessions mid-conversation with provider-owned state (signed thinking,
       codex reasoning items) on an unpinned lane at upgrade fail closed with
       unknown binding affinity until restarted; accepted under the no-seeding
       decision, record it in the docs
 
-- [ ] OpenRouter: when toker holds its own key, strip every incoming credential
+- [x] OpenRouter: when toker holds its own key, strip every incoming credential
       rather than only `sk-ant-` bearers; delete `docs/plans/token-bug-claude.md`
-- [ ] Move the subscription signing checklist out of `docs/plans/`
-- [ ] Opencode session lanes per `docs/plans/opencode-session-lanes.md`, then
+- [x] Move the subscription signing checklist out of `docs/plans/`
+- [x] Opencode session lanes per `docs/plans/opencode-session-lanes.md`, then
       unplan it
 
 ### Docs
 
-- [ ] Rewrite stale routing passages in `routing.md`, `models.md`,
+- [x] Rewrite stale routing passages in `routing.md`, `models.md`,
       `invariants.md`, `cold-gate.md`, `lanes.md`, `ledger-schema.md` and the
       internals `README.md` file map (add `src/policy/`)
-- [ ] Document policy lifecycle, resolver, fallback commitment, lane/cache
+- [x] Document policy lifecycle, resolver, fallback commitment, lane/cache
       domains, attempt read models, publication ownership, control operations,
       lineage evidence and migration recovery
 - [ ] Check `README.md` and `AGENTS.md` against the result
