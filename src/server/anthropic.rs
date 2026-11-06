@@ -310,6 +310,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut batch_model_mappings: Option<serde_json::Value> = None;
     let mut cold_lane_key = None;
     let mut cold_lane = None;
+    // What the cold notice needs to ask policy where a compaction of this
+    // session would run: the request's own facts and credential evidence,
+    // kept only for an ordinary turn when the notice is on.
+    let mut compaction_probe: Option<(
+        crate::policy::RequestFacts,
+        crate::policy::CredentialSnapshot,
+    )> = None;
     // The gate's meter snapshot, loaded at most once per request and only
     // when the gate is armed (every other backend must be a no-op without
     // even reading meters).
@@ -581,30 +588,21 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 class,
             );
             if class == crate::policy::RequestClass::Compaction {
-                facts.legacy_compaction = Some(crate::policy::LegacyCompactionFacts {
-                    lane_cold: cold::lane_is_cold(
-                        cold_lane.as_ref(),
-                        server.config.gates.cold_min_tokens,
-                        cold_idle_ms(&server.config.gates),
-                        facts.now_ms,
-                    ),
-                    prompt_tokens: cold_lane
-                        .as_ref()
-                        .and_then(|lane| lane.prompt_tokens)
-                        .and_then(|prompt| u64::try_from(prompt).ok())
-                        .unwrap_or_default(),
-                    transform_applied: {
-                        let mut probe = request.clone();
-                        crate::middleware::canonical::retarget_compaction(&mut probe, None, true)
-                            .is_some()
-                    },
-                });
+                facts.legacy_compaction = Some(legacy_compaction_facts(
+                    &server,
+                    request,
+                    cold_lane.as_ref(),
+                    facts.now_ms,
+                ));
             }
             let credentials = server.credential_snapshot(
                 &parts.headers,
                 ProtocolId::AnthropicMessages,
                 facts.now_ms,
             );
+            if class == crate::policy::RequestClass::Inference && server.config.gates.cold_enabled {
+                compaction_probe = Some((facts.clone(), credentials.clone()));
+            }
             let lane = server.lane_facts(
                 cold_lane.as_ref(),
                 pinned_binding
@@ -1111,16 +1109,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         gate_on: server.config.gates.quota_enabled,
                     });
                 } else {
-                    // The compact model is resolved, not assumed:
-                    // the notice names the model a
-                    // cheap `/compact` would actually run on, and stays
-                    // silent about it when there is none.
-                    //
-                    // Named as the model policy resolved for the compaction.
-                    let compact_on = policy_attempt
-                        .as_ref()
-                        .filter(|resolved| resolved.plan.compaction)
-                        .map(|resolved| resolved.plan.effective_model.clone());
+                    // The compact model is resolved, not assumed: the notice
+                    // names the model policy would move a `/compact` of this
+                    // session to, and stays silent about it when there is
+                    // none. The plan above is for this ordinary turn and so
+                    // cannot answer; ask again as a compaction.
+                    let compact_on = compaction_probe.as_ref().zip(canonical.as_ref()).and_then(
+                        |((facts, credentials), request)| {
+                            cold_compaction_target(
+                                &server,
+                                request,
+                                cold_lane.as_ref(),
+                                facts,
+                                credentials,
+                            )
+                        },
+                    );
                     let text = cold::ColdBlocking::notice_for(
                         // The re-read is written back at the lane's own
                         // tier; a lane with no recorded tier says nothing
@@ -1578,6 +1582,66 @@ fn between_tools_body(sent: &Bytes) -> Option<Bytes> {
         translate::render_anthropic(&canonical, crate::routing::DialectId::AnthropicMessages)
             .ok()?;
     serde_json::to_vec(&rendered.value).ok().map(Bytes::from)
+}
+
+/// The evidence the resolver's compaction rules read from a lane: whether
+/// its cache is gone by its own record, how big its prefix is, and whether
+/// the compaction body transform would apply to `request`.
+fn legacy_compaction_facts(
+    server: &Server,
+    request: &CanonicalRequest,
+    lane: Option<&crate::store::Lane>,
+    now_ms: i64,
+) -> crate::policy::LegacyCompactionFacts {
+    crate::policy::LegacyCompactionFacts {
+        lane_cold: cold::lane_is_cold(
+            lane,
+            server.config.gates.cold_min_tokens,
+            cold_idle_ms(&server.config.gates),
+            now_ms,
+        ),
+        prompt_tokens: lane
+            .and_then(|lane| lane.prompt_tokens)
+            .and_then(|prompt| u64::try_from(prompt).ok())
+            .unwrap_or_default(),
+        transform_applied: {
+            let mut probe = request.clone();
+            crate::middleware::canonical::retarget_compaction(&mut probe, None, true).is_some()
+        },
+    }
+}
+
+/// The model a `/compact` of this session would be moved to if it arrived
+/// now, for the cold notice to name.
+///
+/// `facts` are those of the ordinary turn being stopped; the answer is the
+/// resolver's own, under the same revision and lane the real compaction
+/// would resolve under, with only the request class changed. Nothing is
+/// written: resolution is pure and this never touches the lane. `None` when
+/// the policy has no compaction target, when it would keep the model the
+/// session is on (so there is nothing cheaper to promise), or when the
+/// resolution fails, since a notice must not promise what it could not
+/// resolve.
+fn cold_compaction_target(
+    server: &Server,
+    request: &CanonicalRequest,
+    lane: Option<&crate::store::Lane>,
+    facts: &crate::policy::RequestFacts,
+    credentials: &crate::policy::CredentialSnapshot,
+) -> Option<String> {
+    let mut facts = facts.clone();
+    facts.class = crate::policy::RequestClass::Compaction;
+    facts.legacy_compaction = Some(legacy_compaction_facts(server, request, lane, facts.now_ms));
+    let pinned = lane
+        .and_then(|lane| lane.pin.as_ref())
+        .and_then(|pin| server.registry.binding(&pin.binding_id));
+    let lane_facts = server.lane_facts(lane, pinned, facts.now_ms, true);
+    server
+        .resolve_policy_attempt(&facts, credentials, lane, lane_facts.as_ref())
+        .ok()?
+        .plan
+        .compaction_move()
+        .map(|(_, to)| to)
 }
 
 /// The cold gate's idle floor override, in ms

@@ -657,6 +657,55 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
     assert_no_more_rows(&store, 2).await;
 }
 
+#[tokio::test]
+async fn the_cold_notice_names_the_compaction_target_the_policy_would_pick() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_seeded(test_config(upstream), seed_sonnet).await;
+
+    let body = tools_body("claude-opus-5");
+    poison_cold_lane(&store, &body, 2 * 3_600_000);
+
+    let response = post_messages(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("notice bytes");
+    let text = String::from_utf8_lossy(&bytes);
+    let notice = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "content_block_delta")
+        .and_then(|event| event["delta"]["text"].as_str().map(str::to_owned))
+        .expect("the notice delta");
+    assert!(
+        notice.contains("The proxy would run it on claude-sonnet-5."),
+        "{notice}"
+    );
+    insta::with_settings!({filters => vec![(r" at \d{2}:\d{2}:", " at [HH:MM]:")]}, {
+        insta::assert_snapshot!(notice);
+    });
+
+    // Asking where a compaction would go must not move the lane or reach
+    // upstream: the notice only records that it spoke.
+    assert!(mock.captured().is_empty(), "the gate answered, not the API");
+    let lane = store
+        .load_lane(&lane_key_of(&body))
+        .expect("load")
+        .expect("the poisoned lane");
+    assert_eq!(lane.prompt_tokens, Some(200_000));
+    assert!(
+        lane.noticed_at
+            .is_some_and(|noticed| noticed > lane.updated_ms)
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Cold));
+    assert_eq!(
+        extra_of(&rows[0])["compactTarget"],
+        json!("claude-sonnet-5")
+    );
+    assert_no_more_rows(&store, 1).await;
+}
+
 /// Claude Code's recap: the main conversation, tools included, with the
 /// recap prompt appended as the last turn and a hook's system message
 /// after it.
