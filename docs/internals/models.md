@@ -137,7 +137,7 @@ qualify.
 
 A compaction is never upgraded by this election. It has its own retarget, which
 moves a cold compaction to a cheaper model by the same classifier output; see
-[compaction.md](compaction.md).
+[cold-gate.md](cold-gate.md).
 
 ## An upgrade is decided once and then kept
 
