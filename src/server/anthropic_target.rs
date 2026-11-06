@@ -416,13 +416,13 @@ fn declared_output_limit(server: &Server, model: &str) -> Option<u64> {
 }
 
 fn invalid_request(message: &str, stream: bool, frontend: FrontendWire) -> Response {
-    frontend_error_response(
+    super::record::refused(frontend_error_response(
         frontend.codex_wire(),
         StatusCode::BAD_REQUEST,
         "invalid_request_error",
         message,
         stream,
-    )
+    ))
 }
 
 async fn forward(

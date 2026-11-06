@@ -503,6 +503,64 @@ async fn missing_chat_model_is_rejected_before_routing_and_recording() {
     assert!(store.requests_since(0, 10).unwrap().is_empty());
 }
 
+/// The row of a Chat request toker refused before any send: an error of the
+/// local preparation type with the client's own request and nothing a send adds.
+fn assert_local_preparation_row(row: &RequestRow, requested_model: Option<&str>) {
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.error_type.as_deref(), Some("local_preparation"));
+    assert_eq!(row.status, Some(400));
+    assert_eq!(row.frontend.as_deref(), Some("openai_chat"));
+    assert_eq!(row.requested_model.as_deref(), requested_model);
+    assert!(
+        row.attempt.is_none() && row.policy_routing.is_none() && row.binding_id.is_none(),
+        "{row:?}"
+    );
+    assert!(row.provider.is_none() && row.route.is_none());
+}
+
+#[tokio::test]
+async fn an_untranslatable_streaming_chat_body_gets_the_wires_error_chunk_and_a_row() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
+    let response = post_chat(
+        addr,
+        br#"{"model":"z-ai/glm-5.3","messages":"not an array","stream":true}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error chunk");
+    let data = text
+        .strip_prefix("data: ")
+        .and_then(|rest| rest.strip_suffix("\n\n"))
+        .unwrap_or_else(|| panic!("a Chat data chunk: {text:?}"));
+    let chunk: Value = serde_json::from_str(data).expect("chunk payload");
+    assert_eq!(chunk["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], Some("z-ai/glm-5.3"));
+}
+
+#[tokio::test]
+async fn an_untranslatable_chat_body_that_does_not_stream_gets_the_json_error_and_a_row() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(keyed_config(upstream)).await;
+    let response = post_chat(
+        addr,
+        br#"{"model":"z-ai/glm-5.3","messages":"not an array"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("JSON error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], Some("z-ai/glm-5.3"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
 fn assert_complete_chat(body: &[u8], model: &str) {
     let value: Value = serde_json::from_slice(body).expect("canonical Chat response JSON");
     assert_eq!(value["model"], model);
@@ -1090,12 +1148,10 @@ async fn non_json_bodies_are_rejected_before_the_backend() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(mock.captured().is_empty(), "the malformed body stays local");
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(
-        store.count_requests().expect("count"),
-        0,
-        "no row for an unparseable body"
-    );
+    // It cannot say whether it streams, so the JSON error stands, and the
+    // refusal still leaves its row.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], None);
 }
 
 #[tokio::test]

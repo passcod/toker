@@ -19,7 +19,7 @@ use crate::routing::{BackendAdapterId, BackendBinding, ModelTarget};
 use crate::translate::{Rendered, TranslateError};
 
 use super::codex::{CodexFrontendWire, frontend_error_response};
-use super::record::RecordCtx;
+use super::record::{RecordCtx, RefusalCtx};
 use super::record_anthropic::AnthropicRecordCtx;
 use super::{InFlightGuard, Server};
 
@@ -1093,12 +1093,13 @@ fn prepare_messages(
     let response_projection =
         crate::ir::canonical::ResponseProjection::for_request(&attempt.canonical());
     let rendered = attempt.render_json().map_err(|error| {
-        let stream = attempt.stream().unwrap_or(false);
-        Box::new(super::codex::anthropic_error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &format!("the request could not be translated: {error}"),
-            stream,
+        Box::new(super::record::refused(
+            super::codex::anthropic_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("the request could not be translated: {error}"),
+                expected_stream,
+            ),
         ))
     })?;
     if !rendered.report.is_empty()
@@ -1138,9 +1139,12 @@ fn prepare_chat(
     let effective_model = attempt.effective_model().unwrap_or_default().to_owned();
     let response_model = attempt.requested_model().to_owned();
     let expected_stream = attempt.stream().unwrap_or(false);
-    let rendered = attempt
-        .render_json()
-        .map_err(|error| Box::new(super::proxy::compatibility_error(&error.to_string())))?;
+    let rendered = attempt.render_json().map_err(|error| {
+        Box::new(super::record::refused(super::proxy::compatibility_error(
+            &error.to_string(),
+            expected_stream,
+        )))
+    })?;
     let body = serde_json::to_vec(&rendered.value)
         .map(bytes::Bytes::from)
         .map_err(|error| {
@@ -1163,6 +1167,14 @@ fn prepare_chat(
     })
 }
 
+/// Whether a refusal of a Messages request answers as a stream. A Messages
+/// handler builds its record context only from a body that parsed, and only a
+/// parsed body can say whether it asked to stream; one that is not JSON at all
+/// keeps the JSON error.
+fn refusal_streams(body_parsed: bool, client_wants_json: bool) -> bool {
+    body_parsed && !client_wants_json
+}
+
 pub(crate) async fn coordinate_messages(
     server: Server,
     adapter: Option<BackendAdapterId>,
@@ -1178,6 +1190,19 @@ pub(crate) async fn coordinate_messages(
         session_id,
         client_wants_json,
     } = input;
+    let refusal = RefusalCtx::new(
+        record
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |ctx| ctx.started),
+        super::frontend_of(&parts.extensions),
+        "anthropic",
+        session_id.as_deref(),
+        record
+            .as_ref()
+            .and_then(|ctx| ctx.requested_model.as_deref()),
+        record.as_ref().and_then(|ctx| ctx.lineage.clone()),
+    );
+    let streams = refusal_streams(record.is_some(), client_wants_json);
     let policy_routing = attempt
         .as_ref()
         .ok()
@@ -1192,11 +1217,14 @@ pub(crate) async fn coordinate_messages(
         ctx.policy_routing = policy_routing;
     }
     if let Err(error @ TranslateError::Malformed { .. }) = &attempt {
-        return super::codex::anthropic_error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            &format!("the request could not be translated: {error}"),
-            false,
+        return refusal.settle(
+            &server,
+            super::record::refused(super::codex::anthropic_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("the request could not be translated: {error}"),
+                streams,
+            )),
         );
     }
     let prepared = prepare_messages_backend(
@@ -1214,7 +1242,7 @@ pub(crate) async fn coordinate_messages(
     .await;
     let ready = match prepared {
         Ok(ready) => ready,
-        Err(response) => return *response,
+        Err(response) => return refusal.settle(&server, *response),
     };
     let provenance = super::attempt::initial_provenance();
     // An attempt only prepares from a body that policy routed, which also
@@ -1253,23 +1281,26 @@ async fn prepare_messages_backend(
         session_id,
         client_wants_json,
     } = input;
+    let streams = refusal_streams(record.is_some(), client_wants_json);
+    let attempt = attempt.map_err(|error| {
+        Box::new(super::record::refused(
+            super::codex::anthropic_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("the request could not be translated: {error}"),
+                streams,
+            ),
+        ))
+    })?;
     match adapter {
         Some(BackendAdapterId::AnthropicMessages) => {
-            let attempt = attempt.map_err(|error| {
-                Box::new(super::codex::anthropic_error_response(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &format!("the request could not be translated: {error}"),
-                    false,
-                ))
-            })?;
             prepare_messages(parts, attempt, record, in_flight).map(ReadyBackendAttempt::Messages)
         }
         Some(BackendAdapterId::CodexResponses) => super::codex::prepare(
             server,
             super::codex::AttemptInput {
                 parts,
-                attempt,
+                attempt: Ok(attempt),
                 record,
                 in_flight,
                 session_id,
@@ -1494,6 +1525,18 @@ pub(crate) async fn coordinate_chat(
         session_id,
         client_wants_json,
     } = input;
+    let refusal = RefusalCtx::new(
+        record
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |ctx| ctx.started),
+        super::frontend_of(&parts.extensions),
+        "openai_chat",
+        session_id.as_deref(),
+        record
+            .as_ref()
+            .and_then(|ctx| ctx.requested_model.as_deref()),
+        None,
+    );
     let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
         tracing::error!(%error, "policy attempt provenance omitted");
         None
@@ -1518,7 +1561,7 @@ pub(crate) async fn coordinate_chat(
     .await;
     let ready = match prepared {
         Ok(ready) => ready,
-        Err(response) => return *response,
+        Err(response) => return refusal.settle(&server, *response),
     };
     let provenance = super::attempt::initial_provenance();
     coordinate_policy_chat(
@@ -1848,6 +1891,18 @@ pub(crate) async fn coordinate_responses(
         request_id,
         client_wants_json,
     } = input;
+    let refusal = RefusalCtx::new(
+        record
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |ctx| ctx.started),
+        super::frontend_of(&parts.extensions),
+        "openai_responses",
+        session_id.as_deref(),
+        record
+            .as_ref()
+            .and_then(|ctx| ctx.requested_model.as_deref()),
+        record.as_ref().and_then(|ctx| ctx.lineage.clone()),
+    );
     let policy_routing = attempt.policy_routing().unwrap_or_else(|error| {
         tracing::error!(%error, "policy attempt provenance omitted");
         None
@@ -1874,7 +1929,7 @@ pub(crate) async fn coordinate_responses(
     .await;
     let ready = match prepared {
         Ok(ready) => ready,
-        Err(response) => return *response,
+        Err(response) => return refusal.settle(&server, *response),
     };
     let provenance = super::attempt::initial_provenance();
     coordinate_policy_responses(

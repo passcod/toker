@@ -2129,7 +2129,7 @@ async fn missing_messages_model_is_rejected_before_default_route_lookup() {
 }
 
 #[tokio::test]
-async fn non_json_messages_are_rejected_locally_without_a_row() {
+async fn non_json_messages_are_rejected_locally_with_a_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
 
@@ -2139,12 +2139,17 @@ async fn non_json_messages_are_rejected_locally_without_a_row() {
     assert_eq!(error["error"]["type"], json!("invalid_request_error"));
     assert!(mock.captured().is_empty(), "invalid JSON stays local");
 
-    assert_no_rows(&store).await;
+    // A body that is not JSON cannot say whether it streams, so it keeps the
+    // JSON error, and it still leaves its row.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], None);
     assert_eq!(store.load_meters("anthropic_sub").expect("meters"), None);
 }
 
+/// A streaming request whose body cannot be translated is answered with
+/// Messages' own stream error, and leaves a row.
 #[tokio::test]
-async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
+async fn malformed_streaming_messages_get_the_wires_error_event_and_a_row() {
     let (mock, upstream) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
     let body = serde_json::to_vec(&json!({
@@ -2158,12 +2163,55 @@ async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "text/event-stream"
     );
-    let error: Value = response.json().await.expect("typed compatibility error");
+    let text = response.text().await.expect("error event");
+    let data = text
+        .strip_prefix("event: error\ndata: ")
+        .and_then(|rest| rest.strip_suffix("\n\n"))
+        .unwrap_or_else(|| panic!("an error event: {text:?}"));
+    let error: Value = serde_json::from_str(data).expect("event payload");
+    assert_eq!(error["type"], json!("error"));
     assert_eq!(error["error"]["type"], json!("invalid_request_error"));
     assert!(mock.captured().is_empty());
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], Some("claude-opus-5"));
+}
+
+#[tokio::test]
+async fn malformed_non_streaming_messages_stay_json_and_leave_a_row() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let body = serde_json::to_vec(&json!({
+        "model": "claude-opus-5",
+        "messages": "not an array",
+    }))
+    .unwrap();
+
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    assert!(mock.captured().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], Some("claude-opus-5"));
+}
+
+/// The row of a request toker could not translate: an error with the local
+/// preparation type and nothing a send would have, since none happened.
+fn assert_local_preparation_row(row: &RequestRow, requested_model: Option<&str>) {
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.error_type.as_deref(), Some("local_preparation"));
+    assert_eq!(row.status, Some(400));
+    assert_eq!(row.frontend.as_deref(), Some("anthropic"));
+    assert_eq!(row.requested_model.as_deref(), requested_model);
+    assert!(
+        row.attempt.is_none() && row.policy_routing.is_none() && row.binding_id.is_none(),
+        "{row:?}"
+    );
+    assert!(row.provider.is_none() && row.route.is_none());
 }
 
 #[tokio::test]
@@ -2975,7 +3023,8 @@ async fn an_untranslatable_marker_does_not_grant_or_emit_a_notice() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(mock.captured().is_empty());
     assert!(store.load_allowances().expect("allowances").is_empty());
-    assert_no_rows(&store).await;
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], Some("claude-opus-5"));
 }
 
 /// The over marker through the real router: offered while the plan has

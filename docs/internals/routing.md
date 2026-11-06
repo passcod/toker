@@ -264,6 +264,12 @@ canonically, and renders Messages for the client. This applies to
 binding. An invalid request is a local typed 400; a compressed, oversized, or
 malformed provider response that cannot cross the canonical boundary is a
 local typed 502. Neither reaches the other side as an unverified wire shape.
+A request that asked to stream gets its 400 in the wire's own stream error
+(Messages and Responses an `event: error`, Chat a bare `data:` chunk), since the
+client is reading a stream; a body that is not JSON cannot say, and gets the
+JSON error. The first attempt's refusal leaves an `error` row with
+`error_type = local_preparation` and no attempt, provider, route or binding,
+because nothing was attempted (see [attempts.md](attempts.md)).
 Malformed bodies retain a wire-shaped view only for the quota decision and
 error presentation, not inference mutation or shape extraction. Administrative
 bodies keep their path-specific behavior.
@@ -281,7 +287,8 @@ Anthropic Messages backend adapter renders it. Responses take the reverse path
 through canonical events or a complete canonical turn. Original provider
 response bytes feed the ledger observer before translation, so `usage_raw`,
 billed cost, estimated-cost inputs, and the serving provider remain
-provider-attested evidence. An invalid Chat body is a local 400 and a
+provider-attested evidence. An invalid Chat body is a local 400 (in the stream's
+own error chunk when it asked to stream, like the Messages refusal above) and a
 compressed or malformed upstream response is a local 502; neither is forwarded
 as though it had crossed the canonical boundary.
 

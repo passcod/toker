@@ -65,8 +65,9 @@ use crate::translate::{self, OpenAiChatRenderer};
 use super::InFlightGuard;
 use super::Server;
 use super::record::{
-    ColdOpenaiRecord, RecordCtx, now_ms, parse_error_type, record_error, record_measurement,
-    record_openai_cold, record_openai_cold_quiet, record_unroutable, retry_after_ms,
+    ColdOpenaiRecord, RecordCtx, RefusalCtx, now_ms, parse_error_type, record_error,
+    record_measurement, record_openai_cold, record_openai_cold_quiet, record_unroutable, refused,
+    retry_after_ms,
 };
 use super::record_anthropic::{
     AnthropicRecordCtx, QuotaBlockedRecord, record_anthropic_released, record_quota_blocked,
@@ -130,16 +131,49 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // cold gate keys the lane on the session × tools-hash the request
     // itself carries, answers in the wire form the request asked for,
     // and exempts by the post-routing model.
+    // A body that cannot be built into a request leaves a ledger row. Only
+    // a parsed body can say whether it asked to stream, so one that is not
+    // JSON at all keeps the JSON error.
+    let refusal = RefusalCtx::new(
+        started,
+        frontend.as_deref(),
+        "openai_chat",
+        session_id.as_deref(),
+        None,
+        None,
+    );
     let value: serde_json::Value = match serde_json::from_slice(&original) {
         Ok(value) => value,
-        Err(_) => return compatibility_error("the request body is not valid JSON"),
+        Err(_) => {
+            return refusal.settle(
+                &server,
+                refused(compatibility_error(
+                    "the request body is not valid JSON",
+                    false,
+                )),
+            );
+        }
     };
+    let stream_asked = value.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
     let canonical = match translate::from_openai_chat(&value) {
         Ok(canonical) => canonical,
-        Err(error) => return compatibility_error(&error.to_string()),
+        Err(error) => {
+            let refusal = RefusalCtx::new(
+                started,
+                frontend.as_deref(),
+                "openai_chat",
+                session_id.as_deref(),
+                value.get("model").and_then(serde_json::Value::as_str),
+                None,
+            );
+            return refusal.settle(
+                &server,
+                refused(compatibility_error(&error.to_string(), stream_asked)),
+            );
+        }
     };
     let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
-        return compatibility_error("model is missing, empty, or not a string");
+        return compatibility_error("model is missing, empty, or not a string", stream_asked);
     };
     let mut inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let canonical = inference.canonical();
@@ -169,6 +203,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         let Some(binding) = pinned_binding_id else {
             return compatibility_error(
                 "the request contains provider-owned state with unknown binding affinity",
+                canonical.stream == Some(true),
             );
         };
         Some(binding)
@@ -790,16 +825,16 @@ fn json_response(
     )
 }
 
-pub(crate) fn compatibility_error(message: &str) -> Response {
-    error_response(
-        ErrorWire::Openai,
+/// A 400 for a Chat request toker cannot use, in Chat's own shape: a JSON
+/// error, or for a request that asked to stream, the same error as the
+/// stream's `data:` chunk, which is how a Chat stream reports one.
+pub(crate) fn compatibility_error(message: &str, stream: bool) -> Response {
+    super::codex::frontend_error_response(
+        super::codex::CodexFrontendWire::OpenAiChat,
         StatusCode::BAD_REQUEST,
-        WireError {
-            anthropic_type: "invalid_request_error",
-            openai_type: "invalid_request_error",
-            openai_code: None,
-        },
+        "invalid_request_error",
         message,
+        stream,
     )
 }
 

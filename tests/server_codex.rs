@@ -1406,7 +1406,95 @@ async fn responses_to_anthropic_api_reject_missing_limit_without_upstream() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(response.text().await.unwrap().contains("max_output_tokens"));
     assert!(mock.requests.lock().unwrap().is_empty());
-    assert!(wait_for_rows(&store, 0).await.is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(
+        &rows[0],
+        "openai_responses",
+        Some("anthropic_api/claude-sonnet-5"),
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_responses_request_without_a_limit_gets_the_wires_error_event() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(anthropic_responses_config("api-limit-stream", upstream)).await;
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model":"anthropic_api/claude-sonnet-5", "input":"hello", "stream":true}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error event");
+    let data = text
+        .strip_prefix("event: error\ndata: ")
+        .and_then(|rest| rest.strip_suffix("\n\n"))
+        .unwrap_or_else(|| panic!("a Responses error event: {text:?}"));
+    let event: Value = serde_json::from_str(data).expect("event payload");
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["error"]["type"], "invalid_request_error");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(
+        &rows[0],
+        "openai_responses",
+        Some("anthropic_api/claude-sonnet-5"),
+    );
+}
+
+#[tokio::test]
+async fn an_untranslatable_responses_body_gets_the_wires_error_event_and_a_row() {
+    let (upstream, mock) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config("bad-responses", upstream, false)).await;
+    // `input` is neither text nor a list of items, so there is no canonical
+    // form for any backend.
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": 7, "stream": true}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    let text = response.text().await.expect("error event");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(mock.requests.lock().unwrap().is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], "openai_responses", Some("gpt-5.6-sol"));
+
+    // The same body without `stream` is the JSON error, and the same row.
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": 7}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.expect("JSON error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    wait_for_rows(&store, 2).await;
+}
+
+/// The row of a request toker refused before any send: an error of the local
+/// preparation type with the client's own request and nothing a send adds.
+fn assert_local_preparation_row(row: &RequestRow, frontend: &str, requested_model: Option<&str>) {
+    assert_eq!(row.kind, Some(RowKind::Error));
+    assert_eq!(row.error_type.as_deref(), Some("local_preparation"));
+    assert_eq!(row.status, Some(400));
+    assert_eq!(row.frontend.as_deref(), Some(frontend));
+    assert_eq!(row.requested_model.as_deref(), requested_model);
+    assert!(
+        row.attempt.is_none() && row.policy_routing.is_none() && row.binding_id.is_none(),
+        "{row:?}"
+    );
+    assert!(row.provider.is_none() && row.route.is_none());
 }
 
 #[tokio::test]
@@ -2651,7 +2739,7 @@ async fn missing_responses_model_is_rejected_locally_without_a_row() {
 }
 
 #[tokio::test]
-async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
+async fn malformed_streaming_messages_get_the_wires_error_event_and_a_row() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("malformed", upstream, true)).await;
     let body = serde_json::to_vec(&json!({
@@ -2671,13 +2759,14 @@ async fn malformed_streaming_messages_are_rejected_as_json_without_a_row() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "text/event-stream"
     );
-    let error: Value = response.json().await.expect("typed compatibility error");
-    assert_eq!(error["error"]["type"], json!("invalid_request_error"));
+    let text = response.text().await.expect("error event");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(text.contains("invalid_request_error"), "{text:?}");
     assert!(mock.requests.lock().unwrap().is_empty());
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(store.requests_since(0, 100).expect("rows").is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], "anthropic", Some("claude-opus-5"));
 }
 
 #[tokio::test]
@@ -2704,15 +2793,15 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
         .await
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    // A refusal before any stream starts is a plain JSON error, even when
-    // the client asked to stream: there is no event stream to ride yet.
+    // The client asked to stream, so the refusal is Messages' own stream
+    // error rather than a JSON body its stream reader would choke on.
     assert_eq!(
         response.headers().get(header::CONTENT_TYPE).unwrap(),
-        "application/json"
+        "text/event-stream"
     );
     let text = response.text().await.expect("body");
-    let error: Value = serde_json::from_str(&text).expect("a JSON error body");
-    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(text.starts_with("event: error\ndata: {"), "{text:?}");
+    assert!(text.contains("invalid_request_error"), "{text}");
     assert!(
         text.to_ascii_lowercase().contains("image"),
         "the error names the unsupported thing: {text}"
@@ -2721,10 +2810,9 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
         mock.requests.lock().unwrap().is_empty(),
         "nothing forwarded"
     );
-    // A body with no canonical form has nothing for policy to route, so no
-    // backend answered and no row attributes the refusal to one.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(store.requests_since(0, 100).expect("rows").is_empty());
+    // No backend answered, so the row names the request and no backend.
+    let rows = wait_for_rows(&store, 1).await;
+    assert_local_preparation_row(&rows[0], "anthropic", Some("claude-opus-5"));
 }
 
 #[tokio::test]

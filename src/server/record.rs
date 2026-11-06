@@ -339,76 +339,172 @@ fn record_route_unavailable(
     lineage: Option<SessionLineage>,
     policy_routing: PolicyRouteProvenance,
 ) {
-    let row = with_frontend(
-        RequestRow {
-            id: None,
-            ts_ms: now_ms(),
-            duration_ms: Some(elapsed_ms(started)),
-            kind: Some(RowKind::RouteUnavailable),
-            frontend: Some(frontend_protocol.to_owned()),
-            provider: None,
-            route: None,
-            session_id: session_id.map(str::to_owned),
-            ping: None,
-            model: None,
-            raw_model: None,
-            requested_model: requested_model.map(str::to_owned),
-            effective_model: None,
-            input: None,
-            cache_read: None,
-            cache_write_total: None,
-            cache_write_5m: None,
-            cache_write_1h: None,
-            output: None,
-            reasoning: None,
-            iterations: None,
-            web_searches: None,
-            code_execs: None,
-            ttl_split_known: None,
-            usage_presence: None,
-            usage_raw: None,
-            cost_usd: None,
-            cost_kind: None,
-            rate_limits: None,
-            req_bytes: None,
-            req_messages: None,
-            req_tools: None,
-            tools_hash: None,
-            system_chars: None,
-            system_hash: None,
-            system_blocks: None,
-            system_messages: None,
-            compact_generations: None,
-            summarising: None,
-            system_change: None,
-            system_ladder: None,
-            system_tail: None,
-            gate_on: None,
-            cold_on: None,
-            forced_from: None,
-            forced_to: None,
-            downgraded_from: None,
-            downgraded_to: None,
-            cache_stripped: None,
-            system_merged: None,
-            model_mappings: None,
-            drift_digest: None,
-            status: None,
-            error_type: None,
-            retry_after_ms: None,
-            extra: None,
-            betas: None,
-            geo: None,
-            fast: None,
-            binding_id: None,
-            attempt: None,
-            policy_routing: Some(policy_routing),
-            lineage,
-        },
-        frontend,
+    let mut row = unsent_row(
+        RowKind::RouteUnavailable,
+        started,
+        frontend_protocol,
+        session_id,
+        requested_model,
+        lineage,
     );
+    row.policy_routing = Some(policy_routing);
+    let row = with_frontend(row, frontend);
     if let Err(error) = server.store.record_request(&row) {
         tracing::error!(%error, "route-unavailable ledger insert failed");
+    }
+}
+
+/// A row for a request toker refused before choosing or contacting any
+/// backend: no provider, route, binding, usage or cost, only what the client
+/// asked for. The caller sets whatever its kind adds.
+fn unsent_row(
+    kind: RowKind,
+    started: Instant,
+    frontend_protocol: &'static str,
+    session_id: Option<&str>,
+    requested_model: Option<&str>,
+    lineage: Option<SessionLineage>,
+) -> RequestRow {
+    RequestRow {
+        id: None,
+        ts_ms: now_ms(),
+        duration_ms: Some(elapsed_ms(started)),
+        kind: Some(kind),
+        frontend: Some(frontend_protocol.to_owned()),
+        provider: None,
+        route: None,
+        session_id: session_id.map(str::to_owned),
+        ping: None,
+        model: None,
+        raw_model: None,
+        requested_model: requested_model.map(str::to_owned),
+        effective_model: None,
+        input: None,
+        cache_read: None,
+        cache_write_total: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        output: None,
+        reasoning: None,
+        iterations: None,
+        web_searches: None,
+        code_execs: None,
+        ttl_split_known: None,
+        usage_presence: None,
+        usage_raw: None,
+        cost_usd: None,
+        cost_kind: None,
+        rate_limits: None,
+        req_bytes: None,
+        req_messages: None,
+        req_tools: None,
+        tools_hash: None,
+        system_chars: None,
+        system_hash: None,
+        system_blocks: None,
+        system_messages: None,
+        compact_generations: None,
+        summarising: None,
+        system_change: None,
+        system_ladder: None,
+        system_tail: None,
+        gate_on: None,
+        cold_on: None,
+        forced_from: None,
+        forced_to: None,
+        downgraded_from: None,
+        downgraded_to: None,
+        cache_stripped: None,
+        system_merged: None,
+        model_mappings: None,
+        drift_digest: None,
+        status: None,
+        error_type: None,
+        retry_after_ms: None,
+        extra: None,
+        betas: None,
+        geo: None,
+        fast: None,
+        binding_id: None,
+        attempt: None,
+        policy_routing: None,
+        lineage,
+    }
+}
+
+/// Set on a response toker answered itself because the request could not be
+/// turned into a body for any backend, so [`RefusalCtx::settle`] knows to
+/// leave the ledger row. Only the first attempt settles it: a fallback
+/// candidate that cannot be prepared follows an attempt that already has its
+/// own error row, and its group's final outcome is that one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalPreparationRefusal;
+
+/// Mark `response` as a local-preparation refusal.
+pub(crate) fn refused(mut response: axum::response::Response) -> axum::response::Response {
+    response.extensions_mut().insert(LocalPreparationRefusal);
+    response
+}
+
+/// What the ledger row of a refused request knows, captured before the
+/// request is consumed.
+pub(crate) struct RefusalCtx {
+    started: Instant,
+    frontend: Option<String>,
+    frontend_protocol: &'static str,
+    session_id: Option<String>,
+    requested_model: Option<String>,
+    lineage: Option<SessionLineage>,
+}
+
+impl RefusalCtx {
+    pub(crate) fn new(
+        started: Instant,
+        frontend: Option<&str>,
+        frontend_protocol: &'static str,
+        session_id: Option<&str>,
+        requested_model: Option<&str>,
+        lineage: Option<SessionLineage>,
+    ) -> Self {
+        Self {
+            started,
+            frontend: frontend.map(str::to_owned),
+            frontend_protocol,
+            session_id: session_id.map(str::to_owned),
+            requested_model: requested_model.map(str::to_owned),
+            lineage,
+        }
+    }
+
+    /// Write the `local_preparation` error row when `response` is a marked
+    /// refusal, and pass the response through either way. The row has no
+    /// attempt provenance, since nothing was attempted.
+    pub(crate) fn settle(
+        &self,
+        server: &Server,
+        response: axum::response::Response,
+    ) -> axum::response::Response {
+        if response
+            .extensions()
+            .get::<LocalPreparationRefusal>()
+            .is_some()
+        {
+            let mut row = unsent_row(
+                RowKind::Error,
+                self.started,
+                self.frontend_protocol,
+                self.session_id.as_deref(),
+                self.requested_model.as_deref(),
+                self.lineage.clone(),
+            );
+            row.status = Some(i64::from(response.status().as_u16()));
+            row.error_type = Some("local_preparation".to_owned());
+            let row = with_frontend(row, self.frontend.as_deref());
+            if let Err(error) = server.store.record_request(&row) {
+                tracing::error!(%error, "local-preparation ledger insert failed");
+            }
+        }
+        response
     }
 }
 

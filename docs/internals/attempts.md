@@ -103,6 +103,14 @@ the subscription and a successful one on the API are not one cost.
   future that was dropped cannot write anything, and it never pins the lane: a
   cancelled attempt did not establish what the cache lives on.
 
+A request toker cannot build a body for, on any backend, has no attempt to
+attach anything to, so it is not part of a group. It is one `error` row with
+`error_type = local_preparation`, the status the client saw, and the request's
+frontend, session, requested model and lineage; `provider`, `route`,
+`binding_id` and the attempt fields are NULL. A fallback candidate that cannot
+be prepared after an attempt already failed writes no such row: the failed
+attempt's row stands as the group's final outcome.
+
 Nothing sums a group into a single synthetic row, and no reader should. The
 group's final outcome is its attempt of greatest index, or its
 `route-unavailable` row when it never made one. The TUI window reads it to say

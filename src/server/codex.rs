@@ -175,7 +175,18 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
 
     // A body that does not canonicalise names nothing for policy to route.
     let (Some(canonical_request), Some(shape)) = (canonical_request, shape.as_ref()) else {
-        return super::inference::invalid_responses_body(client_wants_json);
+        return super::record::RefusalCtx::new(
+            started,
+            frontend.as_deref(),
+            RESPONSES_FRONTEND,
+            request_session.as_deref(),
+            Some(requested_model.as_str()),
+            lineage.clone(),
+        )
+        .settle(
+            &server,
+            super::record::refused(super::inference::invalid_responses_body(client_wants_json)),
+        );
     };
     let (target, policy_attempt) = {
         let binding_affinity = if canonical_request.requires_binding_affinity() {
@@ -640,7 +651,6 @@ pub(crate) async fn prepare(
         Err(error) => {
             return Err(Box::new(translation_error_response(
                 &error,
-                record.as_ref(),
                 frontend_wire,
                 client_wants_json,
             )));
@@ -659,7 +669,6 @@ pub(crate) async fn prepare(
     let rendered = translate::render_codex(&canonical, &prompt_cache_key).map_err(|error| {
         Box::new(translation_error_response(
             &error,
-            record.as_ref(),
             frontend_wire,
             client_wants_json,
         ))
@@ -1271,30 +1280,22 @@ fn parse_upstream_error(body: &[u8]) -> Option<ResponseError> {
     (error.kind.is_some() || error.code.is_some()).then_some(error)
 }
 
+/// The refusal for a request that cannot be translated for this backend. It
+/// is marked, so the coordinator of the first attempt writes the ledger row
+/// (the request has no attempt to attach it to).
 fn translation_error_response(
     error: &TranslateError,
-    record: Option<&AnthropicRecordCtx>,
     frontend_wire: CodexFrontendWire,
     client_wants_json: bool,
 ) -> Response {
     let (status, message) = translate_failure(error);
-    if let Some(ctx) = record {
-        record_codex_error(
-            ctx,
-            status.as_u16(),
-            "invalid_request_error",
-            &message,
-            None,
-            frontend_wire.protocol(),
-        );
-    }
-    frontend_error_response(
+    super::record::refused(frontend_error_response(
         frontend_wire,
         status,
         "invalid_request_error",
         &message,
         !client_wants_json,
-    )
+    ))
 }
 
 /// A translation failure → the HTTP status and message the client sees.
@@ -1345,6 +1346,9 @@ pub(crate) fn anthropic_error_response(
     }
 }
 
+/// A local error in the shape of the wire the client speaks, which for a
+/// stream is that wire's own error frame: Messages and Responses send an
+/// `event: error`, Chat a bare `data:` chunk.
 pub(crate) fn frontend_error_response(
     wire: CodexFrontendWire,
     status: StatusCode,
@@ -1352,17 +1356,38 @@ pub(crate) fn frontend_error_response(
     message: &str,
     stream: bool,
 ) -> Response {
-    if wire == CodexFrontendWire::Anthropic {
-        return anthropic_error_response(status, kind, message, stream);
-    }
-    let value = serde_json::json!({
-        "error": {"type": kind, "message": message}
-    });
-    let json = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+    let (json, frame) = match wire {
+        CodexFrontendWire::Anthropic => {
+            return anthropic_error_response(status, kind, message, stream);
+        }
+        CodexFrontendWire::OpenAiChat => {
+            let json = serde_json::json!({
+                "error": {"message": message, "type": kind, "param": null, "code": null}
+            });
+            (json.clone(), json)
+        }
+        CodexFrontendWire::OpenAiResponses => (
+            serde_json::json!({"error": {"type": kind, "message": message}}),
+            serde_json::json!({
+                "type": "error",
+                "sequence_number": 0,
+                "error": {"type": kind, "code": kind, "message": message},
+            }),
+        ),
+    };
     let (content_type, body) = if stream {
-        ("text/event-stream", format!("data: {json}\n\n"))
+        let frame = serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_owned());
+        let event = if wire == CodexFrontendWire::OpenAiResponses {
+            "event: error\n"
+        } else {
+            ""
+        };
+        ("text/event-stream", format!("{event}data: {frame}\n\n"))
     } else {
-        ("application/json", json)
+        (
+            "application/json",
+            serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_owned()),
+        )
     };
     Response::builder()
         .status(status)
