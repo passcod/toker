@@ -49,20 +49,24 @@ Changeset 12 left legacy routing reachable in production:
 
 ### Delete the legacy runtime
 
-- [ ] `RouteRegistry` becomes topology and binding lookup only: no prefix,
+- [x] `RouteRegistry` becomes topology and binding lookup only: no prefix,
       alias or default interpretation; `default_backend_*` read only by the
       legacy compiler and setup import
-- [ ] Remove runtime model-map plumbing (`Provider::model_map`,
+- [x] Remove runtime model-map plumbing (`Provider::model_map`,
       `canonical::map_model`, `inference::apply_model_map`,
       `compaction_target_of`); keep `middleware::model_map` parsing and
       `rewrite_model_positions` for the legacy compiler and batch splicing
-- [ ] Move `family_of`/`newer_than` beside the revision-one classifier in
+- [x] Move `family_of`/`newer_than` beside the revision-one classifier in
       `policy/`; route compaction through classifier output
-- [ ] Move `force_newest` constants and `prompt_bound` into `policy/`; delete
+- [x] Move `force_newest` constants and `prompt_bound` into `policy/`; delete
       `decide`, `ForceContext`, `force_target_of`, `ModelStore::force_target`
 - [ ] Remove `compact_spec` runtime reads; compaction comes from the compiled
       route only
-- [ ] Stop dual-writing the legacy `ModelStore`; remove `/_toker/models/merge`
+  - No runtime `compact_spec`/`gates.compact_model` read remains (only the
+    legacy compiler authors it). `RequestFacts::legacy_compaction` stays: it
+    is the lane and body input of the stored `RevisionOneLegacy` compaction
+    target, which revision one's persisted document carries.
+- [x] Stop dual-writing the legacy `ModelStore`; remove `/_toker/models/merge`
       and test-only promotion planning
 - [x] Remove shadow mode (`policy/shadow.rs`, `LegacyShadow` ownership, shadow
       observers and callers); rename the live `shadow_*` helpers and
@@ -84,12 +88,12 @@ Changeset 12 left legacy routing reachable in production:
         proxy,record,record_anthropic,attempt,cancel,control}.rs (only mod.rs
         needed changes; the rest already ran on an authoritative server)
   - [x] src/tui/routing/import.rs and src/cmds.rs tests (swept, no change)
-- [ ] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
+- [x] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
       `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
       `middleware/mod.rs`, `middleware/model_map.rs`)
   - Done: `server/mod.rs`, `store/schema.rs`, `store/state.rs`,
-    `anthropic.rs`, `policy/learning.rs`. Left for the model-map and
-    ModelStore deletions: `middleware/mod.rs`, `middleware/model_map.rs`.
+    `anthropic.rs`, `policy/learning.rs`, `middleware/mod.rs`,
+    `middleware/model_map.rs`.
 
 ### Regressions the test port surfaced
 
