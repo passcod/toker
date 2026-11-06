@@ -39,9 +39,9 @@ Changeset 12 left legacy routing reachable in production:
 
 - [x] Unpinned existing lanes resolve under the active revision; a lane
       mismatch is an error path, not a legacy fallback
-- [ ] Drop the legacy-default gate on administrative Anthropic paths; resolve
+- [x] Drop the legacy-default gate on administrative Anthropic paths; resolve
       count_tokens, batches, unmatched and batch GET/cancel from policy only
-- [ ] Stop applying provider model maps after policy resolution (count_tokens,
+- [x] Stop applying provider model maps after policy resolution (count_tokens,
       batches) and stop passing them into cold-gate compaction pricing
 - [ ] `/v1/models` for every profile from the active revision
 - [ ] `toker promote` and `toker status` read the active revision; drop the

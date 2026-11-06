@@ -153,7 +153,6 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
     if path == "/_toker" || path.starts_with("/_toker/") {
         return plain_status(StatusCode::NOT_FOUND, "no such toker control endpoint\n");
     }
-    let legacy_default = server.registry.resolve(ProtocolId::AnthropicMessages, None);
     let facts = server.shadow_facts(
         ProtocolId::AnthropicMessages,
         super::frontend_of(request.extensions()),
@@ -181,7 +180,9 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },
-        Ok(None) => match legacy_default {
+        // No active revision: only a test-only server, which still routes by
+        // the configured default.
+        Ok(None) => match server.legacy_target(ProtocolId::AnthropicMessages, None) {
             Ok(default) => {
                 if let Some(legacy) = server.legacy_shadow_outcome(
                     &facts,
@@ -273,27 +274,22 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         );
     }
 
-    let legacy_default = server.registry.resolve(ProtocolId::AnthropicMessages, None);
-    if path != "/v1/messages" && legacy_default.is_err() {
-        return super::anthropic_not_configured();
+    let policy_active = server.has_active_policy();
+    // Administrative bodies are routed by their model, so a body that is not
+    // JSON has nothing for the active policy to route on.
+    if policy_active && path != "/v1/messages" && parsed.is_err() {
+        return super::codex::anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "the request body is not valid JSON",
+            false,
+        );
     }
-    // Active policy authority is only reachable after canonical parsing below.
-    // Until then, a configured target is a temporary provider context for the
-    // parse-failure and administrative legacy paths.
-    let mut target = match legacy_default {
-        Ok(target) => target,
-        Err(_) if path == "/v1/messages" && server.has_active_policy() => {
-            match server.registry.bindings().find_map(|binding| {
-                server
-                    .registry
-                    .resolve_binding(ProtocolId::AnthropicMessages, binding.id(), None, "pending")
-                    .ok()
-            }) {
-                Some(target) => target,
-                None => return super::anthropic_not_configured(),
-            }
-        }
-        Err(_) => return super::anthropic_not_configured(),
+    // The pipeline needs a target before policy has routed anything (a body
+    // that never parses, a gate armed ahead of resolution). Policy replaces
+    // it as soon as it resolves, so it never decides the route.
+    let Some(mut target) = server.pending_messages_target() else {
+        return super::anthropic_not_configured();
     };
     let mut backend = target.provider().clone();
 
@@ -359,9 +355,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         // Inference routing reads the canonical model; administrative
         // bodies retain their typed model view and lexical mapper.
         let model = client_model.clone();
-        let legacy_target = server
-            .registry
-            .resolve(ProtocolId::AnthropicMessages, model.as_deref());
+        let legacy_target = server.legacy_target(ProtocolId::AnthropicMessages, model.as_deref());
         if path == "/v1/messages/count_tokens" {
             let canonical = translate::from_anthropic(ir.value()).ok();
             let shape = canonical.as_ref().map(|request| {
@@ -1014,7 +1008,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     // client's alias is not one. Measured on the routed
                     // backend's own meters only.
                     let sent = served_model.as_deref().and_then(|model| {
-                        if policy_attempt.is_some() {
+                        if policy_active {
                             Some(model)
                         } else {
                             model_map::preview_mapped_model(backend.model_map(), model)
@@ -1172,7 +1166,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     //
                     // Named as the identity the backend's model map will
                     // send — what the compaction will actually run on.
-                    let compact_on = if policy_attempt.is_some() {
+                    let compact_on = if policy_active {
                         policy_attempt
                             .as_ref()
                             .filter(|resolved| resolved.plan.compaction)
@@ -1279,7 +1273,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
         }
     }
 
-    let authoritative = policy_attempt.is_some();
+    // Policy owns routing for every path under an active revision, including
+    // the administrative ones that never carry a `policy_attempt`: nothing
+    // below may re-route or re-map what policy chose.
+    let authoritative = policy_active;
+    // The provider's model map prices and rewrites only on the legacy
+    // resolver; policy's effective model is the model.
+    let legacy_map = if authoritative {
+        None
+    } else {
+        backend.model_map()
+    };
     let policy_compaction = policy_attempt
         .as_ref()
         .is_some_and(|resolved| resolved.plan.compaction);
@@ -1352,8 +1356,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     .flatten()
             };
             let retargeted = inference_attempt.as_mut().and_then(|attempt| {
-                let outcome =
-                    attempt.apply_compaction(compaction_target.as_deref(), backend.model_map())?;
+                let outcome = attempt.apply_compaction(compaction_target.as_deref(), legacy_map)?;
                 let prepared = attempt.canonical();
                 let rendered = translate::render_anthropic(
                     &prepared,
@@ -2162,7 +2165,6 @@ fn compact_spec(gates: &GatesConfig) -> String {
 /// "not just accounted ones" rule names. No in-flight hold either — the
 /// count is only on the exact `/v1/messages` path.
 async fn transparent_administrative(server: Server, request: Request) -> Response {
-    let legacy = server.registry.resolve(ProtocolId::AnthropicMessages, None);
     let facts = server.shadow_facts(
         ProtocolId::AnthropicMessages,
         super::frontend_of(request.extensions()),
@@ -2190,7 +2192,7 @@ async fn transparent_administrative(server: Server, request: Request) -> Respons
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },
-        Ok(None) => match legacy {
+        Ok(None) => match server.legacy_target(ProtocolId::AnthropicMessages, None) {
             Ok(target) => target,
             Err(_) => return super::anthropic_not_configured(),
         },

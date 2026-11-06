@@ -142,9 +142,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let Some(model) = canonical.model.clone().filter(|model| !model.is_empty()) else {
         return compatibility_error("model is missing, empty, or not a string");
     };
-    let legacy_target = server
-        .registry
-        .resolve(ProtocolId::OpenAiChat, Some(model.as_str()));
+    let legacy_target = server.legacy_target(ProtocolId::OpenAiChat, Some(model.as_str()));
     let mut inference = super::inference::InferenceRequest::new(model.clone(), canonical);
     let canonical = inference.canonical();
     let shape = Shape::from_canonical(&canonical, original.len() as u64);

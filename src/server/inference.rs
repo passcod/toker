@@ -1494,10 +1494,8 @@ fn prepare_messages_fallback_attempt(
     let backend = target.provider().clone();
     let mut attempt = inference.prepare_policy(target, policy_attempt.plan.clone());
     if policy_attempt.plan.compaction
-        && let Some(outcome) = attempt.apply_compaction(
-            Some(&policy_attempt.plan.effective_model),
-            backend.model_map(),
-        )
+        && let Some(outcome) =
+            attempt.apply_compaction(Some(&policy_attempt.plan.effective_model), None)
         && let Some(record) = record
     {
         let moved = outcome.from != outcome.to;

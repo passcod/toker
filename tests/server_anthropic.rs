@@ -676,6 +676,20 @@ fn messages_fallback_policy() -> toker::policy::ValidatedPolicyDocument {
 fn messages_fallback_policy_with_model(
     primary_model: &str,
 ) -> toker::policy::ValidatedPolicyDocument {
+    messages_fallback_policy_document(primary_model, true)
+}
+
+/// `with_requested_model` binds the client's model into the route as a
+/// parameter. Without it the route needs no model, which the calls that
+/// carry none (batch polls, unknown paths) can only be routed by.
+fn messages_fallback_policy_document(
+    primary_model: &str,
+    with_requested_model: bool,
+) -> toker::policy::ValidatedPolicyDocument {
+    let parameters: Vec<toker::policy::StableId> = with_requested_model
+        .then(|| REQUESTED_MODEL_PARAMETER.parse().unwrap())
+        .into_iter()
+        .collect();
     let route_id = RouteId::new("messages-fallback").unwrap();
     PolicyDocument {
         format_version: CURRENT_FORMAT_VERSION,
@@ -686,10 +700,10 @@ fn messages_fallback_policy_with_model(
             },
             target: RouteReference {
                 route_id: route_id.clone(),
-                parameters: std::collections::BTreeMap::from([(
-                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
-                    ArgumentBinding::RequestedModel,
-                )]),
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| (parameter.clone(), ArgumentBinding::RequestedModel))
+                    .collect(),
             },
         }],
         presentations: vec![],
@@ -697,7 +711,7 @@ fn messages_fallback_policy_with_model(
             id: route_id,
             display_name: "Messages fallback".to_owned(),
             description: None,
-            parameters: vec![REQUESTED_MODEL_PARAMETER.parse().unwrap()],
+            parameters,
             chain: RouteChain {
                 first: Candidate {
                     id: CandidateId::new("primary").unwrap(),
@@ -3804,6 +3818,135 @@ async fn thinking_retry_precedes_route_fallback_in_one_attempt_group() {
     assert_eq!(attempts[0].kind, Some(RowKind::Error));
     assert_eq!(attempts[1].kind, Some(RowKind::Error));
     assert_eq!(attempts[2].kind, None);
+}
+
+/// An authoritative server whose only route sends everything to `pol-model`,
+/// with a model map configured on the provider that would rename it.
+async fn spawn_policy_with_a_model_map(
+    name: &str,
+    mapped: bool,
+    legacy_default: bool,
+) -> (MockState, SocketAddr, Arc<Store>) {
+    let (mock, upstream) = spawn_mock().await;
+    let mut config = test_config(upstream, Some("sk-ant-test".to_owned()), "anthropic_sub");
+    config.anthropic_sub.as_mut().unwrap().oauth_token = Some("held-token".to_owned());
+    if mapped {
+        config.anthropic_sub.as_mut().unwrap().model_map =
+            toker::middleware::model_map::parse_model_map(
+                r#"{"model:pol-model": "mapped-away", "family:opus": "mapped-away"}"#,
+            )
+            .expect("the test map parses");
+    }
+    if !legacy_default {
+        config.default_backend_anthropic = None;
+    }
+    config.db_path = common::tempdir(name).join("toker.db");
+    let (addr, store) = spawn_toker_with_policy_document(
+        config,
+        messages_fallback_policy_document("pol-model", false),
+    )
+    .await;
+    (mock, addr, store)
+}
+
+#[tokio::test]
+async fn count_tokens_and_batches_send_the_policy_model_not_the_mapped_one() {
+    let (mock, addr, store) =
+        spawn_policy_with_a_model_map("server-anthropic-policy-admin-map-", true, true).await;
+
+    let response = post_messages(
+        addr,
+        "/v1/messages/count_tokens",
+        &[],
+        &messages_body("claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("count_tokens bytes");
+
+    let batch = json!({"requests": [
+        {"custom_id": "a", "params": {"model": "claude-opus-5", "max_tokens": 1, "messages": []}},
+        {"custom_id": "b", "params": {"model": "claude-sonnet-5", "max_tokens": 1, "messages": []}},
+    ]});
+    let response = post_messages(
+        addr,
+        "/v1/messages/batches",
+        &[],
+        &serde_json::to_vec(&batch).expect("batch body"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = mock.captured();
+    let counted: Value = serde_json::from_slice(&captured[0].body).unwrap();
+    assert_eq!(
+        counted["model"], "pol-model",
+        "the provider's map must not rename what policy chose"
+    );
+    let sent: Value = serde_json::from_slice(&captured[1].body).unwrap();
+    assert_eq!(
+        sent.pointer("/requests/0/params/model"),
+        Some(&json!("pol-model"))
+    );
+    assert_eq!(
+        sent.pointer("/requests/1/params/model"),
+        Some(&json!("pol-model"))
+    );
+    assert_no_rows(&store).await;
+}
+
+#[tokio::test]
+async fn administrative_paths_route_by_policy_with_no_legacy_default_backend() {
+    let (mock, addr, _store) =
+        spawn_policy_with_a_model_map("server-anthropic-policy-admin-nodefault-", false, false)
+            .await;
+
+    let response = post_messages(
+        addr,
+        "/v1/messages/count_tokens",
+        &[],
+        &messages_body("claude-opus-5", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client()
+        .get(toker_url(addr, "/v1/messages/batches/batch_123"))
+        .send()
+        .await
+        .expect("batch get");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client()
+        .post(toker_url(addr, "/v1/messages/batches/batch_123/cancel"))
+        .send()
+        .await
+        .expect("batch cancel");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client()
+        .get(toker_url(addr, "/v1/some/other/path"))
+        .send()
+        .await
+        .expect("unmatched");
+    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+
+    let paths: Vec<_> = mock.captured().into_iter().map(|c| c.path).collect();
+    assert_eq!(
+        paths,
+        [
+            "/v1/messages/count_tokens",
+            "/v1/messages/batches/batch_123",
+            "/v1/messages/batches/batch_123/cancel",
+            "/v1/some/other/path"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_administrative_body_that_is_not_json_has_nothing_for_policy_to_route() {
+    let (mock, addr, _store) =
+        spawn_policy_with_a_model_map("server-anthropic-policy-admin-badjson-", false, true).await;
+    let response = post_messages(addr, "/v1/messages/count_tokens", &[], b"not json").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(mock.captured().is_empty(), "nothing reaches an upstream");
 }
 
 #[tokio::test]

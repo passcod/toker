@@ -143,9 +143,8 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             false,
         );
     };
-    let legacy_target = server
-        .registry
-        .resolve(ProtocolId::OpenAiResponses, Some(requested_model.as_str()));
+    let legacy_target =
+        server.legacy_target(ProtocolId::OpenAiResponses, Some(requested_model.as_str()));
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
