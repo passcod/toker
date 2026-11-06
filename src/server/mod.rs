@@ -429,20 +429,7 @@ impl Server {
         ]
         .into_iter()
         .flatten();
-        let defaults = [
-            config
-                .default_backend_anthropic
-                .clone()
-                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
-            config
-                .default_backend_openai_chat
-                .clone()
-                .map(|provider| (ProtocolId::OpenAiChat, provider)),
-            Some((ProtocolId::OpenAiResponses, "codex_sub".to_owned())),
-        ]
-        .into_iter()
-        .flatten();
-        let registry = RouteRegistry::new(providers, defaults);
+        let registry = RouteRegistry::new(providers);
 
         // The lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
@@ -4924,7 +4911,10 @@ api_key = "ak-literal-test"
         let server = server(&dir);
         let target = server
             .registry
-            .resolve(ProtocolId::AnthropicMessages, None)
+            .resolve_binding_model_free(
+                ProtocolId::AnthropicMessages,
+                crate::routing::ANTHROPIC_SUB_MESSAGES.id(),
+            )
             .expect("enabled");
         let ctx = AnthropicRecordCtx {
             server: server.clone(),

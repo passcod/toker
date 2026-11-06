@@ -107,6 +107,16 @@ pub fn compile_document(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> Compilation {
+    // The bare-slug half of the listing follows the document's own protocol
+    // default, so a stored revision lists what it routes rather than what
+    // the config says today.
+    let defaults: Vec<_> = [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses]
+        .into_iter()
+        .map(|protocol| {
+            let provider = default_provider(document.document(), topology, protocol);
+            (protocol, provider)
+        })
+        .collect();
     let mut compilation = super::compile(
         document,
         topology,
@@ -114,22 +124,49 @@ pub fn compile_document(
         PolicyOrigin::GeneratedRevisionOne,
     );
     if let Some(policy) = compilation.policy_mut() {
-        for protocol in [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses] {
+        for (protocol, default_provider) in defaults {
             policy.add_generated_publication(
                 protocol.into(),
-                offers::for_frontend_inventory(topology, inventory, protocol)
-                    .into_iter()
-                    .map(|offer| {
-                        (
-                            offer.routed_model_id,
-                            offer.binding.id().clone(),
-                            offer.backend_model_id,
-                        )
-                    }),
+                offers::for_frontend_inventory(
+                    topology,
+                    inventory,
+                    protocol,
+                    default_provider.as_deref(),
+                )
+                .into_iter()
+                .map(|offer| {
+                    (
+                        offer.routed_model_id,
+                        offer.binding.id().clone(),
+                        offer.backend_model_id,
+                    )
+                }),
             );
         }
     }
     compilation
+}
+
+/// The provider a generated document defaults `protocol` to, if any.
+fn default_provider(
+    document: &PolicyDocument,
+    topology: &RouteRegistry,
+    protocol: ProtocolId,
+) -> Option<String> {
+    let scope = FrontendScope::Protocol {
+        protocol: protocol.into(),
+    };
+    let default = document
+        .defaults
+        .iter()
+        .find(|default| default.scope == scope)?;
+    topology
+        .routes()
+        .filter(|route| route.frontend() == protocol)
+        .find(|route| {
+            backend_route_id(route.binding()).is_ok_and(|id| id == default.target.route_id)
+        })
+        .map(|route| route.binding().provider().to_owned())
 }
 
 struct LegacyBuilder<'a> {
@@ -642,19 +679,7 @@ mod tests {
                 provider.model_map.clone(),
             )));
         }
-        let defaults = [
-            config
-                .default_backend_anthropic
-                .clone()
-                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
-            config
-                .default_backend_openai_chat
-                .clone()
-                .map(|provider| (ProtocolId::OpenAiChat, provider)),
-        ]
-        .into_iter()
-        .flatten();
-        RouteRegistry::new(providers, defaults)
+        RouteRegistry::new(providers)
     }
 
     #[test]
@@ -958,10 +983,7 @@ mod tests {
         // Codex construction needs a login, but topology is immutable; use a
         // registry with no configured provider to inspect the generated raw
         // policy after marking the config route through its map.
-        let codex_topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn Provider>>(),
-            [(ProtocolId::OpenAiResponses, "codex_sub".to_owned())],
-        );
+        let codex_topology = RouteRegistry::new(std::iter::empty::<Arc<dyn Provider>>());
         let generated = document(&config, &codex_topology).unwrap();
         assert!(
             generated
@@ -1001,7 +1023,7 @@ mod tests {
         );
         let topology = topology(&config);
         let mut catalogs = FetchedCatalogs::default();
-        for source in ["openrouter", "openai"] {
+        for source in ["openrouter", "openai_api"] {
             catalogs.set(
                 source,
                 FetchedCatalog {
@@ -1019,11 +1041,17 @@ mod tests {
             );
         }
         let inventory = offers::inventory(&topology, &catalogs);
-        let legacy: std::collections::BTreeSet<_> =
-            offers::for_frontend_inventory(&topology, &inventory, ProtocolId::OpenAiChat)
-                .into_iter()
-                .map(|offer| offer.routed_model_id)
-                .collect();
+        let legacy: std::collections::BTreeSet<String> = [
+            "openrouter/openrouter-shared",
+            "openrouter/openrouter-specific",
+            "openrouter-shared",
+            "openrouter-specific",
+            "openai_api/openai_api-shared",
+            "openai_api/openai_api-specific",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         let compilation = compile(&config, &topology, &inventory).unwrap();
         let policy = compilation.policy().expect("compiled");
         let compiled: std::collections::BTreeSet<_> = policy

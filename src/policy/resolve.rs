@@ -1814,10 +1814,8 @@ mod tests {
         inventory: &OfferInventory,
         origin: PolicyOrigin,
     ) -> CompiledPolicy {
-        let topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-        );
+        let topology =
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
         crate::policy::compile(document.validate().unwrap(), &topology, inventory, origin)
             .into_policy()
             .unwrap()

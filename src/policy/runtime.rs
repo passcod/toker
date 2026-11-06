@@ -615,10 +615,7 @@ mod tests {
         Arc::new(
             super::super::compile(
                 document(description),
-                &RouteRegistry::new(
-                    std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-                    std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-                ),
+                &RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>()),
                 &OfferInventory::default(),
                 PolicyOrigin::Authored,
             )
@@ -633,10 +630,7 @@ mod tests {
         let revision = store.load_policy_revision(revision_id).unwrap().unwrap();
         let runtime = PolicyRuntime::new(
             store.clone(),
-            RouteRegistry::new(
-                std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-                std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-            ),
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>()),
             &revision,
             compiled("initial"),
             Arc::new(OfferInventory::default()),
@@ -702,10 +696,8 @@ mod tests {
             .load_policy_revision(revision_id)
             .unwrap()
             .expect("revision");
-        let topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-        );
+        let topology =
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
         let runtime = PolicyRuntime::new(
             store,
             topology,
@@ -737,10 +729,7 @@ mod tests {
         let second = store.load_policy_revision(second_id).unwrap().unwrap();
         let runtime = PolicyRuntime::new(
             store,
-            RouteRegistry::new(
-                std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-                std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-            ),
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>()),
             &first,
             compiled("first"),
             Arc::new(OfferInventory::default()),
@@ -899,10 +888,8 @@ mod tests {
             .load_policy_revision(revision_id)
             .unwrap()
             .expect("revision");
-        let topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-        );
+        let topology =
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
         let runtime = PolicyRuntime::new(
             store,
             topology,

@@ -2051,10 +2051,7 @@ mod tests {
     };
 
     fn topology() -> RouteRegistry {
-        RouteRegistry::new(
-            std::iter::empty::<Arc<dyn Provider>>(),
-            std::iter::empty::<(ProtocolId, String)>(),
-        )
+        RouteRegistry::new(std::iter::empty::<Arc<dyn Provider>>())
     }
 
     fn empty_inventory() -> OfferInventory {
