@@ -124,3 +124,14 @@ server without an active revision (they compile and pass today).
   legacy path answered 503 `catalog_unavailable`.
 - Policy not-configured answers lost the `x-toker-not-configured` marker that
   `setup/verify.rs` reads; verify now sees toker's own 502/503 instead.
+- Compaction retarget provenance: under an authoritative server policy picks
+  the cheaper model before the compaction transform runs, so
+  `retarget_compaction` sees no model change and rows record
+  `downgraded_from`/`downgraded_to` as None (the TUI detail view reads them).
+  `server_cold`'s retarget test now asserts the policy outcome's baseline
+  instead. Decide whether the compaction branch of `anthropic.rs` should
+  derive them from the plan (`baseline_model` vs `retargeted_model`).
+- The compaction retarget target comes from the binding's own learning
+  (`merge_binding_learning`), published as a snapshot when the server is built;
+  seeding the legacy `ModelStore` (`upsert_model`) or seeding after
+  construction has no effect. Tests seed the store before building the server.

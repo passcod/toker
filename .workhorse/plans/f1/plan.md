@@ -73,15 +73,16 @@ Changeset 12 left legacy routing reachable in production:
     `Server::with_seams` + `Seams`), `tests/common` helpers, `server_proxy.rs`;
     recipe in `port-notes.md`.
   - [ ] tests/server_anthropic.rs
-  - [ ] tests/server_awake.rs
+  - [x] tests/server_awake.rs
   - [ ] tests/server_codex.rs
-  - [ ] tests/server_cold.rs
+  - [x] tests/server_cold.rs
   - [ ] tests/server_force_newest.rs
-  - [ ] tests/server_session.rs
-  - [ ] tests/server_shutdown.rs
-  - [ ] unit tests: `mod tests` in src/server/{mod,anthropic,codex,inference,
-        proxy,record,record_anthropic,attempt,cancel,control}.rs
-  - [ ] src/tui/routing/import.rs and src/cmds.rs tests
+  - [x] tests/server_session.rs
+  - [x] tests/server_shutdown.rs
+  - [x] unit tests: `mod tests` in src/server/{mod,anthropic,codex,inference,
+        proxy,record,record_anthropic,attempt,cancel,control}.rs (only mod.rs
+        needed changes; the rest already ran on an authoritative server)
+  - [x] src/tui/routing/import.rs and src/cmds.rs tests (swept, no change)
 - [ ] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
       `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
       `middleware/mod.rs`, `middleware/model_map.rs`)
