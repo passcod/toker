@@ -374,6 +374,7 @@ async fn a_stream_under_way_finishes_while_new_connections_are_refused() {
         .header("x-claude-code-session-id", "ses-1")
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test")
         .body(body)
         .send()
         .await
@@ -485,6 +486,7 @@ async fn a_forced_shutdown_does_not_wait_for_a_stream_but_exits_cleanly() {
         .header("x-claude-code-session-id", "ses-1")
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test")
         .body(body)
         .send()
         .await
