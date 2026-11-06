@@ -167,7 +167,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         // Provider-owned state belongs to the binding that produced it,
         // which only a pin records.
         let Some(binding) = pinned_binding_id else {
-            return super::openai_not_configured();
+            return compatibility_error(
+                "the request contains provider-owned state with unknown binding affinity",
+            );
         };
         Some(binding)
     } else {
