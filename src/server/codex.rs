@@ -310,13 +310,18 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             }
             Err(error) => {
                 tracing::error!(%error, "active Responses policy resolution failed");
-                return frontend_error_response(
+                let response = frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,
                     StatusCode::BAD_GATEWAY,
                     "server_error",
                     "the active routing policy could not resolve this request",
                     !client_wants_json,
                 );
+                return if error.is_no_default_route() {
+                    super::mark_not_configured(response, RESPONSES_FRONTEND)
+                } else {
+                    response
+                };
             }
         }
     } else {

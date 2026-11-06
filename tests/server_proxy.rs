@@ -1913,6 +1913,14 @@ async fn a_protocol_with_no_backend_is_answered_by_toker_and_reaches_no_upstream
     // request at all: toker's own answer, openai-shaped, nothing upstream.
     let response = post_chat(addr, &chat_body("z-ai/glm-5.3", false)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // The setup check tells this from an upstream's verdict by the marker.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-toker-not-configured")
+            .and_then(|value| value.to_str().ok()),
+        Some("openai_chat")
+    );
     let body: Value = response.json().await.expect("openai-shaped JSON");
     assert!(
         body["error"]["message"]
@@ -1931,6 +1939,10 @@ async fn a_protocol_with_no_backend_is_answered_by_toker_and_reaches_no_upstream
         .await
         .expect("messages request");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response.headers().get("x-toker-not-configured").is_none(),
+        "the protocol has a backend; this one prefix names a disabled one"
+    );
     let body: Value = response.json().await.expect("anthropic-shaped JSON");
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "api_error");
@@ -1989,6 +2001,14 @@ async fn no_anthropic_backend_answers_every_anthropic_path_itself() {
     for (status, request) in requests {
         let response = request.send().await.expect("request");
         assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-toker-not-configured")
+                .and_then(|value| value.to_str().ok()),
+            Some("anthropic"),
+            "the setup check reads the marker"
+        );
         let body: Value = response.json().await.expect("anthropic-shaped JSON");
         assert_eq!(body["error"]["type"], "api_error");
     }

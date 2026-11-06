@@ -200,11 +200,14 @@ pub(crate) async fn unmatched(State(server): State<Server>, request: Request) ->
         },
         Err(error) => {
             tracing::error!(%error, "active administrative policy resolution failed");
-            return codex::anthropic_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                "the active routing policy has no backend for this path",
-                false,
+            return super::mark_not_configured(
+                codex::anthropic_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "the active routing policy has no backend for this path",
+                    false,
+                ),
+                "anthropic",
             );
         }
     };
@@ -411,12 +414,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 }
                 Err(error) => {
                     tracing::error!(%error, "active count_tokens policy resolution failed");
-                    return super::codex::anthropic_error_response(
+                    let response = super::codex::anthropic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "api_error",
                         "the active routing policy has no tokenizer backend for this model",
                         false,
                     );
+                    return if error.is_no_default_route() {
+                        super::mark_not_configured(response, "anthropic")
+                    } else {
+                        response
+                    };
                 }
             }
         } else if path == "/v1/messages/batches" {
@@ -549,12 +557,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 }
                 Err(error) => {
                     tracing::error!(%error, "active batch policy resolution failed");
-                    return super::codex::anthropic_error_response(
+                    let response = super::codex::anthropic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "api_error",
                         "the active routing policy cannot route every batch request",
                         false,
                     );
+                    return if error.is_no_default_route() {
+                        super::mark_not_configured(response, "anthropic")
+                    } else {
+                        response
+                    };
                 }
             }
         } else if path == "/v1/messages"
@@ -721,12 +734,17 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 }
                 Err(error) => {
                     tracing::error!(%error, "active Messages policy resolution failed");
-                    return super::codex::anthropic_error_response(
+                    let response = super::codex::anthropic_error_response(
                         StatusCode::BAD_GATEWAY,
                         "api_error",
                         "the active routing policy could not resolve this request",
                         request.stream == Some(true),
                     );
+                    return if error.is_no_default_route() {
+                        super::mark_not_configured(response, "anthropic")
+                    } else {
+                        response
+                    };
                 }
             }
         } else if let Ok(legacy) = legacy_target {
@@ -2235,11 +2253,14 @@ async fn transparent_administrative(server: Server, request: Request) -> Respons
         },
         Err(error) => {
             tracing::error!(%error, "active batch-management policy resolution failed");
-            return codex::anthropic_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                "the active routing policy has no backend for batch management",
-                false,
+            return super::mark_not_configured(
+                codex::anthropic_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    "the active routing policy has no backend for batch management",
+                    false,
+                ),
+                "anthropic",
             );
         }
     };

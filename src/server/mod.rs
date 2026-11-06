@@ -157,6 +157,20 @@ pub(crate) enum PolicyAttemptError {
     LaneFactsMismatch,
 }
 
+impl PolicyAttemptError {
+    /// The revision has no default route for the request's protocol, so no
+    /// backend was ever a candidate.
+    pub(crate) fn is_no_default_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolve {
+                failure: crate::policy::ResolveFailure::NoRoute,
+                ..
+            }
+        )
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct PolicyAttempt {
@@ -2902,16 +2916,29 @@ pub(crate) fn responses_not_configured() -> axum::response::Response {
 }
 
 fn not_configured(wire: proxy::ErrorWire, protocol: &'static str) -> axum::response::Response {
-    let mut response = proxy::error_response(
-        wire,
-        axum::http::StatusCode::NOT_FOUND,
-        proxy::WireError {
-            anthropic_type: "not_found_error",
-            openai_type: "invalid_request_error",
-            openai_code: Some("backend_not_configured"),
-        },
-        &not_configured_message(protocol),
-    );
+    mark_not_configured(
+        proxy::error_response(
+            wire,
+            axum::http::StatusCode::NOT_FOUND,
+            proxy::WireError {
+                anthropic_type: "not_found_error",
+                openai_type: "invalid_request_error",
+                openai_code: Some("backend_not_configured"),
+            },
+            &not_configured_message(protocol),
+        ),
+        protocol,
+    )
+}
+
+/// Tag an answer as toker's own "this protocol has no backend", for the
+/// setup check to tell from an upstream's verdict. The active policy has its
+/// own answers for the same condition (no default route for the protocol),
+/// each in the status and shape of its path, so they carry the tag too.
+pub(crate) fn mark_not_configured(
+    mut response: axum::response::Response,
+    protocol: &'static str,
+) -> axum::response::Response {
     response.headers_mut().insert(
         NOT_CONFIGURED_HEADER,
         axum::http::HeaderValue::from_static(protocol),

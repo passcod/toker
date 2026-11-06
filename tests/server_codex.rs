@@ -2946,6 +2946,35 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     assert!(store.requests_since(0, 100).expect("rows").is_empty());
 }
 
+#[tokio::test]
+async fn responses_with_no_codex_backend_are_answered_locally_and_marked() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = test_config("no-codex", upstream, false);
+    fixture.config.codex_sub = None;
+    fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
+    let (addr, _store) = spawn_toker(fixture).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": "hello", "stream": false}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-toker-not-configured")
+            .and_then(|value| value.to_str().ok()),
+        Some("openai_responses"),
+        "the setup check reads the marker"
+    );
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "nothing forwarded"
+    );
+}
+
 /// Read a response body to its end: `Err` when the transfer was
 /// aborted rather than terminated.
 async fn read_to_end(mut response: reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {

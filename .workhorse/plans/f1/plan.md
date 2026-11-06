@@ -109,7 +109,7 @@ policy path and what the legacy path did.
 
 ### Other outstanding work
 
-- [ ] Policy's not-configured answers lost `x-toker-not-configured`, which
+- [x] Policy's not-configured answers lost `x-toker-not-configured`, which
       `setup/verify.rs` reads: restore it (or teach verify the new answers)
 - [ ] Revision one has no Chat presentations, so `/v1/models` on a Chat profile
       (opencode) lists nothing and a missing catalogue reads as an empty

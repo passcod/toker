@@ -267,10 +267,15 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
         }
         Err(error) => {
             tracing::error!(%error, "active Chat policy resolution failed");
-            return upstream_failure(
+            let response = upstream_failure(
                 ErrorWire::Openai,
                 "the active routing policy could not resolve this request",
             );
+            return if error.is_no_default_route() {
+                super::mark_not_configured(response, "openai_chat")
+            } else {
+                response
+            };
         }
     };
     let gate_model = policy_plan
