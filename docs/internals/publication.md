@@ -51,8 +51,8 @@ catalogue has not been fetched yet, or the model left the provider's listing),
 the whole listing is unresolved and answers 503 `catalog_unavailable`. A partial
 list would advertise a model that nothing can route, or silently drop one the
 user chose. Failing the list is visible; a short list is not. The same
-presentation compiles with an `offer-unknown` info diagnostic, which is how the
-TUI shows it before activation.
+presentation still compiles (the compiler notes `offer-unknown` internally),
+because a catalogue can legitimately lag a policy.
 
 ### The generated listing
 
