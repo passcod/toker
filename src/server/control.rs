@@ -1,19 +1,16 @@
-//! The `/_toker/*` control endpoints (plan: frontend adapters —
-//! "localhost only, gated by a custom header (a cross-origin web page
-//! cannot drive it without an unanswered preflight)").
+//! The `/_toker/*` control endpoints.
 //!
 //! Gate: the `x-toker-control` header must carry the operation's verb
 //! (`status`, `session`, `shutdown`, and one per routing operation). A page
-//! that cannot set a custom header without an unanswered CORS preflight can never pass the gate. A
-//! wrong or missing gate is a 403 naming what is missing — loopback-only, no
-//! discovery value to suppress.
+//! cannot set a custom header without a CORS preflight nothing answers, so
+//! none can pass the gate. A wrong or missing gate is a 403 naming what is
+//! missing: loopback-only, so there is no discovery value to suppress.
 //!
-//! `/_toker/session` is the attribution plugin's query (plan: "the
-//! attribution plugin's queries"): opencode sends its session id on every
-//! request, toker records it per ledger row, so the plugin asks for one
-//! session's aggregate and the answer is exact — the predecessor-era
-//! token-vector join is retired. The reply is counts, sums, and labels the rows already
-//! carry: no content, no credentials (invariants 1-2).
+//! `/_toker/session` is the attribution plugin's query: opencode sends its
+//! session id on every request, toker records it per ledger row, so the
+//! plugin asks for one session's aggregate and the answer is exact. The reply
+//! is counts, sums, and labels the rows already carry: no content, no
+//! credentials (invariants 1-2).
 //!
 //! `/_toker/shutdown` is `toker restart`'s second step: the CLI waits
 //! for a quiet moment on `status`, then asks this instance, by the id
