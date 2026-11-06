@@ -26,8 +26,8 @@ impl View {
     pub(super) fn title(self) -> &'static str {
         match self {
             View::Presentations => "PRESENTATIONS",
-            View::Routes => "ROUTES & CANDIDATES",
-            View::Rewrites => "REWRITES, FAMILIES & UPGRADES",
+            View::Routes => "ROUTES, CANDIDATES & DEFAULTS",
+            View::Rewrites => "REWRITES, FAMILIES, UPGRADES & COMPACTION",
             View::Status => "PREVIEW, REVISIONS & ACTIVATION",
         }
     }
@@ -266,22 +266,33 @@ impl State {
                 .collect(),
             View::Routes => policy
                 .into_iter()
-                .flat_map(|document| array(document, "routes"))
-                .map(|value| Entry {
-                    key: "routes",
-                    value,
+                .flat_map(|document| {
+                    ["routes", "defaults"].into_iter().flat_map(move |key| {
+                        array(document, key)
+                            .iter()
+                            .map(move |value| Entry { key, value })
+                    })
                 })
                 .collect(),
             View::Rewrites => policy
                 .into_iter()
                 .flat_map(|document| {
-                    ["rewrites", "classifiers", "upgrades"]
+                    let records = ["rewrites", "classifiers", "upgrades"]
                         .into_iter()
                         .flat_map(move |key| {
                             array(document, key)
                                 .iter()
                                 .map(move |value| Entry { key, value })
-                        })
+                        });
+                    // The compaction policy is one optional record, not a list.
+                    let compaction = document
+                        .get("compaction")
+                        .filter(|value| !value.is_null())
+                        .map(|value| Entry {
+                            key: "compaction",
+                            value,
+                        });
+                    records.chain(compaction)
                 })
                 .collect(),
             View::Status => {
@@ -1177,13 +1188,24 @@ fn generation(snapshot: &Value) -> Option<u64> {
 fn editable_key(key: &str) -> bool {
     matches!(
         key,
-        "presentations" | "routes" | "rewrites" | "classifiers" | "upgrades"
+        "presentations"
+            | "routes"
+            | "defaults"
+            | "rewrites"
+            | "classifiers"
+            | "upgrades"
+            | "compaction"
     )
 }
 
 fn replace_edit(key: &str, value: Value) -> Value {
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     match key {
+        "defaults" => {
+            let scope = value.get("scope").cloned().unwrap_or(Value::Null);
+            json!({ "kind": "replace_default", "scope": scope, "default": value })
+        }
+        "compaction" => json!({ "kind": "replace_compaction", "compaction": value }),
         "presentations" => {
             json!({ "kind": "replace_presentation", "id": id, "presentation": value })
         }
@@ -1198,12 +1220,35 @@ fn replace_edit(key: &str, value: Value) -> Value {
 fn remove_edit(key: &str, value: &Value) -> Value {
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     match key {
+        "defaults" => {
+            let scope = value.get("scope").cloned().unwrap_or(Value::Null);
+            json!({ "kind": "remove_default", "scope": scope })
+        }
+        "compaction" => json!({ "kind": "remove_compaction" }),
         "presentations" => json!({ "kind": "remove_presentation", "id": id }),
         "routes" => json!({ "kind": "remove_route", "id": id }),
         "rewrites" => json!({ "kind": "remove_rewrite", "id": id }),
         "classifiers" => json!({ "kind": "remove_classifier", "id": id }),
         "upgrades" => json!({ "kind": "remove_upgrade", "id": id }),
         _ => Value::Null,
+    }
+}
+
+/// A default's identity is the scope it covers, as the daemon addresses it.
+pub(super) fn scope_label(record: &Value) -> String {
+    let scope = record.get("scope");
+    let text = |key: &str| {
+        scope
+            .and_then(|scope| scope.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+    };
+    match scope
+        .and_then(|scope| scope.get("kind"))
+        .and_then(Value::as_str)
+    {
+        Some("profile") => format!("{}/{}", text("profile"), text("protocol")),
+        _ => text("protocol").to_owned(),
     }
 }
 
@@ -1217,16 +1262,30 @@ fn changed_records(snapshot: &Value) -> Vec<String> {
     for key in [
         "presentations",
         "routes",
+        "defaults",
         "rewrites",
         "classifiers",
         "upgrades",
+        "compaction",
     ] {
         let by_id = |document: Option<&Value>| -> Vec<(String, Value)> {
+            // Compaction is one optional record, so it has no id to match by.
+            if key == "compaction" {
+                return document
+                    .and_then(|document| document.get("compaction"))
+                    .filter(|record| !record.is_null())
+                    .map(|record| (String::new(), record.clone()))
+                    .into_iter()
+                    .collect();
+            }
             document
                 .map(|document| array(document, key))
                 .unwrap_or(&[])
                 .iter()
                 .map(|record| {
+                    if key == "defaults" {
+                        return (scope_label(record), record.clone());
+                    }
                     let id = record
                         .get("id")
                         .or_else(|| record.get("slug"))
@@ -1238,17 +1297,23 @@ fn changed_records(snapshot: &Value) -> Vec<String> {
         };
         let before = by_id(active);
         let after = by_id(Some(draft));
-        let kind = key.trim_end_matches('s');
+        let kind = if key == "compaction" {
+            key
+        } else {
+            key.trim_end_matches('s')
+        };
         for (id, record) in &after {
             match before.iter().find(|(prior, _)| prior == id) {
-                None => changes.push(format!("+{kind} {id}")),
-                Some((_, prior)) if prior != record => changes.push(format!("~{kind} {id}")),
+                None => changes.push(format!("+{kind} {id}").trim_end().to_owned()),
+                Some((_, prior)) if prior != record => {
+                    changes.push(format!("~{kind} {id}").trim_end().to_owned())
+                }
                 Some(_) => {}
             }
         }
         for (id, _) in &before {
             if !after.iter().any(|(next, _)| next == id) {
-                changes.push(format!("-{kind} {id}"));
+                changes.push(format!("-{kind} {id}").trim_end().to_owned());
             }
         }
     }
@@ -1869,5 +1934,127 @@ mod tests {
         state.command_refused("activate");
         assert!(!state.in_flight());
         assert!(state.error().is_some_and(|error| error.contains("busy")));
+    }
+
+    fn defaults_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "draft_generation": 5,
+            "draft": {"policy": {
+                "routes": [{"id": "route-a"}],
+                "defaults": [
+                    {"scope": {"kind": "protocol", "protocol": "openai_chat"},
+                     "target": {"route_id": "route-a"}},
+                    {"scope": {"kind": "profile", "profile": "unprefixed", "protocol": "openai_chat"},
+                     "target": {"route_id": "route-a"}},
+                ],
+                "compaction": {
+                    "target": {"route_id": "route-a"},
+                    "lane_transition": "move_when_cold",
+                    "cache_transition": "allow_when_cold",
+                },
+            }},
+            "active_revision": {"policy": {"routes": [{"id": "route-a"}], "defaults": [
+                {"scope": {"kind": "protocol", "protocol": "openai_chat"},
+                 "target": {"route_id": "route-b"}},
+                {"scope": {"kind": "protocol", "protocol": "openai_responses"},
+                 "target": {"route_id": "route-b"}},
+            ]}},
+        })
+    }
+
+    #[test]
+    fn defaults_and_compaction_are_listed_where_they_are_edited() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Routes);
+        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
+        assert_eq!(keys, ["routes", "defaults", "defaults"]);
+        state.set_view(View::Rewrites);
+        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
+        assert_eq!(keys, ["compaction"]);
+    }
+
+    #[test]
+    fn a_default_is_replaced_and_removed_by_its_scope() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Routes);
+        state.move_selection(2);
+        press(&mut state, KeyCode::Char('e'));
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let command = state.key(ctrl_enter).expect("replace command");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "replace_default");
+        assert_eq!(operation["scope"]["profile"], "unprefixed");
+        assert_eq!(operation["default"]["target"]["route_id"], "route-a");
+        state.receive(reply(
+            "draft-edit",
+            200,
+            serde_json::json!({"generation": 6}),
+        ));
+
+        press(&mut state, KeyCode::Char('d'));
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "remove_default");
+        assert_eq!(operation["scope"]["profile"], "unprefixed");
+    }
+
+    #[test]
+    fn compaction_is_replaced_and_removed_without_an_id() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Rewrites);
+        press(&mut state, KeyCode::Char('d'));
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "remove_compaction");
+        state.receive(reply(
+            "draft-edit",
+            200,
+            serde_json::json!({"generation": 6}),
+        ));
+        press(&mut state, KeyCode::Char('e'));
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        let command = state.key(ctrl_enter).expect("replace command");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "replace_compaction");
+        assert_eq!(operation["compaction"]["target"]["route_id"], "route-a");
+    }
+
+    #[test]
+    fn the_activation_summary_counts_default_and_compaction_changes() {
+        let state = loaded(defaults_snapshot());
+        let summary = state.activation_summary().join("\n");
+        assert!(summary.contains("~default openai_chat"), "{summary}");
+        assert!(
+            summary.contains("+default unprefixed/openai_chat"),
+            "{summary}"
+        );
+        assert!(summary.contains("-default openai_responses"), "{summary}");
+        assert!(summary.contains("+compaction"), "{summary}");
+    }
+
+    /// The terminal builds default and compaction edits by hand as well; the
+    /// daemon's typed vocabulary is the authority on what it understands.
+    #[test]
+    fn default_and_compaction_edits_are_the_daemons_typed_operations() {
+        use crate::policy::PolicyEdit;
+        let default = serde_json::json!({
+            "scope": {"kind": "protocol", "protocol": "openai_chat"},
+            "target": {"route_id": "route-a"},
+        });
+        let compaction = serde_json::json!({
+            "target": {"route_id": "route-a"},
+            "lane_transition": "move_when_cold",
+            "cache_transition": "allow_when_cold",
+        });
+        let operations = [
+            super::replace_edit("defaults", default.clone()),
+            super::remove_edit("defaults", &default),
+            super::replace_edit("compaction", compaction.clone()),
+            super::remove_edit("compaction", &compaction),
+        ];
+        let edit: PolicyEdit =
+            serde_json::from_value(serde_json::json!({ "operations": operations }))
+                .expect("every emitted operation is a typed PolicyEdit operation");
+        assert_eq!(edit.operations.len(), 4);
     }
 }

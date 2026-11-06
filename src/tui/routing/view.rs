@@ -140,6 +140,13 @@ fn selected(index: usize, state: &State) -> Style {
 
 fn entry_summary(entry: &Entry<'_>) -> String {
     let value = entry.value;
+    if entry.key == "defaults" {
+        return format!(
+            "default {}  {}",
+            super::model::scope_label(value),
+            short(value)
+        );
+    }
     let name = ["slug", "id", "name", "revision", "adapter", "provider"]
         .into_iter()
         .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_owned))
