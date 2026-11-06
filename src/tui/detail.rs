@@ -776,6 +776,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn linked_children_are_named_by_role_beneath_the_display_session() {
+        let (_, mut detail) = fixture(None);
+        detail.child_roles = vec![super::super::model::ChildRoleAgg {
+            role: crate::store::ChildRole::Guardian,
+            requests: 3,
+        }];
+        let text = lines(&detail, false, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("ses-detail-0001"), "{text}");
+        assert!(text.contains("children"), "{text}");
+        assert!(text.contains("3 guardian"), "{text}");
+        let (_, plain) = fixture(None);
+        let plain = lines(&plain, false, NOW, &utc(), &Fmt::fixed())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !plain.contains("children"),
+            "unlinked sessions show no children: {plain}"
+        );
+    }
+
     /// The popup draws over the frame with its controls on one row, and
     /// reports a rectangle for each that lands on its own text.
     #[test]

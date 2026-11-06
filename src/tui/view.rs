@@ -467,9 +467,11 @@ pub(crate) fn render(
 fn header_actions(area: Rect) -> (Rect, Rect, Rect) {
     let legend_width = area.width.min(HEADER_ACTION_WIDTH);
     let legend = Rect::new(area.x, area.y, legend_width, area.height.min(1));
-    let routing_width = area.width.saturating_sub(200).min(HEADER_ACTION_WIDTH);
+    // One cell in the gutter after the legend; below 80 columns the status
+    // needs every cell and `Tab` is the way across.
+    let routing_width = u16::from(area.width >= 80);
     let routing = Rect::new(
-        area.x + area.width.saturating_sub(routing_width),
+        area.x + legend_width,
         area.y,
         routing_width,
         area.height.min(1),
@@ -3160,7 +3162,12 @@ mod tests {
                     .contains(ratatui::layout::Position::new(x, 0))
             );
         }
-        assert_eq!(buffer[(3, 0)].symbol(), " ", "a gutter follows the action");
+        assert_eq!(
+            drawn.routing_button,
+            ratatui::layout::Rect::new(3, 0, 1, 1),
+            "the routing chip fills the gutter"
+        );
+        assert_eq!(buffer[(3, 0)].symbol(), "⇄");
         assert_eq!(
             buffer[(4, 0)].symbol(),
             "l",
@@ -4760,5 +4767,24 @@ mod tests {
                 })
                 .expect("draw");
         }
+    }
+
+    #[test]
+    fn the_routing_chip_sits_in_the_legend_gutter_from_80_columns() {
+        let wide = super::header_actions(ratatui::layout::Rect::new(0, 0, 100, 24));
+        assert_eq!(wide.1, ratatui::layout::Rect::new(3, 0, 1, 1));
+        assert_eq!(wide.2.x, 4, "the status starts after the gutter");
+        assert_eq!(
+            super::header_actions(ratatui::layout::Rect::new(0, 0, 80, 24))
+                .1
+                .width,
+            1
+        );
+        assert_eq!(
+            super::header_actions(ratatui::layout::Rect::new(0, 0, 79, 24))
+                .1
+                .width,
+            0
+        );
     }
 }

@@ -158,6 +158,9 @@ async fn patch_draft(State(server): State<Server>, request: Request) -> Response
 }
 
 fn draft_edit_error_response(error: PolicyEditError) -> Response {
+    // Edit errors name record kinds, ids and policy paths only, so the text is
+    // safe to return and is the only way a terminal can say what was wrong.
+    let detail = Some(json!({ "detail": error.to_string() }));
     match error {
         PolicyEditError::RecordNotFound { .. }
         | PolicyEditError::DefaultNotFound
@@ -166,14 +169,19 @@ fn draft_edit_error_response(error: PolicyEditError) -> Response {
             StatusCode::NOT_FOUND,
             "routing-draft-edit",
             "record_not_found",
-            None,
+            detail,
         ),
-        PolicyEditError::InvalidDocument(_) => invalid_policy(Vec::new()),
+        PolicyEditError::InvalidDocument(_) => routing_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "routing-control",
+            "invalid_policy",
+            detail,
+        ),
         _ => routing_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "routing-draft-edit",
             "invalid_policy_edit",
-            None,
+            detail,
         ),
     }
 }

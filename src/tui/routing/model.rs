@@ -117,6 +117,8 @@ pub(super) struct State {
     generation: Option<u64>,
     selected: usize,
     error: Option<String>,
+    /// The outcome of the last post-activation Claude settings sync.
+    settings_note: Option<String>,
     loading: bool,
     in_flight: bool,
     modal: Modal,
@@ -134,6 +136,7 @@ impl Default for State {
             generation: None,
             selected: 0,
             error: None,
+            settings_note: None,
             loading: false,
             in_flight: false,
             modal: Modal::None,
@@ -153,6 +156,57 @@ impl State {
 
     pub(super) fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// What an activation would do, from the snapshot the daemon last sent:
+    /// the records the draft changes, the lane impact, any draft diagnostics,
+    /// and where each publication stands. Shown before the user confirms.
+    pub(super) fn activation_summary(&self) -> Vec<String> {
+        let Some(snapshot) = &self.snapshot else {
+            return vec!["no daemon snapshot loaded".to_owned()];
+        };
+        let mut lines = Vec::new();
+        let changes = changed_records(snapshot);
+        if changes.is_empty() {
+            lines.push("changed records: none".to_owned());
+        } else {
+            lines.push(format!("changed records: {}", changes.join(", ")));
+        }
+        match snapshot.get("lane_impacts") {
+            Some(impacts) => {
+                let count = |key: &str| impacts.get(key).and_then(Value::as_u64).unwrap_or(0);
+                lines.push(format!(
+                    "lanes: {} total, {} unpinned, {} warm, {} cold, {} unknown",
+                    count("total"),
+                    count("unpinned"),
+                    count("warm"),
+                    count("cold"),
+                    count("unknown"),
+                ));
+            }
+            None => lines.push("lanes: impact not reported".to_owned()),
+        }
+        let diagnostics = array(snapshot, "draft_diagnostics");
+        if !diagnostics.is_empty() {
+            lines.push(format!("draft diagnostics: {}", diagnostics.len()));
+        }
+        for publication in array(snapshot, "publications") {
+            let text = |key: &str| publication.get(key).and_then(Value::as_str).unwrap_or("-");
+            lines.push(format!(
+                "publication {}: {}",
+                text("adapter"),
+                text("state")
+            ));
+        }
+        lines
+    }
+
+    pub(super) fn settings_note(&self) -> Option<&str> {
+        self.settings_note.as_deref()
+    }
+
+    pub(super) fn set_settings_note(&mut self, note: String) {
+        self.settings_note = Some(note);
     }
 
     pub(super) fn loading(&self) -> bool {
@@ -243,10 +297,27 @@ impl State {
                     key: "publications",
                     value,
                 });
+                let lane_impacts = snapshot.get("lane_impacts").into_iter().map(|value| Entry {
+                    key: "lane_impacts",
+                    value,
+                });
+                let diagnostics = array(snapshot, "draft_diagnostics")
+                    .iter()
+                    .map(|value| Entry {
+                        key: "diagnostic",
+                        value,
+                    });
+                let offers = array(snapshot, "offers").iter().map(|value| Entry {
+                    key: "offer",
+                    value,
+                });
                 active
                     .chain(draft)
                     .chain(revisions)
                     .chain(publications)
+                    .chain(lane_impacts)
+                    .chain(diagnostics)
+                    .chain(offers)
                     .collect()
             }
         }
@@ -265,16 +336,36 @@ impl State {
         match reply {
             Reply::Command(command, Ok(response)) => self.receive_response(command, response),
             Reply::Command(command, Err(error)) => {
-                self.loading = false;
-                self.in_flight = false;
+                self.settle(command.name);
                 self.error = Some(format!("{}: {error}", command.name));
             }
         }
     }
 
-    fn receive_response(&mut self, command: Command, response: Response) {
+    /// A reply ends only what its own command began: a snapshot or revisions
+    /// read queued before an edit must not release the edit's busy guard.
+    fn settle(&mut self, name: &str) {
+        if matches!(name, "snapshot" | "revisions") {
+            self.loading = false;
+        } else {
+            self.in_flight = false;
+        }
+    }
+
+    /// The worker queue refused a refresh, so no reply will ever come.
+    pub(super) fn refresh_refused(&mut self) {
         self.loading = false;
+        self.error = Some("snapshot: routing command queue is busy".to_owned());
+    }
+
+    /// The worker queue refused an operation, so no reply will ever come.
+    pub(super) fn command_refused(&mut self, name: &str) {
         self.in_flight = false;
+        self.error = Some(format!("{name}: routing command queue is busy"));
+    }
+
+    fn receive_response(&mut self, command: Command, response: Response) {
+        self.settle(command.name);
         if command.name == "snapshot" && response.status / 100 == 2 {
             self.receive_snapshot(response.body);
             return;
@@ -298,6 +389,11 @@ impl State {
             return;
         }
         if response.status / 100 != 2 {
+            // A refused edit is not a conflicted one: a later, unrelated
+            // stale-draft refusal must not offer to reapply it.
+            if command.name == "draft-edit" {
+                self.conflicted_edits.clear();
+            }
             self.error = Some(control_error(&command, &response));
             return;
         }
@@ -433,7 +529,11 @@ impl State {
     }
 
     fn open_edit(&mut self) {
-        if self.selected == 0 && self.view == View::Status {
+        let on_draft = self
+            .entries()
+            .get(self.selected)
+            .is_some_and(|entry| entry.key == "draft");
+        if on_draft {
             let description = draft_policy(self.snapshot.as_ref().unwrap_or(&Value::Null))
                 .and_then(|policy| policy.get("description"))
                 .and_then(Value::as_str)
@@ -532,6 +632,26 @@ impl State {
         }
     }
 
+    /// Fill the binding and model from the next daemon offer after the one
+    /// already entered (or the first), so a promotion names an offer that
+    /// exists rather than a typed guess.
+    fn complete_offer(&self, binding: &mut String, model: &mut String) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let offers = array(snapshot, "offers");
+        let current = offers.iter().position(|offer| {
+            offer.get("binding_id").and_then(Value::as_str) == Some(binding.as_str())
+                && offer.get("model_id").and_then(Value::as_str) == Some(model.as_str())
+        });
+        let next = current.map_or(0, |index| index + 1);
+        if let Some(offer) = offers.get(next % offers.len().max(1)) {
+            let text = |key: &str| offer.get(key).and_then(Value::as_str).unwrap_or_default();
+            *binding = text("binding_id").to_owned();
+            *model = text("model_id").to_owned();
+        }
+    }
+
     fn open_promote(&mut self) {
         self.modal = Modal::Promote {
             field: 0,
@@ -545,6 +665,9 @@ impl State {
         let (modal, action) = match modal {
             Modal::None => (Modal::None, ModalAction::None),
             Modal::Description { mut value } => {
+                if key.code == KeyCode::Esc {
+                    return None;
+                }
                 if text_key(&mut value, key) {
                     let description = if value.is_empty() {
                         Value::Null
@@ -759,6 +882,10 @@ impl State {
                         model: model.clone(),
                     },
                     KeyCode::Esc => return None,
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.complete_offer(&mut binding, &mut model);
+                        ModalAction::None
+                    }
                     _ => {
                         text_key(if field == 0 { &mut binding } else { &mut model }, key);
                         ModalAction::None
@@ -1039,6 +1166,54 @@ fn remove_edit(key: &str, value: &Value) -> Value {
     }
 }
 
+/// The records the draft adds (`+`), removes (`-`) or changes (`~`) relative
+/// to the active revision, by kind and id.
+fn changed_records(snapshot: &Value) -> Vec<String> {
+    let (Some(draft), active) = (draft_policy(snapshot), active_policy(snapshot)) else {
+        return Vec::new();
+    };
+    let mut changes = Vec::new();
+    for key in [
+        "presentations",
+        "routes",
+        "rewrites",
+        "classifiers",
+        "upgrades",
+    ] {
+        let by_id = |document: Option<&Value>| -> Vec<(String, Value)> {
+            document
+                .map(|document| array(document, key))
+                .unwrap_or(&[])
+                .iter()
+                .map(|record| {
+                    let id = record
+                        .get("id")
+                        .or_else(|| record.get("slug"))
+                        .map(|id| id.as_str().map_or_else(|| id.to_string(), str::to_owned))
+                        .unwrap_or_default();
+                    (id, record.clone())
+                })
+                .collect()
+        };
+        let before = by_id(active);
+        let after = by_id(Some(draft));
+        let kind = key.trim_end_matches('s');
+        for (id, record) in &after {
+            match before.iter().find(|(prior, _)| prior == id) {
+                None => changes.push(format!("+{kind} {id}")),
+                Some((_, prior)) if prior != record => changes.push(format!("~{kind} {id}")),
+                Some(_) => {}
+            }
+        }
+        for (id, _) in &before {
+            if !after.iter().any(|(next, _)| next == id) {
+                changes.push(format!("-{kind} {id}"));
+            }
+        }
+    }
+    changes
+}
+
 fn candidate_count(route: &Value) -> usize {
     route
         .get("chain")
@@ -1046,38 +1221,44 @@ fn candidate_count(route: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// Reorders only complete candidate-step records.  Thus every fallback edge is
-/// visible and survives the edit rather than being guessed from its new index.
+/// Reorders the candidates while every transition edge keeps its position in
+/// the chain.  The first candidate has no incoming edge, so a candidate moved
+/// to or from the front cannot carry one with it; keeping edges positional
+/// means every step always has the edge the daemon's step record requires,
+/// and the daemon stays the validator of whether the result is acceptable.
 fn move_candidate(route: &mut Value, selected: usize, delta: isize) {
     let Some(chain) = route.get_mut("chain").and_then(Value::as_object_mut) else {
         return;
     };
-    let Some(first) = chain.remove("first") else {
-        return;
-    };
     let Some(steps) = chain.get("steps").and_then(Value::as_array) else {
-        chain.insert("first".to_owned(), first);
         return;
     };
-    let mut items = vec![json!({ "candidate": first })];
-    items.extend(steps.iter().cloned());
+    let Some(first) = chain.get("first") else {
+        return;
+    };
+    let mut candidates = vec![first.clone()];
+    let mut edges = Vec::with_capacity(steps.len());
+    for step in steps {
+        edges.push(step.get("edge").cloned().unwrap_or(Value::Null));
+        candidates.push(step.get("candidate").cloned().unwrap_or(Value::Null));
+    }
     let destination = selected
         .saturating_add_signed(delta)
-        .min(items.len().saturating_sub(1));
-    if destination != selected {
-        let item = items.remove(selected);
-        items.insert(destination, item);
+        .min(candidates.len().saturating_sub(1));
+    if selected >= candidates.len() || destination == selected {
+        return;
     }
-    let first = items
-        .remove(0)
-        .get("candidate")
-        .cloned()
-        .unwrap_or(Value::Null);
-    // The edge is part of each stored transition. On a reordered chain the
-    // terminal keeps the explicit edge that was attached to each moved target;
-    // the daemon remains the validator of whether that policy is acceptable.
+    let candidate = candidates.remove(selected);
+    candidates.insert(destination, candidate);
+    let mut candidates = candidates.into_iter();
+    let first = candidates.next().unwrap_or(Value::Null);
+    let steps = edges
+        .into_iter()
+        .zip(candidates)
+        .map(|(edge, candidate)| json!({ "edge": edge, "candidate": candidate }))
+        .collect();
     chain.insert("first".to_owned(), first);
-    chain.insert("steps".to_owned(), Value::Array(items));
+    chain.insert("steps".to_owned(), Value::Array(steps));
 }
 
 fn text_key(value: &mut String, key: KeyEvent) -> bool {
@@ -1110,7 +1291,22 @@ fn control_error(command: &Command, response: &Response) -> String {
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or("request_failed");
-    format!("{}: {code} (HTTP {})", command.name, response.status)
+    let diagnostics = array(&response.body, "diagnostics")
+        .iter()
+        .take(5)
+        .map(|diagnostic| {
+            let text = |key: &str| diagnostic.get(key).and_then(Value::as_str).unwrap_or("?");
+            format!("{} at {}", text("code"), text("path"))
+        })
+        .collect::<Vec<_>>();
+    let mut message = format!("{}: {code} (HTTP {})", command.name, response.status);
+    if let Some(detail) = response.body.get("detail").and_then(Value::as_str) {
+        message.push_str(&format!(": {detail}"));
+    }
+    if !diagnostics.is_empty() {
+        message.push_str(&format!("; {}", diagnostics.join("; ")));
+    }
+    message
 }
 
 #[cfg(test)]
@@ -1162,9 +1358,10 @@ mod tests {
         assert_eq!(command.expect("validation command").name, "validate");
         state.conflicted_edits =
             vec![serde_json::json!({"kind": "set_description", "description": "mine"})];
-        state.receive(Reply::Command(
-            Command::snapshot(),
-            Ok(Response { status: 409, body: serde_json::json!({"error": "stale_draft", "generation": 8, "draft": {"policy": {"description": "theirs"}}}) }),
+        state.receive(reply(
+            "draft-edit",
+            409,
+            serde_json::json!({"error": "stale_draft", "generation": 8, "draft": {"policy": {"description": "theirs"}}}),
         ));
         assert!(matches!(state.modal(), Modal::Conflict { .. }));
         let command = state.key(crossterm::event::KeyEvent::new(
@@ -1183,5 +1380,387 @@ mod tests {
         move_candidate(&mut route, 1, -1);
         assert_eq!(route["chain"]["first"]["id"], "two");
         assert_eq!(route["chain"]["steps"][0]["candidate"]["id"], "one");
+        assert_eq!(
+            route["chain"]["steps"][0]["edge"],
+            serde_json::json!({"preflight": "enabled"}),
+            "every step keeps an edge, so the daemon can read the route back"
+        );
+    }
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(state: &mut State, code: KeyCode) -> Option<Command> {
+        state.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn typed(state: &mut State, text: &str) {
+        for character in text.chars() {
+            assert!(press(state, KeyCode::Char(character)).is_none());
+        }
+    }
+
+    fn loaded(body: serde_json::Value) -> State {
+        let mut state = State::default();
+        state.receive(Reply::Command(
+            Command::snapshot(),
+            Ok(Response { status: 200, body }),
+        ));
+        state
+    }
+
+    fn reply(name: &'static str, status: u16, body: serde_json::Value) -> Reply {
+        let mut command = Command::snapshot();
+        command.name = name;
+        Reply::Command(command, Ok(Response { status, body }))
+    }
+
+    fn full_snapshot() -> serde_json::Value {
+        serde_json::json!({
+            "draft_generation": 3,
+            "draft": {"policy": {
+                "description": "draft",
+                "presentations": [{"id": "kept", "slug": "k"}, {"id": "added", "slug": "a"}],
+                "routes": [{"id": "changed", "chain": {"first": {"id": "b"}, "steps": []}}],
+            }},
+            "active_revision": {"policy": {
+                "presentations": [{"id": "kept", "slug": "k"}, {"id": "gone", "slug": "g"}],
+                "routes": [{"id": "changed", "chain": {"first": {"id": "a"}, "steps": []}}],
+            }},
+            "draft_diagnostics": [{"code": "unused_binding", "severity": "warning", "path": "/routes/0"}],
+            "lane_impacts": {"total": 5, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 1},
+            "offers": [
+                {"binding_id": "openrouter.chat", "model_id": "vendor/one"},
+                {"binding_id": "openrouter.chat", "model_id": "vendor/two"},
+            ],
+            "publications": [{"adapter": "claude", "state": "applied"}],
+        })
+    }
+
+    #[test]
+    fn views_wrap_and_selection_clamps_without_a_snapshot() {
+        let mut state = State::default();
+        state.move_selection(5);
+        assert_eq!(state.selected(), 0);
+        state.move_view(-1);
+        assert_eq!(state.view(), View::Status);
+        state.move_view(1);
+        assert_eq!(state.view(), View::Presentations);
+        let mut state = loaded(full_snapshot());
+        state.move_selection(9);
+        assert_eq!(state.selected(), 1, "clamped to the last presentation");
+        state.set_view(View::Routes);
+        assert_eq!(state.selected(), 0, "a view change resets the selection");
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_snapshot_readable() {
+        let mut state = loaded(full_snapshot());
+        assert!(state.begin_refresh());
+        assert!(!state.begin_refresh(), "one refresh at a time");
+        state.receive(Reply::Command(Command::snapshot(), Err("down".to_owned())));
+        assert!(state.error().is_some_and(|error| error.contains("down")));
+        assert_eq!(state.entries().len(), 2);
+        assert!(state.begin_refresh(), "refresh can resume once it settled");
+    }
+
+    #[test]
+    fn status_view_lists_diagnostics_lane_impact_and_offers() {
+        let mut state = loaded(full_snapshot());
+        state.set_view(View::Status);
+        let keys: Vec<_> = state.entries().iter().map(|entry| entry.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "active_revision",
+                "draft",
+                "publications",
+                "lane_impacts",
+                "diagnostic",
+                "offer",
+                "offer"
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_waits_for_confirmation_and_carries_scope_and_force() {
+        let mut state = loaded(full_snapshot());
+        assert!(press(&mut state, KeyCode::Char('a')).is_none());
+        assert!(matches!(state.modal(), Modal::Activate { .. }));
+        press(&mut state, KeyCode::Char('l'));
+        press(&mut state, KeyCode::Char('f'));
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        assert_eq!(
+            (command.name, command.control),
+            ("activate", "routing-activate")
+        );
+        let body = command.body.expect("body");
+        assert_eq!(body["expected_generation"], 3);
+        assert_eq!(body["scope"], "new_and_cold_lanes");
+        assert_eq!(body["force_cache_transition"], true);
+        assert!(state.in_flight());
+    }
+
+    #[test]
+    fn escape_cancels_every_confirmation_without_a_command() {
+        let mut state = loaded(full_snapshot());
+        for key in ['a', 'd', 'p', 'v'] {
+            press(&mut state, KeyCode::Char(key));
+            assert!(state.modal().active(), "{key} opens a form");
+            assert!(press(&mut state, KeyCode::Esc).is_none());
+            assert!(!state.modal().active(), "{key} closes on Esc");
+        }
+        press(&mut state, KeyCode::Char('e'));
+        assert!(matches!(state.modal(), Modal::Record { .. }));
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.modal().active());
+        state.set_view(View::Status);
+        // Entry 0 is the active revision; the draft follows it.
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('e'));
+        assert!(matches!(state.modal(), Modal::Description { .. }));
+        press(&mut state, KeyCode::Esc);
+        assert!(
+            !state.modal().active(),
+            "the description form closes on Esc"
+        );
+    }
+
+    #[test]
+    fn removal_needs_a_yes_and_names_the_record() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('d'));
+        assert!(
+            press(&mut state, KeyCode::Char('x')).is_none(),
+            "other keys do nothing"
+        );
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "remove_presentation");
+        assert_eq!(operation["id"], "kept");
+    }
+
+    #[test]
+    fn a_record_edit_sends_the_typed_replacement_and_rejects_bad_json() {
+        let mut state = loaded(full_snapshot());
+        state.set_view(View::Routes);
+        press(&mut state, KeyCode::Char('e'));
+        let Modal::Record { value, .. } = state.modal().clone() else {
+            panic!("record form");
+        };
+        assert!(value.contains("\"changed\""));
+        // Corrupt the JSON: the form stays open, shows why, sends nothing.
+        typed(&mut state, "}");
+        let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(state.key(ctrl_enter).is_none());
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.starts_with("record JSON"))
+        );
+        assert!(matches!(state.modal(), Modal::Record { .. }));
+        // A backspace restores valid JSON, which saves as a typed replace.
+        press(&mut state, KeyCode::Backspace);
+        let command = state.key(ctrl_enter).expect("edit command");
+        assert_eq!(command.method, reqwest::Method::PATCH);
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "replace_route");
+        assert_eq!(operation["id"], "changed");
+    }
+
+    #[test]
+    fn keys_are_ignored_while_a_command_is_in_flight() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        assert!(state.in_flight());
+        assert!(press(&mut state, KeyCode::Char('y')).is_none());
+        assert!(press(&mut state, KeyCode::Char('V')).is_none());
+        state.receive(reply("activate", 200, serde_json::json!({"generation": 4})));
+        assert!(!state.in_flight());
+    }
+
+    #[test]
+    fn activation_summary_names_changes_lane_impact_and_publications() {
+        let state = loaded(full_snapshot());
+        let summary = state.activation_summary().join("\n");
+        assert!(summary.contains("+presentation added"), "{summary}");
+        assert!(summary.contains("-presentation gone"), "{summary}");
+        assert!(summary.contains("~route changed"), "{summary}");
+        assert!(!summary.contains("kept"), "{summary}");
+        assert!(
+            summary.contains("lanes: 5 total, 1 unpinned, 2 warm, 1 cold, 1 unknown"),
+            "{summary}"
+        );
+        assert!(summary.contains("draft diagnostics: 1"), "{summary}");
+        assert!(summary.contains("publication claude: applied"), "{summary}");
+        assert_eq!(
+            State::default().activation_summary(),
+            ["no daemon snapshot loaded"]
+        );
+    }
+
+    #[test]
+    fn a_refused_activation_keeps_the_form_open_with_the_reason() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        state.receive(reply(
+            "activate",
+            409,
+            serde_json::json!({"error": "forced_cache_transition_required"}),
+        ));
+        assert!(matches!(state.modal(), Modal::Activate { .. }));
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.contains("forced_cache_transition_required"))
+        );
+        // Toggling the force and confirming again resubmits.
+        press(&mut state, KeyCode::Char('f'));
+        let command = press(&mut state, KeyCode::Char('y')).expect("resubmitted");
+        assert_eq!(command.body.expect("body")["force_cache_transition"], true);
+    }
+
+    #[test]
+    fn an_invalid_activation_names_its_diagnostics() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        state.receive(reply(
+            "activate",
+            422,
+            serde_json::json!({"error": "invalid_policy", "diagnostics": [
+                {"code": "unknown_binding", "path": "/routes/0/chain/first"}
+            ]}),
+        ));
+        let error = state.error().expect("error").to_owned();
+        assert!(
+            error.contains("unknown_binding at /routes/0/chain/first"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reactivation_confirms_the_selected_revision() {
+        let mut state = loaded(full_snapshot());
+        state.receive(reply(
+            "revisions",
+            200,
+            serde_json::json!({"revisions": [{"revision_id": 9}, {"revision_id": 4}]}),
+        ));
+        state.set_view(View::Status);
+        // Entries: active, draft, then the revisions.
+        state.move_selection(3);
+        assert!(press(&mut state, KeyCode::Char('x')).is_none());
+        assert!(matches!(
+            state.modal(),
+            Modal::Reactivate { revision_id: 4, .. }
+        ));
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        let body = command.body.expect("body");
+        assert_eq!(command.name, "reactivate");
+        assert_eq!(body["revision_id"], 4);
+        assert_eq!(body["force_cache_transition"], false);
+    }
+
+    #[test]
+    fn promotion_needs_a_binding_and_a_model_and_completes_from_offers() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('p'));
+        assert!(press(&mut state, KeyCode::Enter).is_none());
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.contains("both required"))
+        );
+        let complete = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(state.key(complete).is_none());
+        let Modal::Promote { binding, model, .. } = state.modal().clone() else {
+            panic!("promote form");
+        };
+        assert_eq!(
+            (binding.as_str(), model.as_str()),
+            ("openrouter.chat", "vendor/one")
+        );
+        // A second completion moves to the next offer.
+        state.key(complete);
+        let command = press(&mut state, KeyCode::Enter).expect("promotion");
+        let body = command.body.expect("body");
+        assert_eq!(body["binding_id"], "openrouter.chat");
+        assert_eq!(body["model_id"], "vendor/two");
+    }
+
+    #[test]
+    fn a_conflict_can_reload_and_discards_the_local_batch() {
+        let mut state = loaded(full_snapshot());
+        state.conflicted_edits =
+            vec![serde_json::json!({"kind": "set_description", "description": "mine"})];
+        state.receive(reply(
+            "draft-edit",
+            409,
+            serde_json::json!({"error": "stale_draft", "generation": 4,
+                "draft": {"policy": {"description": "theirs"}}}),
+        ));
+        assert_eq!(state.generation(), Some(4), "the daemon copy is shown");
+        let command = press(&mut state, KeyCode::Char('r')).expect("reload");
+        assert_eq!(command.name, "snapshot");
+        assert!(state.conflicted_edits.is_empty());
+        assert!(!state.modal().active());
+    }
+
+    /// The terminal builds its edits by hand; the daemon's typed vocabulary is
+    /// the authority on whether they are the edits it understands.
+    #[test]
+    fn removals_and_descriptions_are_the_daemons_typed_operations() {
+        use crate::policy::PolicyEdit;
+        let record = serde_json::json!({"id": "some-id"});
+        let operations: Vec<_> = [
+            "presentations",
+            "routes",
+            "rewrites",
+            "classifiers",
+            "upgrades",
+        ]
+        .into_iter()
+        .map(|key| super::remove_edit(key, &record))
+        .chain([serde_json::json!({"kind": "set_description", "description": null})])
+        .collect();
+        let edit: PolicyEdit =
+            serde_json::from_value(serde_json::json!({ "operations": operations }))
+                .expect("every emitted operation is a typed PolicyEdit operation");
+        assert_eq!(edit.operations.len(), 6);
+    }
+
+    #[test]
+    fn a_read_reply_does_not_release_a_pending_edit() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        assert!(state.in_flight());
+        // The page's earlier snapshot and revisions reads land first.
+        state.receive(reply(
+            "revisions",
+            200,
+            serde_json::json!({"revisions": []}),
+        ));
+        state.receive(reply("snapshot", 200, full_snapshot()));
+        assert!(state.in_flight());
+        assert!(press(&mut state, KeyCode::Char('y')).is_none());
+        state.receive(reply("activate", 200, serde_json::json!({"generation": 4})));
+        assert!(!state.in_flight());
+    }
+
+    #[test]
+    fn a_refused_queue_slot_releases_the_busy_guards() {
+        let mut state = loaded(full_snapshot());
+        assert!(state.begin_refresh());
+        state.refresh_refused();
+        assert!(state.begin_refresh(), "a refused refresh can be retried");
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        state.command_refused("activate");
+        assert!(!state.in_flight());
+        assert!(state.error().is_some_and(|error| error.contains("busy")));
     }
 }

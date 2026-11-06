@@ -771,7 +771,7 @@ impl Server {
             .map(|draft| {
                 compile_control_policy(
                     &draft.document,
-                    PolicyCompilerOrigin::Authored,
+                    revision.compiler_origin,
                     &self.registry,
                     &inventory,
                 )
@@ -783,7 +783,7 @@ impl Server {
                 .unwrap_or_default()
             })
             .unwrap_or_default();
-        let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms());
+        let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
         let publications = self.store.load_publications()?;
         Ok(RoutingControlSnapshot {
             active_revision: revision,
@@ -866,7 +866,7 @@ impl Server {
             .ok_or(RoutingControlError::DraftMissing)?;
         let diagnostics = match compile_control_policy(
             &draft.document,
-            PolicyCompilerOrigin::Authored,
+            snapshot.active_revision.compiler_origin,
             &self.registry,
             &snapshot.inventory,
         ) {
@@ -898,7 +898,7 @@ impl Server {
             .ok_or(RoutingControlError::DraftMissing)?;
         let policy = compile_control_policy(
             &draft.document,
-            PolicyCompilerOrigin::Authored,
+            snapshot.active_revision.compiler_origin,
             &self.registry,
             &snapshot.inventory,
         )?;
@@ -1004,6 +1004,18 @@ impl Server {
         let base_revision_id = state.active_revision_id.ok_or_else(|| {
             anyhow::anyhow!("cannot reactivate without an active policy revision")
         })?;
+        // Everything that can refuse the activation is checked before the
+        // draft is replaced: a refusal must leave the user's draft, and the
+        // generation they hold, untouched.
+        let snapshot = self.routing_snapshot_locked()?;
+        let impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
+        require_cache_consent(&impacts, scope, forced_cache_transition)?;
+        compile_control_policy(
+            &selected.document,
+            selected.compiler_origin,
+            &self.registry,
+            &snapshot.inventory,
+        )?;
         match self.store.compare_and_swap_policy_draft(
             expected_generation,
             base_revision_id,
@@ -1057,13 +1069,8 @@ impl Server {
             .draft
             .clone()
             .ok_or(RoutingControlError::DraftMissing)?;
-        let impacts = self.routing_lane_impacts_locked(&snapshot.state, now_ms());
-        if options.scope == crate::policy::ActivationScope::Immediate
-            && impacts.warm + impacts.unknown > 0
-            && !options.forced_cache_transition
-        {
-            return Err(RoutingControlError::ForcedTransitionRequired { impacts });
-        }
+        let impacts = self.routing_lane_impacts_locked(&snapshot.state, now_ms())?;
+        require_cache_consent(&impacts, options.scope, options.forced_cache_transition)?;
         let compiler_origin = options
             .requested_origin
             .unwrap_or(snapshot.active_revision.compiler_origin);
@@ -1125,11 +1132,11 @@ impl Server {
         &self,
         _state: &RoutingPolicyState,
         now: i64,
-    ) -> RoutingLaneImpacts {
+    ) -> Result<RoutingLaneImpacts, crate::store::Error> {
         let mut impacts = RoutingLaneImpacts::default();
-        let Ok(lanes) = self.store.load_lanes() else {
-            return impacts;
-        };
+        // A ledger that cannot be read is no evidence of zero warm lanes: the
+        // consent gate must refuse to proceed, not read an empty impact.
+        let lanes = self.store.load_lanes()?;
         for lane in lanes {
             impacts.total += 1;
             let Some(pin) = lane.pin.as_ref() else {
@@ -1154,7 +1161,7 @@ impl Server {
                 }
             }
         }
-        impacts
+        Ok(impacts)
     }
 
     pub(crate) fn routing_revisions(&self) -> Result<Vec<PolicyRevision>, crate::store::Error> {
@@ -2511,6 +2518,22 @@ pub(crate) enum RoutingControlError {
     DraftEdit(#[from] crate::policy::PolicyEditError),
     #[error("an immediate activation needs explicit warm-cache consent")]
     ForcedTransitionRequired { impacts: RoutingLaneImpacts },
+}
+
+/// An immediate activation can strand a warm cache, so it needs explicit
+/// consent whenever any lane is warm or not provably cold.
+fn require_cache_consent(
+    impacts: &RoutingLaneImpacts,
+    scope: crate::policy::ActivationScope,
+    forced_cache_transition: bool,
+) -> Result<(), RoutingControlError> {
+    if scope == crate::policy::ActivationScope::Immediate
+        && impacts.warm + impacts.unknown > 0
+        && !forced_cache_transition
+    {
+        return Err(RoutingControlError::ForcedTransitionRequired { impacts: *impacts });
+    }
+    Ok(())
 }
 
 fn preview_result_body(

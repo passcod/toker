@@ -49,6 +49,7 @@ mod quota;
 mod rebuilds;
 mod reexec;
 mod routing;
+pub use routing::SettingsSync;
 mod view;
 
 use std::collections::HashMap;
@@ -144,6 +145,7 @@ pub fn run(
     extra_transcript_roots: &[PathBuf],
     gates: &crate::config::GatesConfig,
     port: u16,
+    settings: Option<SettingsSync>,
 ) -> anyhow::Result<()> {
     let store = Store::open(db_path)?;
     // Taken before the terminal: the file this process was started
@@ -168,7 +170,7 @@ pub fn run(
     };
     let mut drawn = view::Drawn::default();
     let mut page = Page::Dashboard;
-    let mut routing = routing::Page::new(port);
+    let mut routing = routing::Page::new(port, settings);
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));

@@ -342,9 +342,11 @@ async fn preview_rejects_content_fields_and_only_projects_content_free_trace() {
         ))
         .await
         .unwrap();
-    assert_eq!(preview.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // The draft compiles under the compiler its activation would use, so the
+    // preview resolves rather than reporting diagnostics activation would not.
+    assert_eq!(preview.status(), StatusCode::OK);
     let preview = body(preview).await;
-    assert_eq!(preview["error"], "invalid_policy");
+    assert!(preview["result"]["outcome"].is_string());
     assert!(preview["diagnostics"].is_array());
     assert!(!preview.to_string().contains("never accepted"));
 }
@@ -461,6 +463,61 @@ async fn immediate_activation_requires_an_explicit_warm_cache_override() {
         .await
         .unwrap();
     assert_eq!(forced.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_refused_reactivation_leaves_the_draft_and_its_generation_alone() {
+    let (server, store) = server();
+    let app = server.router();
+    let generation = snapshot(&app).await["draft_generation"].as_i64().unwrap();
+    store
+        .upsert_lane(&Lane {
+            key: "warm-lane".to_owned(),
+            session_id: None,
+            tools_hash: None,
+            updated_ms: jiff::Timestamp::now().as_millisecond(),
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: Some(LanePin {
+                policy_revision_id: 1,
+                policy_route_id: "route".parse().unwrap(),
+                route_fingerprint: "11".repeat(32).parse().unwrap(),
+                candidate_id: "candidate".parse().unwrap(),
+                binding_id: "openrouter.openai_chat".parse().unwrap(),
+                baseline_model: "base".to_owned(),
+                effective_model: "effective".to_owned(),
+            }),
+        })
+        .unwrap();
+
+    let denied = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/_toker/routing/reactivate",
+            Some("routing-reactivate"),
+            Some(json!({
+                "expected_generation": generation,
+                "revision_id": 1,
+                "scope": "immediate",
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body(denied).await["error"],
+        "forced_cache_transition_required"
+    );
+    // The refusal did not consume the draft: the same generation still works.
+    let after = snapshot(&app).await;
+    assert_eq!(after["draft_generation"].as_i64().unwrap(), generation);
+    assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
 }
 
 #[tokio::test]

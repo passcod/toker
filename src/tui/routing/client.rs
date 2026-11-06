@@ -13,6 +13,10 @@ use serde_json::Value;
 const REQUEST_QUEUE: usize = 4;
 const REPLY_QUEUE: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Writes (an activation compiles and persists a revision) get longer than
+/// reads: a timeout on a write that then lands would report a failure for a
+/// change the daemon made, and skip the settings sync that follows it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A named control operation, kept with its reply so state can distinguish an
 /// old snapshot from a draft edit or confirmation action.
@@ -63,6 +67,17 @@ pub(super) struct Response {
 #[derive(Debug)]
 pub(super) enum Reply {
     Command(Command, Result<Response, String>),
+}
+
+/// Whether a reply is a successful activation or reactivation, after which
+/// the user's Claude settings should follow the new active policy.
+pub(super) fn activated(reply: &Reply) -> bool {
+    match reply {
+        Reply::Command(command, Ok(response)) => {
+            matches!(command.name, "activate" | "reactivate") && response.status / 100 == 2
+        }
+        Reply::Command(_, Err(_)) => false,
+    }
 }
 
 /// The terminal-side half of the routing control worker.
@@ -121,7 +136,7 @@ fn worker(base: String, requests: Receiver<Request>, replies: SyncSender<Reply>)
             return;
         }
     };
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    let client = match reqwest::Client::builder().build() {
         Ok(client) => client,
         Err(error) => {
             let command = Command::snapshot();
@@ -145,7 +160,12 @@ async fn request(
 ) -> Result<Response, String> {
     let mut request = client
         .request(command.method.clone(), format!("{base}/{}", command.path))
-        .header("x-toker-control", command.control);
+        .header("x-toker-control", command.control)
+        .timeout(if command.method == Method::GET {
+            REQUEST_TIMEOUT
+        } else {
+            WRITE_TIMEOUT
+        });
     if let Some(body) = &command.body {
         request = request.json(body);
     }
@@ -165,7 +185,7 @@ async fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, base_endpoint};
+    use super::{Command, Reply, Response, activated, base_endpoint};
 
     #[test]
     fn control_requests_are_pinned_to_loopback_and_their_verb() {
@@ -175,5 +195,29 @@ mod tests {
         );
         assert_eq!(Command::snapshot().control, "routing-snapshot");
         assert_eq!(Command::revisions().path, "revisions");
+    }
+
+    fn reply(name: &'static str, status: u16) -> Reply {
+        let mut command = Command::snapshot();
+        command.name = name;
+        Reply::Command(
+            command,
+            Ok(Response {
+                status,
+                body: serde_json::Value::Null,
+            }),
+        )
+    }
+
+    #[test]
+    fn only_a_successful_activation_triggers_the_settings_sync() {
+        assert!(activated(&reply("activate", 200)));
+        assert!(activated(&reply("reactivate", 200)));
+        assert!(!activated(&reply("activate", 409)));
+        assert!(!activated(&reply("draft-edit", 200)));
+        assert!(!activated(&Reply::Command(
+            Command::snapshot(),
+            Err("down".to_owned())
+        )));
     }
 }

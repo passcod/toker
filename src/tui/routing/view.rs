@@ -63,7 +63,7 @@ pub(super) fn render(frame: &mut Frame, state: &State, legend: bool) -> Drawn {
         render_legend(frame);
     }
     if state.modal().active() {
-        render_modal(frame, state.modal());
+        render_modal(frame, state);
     }
     Drawn {
         legend_button,
@@ -190,8 +190,12 @@ fn footer_text(state: &State) -> String {
         .map(|generation| format!("draft {generation} · "))
         .unwrap_or_default();
     let busy = if state.in_flight() { "working · " } else { "" };
+    let settings = state
+        .settings_note()
+        .map(|note| format!("{note} · "))
+        .unwrap_or_default();
     format!(
-        "{generation}{busy}←/→ or 1–4 view · ↑/↓ select · e edit · d remove · v preview · V validate · a activate · p promote · r refresh · Tab dashboard · ? help"
+        "{generation}{busy}{settings}←/→ or 1–4 view · ↑/↓ select · e edit · d remove · v preview · V validate · a activate · p promote · r refresh · Tab dashboard · ? help"
     )
 }
 
@@ -203,8 +207,9 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unrenderable>".to_owned())
 }
 
-fn render_modal(frame: &mut Frame, modal: &Modal) {
-    let lines = modal_lines(modal);
+fn render_modal(frame: &mut Frame, state: &State) {
+    let modal = state.modal();
+    let lines = modal_text(state);
     let width = lines
         .iter()
         .map(|line| line.chars().count())
@@ -229,6 +234,23 @@ fn render_modal(frame: &mut Frame, modal: &Modal) {
     );
 }
 
+/// The modal's own lines, the impact summary an activation confirms against,
+/// and the last daemon refusal, which would otherwise hide behind the popup.
+fn modal_text(state: &State) -> Vec<String> {
+    let modal = state.modal();
+    let mut lines = modal_lines(modal);
+    if matches!(modal, Modal::Activate { .. } | Modal::Reactivate { .. }) {
+        // Before the closing "confirms" line, so the prompt stays last.
+        let confirm = lines.pop();
+        lines.extend(state.activation_summary());
+        lines.extend(confirm);
+    }
+    if let Some(error) = state.error() {
+        lines.push(format!("! {error}"));
+    }
+    lines
+}
+
 fn modal_lines(modal: &Modal) -> Vec<String> {
     match modal {
         Modal::None => Vec::new(),
@@ -248,7 +270,7 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
         ],
         Modal::CandidateOrder { route, selected } => vec![
             "j/k choose candidate · h/l moves it · Enter saves typed route edit.".to_owned(),
-            "Each fallback remains paired with its explicit transition edge.".to_owned(),
+            "Transition edges keep their positions; the daemon validates the result.".to_owned(),
             format!("selected candidate {}", selected + 1),
             pretty(route),
         ],
@@ -276,7 +298,7 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             "Promotion records a binding-specific learned model; it does not activate a draft.".to_owned(),
             if *field == 0 { format!("> binding: {binding}") } else { format!("  binding: {binding}") },
             if *field == 1 { format!("> model: {model}") } else { format!("  model: {model}") },
-            "Tab selects · Enter records promotion · Esc cancels".to_owned(),
+            "Tab selects · Ctrl+O completes from a daemon offer · Enter records · Esc cancels".to_owned(),
         ],
         Modal::Conflict { daemon_generation, daemon_draft } => vec![
             "The daemon draft changed while this terminal was editing.".to_owned(),
@@ -296,7 +318,6 @@ fn activation_lines(prompt: &str, scope: usize, force_cache_transition: bool) ->
             "forced warm-cache transition: {} (f toggles)",
             if force_cache_transition { "YES" } else { "no" }
         ),
-        "Review lane impacts, billing boundaries, and publication status in the reply.".to_owned(),
         "y/Enter confirms · n/Esc cancels".to_owned(),
     ]
 }
@@ -332,7 +353,7 @@ fn render_legend(frame: &mut Frame) {
 mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{State, render};
+    use super::{State, modal_text, render};
     use crate::tui::routing::client::{Command, Reply, Response};
 
     #[test]
@@ -365,5 +386,48 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("e edit"));
         assert!(text.contains("a activate"));
+    }
+
+    #[test]
+    fn the_activation_form_shows_its_impact_and_the_last_refusal() {
+        let mut state = State::default();
+        state.receive(Reply::Command(
+            Command::snapshot(),
+            Ok(Response {
+                status: 200,
+                body: serde_json::json!({
+                    "draft_generation": 2,
+                    "draft": {"policy": {"routes": [{"id": "new-route"}]}},
+                    "active_revision": {"policy": {"routes": []}},
+                    "lane_impacts": {"total": 4, "unpinned": 1, "warm": 2, "cold": 1, "unknown": 0},
+                    "publications": [{"adapter": "claude", "state": "failed"}],
+                }),
+            }),
+        ));
+        state.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut command = Command::snapshot();
+        command.name = "activate";
+        state.receive(Reply::Command(
+            command,
+            Ok(Response {
+                status: 409,
+                body: serde_json::json!({"error": "forced_cache_transition_required"}),
+            }),
+        ));
+        let text = modal_text(&state).join("\n");
+        assert!(text.contains("+route new-route"), "{text}");
+        assert!(text.contains("2 warm"), "{text}");
+        assert!(text.contains("publication claude: failed"), "{text}");
+        assert!(text.contains("forced_cache_transition_required"), "{text}");
+        assert!(
+            text.lines()
+                .rev()
+                .nth(1)
+                .is_some_and(|line| line.contains("confirms")),
+            "the confirmation prompt stays above the refusal: {text}"
+        );
     }
 }

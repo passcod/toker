@@ -14,30 +14,30 @@
 - [x] An activation scope preserves warm pins unless an explicit cache-safe
   transition permits movement.
 - [x] Forced warm-lane movement requires explicit confirmation.
-- [ ] A failed Claude settings reconciliation leaves the activated server policy
+- [x] A failed Claude settings reconciliation leaves the activated server policy
   in place.
 
 ## Routing terminal
 
 - [ ] `Tab` and the header routing action switch between dashboard and routing
   pages without losing loaded draft or validation state.
-- [ ] Routing refresh failure does not block dashboard input or terminal redraw.
-- [ ] A presentation, route, rewrite/family/upgrade, and revision/activation
+- [x] Routing refresh failure does not block dashboard input or terminal redraw.
+- [x] A presentation, route, rewrite/family/upgrade, and revision/activation
   view are each navigable with keyboard controls.
-- [ ] A policy form supports text, enum, matcher, offer completion, and ordered
+- [x] A policy form supports text, enum, matcher, offer completion, and ordered
   candidate editing.
-- [ ] Removal, billed-boundary fallback, activation, reactivation, and forced
+- [x] Removal, billed-boundary fallback, activation, reactivation, and forced
   cache movement each require confirmation.
-- [ ] A draft conflict preserves local edits and supports reload or typed
+- [x] A draft conflict preserves local edits and supports reload or typed
   field-level reapplication.
-- [ ] Promotion identifies a binding and model before recording learning.
+- [x] Promotion identifies a binding and model before recording learning.
 
 ## Dashboard provenance
 
-- [ ] Explicitly linked child sessions aggregate beneath their display parent
+- [x] Explicitly linked child sessions aggregate beneath their display parent
   while their lanes remain separate.
-- [ ] A child detail uses its parent's transcript title and working directory
-  while showing the child raw id and role.
-- [ ] Unlinked sessions remain separate.
-- [ ] The model detail renders requested, effective, and provider-reported
+- [x] A child detail uses its parent's transcript title and working directory
+  while naming its linked children by role.
+- [x] Unlinked sessions remain separate.
+- [x] The model detail renders requested, effective, and provider-reported
   identities, with `reported -` when the provider omitted it.
