@@ -22,7 +22,6 @@ use toker::ir::{Release, Request};
 use toker::middleware::awake::decide_awake;
 use toker::middleware::cold::{self, ColdDecision};
 use toker::middleware::lanes::Ttl;
-use toker::middleware::model_map;
 use toker::middleware::quota::{self, GateDecision, Meter, Meters};
 use toker::store::{Allowance, Lane};
 
@@ -183,7 +182,7 @@ fn cold_gate_cases_pass_against_the_vendored_contract() {
                 }))
                 .expect("serialise the fixture body");
                 let mut request = Request::parse(&body).expect("the fixture body parses");
-                let outcome = cold::retarget_compaction(&mut request, None, cold, None);
+                let outcome = cold::retarget_compaction(&mut request, None, cold);
                 match expected.get("action").and_then(Value::as_str) {
                     Some("forward") => assert!(
                         outcome.is_none(),
@@ -428,82 +427,5 @@ fn awake_cases_pass_against_the_vendored_contract() {
     assert!(
         awake_cases >= 1,
         "the fixture carries awake-decision cases; none dispatched"
-    );
-}
-
-#[test]
-fn model_map_cases_pass_against_the_vendored_contract() {
-    let contract = contract();
-    let mut route_cases = 0;
-
-    for case in contract
-        .get("cases")
-        .and_then(Value::as_array)
-        .expect("an ordered cases array")
-    {
-        let id = case.get("id").and_then(Value::as_str).expect("case id");
-        let operation = case
-            .get("operation")
-            .and_then(Value::as_str)
-            .expect("case operation");
-        let input = case.get("input").expect("case input");
-        let expected = case.get("expected").expect("case expected");
-
-        match operation {
-            // routeIdentity(): the routing identity contract — the model
-            // the client asked for, the model the map sends upstream, and
-            // the model that served stay three distinct things. The
-            // fixture's map is stringified and re-parsed
-            // (a `JSON.stringify` round-trip, as the fixture's own oracle
-            // ran it),
-            // and the synthetic body carries only a model — no prompt,
-            // completion, system, or tool content enters the fixture.
-            "route-identity" => {
-                let raw_map = serde_json::to_string(input.get("modelMap").expect("case modelMap"))
-                    .expect("serialise the fixture map");
-                let policy = model_map::parse_model_map(&raw_map)
-                    .expect("case model map parses")
-                    .expect("the fixture's map is enabled");
-                let requested = input
-                    .get("requestedModel")
-                    .and_then(Value::as_str)
-                    .expect("case requestedModel");
-                let body = serde_json::to_vec(&serde_json::json!({"model": requested}))
-                    .expect("serialise the fixture body");
-                let rewritten =
-                    model_map::rewrite_mapped_models(Some(&policy), &body, "POST", "/v1/messages");
-                assert_eq!(
-                    rewritten.pre_map_model.as_deref(),
-                    expected.get("requestedModel").and_then(Value::as_str),
-                    "case {id}: requested model"
-                );
-                assert_eq!(
-                    rewritten.effective_model.as_deref(),
-                    expected.get("effectiveModel").and_then(Value::as_str),
-                    "case {id}: effective model"
-                );
-                assert_eq!(
-                    rewritten.mapped,
-                    expected.get("mapped") == Some(&Value::Bool(true)),
-                    "case {id}: mapped"
-                );
-                // `servedModel` is the response identity — the row's, not
-                // the rewrite's. The oracle echoes it; so does this
-                // harness, pinning that the rewrite never touches it.
-                assert_eq!(
-                    input.get("servedModel"),
-                    expected.get("servedModel"),
-                    "case {id}: served model is the response's, untouched"
-                );
-                route_cases += 1;
-            }
-            // Other units' operations: not this harness's to dispatch.
-            _ => continue,
-        }
-    }
-
-    assert!(
-        route_cases >= 1,
-        "the fixture carries route-identity cases; none dispatched"
     );
 }

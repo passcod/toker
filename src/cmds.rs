@@ -27,19 +27,8 @@ pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
     let config = Config::load()?;
     let store = Arc::new(Store::open(&config.db_path)?);
-    tracing::info!(
-        "serving anthropic → {}, openai_chat → {} (db: {})",
-        config
-            .default_backend_anthropic
-            .as_deref()
-            .unwrap_or("not configured"),
-        config
-            .default_backend_openai_chat
-            .as_deref()
-            .unwrap_or("not configured"),
-        config.db_path.display()
-    );
-    Server::new_authoritative(config, store)?.serve().await
+    tracing::info!(db = %config.db_path.display(), "serving");
+    Server::new(config, store)?.serve().await
 }
 
 /// `setup`: the interactive wizard (plan: "Setup wizard") — the ONLY
@@ -87,14 +76,17 @@ pub fn status() -> anyhow::Result<()> {
     println!(
         "routing: {}",
         routing_state.active_revision_id.map_or_else(
-            || "config".to_owned(),
-            |revision| format!("database revision {revision}")
+            || "no active revision yet (the service creates revision one from this config)"
+                .to_owned(),
+            |revision| format!("active revision {revision}")
         )
     );
     println!(
         "session headers: {}",
         config.session_header_names.join(", ")
     );
+    // Before the first start, the config's defaults are what revision one
+    // will be generated from; afterwards the revision owns routing.
     if routing_state.active_revision_id.is_none() {
         println!(
             "default backend (anthropic): {}",
@@ -426,16 +418,15 @@ pub struct PromoteOpts {
 }
 
 /// Apply one binding-local promotion directly to the configured ledger. The
-/// binding-aware daemon endpoint belongs to the later authoritative control
-/// surface; this non-authoritative changeset must not route through the legacy
-/// global merge endpoint or write the legacy `models` table.
+/// promotable families come from the active routing revision. This writes
+/// only the binding's own learning, never the legacy `models` table.
 pub fn promote_run(
     config: &Config,
     opts: &PromoteOpts,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
     use crate::catalog::offers::OfferInventory;
-    use crate::routing::{ProtocolId, RouteRegistry};
+    use crate::routing::RouteRegistry;
 
     if !config.db_path.exists() {
         bail!(
@@ -464,36 +455,39 @@ pub fn promote_run(
             )
         }
     };
-    let topology = RouteRegistry::new(
-        std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-        [
-            config
-                .default_backend_anthropic
-                .clone()
-                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
-            config
-                .default_backend_openai_chat
-                .clone()
-                .map(|provider| (ProtocolId::OpenAiChat, provider)),
-            Some((ProtocolId::OpenAiResponses, "codex_sub".to_owned())),
-        ]
-        .into_iter()
-        .flatten(),
-    );
+    // The active revision, as the service compiled it: a credential-free view
+    // of the enabled bindings is all the classifiers need.
+    let topology = RouteRegistry::configured_bindings(crate::picker::configured_bindings(config));
     if topology.binding(&binding).is_none() {
         bail!("{binding} is not a declared backend binding");
     }
     let entry = store
         .load_binding_learning(&binding, model)?
         .ok_or_else(|| anyhow::anyhow!(binding_unseen_message(model, &[binding.as_str()])))?;
-    let policy = crate::policy::legacy::compile(config, &topology, &OfferInventory::default())?
-        .into_policy()
-        .map_err(|diagnostics| {
+    let revision_id = store
+        .load_routing_policy_state()?
+        .active_revision_id
+        .ok_or_else(|| {
             anyhow::anyhow!(
-                "the generated revision-one policy has {} diagnostic(s)",
-                diagnostics.len()
+                "no active routing revision in {}: start the service once, or run `toker setup`",
+                config.db_path.display()
             )
         })?;
+    let revision = store
+        .load_policy_revision(revision_id)?
+        .ok_or_else(|| anyhow::anyhow!("active policy revision {revision_id} is missing"))?;
+    let policy = crate::policy::runtime::compile_stored_revision(
+        &revision,
+        &topology,
+        &OfferInventory::default(),
+    )
+    .into_policy()
+    .map_err(|diagnostics| {
+        anyhow::anyhow!(
+            "active policy revision {revision_id} has {} diagnostic(s)",
+            diagnostics.len()
+        )
+    })?;
     let mut applicable = policy
         .upgrades()
         .filter(|upgrade| upgrade.policy().enabled && upgrade.policy().allow_manual_promotion)
@@ -542,10 +536,6 @@ pub fn promote_run(
         out,
         "\n  binding-scoped promotion {outcome} in {}",
         config.db_path.display()
-    )?;
-    writeln!(
-        out,
-        "  routing remains legacy-authoritative until policy cutover"
     )?;
     Ok(())
 }
@@ -1108,6 +1098,24 @@ mod tests {
         (dir, config)
     }
 
+    /// Give the ledger the active revision a started service would have
+    /// created from this config.
+    fn activate(config: &Config) {
+        let store = Store::open(&config.db_path).unwrap();
+        let topology = crate::routing::RouteRegistry::configured_bindings(
+            crate::picker::configured_bindings(config),
+        );
+        crate::policy::legacy::establish_revision_one(
+            &store,
+            config,
+            &topology,
+            &crate::catalog::offers::OfferInventory::default(),
+            0,
+            1,
+        )
+        .unwrap();
+    }
+
     fn binding(value: &str) -> BindingId {
         value.parse().unwrap()
     }
@@ -1137,6 +1145,7 @@ mod tests {
     #[test]
     fn unique_binding_is_inferred_and_only_promotion_state_changes() {
         let (_dir, config) = config("unique");
+        activate(&config);
         let store = Store::open(&config.db_path).unwrap();
         let selected = binding("anthropic_sub.anthropic_messages");
         learn(&store, &selected, "claude-opus-5");
@@ -1154,10 +1163,7 @@ mod tests {
         let report = String::from_utf8(out).unwrap();
         assert!(report.contains(selected.as_str()), "{report}");
         assert!(report.contains("family       opus"), "{report}");
-        assert!(
-            report.contains("routing remains legacy-authoritative"),
-            "{report}"
-        );
+        assert!(!report.contains("legacy"), "{report}");
         let learned = store
             .load_binding_learning(&selected, "claude-opus-5")
             .unwrap()
@@ -1180,6 +1186,7 @@ mod tests {
     #[test]
     fn ambiguous_model_requires_binding_and_explicit_binding_is_isolated() {
         let (_dir, config) = config("ambiguous");
+        activate(&config);
         let store = Store::open(&config.db_path).unwrap();
         let first = binding("anthropic_api.anthropic_messages");
         let second = binding("anthropic_sub.anthropic_messages");
@@ -1222,6 +1229,7 @@ mod tests {
     #[test]
     fn dry_run_and_refusals_write_nothing() {
         let (_dir, config) = config("refusals");
+        activate(&config);
         let store = Store::open(&config.db_path).unwrap();
         let selected = binding("anthropic_sub.anthropic_messages");
         learn(&store, &selected, "claude-opus-5");
@@ -1251,6 +1259,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not been learned")
+        );
+    }
+
+    #[test]
+    fn a_ledger_with_no_active_revision_has_nothing_to_promote_under() {
+        let (_dir, config) = config("no-revision");
+        let store = Store::open(&config.db_path).unwrap();
+        learn(
+            &store,
+            &binding("anthropic_sub.anthropic_messages"),
+            "claude-opus-5",
+        );
+        let error = promote_run(
+            &config,
+            &opts("claude-opus-5", None, false),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no active routing revision"),
+            "{error}"
+        );
+        assert!(
+            !store
+                .load_binding_learning(
+                    &binding("anthropic_sub.anthropic_messages"),
+                    "claude-opus-5"
+                )
+                .unwrap()
+                .unwrap()
+                .explicitly_promoted
         );
     }
 

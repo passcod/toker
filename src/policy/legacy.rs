@@ -1,7 +1,7 @@
 //! Pure conversion of resolved legacy configuration into revision-one policy.
 //!
 //! This module translates routing vocabulary only. It does not persist a
-//! policy, consult the ledger, or make policy authoritative in handlers.
+//! policy or consult the ledger.
 
 use std::collections::BTreeMap;
 
@@ -107,6 +107,16 @@ pub fn compile_document(
     topology: &RouteRegistry,
     inventory: &OfferInventory,
 ) -> Compilation {
+    // The bare-slug half of the listing follows the document's own protocol
+    // default, so a stored revision lists what it routes rather than what
+    // the config says today.
+    let defaults: Vec<_> = [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses]
+        .into_iter()
+        .map(|protocol| {
+            let provider = default_provider(document.document(), topology, protocol);
+            (protocol, provider)
+        })
+        .collect();
     let mut compilation = super::compile(
         document,
         topology,
@@ -114,16 +124,49 @@ pub fn compile_document(
         PolicyOrigin::GeneratedRevisionOne,
     );
     if let Some(policy) = compilation.policy_mut() {
-        for protocol in [ProtocolId::OpenAiChat, ProtocolId::OpenAiResponses] {
+        for (protocol, default_provider) in defaults {
             policy.add_generated_publication(
                 protocol.into(),
-                offers::for_frontend_inventory(topology, inventory, protocol)
-                    .into_iter()
-                    .map(|offer| offer.routed_model_id),
+                offers::for_frontend_inventory(
+                    topology,
+                    inventory,
+                    protocol,
+                    default_provider.as_deref(),
+                )
+                .into_iter()
+                .map(|offer| {
+                    (
+                        offer.routed_model_id,
+                        offer.binding.id().clone(),
+                        offer.backend_model_id,
+                    )
+                }),
             );
         }
     }
     compilation
+}
+
+/// The provider a generated document defaults `protocol` to, if any.
+fn default_provider(
+    document: &PolicyDocument,
+    topology: &RouteRegistry,
+    protocol: ProtocolId,
+) -> Option<String> {
+    let scope = FrontendScope::Protocol {
+        protocol: protocol.into(),
+    };
+    let default = document
+        .defaults
+        .iter()
+        .find(|default| default.scope == scope)?;
+    topology
+        .routes()
+        .filter(|route| route.frontend() == protocol)
+        .find(|route| {
+            backend_route_id(route.binding()).is_ok_and(|id| id == default.target.route_id)
+        })
+        .map(|route| route.binding().provider().to_owned())
 }
 
 struct LegacyBuilder<'a> {
@@ -157,7 +200,6 @@ impl<'a> LegacyBuilder<'a> {
         self.add_defaults()?;
         self.add_explicit_prefixes()?;
         self.add_anthropic_alias()?;
-        self.add_auxiliary_claude_route()?;
         self.add_picker()?;
         self.add_compaction()?;
         Ok(self.policy)
@@ -231,7 +273,12 @@ impl<'a> LegacyBuilder<'a> {
                     },
                     steps: vec![],
                 },
-                lane_transition: LaneTransitionPolicy::PreservePinned,
+                // A pinned lane may move once its cache is gone, which is
+                // what the force-newest upgrade and the compaction retarget
+                // need. The combination with their own policies is the
+                // stricter of the two, so PreservePinned here would deny
+                // both for every pinned lane however long it idled.
+                lane_transition: LaneTransitionPolicy::MoveWhenCold,
             });
         }
         Ok(())
@@ -325,41 +372,6 @@ impl<'a> LegacyBuilder<'a> {
             model_matcher: MatcherSpec::Regex(r"^anthropic/(?P<model>.+)$".to_owned()),
             target: RouteReference {
                 route_id: backend_route_id(binding)?,
-                parameters: BTreeMap::from([(
-                    parameter(REQUESTED_ROUTE_PARAMETER)?,
-                    ArgumentBinding::RegexCaptureName {
-                        name: "model".to_owned(),
-                    },
-                )]),
-            },
-        });
-        Ok(())
-    }
-
-    fn add_auxiliary_claude_route(&mut self) -> anyhow::Result<()> {
-        if self.config.default_backend_anthropic.is_some() {
-            return Ok(());
-        }
-        let candidate = self
-            .topology
-            .routes()
-            .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
-            .find(|route| {
-                self.topology.binding_is_configured(route.binding())
-                    && model_map_for(self.config, route.binding().provider()).is_some()
-            });
-        let Some(route) = candidate else {
-            return Ok(());
-        };
-        self.policy.rewrites.push(RewriteRule {
-            id: RewriteId::new("legacy-auxiliary-claude")?,
-            scope: FrontendScope::Protocol {
-                protocol: FrontendProtocol::AnthropicMessages,
-            },
-            priority: 10_000,
-            model_matcher: MatcherSpec::Regex(r"^(?P<model>claude-.+)$".to_owned()),
-            target: RouteReference {
-                route_id: backend_route_id(route.binding())?,
                 parameters: BTreeMap::from([(
                     parameter(REQUESTED_ROUTE_PARAMETER)?,
                     ArgumentBinding::RegexCaptureName {
@@ -619,31 +631,14 @@ mod tests {
         if let Some(provider) = &config.anthropic_sub {
             providers.push(Arc::new(AnthropicSub::new(
                 provider.upstream.clone(),
-                provider.model_map.clone(),
                 None,
                 None,
             )));
         }
         if let Some(provider) = &config.anthropic_api {
-            providers.push(Arc::new(AnthropicApi::new(
-                provider.upstream.clone(),
-                None,
-                provider.model_map.clone(),
-            )));
+            providers.push(Arc::new(AnthropicApi::new(provider.upstream.clone(), None)));
         }
-        let defaults = [
-            config
-                .default_backend_anthropic
-                .clone()
-                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
-            config
-                .default_backend_openai_chat
-                .clone()
-                .map(|provider| (ProtocolId::OpenAiChat, provider)),
-        ]
-        .into_iter()
-        .flatten();
-        RouteRegistry::new(providers, defaults)
+        RouteRegistry::new(providers)
     }
 
     #[test]
@@ -858,7 +853,7 @@ mod tests {
                 "claude-3-7-sonnet",
                 "claude-3-7-sonnet-20250219",
             ] {
-                let expected = crate::middleware::models::family_of(model).expect("legacy family");
+                let expected = crate::policy::family::family_of(model).expect("legacy family");
                 let classified = classifier
                     .classify(model)
                     .expect("classification succeeds")
@@ -938,51 +933,6 @@ mod tests {
     }
 
     #[test]
-    fn auxiliary_bare_claude_routes_without_anthropic_default_via_model_map() {
-        let config = load_config(
-            "[providers.codex_sub]\n\
-             [providers.codex_sub.model_map]\n\
-             \"family:sonnet\" = \"gpt-5.6-luna\"\n",
-        );
-        // Codex construction needs a login, but topology is immutable; use a
-        // registry with no configured provider to inspect the generated raw
-        // policy after marking the config route through its map.
-        let codex_topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn Provider>>(),
-            [(ProtocolId::OpenAiResponses, "codex_sub".to_owned())],
-        );
-        let generated = document(&config, &codex_topology).unwrap();
-        assert!(
-            generated
-                .rewrites
-                .iter()
-                .all(|rule| rule.id.as_str() != "legacy-auxiliary-claude")
-        );
-
-        let config = load_config(
-            "[providers.anthropic_api]\n\
-             [providers.anthropic_api.model_map]\n\
-             \"family:sonnet\" = \"claude-sonnet-5\"\n",
-        );
-        let mut config = config;
-        config.default_backend_anthropic = None;
-        let topology = topology(&config);
-        let generated = document(&config, &topology).unwrap();
-        let auxiliary = generated
-            .rewrites
-            .iter()
-            .find(|rule| rule.id.as_str() == "legacy-auxiliary-claude")
-            .expect("auxiliary route");
-        assert!(matches!(auxiliary.model_matcher, MatcherSpec::Regex(_)));
-        assert!(
-            compile(&config, &topology, &OfferInventory::default())
-                .unwrap()
-                .policy()
-                .is_some()
-        );
-    }
-
-    #[test]
     fn chat_publication_matches_the_shared_legacy_projection() {
         let config = load_config(
             "default_backend_openai_chat = \"openrouter\"\n\
@@ -990,7 +940,7 @@ mod tests {
         );
         let topology = topology(&config);
         let mut catalogs = FetchedCatalogs::default();
-        for source in ["openrouter", "openai"] {
+        for source in ["openrouter", "openai_api"] {
             catalogs.set(
                 source,
                 FetchedCatalog {
@@ -1008,11 +958,17 @@ mod tests {
             );
         }
         let inventory = offers::inventory(&topology, &catalogs);
-        let legacy: std::collections::BTreeSet<_> =
-            offers::for_frontend_inventory(&topology, &inventory, ProtocolId::OpenAiChat)
-                .into_iter()
-                .map(|offer| offer.routed_model_id)
-                .collect();
+        let legacy: std::collections::BTreeSet<String> = [
+            "openrouter/openrouter-shared",
+            "openrouter/openrouter-specific",
+            "openrouter-shared",
+            "openrouter-specific",
+            "openai_api/openai_api-shared",
+            "openai_api/openai_api-specific",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         let compilation = compile(&config, &topology, &inventory).unwrap();
         let policy = compilation.policy().expect("compiled");
         let compiled: std::collections::BTreeSet<_> = policy
@@ -1030,6 +986,56 @@ mod tests {
                 .all(|slug| policy.presentation(&scope, slug).is_none()),
             "inventory publication must not become request-routing presentations"
         );
+    }
+
+    #[test]
+    fn chat_listing_renders_the_generated_publication() {
+        let config = load_config(
+            "default_backend_openai_chat = \"openrouter\"\n\
+             [providers.openrouter]\n",
+        );
+        let topology = topology(&config);
+        let mut catalogs = FetchedCatalogs::default();
+        catalogs.set(
+            "openrouter",
+            FetchedCatalog {
+                fetched_at_ms: 7,
+                models: vec![FetchedModel {
+                    id: "lab/one".to_owned(),
+                    context_window: Some(100),
+                    chronology: None,
+                    raw: json!({"id": "lab/one", "created": 3}),
+                }],
+            },
+        );
+        let inventory = offers::inventory(&topology, &catalogs);
+        let compilation = compile(&config, &topology, &inventory).unwrap();
+        let policy = compilation.policy().expect("compiled");
+
+        // Prefixed, and bare because openrouter is the Chat default.
+        let offers::PolicyPublication::Ready(listing) =
+            offers::render_policy(policy, &inventory, None, FrontendProtocol::OpenaiChat)
+        else {
+            panic!("the inventory resolves every generated slug");
+        };
+        let ids: Vec<_> = listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["lab/one", "openrouter/lab/one"]);
+
+        // A Messages frontend has no generated listing to add.
+        let offers::PolicyPublication::Ready(messages) = offers::render_policy(
+            policy,
+            &inventory,
+            None,
+            FrontendProtocol::AnthropicMessages,
+        ) else {
+            panic!("an empty publication resolves");
+        };
+        assert!(messages["data"].as_array().unwrap().is_empty());
     }
 
     #[test]

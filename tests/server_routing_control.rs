@@ -43,7 +43,8 @@ fn server() -> (Server, Arc<Store>) {
     let config = config();
     let store = Arc::new(Store::open(&config.db_path).unwrap());
     (
-        Server::new_authoritative(config, store.clone()).expect("authoritative server"),
+        Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+            .expect("authoritative server"),
         store,
     )
 }
@@ -300,7 +301,15 @@ async fn typed_patch_only_changes_its_target_and_validation_is_non_mutating() {
     assert_eq!(validated.status(), StatusCode::OK);
     let validated = body(validated).await;
     assert_eq!(validated["generation"], generation);
-    assert!(validated["diagnostics"].is_array());
+    assert_eq!(validated["valid"], true, "{validated}");
+    let diagnostics = validated["diagnostics"].as_array().unwrap();
+    assert!(
+        !diagnostics.is_empty()
+            && diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["severity"] != "error"),
+        "a policy that compiles still reports its notes: {validated}"
+    );
     assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
 }
 

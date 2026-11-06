@@ -914,14 +914,15 @@ pub struct RequestRow {
     pub geo: Option<String>,
     /// Provider's fast/low-latency tier flag, when reported.
     pub fast: Option<bool>,
-    /// Selected backend binding. Legacy-attributed rows may carry it without
-    /// policy provenance; a policy actual attempt must carry the selected
-    /// binding while a preflight terminal must not.
+    /// Selected backend binding. Rows written before policy routing may carry
+    /// it without policy provenance; a policy actual attempt must carry the
+    /// selected binding while a preflight terminal must not.
     pub binding_id: Option<BindingId>,
-    /// One actual upstream send's identity, independent of whether policy or
-    /// the legacy router selected it. Preflight-only terminals have no attempt.
+    /// One actual upstream send's identity. Preflight-only terminals have no
+    /// attempt.
     pub attempt: Option<AttemptProvenance>,
-    /// Closed policy-routing provenance, absent on legacy/non-routing rows.
+    /// Closed policy-routing provenance, absent on non-routing rows and on
+    /// rows written before policy routing.
     pub policy_routing: Option<PolicyRouteProvenance>,
     pub lineage: Option<SessionLineage>,
 }
@@ -1274,57 +1275,6 @@ pub(super) fn requests_since(conn: &Connection, ts_ms: i64, limit: i64) -> Resul
         [ts_ms, limit],
         read_row,
     )
-}
-
-/// The learned model store's reseed input: one [`ModelObservation`] per
-/// served model string and [`OBSERVATION_BUCKET_MS`] bucket, over the
-/// whole ledger.
-///
-/// Over the whole ledger because the store reseeded from the newest
-/// 20,000 rows only, and the rows that proved `claude-sonnet-5` at 398k
-/// (imported from ctp) sat further back, so its learned ceiling stayed at
-/// 248k. Bucketed rather than per row so the read stays small as the
-/// ledger grows: every UTC offset in use is a whole number of quarter
-/// hours, so a bucket never straddles a local midnight and its start
-/// names the same local day as every row in it.
-///
-/// API measurements only (`kind IS NULL`): proxy-written rows are not
-/// observations. The served identity is `raw_model`, falling back to
-/// `model` for rows that carry only the normalised form.
-pub(super) fn model_observations(conn: &Connection) -> Result<Vec<ModelObservation>> {
-    rows_of(
-        conn,
-        "SELECT COALESCE(raw_model, model) AS served,
-                (ts_ms / ?1) * ?1 AS bucket_ms,
-                MAX(COALESCE(input, 0) + COALESCE(cache_read, 0)
-                    + COALESCE(cache_write_total, 0)) AS held
-         FROM requests
-         WHERE kind IS NULL AND COALESCE(raw_model, model) IS NOT NULL
-         GROUP BY served, bucket_ms",
-        [OBSERVATION_BUCKET_MS],
-        |row| {
-            Ok(ModelObservation {
-                model: row.get("served")?,
-                bucket_ms: row.get("bucket_ms")?,
-                held: row.get("held")?,
-            })
-        },
-    )
-}
-
-/// The width of a [`model_observations`] bucket: a quarter hour.
-pub const OBSERVATION_BUCKET_MS: i64 = 15 * 60 * 1000;
-
-/// One served model's largest prompt within one bucket
-/// ([`model_observations`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelObservation {
-    /// The served model string as the row recorded it, unnormalised.
-    pub model: String,
-    /// The bucket's start, epoch milliseconds.
-    pub bucket_ms: i64,
-    /// The largest fresh input + cache read + cache write in the bucket.
-    pub held: i64,
 }
 
 /// The meter lookback's narrow read ([`MeterRow`]s): rows within the

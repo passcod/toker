@@ -35,10 +35,9 @@ use toker::config::{
 use toker::middleware::model_map;
 use toker::policy::{
     ArgumentBinding, BoundaryConsent, CURRENT_FORMAT_VERSION, CacheTransitionPolicy, Candidate,
-    CandidateEdge, CandidateId, CandidateModel, CollectingObserver, DefaultRoute, FailureClass,
-    FallbackPermission, FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
+    CandidateEdge, CandidateId, CandidateModel, DefaultRoute, FailureClass, FallbackPermission,
+    FrontendProtocol, FrontendScope, LaneTransitionPolicy, PolicyDocument,
     REQUESTED_MODEL_PARAMETER, Route, RouteChain, RouteId, RouteReference, RouteStep,
-    ShadowComparison, ShadowRecord,
 };
 use toker::routing::{ANTHROPIC_API_MESSAGES, CODEX_SUB_RESPONSES, OPENROUTER_RESPONSES};
 use toker::server::Server;
@@ -954,36 +953,22 @@ async fn spawn_toker_with_policy(
         .expect("activate policy fixture");
     // Policy fixtures intentionally use exact fake model ids. Do not let the
     // host's cached provider listings turn them into fresh-catalogue misses.
-    let server = Server::new_authoritative_with_catalogs(
-        config,
-        store.clone(),
-        toker::catalog::FetchedCatalogs::default(),
-    )
-    .expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     serve_toker(server, store, dir).await
 }
 
 async fn spawn_toker(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
+    let server = Server::with_seams(config, store.clone(), toker::server::Seams::isolated())
+        .expect("build server");
     serve_toker(server, store, dir).await
 }
 
-async fn spawn_toker_cataloged(
-    fixture: TestConfig,
-) -> (SocketAddr, Arc<Store>, Arc<CollectingObserver>) {
+async fn spawn_toker_cataloged(fixture: TestConfig) -> (SocketAddr, Arc<Store>) {
     let TestConfig { config, dir } = fixture;
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let observer = Arc::new(CollectingObserver::default());
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer.clone(),
-    )
-    .expect("build server");
     let raw = json!({
         "models": [{
             "slug": "gpt-5.6-sol",
@@ -991,20 +976,18 @@ async fn spawn_toker_cataloged(
             "max_context_window": 872000
         }]
     });
-    server.install_catalog(
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(
         "codex_sub",
         toker::catalog::fetched::parse_codex(&raw, 1).expect("catalog"),
     );
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        let _dir = dir;
-        axum::serve(listener, app).await.expect("toker serves");
-    });
-    (addr, store, observer)
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_catalogs(catalogs),
+    )
+    .expect("build server");
+    serve_toker(server, store, dir).await
 }
 
 /// A claude-shaped streaming Messages request for `model`, with a system
@@ -1047,8 +1030,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     let (upstream, mock) = spawn_mock().await;
-    let (addr, _store, observer) =
-        spawn_toker_cataloged(test_config("models", upstream, false)).await;
+    let (addr, _store) = spawn_toker_cataloged(test_config("models", upstream, false)).await;
 
     let response = client()
         .get(format!("http://{addr}/f/codex/v1/models"))
@@ -1062,22 +1044,6 @@ async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     assert_eq!(body["models"][1]["slug"], "gpt-5.6-sol");
     assert_eq!(body["models"][0]["max_context_window"], 872000);
     assert!(mock.requests.lock().unwrap().is_empty());
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while observer.records().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("publication observation");
-    assert_eq!(
-        observer.records(),
-        vec![ShadowRecord {
-            comparison: ShadowComparison::Match,
-            code: "policy-shadow-publication-match",
-            legacy: None,
-            shadow: None,
-        }]
-    );
 }
 
 #[tokio::test]
@@ -1209,7 +1175,7 @@ async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let attempt = row.attempt.as_ref().expect("initial attempt provenance");
     assert_eq!(attempt.attempt_index.get(), 0);
     assert_eq!(attempt.reason, toker::store::AttemptReason::Initial);
-    assert!(row.policy_routing.is_none());
+    assert!(row.policy_routing.is_some());
     assert_eq!(
         row.requested_model.as_deref(),
         Some("codex_sub/gpt-5.6-sol")
@@ -1510,9 +1476,14 @@ async fn foreign_subscription_route_without_credential_stops_locally() {
         .send()
         .await
         .expect("local answer");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // The foreign bearer is not an Anthropic credential and there is no
+    // other, so policy finds no available candidate and toker answers itself.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(mock.requests.lock().unwrap().is_empty());
-    assert!(wait_for_rows(&store, 0).await.is_empty());
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, Some(RowKind::RouteUnavailable));
+    assert!(rows[0].status.is_none(), "no upstream attempt behind it");
 }
 
 #[tokio::test]
@@ -2733,29 +2704,27 @@ async fn an_untranslatable_body_never_reaches_the_upstream() {
         .await
         .expect("toker answers");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    // The client asked to stream, so the error rides an SSE error event.
-    let sse = response.text().await.expect("body");
-    assert!(sse.contains("event: error"), "the SSE error shape: {sse}");
-    assert!(
-        sse.contains("invalid_request_error"),
-        "the mapped type: {sse}"
+    // A refusal before any stream starts is a plain JSON error, even when
+    // the client asked to stream: there is no event stream to ride yet.
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
     );
+    let text = response.text().await.expect("body");
+    let error: Value = serde_json::from_str(&text).expect("a JSON error body");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
     assert!(
-        sse.to_ascii_lowercase().contains("image"),
-        "the error names the unsupported thing: {sse}"
+        text.to_ascii_lowercase().contains("image"),
+        "the error names the unsupported thing: {text}"
     );
     assert!(
         mock.requests.lock().unwrap().is_empty(),
         "nothing forwarded"
     );
-    let rows = wait_for_rows(&store, 1).await;
-    assert_eq!(rows[0].kind, Some(RowKind::Error));
-    assert_eq!(rows[0].status, Some(400));
-    assert_eq!(rows[0].error_type.as_deref(), Some("invalid_request_error"));
-    assert_eq!(
-        rows[0].req_messages, None,
-        "unsupported input has no canonical shape"
-    );
+    // A body with no canonical form has nothing for policy to route, so no
+    // backend answered and no row attributes the refusal to one.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(store.requests_since(0, 100).expect("rows").is_empty());
 }
 
 #[tokio::test]
@@ -2886,29 +2855,41 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     let (upstream, mock) = spawn_mock().await;
     let (addr, store) = spawn_toker(test_config("unmatched", upstream, false)).await;
 
-    // An unmatched path: the codex backend serves no anthropic paths, so
-    // the answer is anthropic's own 404 shape, not a forward.
-    let response = client()
-        .get(format!("http://{addr}/v1/files?limit=2"))
-        .send()
-        .await
-        .expect("toker answers");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let error: Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
-    assert_eq!(error["error"]["type"], "not_found_error");
-
-    // A batch GET: the same typed error as batch creation on this
-    // backend.
-    let response = client()
-        .get(format!("http://{addr}/v1/messages/batches/batch_123"))
-        .send()
-        .await
-        .expect("toker answers");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let error: Value =
-        serde_json::from_str(&response.text().await.expect("body")).expect("error json");
-    assert_eq!(error["error"]["type"], "invalid_request_error");
+    // The codex backend serves no anthropic administrative paths. Policy
+    // resolves these model-free requests to the codex default, and toker
+    // answers in anthropic's error shape instead of forwarding: a 404 for an
+    // unmatched path, a 400 for batch management.
+    for (path, status, error_type, message) in [
+        (
+            "/v1/files?limit=2",
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "serves only the Messages API",
+        ),
+        (
+            "/v1/messages/batches/batch_123",
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "does not support count_tokens or batch requests",
+        ),
+    ] {
+        let response = client()
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .expect("toker answers");
+        assert_eq!(response.status(), status, "{path}");
+        let error: Value =
+            serde_json::from_str(&response.text().await.expect("body")).expect("error json");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], error_type, "{path}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|text| text.contains(message)),
+            "{path}: {error}"
+        );
+    }
 
     assert!(
         mock.requests.lock().unwrap().is_empty(),
@@ -2916,6 +2897,35 @@ async fn unmatched_and_batch_paths_on_a_codex_default_answer_locally() {
     );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(store.requests_since(0, 100).expect("rows").is_empty());
+}
+
+#[tokio::test]
+async fn responses_with_no_codex_backend_are_answered_locally_and_marked() {
+    let (upstream, mock) = spawn_mock().await;
+    let mut fixture = test_config("no-codex", upstream, false);
+    fixture.config.codex_sub = None;
+    fixture.config.default_backend_anthropic = Some("anthropic_sub".to_owned());
+    let (addr, _store) = spawn_toker(fixture).await;
+
+    let response = client()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&json!({"model": "gpt-5.6-sol", "input": "hello", "stream": false}))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-toker-not-configured")
+            .and_then(|value| value.to_str().ok()),
+        Some("openai_responses"),
+        "the setup check reads the marker"
+    );
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "nothing forwarded"
+    );
 }
 
 /// Read a response body to its end: `Err` when the transfer was

@@ -57,12 +57,12 @@ pub(crate) struct RecordCtx {
     pub(crate) server: Server,
     /// The selected backend owns route identity and cost semantics.
     pub(crate) backend: Arc<dyn Provider>,
-    /// The exact legacy-selected backend binding. This identifies the wire
-    /// dialect without implying a policy revision or candidate selection.
+    /// The backend binding the send went to. This identifies the wire
+    /// dialect without implying a candidate selection.
     pub(crate) binding_id: BindingId,
     /// The actual upstream send this response completes.
     pub(crate) attempt: Option<AttemptProvenance>,
-    /// The authoritative policy route that selected this send.
+    /// The policy route that selected this send.
     pub(crate) policy_routing: Option<PolicyRouteProvenance>,
     /// One successful attempt's already-decided lane-pin transition.
     pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
@@ -269,10 +269,11 @@ pub(super) fn persist_lane_pin(
         })?;
         crate::policy::persist_transition(&server.store, &key, decision)
     };
-    let result = if let (Some(runtime), Some(revision_id)) =
-        (server.policy_runtime.as_ref(), activation_revision)
-    {
-        let Some(result) = runtime.with_activation_fence(revision_id, persist) else {
+    let result = if let Some(revision_id) = activation_revision {
+        let Some(result) = server
+            .policy_runtime
+            .with_activation_fence(revision_id, persist)
+        else {
             tracing::debug!(
                 lane_key = key,
                 "lane activation pin lost to a newer active revision"
@@ -765,23 +766,12 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 6) — it is logged as the visible breakage it is.
-///
-/// Every row the API answered also marks its model served, on the
-/// identity the RESPONSE named (the predecessor's `appendRow` did this
-/// for every row). The mark before sending covers a lane deciding while
-/// this request is in flight; this one covers what the upstream actually
-/// served, which a host-side alias or an upstream substitution can make
-/// differ from what was sent — and recency must follow the served
-/// identity. In-memory and infallible, so it cannot cost the row.
+/// (invariant 3) — it is logged as the visible breakage it is.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
-    ctx.server
-        .models
-        .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
 }
 
 /// The normalized token buckets from one capture (see the module docs for

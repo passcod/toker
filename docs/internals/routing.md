@@ -1,8 +1,10 @@
 # Frontends, backends, and the bytes in between
 
 ctp had one frontend and one upstream, and forwarded every path but its control
-one. toker has several of each, so most of what is new here is about which route
-a request takes and what that route may do to it.
+one. toker has several of each. Which backend a request takes is the routing
+policy's decision ([policy.md](policy.md)); this file is about the paths, what
+each backend does to a request's bytes and credentials, and what a route may
+change.
 
 ## Protocols and backends
 
@@ -11,112 +13,102 @@ serves them all, because the paths do not collide:
 
 | Protocol | Paths | Backends |
 | --- | --- | --- |
-| Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter` (by prefix only), `codex_sub` (translated) |
+| Anthropic Messages | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches…` | `anthropic_sub`, `anthropic_api`, `openrouter`, `codex_sub` (translated) |
 | OpenAI Chat | `/v1/chat/completions`, `/v1/models` | `openrouter`, `openai_api`, `codex_sub`, `anthropic_api`, `anthropic_sub` (last three translated) |
 | OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `openrouter`, `anthropic_api`, `anthropic_sub` (translated) |
 
-A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
-Each protocol has a default, which bare model names go to. The routing policy
-in the database owns it; `default_backend_anthropic` and
-`default_backend_openai_chat` in `toker.toml` are legacy fields, read only to
-compile revision one and by the TUI's import-to-draft. A model string can
-name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
-`anthropic/…` (the Messages protocol default), `openrouter/…`,
-`openai_api/…`, and `codex_sub/…` are stripped and routed where the shared
-route registry declares that frontend-to-binding path. The resolved
-`ModelTarget` keeps the provider,
-verified backend binding, requested model, and effective model distinct; the
-row records both model spellings. A prefix naming a backend whose block is
-absent is answered locally, never sent to the default with the prefix still on.
-An unknown prefix belongs to the provider's model id and stays intact. A
-protocol with no enabled backend answers its routes with a not-configured error
-in that protocol's own shape, carrying the `x-toker-not-configured` header, and
-reaches no upstream.
+A backend is enabled by its `[providers.X]` block's presence in `toker.toml`;
+which of the enabled backends serves a request is decided by the active policy
+revision, not by this file. The policy presents models to each frontend,
+resolves the requested name onto an ordered chain of candidate bindings, and may
+upgrade the model within its family or fall back along the chain. The resolved
+`ModelTarget` keeps the provider, verified backend binding, requested model and
+effective model distinct, and the row records both model spellings.
 
-For a known OpenAI frontend profile, `/v1/models` is projected locally from
-the fetched provider catalogues through this same route registry. Each listed
-model has a provider-qualified id; the configured default also gets a bare
-alias. A model without a complete route is absent. Chat receives the OpenAI
-list shape, built from known fields rather than copying a foreign provider's
-entry; Codex receives its native `models` shape with routed slugs and its
-provider metadata retained. Catalogue age stays with each internal offer.
-Codex's model parser requires a full `ModelInfo` entry, so foreign providers
-remain explicitly routable but are not advertised in its models response until
-their metadata projection is verified.
-When no usable catalogue has arrived, the endpoint returns 503, not a false
-empty list. Unknown and unprefixed profiles keep path-driven forwarding.
-The service loads cached catalogues before serving, then refreshes in the
-background. OpenRouter's public listing needs no key; OpenAI's `/v1/models`
-listing uses the configured direct-API credential and remains cache-only when
-none is stored. Claude's picker filters the OpenRouter Messages offers from
-the same join, subject to its own tool/text and user-rule constraints.
+How a request is answered when policy cannot place it:
 
-Every path the route table does not match is forwarded to the default anthropic
-backend (`anthropic::unmatched`), as ctp forwarded everything, except the
-`/_toker/` namespace, which never leaves the proxy.
+- **No route at all** (no presentation, rewrite or default matches, which is a
+  protocol with no enabled backend under the generated policy): a not-configured
+  error in the protocol's own shape, with the `x-toker-not-configured` header,
+  reaching no upstream.
+- **A route whose candidates are all unavailable** (a provider whose block is
+  absent, a missing credential, an open circuit): a 503 in the protocol's shape
+  and a `route-unavailable` row carrying the trace. Under the generated
+  revision-one policy a provider prefix (`openrouter/<id>`, `codex_sub/<id>`)
+  always belongs to that provider, so a prefix naming a disabled backend ends
+  here; it is never sent to the default with the prefix still on. A prefix the
+  policy does not know belongs to the provider's model id and stays intact.
+
+`/v1/models` on the OpenAI frontends is projected locally from the active
+policy and the joined offer inventory (`catalog::offers::render_policy`), not
+from any one upstream's raw listing. Each listed model is a presentation or a
+generated listing for an offer that has a complete route to that frontend.
+Chat receives the OpenAI list shape, built from known fields rather than
+copying a foreign provider's entry; Codex receives its native `models` shape
+with routed slugs and its provider metadata retained. Codex's model parser
+requires a full `ModelInfo` entry, so foreign providers remain explicitly
+routable but are not advertised in its models response until their metadata
+projection is verified. When no usable catalogue has arrived, or a presented
+offer is not in the inventory, the endpoint returns 503, not a false empty list.
+The service loads
+cached catalogues before serving, then refreshes in the background, and each
+refresh recompiles the active revision against the new inventory. OpenRouter's
+public listing needs no key; OpenAI's `/v1/models` listing uses the configured
+direct-API credential and remains cache-only when none is stored. Claude's
+picker filters the OpenRouter Messages offers from the same join, subject to its
+own tool/text and user-rule constraints.
+
+Every Anthropic path the route table does not match is forwarded, as ctp
+forwarded everything, to the binding the policy's Messages default route names
+first (`anthropic::unmatched`, through `resolve_model_free`: there is no model
+for a rewrite to match, and nothing to upgrade or fall back to). The `/_toker/`
+namespace never leaves the proxy. `count_tokens` and batch creation resolve
+their first candidate only, require a binding that declares the operation, and
+splice only the effective model into the documented positions of the client's
+bytes; a batch whose requests resolve to different bindings is a 400.
 
 ### Live routing controls
 
-`/_toker/routing/` exposes the running policy to local control clients. Every
-operation requires its matching `x-toker-control` value before parsing its body:
-`routing-snapshot`, `routing-apply`, `routing-revisions`, `routing-restore`,
-`routing-promote`, or `routing-publication`. Mutations require JSON and reject
-unknown fields.
+`/_toker/routing/` exposes the policy to local control clients: the snapshot of
+the active revision, draft and publications, draft replace and edit, validate,
+preview, activate, revisions, reactivate, promote and publication. Every
+operation requires its matching `x-toker-control` value before parsing its body,
+and mutations require JSON and refuse unknown fields. What each does, and the
+revision lifecycle behind them, is in [policy.md](policy.md).
 
-An apply submits one complete policy document. The daemon compiles it against
-one captured inventory, then atomically inserts and activates a new revision
-and records every publication adapter's desired revision and inventory
-generation. Only the committed revision is installed into the runtime, so
-in-flight requests keep their earlier immutable snapshot. A failed compiler
-diagnostic leaves the active revision untouched.
-
-A restore selects a historical revision's document and produces a new active
-reactivation revision. The selected revision remains immutable. History source
-and compiler origin are separate: restoring the generated initial policy keeps
-its legacy compatibility semantics while recording the later reactivation.
-
-Publication acknowledgements are compare-and-swap updates over the desired
-revision and inventory generation. The generic control endpoint records only
-pending failure or unsupported outcomes with a stable detail code. Publishing
-adapters persist their own successful result and exact owned external row
-identities, so a caller cannot claim ownership of a user-managed row. A stale
-acknowledgement cannot overwrite a newer publication handoff.
-
-The Codex Responses route is canonical even though both ends speak Responses. Toker
-parses the request into canonical IR, deterministically renders it for the
+The Codex Responses route is canonical even though both ends speak Responses.
+Toker parses the request into canonical IR, deterministically renders it for the
 Codex binding, interprets upstream events canonically, and renders Responses
 events back to the client. Compatible extensions, provider-owned input items
 (including encrypted reasoning and incremental tool declarations), and
-provider-owned tool kinds replay opaquely through the canonical model. The
-same applies to provider-owned response items and their incremental events;
-the terminal `end_turn` flag remains authoritative even when the item has no
-portable tool-call shape. This
-lets a newer frontend shape reach a compatible backend without requiring toker
-to understand its contents. Toker always replaces the frontend credential
-with its shared Codex login before the request leaves loopback.
-On a Messages-to-Codex route, an explicit thinking budget maps to the documented
-Codex effort ladder. Adaptive thinking leaves effort at the Codex model default,
-or carries `output_config.effort` across as the same named tier when Claude sends
-one.
+provider-owned tool kinds replay opaquely through the canonical model. The same
+applies to provider-owned response items and their incremental events; the
+terminal `end_turn` flag remains authoritative even when the item has no
+portable tool-call shape. This lets a newer frontend shape reach a compatible
+backend without requiring toker to understand its contents. Toker always
+replaces the frontend credential with its shared Codex login before the request
+leaves loopback. On a Messages-to-Codex route, an explicit thinking budget maps
+to the documented Codex effort ladder. Adaptive thinking leaves effort at the
+Codex model default, or carries `output_config.effort` across as the same named
+tier when Claude sends one.
 
 Every Chat route is canonical. The OpenRouter and direct OpenAI bindings
 deterministically render Chat again and interpret their responses before the
 frontend renders Chat. Provider response bytes are observed before translation
 so billing or usage evidence stays intact. OpenRouter records the provider's
 `usage.cost`; direct OpenAI requests terminal usage on every stream and uses
-only the separately verified exact-model estimator. Chat may also select
-`codex_sub` as its configured default or with a `codex_sub/<model>` prefix;
-that binding renders a Responses request and translates the Responses turn
-back to Chat SSE or complete JSON. Toker signs the Codex upstream itself,
+only the separately verified exact-model estimator. Chat may also be routed to
+`codex_sub` by policy (revision one: a `codex_sub/<model>` prefix, or the Chat
+default); that binding renders a Responses request and translates the Responses
+turn back to Chat SSE or complete JSON. Toker signs the Codex upstream itself,
 records the route as `openai_chat:codex_sub`, and never forwards the frontend
-credential.
-The Anthropic Messages bindings accept Chat and Responses requests after
-canonical rendering. A foreign OpenAI bearer is removed before provider-owned
-authentication is added. Responses and Chat output limits are optional on
-their own wires but required by Messages: a positive caller limit wins, then
-the fetched model's declared `max_tokens`; absent evidence is a local 400,
-not a guessed limit. The reverse path interprets Messages events or JSON and
-renders the client's OpenAI wire, while Anthropic usage is observed before
+credential. The Anthropic Messages bindings accept Chat and Responses requests
+after canonical rendering. A foreign OpenAI bearer is removed before
+provider-owned authentication is added. Responses and Chat output limits are
+optional on their own wires but required by Messages: a positive caller limit
+wins, then the fetched model's declared `max_tokens`; absent evidence is a local
+400, not a guessed limit. The reverse path interprets Messages events or JSON
+and renders the client's OpenAI wire, while Anthropic usage is observed before
 translation.
 
 ### What differs per backend
@@ -134,9 +126,9 @@ kept separately in `catalog/openai_pricing.rs`; unknown models, service tiers,
 or token categories leave cost NULL rather than filling a guessed zero.
 
 The OpenRouter Chat cold gate uses its documented ten-minute sticky-session
-clock. Other Chat bindings do not inherit that clock. Until the live-routing
-work stores cache state per binding, direct OpenAI and translated Chat routes
-remain unlaned and cannot emit that cold notice.
+clock. Other Chat bindings do not inherit that clock: their lanes hold a routing
+pin but record no TTL or prompt size, so they cannot emit the cold notice and
+their coldness reads as unknown ([lanes-and-cache.md](lanes-and-cache.md)).
 
 For a foreign frontend, `anthropic_sub` resolves its own token from
 `oauth_token_env`, the `anthropic_sub` keyring entry when configured, then a
@@ -169,9 +161,10 @@ picks the frontend's notice style from `[notices]` and is recorded on the row's
 `extra.frontend`. Setup writes the prefix into each frontend it patches
 (`/f/claude`, `/f/workhorse`, `/f/codex`); an unprefixed request is an unknown
 frontend and gets the default style. Names are lowercase ASCII letters, digits,
-`-` and `_`
-(`config::is_frontend_name`), and a `[notices]` key outside that set could never
-match, so it is refused.
+`-` and `_` (`config::is_frontend_name`), and a `[notices]` key outside that set
+could never match, so it is refused. The name is also the request's policy
+profile, so a profile-scoped presentation, rewrite or default applies to one
+frontend only; an unprefixed request is the `unprefixed` profile.
 
 The prefix is also why setup's wiring check has two halves (`setup/verify.rs`).
 An upstream's verdict on a prefixed usage path cannot prove the prefix was
@@ -188,17 +181,21 @@ which the openrouter provider's `endpoint` already maps `/v1/messages` onto. So
 an `openrouter/<id>` model on the anthropic frontend is a same-protocol
 canonical route with the prefix stripped before deterministic rendering. The
 client's own credential is Claude's OAuth bearer, meant for Anthropic:
-`OpenRouter::strip_foreign_credentials` drops any `sk-ant-` bearer and
-`x-api-key`, and the stored openrouter key goes in its place. Nothing of the
-subscription's reaches openrouter.ai.
+`OpenRouter::strip_foreign_credentials` drops `x-api-key` and, when toker holds
+an openrouter key, every incoming bearer too (claude's settings carry a
+placeholder one); the stored key goes in its place. With no stored key, only
+`sk-ant-` bearers are dropped and a client's own `sk-or-` key passes through.
+Nothing of the subscription's reaches openrouter.ai.
 
-Two rewrites stay off this route (`picks_from_anthropic_catalogue`): the
-compaction retarget and force-newest both pick a bare `claude-*` id from the
-Anthropic catalogue, which on openrouter would move the conversation off the
-model the user picked. Codex keeps them, because its model map turns those ids
-into codex ones. The quota gate is subscription-only already; the cold gate
-runs, and since openrouter is no meter source its notice says the re-read is
-billed.
+Two model rewrites are shaped for the Anthropic catalogue and stay out of this
+route. The compaction retarget is not eligible on any `openrouter` binding
+(revision one leaves it out of the compaction target's bindings), because it
+would pick a bare `claude-*` id and move the conversation off the model the user
+picked. An upgrade, if the route's candidate has an upgrade policy, reads only
+models learned through the same binding, so it cannot pick another provider's
+id from the Anthropic catalogue. The quota gate is subscription-only already;
+the cold gate runs, and since openrouter is no meter source its notice says the
+re-read is billed.
 
 What the endpoint does, measured through toker on 2026-10-06:
 
@@ -228,8 +225,8 @@ add models to `/model`; only one works on a subscription:
 
 - Gateway discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) fetches
   `<ANTHROPIC_BASE_URL>/v1/models` at launch, but only with a credential from
-  `ANTHROPIC_AUTH_TOKEN`, an API key, or `apiKeyHelper`. The claude.ai login does
-  not count, and setting any of those three replaces the OAuth bearer on
+  `ANTHROPIC_AUTH_TOKEN`, an API key, or `apiKeyHelper`. The claude.ai login
+  does not count, and setting any of those three replaces the OAuth bearer on
   `/v1/messages` as well, ending subscription passthrough. It also drops every
   id not matching `/(claude|anthropic)/i`.
 - The subscription's own additions come from `/api/claude_cli/bootstrap`, which
@@ -267,12 +264,13 @@ malformed provider response that cannot cross the canonical boundary is a
 local typed 502. Neither reaches the other side as an unverified wire shape.
 Malformed bodies retain a wire-shaped view only for the quota decision and
 error presentation, not inference mutation or shape extraction. Administrative
-bodies keep their legacy path-specific behavior.
+bodies keep their path-specific behavior.
 
 The non-inference Messages surfaces remain transparent. Count-token and batch
-creation retain their legacy buffer, routing rewrites, observation, and
-error-row behavior; batch reads, cancellation, and unmatched administrative
-paths stream without inference observation.
+creation keep their buffer, observation and error-row behavior, and only the
+documented model positions are replaced from the policy's result; batch reads,
+cancellation, and unmatched administrative paths stream without inference
+observation.
 
 OpenAI Chat is canonical for every declared route. The frontend adapter parses
 each request; routing and cold-gate shape extraction read that canonical

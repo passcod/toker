@@ -98,9 +98,14 @@ impl Provider for OpenRouter {
     /// served here for every frontend, and an anthropic-shaped client
     /// calling it sends its anthropic key or claude's OAuth bearer, which
     /// pass-through-when-present would otherwise forward verbatim.
+    ///
+    /// When toker holds its own key, nothing the client sent is
+    /// openrouter's to see: the bearer a frontend is configured with only
+    /// satisfies the client (claude's settings carry a placeholder), and
+    /// forwarding it would take the place of the stored key.
     fn strip_foreign_credentials(&self, outgoing: &mut HeaderMap) {
         outgoing.remove(&X_API_KEY);
-        if carries_anthropic_credential(outgoing) {
+        if self.api_key.is_some() || carries_anthropic_credential(outgoing) {
             outgoing.remove(AUTHORIZATION);
         }
     }
@@ -160,6 +165,15 @@ mod tests {
     use crate::routing::{BackendAdapterId, Capabilities, ProtocolId};
     use axum::http::header::AUTHORIZATION;
     use axum::http::{HeaderMap, HeaderValue};
+
+    fn keyless() -> OpenRouter {
+        OpenRouter::new(
+            "https://openrouter.ai/api/v1"
+                .parse()
+                .expect("upstream url"),
+            None,
+        )
+    }
 
     fn provider() -> OpenRouter {
         OpenRouter::new(
@@ -290,7 +304,9 @@ mod tests {
             assert!(headers.get("x-api-key").is_none(), "x-api-key dropped");
         }
 
-        // The frontend's own openrouter key stays, verbatim.
+        // With no stored key, the frontend's own openrouter key stays,
+        // verbatim.
+        let provider = keyless();
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -305,26 +321,48 @@ mod tests {
     }
 
     #[test]
-    fn credential_evidence_is_destination_specific() {
+    fn a_stored_key_replaces_whatever_the_client_sent() {
         let provider = provider();
+        for bearer in [
+            "Bearer unused",
+            "Bearer sk-or-v1-own",
+            "Bearer sk-ant-oat01-x",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_static(bearer));
+            headers.insert("x-api-key", HeaderValue::from_static("placeholder"));
+            provider.strip_foreign_credentials(&mut headers);
+            assert!(headers.get(AUTHORIZATION).is_none(), "{bearer:?} dropped");
+            assert!(headers.get("x-api-key").is_none());
+            assert!(!provider.credential_present(&headers));
+        }
+    }
+
+    #[test]
+    fn credential_evidence_is_destination_specific() {
         let mut native = HeaderMap::new();
         native.insert(
             AUTHORIZATION,
             HeaderValue::from_static("Bearer sk-or-v1-own"),
         );
+        let keyless = keyless();
         assert_eq!(
-            provider.credential_availability(&native, ProtocolId::OpenAiChat, 0),
+            keyless.credential_availability(&native, ProtocolId::OpenAiChat, 0),
             super::super::CredentialAvailability::PassingNative
         );
         assert_eq!(
-            provider.credential_availability(&native, ProtocolId::OpenAiResponses, 0),
-            super::super::CredentialAvailability::Held,
+            keyless.credential_availability(&native, ProtocolId::OpenAiResponses, 0),
+            super::super::CredentialAvailability::KnownMissingOrExpired,
             "a Codex frontend bearer is stripped before OpenRouter signs"
         );
-        let keyless = OpenRouter::new("https://openrouter.ai/api/v1".parse().unwrap(), None);
         assert_eq!(
             keyless.credential_availability(&HeaderMap::new(), ProtocolId::OpenAiChat, 0),
             super::super::CredentialAvailability::KnownMissingOrExpired
+        );
+        assert_eq!(
+            provider().credential_availability(&native, ProtocolId::OpenAiChat, 0),
+            super::super::CredentialAvailability::Held,
+            "a stored key signs in place of the client's"
         );
     }
 }

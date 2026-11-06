@@ -56,8 +56,14 @@ configure it by hand, add the provider block:
 [providers.openai_api]
 ```
 
-Make it the Chat default in the routing page. Bare Chat model names then use
-`https://api.openai.com/v1`; with several Chat backends enabled,
+Make it the Chat default in the routing page: in the routes view (`2`), select
+the default whose scope is `openai_chat`, press `e`, set its `target.route_id`
+to `legacy-route-openai_api-openai_chat_completions` and save with Ctrl+Enter.
+Setup writes a second default for the `unprefixed` profile, which is what a
+frontend without a `/f/<name>` prefix uses and which wins over the protocol
+default, so change that one the same way. If there is no default to change,
+`n` adds one. Then `V` validates and `a` activates. Bare Chat model names then
+use `https://api.openai.com/v1`; with several Chat backends enabled,
 `openai_api/<model>` selects it for one request. Toker asks
 streaming completions to include terminal usage and estimates cost only when
 the exact model, service tier, and every required token category are known.
@@ -67,13 +73,15 @@ with the same key and feeds the shared model catalogue.
 ## Codex subscription from OpenAI Chat clients
 
 An OpenAI Chat frontend such as opencode can use the Codex subscription
-backend through the canonical mux. Enable the provider, and make it that
-protocol's default in the routing page:
+backend through the canonical mux. Enable the provider:
 
 ```toml
 [providers.codex_sub]
 ```
 
+Then make it the Chat default in the routing page the same way as above, with
+`legacy-route-codex_sub-codex_responses` as the route (`e` on the
+`openai_chat` and `unprefixed/openai_chat` defaults, or `n` to add one).
 Bare Chat model names then route to the subscription. With several Chat
 backends enabled, a single request can instead select it with a
 `codex_sub/<model>` model id. Streaming, tools, usage, errors and plain JSON

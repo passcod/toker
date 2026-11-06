@@ -151,7 +151,7 @@ impl CompiledMatcher {
             Self::RevisionOneModel(expected) => Ok(crate::catalog::model_identity(input)
                 .is_some_and(|identity| identity == *expected)
                 .then(|| MatcherCaptures::empty(input))),
-            Self::RevisionOneFamily(expected) => Ok(crate::middleware::models::family_of(input)
+            Self::RevisionOneFamily(expected) => Ok(super::family::family_of(input)
                 .is_some_and(|family| family.name == *expected)
                 .then(|| MatcherCaptures::empty(input))),
         }
@@ -429,5 +429,29 @@ mod tests {
             Template::parse("${1}", &BTreeSet::new(), &exact.capture_schema()),
             Err(TemplateError::UnknownReference("1".to_owned()))
         );
+    }
+
+    #[test]
+    fn revision_one_matchers_fold_bracket_variants_and_only_published_snapshots() {
+        let family = MatcherSpec::RevisionOneFamily("haiku".to_owned())
+            .compile()
+            .unwrap();
+        assert!(family.is_match("claude-haiku-4-5[1m]").unwrap());
+        assert!(family.is_match("claude-3-7-haiku").unwrap());
+        assert!(!family.is_match("claude-opus-4-5").unwrap());
+        let opus = MatcherSpec::RevisionOneFamily("opus".to_owned())
+            .compile()
+            .unwrap();
+        assert!(opus.is_match("claude-opus-9").unwrap());
+        // An unpublished snapshot has no family: never matched, never
+        // guessed into one.
+        assert!(!opus.is_match("claude-opus-5-20990101").unwrap());
+        assert!(!opus.is_match("").unwrap());
+
+        let exact = MatcherSpec::RevisionOneModel("claude-opus-4-5".to_owned())
+            .compile()
+            .unwrap();
+        assert!(exact.is_match("claude-opus-4-5-20251101").unwrap());
+        assert!(!exact.is_match("claude-opus-4-6").unwrap());
     }
 }

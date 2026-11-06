@@ -9,8 +9,8 @@ use std::convert::Infallible;
 
 use thiserror::Error;
 
+use super::force_newest::{NEW_CONVERSATION_MESSAGES, idle_for_ttl};
 use crate::catalog::offers::OfferInventory;
-use crate::middleware::force_newest::{NEW_CONVERSATION_MESSAGES, idle_for_ttl};
 use crate::routing::Capabilities;
 
 use super::{
@@ -242,7 +242,8 @@ pub enum TraceEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptPlan {
     pub policy_fingerprint: PolicyFingerprint,
-    /// Legacy in-memory policy has no persisted revision yet.
+    /// The stored revision this plan resolved under; an in-memory policy
+    /// resolved directly has none.
     pub policy_revision: Option<i64>,
     pub route_id: Option<RouteId>,
     pub route_fingerprint: Option<RouteFingerprint>,
@@ -252,6 +253,11 @@ pub struct AttemptPlan {
     pub provider: String,
     pub requested_model: Option<String>,
     pub baseline_model: String,
+    /// Whether the client's own model spelling decided the baseline, as
+    /// opposed to a policy-owned exact model or an offer selector's winner.
+    /// A changed baseline on the same candidate is the client's doing only
+    /// when this holds; otherwise the policy moved it.
+    pub baseline_from_request: bool,
     pub upgraded_model: Option<String>,
     pub retargeted_model: Option<String>,
     pub aliased_model: Option<String>,
@@ -271,6 +277,36 @@ impl AttemptPlan {
             continuation.policy_revision = Some(revision_id);
         }
         self
+    }
+
+    /// The upgrade this plan made, as the `(from, to)` pair a row and its
+    /// lane record. The lane keeps it while its cache is warm, which is what
+    /// makes the next turn resolve to the same model instead of the one the
+    /// client keeps asking for.
+    pub fn forced_pair(&self) -> Option<(String, String)> {
+        self.upgraded_model
+            .as_ref()
+            .map(|to| (self.baseline_model.clone(), to.clone()))
+    }
+
+    /// The model a compaction was moved off and onto, as the `(from, to)`
+    /// pair a row records as its downgrade.
+    ///
+    /// Policy picks the cheaper model before the compaction body transform
+    /// runs, so the transform sees the request already on it and cannot report
+    /// the move; the plan still holds both ends. `None` when the plan made no
+    /// move: a compaction that kept its model only strips cache writes.
+    pub fn compaction_move(&self) -> Option<(String, String)> {
+        let from = if self.provenance == RouteProvenance::Compaction {
+            self.requested_model.clone()?
+        } else if self.retargeted_model.is_some() {
+            self.upgraded_model
+                .clone()
+                .unwrap_or_else(|| self.baseline_model.clone())
+        } else {
+            return None;
+        };
+        (from != self.effective_model).then(|| (from, self.effective_model.clone()))
     }
 
     pub fn pin_identity(&self) -> Option<super::PinIdentity> {
@@ -586,6 +622,7 @@ fn resolve_selected<L: LearningView>(
             provider,
             requested_model: facts.requested_model.clone(),
             baseline_model: model.to_owned(),
+            baseline_from_request: false,
             upgraded_model: None,
             retargeted_model: None,
             aliased_model: None,
@@ -784,6 +821,10 @@ fn resolve_selected<L: LearningView>(
             provider,
             requested_model: facts.requested_model.clone(),
             baseline_model: baseline,
+            baseline_from_request: matches!(
+                candidate.model(),
+                CompiledCandidateModel::RequestedModel | CompiledCandidateModel::Template(_)
+            ),
             upgraded_model: upgraded,
             retargeted_model: retargeted,
             aliased_model: aliased,
@@ -875,27 +916,87 @@ fn lookup<'a>(
     {
         return Ok(selected);
     }
-    if let Some(scope) = facts.profile_scope()
-        && let Some(reference) = policy.default_route(&scope)
-    {
-        return from_reference(
-            policy,
-            reference,
-            facts,
-            None,
-            RouteProvenance::ProfileDefault,
-        );
+    let (reference, provenance) =
+        default_reference(policy, facts).ok_or(ResolveFailure::NoRoute)?;
+    from_reference(policy, reference, facts, None, provenance)
+}
+
+/// The exact-profile default, else the protocol default.
+fn default_reference<'a>(
+    policy: &'a CompiledPolicy,
+    facts: &RequestFacts,
+) -> Option<(&'a CompiledRouteReference, RouteProvenance)> {
+    facts
+        .profile_scope()
+        .and_then(|scope| policy.default_route(&scope))
+        .map(|reference| (reference, RouteProvenance::ProfileDefault))
+        .or_else(|| {
+            policy
+                .default_route(&facts.protocol_scope())
+                .map(|reference| (reference, RouteProvenance::ProtocolDefault))
+        })
+}
+
+/// Resolve a request that carries no model, such as a batch result fetch or
+/// any Anthropic path toker does not itself serve, to the one binding it is
+/// forwarded to.
+///
+/// Only the default route can answer it: there is no model for a
+/// presentation or rewrite to match. The route's first candidate is the
+/// whole answer, with no fallback and no model, so none of the candidate's
+/// model-dependent steps (offer selection, upgrade, alias, circuits) apply.
+/// This is deliberately not a mode of [`resolve`]: an inference request
+/// without a model has nothing to send and still fails there, and a request
+/// that does carry a model is refused here rather than silently routed
+/// without it.
+pub fn resolve_model_free(
+    policy: &CompiledPolicy,
+    availability: &AvailabilitySnapshot,
+    facts: &RequestFacts,
+) -> Result<BindingId, ResolveFailure> {
+    if facts.requested_model.is_some() {
+        return Err(ResolveFailure::InvalidArgument);
     }
-    if let Some(reference) = policy.default_route(&protocol) {
-        return from_reference(
-            policy,
-            reference,
-            facts,
-            None,
-            RouteProvenance::ProtocolDefault,
-        );
+    let (reference, provenance) =
+        default_reference(policy, facts).ok_or(ResolveFailure::NoRoute)?;
+    let route = policy
+        .route(reference.route_id())
+        .ok_or(ResolveFailure::MissingRoute)?;
+    let candidate = route
+        .candidates()
+        .first()
+        .ok_or(ResolveFailure::MissingRoute)?;
+    let reason = if !candidate.enabled() {
+        Some(SkipReason::Disabled)
+    } else {
+        availability.get(candidate.binding_id()).and_then(|live| {
+            common_denial(
+                live,
+                merge_capabilities(
+                    candidate.required_capabilities(),
+                    facts.required_capabilities,
+                ),
+            )
+        })
+    };
+    match reason {
+        None => Ok(candidate.binding_id().clone()),
+        Some(reason) => Err(ResolveFailure::RouteUnavailable {
+            route_id: route.id().clone(),
+            route_fingerprint: route.fingerprint().clone(),
+            provenance: provenance.clone(),
+            trace: vec![
+                TraceEvent::Lookup(provenance),
+                TraceEvent::Candidate(CandidateEvidence {
+                    candidate_id: candidate.id().clone(),
+                    crossed_from: None,
+                    binding_id: candidate.binding_id().clone(),
+                    model: None,
+                    result: Err(reason),
+                }),
+            ],
+        }),
     }
-    Err(ResolveFailure::NoRoute)
 }
 
 fn first_rewrite<'a>(
@@ -1055,9 +1156,8 @@ fn candidate_evidence(
         .or_else(|| match candidate.model() {
             // A fresh listing can disprove a policy-owned exact offer. Models
             // supplied by a compatibility default or template remain
-            // provider-owned strings, as they are on the legacy route: an
-            // incomplete catalogue must not turn the listing into an
-            // upstream allowlist.
+            // provider-owned strings: an incomplete catalogue must not turn
+            // the listing into an upstream allowlist.
             CompiledCandidateModel::Exact(_) => {
                 model_availability(candidate.binding_id(), model, live.catalogue, inventory)
             }
@@ -1428,24 +1528,32 @@ fn choose_revision_one_compaction<L: LearningView>(
         return Ok(None);
     }
 
-    let family = crate::middleware::models::family_of(spec);
-    let target = match family {
+    // The binding's generated classifier splits the ids, so compaction reads
+    // the same family and version the upgrade election does.
+    let Some(classifier) = policy.family_split_for(candidate.binding_id()) else {
+        return Ok(None);
+    };
+    let target = match classifier.family_split(spec) {
         Some(family) if family.version.is_empty() => {
-            let mut best: Option<String> = None;
+            let mut best: Option<(String, super::family::Family)> = None;
             let Ok(models) = learning.known_models(candidate.binding_id()) else {
                 return Ok(None);
             };
             for model in models {
-                if crate::middleware::models::family_of(&model)
-                    .is_none_or(|candidate_family| candidate_family.name != family.name)
-                    || !learning_minimum(
-                        MinimumLearning::RevisionOneAdaptive,
-                        false,
-                        learning,
-                        candidate.binding_id(),
-                        &model,
-                    )
-                    .unwrap_or(false)
+                let Some(member) = classifier
+                    .family_split(&model)
+                    .filter(|member| member.name == family.name)
+                else {
+                    continue;
+                };
+                if !learning_minimum(
+                    MinimumLearning::RevisionOneAdaptive,
+                    false,
+                    learning,
+                    candidate.binding_id(),
+                    &model,
+                )
+                .unwrap_or(false)
                 {
                     continue;
                 }
@@ -1455,13 +1563,13 @@ fn choose_revision_one_compaction<L: LearningView>(
                     continue;
                 }
                 if best
-                    .as_deref()
-                    .is_none_or(|current| crate::middleware::models::newer_than(&model, current))
+                    .as_ref()
+                    .is_none_or(|(_, current)| member.is_newer_than(current))
                 {
-                    best = Some(model);
+                    best = Some((model, member));
                 }
             }
-            best
+            best.map(|(model, _)| model)
         }
         Some(_) => crate::catalog::model_identity(spec),
         None => None,
@@ -1532,7 +1640,7 @@ fn learning_minimum<L: LearningView>(
             let active_days = learning
                 .active_days(binding)
                 .map_err(|_| ResolveFailure::LearningUnavailable)?;
-            let needed = crate::middleware::models::requirement(active_days);
+            let needed = super::learning::requirement(active_days);
             Ok(evidence.is_some_and(|evidence| evidence.distinct_days().len() as f64 > needed))
         }
     }
@@ -1714,10 +1822,8 @@ mod tests {
         inventory: &OfferInventory,
         origin: PolicyOrigin,
     ) -> CompiledPolicy {
-        let topology = RouteRegistry::new(
-            std::iter::empty::<Arc<dyn crate::providers::Provider>>(),
-            std::iter::empty::<(crate::routing::ProtocolId, String)>(),
-        );
+        let topology =
+            RouteRegistry::new(std::iter::empty::<Arc<dyn crate::providers::Provider>>());
         crate::policy::compile(document.validate().unwrap(), &topology, inventory, origin)
             .into_policy()
             .unwrap()
@@ -3611,6 +3717,20 @@ mod tests {
             ),
             vec![],
         ));
+        document.classifiers.push(FamilyClassifier {
+            id: ClassifierId::new("family").unwrap(),
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            model_matcher: MatcherSpec::Regex(
+                r"^(?:claude-)?(?P<family>[a-z0-9][a-z0-9-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+                    .to_owned(),
+            ),
+            family_template: "${family}".to_owned(),
+            version_template: "${version}".to_owned(),
+            version_parser: VersionParserSpec::LegacyNumericTuple {
+                separator: "-".to_owned(),
+            },
+            legacy_hyphenated: true,
+        });
         document.compaction = Some(CompactionPolicy {
             target: CompactionTarget::RevisionOneLegacy {
                 model_spec: "sonnet".to_owned(),
@@ -3791,5 +3911,167 @@ mod tests {
             assert_eq!(plan.baseline_model, "original");
             assert_ne!(plan.provenance, RouteProvenance::Compaction);
         }
+    }
+
+    fn model_free_facts() -> RequestFacts {
+        RequestFacts {
+            requested_model: None,
+            ..facts("unused")
+        }
+    }
+
+    fn model_free_document() -> PolicyDocument {
+        let first = candidate(
+            "first",
+            &ANTHROPIC_SUB_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        let second = candidate(
+            "second",
+            &ANTHROPIC_API_MESSAGES,
+            CandidateModel::RequestedModel,
+        );
+        document(route(
+            first,
+            vec![RouteStep {
+                edge: CandidateEdge {
+                    preflight: FallbackPermission::Enabled,
+                    post_send: vec![],
+                    billed_boundary: BoundaryConsent::Allow,
+                    ambiguous_transport: BoundaryConsent::Deny,
+                    cache_transition: CacheTransitionPolicy::AllowCacheLoss,
+                },
+                candidate: second,
+            }],
+        ))
+    }
+
+    #[test]
+    fn a_model_free_request_takes_the_default_routes_first_binding() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let binding =
+            resolve_model_free(&policy, &availability(true, false), &model_free_facts()).unwrap();
+        assert_eq!(&binding, ANTHROPIC_SUB_MESSAGES.id());
+    }
+
+    #[test]
+    fn a_model_free_request_prefers_the_profile_default_to_the_protocol_one() {
+        let mut document = model_free_document();
+        let mut profile_route = route(
+            candidate(
+                "profile-first",
+                &ANTHROPIC_API_MESSAGES,
+                CandidateModel::RequestedModel,
+            ),
+            vec![],
+        );
+        profile_route.id = id("profile-route");
+        document.routes.push(profile_route);
+        document.defaults.push(DefaultRoute {
+            scope: scope(Some("claude")),
+            target: reference("profile-route", ArgumentBinding::RequestedModel),
+        });
+        let policy = compile(document, &OfferInventory::default());
+        let binding =
+            resolve_model_free(&policy, &availability(true, false), &model_free_facts()).unwrap();
+        assert_eq!(&binding, ANTHROPIC_API_MESSAGES.id());
+    }
+
+    #[test]
+    fn a_model_free_request_does_not_fall_back_past_an_unavailable_first_binding() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let failure = resolve_model_free(&policy, &availability(false, false), &model_free_facts())
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            ResolveFailure::RouteUnavailable { trace, .. }
+                if matches!(&trace[1], TraceEvent::Candidate(evidence)
+                    if evidence.candidate_id == id("first")
+                        && evidence.result == Err(SkipReason::ProviderUnconfigured))
+        ));
+    }
+
+    #[test]
+    fn model_free_resolution_refuses_a_request_that_names_a_model() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        assert!(matches!(
+            resolve_model_free(&policy, &availability(true, false), &facts("asked")),
+            Err(ResolveFailure::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn an_inference_request_without_a_model_still_fails_ordinary_resolution() {
+        let policy = compile(model_free_document(), &OfferInventory::default());
+        let failure = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &model_free_facts(),
+        )
+        .unwrap_err();
+        assert!(matches!(failure, ResolveFailure::InvalidArgument));
+    }
+
+    #[test]
+    fn a_compaction_move_is_read_off_the_plan_and_only_when_there_is_one() {
+        let policy = compile(
+            document(route(
+                candidate(
+                    "first",
+                    &ANTHROPIC_SUB_MESSAGES,
+                    CandidateModel::RequestedModel,
+                ),
+                vec![],
+            )),
+            &OfferInventory::default(),
+        );
+        let mut plan = resolve(
+            &policy,
+            &OfferInventory::default(),
+            &NoLearning,
+            None,
+            &availability(true, false),
+            &facts("opus"),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.compaction_move(),
+            None,
+            "an ordinary plan moves nothing"
+        );
+
+        plan.retargeted_model = Some("sonnet".to_owned());
+        plan.effective_model = "sonnet".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus".to_owned(), "sonnet".to_owned()))
+        );
+
+        plan.upgraded_model = Some("opus-2".to_owned());
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus-2".to_owned(), "sonnet".to_owned())),
+            "the lane's upgraded model is what it moved off"
+        );
+
+        plan.upgraded_model = None;
+        plan.effective_model = "opus".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            None,
+            "a retarget that lands on the model it started on is not a move"
+        );
+
+        plan.provenance = RouteProvenance::Compaction;
+        plan.retargeted_model = None;
+        plan.effective_model = "haiku".to_owned();
+        assert_eq!(
+            plan.compaction_move(),
+            Some(("opus".to_owned(), "haiku".to_owned())),
+            "an explicit compaction route moves off what the client asked for"
+        );
     }
 }

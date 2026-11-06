@@ -115,18 +115,21 @@ pub struct Config {
     /// request carried it is recorded but excluded from liveness (plan:
     /// Ping tagging).
     pub ping_header_name: String,
-    /// The default backend for the openai_chat protocol, always one of
-    /// the enabled providers; `None` when the protocol has no backend
-    /// (its routes then answer a not-configured error).
+    /// The default backend for the openai_chat protocol, always one of the
+    /// enabled providers; `None` when the protocol has no backend. Read only
+    /// to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it, because the active revision owns
+    /// routing.
     pub default_backend_openai_chat: Option<String>,
     /// The openrouter provider block; `None` when absent, which is the
     /// disabled state: a `[providers.X]` block's presence enables X.
     pub openrouter: Option<OpenRouterConfig>,
     /// The OpenAI API provider block (`None`: disabled).
     pub openai_api: Option<OpenAiApiConfig>,
-    /// The default backend for the anthropic protocol (plan: Routing —
-    /// bare model names go to the protocol default), always one of the
-    /// enabled providers; `None` when no anthropic backend is enabled.
+    /// The default backend for the anthropic protocol, always one of the
+    /// enabled providers; `None` when no anthropic backend is enabled. Read
+    /// only to author revision one (`policy::legacy`) and by setup's import;
+    /// nothing at request time reads it.
     pub default_backend_anthropic: Option<String>,
     /// The anthropic subscription provider block (`None`: disabled).
     pub anthropic_sub: Option<AnthropicSubConfig>,
@@ -385,10 +388,10 @@ impl OpenAiApiConfig {
 pub struct AnthropicSubConfig {
     /// Upstream base — the API root, no `/v1` prefix.
     pub upstream: reqwest::Url,
-    /// The model routing map (plan: Middleware — "Model routing map"):
-    /// `[providers.anthropic_sub.model_map]`, an optional operator policy
-    /// applied as the pipeline's final routing stage on this backend.
-    /// `None` when the table is absent (the default — no mapping).
+    /// The model routing map: `[providers.anthropic_sub.model_map]`, an
+    /// optional operator policy. Revision one's generator compiles it into an
+    /// alias policy on this backend's candidate; it is not read at request
+    /// time. `None` when the table is absent (the default: no mapping).
     pub model_map: Option<ModelMap>,
     /// Toker-held OAuth token sources, preferred to Claude's local login
     /// when both are available for a foreign frontend.
@@ -1560,7 +1563,6 @@ mod tests {
         DEFAULT_OPENAI_API_KEY_ENV, DEFAULT_OPENAI_API_UPSTREAM, DEFAULT_OPENROUTER_UPSTREAM,
         DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources, OpenRouterConfig,
     };
-    use crate::middleware::model_map;
     use crate::middleware::notice::NoticeStyle;
     use crate::store::Store;
     use std::collections::HashMap;
@@ -2094,18 +2096,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("codex map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-5"),
-            Some("gpt-5.6-sol")
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-opus-4-5-20251101"),
-            Some("special-opus"),
-            "the exact selector beats the family one"
-        );
-        assert_eq!(
-            model_map::preview_mapped_model(Some(codex_map), "claude-sonnet-5"),
-            Some("claude-sonnet-5"),
-            "an unmatched model is the identity"
+            codex_map.entries().collect::<Vec<_>>(),
+            vec![
+                ("model:claude-opus-4-5", "special-opus"),
+                ("family:haiku", "gpt-5.6-luna"),
+                ("family:opus", "gpt-5.6-sol"),
+            ]
         );
         let sub_map = config
             .anthropic_sub
@@ -2115,16 +2111,12 @@ auth_path = "~/.codex/auth.json"
             .as_ref()
             .expect("sub map");
         assert_eq!(
-            model_map::preview_mapped_model(Some(sub_map), "claude-opus-4-5"),
-            Some("claude-opus-4-8")
+            sub_map.entries().collect::<Vec<_>>(),
+            vec![("family:opus", "claude-opus-4-8")]
         );
         // A backend with no block carries no policy, and one backend's
         // map never answers for another's.
         assert_eq!(config.anthropic_api, None);
-        assert_eq!(
-            model_map::preview_mapped_model(None, "claude-opus-5"),
-            Some("claude-opus-5")
-        );
 
         // A present table with bad selector syntax fails the load naming
         // its provider block — a typo'd policy must not silently read as
@@ -2173,16 +2165,16 @@ auth_path = "~/.codex/auth.json"
             "an empty table is an explicitly empty policy"
         );
         assert_eq!(
-            model_map::preview_mapped_model(
-                config
-                    .codex_sub
-                    .as_ref()
-                    .expect("enabled")
-                    .model_map
-                    .as_ref(),
-                "claude-opus-5"
-            ),
-            Some("claude-opus-5")
+            config
+                .codex_sub
+                .as_ref()
+                .expect("enabled")
+                .model_map
+                .as_ref()
+                .expect("empty policy")
+                .entries()
+                .count(),
+            0
         );
     }
 

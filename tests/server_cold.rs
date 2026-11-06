@@ -22,6 +22,8 @@
 //!   row with `writesFree` records the withholding (the
 //!   withheld-notice-with-reason discipline).
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,9 +42,7 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, GatesConfig, OpenRouterConfig,
 };
 use toker::ir::Request as IrRequest;
-use toker::policy::{CollectingObserver, ShadowComparison};
-use toker::server::Server;
-use toker::store::{Lane, ModelEntry, RequestRow, RowKind, Store};
+use toker::store::{BindingLearningUpdate, Lane, RequestRow, RowKind, Store};
 use toker::translate::from_anthropic;
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
@@ -245,52 +245,35 @@ fn test_config(upstream: reqwest::Url) -> Config {
 }
 
 async fn spawn_toker(config: Config) -> (SocketAddr, Arc<Store>) {
-    let (addr, store, _) = spawn_toker_observed(config).await;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+    let addr = common::serve(common::server(config, &store)).await;
     (addr, store)
 }
 
-async fn spawn_toker_observed(config: Config) -> (SocketAddr, Arc<Store>, Arc<CollectingObserver>) {
+/// [`spawn_toker`] over a store the test seeded first. Revision one reads
+/// the binding's learning as published when the server is built, so a
+/// retarget target (see [`seed_sonnet`]) must be there before the server is.
+async fn spawn_toker_seeded(config: Config, seed: impl FnOnce(&Store)) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let observer = Arc::new(CollectingObserver::default());
-    let server = Server::with_shadow_observer(
-        config,
-        store.clone(),
-        Box::new(toker::middleware::awake::ProcessSpawner),
-        Arc::new(toker::secrets::MemoryStore::new()),
-        observer.clone(),
-    )
-    .expect("build server");
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
-    (addr, store, observer)
+    seed(&store);
+    let addr = common::serve(common::server(config, &store)).await;
+    (addr, store)
 }
 
-/// [`spawn_toker`], with one fetched catalogue installed before serving —
-/// the writes-free exemption's fixture. The background refresh task
-/// only spawns in `serve`, which tests never run, so this is the only
-/// way a test's server sees a catalogue.
+/// [`spawn_toker`], with one fetched catalogue present from startup: the
+/// writes-free exemption's fixture. The background refresh task only
+/// spawns in `serve`, which tests never run, so this is the only way a
+/// test's server sees a catalogue.
 async fn spawn_toker_cataloged(
     config: Config,
     source: &'static str,
     catalog: toker::catalog::FetchedCatalog,
 ) -> (SocketAddr, Arc<Store>) {
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
-    server.install_catalog(source, catalog);
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(source, catalog);
+    let seams = toker::server::Seams::isolated().with_catalogs(catalogs);
+    let addr = common::serve(common::server_with(config, &store, seams)).await;
     (addr, store)
 }
 
@@ -312,16 +295,6 @@ async fn post_messages(addr: SocketAddr, body: &[u8]) -> reqwest::Response {
 }
 
 /// Poll the ledger until it holds at least `count` rows.
-async fn wait_for_shadow(observer: &CollectingObserver) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while observer.records().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("shadow observation");
-}
-
 async fn wait_for_rows(store: &Store, count: usize) -> Vec<RequestRow> {
     for _ in 0..200 {
         let rows = store.requests_since(0, 1000).expect("read rows");
@@ -535,12 +508,17 @@ fn compaction_body() -> Vec<u8> {
 }
 
 /// Teach the store a sonnet the lane's prefix fits on, so the retarget
-/// has a target to resolve.
+/// has a target to resolve. The compaction policy reads what the binding
+/// itself has served, on the binding the subscription requests route to.
+/// Seed it before building the server (see [`spawn_toker_seeded`]).
 fn seed_sonnet(store: &Store) {
     store
-        .upsert_model(&ModelEntry {
+        .merge_binding_learning(&BindingLearningUpdate {
+            binding_id: "anthropic_sub.anthropic_messages"
+                .parse()
+                .expect("binding id"),
             model_id: "claude-sonnet-5".to_owned(),
-            days_json: Some(json!([
+            days: [
                 "2026-09-26",
                 "2026-09-27",
                 "2026-09-28",
@@ -549,11 +527,16 @@ fn seed_sonnet(store: &Store) {
                 "2026-10-01",
                 "2026-10-02",
                 "2026-10-03",
-            ])),
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             max_prompt: Some(1_000_000),
-            context_window_json: None,
+            context_window: None,
+            explicitly_promoted: false,
+            updated_ms: 1,
         })
-        .expect("seed model");
+        .expect("seed learning");
 }
 
 fn extra_of(row: &RequestRow) -> Value {
@@ -672,6 +655,55 @@ async fn a_cold_lane_gets_the_notice_a_cold_row_and_no_upstream_then_the_resend_
         .expect("measurement");
     assert_eq!(measurement.model.as_deref(), Some("claude-opus-5"));
     assert_no_more_rows(&store, 2).await;
+}
+
+#[tokio::test]
+async fn the_cold_notice_names_the_compaction_target_the_policy_would_pick() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker_seeded(test_config(upstream), seed_sonnet).await;
+
+    let body = tools_body("claude-opus-5");
+    poison_cold_lane(&store, &body, 2 * 3_600_000);
+
+    let response = post_messages(addr, &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("notice bytes");
+    let text = String::from_utf8_lossy(&bytes);
+    let notice = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "content_block_delta")
+        .and_then(|event| event["delta"]["text"].as_str().map(str::to_owned))
+        .expect("the notice delta");
+    assert!(
+        notice.contains("The proxy would run it on claude-sonnet-5."),
+        "{notice}"
+    );
+    insta::with_settings!({filters => vec![(r" at \d{2}:\d{2}:", " at [HH:MM]:")]}, {
+        insta::assert_snapshot!(notice);
+    });
+
+    // Asking where a compaction would go must not move the lane or reach
+    // upstream: the notice only records that it spoke.
+    assert!(mock.captured().is_empty(), "the gate answered, not the API");
+    let lane = store
+        .load_lane(&lane_key_of(&body))
+        .expect("load")
+        .expect("the poisoned lane");
+    assert_eq!(lane.prompt_tokens, Some(200_000));
+    assert!(
+        lane.noticed_at
+            .is_some_and(|noticed| noticed > lane.updated_ms)
+    );
+
+    let rows = wait_for_rows(&store, 1).await;
+    assert_eq!(rows[0].kind, Some(RowKind::Cold));
+    assert_eq!(
+        extra_of(&rows[0])["compactTarget"],
+        json!("claude-sonnet-5")
+    );
+    assert_no_more_rows(&store, 1).await;
 }
 
 /// Claude Code's recap: the main conversation, tools included, with the
@@ -834,11 +866,10 @@ async fn an_on_track_outlook_withholds_the_notice_and_records_cold_quiet() {
 #[tokio::test]
 async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store, observer) = spawn_toker_observed(test_config(upstream)).await;
+    let (addr, store) = spawn_toker_seeded(test_config(upstream), seed_sonnet).await;
 
     let body = compaction_body();
     poison_cold_lane(&store, &body, 2 * 3_600_000);
-    seed_sonnet(&store);
 
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -884,8 +915,16 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
         Some("claude-sonnet-5"),
         "the response model is the retarget's"
     );
+    // Policy chose the retarget before the compaction transform ran, so the
+    // move is read off the plan: the model the lane was on and the one the
+    // compaction went to. The detail view shows exactly this pair.
     assert_eq!(row.downgraded_from.as_deref(), Some("claude-opus-5"));
     assert_eq!(row.downgraded_to.as_deref(), Some("claude-sonnet-5"));
+    let policy = row.policy_routing.as_ref().expect("policy provenance");
+    let toker::store::PolicyRoutingOutcome::Attempt { baseline_model, .. } = &policy.outcome else {
+        panic!("a forwarded request records an attempt outcome");
+    };
+    assert_eq!(baseline_model, "claude-opus-5");
     assert_eq!(row.cache_stripped, Some(true), "three breakpoints went");
     assert_eq!(row.system_merged, Some(true), "one system message merged");
     // The summarising request was never interrupted by the cold gate:
@@ -899,14 +938,6 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
         "no quiet row either"
     );
     assert_no_more_rows(&store, 1).await;
-    wait_for_shadow(&observer).await;
-    assert_eq!(observer.records().len(), 1);
-    assert_eq!(
-        observer.records()[0].comparison,
-        ShadowComparison::Match,
-        "{:?}",
-        observer.records()[0]
-    );
 }
 
 /// A cold compaction routed to openrouter is not retargeted: the target
@@ -916,13 +947,12 @@ async fn a_cold_compaction_is_exempt_from_the_notice_and_retargeted_upstream() {
 #[tokio::test]
 async fn a_cold_openrouter_compaction_is_not_retargeted() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream)).await;
+    let (addr, store) = spawn_toker_seeded(test_config(upstream), seed_sonnet).await;
 
     let mut ir = IrRequest::parse(&compaction_body()).expect("parse");
     ir.anthropic_mut().set_model("openrouter/claude-opus-5");
     let body = ir.serialise();
     poison_cold_lane(&store, &body, 2 * 3_600_000);
-    seed_sonnet(&store);
 
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -944,7 +974,7 @@ async fn a_cold_openrouter_compaction_is_not_retargeted() {
 #[tokio::test]
 async fn a_warm_compaction_passes_through_untouched() {
     let (mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream)).await;
+    let (addr, store) = spawn_toker_seeded(test_config(upstream), seed_sonnet).await;
 
     let body = compaction_body();
     // Idle zero: warm. On a warm lane the breakpoints are what earn the
@@ -952,7 +982,6 @@ async fn a_warm_compaction_passes_through_untouched() {
     // tokens against hundreds of thousands read back — so the retarget
     // declines its cold licence.
     poison_cold_lane(&store, &body, 0);
-    seed_sonnet(&store);
 
     let response = post_messages(addr, &body).await;
     assert_eq!(response.status(), StatusCode::OK);

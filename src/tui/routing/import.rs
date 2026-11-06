@@ -69,9 +69,10 @@ mod tests {
         let mut config = load("[providers.openrouter]\n");
         config.db_path = std::path::PathBuf::from(":memory:");
         let store = Arc::new(crate::store::Store::open(&config.db_path).unwrap());
-        let app = crate::server::Server::new_authoritative(config, store)
-            .unwrap()
-            .router();
+        let app =
+            crate::server::Server::with_seams(config, store, crate::server::Seams::isolated())
+                .unwrap()
+                .router();
         let snapshot = |app: axum::Router| async move {
             let response = app
                 .oneshot(

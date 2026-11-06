@@ -1,11 +1,10 @@
-Prime directive: this is a hobby project.
-it has, at this moment, exactly two users.
-me. and me at my other computer.
-there are exactly ZERO instances of the code you're editing that are running live.
-i don't give a bullcrap about whatever complexity you imagined.
-the job is to do the most expedient thing to get this interminable 17-odd step refactor to the finish line.
-
 # Working on toker
+
+toker is a hobby project: one user, running it on a couple of machines. Prefer
+the simplest change that does the job, and don't build compatibility layers,
+options or abstractions for users or deployments that don't exist. The ledgers
+on those machines are real history, though, so migrations stay append-only and
+never lose rows.
 
 A local proxy and ledger for LLM traffic: Claude Code, opencode and the codex
 CLI talk to it on loopback, and it forwards to the configured backends
@@ -21,14 +20,16 @@ it in claude-token-proxy (ctp), the Node proxy toker replaces.
 
 State lives in the SQLite ledger at the config's `db_path` (default
 `$XDG_DATA_HOME/toker/toker.db`); its directory is the state dir, and the only
-path the installed service may write. Lanes, learned models, allowances, pings
-and meter snapshots are tables there, not files. Config is
+path the installed service may write. Lanes, learned models, allowances, pings,
+meter snapshots and the routing policy are tables there, not files. Config is
 `~/.config/toker/toker.toml` (`$XDG_CONFIG_HOME`, or `TOKER_CONFIG`), written by
-`toker setup` and read by the service. Anything new the service writes goes in
-the state dir, and tests get a temp directory, never the real ledger. The one
-write outside it is the codex login refresh, which rewrites the codex CLI's own
-`~/.codex/auth.json`; setup makes that directory writable in the unit only when
-codex_sub is enabled (see [routing.md](docs/internals/routing.md)).
+`toker setup` and read by the service. It holds providers, credential sources
+and the listener; model routing lives in the ledger and is edited from
+`toker tui`. Anything new the service writes goes in the state dir, and tests
+get a temp directory, never the real ledger. The one write outside it is the
+codex login refresh, which rewrites the codex CLI's own `~/.codex/auth.json`;
+setup makes that directory writable in the unit only when codex_sub is enabled
+(see [routing.md](docs/internals/routing.md)).
 
 ## Invariants
 
@@ -95,12 +96,13 @@ the same by hand.
 
 ## Verification
 
-Run `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check` before
-committing. The server tests drive the real router against mock upstreams and
-spend no quota. Rendered output is pinned by assertions, and increasingly by
-insta snapshots: review a changed snapshot with `cargo insta review`, or accept
-all with `INSTA_UPDATE=always cargo test`, and only once you have read the diff.
-A changed notice snapshot is a changed model-visible byte.
+Run `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check` at the
+end of a batch of changes and before pushing; there is no CI. The server tests
+drive the real router against mock upstreams and spend no quota. Rendered output
+is pinned by assertions, and increasingly by insta snapshots: review a changed
+snapshot with `cargo insta review`, or accept all with
+`INSTA_UPDATE=always cargo test`, and only once you have read the diff. A
+changed notice snapshot is a changed model-visible byte.
 
 A green run is not enough on its own. Bugs have shipped past it because the
 tests confirmed the code did what had been written. So:
@@ -117,8 +119,9 @@ tests confirmed the code did what had been written. So:
 
 ## Conventions
 
-- Use **jj**, not git. Commit as you work; bookmark `main` at the tip and leave
-  an empty working commit on top.
+- Commit as you work, one logical change per commit, with conventional-commit
+  subjects (`feat(scope): …`, `fix`, `refactor`, `test`, `docs`). No `!`
+  breaking-change marker.
 - Comments explain *why*, especially where something was learned the hard way.
   Comments that record a specific bug stay.
 - Prose lines wrap at 80 columns; tables and code blocks may exceed it.

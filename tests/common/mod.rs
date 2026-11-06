@@ -1,7 +1,62 @@
-//! Shared helpers for integration tests: deterministic generated bodies and
-//! automatically cleaned temporary directories.
+//! Shared helpers for integration tests: deterministic generated bodies,
+//! automatically cleaned temporary directories, and authoritative servers
+//! that touch nothing of the host.
 
 #![allow(dead_code)]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use toker::catalog::FetchedCatalogs;
+use toker::config::Config;
+use toker::server::{Seams, Server};
+use toker::store::Store;
+
+/// The models each fetched-catalogue source lists: `("openrouter",
+/// &["z-ai/glm-5.3"])`. Sources are `openrouter`, `openai_api`, `anthropic`
+/// and `codex_sub`.
+pub type Listing<'a> = (&'static str, &'a [&'a str]);
+
+/// Deterministic startup catalogues listing exactly these models, with no
+/// windows or prices. A server built over them never reads the host's cache.
+pub fn catalogs(listings: &[Listing]) -> FetchedCatalogs {
+    FetchedCatalogs::listing(listings.iter().copied())
+}
+
+/// An authoritative server over `store`, revision one established from the
+/// config's routing fields, with no sleep lock, an empty in-memory keyring
+/// and no catalogues: the same as production minus everything of the host.
+pub fn server(config: Config, store: &Arc<Store>) -> Server {
+    server_with(config, store, Seams::isolated())
+}
+
+/// [`server`], with these catalogues present from startup.
+pub fn server_with_models(config: Config, store: &Arc<Store>, listings: &[Listing]) -> Server {
+    server_with(
+        config,
+        store,
+        Seams::isolated().with_catalogs(catalogs(listings)),
+    )
+}
+
+/// [`server`], with the seams the test needs (a fake sleep-lock spawner, a
+/// seeded keyring, catalogues).
+pub fn server_with(config: Config, store: &Arc<Store>, seams: Seams) -> Server {
+    Server::with_seams(config, store.clone(), seams).expect("build server")
+}
+
+/// Serve the router on a loopback port for the life of the test runtime.
+pub async fn serve(server: Server) -> SocketAddr {
+    let app = server.router();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("toker binds");
+    let addr = listener.local_addr().expect("toker addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("toker serves");
+    });
+    addr
+}
 
 pub struct TestDir(tempfile::TempDir);
 

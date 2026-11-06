@@ -119,10 +119,6 @@ pub struct CodexSub {
     /// a second turn that waited adopts the refreshed login instead of
     /// refreshing again with an already-rotated token.
     refresh_lock: tokio::sync::Mutex<()>,
-    /// The operator's model routing map
-    /// (`[providers.codex_sub.model_map]`): claude asks for
-    /// `claude-opus-5`, the codex backend receives `gpt-5.6-sol`.
-    model_map: Option<crate::middleware::model_map::ModelMap>,
     /// The codex client version to identify as (see
     /// [`DEFAULT_CLIENT_VERSION`]) — resolved at construction from the
     /// local sources (config override → the installed CLI's own
@@ -143,7 +139,6 @@ impl CodexSub {
         originator: String,
         auth_path: PathBuf,
         refresh_url: Url,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
         client_version: Option<String>,
         version_probe: bool,
     ) -> anyhow::Result<CodexSub> {
@@ -164,7 +159,6 @@ impl CodexSub {
             refresh_url,
             auth: Mutex::new(auth),
             refresh_lock: tokio::sync::Mutex::new(()),
-            model_map,
             client_version: std::sync::RwLock::new(client_version),
         };
         // A pinned version wins absolutely (the operator chose it);
@@ -493,10 +487,6 @@ impl Provider for CodexSub {
         BINDINGS
     }
 
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
-    }
-
     fn endpoint(&self, path: &str) -> Url {
         endpoint_of(&self.upstream, path)
     }
@@ -574,7 +564,6 @@ mod tests {
                 .parse()
                 .expect("refresh url"),
             None,
-            None,
             false,
         )
         .expect("provider builds")
@@ -607,7 +596,6 @@ mod tests {
             "codex_cli_rs".to_owned(),
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
-            None,
             None,
             false,
         )
@@ -797,7 +785,6 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/auth.json"),
             "https://auth.openai.com/oauth/token".parse().expect("url"),
             None,
-            None,
             false,
         )
         .expect("provider builds");
@@ -858,7 +845,6 @@ mod tests {
             "codex_cli_rs".to_owned(),
             dir.to_path_buf(),
             url,
-            None,
             None,
             false,
         )

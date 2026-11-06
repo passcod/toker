@@ -9,6 +9,8 @@ pub mod compile;
 pub mod diagnostic;
 pub mod document;
 pub mod edit;
+pub mod family;
+pub mod force_newest;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;
@@ -16,7 +18,6 @@ pub mod pinning;
 pub mod resolve;
 pub mod runtime;
 mod selector;
-pub mod shadow;
 pub mod transition;
 pub mod version;
 
@@ -39,8 +40,7 @@ pub use edit::{
     PolicyEditOperation,
 };
 pub use learning::{
-    BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, LegacyLearningView,
-    RecencyEvidence,
+    BindingLearningView, LearnedEvidence, LearningSnapshot, LearningView, RecencyEvidence,
 };
 pub use matcher::{
     CaptureSchema, CompiledMatcher, MAX_MATCH_INPUT_BYTES, MAX_RENDERED_TEMPLATE_BYTES,
@@ -52,13 +52,9 @@ pub use resolve::{
     CatalogueAvailability, CircuitSnapshot, CredentialSnapshot, Evidence, LaneFacts,
     LegacyCompactionFacts, NoLearning, OpenCircuitTarget, ProvisionalPin, RequestClass,
     RequestFacts, ResolveFailure, RouteProvenance, SkipReason, TraceEvent, resolve,
-    resolve_after_failure, resolve_first_candidate, resolve_with_circuits,
+    resolve_after_failure, resolve_first_candidate, resolve_model_free, resolve_with_circuits,
 };
 pub use runtime::{HealthCircuitKey, PolicyRuntime, PolicyRuntimeError, PolicySnapshot};
-pub use shadow::{
-    CollectingObserver, LegacyOutcome, PolicyShadow, ShadowComparison, ShadowObserver,
-    ShadowOutcome, ShadowRecord, TracingObserver,
-};
 pub use transition::{
     CacheTemperature, LaneState, PinIdentity, TransitionCause,
     TransitionDecision as LaneTransitionDecision, TransitionDenied, TransitionSource,

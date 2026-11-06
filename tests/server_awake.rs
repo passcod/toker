@@ -27,6 +27,8 @@
 //! - a stalled upstream on a live connection releases the lock once the
 //!   upstream idle timeout fires, without the client hanging up.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,7 +48,7 @@ use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, GatesConfig, OpenRouterConfig,
 };
 use toker::middleware::awake::{InhibitCommand, InhibitLock, LockSpawner};
-use toker::server::Server;
+use toker::server::Seams;
 use toker::store::{Lane, RequestRow, RowKind, Store};
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
@@ -222,7 +224,8 @@ fn test_config(upstream: reqwest::Url, awake: bool) -> Config {
             upstream: openrouter_upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
-            api_key: None,
+            // Policy refuses a backend with no credential to sign with.
+            api_key: Some("sk-or-test".to_owned()),
             picker: None,
         }),
         openai_api: None,
@@ -278,22 +281,17 @@ async fn spawn_toker_idle(
 ) -> (SocketAddr, Arc<Store>, AwakeProbe) {
     let probe = AwakeProbe::default();
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let mut server =
-        Server::with_awake_spawner(config, store.clone(), Box::new(ProbeSpawner(probe.clone())))
-            .expect("build server");
+    let mut server = common::server_with(
+        config,
+        &store,
+        Seams::isolated().with_spawner(Box::new(ProbeSpawner(probe.clone()))),
+    );
     if let Some(idle) = idle {
         server
             .set_upstream_idle_timeout(idle)
             .expect("rebuild the upstream client");
     }
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let addr = common::serve(server).await;
     (addr, store, probe)
 }
 
@@ -307,7 +305,8 @@ async fn post_messages(addr: SocketAddr, body: &[u8], ping: bool) -> reqwest::Re
         .post(format!("http://{addr}/v1/messages"))
         .header("x-claude-code-session-id", "ccses-42")
         .header(header::CONTENT_TYPE, "application/json")
-        .header("anthropic-version", "2023-06-01");
+        .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test");
     if ping {
         request = request.header("x-toker-ping", "1");
     }
@@ -337,6 +336,7 @@ async fn post_sessionless(addr: SocketAddr, path: &str, body: &[u8]) -> reqwest:
         .post(format!("http://{addr}{path}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header("anthropic-version", "2023-06-01")
+        .header(header::AUTHORIZATION, "Bearer sk-ant-oat-test")
         .body(body.to_vec())
         .send()
         .await

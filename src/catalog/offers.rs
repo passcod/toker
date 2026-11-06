@@ -1,5 +1,6 @@
-//! Frontend-visible models are a legacy projection of canonical backend offers
+//! Frontend-visible model lists are projected from canonical backend offers
 //! through the implemented route graph, never one upstream's raw listing.
+//! Revision one's generated Chat and Responses listings are this projection.
 
 use std::collections::BTreeMap;
 
@@ -147,6 +148,35 @@ pub fn render_policy(
             None => virtual_slugs.push(slug.to_owned()),
         }
     }
+    // Revision one authors presentations for the claude picker only. The
+    // other frontends list what the legacy projection listed, from the
+    // generated publication, under the slug a presentation does not hold.
+    let presented: std::collections::BTreeSet<String> = exact
+        .iter()
+        .map(|offer| offer.routed_model_id.clone())
+        .collect();
+    for (slug, binding_id, model_id) in policy.generated_publication(protocol) {
+        if presented.contains(slug)
+            || virtual_slugs
+                .iter()
+                .any(|virtual_slug| virtual_slug == slug)
+        {
+            continue;
+        }
+        let Some(offer) = inventory.get(binding_id, model_id) else {
+            return PolicyPublication::Unresolved;
+        };
+        exact.push(ModelOffer {
+            provider: offer.provider.clone(),
+            backend_model_id: offer.backend_model_id.clone(),
+            routed_model_id: slug.to_owned(),
+            binding: offer.binding.clone(),
+            context_window: offer.context_window,
+            chronology: offer.chronology,
+            fetched_at_ms: offer.fetched_at_ms,
+            raw: offer.raw.clone(),
+        });
+    }
     exact.sort_by(|left, right| left.routed_model_id.cmp(&right.routed_model_id));
     match protocol {
         crate::policy::FrontendProtocol::OpenaiChat => {
@@ -168,29 +198,62 @@ pub fn render_policy(
         }
         crate::policy::FrontendProtocol::OpenaiResponses => PolicyPublication::Unresolved,
         crate::policy::FrontendProtocol::AnthropicMessages => {
-            PolicyPublication::Ready(Value::Array(Vec::new()))
+            let mut data: Vec<Value> = exact
+                .iter()
+                .map(|offer| anthropic_entry(&offer.routed_model_id, &offer.raw))
+                .collect();
+            data.extend(
+                virtual_slugs
+                    .into_iter()
+                    .map(|slug| anthropic_entry(&slug, &Value::Null)),
+            );
+            data.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            let first = data.first().map(|entry| entry["id"].clone());
+            let last = data.last().map(|entry| entry["id"].clone());
+            PolicyPublication::Ready(json!({
+                "data": data,
+                "has_more": false,
+                "first_id": first,
+                "last_id": last,
+            }))
         }
     }
 }
 
-/// Project canonical offers into the legacy frontend aliases. Equal slugs on
-/// two providers never merge. Staleness remains in `fetched_at_ms`, not a
-/// made-up fresh claim.
-pub fn for_frontend(
-    registry: &RouteRegistry,
-    catalogs: &FetchedCatalogs,
-    frontend: ProtocolId,
-) -> Vec<ModelOffer> {
-    for_frontend_inventory(registry, &inventory(registry, catalogs), frontend)
+/// One entry of Anthropic's models list. `display_name` and `created_at`
+/// are the provider's own when its listing carried them; a published slug
+/// with no listing entry (a virtual model) names itself and has no creation
+/// time rather than a made-up one.
+fn anthropic_entry(slug: &str, raw: &Value) -> Value {
+    let mut entry = Map::new();
+    entry.insert("type".to_owned(), json!("model"));
+    entry.insert("id".to_owned(), json!(slug));
+    let display = raw
+        .get("display_name")
+        .and_then(Value::as_str)
+        .unwrap_or(slug);
+    entry.insert("display_name".to_owned(), json!(display));
+    if let Some(created) = raw.get("created_at").and_then(Value::as_str) {
+        entry.insert("created_at".to_owned(), json!(created));
+    }
+    Value::Object(entry)
 }
 
 /// Project one already-captured canonical inventory into the legacy frontend
-/// aliases. This is the shared source for both the authoritative model-list
-/// response and revision-one policy publication.
+/// aliases: `<provider>/<id>` for every implemented edge to a configured
+/// provider, and the bare `<id>` for the offers of `default_provider`, the one
+/// the revision-one document defaults the frontend's protocol to. Equal slugs
+/// on two providers never merge. Staleness remains in `fetched_at_ms`, not a
+/// made-up fresh claim.
+///
+/// This is revision one's generated publication for Chat and Responses, never
+/// a routing decision: the requests these slugs name are routed by the
+/// revision's own rewrites and defaults.
 pub fn for_frontend_inventory(
     registry: &RouteRegistry,
     inventory: &OfferInventory,
     frontend: ProtocolId,
+    default_provider: Option<&str>,
 ) -> Vec<ModelOffer> {
     let mut offers = Vec::new();
     for offer in inventory.iter() {
@@ -198,8 +261,9 @@ pub fn for_frontend_inventory(
         if let Some(projected) = projected(registry, offer, frontend, routed) {
             offers.push(projected);
         }
-        if let Some(projected) =
-            projected(registry, offer, frontend, offer.backend_model_id.clone())
+        if default_provider == Some(offer.provider.as_str())
+            && let Some(projected) =
+                projected(registry, offer, frontend, offer.backend_model_id.clone())
         {
             offers.push(projected);
         }
@@ -221,11 +285,10 @@ fn projected(
     if frontend == ProtocolId::OpenAiResponses && offer.provider != "codex_sub" {
         return None;
     }
-    let target = registry.resolve(frontend, Some(&routed_model_id)).ok()?;
-    if target.provider().id() != offer.provider
-        || target.binding() != &offer.binding
-        || target.effective_model() != Some(offer.backend_model_id.as_str())
-    {
+    let implemented = registry
+        .routes()
+        .any(|route| route.frontend() == frontend && route.binding() == &offer.binding);
+    if !implemented || !registry.binding_is_configured(&offer.binding) {
         return None;
     }
     Some(ModelOffer {
@@ -297,13 +360,7 @@ mod tests {
             "https://openrouter.ai/api/v1".parse().expect("url"),
             None,
         ));
-        RouteRegistry::new(
-            [provider],
-            [
-                (ProtocolId::AnthropicMessages, "openrouter".to_owned()),
-                (ProtocolId::OpenAiChat, "openrouter".to_owned()),
-            ],
-        )
+        RouteRegistry::new([provider])
     }
 
     fn catalogs() -> FetchedCatalogs {
@@ -323,9 +380,19 @@ mod tests {
         catalogs
     }
 
+    fn chat_offers() -> Vec<ModelOffer> {
+        let registry = registry();
+        for_frontend_inventory(
+            &registry,
+            &inventory(&registry, &catalogs()),
+            ProtocolId::OpenAiChat,
+            Some("openrouter"),
+        )
+    }
+
     #[test]
     fn policy_publication_filters_without_changing_offer_metadata() {
-        let mut offers = for_frontend(&registry(), &catalogs(), ProtocolId::OpenAiChat);
+        let mut offers = chat_offers();
         let kept = offers
             .iter()
             .find(|offer| offer.routed_model_id == "openrouter/vendor/model")
@@ -360,7 +427,7 @@ mod tests {
 
     #[test]
     fn legacy_projection_adds_prefix_and_default_alias_without_changing_metadata() {
-        let offers = for_frontend(&registry(), &catalogs(), ProtocolId::OpenAiChat);
+        let offers = chat_offers();
         assert_eq!(offers.len(), 2);
         assert_eq!(offers[0].routed_model_id, "openrouter/vendor/model");
         assert_eq!(offers[1].routed_model_id, "vendor/model");

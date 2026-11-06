@@ -7,18 +7,8 @@ use crate::ir::canonical::{
     ToolResultContent,
 };
 use crate::middleware::cold::{self, RetargetOutcome};
-use crate::middleware::model_map::{self, MapTarget, ModelMap};
 use crate::routing::DialectId;
 use serde_json::Value;
-
-/// Apply a configured provider map to the one inference model position.
-/// Batches and count-token bodies are administrative and keep their lexical
-/// mapper. A same-identity match still returns its provenance for the row.
-pub fn map_model(request: &mut CanonicalRequest, policy: Option<&ModelMap>) -> Option<MapTarget> {
-    let matched = model_map::mapped_model(policy, request.model.as_deref()?)?.clone();
-    request.model = Some(matched.target.clone());
-    Some(matched)
-}
 
 /// Remove mid-conversation effort updates for a binding that rejects them.
 /// The wire-side content shape decides whether an effort-only system message
@@ -72,13 +62,12 @@ pub fn retarget_compaction(
     request: &mut CanonicalRequest,
     target: Option<&str>,
     cold_lane: bool,
-    map: Option<&ModelMap>,
 ) -> Option<RetargetOutcome> {
     if request.messages.is_empty() {
         return None;
     }
     let from = request.model.clone();
-    let cheaper = cold::cheaper_of(from.as_deref(), target, map);
+    let cheaper = cold::cheaper_of(from.as_deref(), target);
     if cheaper.is_none() && !cold_lane {
         return None;
     }
@@ -348,9 +337,9 @@ mod tests {
             let mut legacy = Request::parse(&bytes).unwrap();
             let mut canonical = from_anthropic(&value).unwrap();
             let legacy_outcome =
-                crate::middleware::cold::retarget_compaction(&mut legacy, None, true, None);
+                crate::middleware::cold::retarget_compaction(&mut legacy, None, true);
             let before = canonical.clone();
-            let canonical_outcome = retarget_compaction(&mut canonical, None, true, None);
+            let canonical_outcome = retarget_compaction(&mut canonical, None, true);
             assert_eq!(canonical_outcome, legacy_outcome);
             if legacy_outcome.is_some() {
                 let rendered = render_anthropic(&canonical, DialectId::AnthropicMessages)

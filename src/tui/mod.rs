@@ -399,14 +399,7 @@ pub fn run(
                 {
                     routing.refresh()
                 }
-                code if page == Page::Routing
-                    && matches!(
-                        code,
-                        crossterm::event::KeyCode::Char(
-                            'e' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p'
-                        )
-                    ) =>
-                {
+                code if page == Page::Routing && routing::owns_key(code) => {
                     routing.key(key);
                 }
                 crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Char('h')

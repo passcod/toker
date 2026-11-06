@@ -7,6 +7,8 @@
 //! by `x-session-id` (the header opencode sends), read back through the
 //! endpoint.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +24,7 @@ use serde_json::Value;
 use toker::config::{
     AnthropicApiConfig, AnthropicSubConfig, CodexSubConfig, Config, OpenRouterConfig,
 };
-use toker::server::Server;
-use toker::store::{CostKind, RequestRow, RowKind, Store};
+use toker::store::{CostKind, Lane, RequestRow, RowKind, Store};
 
 /// An env name no test ever sets, so nothing resolves and nothing injects.
 const UNSET_KEY_ENV: &str = "TOKER_TEST_KEY_UNSET_SESSION_7C";
@@ -91,7 +92,8 @@ fn test_config(upstream: reqwest::Url) -> Config {
             upstream,
             api_key_env: UNSET_KEY_ENV.to_owned(),
             api_key_keyring: false,
-            api_key: None,
+            // Policy refuses a backend with no credential to sign with.
+            api_key: Some("sk-or-test".to_owned()),
             picker: None,
         }),
         openai_api: None,
@@ -139,15 +141,7 @@ fn test_config(upstream: reqwest::Url) -> Config {
 async fn spawn_toker(upstream: reqwest::Url) -> (SocketAddr, Arc<Store>) {
     let config = test_config(upstream);
     let store = Arc::new(Store::open(&config.db_path).expect("open store"));
-    let server = Server::new(config, store.clone()).expect("build server");
-    let app = server.router();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("toker binds");
-    let addr = listener.local_addr().expect("toker addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("toker serves");
-    });
+    let addr = common::serve(common::server(config, &store)).await;
     (addr, store)
 }
 
@@ -315,6 +309,110 @@ async fn an_absent_session_answers_zero_requests_with_nulls() {
     assert_eq!(value["cost"]["billed_total"], Value::Null);
     assert_eq!(value["cost"]["per_provider"], serde_json::json!([]));
     assert_eq!(value["cost"]["per_model"], serde_json::json!([]));
+    assert_eq!(
+        value["lanes"],
+        serde_json::json!([]),
+        "no lane rows is an empty array, never an invented cold lane"
+    );
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
+}
+
+fn seeded_lane(session: &str, tools: &str, updated_ms: i64) -> Lane {
+    Lane {
+        key: format!("{session}|{tools}"),
+        session_id: Some(session.to_owned()),
+        tools_hash: Some(tools.to_owned()),
+        updated_ms,
+        prompt_tokens: None,
+        ttl: None,
+        ping: None,
+        noticed_at: None,
+        forced_from: None,
+        forced_to: None,
+        pin_generation: 0,
+        pin: None,
+    }
+}
+
+#[tokio::test]
+async fn a_sessions_lanes_ride_along_with_a_state_each() {
+    let upstream = spawn_mock().await;
+    let (addr, store) = spawn_toker(upstream).await;
+    let now = now_ms();
+
+    // Main lane: 5m tier, two minutes idle, so warm with about three
+    // minutes left. A sticky transition and a notice time ride along.
+    let mut main = seeded_lane("ses-l", "aaaaaaaaaaaa", now - 120_000);
+    main.prompt_tokens = Some(180_000);
+    main.ttl = Some(300_000);
+    main.noticed_at = Some(now - 60_000);
+    main.forced_from = Some("model-a".to_owned());
+    main.forced_to = Some("model-b".to_owned());
+    // A utility lane that has been idle past its 5m tier: cold.
+    let mut utility = seeded_lane("ses-l", "bbbbbbbbbbbb", now - 3_600_000);
+    utility.prompt_tokens = Some(900);
+    utility.ttl = Some(300_000);
+    // A ping lane, fresh: a ping, not warm.
+    let mut ping = seeded_lane("ses-l", "cccccccccccc", now - 10_000);
+    ping.ttl = Some(300_000);
+    ping.ping = Some(true);
+    // Another session's lane, whose id extends ours.
+    let other = seeded_lane("ses-l2", "dddddddddddd", now);
+    for lane in [&main, &utility, &ping, &other] {
+        store.upsert_lane(lane).expect("seed lane");
+    }
+
+    // The gate still guards the lanes: no verb, no answer.
+    let response = get_session(addr, "?session=ses-l", None).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = get_session(addr, "?session=ses-l", Some("session")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = response.json().await.expect("session body");
+    let lanes = value["lanes"].as_array().expect("lanes array");
+    let ids: Vec<&str> = lanes
+        .iter()
+        .map(|lane| lane["tools_id"].as_str().expect("tools id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["cccccc", "aaaaaa", "bbbbbb"],
+        "this session's lanes only, newest first, as short ids"
+    );
+
+    let ping = &lanes[0];
+    assert_eq!(ping["state"], "ping");
+    assert_eq!(ping["ping"], true);
+    assert_eq!(ping["warm_remaining_ms"], Value::Null);
+
+    let main = &lanes[1];
+    assert_eq!(main["state"], "warm");
+    assert_eq!(main["prompt_tokens"], 180_000);
+    assert_eq!(main["ttl_ms"], 300_000);
+    let remaining = main["warm_remaining_ms"].as_i64().expect("remaining");
+    assert!(
+        (170_000..=180_000).contains(&remaining),
+        "about three minutes left, got {remaining}"
+    );
+    assert_eq!(
+        main["forced"],
+        serde_json::json!({"from": "model-a", "to": "model-b"})
+    );
+    assert_eq!(main["noticed_ms"], now - 60_000);
+
+    let utility = &lanes[2];
+    assert_eq!(utility["state"], "cold");
+    assert_eq!(utility["warm_remaining_ms"], Value::Null);
+    assert_eq!(utility["forced"], Value::Null);
+
+    // Lanes need no ledger rows: the summary half stays the zero shape.
+    assert_eq!(value["requests"], 0);
 }
 
 #[tokio::test]

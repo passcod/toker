@@ -118,7 +118,6 @@ pub enum TransitionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionDenied {
-    ExistingLaneUnpinned,
     StaleRevision,
     LanePinned,
     LaneNotCold,
@@ -164,22 +163,14 @@ pub fn decide_transition(
         };
     };
     let Some(current) = pin else {
-        return if *temperature != CacheTemperature::Cold {
-            TransitionDecision::Denied(TransitionDenied::ExistingLaneUnpinned)
-        } else if matches!(
-            cause,
-            TransitionCause::Activation {
-                scope: ActivationScope::NewLanes,
-                ..
-            }
-        ) {
-            TransitionDecision::Keep { pin: None }
-        } else {
-            TransitionDecision::FirstPin {
-                expected_generation: *generation,
-                new_pin: prospective,
-                source: source_of(cause),
-            }
+        // A lane with no pin predates policy routing, so there is no pinned
+        // binding whose cache the move could orphan. It is pinned like a new
+        // lane; the cache it may have warm elsewhere is knowingly given up
+        // once rather than seeded a pin from guesswork.
+        return TransitionDecision::FirstPin {
+            expected_generation: *generation,
+            new_pin: prospective,
+            source: TransitionSource::NewLane,
         };
     };
     if current == &prospective {
@@ -404,36 +395,36 @@ mod tests {
     }
 
     #[test]
-    fn existing_unpinned_lane_requires_verified_coldness() {
+    fn an_existing_unpinned_lane_is_pinned_like_a_new_lane_whatever_its_temperature() {
         let prospective = pin(1, "openrouter.openrouter_chat_completions", "model");
-        for temperature in [CacheTemperature::Warm, CacheTemperature::Unknown] {
-            assert_eq!(
-                decide_transition(
-                    &lane(None, temperature),
-                    prospective.clone(),
-                    TransitionCause::Activation {
-                        scope: ActivationScope::Immediate,
-                        forced_cache_transition: true,
+        for temperature in [
+            CacheTemperature::Warm,
+            CacheTemperature::Unknown,
+            CacheTemperature::Cold,
+        ] {
+            for scope in [
+                ActivationScope::NewLanes,
+                ActivationScope::NewAndColdLanes,
+                ActivationScope::Immediate,
+            ] {
+                assert_eq!(
+                    decide_transition(
+                        &lane(None, temperature),
+                        prospective.clone(),
+                        TransitionCause::Activation {
+                            scope,
+                            forced_cache_transition: false,
+                        },
+                    ),
+                    TransitionDecision::FirstPin {
+                        expected_generation: 4,
+                        new_pin: prospective.clone(),
+                        source: TransitionSource::NewLane,
                     },
-                ),
-                TransitionDecision::Denied(TransitionDenied::ExistingLaneUnpinned)
-            );
-        }
-        assert_eq!(
-            decide_transition(
-                &lane(None, CacheTemperature::Cold),
-                prospective.clone(),
-                TransitionCause::Activation {
-                    scope: ActivationScope::NewAndColdLanes,
-                    forced_cache_transition: false,
-                },
-            ),
-            TransitionDecision::FirstPin {
-                expected_generation: 4,
-                new_pin: prospective,
-                source: TransitionSource::Activation,
+                    "{temperature:?} under {scope:?}"
+                );
             }
-        );
+        }
     }
 
     #[test]

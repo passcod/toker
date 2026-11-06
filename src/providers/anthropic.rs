@@ -50,10 +50,6 @@ pub struct AnthropicSub {
     upstream: Url,
     oauth_token: Option<String>,
     claude_credentials_path: Option<PathBuf>,
-    /// The operator's model routing map, when one is configured
-    /// (`[providers.anthropic_sub.model_map]`) — the routing map this
-    /// backend applies, ported from the predecessor's env-typed knob.
-    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicSub {
@@ -61,13 +57,11 @@ impl AnthropicSub {
     /// frontend paths carry their own, unlike openrouter's base).
     pub fn new(
         upstream: Url,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
         oauth_token: Option<String>,
         claude_credentials_path: Option<PathBuf>,
     ) -> AnthropicSub {
         AnthropicSub {
             upstream,
-            model_map,
             oauth_token,
             claude_credentials_path,
         }
@@ -118,22 +112,12 @@ pub struct AnthropicApi {
     /// literal — see [`crate::config::AnthropicApiConfig::api_key`]). Never
     /// logged, never in the ledger (invariant 2).
     api_key: Option<String>,
-    /// The operator's model routing map (see [`AnthropicSub::model_map`]).
-    model_map: Option<crate::middleware::model_map::ModelMap>,
 }
 
 impl AnthropicApi {
     /// Build the provider. `api_key` is the already-resolved key.
-    pub fn new(
-        upstream: Url,
-        api_key: Option<String>,
-        model_map: Option<crate::middleware::model_map::ModelMap>,
-    ) -> AnthropicApi {
-        AnthropicApi {
-            upstream,
-            api_key,
-            model_map,
-        }
+    pub fn new(upstream: Url, api_key: Option<String>) -> AnthropicApi {
+        AnthropicApi { upstream, api_key }
     }
 }
 
@@ -156,10 +140,6 @@ impl Provider for AnthropicSub {
 
     fn bindings(&self) -> &'static [BackendBinding] {
         ANTHROPIC_SUB_BINDINGS
-    }
-
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -233,10 +213,6 @@ impl Provider for AnthropicApi {
 
     fn bindings(&self) -> &'static [BackendBinding] {
         ANTHROPIC_API_BINDINGS
-    }
-
-    fn model_map(&self) -> Option<&crate::middleware::model_map::ModelMap> {
-        self.model_map.as_ref()
     }
 
     fn endpoint(&self, path: &str) -> Url {
@@ -411,7 +387,6 @@ mod tests {
             "https://api.anthropic.com".parse().expect("upstream url"),
             None,
             None,
-            None,
         )
     }
 
@@ -419,7 +394,6 @@ mod tests {
         AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
             Some("sk-ant-test-key".to_owned()),
-            None,
         )
     }
 
@@ -486,7 +460,6 @@ mod tests {
         }
         let slashed = AnthropicSub::new(
             "http://localhost:9/".parse().expect("upstream url"),
-            None,
             None,
             None,
         );
@@ -562,7 +535,6 @@ mod tests {
 
         let keyless = AnthropicApi::new(
             "https://api.anthropic.com".parse().expect("upstream url"),
-            None,
             None,
         );
         let mut outgoing = HeaderMap::new();

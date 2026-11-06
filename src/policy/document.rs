@@ -1048,9 +1048,8 @@ pub enum MinimumLearning {
     /// The revision-one election bar: strictly more than
     /// `min(7, active_days / 2)` distinct days.
     ///
-    /// This exists only to preserve the adaptive legacy election while its
-    /// unattributable learning table remains readable. Authored policy cannot
-    /// select it.
+    /// This exists only to preserve revision one's adaptive election bar over
+    /// binding-local learning. Authored policy cannot select it.
     RevisionOneAdaptive,
 }
 

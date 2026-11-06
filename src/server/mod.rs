@@ -12,23 +12,23 @@
 //!   binding):
 //!   - `POST /v1/chat/completions` — the usage path: buffered, parsed to
 //!     the IR, routed, recorded ([`proxy`]).
-//!   - `GET /v1/models` — local route-graph projection for a known Chat
-//!     profile, no recording.
+//!   - `GET /v1/models` — a local projection of the active revision's
+//!     publication for the profile; nothing is forwarded or recorded.
 //! - Anthropic frontend (→ any registered Messages/Codex binding):
 //!   - `POST /v1/messages` — the anthropic usage path, fully recorded;
 //!     `count_tokens` and `batches` run the same pipeline (they are not
 //!     gated — gates arrive with the quota-gate unit) but carry no usage,
 //!     so they record nothing in practice ([`anthropic`]).
-//!   - The batch-result GETs (and cancel) — transparent forwarding like
-//!     `/v1/models` (a local projection for a known Responses profile).
-//! - `GET /_toker/status`, `POST /_toker/models/merge`,
-//!   `GET /_toker/session`, `POST /_toker/shutdown` — the control
+//!   - The batch-result GETs (and cancel) — transparent forwarding to the
+//!     binding the active revision's default route names, no recording.
+//! - `GET /_toker/status`, `GET /_toker/session`,
+//!   `POST /_toker/shutdown` — the control
 //!   endpoints, gated by a custom header ([`control`]); `session` is the
 //!   attribution plugin's query, `shutdown` is `toker restart`'s drain.
 //!   Any other `/_toker/` path is a local 404.
-//! - Every other path — transparent forwarding to the default anthropic
-//!   backend ([`anthropic::unmatched`]), as the predecessor forwarded
-//!   everything but its control path.
+//! - Every other path — transparent forwarding to the binding the active
+//!   revision's default route names ([`anthropic::unmatched`]), as the
+//!   predecessor forwarded everything but its control path.
 //!
 //! Every route above also answers under a `/f/<frontend>` prefix: the
 //! router strips it before matching and keeps the profile
@@ -41,8 +41,8 @@
 //! not-configured error in that protocol's own error shape
 //! ([`anthropic_not_configured`], [`openai_not_configured`]) and reaches
 //! no upstream; that includes the unmatched-path fallback, which is the
-//! anthropic default's. Unprefixed or unknown-profile `GET /v1/models`
-//! retains path-driven forwarding; known OpenAI profiles use local discovery.
+//! anthropic default's. Policy chooses the binding for every request; the
+//! route registry only turns that choice into a target.
 //!
 //! Timeouts: axum applies no default request or idle timeout on the
 //! client side, so streams run as long as both ends keep the connection
@@ -88,11 +88,9 @@ use crate::catalog::offers;
 use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
-use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
-    LaneFacts, LegacyLearningView, LegacyOutcome, PolicyShadow, ProfileId, RequestClass,
-    RequestFacts, ShadowObserver, TracingObserver,
+    LaneFacts, ProfileId, RequestClass, RequestFacts,
 };
 use crate::providers::{AnthropicApi, AnthropicSub, CodexSub, OpenAiApi, OpenRouter, Provider};
 use crate::routing::{FrontendProfile, ModelTarget, ProtocolId, RouteRegistry};
@@ -150,6 +148,25 @@ pub(crate) enum PolicyAttemptError {
         revision_id: i64,
         reason: crate::policy::TransitionDenied,
     },
+    /// The caller built lane facts for a lane it had not loaded, or the other
+    /// way round. That is a handler bug, and routing on half a lane would
+    /// guess its cache temperature.
+    #[error("the stored lane and the policy lane facts disagreed")]
+    LaneFactsMismatch,
+}
+
+impl PolicyAttemptError {
+    /// The revision has no default route for the request's protocol, so no
+    /// backend was ever a candidate.
+    pub(crate) fn is_no_default_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Resolve {
+                failure: crate::policy::ResolveFailure::NoRoute,
+                ..
+            }
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -180,10 +197,55 @@ struct ResolvedPolicySnapshot {
     circuits: crate::policy::CircuitSnapshot,
 }
 
-#[derive(Clone, Copy)]
-enum RoutingOwnership {
-    LegacyShadow,
-    Policy,
+/// The injectable edges of a [`Server`]: what a test replaces so it touches
+/// nothing of the host it runs on.
+pub struct Seams {
+    /// Takes the idle-sleep lock. The real one runs systemd-inhibit or the
+    /// like, so tests never hand it to a server with `awake` on.
+    pub spawner: Box<dyn LockSpawner>,
+    /// Where stored API keys are read, once, at startup.
+    pub secrets: Arc<dyn SecretStore>,
+    /// The model catalogues the server starts with. `None` loads the host's
+    /// cache, which only the service wants: a test's inventory would then
+    /// depend on whichever machine runs it.
+    pub catalogs: Option<FetchedCatalogs>,
+}
+
+impl Seams {
+    /// The service's own: process spawner, OS keyring, cached catalogues.
+    pub fn host() -> Seams {
+        Seams {
+            spawner: Box::new(awake::ProcessSpawner),
+            secrets: Arc::new(OsKeyring),
+            catalogs: None,
+        }
+    }
+
+    /// Touches nothing of the host: no sleep lock, an empty in-memory
+    /// keyring, no catalogues. Add what a test needs with the `with_*`
+    /// methods.
+    pub fn isolated() -> Seams {
+        Seams {
+            spawner: Box::new(awake::RefusingSpawner),
+            secrets: Arc::new(secrets::MemoryStore::new()),
+            catalogs: Some(FetchedCatalogs::default()),
+        }
+    }
+
+    pub fn with_spawner(mut self, spawner: Box<dyn LockSpawner>) -> Seams {
+        self.spawner = spawner;
+        self
+    }
+
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Seams {
+        self.secrets = secrets;
+        self
+    }
+
+    pub fn with_catalogs(mut self, catalogs: FetchedCatalogs) -> Seams {
+        self.catalogs = Some(catalogs);
+        self
+    }
 }
 
 /// The upstream client: a connect timeout and the between-reads idle
@@ -205,13 +267,8 @@ fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
 pub struct Server {
     pub(crate) store: Arc<Store>,
     pub(crate) config: Arc<Config>,
-    /// The learned model store (days served + maxPrompt, the day-based
-    /// family election) with its in-memory recently-served map, seeded
-    /// from the ledger tail at startup.
-    pub(crate) models: Arc<ModelStore>,
-    /// Binding-attributed observations and recently-sent targets. This is
-    /// non-authoritative policy evidence; revision-one routing continues to
-    /// read [`Self::models`].
+    /// Binding-attributed observations and recently-sent targets: the
+    /// learning evidence policy resolves against.
     pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
     /// The fetched models catalogues (one per source: openrouter's
     /// public listing, anthropic's presence list, the codex backend's
@@ -237,7 +294,8 @@ pub struct Server {
     /// its upstream keeps talking (see [`UPSTREAM_IDLE_TIMEOUT`]).
     pub(crate) http: reqwest::Client,
     /// The enabled provider bindings and implemented frontend-to-backend
-    /// routes. Every inference handler resolves a concrete model target here.
+    /// routes. Policy picks the binding; handlers turn it into a concrete
+    /// model target here.
     pub(crate) registry: RouteRegistry,
     /// The codex subscription backend, concretely — the translation
     /// branch needs [`crate::providers::codex::CodexSub`]'s own methods
@@ -280,117 +338,34 @@ pub struct Server {
     /// persisted desired inventory generation always matches the snapshot the
     /// new runtime policy was compiled against.
     routing_control: Arc<Mutex<()>>,
-    /// Atomically captured candidate policy and live evidence. It remains
-    /// non-authoritative until the explicit routing cutover.
-    pub(crate) policy_runtime: Option<Arc<crate::policy::PolicyRuntime>>,
-    /// In-memory revision-one resolver used only to compare decisions made by
-    /// the still-authoritative legacy path.
-    pub(crate) policy_shadow: Option<Arc<PolicyShadow<LegacyLearningView>>>,
+    /// The active policy and the live evidence it resolves against, captured
+    /// atomically.
+    pub(crate) policy_runtime: Arc<crate::policy::PolicyRuntime>,
 }
 
 impl Server {
-    /// Build the server: resolve the provider credentials once, validate
-    /// the routing table, build the upstream client, and arm the
-    /// idle-sleep lock over this host's platform command.
+    /// Build the production server: this host's keyring, idle-sleep lock and
+    /// cached model catalogues. Tests never come through here; they use
+    /// [`Server::with_seams`] with [`Seams::isolated`], so the host's state
+    /// cannot leak into a fixture.
     pub fn new(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
-        Self::with_awake_spawner(config, store, Box::new(awake::ProcessSpawner))
+        Self::with_seams(config, store, Seams::host())
     }
 
-    pub fn new_authoritative(config: Config, store: Arc<Store>) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
-            Box::new(awake::ProcessSpawner),
-            Arc::new(OsKeyring),
-            Arc::new(TracingObserver),
-            RoutingOwnership::Policy,
-            None,
-        )
-    }
-
-    /// Build an authoritative server with an explicit initial fetched-model
-    /// catalogue snapshot. The normal constructor keeps loading the host's
-    /// cached catalogues; this seam lets embedders and integration tests make
-    /// their startup inventory deterministic.
-    pub fn new_authoritative_with_catalogs(
-        config: Config,
-        store: Arc<Store>,
-        catalogs: FetchedCatalogs,
-    ) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
-            Box::new(awake::ProcessSpawner),
-            Arc::new(OsKeyring),
-            Arc::new(TracingObserver),
-            RoutingOwnership::Policy,
-            Some(catalogs),
-        )
-    }
-
-    /// [`Server::new`], with the sleep-lock spawner injected. The real
-    /// spawner takes a REAL idle-sleep lock via systemd-inhibit /
-    /// gnome-session-inhibit, so tests inject a fake through here and
-    /// never arm a real inhibitor on the host they run on.
-    pub fn with_awake_spawner(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-    ) -> anyhow::Result<Server> {
-        Self::with_seams(config, store, spawner, Arc::new(OsKeyring))
-    }
-
-    /// [`Server::with_awake_spawner`], with the keyring injected too: the
-    /// stored API keys are read from it here, once, in the service — the
-    /// only process that ever reads the keyring. Tests pass a
-    /// [`crate::secrets::MemoryStore`] and never touch the real one.
-    pub fn with_seams(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-    ) -> anyhow::Result<Server> {
-        Self::with_shadow_observer(config, store, spawner, secrets, Arc::new(TracingObserver))
-    }
-
-    /// [`Server::with_seams`], with the read-only shadow observer injected.
-    /// The observer is one-way and cannot affect a handler result.
-    pub fn with_shadow_observer(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-        shadow_observer: Arc<dyn ShadowObserver>,
-    ) -> anyhow::Result<Server> {
-        Self::with_routing_ownership(
-            config,
-            store,
+    /// Build the server: resolve the provider credentials once, validate
+    /// the routing table, build the upstream client, arm the idle-sleep
+    /// lock, and take the active routing revision, establishing revision one
+    /// from the config's routing fields when the ledger has none. Every
+    /// server routes by policy; there is no other mode.
+    pub fn with_seams(config: Config, store: Arc<Store>, seams: Seams) -> anyhow::Result<Server> {
+        let Seams {
             spawner,
             secrets,
-            shadow_observer,
-            RoutingOwnership::LegacyShadow,
-            None,
-        )
-    }
-
-    fn with_routing_ownership(
-        config: Config,
-        store: Arc<Store>,
-        spawner: Box<dyn LockSpawner>,
-        secrets: Arc<dyn SecretStore>,
-        shadow_observer: Arc<dyn ShadowObserver>,
-        routing_ownership: RoutingOwnership,
-        initial_catalogs: Option<FetchedCatalogs>,
-    ) -> anyhow::Result<Server> {
-        // The config's own validation, again: a Config built by hand (the
-        // tests, any embedder) must not reach the registry with a default
-        // that names a disabled backend. Under policy ownership the legacy
-        // defaults are not routing input, so only establishing revision one
-        // from them checks them.
-        match routing_ownership {
-            RoutingOwnership::LegacyShadow => config.validate()?,
-            RoutingOwnership::Policy => config.validate_retained()?,
-        }
+            catalogs: initial_catalogs,
+        } = seams;
+        // The legacy routing fields are only input to establishing revision
+        // one, which validates them itself.
+        config.validate_retained()?;
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
@@ -411,7 +386,6 @@ impl Server {
         let anthropic_sub = config.anthropic_sub.as_ref().map(|sub| {
             Arc::new(AnthropicSub::new(
                 sub.upstream.clone(),
-                sub.model_map.clone(),
                 sub.oauth_token(|| {
                     secrets::read_key(secrets.clone(), "anthropic_sub", KEYRING_READ_TIMEOUT)
                 }),
@@ -424,7 +398,6 @@ impl Server {
                 api.api_key(|| {
                     secrets::read_key(secrets.clone(), "anthropic_api", KEYRING_READ_TIMEOUT)
                 }),
-                api.model_map.clone(),
             )) as Arc<dyn Provider>
         });
         let codex_turn = match &config.codex_sub {
@@ -433,7 +406,6 @@ impl Server {
                 codex.originator.clone(),
                 codex.auth_path.clone(),
                 codex.refresh_url.clone(),
-                codex.model_map.clone(),
                 codex.client_version.clone(),
                 codex.version_probe,
             )?)),
@@ -449,20 +421,7 @@ impl Server {
         ]
         .into_iter()
         .flatten();
-        let defaults = [
-            config
-                .default_backend_anthropic
-                .clone()
-                .map(|provider| (ProtocolId::AnthropicMessages, provider)),
-            config
-                .default_backend_openai_chat
-                .clone()
-                .map(|provider| (ProtocolId::OpenAiChat, provider)),
-            Some((ProtocolId::OpenAiResponses, "codex_sub".to_owned())),
-        ]
-        .into_iter()
-        .flatten();
-        let registry = RouteRegistry::new(providers, defaults);
+        let registry = RouteRegistry::new(providers);
 
         // The lock exists only while the toggle is
         // on, and an unavailable platform says so once, at startup —
@@ -478,104 +437,56 @@ impl Server {
             Arc::new(Mutex::new(state))
         });
 
-        // The startup seed: the newest ledger rows, read
-        // once, feed both state stores (lanes and served-models).
-        // Reseeding is idempotent, so every
-        // Server::new — serve, tests, restarts — rebuilds the same state.
-        let total = store.count_requests()?;
+        // The startup seed: the newest ledger rows, read once, feed both
+        // state stores (lanes and binding learning). Reseeding is
+        // idempotent, so every Server::new (serve, tests, restarts)
+        // rebuilds the same state.
         let seed = store.requests_since(0, SEED_ROWS)?;
-        // How far the served map vouches: the tail read everything (no
-        // cut) →
-        // the served map vouches from the beginning;
-        // else only from the oldest row the tail kept.
-        let covered =
-            (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
         lanes::reseed(&store, &seed)?;
-        let models = Arc::new(ModelStore::seeded(store.clone(), &seed, covered));
         let binding_learning = Arc::new(crate::policy::BindingLearningView::seeded(
             store.clone(),
             &seed,
         ));
-        let (initial_catalogs, initial_catalog_dir) = match routing_ownership {
-            RoutingOwnership::LegacyShadow => (FetchedCatalogs::default(), None),
-            RoutingOwnership::Policy => match initial_catalogs {
-                Some(catalogs) => (catalogs, None),
-                None => {
-                    let cache_dir = fetched::cache_dir().ok();
-                    let catalogs = cache_dir
-                        .as_deref()
-                        .map(fetched::load_cached)
-                        .unwrap_or_default();
-                    (catalogs, cache_dir)
-                }
-            },
+        let (initial_catalogs, initial_catalog_dir) = match initial_catalogs {
+            Some(catalogs) => (catalogs, None),
+            None => {
+                let cache_dir = fetched::cache_dir().ok();
+                let catalogs = cache_dir
+                    .as_deref()
+                    .map(fetched::load_cached)
+                    .unwrap_or_default();
+                (catalogs, cache_dir)
+            }
         };
         let inventory = offers::inventory(&registry, &initial_catalogs);
         let availability = Arc::new(availability_for(&registry, &initial_catalogs));
-        let (policy_runtime, policy_shadow) = match routing_ownership {
-            RoutingOwnership::LegacyShadow => {
-                let policy_runtime = match crate::policy::legacy::compile(
-                    &config, &registry, &inventory,
-                )
-                .and_then(|compilation| {
-                    compilation
-                        .into_policy()
-                        .map_err(|_| anyhow::anyhow!("policy-shadow-compile-diagnostic"))
-                }) {
-                    Ok(policy) => Some(Arc::new(crate::policy::PolicyRuntime::new(
-                        store.clone(),
-                        registry.clone(),
-                        Arc::new(policy),
-                        Arc::new(inventory),
-                        availability,
-                    ))),
-                    Err(error) => {
-                        tracing::warn!(code = "policy-shadow-startup-disabled", %error);
-                        None
-                    }
-                };
-                let policy_shadow = policy_runtime.as_ref().map(|runtime| {
-                    Arc::new(PolicyShadow::new(
-                        runtime.clone(),
-                        Arc::new(LegacyLearningView::new(models.clone())),
-                        shadow_observer,
-                    ))
-                });
-                (policy_runtime, policy_shadow)
+        let publication_generation = fetched::snapshot_generation(&initial_catalogs);
+        let state = store.load_routing_policy_state()?;
+        let (revision, policy) = match state.active_revision_id {
+            Some(revision_id) => {
+                let revision = store.load_policy_revision(revision_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("active policy revision {revision_id} is missing")
+                })?;
+                let policy = compile_stored_policy(&revision, &registry, &inventory)?;
+                (revision, policy)
             }
-            RoutingOwnership::Policy => {
-                let publication_generation = fetched::snapshot_generation(&initial_catalogs);
-                let state = store.load_routing_policy_state()?;
-                let (revision, policy) = match state.active_revision_id {
-                    Some(revision_id) => {
-                        let revision =
-                            store.load_policy_revision(revision_id)?.ok_or_else(|| {
-                                anyhow::anyhow!("active policy revision {revision_id} is missing")
-                            })?;
-                        let policy = compile_stored_policy(&revision, &registry, &inventory)?;
-                        (revision, policy)
-                    }
-                    None => crate::policy::legacy::establish_revision_one(
-                        &store,
-                        &config,
-                        &registry,
-                        &inventory,
-                        publication_generation,
-                        now_ms(),
-                    )?,
-                };
-                let runtime = crate::policy::PolicyRuntime::new_active_at_generation(
-                    store.clone(),
-                    registry.clone(),
-                    &revision,
-                    Arc::new(policy),
-                    Arc::new(inventory),
-                    availability,
-                    0,
-                );
-                (Some(Arc::new(runtime)), None)
-            }
+            None => crate::policy::legacy::establish_revision_one(
+                &store,
+                &config,
+                &registry,
+                &inventory,
+                publication_generation,
+                now_ms(),
+            )?,
         };
+        let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new(
+            store.clone(),
+            registry.clone(),
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            availability,
+        ));
         let catalog_dir = Arc::new(std::sync::OnceLock::new());
         if let Some(initial_catalog_dir) = initial_catalog_dir {
             let _ = catalog_dir.set(initial_catalog_dir);
@@ -586,7 +497,6 @@ impl Server {
             http,
             registry,
             codex_turn,
-            models,
             binding_learning,
             catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
             catalog_dir,
@@ -601,13 +511,11 @@ impl Server {
             quota_events: Arc::default(),
             routing_control: Arc::default(),
             policy_runtime,
-            policy_shadow,
         })
     }
 
     /// Mark one selected binding and effective target immediately before an
-    /// actual inference transport starts. This state is deliberately separate
-    /// from the authoritative legacy model store.
+    /// actual inference transport starts.
     pub(crate) fn note_binding_sent(
         &self,
         binding_id: &crate::policy::BindingId,
@@ -635,6 +543,16 @@ impl Server {
                 .note_observed(binding_id, reported_model, at_ms, prompt, &tz)
         {
             tracing::error!(%error, "binding model observation update failed");
+            return;
+        }
+        // The resolver reads only the published snapshot (no I/O on the
+        // request path), so a response that taught something is where it
+        // gets republished; otherwise learning and recency would stay frozen
+        // at their startup values until a promote or a restart.
+        if let Err(error) =
+            crate::policy::LearningView::refresh_snapshot(self.binding_learning.as_ref())
+        {
+            tracing::error!(%error, "binding learning snapshot refresh failed");
         }
     }
 
@@ -672,43 +590,16 @@ impl Server {
         Ok(())
     }
 
-    pub(crate) fn compare_publication_shadow(
-        &self,
-        protocol: ProtocolId,
-        profile: Option<&str>,
-        legacy_models: impl IntoIterator<Item = String>,
-    ) {
-        let Some(shadow) = &self.policy_shadow else {
-            return;
-        };
-        let profile = profile.and_then(|profile| ProfileId::new(profile).ok());
-        let legacy: std::collections::BTreeSet<_> = legacy_models.into_iter().collect();
-        let Some(compiled) = shadow.publication_slugs(profile.as_ref(), protocol.into()) else {
-            return;
-        };
-        let matched = legacy == compiled;
-        let record = crate::policy::ShadowRecord {
-            comparison: if matched {
-                crate::policy::ShadowComparison::Match
-            } else {
-                crate::policy::ShadowComparison::Mismatch
-            },
-            code: if matched {
-                "policy-shadow-publication-match"
-            } else {
-                "policy-shadow-publication-mismatch"
-            },
-            legacy: None,
-            shadow: None,
-        };
-        shadow.observe_record(record);
-    }
-
-    pub(crate) fn has_active_policy(&self) -> bool {
-        self.policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .is_some_and(|snapshot| snapshot.revision_id().is_some())
+    /// A Messages target standing in for a request that policy has not
+    /// routed yet: the context a body that never parses, or a gate that runs
+    /// before the route is known, needs. Any binding that serves Messages
+    /// will do, since the placeholder carries no routing decision.
+    pub(crate) fn pending_messages_target(&self) -> Option<ModelTarget> {
+        self.registry.bindings().find_map(|binding| {
+            self.registry
+                .resolve_binding(ProtocolId::AnthropicMessages, binding.id(), None, "pending")
+                .ok()
+        })
     }
 
     /// Capture the active runtime policy and all evidence derived from one
@@ -723,16 +614,7 @@ impl Server {
     }
 
     fn routing_snapshot_locked(&self) -> anyhow::Result<RoutingControlSnapshot> {
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
-        let runtime_snapshot = runtime
-            .capture()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime has no active snapshot"))?;
-        let revision_id = runtime_snapshot
-            .revision_id()
-            .ok_or_else(|| anyhow::anyhow!("routing is not yet policy-owned"))?;
+        let revision_id = self.policy_runtime.capture().revision_id();
         let revision = self
             .store
             .load_policy_revision(revision_id)?
@@ -749,18 +631,14 @@ impl Server {
             .draft
             .as_ref()
             .map(|draft| {
-                compile_control_policy(
+                compile_control(
                     &draft.document,
                     revision.compiler_origin,
                     &self.registry,
                     &inventory,
                 )
-                .err()
-                .and_then(|error| match error {
-                    RoutingControlError::Compilation(diagnostics) => Some(diagnostics),
-                    _ => None,
-                })
-                .unwrap_or_default()
+                .diagnostics()
+                .to_vec()
             })
             .unwrap_or_default();
         let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
@@ -844,19 +722,19 @@ impl Server {
             .state
             .draft
             .ok_or(RoutingControlError::DraftMissing)?;
-        let diagnostics = match compile_control_policy(
+        let compilation = compile_control(
             &draft.document,
             snapshot.active_revision.compiler_origin,
             &self.registry,
             &snapshot.inventory,
-        ) {
-            Ok(_) => Vec::new(),
-            Err(RoutingControlError::Compilation(diagnostics)) => diagnostics,
-            Err(error) => return Err(error),
-        };
+        );
+        // Info and warning findings ride along with a policy that compiled,
+        // so validate shows the notes (an unconfigured binding, an offer the
+        // catalogue lacks) the same way it shows the errors.
         Ok(RoutingDraftValidation {
             generation: snapshot.state.draft_generation,
-            diagnostics,
+            valid: compilation.policy().is_some(),
+            diagnostics: compilation.diagnostics().to_vec(),
         })
     }
 
@@ -890,7 +768,7 @@ impl Server {
         let now = now_ms();
         let lane = lane.as_ref().and_then(|lane| {
             lane.as_ref().and_then(|lane| {
-                self.shadow_lane(
+                self.lane_facts(
                     Some(lane),
                     lane.pin
                         .as_ref()
@@ -1076,11 +954,7 @@ impl Server {
                 desired_inventory_generation: snapshot.inventory_generation,
                 publications: &crate::store::publication_targets()?,
             })?;
-        let runtime = self
-            .policy_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("policy runtime is unavailable"))?;
-        runtime.replace_active(
+        self.policy_runtime.replace_active(
             &activation.revision,
             Arc::new(policy),
             Arc::new(snapshot.inventory),
@@ -1187,32 +1061,25 @@ impl Server {
         &self,
         profile: Option<&str>,
         protocol: crate::policy::FrontendProtocol,
-    ) -> Option<crate::catalog::offers::PolicyPublication> {
-        let snapshot = self.policy_runtime.as_ref()?.capture()?;
-        snapshot.revision_id()?;
+    ) -> crate::catalog::offers::PolicyPublication {
+        let snapshot = self.policy_runtime.capture();
         let profile = profile.and_then(|profile| crate::policy::ProfileId::new(profile).ok());
-        Some(crate::catalog::offers::render_policy(
+        crate::catalog::offers::render_policy(
             snapshot.policy(),
             snapshot.inventory(),
             profile.as_ref(),
             protocol,
-        ))
+        )
     }
 
     pub(crate) fn resolve_policy_first_candidate(
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
-    ) -> Result<Option<crate::policy::AttemptPlan>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((snapshot, _, _)) = runtime.capture_shadow(None, facts.now_ms) else {
-            return Ok(None);
-        };
-        let Some(revision_id) = snapshot.revision_id() else {
-            return Ok(None);
-        };
+    ) -> Result<crate::policy::AttemptPlan, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let snapshot = runtime.capture();
+        let revision_id = snapshot.revision_id();
         let availability = snapshot
             .availability()
             .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
@@ -1227,29 +1094,42 @@ impl Server {
             &circuits,
             facts,
         )
-        .map(|plan| Some(plan.with_policy_revision(revision_id)))
+        .map(|plan| plan.with_policy_revision(revision_id))
         .map_err(|failure| PolicyAttemptError::Resolve {
             revision_id,
             failure,
         })
     }
 
+    /// The binding a model-free administrative request is forwarded to, under
+    /// the active revision.
+    pub(crate) fn resolve_policy_model_free(
+        &self,
+        facts: &RequestFacts,
+        credentials: &crate::policy::CredentialSnapshot,
+    ) -> Result<crate::policy::BindingId, PolicyAttemptError> {
+        let snapshot = self.policy_runtime.capture();
+        let revision_id = snapshot.revision_id();
+        let availability = snapshot
+            .availability()
+            .at(facts.now_ms, crate::catalog::fetched::CACHE_TTL_MS)
+            .with_credentials(credentials);
+        crate::policy::resolve_model_free(snapshot.policy(), &availability, facts).map_err(
+            |failure| PolicyAttemptError::Resolve {
+                revision_id,
+                failure,
+            },
+        )
+    }
+
     pub(crate) fn resolve_policy_first_candidates(
         &self,
         facts: &[RequestFacts],
         credentials: &crate::policy::CredentialSnapshot,
-    ) -> Result<Option<Vec<crate::policy::AttemptPlan>>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((snapshot, _, _)) =
-            runtime.capture_shadow(None, facts.first().map_or(0, |f| f.now_ms))
-        else {
-            return Ok(None);
-        };
-        let Some(revision_id) = snapshot.revision_id() else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<crate::policy::AttemptPlan>, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let snapshot = runtime.capture();
+        let revision_id = snapshot.revision_id();
         let learning = crate::policy::LearningView::snapshot(self.binding_learning.as_ref());
         let mut plans = Vec::with_capacity(facts.len());
         for facts in facts {
@@ -1273,31 +1153,26 @@ impl Server {
             })?;
             plans.push(plan);
         }
-        Ok(Some(plans))
+        Ok(plans)
     }
 
+    /// Resolve one inference attempt under the active policy revision, or
+    /// the revision its lane is pinned to: every request resolves or fails
+    /// with a [`PolicyAttemptError`].
     pub(crate) fn resolve_policy_attempt(
         &self,
         facts: &RequestFacts,
         credentials: &crate::policy::CredentialSnapshot,
         stored_lane: Option<&crate::store::Lane>,
         lane: Option<&LaneFacts>,
-    ) -> Result<Option<PolicyAttempt>, PolicyAttemptError> {
-        let Some(runtime) = &self.policy_runtime else {
-            return Ok(None);
-        };
-        let Some((current, evidence, _)) = runtime.capture_shadow(None, facts.now_ms) else {
-            return Ok(None);
-        };
-        let Some(current_revision_id) = current.revision_id() else {
-            return Ok(None);
-        };
-        let scope = current
-            .activation_scope()
-            .expect("a persisted current revision has an activation scope");
+    ) -> Result<PolicyAttempt, PolicyAttemptError> {
+        let runtime = &self.policy_runtime;
+        let current = runtime.capture();
+        let evidence = current.evidence();
+        let current_revision_id = current.revision_id();
+        let scope = current.activation_scope();
         if stored_lane.is_some() != lane.is_some() {
-            tracing::error!("stored lane and policy lane facts disagreed");
-            return Ok(None);
+            return Err(crate::server::PolicyAttemptError::LaneFactsMismatch);
         }
         let temperature = lane
             .map(|lane| lane.temperature)
@@ -1306,26 +1181,29 @@ impl Server {
         let pinned_revision = stored_lane
             .and_then(|lane| lane.pin.as_ref())
             .map(|pin| pin.policy_revision_id);
+        // A lane with no pin predates policy routing and resolves under the
+        // active revision like a new lane, whatever the activation scope:
+        // its cache cannot be attributed to a binding, so there is nothing a
+        // pinned revision could preserve. The one thing kept from it is a
+        // proven-cold temperature, which the compaction route needs.
+        let lane = lane.filter(|lane| {
+            pinned_revision.is_some() || lane.temperature == crate::policy::CacheTemperature::Cold
+        });
 
-        let use_active = match (stored_lane, pinned_revision, scope) {
-            (None, _, _) => true,
-            (Some(_), None, crate::policy::ActivationScope::NewLanes) => return Ok(None),
-            (Some(_), None, _) if temperature != crate::policy::CacheTemperature::Cold => {
-                return Ok(None);
-            }
-            (Some(_), None, _) => true,
-            (_, Some(revision), _) if revision > current_revision_id => {
+        let use_active = match (pinned_revision, scope) {
+            (None, _) => true,
+            (Some(revision), _) if revision > current_revision_id => {
                 return Err(PolicyAttemptError::Transition {
                     revision_id: revision,
                     reason: crate::policy::TransitionDenied::StaleRevision,
                 });
             }
-            (_, Some(revision), _) if revision == current_revision_id => true,
-            (_, Some(_), crate::policy::ActivationScope::NewLanes) => false,
-            (_, Some(_), crate::policy::ActivationScope::NewAndColdLanes) => {
+            (Some(revision), _) if revision == current_revision_id => true,
+            (Some(_), crate::policy::ActivationScope::NewLanes) => false,
+            (Some(_), crate::policy::ActivationScope::NewAndColdLanes) => {
                 temperature == crate::policy::CacheTemperature::Cold
             }
-            (_, Some(_), crate::policy::ActivationScope::Immediate) => true,
+            (Some(_), crate::policy::ActivationScope::Immediate) => true,
         };
         let snapshot = if use_active {
             current
@@ -1387,7 +1265,7 @@ impl Server {
                 revision_id: resolved
                     .plan
                     .policy_revision
-                    .expect("an authoritative plan has a persisted revision"),
+                    .expect("a resolved plan carries its revision"),
                 reason,
             });
         }
@@ -1404,11 +1282,11 @@ impl Server {
                 .map(|(binding, _)| binding.clone())
                 .collect(),
         };
-        Ok(Some(PolicyAttempt {
+        Ok(PolicyAttempt {
             plan: resolved.plan,
             pin_transition: decision,
             continuation,
-        }))
+        })
     }
 
     pub(crate) fn open_policy_circuit(
@@ -1417,9 +1295,7 @@ impl Server {
         failure: crate::policy::FailureClass,
         now_ms: i64,
     ) {
-        let Some(runtime) = self.policy_runtime.as_ref() else {
-            return;
-        };
+        let runtime = &self.policy_runtime;
         if failure == crate::policy::FailureClass::Authentication
             && attempt
                 .continuation
@@ -1468,16 +1344,13 @@ impl Server {
     }
 
     pub(crate) fn clear_policy_target_circuits(&self, attempt: &PolicyAttempt) {
-        let Some(runtime) = self.policy_runtime.as_ref() else {
-            return;
-        };
         let (Some(route_id), Some(candidate_id)) = (
             attempt.plan.route_id.as_ref(),
             attempt.plan.candidate_id.as_ref(),
         ) else {
             return;
         };
-        runtime.clear_target_circuits(
+        self.policy_runtime.clear_target_circuits(
             &attempt.continuation.snapshot,
             route_id,
             candidate_id,
@@ -1494,7 +1367,7 @@ impl Server {
         let revision_id = failed
             .plan
             .policy_revision
-            .expect("an authoritative attempt has a persisted revision");
+            .expect("a resolved plan carries its revision");
         let plan = crate::policy::resolve_after_failure(
             failed.continuation.snapshot.policy(),
             failed.continuation.snapshot.inventory(),
@@ -1539,9 +1412,7 @@ impl Server {
         lane: Option<&LaneFacts>,
         activation_allows_cache_loss: bool,
     ) -> Result<ResolvedPolicySnapshot, PolicyAttemptError> {
-        let revision_id = snapshot
-            .revision_id()
-            .expect("an authoritative snapshot has a persisted revision");
+        let revision_id = snapshot.revision_id();
         let mut lane = lane.cloned();
         if let Some(pin) = lane.as_mut().and_then(|lane| lane.pinned.as_mut()) {
             pin.policy_fingerprint = Some(snapshot.policy().fingerprint().clone());
@@ -1576,20 +1447,7 @@ impl Server {
         })
     }
 
-    pub(crate) fn observe_policy_shadow(
-        &self,
-        facts: RequestFacts,
-        credentials: crate::policy::CredentialSnapshot,
-        lane: Option<LaneFacts>,
-        legacy: LegacyOutcome,
-    ) {
-        let Some(shadow) = &self.policy_shadow else {
-            return;
-        };
-        shadow.observe(facts, credentials, lane, legacy);
-    }
-
-    pub(crate) fn shadow_credentials(
+    pub(crate) fn credential_snapshot(
         &self,
         headers: &HeaderMap,
         frontend: ProtocolId,
@@ -1619,7 +1477,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn shadow_facts(
+    pub(crate) fn request_facts(
         &self,
         protocol: ProtocolId,
         profile: Option<&str>,
@@ -1650,7 +1508,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn shadow_lane(
+    pub(crate) fn lane_facts(
         &self,
         lane: Option<&crate::store::Lane>,
         binding: Option<&crate::routing::BackendBinding>,
@@ -1669,14 +1527,15 @@ impl Server {
                 now,
             );
         let temperature = if compaction_cold {
-            // This is the authoritative legacy proof used by the compaction
-            // transform itself. Once the lane's recorded TTL has expired, no
+            // Proof from the lane's own record, the same the compaction
+            // transform uses. Once the lane's recorded TTL has expired, no
             // binding-local cache remains to preserve; a policy pin is not
             // needed to make that positive cold fact safe.
             crate::policy::CacheTemperature::Cold
         } else if compaction {
-            // The legacy predicate can disprove eligibility without proving
-            // which binding owns a still-live cache.
+            // A lane that is not cold by its own record can disprove
+            // eligibility without proving which binding owns a still-live
+            // cache.
             crate::policy::CacheTemperature::Unknown
         } else {
             cache_temperature(lane, binding, now)
@@ -1685,8 +1544,7 @@ impl Server {
             temperature,
             pinned: lane.pin.as_ref().map(|pin| crate::policy::ProvisionalPin {
                 policy_revision_id: Some(pin.policy_revision_id),
-                // The shadow worker fills this after loading the pin's
-                // immutable revision.
+                // Filled once the pin's immutable revision is loaded.
                 policy_fingerprint: None,
                 route_fingerprint: pin.route_fingerprint.clone(),
                 candidate_id: pin.candidate_id.clone(),
@@ -1696,39 +1554,6 @@ impl Server {
             }),
             forced_from: lane.forced_from.clone(),
             forced_to: lane.forced_to.clone(),
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn legacy_shadow_outcome(
-        &self,
-        facts: &RequestFacts,
-        target: &ModelTarget,
-        baseline_model: Option<String>,
-        upgraded_model: Option<String>,
-        retargeted_model: Option<String>,
-        aliased_model: Option<String>,
-        effective_model: Option<String>,
-        compaction: bool,
-    ) -> Option<LegacyOutcome> {
-        let baseline_model =
-            baseline_model.or_else(|| target.effective_model().map(str::to_owned))?;
-        let route_source = legacy_route_source(facts, target);
-        Some(LegacyOutcome {
-            protocol: facts.protocol,
-            profile: facts.profile.clone(),
-            requested_model: facts.requested_model.clone(),
-            provider: target.provider().id().to_owned(),
-            binding_id: target.binding().id().clone(),
-            route_source,
-            baseline_model,
-            upgraded_model,
-            retargeted_model,
-            aliased_model,
-            effective_model: effective_model
-                .or_else(|| target.effective_model().map(str::to_owned))
-                .unwrap_or_default(),
-            compaction,
         })
     }
 
@@ -1829,7 +1654,6 @@ impl Server {
             )
             .route("/_toker/status", get(control::status))
             .route("/_toker/session", get(control::session))
-            .route("/_toker/models/merge", post(control::models_merge))
             .route("/_toker/shutdown", post(control::shutdown))
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
             .route("/_toker/routing/draft", any(control::routing::draft))
@@ -2046,8 +1870,8 @@ impl Server {
         self.replace_catalogs(next);
     }
 
-    /// Replace catalogue state and every immutable shadow projection derived
-    /// from it as one update. In-flight observations retain the old snapshot.
+    /// Replace catalogue state and every immutable projection derived from it as
+    /// one update. In-flight observations retain the old snapshot.
     fn replace_catalogs(&self, next: FetchedCatalogs) {
         let _control = self
             .routing_control
@@ -2062,87 +1886,52 @@ impl Server {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed_catalogue_bindings =
             changed_catalogue_bindings(&self.registry, &catalogs, &next);
-        let Some(runtime) = &self.policy_runtime else {
-            *catalogs = next;
-            return;
-        };
+        let runtime = &self.policy_runtime;
         // Model-list readers retain this catalogue guard through their
         // comparison, so they can observe only the old pair or new pair.
-        if let Some(revision_id) = runtime
-            .capture()
-            .and_then(|snapshot| snapshot.revision_id())
-        {
-            let revision = match self.store.load_policy_revision(revision_id) {
-                Ok(Some(revision)) => revision,
-                Ok(None) => {
-                    tracing::error!(revision_id, "active policy refresh revision is missing");
-                    return;
-                }
-                Err(error) => {
-                    tracing::error!(%error, revision_id, "active policy refresh load failed");
-                    return;
-                }
-            };
-            match crate::policy::runtime::compile_stored_revision(
-                &revision,
-                &self.registry,
-                &inventory,
-            )
-            .into_policy()
-            {
-                Ok(policy) => {
-                    let generation = publication_generation;
-                    if let Err(error) = crate::store::publication_targets().and_then(|targets| {
-                        self.store
-                            .set_publications_desired(
-                                &targets,
-                                revision.revision_id,
-                                generation,
-                                now_ms(),
-                            )
-                            .map(|_| ())
-                    }) {
-                        tracing::error!(%error, revision_id, "active publication handoff failed");
-                        return;
-                    }
-                    runtime.replace_active(
-                        &revision,
-                        Arc::new(policy),
-                        Arc::new(inventory),
-                        Arc::new(availability),
-                        &changed_catalogue_bindings,
-                    );
-                    *catalogs = next;
-                }
-                Err(_) => tracing::error!(
-                    revision_id = revision.revision_id,
-                    "active policy refresh compilation failed"
-                ),
+        let revision_id = runtime.capture().revision_id();
+        let revision = match self.store.load_policy_revision(revision_id) {
+            Ok(Some(revision)) => revision,
+            Ok(None) => {
+                tracing::error!(revision_id, "active policy refresh revision is missing");
+                return;
             }
-            return;
-        }
-
-        *catalogs = next;
-        let policy = crate::policy::legacy::compile(&self.config, &self.registry, &inventory)
-            .ok()
-            .and_then(|compilation| compilation.into_policy().ok());
-        if let Some(policy) = policy {
-            runtime.replace_candidate(
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(availability),
-                &changed_catalogue_bindings,
-            );
-        } else {
-            tracing::warn!(
-                code = "policy-shadow-refresh-disabled",
-                "policy shadow disabled for catalogue generation"
-            );
-            runtime.replace_evidence_and_clear_candidate(
-                Arc::new(inventory),
-                Arc::new(availability),
-                &changed_catalogue_bindings,
-            );
+            Err(error) => {
+                tracing::error!(%error, revision_id, "active policy refresh load failed");
+                return;
+            }
+        };
+        match crate::policy::runtime::compile_stored_revision(&revision, &self.registry, &inventory)
+            .into_policy()
+        {
+            Ok(policy) => {
+                let generation = publication_generation;
+                if let Err(error) = crate::store::publication_targets().and_then(|targets| {
+                    self.store
+                        .set_publications_desired(
+                            &targets,
+                            revision.revision_id,
+                            generation,
+                            now_ms(),
+                        )
+                        .map(|_| ())
+                }) {
+                    tracing::error!(%error, revision_id, "active publication handoff failed");
+                    return;
+                }
+                runtime.replace_active(
+                    &revision,
+                    Arc::new(policy),
+                    Arc::new(inventory),
+                    Arc::new(availability),
+                    &changed_catalogue_bindings,
+                );
+                *catalogs = next;
+            }
+            Err(_) => tracing::error!(
+                revision_id = revision.revision_id,
+                "active policy refresh compilation failed"
+            ),
         }
     }
 
@@ -2441,6 +2230,7 @@ pub(crate) struct RoutingLaneImpacts {
 #[derive(Debug)]
 pub(crate) struct RoutingDraftValidation {
     pub(crate) generation: i64,
+    pub(crate) valid: bool,
     pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
 }
 
@@ -2591,13 +2381,13 @@ fn preview_failure_code(error: &crate::policy::ResolveFailure) -> &'static str {
     }
 }
 
-fn compile_control_policy(
+fn compile_control(
     document: &crate::policy::ValidatedPolicyDocument,
     origin: PolicyCompilerOrigin,
     registry: &RouteRegistry,
     inventory: &crate::catalog::offers::OfferInventory,
-) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
-    let compilation = match origin {
+) -> crate::policy::Compilation {
+    match origin {
         PolicyCompilerOrigin::Authored => crate::policy::compile(
             document.clone(),
             registry,
@@ -2607,8 +2397,16 @@ fn compile_control_policy(
         PolicyCompilerOrigin::GeneratedRevisionOne => {
             crate::policy::legacy::compile_document(document.clone(), registry, inventory)
         }
-    };
-    compilation
+    }
+}
+
+fn compile_control_policy(
+    document: &crate::policy::ValidatedPolicyDocument,
+    origin: PolicyCompilerOrigin,
+    registry: &RouteRegistry,
+    inventory: &crate::catalog::offers::OfferInventory,
+) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
+    compile_control(document, origin, registry, inventory)
         .into_policy()
         .map_err(RoutingControlError::Compilation)
 }
@@ -2683,7 +2481,7 @@ fn policy_transition(
 ) -> crate::policy::LaneTransitionDecision {
     let prospective = plan
         .pin_identity()
-        .expect("an authoritative inference plan has complete pin identity");
+        .expect("an inference plan has complete pin identity");
     let same_revision = matches!(
         lane,
         crate::policy::LaneState::Existing {
@@ -2716,6 +2514,24 @@ fn policy_transition(
                 .fallback_cache_transition
                 .expect("a fallback plan retains its crossed-edge consent"),
         },
+        // The client asked for something else: another route or candidate, or
+        // another model on a candidate that takes the client's own spelling.
+        // That choice carries the user's consent to lose the cache it leaves
+        // behind. Everything else that differs within a revision (an offer
+        // selector's winner moving, say) is the policy's doing and keeps the
+        // route's own cache rule.
+        crate::policy::LaneState::Existing {
+            pin: Some(current), ..
+        } if same_revision
+            && (current.route_fingerprint != prospective.route_fingerprint
+                || current.candidate_id != prospective.candidate_id
+                || (plan.baseline_from_request
+                    && current.baseline_model != prospective.baseline_model)) =>
+        {
+            crate::policy::TransitionCause::ExplicitUserChange {
+                cache: crate::policy::CacheTransitionPolicy::AllowCacheLoss,
+            }
+        }
         _ if same_revision => crate::policy::TransitionCause::ExplicitUserChange {
             cache: plan
                 .cache_transition
@@ -2746,50 +2562,22 @@ fn cache_temperature(
     {
         return CacheTemperature::Unknown;
     }
-    let Some(domain) = binding.cache_domain() else {
-        return CacheTemperature::Unknown;
+    // Anthropic and codex bindings declare no cache domain, so the TTL their
+    // cache runs on is the one the lane itself recorded from the usage the
+    // provider reported, read the way the cold gate reads it. A lane that has
+    // recorded none stays unknown: absent evidence is never cold.
+    let ttl_ms = match binding.cache_domain() {
+        Some(domain) => domain.ttl_ms(),
+        None if lane.ttl.is_some() => crate::middleware::cold::ttl_of(lane),
+        None => return CacheTemperature::Unknown,
     };
     let idle_ms = now_ms.saturating_sub(lane.updated_ms);
     if now_ms < lane.updated_ms {
         CacheTemperature::Unknown
-    } else if idle_ms >= domain.ttl_ms() {
+    } else if idle_ms >= ttl_ms {
         CacheTemperature::Cold
     } else {
         CacheTemperature::Warm
-    }
-}
-
-fn legacy_route_source(facts: &RequestFacts, target: &ModelTarget) -> String {
-    if let Some(requested) = facts.requested_model.as_deref() {
-        if requested
-            .strip_prefix(target.provider().id())
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some()
-        {
-            return format!(
-                "protocol-rewrite:legacy-prefix-{}-{}",
-                match facts.protocol {
-                    FrontendProtocol::AnthropicMessages => "anthropic",
-                    FrontendProtocol::OpenaiChat => "openai-chat",
-                    FrontendProtocol::OpenaiResponses => "openai-responses",
-                },
-                target.provider().id()
-            );
-        }
-        if facts.protocol == FrontendProtocol::AnthropicMessages
-            && requested.starts_with("anthropic/")
-        {
-            return "protocol-rewrite:legacy-anthropic-protocol-alias".to_owned();
-        }
-    }
-    if facts
-        .profile
-        .as_ref()
-        .is_some_and(|profile| profile.as_str() == "unprefixed")
-    {
-        "profile-default".to_owned()
-    } else {
-        "protocol-default".to_owned()
     }
 }
 
@@ -2880,16 +2668,29 @@ pub(crate) fn responses_not_configured() -> axum::response::Response {
 }
 
 fn not_configured(wire: proxy::ErrorWire, protocol: &'static str) -> axum::response::Response {
-    let mut response = proxy::error_response(
-        wire,
-        axum::http::StatusCode::NOT_FOUND,
-        proxy::WireError {
-            anthropic_type: "not_found_error",
-            openai_type: "invalid_request_error",
-            openai_code: Some("backend_not_configured"),
-        },
-        &not_configured_message(protocol),
-    );
+    mark_not_configured(
+        proxy::error_response(
+            wire,
+            axum::http::StatusCode::NOT_FOUND,
+            proxy::WireError {
+                anthropic_type: "not_found_error",
+                openai_type: "invalid_request_error",
+                openai_code: Some("backend_not_configured"),
+            },
+            &not_configured_message(protocol),
+        ),
+        protocol,
+    )
+}
+
+/// Tag an answer as toker's own "this protocol has no backend", for the
+/// setup check to tell from an upstream's verdict. The active policy has its
+/// own answers for the same condition (no default route for the protocol),
+/// each in the status and shape of its path, so they carry the tag too.
+pub(crate) fn mark_not_configured(
+    mut response: axum::response::Response,
+    protocol: &'static str,
+) -> axum::response::Response {
     response.headers_mut().insert(
         NOT_CONFIGURED_HEADER,
         axum::http::HeaderValue::from_static(protocol),
@@ -2938,7 +2739,7 @@ fn anthropic_catalog_source(
 
 #[cfg(test)]
 mod tests {
-    use super::Server;
+    use super::{Seams, Server};
     use crate::config::Config;
     use crate::routing::ProtocolId;
     use crate::store::Store;
@@ -2986,7 +2787,7 @@ version_probe = false
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
         let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        Server::new(config, store).expect("server builds")
+        Server::with_seams(config, store, Seams::isolated()).expect("server builds")
     }
 
     #[test]
@@ -3008,13 +2809,8 @@ api_key = "sk-test"
         let mut config = Config::load_from(&path).unwrap();
         config.db_path = dir.join("toker.db");
         let store = Arc::new(Store::open(&config.db_path).unwrap());
-        let first = Server::new_authoritative(config.clone(), store.clone()).unwrap();
-        let first_revision = first
-            .policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .and_then(|snapshot| snapshot.revision_id())
-            .expect("active revision");
+        let first = Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
+        let first_revision = first.policy_runtime.capture().revision_id();
         assert_eq!(
             store
                 .load_routing_policy_state()
@@ -3034,14 +2830,10 @@ api_key = "sk-test"
         );
 
         config.gates.force_newest = !config.gates.force_newest;
-        let restarted = Server::new_authoritative(config, store.clone()).unwrap();
+        let restarted = Server::with_seams(config, store.clone(), Seams::isolated()).unwrap();
         assert_eq!(
-            restarted
-                .policy_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.capture())
-                .and_then(|snapshot| snapshot.revision_id()),
-            Some(first_revision)
+            restarted.policy_runtime.capture().revision_id(),
+            first_revision
         );
         assert_eq!(store.load_policy_revisions().unwrap().len(), 1);
     }
@@ -3054,14 +2846,14 @@ api_key = "sk-test"
         let mut config = Config::load_from(&path).unwrap();
         config.db_path = dir.join("toker.db");
         let store = Arc::new(Store::open(&config.db_path).unwrap());
-        Server::new_authoritative(config.clone(), store.clone()).unwrap();
+        Server::with_seams(config.clone(), store.clone(), Seams::isolated()).unwrap();
         store
             .execute_for_test(
                 "PRAGMA ignore_check_constraints = ON;
                  UPDATE routing_policy_revisions SET document_json = '{' WHERE revision_id = 1;",
             )
             .unwrap();
-        let error = Server::new_authoritative(config, store)
+        let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
         assert!(
@@ -3085,7 +2877,7 @@ api_key = "sk-test"
         let config = (*server.config).clone();
         let store = server.store.clone();
         drop(server);
-        let error = Server::new_authoritative(config, store)
+        let error = Server::with_seams(config, store, Seams::isolated())
             .err()
             .expect("startup fails");
         assert!(
@@ -3208,7 +3000,50 @@ api_key = "sk-test"
         address
     }
 
+    /// Revision one's document for this config, from a throwaway server: the
+    /// route registry is the only thing it takes from one.
+    fn revision_one_document(config: &Config) -> crate::policy::PolicyDocument {
+        let scratch = Server::with_seams(
+            config.clone(),
+            Arc::new(Store::open(":memory:").expect("scratch store")),
+            Seams::isolated(),
+        )
+        .expect("scratch server builds");
+        crate::policy::legacy::document(&scratch.config, &scratch.registry)
+            .expect("legacy document")
+    }
+
+    /// A server whose revision one is this edited document rather than the
+    /// one its config generates. Activated before the server is built, so the
+    /// constructor loads it instead of establishing its own.
+    fn server_under_revision_one(
+        config: Config,
+        document: crate::policy::PolicyDocument,
+    ) -> (Server, Arc<Store>) {
+        let document = document.validate().expect("policy validates");
+        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
+        store
+            .activate_revision_one(&document, 2, 0, &[])
+            .expect("activate policy fixture");
+        let server =
+            Server::with_seams(config, store.clone(), Seams::isolated()).expect("server builds");
+        (server, store)
+    }
+
     async fn policy_chat_fallback_server() -> (Server, ChatBodies, ChatBodies) {
+        policy_chat_fallback_server_with_openrouter_key(true).await
+    }
+
+    /// Without a stored OpenRouter key, a credential on the request is the
+    /// one that signs; with one, it replaces whatever the request carried.
+    async fn policy_chat_fallback_server_with_openrouter_key(
+        stored_key: bool,
+    ) -> (Server, ChatBodies, ChatBodies) {
+        let openrouter_key = if stored_key {
+            "api_key = \"sk-or-test\""
+        } else {
+            ""
+        };
         let primary: ChatBodies = Arc::default();
         primary.response_mode.store(CHAT_FAILURE, Ordering::Relaxed);
         let backup: ChatBodies = Arc::default();
@@ -3249,7 +3084,7 @@ default_backend_openai_chat = "openrouter"
 [providers.openrouter]
 upstream = "http://{primary_address}/v1"
 api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
-api_key = "sk-or-test"
+{openrouter_key}
 
 [providers.anthropic_api]
 upstream = "http://{backup_address}"
@@ -3260,10 +3095,7 @@ api_key = "sk-ant-test"
         )
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
-        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server = Server::new(config, store.clone()).expect("server builds");
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
-            .expect("legacy document");
+        let mut document = revision_one_document(&config);
         let route_id =
             crate::policy::RouteId::new("legacy-route-openrouter-openrouter_chat_completions")
                 .unwrap();
@@ -3319,38 +3151,7 @@ api_key = "sk-ant-test"
                 health_circuits: vec![],
             },
         });
-        let document = document.validate().expect("policy validates");
-        let revision = store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("active Chat fallback test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("insert revision");
-        let catalogs = crate::catalog::FetchedCatalogs::default();
-        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
-        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
-            store,
-            server.registry.clone(),
-            &revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(super::availability_for(&server.registry, &catalogs)),
-        )));
+        let (server, _store) = server_under_revision_one(config, document);
         (server, primary, backup)
     }
 
@@ -3388,10 +3189,7 @@ api_key = "sk-proj-test"
         )
         .expect("write config");
         let config = Config::load_from(&dir.join("toker.toml")).expect("config loads");
-        let store = Arc::new(Store::open(":memory:").expect("scratch store"));
-        let mut server = Server::new(config, store.clone()).expect("server builds");
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
-            .expect("legacy document");
+        let mut document = revision_one_document(&config);
         let openai_route =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
         for default in &mut document.defaults {
@@ -3417,38 +3215,7 @@ api_key = "sk-proj-test"
             .model = crate::policy::CandidateModel::Exact {
             model_id: "policy-effective".to_owned(),
         };
-        let document = document.validate().expect("policy validates");
-        let revision = store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("active Chat test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Legacy,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("insert revision");
-        let catalogs = crate::catalog::FetchedCatalogs::default();
-        let inventory = crate::catalog::offers::inventory(&server.registry, &catalogs);
-        let policy = crate::policy::compile(
-            document,
-            &server.registry,
-            &inventory,
-            crate::policy::PolicyOrigin::GeneratedRevisionOne,
-        )
-        .into_policy()
-        .expect("policy compiles");
-        server.policy_runtime = Some(Arc::new(crate::policy::PolicyRuntime::new_active(
-            store,
-            server.registry.clone(),
-            &revision,
-            Arc::new(policy),
-            Arc::new(inventory),
-            Arc::new(super::availability_for(&server.registry, &catalogs)),
-        )));
+        let (server, _store) = server_under_revision_one(config, document);
         (server, seen)
     }
 
@@ -3486,11 +3253,7 @@ api_key = "sk-proj-test"
             model_id: model.to_owned(),
         };
         let document = document.validate().expect("policy validates");
-        let parent_revision_id = server
-            .policy_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.capture())
-            .and_then(|snapshot| snapshot.revision_id());
+        let parent_revision_id = server.policy_runtime.capture().revision_id();
         let revision = server
             .store
             .insert_policy_revision(&crate::store::NewPolicyRevision {
@@ -3501,7 +3264,7 @@ api_key = "sk-proj-test"
                 forced_cache_transition,
                 source: crate::store::PolicyRevisionSource::Legacy,
                 compiler_origin: None,
-                parent_revision_id,
+                parent_revision_id: Some(parent_revision_id),
                 document: &document,
             })
             .expect("insert revision");
@@ -3515,17 +3278,13 @@ api_key = "sk-proj-test"
         )
         .into_policy()
         .expect("policy compiles");
-        server
-            .policy_runtime
-            .as_ref()
-            .expect("active runtime")
-            .replace_active(
-                &revision,
-                Arc::new(policy),
-                Arc::new(inventory),
-                Arc::new(super::availability_for(&server.registry, &catalogs)),
-                &std::collections::BTreeSet::new(),
-            );
+        server.policy_runtime.replace_active(
+            &revision,
+            Arc::new(policy),
+            Arc::new(inventory),
+            Arc::new(super::availability_for(&server.registry, &catalogs)),
+            &std::collections::BTreeSet::new(),
+        );
         revision.revision_id
     }
 
@@ -3554,8 +3313,8 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let runtime = server.policy_runtime.as_ref().expect("active runtime");
-        let snapshot = runtime.capture().expect("active snapshot");
+        let runtime = &server.policy_runtime;
+        let snapshot = runtime.capture();
         let route_id =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
         let mut document = crate::policy::legacy::document(&server.config, &server.registry)
@@ -3615,7 +3374,7 @@ api_key = "sk-proj-test"
                 forced_cache_transition: false,
                 source: crate::store::PolicyRevisionSource::Legacy,
                 compiler_origin: None,
-                parent_revision_id: snapshot.revision_id(),
+                parent_revision_id: Some(snapshot.revision_id()),
                 document: &document,
             })
             .expect("insert revision");
@@ -3635,7 +3394,7 @@ api_key = "sk-proj-test"
             snapshot.availability().clone(),
             &std::collections::BTreeSet::new(),
         );
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("asked".to_owned()),
@@ -3654,8 +3413,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("initial resolution")
-            .expect("active policy");
+            .expect("initial resolution");
         assert_eq!(first.plan.effective_model, "first-model");
 
         activate_chat_revision(
@@ -3674,24 +3432,8 @@ api_key = "sk-proj-test"
         assert_eq!(next.plan.effective_model, "backup-model");
     }
 
-    #[test]
-    fn new_lanes_activation_preserves_an_existing_unpinned_lane() {
-        let (server, _) = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
-            ProtocolId::OpenAiChat,
-            None,
-            Some("policy-alias".to_owned()),
-            Some("lane".to_owned()),
-            1,
-            Some(1),
-            0,
-            Default::default(),
-            None,
-            crate::policy::RequestClass::Inference,
-        );
-        let stored_lane = crate::store::Lane {
+    fn unpinned_lane() -> crate::store::Lane {
+        crate::store::Lane {
             key: "lane".to_owned(),
             session_id: Some("session".to_owned()),
             tools_hash: Some("tools".to_owned()),
@@ -3702,27 +3444,94 @@ api_key = "sk-proj-test"
             noticed_at: None,
             forced_from: None,
             forced_to: None,
-            pin_generation: 0,
+            pin_generation: 3,
             pin: None,
-        };
-        let lane = crate::policy::LaneFacts {
-            temperature: crate::policy::CacheTemperature::Unknown,
-            pinned: None,
-            forced_from: None,
-            forced_to: None,
-        };
-        assert!(
-            server
+        }
+    }
+
+    fn chat_facts(server: &Server) -> crate::policy::RequestFacts {
+        server.request_facts(
+            ProtocolId::OpenAiChat,
+            None,
+            Some("policy-alias".to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(1),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        )
+    }
+
+    #[test]
+    fn an_existing_unpinned_lane_resolves_under_the_active_revision_like_a_new_lane() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        // The server's revision activates for new lanes only. A lane with no
+        // pin has no revision to be preserved on: it takes the active
+        // revision, and is pinned at the lane's own generation.
+        let facts = chat_facts(&server);
+        let stored_lane = unpinned_lane();
+        for temperature in [
+            crate::policy::CacheTemperature::Warm,
+            crate::policy::CacheTemperature::Unknown,
+            crate::policy::CacheTemperature::Cold,
+        ] {
+            let lane = crate::policy::LaneFacts {
+                temperature,
+                pinned: None,
+                forced_from: None,
+                forced_to: None,
+            };
+            let resolved = server
                 .resolve_policy_attempt(
                     &facts,
                     &crate::policy::CredentialSnapshot::new(),
                     Some(&stored_lane),
                     Some(&lane),
                 )
-                .expect("preservation is not a resolver failure")
-                .is_none(),
-            "an existing unpinned lane stays on legacy authority"
-        );
+                .expect("an unpinned lane resolves");
+            assert_eq!(resolved.plan.policy_revision, Some(1), "{temperature:?}");
+            assert_eq!(resolved.plan.effective_model, "policy-effective");
+            assert!(
+                matches!(
+                    resolved.pin_transition,
+                    crate::policy::LaneTransitionDecision::FirstPin {
+                        expected_generation: 3,
+                        source: crate::policy::TransitionSource::NewLane,
+                        ..
+                    }
+                ),
+                "{temperature:?}: {:?}",
+                resolved.pin_transition
+            );
+        }
+    }
+
+    #[test]
+    fn lane_facts_that_disagree_with_the_stored_lane_are_an_error_not_a_legacy_fallback() {
+        let (server, _) = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(policy_chat_server());
+        let facts = chat_facts(&server);
+        let stored_lane = unpinned_lane();
+        let lane = crate::policy::LaneFacts {
+            temperature: crate::policy::CacheTemperature::Unknown,
+            pinned: None,
+            forced_from: None,
+            forced_to: None,
+        };
+        let credentials = crate::policy::CredentialSnapshot::new();
+        assert!(matches!(
+            server.resolve_policy_attempt(&facts, &credentials, Some(&stored_lane), None),
+            Err(crate::server::PolicyAttemptError::LaneFactsMismatch)
+        ));
+        assert!(matches!(
+            server.resolve_policy_attempt(&facts, &credentials, None, Some(&lane)),
+            Err(crate::server::PolicyAttemptError::LaneFactsMismatch)
+        ));
     }
 
     #[test]
@@ -3730,7 +3539,7 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("policy-alias".to_owned()),
@@ -3749,8 +3558,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("first resolution")
-            .expect("active policy");
+            .expect("first resolution");
         let mut lane = crate::store::Lane {
             key: "lane".to_owned(),
             session_id: Some("session".to_owned()),
@@ -3783,8 +3591,7 @@ api_key = "sk-proj-test"
                     Some(&lane),
                     Some(&lane_facts(&lane, temperature)),
                 )
-                .expect("pinned resolution")
-                .expect("active policy");
+                .expect("pinned resolution");
             assert_eq!(resolved.plan.policy_revision, Some(1));
             assert!(matches!(
                 resolved.pin_transition,
@@ -3798,8 +3605,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Cold)),
             )
-            .expect("cold activation resolution")
-            .expect("active policy");
+            .expect("cold activation resolution");
         assert_eq!(resolved.plan.policy_revision, Some(active_revision));
         assert_eq!(resolved.plan.effective_model, "policy-next");
         assert!(matches!(
@@ -3829,8 +3635,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Warm)),
             )
-            .expect("warm immediate resolution")
-            .expect("active policy");
+            .expect("warm immediate resolution");
         assert_eq!(preserved.plan.policy_revision, Some(active_revision));
         assert!(matches!(
             preserved.pin_transition,
@@ -3850,8 +3655,7 @@ api_key = "sk-proj-test"
                 Some(&lane),
                 Some(&lane_facts(&lane, crate::policy::CacheTemperature::Unknown)),
             )
-            .expect("forced immediate resolution")
-            .expect("active policy");
+            .expect("forced immediate resolution");
         assert_eq!(moved.plan.policy_revision, Some(newest_revision));
         assert_eq!(moved.plan.effective_model, "policy-forced");
         assert!(matches!(
@@ -3869,7 +3673,7 @@ api_key = "sk-proj-test"
         let (server, _) = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(policy_chat_server());
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiChat,
             None,
             Some("policy-alias".to_owned()),
@@ -3888,8 +3692,7 @@ api_key = "sk-proj-test"
                 None,
                 None,
             )
-            .expect("old resolution")
-            .expect("active policy");
+            .expect("old resolution");
         activate_chat_revision(
             &server,
             crate::policy::ActivationScope::NewLanes,
@@ -3974,6 +3777,61 @@ api_key = "sk-proj-test"
             "policy-forced"
         );
         assert!(forced > unforced);
+    }
+
+    #[tokio::test]
+    async fn a_warm_lane_with_no_pin_is_routed_and_pinned_by_the_active_revision() {
+        // The revision activates for new lanes only, and the lane has just
+        // been used, but a lane with no pin has no revision to stay on.
+        let (server, upstream) = policy_chat_server().await;
+        let store = server.store.clone();
+        let address = serve(server).await;
+        let send = || async {
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/chat/completions"))
+                .header("x-toker-session", "unpinned-session")
+                .json(&serde_json::json!({
+                    "model": "policy-alias",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false
+                }))
+                .send()
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+
+        send().await;
+        let pinned = store
+            .load_lanes()
+            .expect("lanes")
+            .into_iter()
+            .find(|lane| lane.session_id.as_deref() == Some("unpinned-session"))
+            .expect("first request pinned the lane");
+        // Strip the pin, leaving the lane as an older version recorded it.
+        store
+            .compare_and_swap_lane_pin(
+                &pinned.key,
+                pinned.pin_generation,
+                pinned.pin.as_ref(),
+                None,
+            )
+            .expect("unpin");
+        assert_eq!(store.load_lane(&pinned.key).unwrap().unwrap().pin, None);
+
+        send().await;
+        let repinned = store.load_lane(&pinned.key).expect("lane").expect("lane");
+        assert_eq!(
+            repinned.pin.as_ref().map(|pin| pin.policy_revision_id),
+            Some(1),
+            "the unpinned lane took the active revision"
+        );
+        assert_eq!(repinned.pin_generation, pinned.pin_generation + 2);
+        assert_eq!(
+            upstream.seen.lock().unwrap().last().unwrap()["model"],
+            "policy-effective",
+            "and was routed by policy, not by the legacy default"
+        );
     }
 
     #[tokio::test]
@@ -4063,33 +3921,9 @@ api_key = "sk-proj-test"
 
         let dir = crate::setup::test_dir("translated-chat-pin");
         let server = server(&dir);
-        let document = crate::policy::PolicyDocument {
-            format_version: crate::policy::CURRENT_FORMAT_VERSION,
-            description: None,
-            defaults: vec![],
-            presentations: vec![],
-            routes: vec![],
-            rewrites: vec![],
-            classifiers: vec![],
-            upgrades: vec![],
-            compaction: None,
-        }
-        .validate()
-        .expect("policy validates");
-        let revision = server
-            .store
-            .insert_policy_revision(&crate::store::NewPolicyRevision {
-                created_ms: 1,
-                activated_ms: 2,
-                description: Some("translated Chat pin test"),
-                activation_scope: crate::policy::ActivationScope::NewLanes,
-                forced_cache_transition: false,
-                source: crate::store::PolicyRevisionSource::Draft,
-                compiler_origin: None,
-                parent_revision_id: None,
-                document: &document,
-            })
-            .expect("revision");
+        // Pins name the active revision: one the server did not activate
+        // would not be the one its lanes are written under.
+        let revision_id = server.policy_runtime.capture().revision_id();
         let make_record = |session: &str, binding: &str, model: &str| {
             let binding_id = BindingId::new(binding).expect("binding");
             let target = server
@@ -4097,7 +3931,7 @@ api_key = "sk-proj-test"
                 .resolve_binding(ProtocolId::OpenAiChat, &binding_id, Some(model), model)
                 .expect("configured translated Chat target");
             let pin = PinIdentity {
-                policy_revision_id: revision.revision_id,
+                policy_revision_id: revision_id,
                 policy_route_id: RouteId::new(format!("route-{session}")).expect("route"),
                 route_fingerprint: "11"
                     .repeat(32)
@@ -4190,8 +4024,8 @@ api_key = "sk-proj-test"
     async fn active_chat_policy_falls_back_before_commitment() {
         let (server, primary, backup) = policy_chat_fallback_server().await;
         let store = server.store.clone();
-        let runtime = server.policy_runtime.as_ref().unwrap().clone();
-        let snapshot = runtime.capture().unwrap();
+        let runtime = server.policy_runtime.clone();
+        let snapshot = runtime.capture();
         let route = snapshot
             .policy()
             .route(
@@ -4201,7 +4035,7 @@ api_key = "sk-proj-test"
             .unwrap();
         let primary_candidate = &route.candidates()[0];
         let primary_circuit = crate::policy::HealthCircuitKey {
-            policy_revision_id: snapshot.revision_id().unwrap(),
+            policy_revision_id: snapshot.revision_id(),
             route_id: route.id().clone(),
             candidate_id: primary_candidate.id().clone(),
             binding_id: primary_candidate.binding_id().clone(),
@@ -4273,12 +4107,13 @@ api_key = "sk-proj-test"
 
     #[tokio::test]
     async fn request_native_auth_failure_does_not_open_a_shared_circuit() {
-        let (server, primary, backup) = policy_chat_fallback_server().await;
+        let (server, primary, backup) =
+            policy_chat_fallback_server_with_openrouter_key(false).await;
         primary
             .response_mode
             .store(CHAT_AUTH_FAILURE, Ordering::Relaxed);
-        let runtime = server.policy_runtime.as_ref().unwrap().clone();
-        let snapshot = runtime.capture().unwrap();
+        let runtime = server.policy_runtime.clone();
+        let snapshot = runtime.capture();
         let route = snapshot
             .policy()
             .route(
@@ -4288,7 +4123,7 @@ api_key = "sk-proj-test"
             .unwrap();
         let primary_candidate = &route.candidates()[0];
         let auth_circuit = crate::policy::HealthCircuitKey {
-            policy_revision_id: snapshot.revision_id().unwrap(),
+            policy_revision_id: snapshot.revision_id(),
             route_id: route.id().clone(),
             candidate_id: primary_candidate.id().clone(),
             binding_id: primary_candidate.binding_id().clone(),
@@ -4365,12 +4200,8 @@ api_key = "sk-proj-test"
             },
         );
         assert_eq!(
-            server
-                .policy_runtime
-                .as_ref()
-                .and_then(|runtime| runtime.capture())
-                .and_then(|snapshot| snapshot.revision_id()),
-            Some(1),
+            server.policy_runtime.capture().revision_id(),
+            1,
             "catalogue refresh preserves active routing authority"
         );
         let store = server.store.clone();
@@ -4739,11 +4570,11 @@ api_key = "ak-literal-test"
     }
 
     #[test]
-    fn compaction_shadow_uses_positive_legacy_cold_proof_without_a_pin() {
+    fn compaction_lane_uses_positive_cold_proof_without_a_pin() {
         use crate::policy::CacheTemperature;
         use crate::store::Lane;
 
-        let dir = crate::setup::test_dir("compaction-shadow-cold");
+        let dir = crate::setup::test_dir("compaction-lane-cold");
         let server = server(&dir);
         let binding = server
             .registry
@@ -4768,7 +4599,7 @@ api_key = "ak-literal-test"
 
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Cold
@@ -4776,7 +4607,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = now - 1_000;
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,
@@ -4786,7 +4617,7 @@ api_key = "ak-literal-test"
         lane.updated_ms = 0;
         assert_eq!(
             server
-                .shadow_lane(Some(&lane), Some(binding), now, true)
+                .lane_facts(Some(&lane), Some(binding), now, true)
                 .unwrap()
                 .temperature,
             CacheTemperature::Unknown,
@@ -4855,9 +4686,103 @@ api_key = "ak-literal-test"
             .find(|binding| binding.id_str() == "anthropic_sub.anthropic_messages")
             .unwrap();
         lane.pin.as_mut().unwrap().binding_id = no_ttl.id().clone();
+        lane.updated_ms = now - 5 * 60 * 1000;
         assert_eq!(
             super::cache_temperature(&lane, Some(no_ttl), now),
-            CacheTemperature::Unknown
+            CacheTemperature::Unknown,
+            "a binding with no cache domain and a lane that recorded no TTL \
+             has no clock, and an unknown clock is never cold"
+        );
+        // Anthropic bindings declare no cache domain; the lane's recorded TTL
+        // is the clock, as it is for the cold gate.
+        lane.ttl = Some(300_000);
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Cold,
+            "idle for exactly the recorded five-minute TTL"
+        );
+        lane.updated_ms = now - 60 * 1000;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Warm
+        );
+        lane.ttl = Some(3_600_000);
+        lane.updated_ms = now - 20 * 60 * 1000;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Warm,
+            "the one-hour TTL outlasts twenty idle minutes"
+        );
+        lane.pin = None;
+        assert_eq!(
+            super::cache_temperature(&lane, Some(no_ttl), now),
+            CacheTemperature::Unknown,
+            "an unattributed lane cannot borrow a binding's TTL"
+        );
+    }
+
+    fn messages_facts(server: &Server, model: &str) -> crate::policy::RequestFacts {
+        server.request_facts(
+            ProtocolId::AnthropicMessages,
+            None,
+            Some(model.to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(3),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        )
+    }
+
+    #[test]
+    fn a_model_switch_on_a_warm_pinned_lane_is_the_users_own_consent_to_lose_the_cache() {
+        use crate::policy::{CacheTemperature, LaneTransitionDecision, TransitionSource};
+
+        let dir = crate::setup::test_dir("explicit-model-switch");
+        let server = server(&dir);
+        let credentials = crate::policy::CredentialSnapshot::new();
+        let resolve = |stored: Option<&crate::store::Lane>, model: &str| {
+            let lane = stored.map(|stored| lane_facts(stored, CacheTemperature::Warm));
+            server.resolve_policy_attempt(
+                &messages_facts(&server, model),
+                &credentials,
+                stored,
+                lane.as_ref(),
+            )
+        };
+
+        let first = resolve(None, "claude-opus-4-8").expect("a new lane resolves");
+        let LaneTransitionDecision::FirstPin { new_pin, .. } = first.pin_transition else {
+            panic!("a new lane is pinned: {:?}", first.pin_transition);
+        };
+        let mut stored = unpinned_lane();
+        stored.pin_generation = 1;
+        stored.pin = Some(new_pin.into());
+
+        // Asking for the same model again changes nothing, warm or not.
+        let again = resolve(Some(&stored), "claude-opus-4-8").expect("the same model resolves");
+        assert!(
+            matches!(again.pin_transition, LaneTransitionDecision::Keep { .. }),
+            "{:?}",
+            again.pin_transition
+        );
+
+        // Asking for another model is the user's choice: the warm cache it
+        // leaves behind is theirs to give up.
+        let switched = resolve(Some(&stored), "claude-sonnet-5").expect("a model switch resolves");
+        assert!(
+            matches!(
+                &switched.pin_transition,
+                LaneTransitionDecision::Replace {
+                    new_pin,
+                    source: TransitionSource::ExplicitUserChange,
+                    ..
+                } if new_pin.effective_model == "claude-sonnet-5"
+            ),
+            "{:?}",
+            switched.pin_transition
         );
     }
 
@@ -4971,18 +4896,20 @@ api_key = "ak-literal-test"
         );
     }
 
-    /// The mark before sending names what toker sent; the response may name
-    /// another identity (a host alias, an upstream substitution), and
-    /// recency must follow what actually served — as the predecessor's
-    /// every-row mark did.
+    /// The response may name another identity than the one toker sent (a
+    /// host alias, an upstream substitution), and what the binding learns
+    /// must follow what actually served.
     #[test]
-    fn a_recorded_response_marks_the_model_it_named_as_served() {
+    fn a_recorded_response_teaches_the_binding_the_model_it_named() {
         use crate::server::record_anthropic::{AnthropicRecordCtx, record_anthropic_measurement};
         let dir = crate::setup::test_dir("served-mark");
         let server = server(&dir);
         let target = server
             .registry
-            .resolve(ProtocolId::AnthropicMessages, None)
+            .resolve_binding_model_free(
+                ProtocolId::AnthropicMessages,
+                crate::routing::ANTHROPIC_SUB_MESSAGES.id(),
+            )
             .expect("enabled");
         let ctx = AnthropicRecordCtx {
             server: server.clone(),
@@ -5015,7 +4942,14 @@ api_key = "ak-literal-test"
         observer.observe_json(
             br#"{"type":"message","model":"claude-sonnet-5","usage":{"input_tokens":3,"output_tokens":1}}"#,
         );
-        assert_eq!(server.models.last_served("claude-sonnet-5"), None);
+        use crate::policy::LearningView;
+        let learned = |model: &str| {
+            server
+                .binding_learning
+                .learned(&ctx.binding_id, model)
+                .expect("learning readable")
+        };
+        assert!(learned("claude-sonnet-5").is_none());
         let (reported_model, capture) = observer.finish_parts();
         record_anthropic_measurement(&ctx, capture.as_ref(), reported_model.as_deref(), None, 200);
         let rows = server.store.requests_since(0, 10).expect("ledger rows");
@@ -5024,13 +4958,21 @@ api_key = "ak-literal-test"
         assert_eq!(rows[0].policy_routing, None);
         assert_eq!(rows[0].lineage, None);
         assert!(
-            server.models.last_served("claude-sonnet-5").is_some(),
-            "the served identity is marked from the response"
+            learned("claude-sonnet-5").is_some(),
+            "the served identity is learned from the response"
         );
-        assert_eq!(
-            server.models.last_served("claude-opus-5"),
-            None,
-            "the sent identity is not what the row marks"
+        assert!(
+            learned("claude-opus-5").is_none(),
+            "the sent identity is not what the response teaches"
+        );
+        // The resolver reads the published snapshot, not the store.
+        let snapshot = server.binding_learning.snapshot();
+        assert!(
+            snapshot
+                .learned(&ctx.binding_id, "claude-sonnet-5")
+                .expect("snapshot readable")
+                .is_some(),
+            "a learned model reaches the snapshot the resolver reads"
         );
     }
 }

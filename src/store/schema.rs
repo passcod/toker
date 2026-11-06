@@ -217,9 +217,9 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE allowances ADD COLUMN release TEXT NOT NULL DEFAULT 'overage';
     "#,
-    // v7 — non-authoritative live-routing storage. The singleton active
-    // pointer starts NULL and this migration never changes it. Policy runtime
-    // does not read these tables until the later atomic-cutover changeset.
+    // v7 — live-routing storage. The singleton active pointer starts NULL
+    // and this migration never changes it; the server establishes revision
+    // one from the config's routing fields the first time it starts.
     r#"
     CREATE TABLE routing_policy_revisions (
         revision_id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -841,6 +841,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     UPDATE routing_policy_revisions
     SET compiler_origin = 'generated_revision_one'
     WHERE revision_id IN (SELECT revision_id FROM generated_lineage);
+    "#,
+    // v16 — a session index on the lane table. The lane key is the composite
+    // `session|tools`, so a session's lanes were only reachable by scanning
+    // every lane; the opencode plugin asks for one session's lanes every
+    // couple of seconds. Newest first matches that read's order.
+    r#"
+    CREATE INDEX lanes_session_idx ON lanes (session_id, updated_ms);
     "#,
 ];
 

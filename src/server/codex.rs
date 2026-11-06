@@ -81,7 +81,6 @@ const RESPONSES_FRONTEND: &str = "openai_responses";
 pub(crate) async fn responses(State(server): State<Server>, request: Request) -> Response {
     let started = Instant::now();
     let (parts, body) = request.into_parts();
-    let shadow_profile = super::frontend_of(&parts.extensions).map(str::to_owned);
     let original = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -143,9 +142,6 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             false,
         );
     };
-    let legacy_target = server
-        .registry
-        .resolve(ProtocolId::OpenAiResponses, Some(requested_model.as_str()));
     let client_wants_json = parsed
         .as_ref()
         .is_none_or(|request| request.get("stream").and_then(Value::as_bool) != Some(true));
@@ -172,21 +168,20 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             .ok()
             .flatten()
     });
-    let legacy_affinity = legacy_target.as_ref().ok().map(|target| target.binding());
     let pinned_binding = stored_lane
         .as_ref()
         .and_then(|lane| lane.pin.as_ref())
         .map(|pin| pin.binding_id.clone());
 
-    let (target, policy_attempt) = if let (Some(canonical), Some(shape)) =
-        (canonical_request, shape.as_ref())
-    {
-        let binding_affinity = if canonical.requires_binding_affinity() {
-            let Some(binding) = pinned_binding.clone().or_else(|| {
-                legacy_affinity
-                    .filter(|binding| binding.id_str() == "codex_sub.codex_responses")
-                    .map(|binding| binding.id().clone())
-            }) else {
+    // A body that does not canonicalise names nothing for policy to route.
+    let (Some(canonical_request), Some(shape)) = (canonical_request, shape.as_ref()) else {
+        return super::inference::invalid_responses_body(client_wants_json);
+    };
+    let (target, policy_attempt) = {
+        let binding_affinity = if canonical_request.requires_binding_affinity() {
+            // Provider-owned state belongs to the binding that produced it,
+            // which only a pin records.
+            let Some(binding) = pinned_binding.clone() else {
                 return frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,
                     StatusCode::BAD_REQUEST,
@@ -199,26 +194,25 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         } else {
             None
         };
-        let facts = server.shadow_facts(
+        let facts = server.request_facts(
             ProtocolId::OpenAiResponses,
-            shadow_profile.as_deref(),
+            frontend.as_deref(),
             Some(requested_model.clone()),
             lane_reference.clone(),
-            crate::middleware::force_newest::prompt_bound(original.len() as u64),
+            crate::policy::force_newest::prompt_bound(original.len() as u64),
             shape.req_messages,
             shape.req_tools,
-            super::anthropic::shadow_capabilities(canonical),
+            super::anthropic::required_capabilities(canonical_request),
             binding_affinity,
             crate::policy::RequestClass::Inference,
         );
         let credentials =
-            server.shadow_credentials(&parts.headers, ProtocolId::OpenAiResponses, facts.now_ms);
-        let lane = server.shadow_lane(
+            server.credential_snapshot(&parts.headers, ProtocolId::OpenAiResponses, facts.now_ms);
+        let lane = server.lane_facts(
             stored_lane.as_ref(),
             pinned_binding
                 .as_ref()
-                .and_then(|binding| server.registry.binding(binding))
-                .or(legacy_affinity),
+                .and_then(|binding| server.registry.binding(binding)),
             facts.now_ms,
             false,
         );
@@ -228,7 +222,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             stored_lane.as_ref(),
             lane.as_ref(),
         ) {
-            Ok(Some(resolved)) => {
+            Ok(resolved) => {
                 let target = match server.registry.resolve_binding(
                     ProtocolId::OpenAiResponses,
                     &resolved.plan.binding_id,
@@ -250,27 +244,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
                         );
                     }
                 };
-                (target, Some(resolved))
-            }
-            Ok(None) => {
-                let target = match legacy_target.clone() {
-                    Ok(target) => target,
-                    Err(_) => return super::responses_not_configured(),
-                };
-                let effective_model = target.effective_model().map(str::to_owned);
-                if let Some(legacy) = server.legacy_shadow_outcome(
-                    &facts,
-                    &target,
-                    effective_model.clone(),
-                    None,
-                    None,
-                    None,
-                    effective_model,
-                    false,
-                ) {
-                    server.observe_policy_shadow(facts, credentials, lane, legacy);
-                }
-                (target, None)
+                (target, resolved)
             }
             Err(super::PolicyAttemptError::Resolve {
                 revision_id,
@@ -311,46 +285,30 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             }
             Err(error) => {
                 tracing::error!(%error, "active Responses policy resolution failed");
-                return frontend_error_response(
+                let response = frontend_error_response(
                     CodexFrontendWire::OpenAiResponses,
                     StatusCode::BAD_GATEWAY,
                     "server_error",
                     "the active routing policy could not resolve this request",
                     !client_wants_json,
                 );
+                return if error.is_no_default_route() {
+                    super::mark_not_configured(response, RESPONSES_FRONTEND)
+                } else {
+                    response
+                };
             }
-        }
-    } else {
-        if server.has_active_policy() {
-            return super::inference::invalid_responses_body(client_wants_json);
-        }
-        match legacy_target.clone() {
-            Ok(target) => (target, None),
-            Err(_) => return super::responses_not_configured(),
         }
     };
     let backend = target.provider().clone();
-    let effective_model = policy_attempt
-        .as_ref()
-        .map(|resolved| resolved.plan.effective_model.clone())
-        .or_else(|| target.effective_model().map(str::to_owned));
-    let pin_transition = policy_attempt
-        .as_ref()
-        .map(|resolved| resolved.pin_transition.clone());
-    let policy_record = policy_attempt.clone().map(std::sync::Arc::new);
-    let mut inference = None;
-    let attempt = canonical.map(|result| {
-        result.map(|canonical| {
-            let request =
-                super::inference::InferenceRequest::new(requested_model.clone(), canonical);
-            let attempt = match policy_attempt.as_ref() {
-                Some(resolved) => request.prepare_policy(target.clone(), resolved.plan.clone()),
-                None => request.prepare(target.clone(), effective_model.clone()),
-            };
-            inference = Some(request);
-            attempt
-        })
-    });
+    let effective_model = Some(policy_attempt.plan.effective_model.clone());
+    let pin_transition = Some(policy_attempt.pin_transition.clone());
+    let policy_record = Some(std::sync::Arc::new(policy_attempt.clone()));
+    let Some(Ok(canonical)) = canonical else {
+        unreachable!("a body that canonicalised was routed above");
+    };
+    let inference = super::inference::InferenceRequest::new(requested_model.clone(), canonical);
+    let attempt = inference.prepare_policy(target.clone(), policy_attempt.plan.clone());
 
     let record = parsed.as_ref().map(|_| AnthropicRecordCtx {
         server: server.clone(),
@@ -366,7 +324,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         policy_routing: None,
         pin_transition,
         betas: None,
-        shape,
+        shape: Some(shape.clone()),
         ping,
         downgraded_from: None,
         downgraded_to: None,
@@ -380,9 +338,6 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         policy_attempt: policy_record,
     });
 
-    let Some(attempt) = attempt else {
-        return super::inference::invalid_responses_body(client_wants_json);
-    };
     let adapter = target
         .binding()
         .canonical_backend()
@@ -392,7 +347,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         adapter,
         attempt,
         policy_attempt,
-        inference.expect("a canonical Responses attempt retains its baseline"),
+        inference,
         super::inference::ResponsesAttemptInput {
             parts,
             max_output_tokens: parsed

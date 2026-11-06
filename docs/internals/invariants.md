@@ -26,11 +26,14 @@ Serialisation purity and prefix stability are covered by
      foreign credential. The anthropic API
      injects `x-api-key` only when the request carries neither `x-api-key` nor
      `authorization`. On a route to openrouter another provider's credential is
-     dropped before the stored one is injected, never forwarded: on the openai
-     path, and on the anthropic path's `openrouter/` route, where every request
-     carries Claude's subscription bearer. The direct OpenAI binding likewise
-     drops Anthropic and OpenRouter credentials before adding its configured
-     bearer; an unknown bearer on its native Chat wire passes through.
+     dropped before the stored one is injected, never forwarded: `x-api-key`
+     always, the bearer whenever toker holds an openrouter key or the bearer is
+     Anthropic's (every Anthropic Messages request carries Claude's subscription
+     bearer, and claude's settings carry a placeholder one), and a Responses
+     frontend's bearer always. With no stored key a client's own `sk-or-` key
+     passes through. The direct OpenAI binding likewise drops Anthropic and
+     OpenRouter credentials before adding its configured bearer; an unknown
+     bearer on its native Chat wire passes through.
    - One request toker makes itself uses a passing credential: the anthropic
      models listing, which names each model's context window. With no API key
      stored, toker has no other way to read it. While that catalogue is stale,
@@ -88,6 +91,14 @@ Serialisation purity and prefix stability are covered by
    one because it is about to rebuild an expired cache, fires once, and re-arms
    itself. Neither is a licence for a third.
 
+   Routing is not accounting, and it can also refuse: when the active revision
+   cannot place a request (no candidate can serve it, no default route applies,
+   a lane's transition is denied), the request is answered with an error before
+   any byte leaves, and a request that found a route but no usable candidate
+   leaves a `route-unavailable` row of ids and reason codes only (see
+   [policy.md](policy.md)). That is the router's answer to a request it cannot
+   place. It is not a licence to drop a request for any other reason.
+
    Every ledger row goes through `Store::record_request`, the only writer of
    `requests`, which has no update or delete path. ctp also needed its
    `appendRow` to keep each row in memory, because the outlook measured against
@@ -98,18 +109,19 @@ Serialisation purity and prefix stability are covered by
 
 4. **Bind `127.0.0.1` only.** The listener binds loopback (`server/mod.rs`, and
    `ListenStream=127.0.0.1:…` in the socket unit). toker answers
-   `/_toker/status`, `/_toker/models/merge`, `/_toker/session` and
-   `/_toker/shutdown` itself; any other `/_toker/` path is a local 404 and
-   never leaves the proxy. Each demands its verb in the `x-toker-control`
-   header (`server/control.rs`), and the two POSTs, `models/merge` and
-   `shutdown`, also a JSON body, so that a web page, which can reach loopback,
-   cannot drive one without a preflight nothing here answers. `models/merge`
-   can only add to the model store, for models already served. `shutdown`
+   `/_toker/status`, `/_toker/session`, `/_toker/shutdown` and the
+   `/_toker/routing/` endpoints itself; any other
+   `/_toker/` path is a local 404 and never leaves the proxy. Each demands its
+   own verb in the `x-toker-control` header (`server/control.rs`,
+   `server/control/routing.rs`), and every mutation also its method and a JSON
+   body, so that a web page, which can reach loopback, cannot drive one without
+   a preflight nothing here answers. The routing endpoints edit, preview and
+   activate the policy the TUI drives (see [control.md](control.md)). `shutdown`
    (`toker restart`'s) names the instance `status` reported and only stops it:
    the listener closes, every response under way finishes (or, with `force`,
    is cut), and the process exits cleanly for systemd to start again, so the
-   worst a caller can do is a restart. Keep any new control path to the same terms, or
-   better, do not add one.
+   worst a caller can do is a restart. Keep any new control path to the same
+   terms.
 
 5. **Never guess prices.** Verify against the published pricing page and move
    the relevant `VERIFIED_ON`: `catalog::pricing` for Anthropic-compatible
@@ -136,16 +148,13 @@ Serialisation purity and prefix stability are covered by
      whatever the gate's toggle: the marker rule is a frozen public API, and a
      toggled strip would change the cached prefix of every conversation
      carrying one.
-   - The `provider/model` prefix strip (`anthropic_sub/`, `anthropic_api/`,
-     `anthropic/`, `openrouter/`, `openai_api/`, `codex_sub/`) is the client
-     choosing a backend in the model string; `set_model` writes the rest back.
    - Policy-selected `set_model` changes only the candidate-local model. Upgrade
      and activation decisions license the cache transition before the body is
      rendered, keeping `cache_control` because that conversation still has a
      cache to build. See [models.md](models.md).
-   - `cold::retarget_compaction` rewrites a *cold compaction only*: model, cache
-     breakpoints, and mid-conversation system messages, together or not at all.
-     That one is defensible because a compaction is a dead end: its body is
+   - `canonical::retarget_compaction` rewrites a *cold compaction only*: model,
+     cache breakpoints, and mid-conversation system messages, together or not at
+     all. That one is defensible because a compaction is a dead end: its body is
      never replayed and the client's transcript is untouched.
    - `strip_message_effort` removes the `output_config` a mid-conversation
      `system` message carries to change the reasoning effort, on a backend

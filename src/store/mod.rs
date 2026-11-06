@@ -32,11 +32,10 @@ mod state;
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
-    MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS,
-    PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource, RequestFilter,
-    RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, SessionSummary,
-    StoredCandidateState, StoredLadders, StoredLookupSource, StoredRoutingTrace,
-    StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+    MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow,
+    RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup,
+    SessionLineage, SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource,
+    StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
@@ -44,7 +43,7 @@ pub use state::{
     LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
     PingRecord, PolicyCompilerOrigin, PolicyDraft, PolicyRevision, PolicyRevisionSource,
     PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
+    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication, local_day,
     publication_targets,
 };
 
@@ -204,12 +203,6 @@ impl Store {
     pub fn record_requests(&self, rows: &[RequestRow]) -> Result<(Option<i64>, Option<i64>)> {
         let mut conn = self.conn()?;
         ledger::insert_batch(&mut conn, rows)
-    }
-
-    /// Every served model's largest prompt per quarter hour, over the whole
-    /// ledger (see `ledger::model_observations`).
-    pub fn model_observations(&self) -> Result<Vec<ModelObservation>> {
-        ledger::model_observations(&*self.conn()?)
     }
 
     /// Rows with `ts_ms >= ts_ms`, oldest first; when the window holds more
@@ -618,6 +611,11 @@ impl Store {
         binding_id: &crate::policy::BindingId,
     ) -> Result<Vec<BindingLearning>> {
         state::load_binding_learnings(&*self.conn()?, binding_id)
+    }
+
+    /// One session's lanes, newest first, through the session index.
+    pub fn load_session_lanes(&self, session_id: &str) -> Result<Vec<Lane>> {
+        state::load_session_lanes(&*self.conn()?, session_id)
     }
 
     /// Age and cap the lanes table (see `state::prune_lanes`): future-dated
@@ -1984,6 +1982,62 @@ mod tests {
     }
 
     #[test]
+    fn session_lanes_are_exact_newest_first_and_indexed() {
+        let store = mem_store();
+        let lane = |session: &str, tools: &str, updated_ms: i64| Lane {
+            key: format!("{session}|{tools}"),
+            session_id: Some(session.to_owned()),
+            tools_hash: Some(tools.to_owned()),
+            updated_ms,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin: None,
+            pin_generation: 0,
+        };
+        for lane in [
+            lane("s1", "aaaa", 1_000),
+            lane("s1", "bbbb", 3_000),
+            lane("s1", "cccc", 3_000),
+            lane("s10", "aaaa", 9_000),
+        ] {
+            store.upsert_lane(&lane).expect("upsert");
+        }
+
+        let keys: Vec<String> = store
+            .load_session_lanes("s1")
+            .expect("lanes")
+            .into_iter()
+            .map(|lane| lane.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["s1|bbbb", "s1|cccc", "s1|aaaa"],
+            "exact session, newest first, key breaks the tie"
+        );
+        assert!(store.load_session_lanes("nope").expect("lanes").is_empty());
+
+        let conn = store.conn().expect("conn");
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key FROM lanes
+                 WHERE session_id = ?1 ORDER BY updated_ms DESC, key",
+            )
+            .expect("prepare")
+            .query_map(["s1"], |row| row.get::<_, String>(3))
+            .expect("plan")
+            .map(|detail| detail.expect("detail"))
+            .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("lanes_session_idx")),
+            "the read uses the session index: {plan:?}"
+        );
+    }
+
+    #[test]
     fn session_summary_aggregates_measurements_tokens_and_billed_cost() {
         let store = mem_store();
 
@@ -2706,7 +2760,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_state_starts_non_authoritative_and_revisions_round_trip() {
+    fn routing_state_starts_without_an_active_revision_and_revisions_round_trip() {
         let store = mem_store();
         let state = store.load_routing_policy_state().expect("state");
         assert_eq!(state.active_revision_id, None);
@@ -3053,6 +3107,37 @@ mod tests {
                 .execute("DELETE FROM routing_publications", [])
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn restating_the_applied_pair_keeps_a_publication_applied() {
+        let store = mem_store();
+        let revision_id = revision(&store, "restated publication", None);
+        let key = PublicationKey::new(
+            FrontendScope::Protocol {
+                protocol: FrontendProtocol::OpenaiChat,
+            },
+            PublicationAdapter::new("claude_settings").unwrap(),
+        );
+        let target = |state| InitialPublication {
+            key: key.clone(),
+            state,
+        };
+        store
+            .set_publications_desired(&[target(PublicationState::Applied)], revision_id, 4, 100)
+            .unwrap();
+        let restated = store
+            .set_publications_desired(&[target(PublicationState::Pending)], revision_id, 4, 200)
+            .unwrap();
+        assert_eq!(restated[0].state, PublicationState::Applied);
+        let moved = store
+            .set_publications_desired(&[target(PublicationState::Pending)], revision_id, 5, 300)
+            .unwrap();
+        assert_eq!(
+            moved[0].state,
+            PublicationState::Pending,
+            "a new inventory generation is something left to apply"
+        );
     }
 
     #[test]

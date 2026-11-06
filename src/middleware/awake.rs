@@ -300,6 +300,16 @@ pub trait LockSpawner: Send {
     fn spawn(&mut self, command: &InhibitCommand) -> Result<Box<dyn InhibitLock>, String>;
 }
 
+/// A spawner that never takes a lock, for servers that must not touch the
+/// host they run on.
+pub struct RefusingSpawner;
+
+impl LockSpawner for RefusingSpawner {
+    fn spawn(&mut self, _command: &InhibitCommand) -> Result<Box<dyn InhibitLock>, String> {
+        Err("refused by the embedder".to_owned())
+    }
+}
+
 /// The real spawner: the inhibitor in **its own process group** with all
 /// stdio nulled — its
 /// own group so release can take the waiting child down with the wrapper,

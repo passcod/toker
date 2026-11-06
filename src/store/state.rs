@@ -14,7 +14,6 @@ use std::str::FromStr;
 
 use crate::catalog::DeclaredWindow;
 use crate::ir::Release;
-use crate::middleware::models::local_day;
 use crate::policy::{
     ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
     RouteId, StableId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
@@ -178,7 +177,7 @@ pub struct PolicyDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingPolicyState {
-    /// Non-NULL only in raw cutover fixtures in this changeset.
+    /// NULL until the server first establishes revision one.
     pub active_revision_id: Option<i64>,
     pub draft_generation: i64,
     pub draft: Option<PolicyDraft>,
@@ -596,6 +595,21 @@ pub(super) fn load_lanes(conn: &Connection) -> Result<Vec<Lane>> {
         conn,
         &format!("SELECT {LANE_COLUMNS} FROM lanes ORDER BY key"),
         [],
+        read_lane,
+    )
+}
+
+/// One session's lanes, newest first (`updated_ms` descending, key as the
+/// tie-break so the order is stable). Exact on the `session_id` column,
+/// never a prefix of the key: "s1" must not collect "s10"'s lanes.
+pub(super) fn load_session_lanes(conn: &Connection, session_id: &str) -> Result<Vec<Lane>> {
+    rows_of(
+        conn,
+        &format!(
+            "SELECT {LANE_COLUMNS} FROM lanes
+             WHERE session_id = ?1 ORDER BY updated_ms DESC, key"
+        ),
+        [session_id],
         read_lane,
     )
 }
@@ -1314,6 +1328,8 @@ pub(super) fn set_publication_desired(
         ));
     }
     let scope_key = encode_publication_scope(&key.scope);
+    // Restating the pair an applied publication already carries (the daily
+    // catalogue refresh does) leaves it applied: nothing is left to apply.
     conn.execute(
         "INSERT INTO routing_publications
          (scope_key, adapter, desired_revision_id, desired_inventory_generation, state, updated_ms)
@@ -1321,7 +1337,17 @@ pub(super) fn set_publication_desired(
          ON CONFLICT(scope_key, adapter) DO UPDATE SET
            desired_revision_id = excluded.desired_revision_id,
            desired_inventory_generation = excluded.desired_inventory_generation,
-           state = 'pending', detail_code = NULL, updated_ms = excluded.updated_ms",
+           state = CASE WHEN state = 'applied'
+                         AND desired_revision_id = excluded.desired_revision_id
+                         AND desired_inventory_generation
+                             = excluded.desired_inventory_generation
+                        THEN state ELSE 'pending' END,
+           detail_code = CASE WHEN state = 'applied'
+                               AND desired_revision_id = excluded.desired_revision_id
+                               AND desired_inventory_generation
+                                   = excluded.desired_inventory_generation
+                              THEN detail_code ELSE NULL END,
+           updated_ms = excluded.updated_ms",
         rusqlite::params![
             scope_key,
             key.adapter.as_str(),
@@ -2191,4 +2217,36 @@ pub(super) fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
         [key],
         |row| Ok(row.get(0)?),
     )
+}
+
+/// The local calendar day of an epoch-millisecond timestamp, `YYYY-MM-DD`
+/// (the same shape an `en-CA` locale day renders as). The timezone is the
+/// caller's, so the grouping is a pure function of its inputs; the server
+/// passes the system zone, and tests pin theirs.
+pub fn local_day(at_ms: i64, tz: &jiff::tz::TimeZone) -> Option<String> {
+    let zoned = jiff::Timestamp::from_millisecond(at_ms)
+        .ok()?
+        .to_zoned(tz.clone());
+    Some(zoned.date().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::tz::TimeZone;
+
+    use super::local_day;
+
+    #[test]
+    fn days_group_by_local_calendar_day_never_utc() {
+        let tz = TimeZone::fixed(jiff::tz::Offset::from_hours(13).expect("offset"));
+        // 2026-02-01 14:00 UTC is 2026-02-02 03:00 at +13: the same instant
+        // on a different local day, and the LOCAL one is what counts.
+        let utc_day = local_day(1_769_954_400_000, &TimeZone::UTC).expect("parses");
+        assert_eq!(utc_day, "2026-02-01");
+        let local = local_day(1_769_954_400_000, &tz).expect("parses");
+        assert_eq!(local, "2026-02-02", "+13:00 is already the next day");
+
+        // A timestamp that cannot exist answers None, never a guess.
+        assert_eq!(local_day(i64::MAX, &tz), None);
+    }
 }
