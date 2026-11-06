@@ -2,31 +2,25 @@
 
 The ledger is the `requests` table in the SQLite file at the config's `db_path`:
 insert-only, one row per upstream attempt or proxy decision, written only by
-`Store::record_request`
-(`store/ledger.rs` has the row type, `RequestRow`, whose fields match the
-columns one to one). The state tables beside it (lanes, learned models,
+`Store::record_request` (`store/ledger.rs` has the row type, `RequestRow`,
+whose fields match the columns one to one, with the policy and attempt columns
+grouped into `PolicyRouteProvenance`, `AttemptProvenance` and `SessionLineage`).
+The state tables beside it (lanes, the routing tables, learned models,
 allowances, pings, meter snapshots, meta) are read-modify-write and are not part
 of the record; lanes and allowances are pruned on a 30-second tick (see
-[lanes.md](lanes.md) and [quota.md](quota.md)). Migrations are an append-only list gated by `PRAGMA user_version`
-(`store/schema.rs`): never edit, reorder or delete an entry, because a database
-in the wild has had exactly the first *n* applied, by position.
+[lanes.md](lanes.md) and [quota.md](quota.md)). Migrations are an append-only
+list gated by `PRAGMA user_version` (`store/schema.rs`): never edit, reorder or
+delete an entry, because a database in the wild has had exactly the first *n*
+applied, by position.
 
 Every column but `ts_ms` is nullable, and NULL means "not recorded", never zero.
 Fields were added over time, both in ctp and in toker, so **earlier rows lack
 later fields**: always handle NULL, and never treat a missing field as a
-negative value. `betas` NULL means "not captured", not "no betas".
-
-Actual upstream sends carry `attempt_group_id`, zero-based `attempt_index`, and
-`fallback_reason` (the physical compatibility name for the reason that attempt
-exists). Index zero is always `initial`; later indices name the transition, such
-as `thinking_negotiation`. A client cancellation after a send is an `error` row
-with `error_type = client_cancelled`, including when it happens before any
-frontend response is committed. Logical request counts group non-NULL group ids,
-while historical rows without one remain independent. Token, cost, meter, and
-error-attempt totals consume physical rows. Policy fields are independently
-nullable: a legacy-selected send has attempt provenance but no policy revision,
-route, candidate, or trace. A policy `route-unavailable` terminal has a group id
-but no index/reason because no send occurred.
+negative value. `betas` NULL means "not captured", not "no betas". The same
+holds for every column the routing work added: a NULL `policy_revision_id` says
+the row predates policy routing or is not a routing row, never "revision zero",
+and a NULL `attempt_group_id` says the row predates attempt identity, never "a
+one-attempt request" (see [Old rows](#old-rows-and-what-is-no-longer-written)).
 
 ## Row kinds
 
@@ -48,7 +42,8 @@ staleness back as the API's, which is how a 77-second observed lag first read as
 | `cold-quiet` | A cold notice was withheld. `extra` carries `quotaExtra` (the re-read's estimated share of a 5-hour window), `quotaBound` (true where that weight was borrowed, so an upper bound), and `util5h` (the utilisation the decision rested on, from the burn, not the last-seen copy). The request itself went through, so an ordinary row follows. |
 | `cold-recap` | A Claude Code recap on a cold lane was answered by the gate and never forwarded. `extra` carries the `cold` row's `idleMs`, `lastPrompt` and `reqMessages`. The lane is untouched, so the notice is still armed. Absent before 2026-10-06. |
 | `awake` | The sleep lock changed hands. No `rate_limits`, and no frontend, provider or route: the lock is not a route. |
-| `error` | A non-2xx on a usage path: `status`, `error_type`, `retry_after_ms`. Never priced. |
+| `error` | A failed upstream attempt, or a non-2xx on a usage path: `status`, `error_type`, `retry_after_ms`. Never priced. On a policy-routed send it carries attempt identity like any attempt, and `error_type` is the failure class (`authentication`, `rate_limit`, `server_error`, ...), `upstream_error`, `response_protocol`, `local_preparation`, or `client_cancelled`; the refused half of a thinking negotiation keeps the upstream's own error type. Its `rate_limits` is the failed response's own snapshot. |
+| `route-unavailable` | Policy found no usable candidate, so nothing was sent. Carries the routing trace and a group id but no attempt index, provider, route, binding, candidate or reason. See [Route-unavailable rows](#route-unavailable-rows). |
 | `fidelity-drift` | Historical only: before universal canonical inference rendering, re-serialisation diverged from the client's bytes; `drift_digest` identifies the divergence. The original bytes were forwarded. New inference rows do not emit this kind. |
 
 `blocked` rows' `context_tokens` is the size of the session's largest lane, the
@@ -63,16 +58,26 @@ regression.
 ## Fields that need care
 
 - **Model identity has three stages.** `requested_model` is what the client
-  named; `effective_model` what toker sent; `raw_model` what the response says
-  served it, with `model` its pricing-normalised form. The served identity is
+  named; `effective_model` what toker sent in that attempt, after the route's
+  upgrade, compaction move and alias; `raw_model` what the response says served
+  it, with `model` its pricing-normalised form. The served identity is
   authoritative for pricing, context, observed days and `max_prompt`; the other
-  two are routing provenance only.
-- `forced_from`/`forced_to` mark every request force-newest moved, not only the
-  first: since the upgrade became sticky, each warm request on a moved lane
-  carries them. `downgraded_from`/`downgraded_to` mark a compaction retarget
-  that changed the model; `cache_stripped` and `system_merged` stand on their
-  own, because a compaction already on the target model is rewritten without
-  being downgraded.
+  two are routing provenance only. A response that names no model leaves
+  `raw_model` and `model` NULL: nothing fills them from `effective_model`, and
+  the TUI shows `reported -`. A fallback attempt has its own `effective_model`,
+  so the two attempts of one request can differ.
+- `forced_from`/`forced_to` mark every request an upgrade policy moved, not only
+  the first: the lane remembers the move while its cache is warm, so each warm
+  request on a moved lane carries them (the resolver reads them back from the
+  lane). `downgraded_from`/`downgraded_to` mark a compaction that policy moved
+  to another model; `cache_stripped` and `system_merged` stand on their own,
+  because a compaction already on the target model is rewritten without being
+  downgraded. All four are taken from the attempt plan, not from the body
+  transform.
+- `model_mappings` is written only on batch creation: one
+  `{requestIndex, requestedModel, effectiveModel}` entry per embedded request
+  whose model policy moved. NULL means no entry moved, or a row that is not a
+  batch.
 - `gate_on` and `cold_on` record whether each gate was armed for that request:
   the toggles are config the ledger cannot otherwise see.
 - `ping` marks a request the window pinger sent.
@@ -85,7 +90,7 @@ regression.
   the last four messages, matched or not: `fromEnd`, `role`, `trailing` (the
   roles after it), `lineStart`, `toolResult`. Absent before 2026-10-06.
 - A `thinking: disabled` refusal and its `between_tools` retry are separate
-  rows in one attempt group (see [routing.md](routing.md)): index zero is the
+  rows in one attempt group (see [attempts.md](attempts.md)): index zero is the
   400 with reason `initial`, and index one has reason `thinking_negotiation`.
   Historical rows from 2026-10-09 through 2026-10-13 recorded only the retry
   and carried `extra.thinkingRewrite = "between_tools"`; they are not
@@ -104,6 +109,327 @@ regression.
 - `reset5h`/`reset7d` group rows into the exact quota windows the API reported,
   so any window can be reconstructed afterwards. The 7-day window has a fixed
   boundary, so a ledger started mid-week can only give a partial first week.
+
+## Policy provenance
+
+Every request that policy routed says which decision routed it. The columns are
+flat on the row, grouped in Rust as `PolicyRouteProvenance`:
+
+| Column | Meaning |
+| --- | --- |
+| `policy_revision_id` | The immutable revision whose compiled policy resolved this send. A lane pinned to an older revision resolves under that one, so this is not always the active revision. |
+| `presentation_id`, `rewrite_id` | Which record matched the client's model string: at most one is set, and neither when the profile or protocol default matched, or when the compaction route did. |
+| `policy_route_id`, `route_fingerprint` | The route and its semantic fingerprint (64 lowercase hex). The fingerprint changes when the route's meaning does, so a lane pin can tell an edited route from the one it was made under. |
+| `candidate_id`, `binding_id` | The chain candidate that was chosen and the backend binding it names, as `provider.adapter`. Absent on a route-unavailable row. |
+| `baseline_model` | What the candidate named before any upgrade, compaction move or alias: the client's spelling for a requested-model candidate, the policy's own exact model otherwise. |
+| `routing_trace` | The content-free account of the lookup and of every candidate considered. |
+
+The lookup source (which of presentation, rewrite or default matched) is stored
+twice, in the two id columns and as the first event of the trace. The writer
+refuses a row where they disagree, and the reader fails on one rather than
+skipping it, so a stored contradiction is loud. `effective_model` (above) is the
+other end of `baseline_model`: the pair is how a reader sees what the upgrade,
+the compaction move and the alias did to this attempt.
+
+The trace is a JSON object, `{"version": 2, "events": [...]}`, at most 128
+events and 64 KiB, with model strings of at most 1,024 bytes (`store/ledger.rs`,
+`StoredRoutingTrace`). Version 1 rows are valid history and carry no
+crossed-edge evidence; the reader accepts both. Events are a closed vocabulary:
+
+- `lookup`: the source above, with the matched record id.
+- `candidate`: a candidate id, its binding, the model it would have sent, and
+  `available` or `skipped` with a closed reason (`disabled`, `binding_unknown`,
+  `provider_unconfigured`, `binding_disabled`, `credential_unavailable`,
+  `missing_required_capability`, `binding_affinity`,
+  `model_missing_from_fresh_catalogue`, `model_unknown`, `selector_unresolved`,
+  `health_circuit_open`, `preflight_fallback_disabled`,
+  `billed_boundary_denied`, `warm_cache_transition_denied`,
+  `warm_lane_transition_denied`). `crossed_from` names the candidate before it
+  when the chain stepped across an edge to reach this one.
+- `upgrade` and `alias`: the `from` and `to` models of each step.
+
+Nothing in it is request content: ids, models, states and reasons only. When a
+maximum-sized trace would exceed the bound, candidate model spellings are
+dropped before anything else, because the candidate id and verdict are the
+decision and the spelling is detail. An unknown version, event kind or reason is
+rejected on insert and on read, so a future writer's vocabulary is a migration,
+not a silent widening.
+
+Each attempt row carries the trace of the plan that selected it. Candidates
+skipped before the first send ride on the first attempt's row, and a fallback
+attempt's row carries the trace of the resolution that chose it.
+
+## Attempt identity
+
+One logical request can make several upstream sends. Each send is its own row,
+and the rows share an identity:
+
+- `attempt_group_id`: 32 lowercase hex characters (a random UUID without
+  dashes), minted once per logical request.
+- `attempt_index`: zero-based and contiguous within the group.
+- `fallback_reason`: why this attempt exists. The column name predates the
+  attempt model and is kept; its meaning is "the reason this actual attempt
+  exists". Index zero is always `initial`, and `initial` is never used at any
+  other index. The rest are `thinking_negotiation` (the same candidate resent
+  after a `thinking: disabled` refusal) and the failure classes that licensed a
+  move to the next candidate: `authentication`, `model_not_found`, `rate_limit`,
+  `provider_quota`, `overload`, `server_error`, `transport_before_accept`,
+  `ambiguous_transport`.
+
+[attempts.md](attempts.md) says when each happens. The schema enforces the shape
+rather than trusting the writer: a unique index on `(attempt_group_id,
+attempt_index)` where the index is not NULL, an `attempt_index` without a group
+is refused, an insert at index *n* needs index *n* - 1 already present (and
+index zero needs none), the reason must be in the closed set and agree with the
+index, and a group is either sends or one preflight terminal, never both (the
+triggers `requests_attempt_sequence_check`, `requests_attempt_reason_check`,
+`requests_provenance_insert_check`). Store writes are serialised on one
+connection, which is what makes the predecessor check deterministic.
+
+A client that disconnects after a send but before any response is committed
+leaves an `error` row for that attempt with `error_type = client_cancelled`. The
+send happened and may have cost something, so it is a row, not an absence.
+
+Counting follows from the shape, and the rule is stated once here: **a logical
+request is a distinct non-NULL `attempt_group_id`, or a row with none**; rows
+with a NULL group are historical or proxy rows and each stand alone. Token,
+cost, meter and error totals sum the physical rows. Quota fitting and model
+learning read each attempt's own evidence and never a group total.
+[attempts.md](attempts.md) has the read models that apply this.
+
+## Route-unavailable rows
+
+When every candidate of the selected route is skipped before any send, toker
+answers the client with an error and writes one `route-unavailable` row, so the
+routing decision does not vanish from the ledger just because nothing was sent.
+The row has a group id but no `attempt_index` and no `fallback_reason` (the
+terminal shape, enforced by `requests_route_terminal_shape_check` and
+`requests_terminal_trace_check`): it has `policy_revision_id`,
+`policy_route_id`, `route_fingerprint`, the lookup ids and the trace, and it
+must not have a `candidate_id`, `binding_id` or `baseline_model`, because none
+was chosen. `provider`, `route`, `effective_model`, `model`, usage and cost are
+NULL and its `requested_model` is the client's. It is not an API measurement and
+is never priced.
+
+A request that policy cannot resolve to a route at all (no presentation,
+rewrite or default matches, or the lane's pin denies the move) is not this: no
+route was selected, so there is nothing to put in the trace and no row is
+written. For a missing default the client gets a 502 marked not configured. That
+asymmetry is deliberate but easy to read as "no failures": a view counting
+unroutable requests must say it counts only the ones that selected a route.
+
+Only the inference paths write it. `count_tokens`, batch creation and the
+transparent administrative forwards leave no row either way.
+
+## Session lineage columns
+
+`parent_session_id`, `child_role` and `relation_source` are either all NULL or
+all set, and the only value pair accepted is role `guardian` from source
+`codex_guardian`. The parent must differ from the row's own `session_id`, and an
+insert that would close a cycle through earlier rows is refused
+(`requests_provenance_insert_check`, `requests_lineage_cycle_check`). A parent
+with no row of its own is valid. `session_id` is never rewritten: it stays the
+raw identity the lane and the cache are keyed on. What counts as evidence, and
+why almost nothing does, is in [lineage.md](lineage.md).
+
+## Routing tables
+
+These are state, not record: they are read-modify-write through the store's
+compare-and-swap operations and none is pruned.
+
+### Revisions and the active pointer
+
+`routing_policy_revisions` holds every policy revision ever activated. A
+revision is immutable: the store has no update or delete for it, and nothing
+reads one without checking that its `document_json` is byte-identical to the
+canonical re-encoding of itself and that its `fingerprint` (SHA-256 of that
+document, 64 lowercase hex) matches. Columns:
+
+- `revision_id`, assigned in order, never reused.
+- `created_ms`, `activated_ms`: equal at the moment of insertion.
+- `description`, free text from whoever activated it.
+- `activation_scope`: `new_lanes` (a lane pinned to an older revision keeps
+  resolving under it), `new_and_cold_lanes` (a pinned lane whose cache is cold
+  moves too) or `immediate` (every lane resolves under the revision).
+- `forced_cache_transition`: 0 or 1, whether an `immediate` activation may
+  discard warm caches.
+- `source`: how it came to exist: `legacy` (generated revision one),
+  `draft` (an authored draft applied) or `reactivation` (an earlier revision
+  restored as a new one).
+- `compiler_origin`: `authored` or `generated_revision_one`, which compiler
+  semantics the document needs. It is separate from `source` on purpose:
+  restoring revision one is a reactivation, but its document still needs the
+  compatibility compiler.
+- `parent_revision_id`: the revision it replaced, or for a reactivation the one
+  restored.
+- `document_json`, `fingerprint`. The fingerprint is not unique: reactivating a
+  revision makes a new row with the same document, which is why v9 exists.
+
+`routing_policy_state` is a singleton row (`id = 1`, created by v7):
+
+- `active_revision_id` is NULL until the server first starts. It then
+  establishes revision one in a single immediate transaction
+  (`Store::activate_revision_one`, called by
+  `policy::legacy::establish_revision_one`): insert the revision generated from
+  the config's routing fields, make it active, seed the draft with its document,
+  set `legacy_imported_ms`, and create the publication rows. If a revision is
+  already active the config's routing fields are not consulted again. A
+  `legacy_imported_ms` with no active revision is an error, not a state to
+  repair silently. The column name is historical: it is the time revision one
+  was generated.
+- The draft is `draft_base_revision_id`, `draft_document_json`,
+  `draft_fingerprint`, `draft_updated_ms`, all set or all NULL, with
+  `draft_generation`, a counter every draft write, clear or activation bumps. A
+  draft write or an activation names the generation it expects and loses on
+  mismatch, so two editors cannot overwrite each other silently. Activation also
+  checks the active revision is the one the document was compiled against.
+
+### Publications
+
+`routing_publications` records, per frontend scope and adapter, which revision
+the outside world should reflect and which it was last made to reflect. The key
+is `(scope_key, adapter)`. `scope_key` is `protocol:<protocol>` or
+`profile:<profile>:<protocol>` with the protocol one of `anthropic_messages`,
+`openai_chat`, `openai_responses`; no nullable column takes part in identity.
+Revision one creates three rows: `dynamic_chat_models` and
+`dynamic_responses_models` (both start `applied`, because they are served live
+from the revision and own no external row) and `claude_settings` (starts
+`pending` until the Claude settings reconciliation runs).
+
+- `desired_revision_id` and `desired_inventory_generation` say what to publish;
+  the `applied_*` pair says what was last published. The inventory generation
+  exists because a selector can change its winner when a catalogue refreshes,
+  without any new revision.
+- `state` is `pending`, `applied`, `failed` or `unsupported`. `applied` requires
+  both applied values to equal the desired pair (a CHECK and a reader check).
+  `pending`, `failed` and `unsupported` may keep the last applied pair, so a
+  failure does not forget what is still published.
+- `detail_code` is a stable identifier, never a free-form error, so nothing an
+  external tool said can end up in the ledger.
+- `applied_identities_json` is the exact set of external row identities the
+  adapter wrote when it last applied (for example the setting keys it owns): a
+  sorted, unique JSON array of at most 1,024 entries and 64 KiB. An adapter may
+  remove only what it listed there, so a row the user wrote by hand is never
+  touched. It moves atomically with the applied pair and survives `pending` and
+  `failed` handoffs.
+- A result is applied by compare-and-swap on the desired pair, so a late
+  reconciler cannot mark newer desired state applied. A failed or unsupported
+  result never overwrites an applied one.
+
+### Binding learning
+
+`learned_models_by_binding`, keyed by `(binding_id, model_id)`, is what the
+upgrade policies elect from. Evidence belongs to one binding because the same
+model name on two providers is two different things with different caches and
+prices.
+
+- `days_json`: the sorted set of local days (`YYYY-MM-DD`, in the machine's
+  time zone when the response arrived) on which the binding served this model.
+- `max_prompt`: the largest prompt (input, cache read and cache write) seen.
+- `context_window_json`: a declared window, replaced only by a caller supplying
+  one; observation never writes it.
+- `explicitly_promoted`: set by `toker promote`, never cleared.
+- A merge unions days, takes the larger `max_prompt`, ORs the promotion and
+  keeps the later `updated_ms`. NULL stays NULL.
+
+It is written after a completed response that names a model
+(`Server::note_binding_observed`), using the provider's reported model, never
+the effective one, so a response that names nothing teaches nothing. The
+"recently sent" evidence the resolver uses to judge whether a cache could still
+be warm is not in this table: it lives in memory, is marked just before each
+send, and is rebuilt at startup from the newest 20,000 ledger rows that carry
+both `binding_id` and `effective_model`. `error` rows count, conservatively: a
+provider may have answered, and forgetting a send could lose a live cache.
+
+`Store::replay_attributable_binding_learning` can rebuild this table from rows
+with `kind` NULL and both `binding_id` and `raw_model`. The service does not
+call it; learning starts empty on a ledger that predates binding attribution and
+grows from live responses. Rows without a binding are deliberately not copied
+into every possible binding.
+
+### Lane pins
+
+`lanes` gained a routing pin, seven columns that are all NULL or all set:
+`policy_revision_id`, `policy_route_id`, `route_fingerprint`, `candidate_id`,
+`binding_id`, `baseline_model`, `effective_model`, plus `pin_generation`, a
+counter. A trigger refuses a half-set pin and a revision that does not exist
+(`lanes_pin_insert_check`, `lanes_pin_update_check`). A pin is written when an
+attempt completes, never at resolution time and never by a client that
+cancelled. It is replaced by compare-and-swap on the generation and the complete
+prior identity (`Store::compare_and_swap_lane_pin`), so a completion that lost a
+race cannot restore an older pin. Ordinary lane upserts (`Store::upsert_lane`,
+which moves `updated_ms`, `prompt_tokens`, `ttl` and the notice and upgrade
+fields) never name the pin columns, so they cannot overwrite one. A lane with no
+pin predates policy routing, or has not completed an attempt under it; the
+resolver treats it like a new lane (see [lanes.md](lanes.md)).
+`lanes_session_idx` serves the per-session lane read the opencode plugin makes.
+
+## Migrations from v7
+
+v1 to v6 are the original schema, the lane notice and sticky-upgrade columns,
+per-provider meters, ping outcomes, the lane index and the allowance release
+kind. Routing storage is v7 onwards, and each entry is there for a reason:
+
+| Version | What and why |
+| --- | --- |
+| v7 | Live-routing storage: the revisions table, the state singleton (active pointer NULL, set only by the server), publications, binding learning, the lane pin columns and their triggers, and every provenance, attempt and lineage column on `requests` with their indexes and checks. No backfill: old rows stay NULL. |
+| v8 | Constraints `ALTER TABLE` cannot express: a unique index for preflight terminals, the attempt-sequence trigger, the policy-revision-exists trigger. v7 had no writer for attempt fields; if a raw fixture had put malformed ones in, v8 would abort and leave history alone. |
+| v9 | A table rebuild so `fingerprint` is no longer unique. Reactivating a revision creates a distinct immutable revision with the same document. The rebuild carries the parent and both dependent tables together and recreates the triggers that referenced them. |
+| v10 | Makes the preflight terminal explicit and bounds the trace envelope (object, version, events array, 128 events, 64 KiB). Existing rows are validated first. |
+| v11 | The trace accepts version 2 beside version 1. SQLite keeps only the bounded envelope; the Rust reader owns the closed event vocabulary. |
+| v12 | The closed attempt-reason set and the route-unavailable shape, for raw SQL writers too. Existing rows are validated first. |
+| v13 | `applied_identities_json` on publications, so an adapter owns only the rows it listed. |
+| v14 | A publication that was `applied` before v13 has no ownership record, and treating unknown as empty would let the next reconciliation delete a user's row. It becomes `pending` with detail `legacy_applied_identities_unknown`, until the adapter applies again and records an exact set. |
+| v15 | `compiler_origin`. Existing revision-one lineage (revision one and reactivations descending from it) is marked `generated_revision_one`. |
+| v16 | `lanes_session_idx`. |
+
+The ledger is insert-only, so a migration never rewrites a request row. Where a
+constraint is added to existing history (v10 and v12), the validation runs first
+inside the migration's own transaction; if a row would violate it the migration
+fails and the database stays at the previous version, and the service does not
+start until the row is repaired by hand. No toker writer produces such a row.
+`Store::open_read_only` never migrates, so `toker export`, `toker
+watch-context-window` and an older binary leave the live file alone, and
+`Store::schema_is_current` lets a reader tell a ledger that has not been
+migrated yet from one it cannot read.
+
+## Old rows and what is no longer written
+
+Nothing here backfills, so a reader meets every era in one table:
+
+- **Before v7** (and every row imported from ctp): none of the policy, attempt
+  or lineage columns exist. Each such row is one logical request and has no
+  routing provenance. A request that was in fact two sends reads as one row, for
+  example the 2026-10-09 to 2026-10-13 thinking retry rows under "Fields that
+  need care".
+- **Between v7 and policy being the only router:** a send may carry attempt
+  identity and `binding_id` without any policy columns, because a request the
+  policy did not route was still sent. Do not require the policy columns where
+  the attempt columns are present.
+- **Since policy routes everything:** every inference attempt is written with
+  both, so a missing `policy_revision_id` on a recent measurement is a bug to
+  chase, not an era to explain.
+
+What the service no longer writes, and how to treat what is left behind:
+
+- The **`models` table** (days served, max prompt, declared context window per
+  bare model id) has no writer. Routing never reads it: the learned evidence the
+  upgrade policies use is `learned_models_by_binding`, and an old row's
+  promotion was not copied because its provider cannot be reconstructed. Only
+  `toker watch-context-window` still reads its declared windows. Treat it as
+  frozen history.
+- **`routing_policy_state.legacy_imported_ms`** and revisions with source
+  `legacy` are still written, once, when revision one is generated. The names
+  are historical.
+- **`lanes.forced_from` and `lanes.forced_to`** are still written and are how a
+  warm lane keeps its upgrade, but the decision that sets them is now the
+  revision's upgrade policy.
+- The legacy **model map, force-newest toggle, default-backend fields and
+  prefixes** are no longer applied at request time. They are inputs to revision
+  one only. Rows that say a model map or force-newest moved a request were
+  written by the earlier code, and `model_mappings` on a batch row from that era
+  records the TOML map's moves where a current one records policy's.
+- `fidelity-drift` rows are historical only (see above).
 
 ## Imported ctp rows
 
