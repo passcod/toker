@@ -273,6 +273,16 @@ impl AttemptPlan {
         self
     }
 
+    /// The upgrade this plan made, as the `(from, to)` pair a row and its
+    /// lane record. The lane keeps it while its cache is warm, which is what
+    /// makes the next turn resolve to the same model instead of the one the
+    /// client keeps asking for.
+    pub fn forced_pair(&self) -> Option<(String, String)> {
+        self.upgraded_model
+            .as_ref()
+            .map(|to| (self.baseline_model.clone(), to.clone()))
+    }
+
     pub fn pin_identity(&self) -> Option<super::PinIdentity> {
         Some(super::PinIdentity {
             policy_revision_id: self.policy_revision?,

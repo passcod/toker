@@ -1452,6 +1452,9 @@ async fn coordinate_policy_messages(
                 });
             ctx.pin_transition = Some(next.pin_transition.clone());
             ctx.effective_model = Some(next.plan.effective_model.clone());
+            let forced = next.plan.forced_pair();
+            ctx.forced_from = forced.as_ref().map(|(from, _)| from.clone());
+            ctx.forced_to = forced.map(|(_, to)| to);
             ctx.policy_attempt = Some(Arc::new(next.clone()));
         }
         let parts = failed.parts;

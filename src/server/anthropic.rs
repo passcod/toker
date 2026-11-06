@@ -880,8 +880,14 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             downgraded_to: None,
             cache_stripped: None,
             system_merged: None,
-            forced_from: None,
-            forced_to: None,
+            forced_from: policy_attempt
+                .as_ref()
+                .and_then(|resolved| resolved.plan.forced_pair())
+                .map(|(from, _)| from),
+            forced_to: policy_attempt
+                .as_ref()
+                .and_then(|resolved| resolved.plan.forced_pair())
+                .map(|(_, to)| to),
             model_mappings: batch_model_mappings.take(),
             translation_report: None,
             policy_attempt: policy_attempt.clone().map(Arc::new),
