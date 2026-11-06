@@ -1046,6 +1046,107 @@ async fn codex_models_projects_the_local_catalogue_without_upstream_fetch() {
     assert!(mock.requests.lock().unwrap().is_empty());
 }
 
+/// A virtual presentation used to make the whole Responses listing answer 503.
+/// It is listed from its `codex` record, left out without one, and the exact
+/// offers around it are listed either way.
+#[tokio::test]
+async fn a_virtual_responses_presentation_is_listed_or_left_out_without_failing_the_list() {
+    use toker::policy::{
+        AdapterMetadata, CodexModelRecord, Presentation, PresentationId, PresentationSource,
+    };
+
+    let (upstream, mock) = spawn_mock().await;
+    let fixture = test_config("virtual-models", upstream, false);
+    let TestConfig { config, dir } = fixture;
+    let store = Arc::new(Store::open(&config.db_path).expect("open store"));
+
+    let mut document = messages_codex_fallback_policy().into_document();
+    let route = document.routes[0].id.clone();
+    let scope = FrontendScope::Protocol {
+        protocol: FrontendProtocol::OpenaiResponses,
+    };
+    document.defaults[0].scope = scope.clone();
+    document.routes[0].chain.steps.clear();
+    document.routes[0].chain.first.model = CandidateModel::Exact {
+        model_id: "gpt-5.6-sol".to_owned(),
+    };
+    let presentation = |name: &str, metadata| Presentation {
+        id: PresentationId::new(name).unwrap(),
+        scope: scope.clone(),
+        slug: name.to_owned(),
+        label: None,
+        description: None,
+        enabled: true,
+        shadow_native: false,
+        source: PresentationSource::Virtual {
+            target: RouteReference {
+                route_id: route.clone(),
+                parameters: std::collections::BTreeMap::from([(
+                    REQUESTED_MODEL_PARAMETER.parse().unwrap(),
+                    ArgumentBinding::RequestedModel,
+                )]),
+            },
+        },
+        metadata,
+    };
+    let record: CodexModelRecord = serde_json::from_value(json!({"priority": 7})).unwrap();
+    document.presentations = vec![
+        presentation(
+            "with-record",
+            Some(AdapterMetadata::Codex {
+                model: Some(record),
+            }),
+        ),
+        presentation("without-record", None),
+        Presentation {
+            id: PresentationId::new("exact").unwrap(),
+            slug: "exact".to_owned(),
+            source: PresentationSource::ExactOffer {
+                binding_id: CODEX_SUB_RESPONSES.id().clone(),
+                model_id: "gpt-5.6-sol".to_owned(),
+            },
+            ..presentation("exact", None)
+        },
+    ];
+    store
+        .activate_revision_one(&document.validate().unwrap(), 1, 0, &[])
+        .expect("activate policy fixture");
+
+    let raw = json!({"models": [{"slug": "gpt-5.6-sol", "display_name": "Sol", "context_window": 272000}]});
+    let mut catalogs = toker::catalog::FetchedCatalogs::default();
+    catalogs.set(
+        "codex_sub",
+        toker::catalog::fetched::parse_codex(&raw, 1).expect("catalog"),
+    );
+    let server = Server::with_seams(
+        config,
+        store.clone(),
+        toker::server::Seams::isolated().with_catalogs(catalogs),
+    )
+    .expect("build server");
+    let (addr, _store) = serve_toker(server, store, dir).await;
+
+    let response = client()
+        .get(format!("http://{addr}/f/codex/v1/models"))
+        .send()
+        .await
+        .expect("toker answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("catalogue JSON");
+    let slugs: Vec<_> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["slug"].as_str().unwrap())
+        .collect();
+    // The generated `codex_sub/` alias is listed too; the virtual slug without
+    // a record is the one left out.
+    assert_eq!(slugs, ["codex_sub/gpt-5.6-sol", "exact", "with-record"]);
+    assert_eq!(body["models"][2]["priority"], 7);
+    assert_eq!(body["models"][2]["shell_type"], "unified_exec");
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn responses_traverses_canonical_ir_and_records_as_codex() {
     let (upstream, mock) = spawn_mock().await;

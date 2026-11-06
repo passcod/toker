@@ -37,12 +37,20 @@ virtual one has no provider record: it names itself and has no creation time
 rather than a made-up one.
 
 Entries are sorted by slug, so the same revision and inventory render the same
-bytes. A Chat or Anthropic list may carry virtual slugs. A Responses list
-cannot: the Codex client's catalogue parser needs a complete model record for
-every entry, and a virtual model has none, so a revision that publishes one on
-the Responses protocol makes that listing unresolved. Only `codex_sub` offers
-are projected to Responses for the same reason: a record from another provider
-is not in the shape the client requires, so it is routable but not advertised.
+bytes. A Chat or Anthropic list may carry virtual slugs. A Responses list needs
+more: the Codex client's catalogue parser requires a complete model record for
+every entry, and a virtual model has no provider to take one from. A virtual
+presentation in a Responses scope is therefore listed from `codex` adapter
+metadata (`model`, a `CodexModelRecord`: description, reasoning levels, shell
+type, visibility, priority and the context windows, each with a default the
+client accepts), rendered under the presented slug with the label as
+`display_name`. One without it is left out of the list, and the compiler says so
+with the info diagnostic `virtual-presentation-unlisted-in-responses`; a
+`codex-model-record-unused` warning marks a record on a presentation that
+cannot use it (another protocol, or an exact offer, which is listed from the
+provider's own record). Only `codex_sub` offers are projected to Responses for
+the same reason: a record from another provider is not in the shape the client
+requires, so it is routable but not advertised.
 
 ### Unresolved listings answer 503
 

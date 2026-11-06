@@ -84,7 +84,8 @@ Slugs are unique within a scope. One that equals a native model id (or
 `provider/id`) reachable from that frontend needs `shadow_native: true`; without
 it the compiler refuses, so a presented name never silently hides a real model.
 Adapter metadata (`claude`'s `behaves_as`, for instance) is typed, not free
-JSON.
+JSON. `codex` metadata may carry the model record the Codex client's catalogue
+needs for a virtual presentation (see [publication.md](publication.md)).
 
 ### Routes, candidates and edges
 

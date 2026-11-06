@@ -989,6 +989,38 @@ mod tests {
     }
 
     #[test]
+    fn revision_one_has_no_virtual_responses_presentation_and_no_codex_record() {
+        let config = load_config(
+            "default_backend_openai_chat = \"openrouter\"\n\
+             [providers.openrouter]\n\
+             [providers.codex_sub]\n",
+        );
+        let topology = topology(&config);
+        let document = document(&config, &topology).unwrap();
+        for presentation in &document.presentations {
+            assert!(
+                !matches!(presentation.metadata, Some(AdapterMetadata::Codex { .. })),
+                "{}",
+                presentation.id
+            );
+            let responses = matches!(
+                presentation.scope,
+                FrontendScope::Protocol {
+                    protocol: FrontendProtocol::OpenaiResponses
+                } | FrontendScope::Profile {
+                    protocol: FrontendProtocol::OpenaiResponses,
+                    ..
+                }
+            );
+            assert!(
+                !(responses && matches!(presentation.source, PresentationSource::Virtual { .. })),
+                "{}",
+                presentation.id
+            );
+        }
+    }
+
+    #[test]
     fn chat_listing_renders_the_generated_publication() {
         let config = load_config(
             "default_backend_openai_chat = \"openrouter\"\n\

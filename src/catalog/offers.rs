@@ -127,7 +127,7 @@ pub fn render_policy(
 ) -> PolicyPublication {
     let publication = policy.publication(profile, protocol);
     let mut exact = Vec::new();
-    let mut virtual_slugs = Vec::new();
+    let mut virtual_presentations = Vec::new();
     for (slug, presentation) in publication {
         match presentation.route().exact_offer() {
             Some((binding_id, model_id)) => {
@@ -145,7 +145,7 @@ pub fn render_policy(
                     raw: offer.raw.clone(),
                 });
             }
-            None => virtual_slugs.push(slug.to_owned()),
+            None => virtual_presentations.push((slug.to_owned(), presentation)),
         }
     }
     // Revision one authors presentations for the claude picker only. The
@@ -157,9 +157,9 @@ pub fn render_policy(
         .collect();
     for (slug, binding_id, model_id) in policy.generated_publication(protocol) {
         if presented.contains(slug)
-            || virtual_slugs
+            || virtual_presentations
                 .iter()
-                .any(|virtual_slug| virtual_slug == slug)
+                .any(|(virtual_slug, _)| virtual_slug == slug)
         {
             continue;
         }
@@ -186,26 +186,36 @@ pub fn render_policy(
                 .cloned()
                 .unwrap_or_default();
             data.extend(
-                virtual_slugs
+                virtual_presentations
                     .into_iter()
-                    .map(|slug| json!({"id": slug, "object": "model", "owned_by": "toker"})),
+                    .map(|(slug, _)| json!({"id": slug, "object": "model", "owned_by": "toker"})),
             );
             data.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
             PolicyPublication::Ready(json!({"object": "list", "data": data}))
         }
-        crate::policy::FrontendProtocol::OpenaiResponses if virtual_slugs.is_empty() => {
-            PolicyPublication::Ready(render_responses(&exact))
+        crate::policy::FrontendProtocol::OpenaiResponses => {
+            let mut models = render_responses(&exact)
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            models.extend(
+                virtual_presentations
+                    .iter()
+                    .filter_map(|(slug, presentation)| responses_virtual_entry(slug, presentation)),
+            );
+            models.sort_by(|left, right| left["slug"].as_str().cmp(&right["slug"].as_str()));
+            PolicyPublication::Ready(json!({ "models": models }))
         }
-        crate::policy::FrontendProtocol::OpenaiResponses => PolicyPublication::Unresolved,
         crate::policy::FrontendProtocol::AnthropicMessages => {
             let mut data: Vec<Value> = exact
                 .iter()
                 .map(|offer| anthropic_entry(&offer.routed_model_id, &offer.raw))
                 .collect();
             data.extend(
-                virtual_slugs
+                virtual_presentations
                     .into_iter()
-                    .map(|slug| anthropic_entry(&slug, &Value::Null)),
+                    .map(|(slug, _)| anthropic_entry(&slug, &Value::Null)),
             );
             data.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
             let first = data.first().map(|entry| entry["id"].clone());
@@ -218,6 +228,67 @@ pub fn render_policy(
             }))
         }
     }
+}
+
+/// A virtual presentation's entry in the Codex client's models list, from its
+/// `codex` metadata. The client refuses a catalogue with an entry missing any
+/// field it requires (`ModelInfo` in `codex-rs/protocol`: `slug`,
+/// `display_name`, `supported_reasoning_levels`, `shell_type`, `visibility`,
+/// `supported_in_api`, `priority`, `support_verbosity`, `truncation_policy`,
+/// `experimental_supported_tools`), so a presentation with no record has no
+/// entry and is left out of the list instead of failing the whole of it.
+pub fn responses_virtual_entry(
+    slug: &str,
+    presentation: &crate::policy::CompiledPresentation,
+) -> Option<Value> {
+    let Some(crate::policy::AdapterMetadata::Codex { model: Some(model) }) =
+        presentation.metadata()
+    else {
+        return None;
+    };
+    let mut entry = Map::new();
+    entry.insert("slug".to_owned(), json!(slug));
+    entry.insert(
+        "display_name".to_owned(),
+        json!(presentation.label().unwrap_or(slug)),
+    );
+    entry.insert(
+        "description".to_owned(),
+        json!(model.description.as_deref().or(presentation.description())),
+    );
+    entry.insert(
+        "supported_reasoning_levels".to_owned(),
+        json!(
+            model
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| json!({"effort": level.effort, "description": level.description}))
+                .collect::<Vec<_>>()
+        ),
+    );
+    if let Some(default) = &model.default_reasoning_level {
+        entry.insert("default_reasoning_level".to_owned(), json!(default));
+    }
+    entry.insert("shell_type".to_owned(), json!(model.shell_type));
+    entry.insert("visibility".to_owned(), json!(model.visibility));
+    entry.insert("supported_in_api".to_owned(), json!(model.supported_in_api));
+    entry.insert("priority".to_owned(), json!(model.priority));
+    entry.insert(
+        "support_verbosity".to_owned(),
+        json!(model.support_verbosity),
+    );
+    entry.insert(
+        "truncation_policy".to_owned(),
+        json!({"mode": "tokens", "limit": 10_000}),
+    );
+    entry.insert("experimental_supported_tools".to_owned(), json!([]));
+    if let Some(window) = model.context_window {
+        entry.insert("context_window".to_owned(), json!(window));
+    }
+    if let Some(window) = model.max_context_window {
+        entry.insert("max_context_window".to_owned(), json!(window));
+    }
+    Some(Value::Object(entry))
 }
 
 /// One entry of Anthropic's models list. `display_name` and `created_at`

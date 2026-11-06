@@ -497,11 +497,14 @@ impl Presentation {
         check_optional_string(&self.label, &field(path, "label"))?;
         check_optional_description(&self.description, &field(path, "description"))?;
         self.source.validate(&field(path, "source"))?;
-        if let Some(AdapterMetadata::Claude {
-            behaves_as: Some(behaves_as),
-        }) = &self.metadata
-        {
-            check_string(behaves_as, &field(&field(path, "metadata"), "behaves_as"))?;
+        match &self.metadata {
+            Some(AdapterMetadata::Claude {
+                behaves_as: Some(behaves_as),
+            }) => check_string(behaves_as, &field(&field(path, "metadata"), "behaves_as"))?,
+            Some(AdapterMetadata::Codex { model: Some(model) }) => {
+                model.validate(&field(&field(path, "metadata"), "model"))?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -552,7 +555,107 @@ pub enum AdapterMetadata {
         behaves_as: Option<String>,
     },
     Openai,
-    Codex,
+    Codex {
+        /// What the Codex client's model catalogue needs to list a model
+        /// toker invents, a virtual presentation that no provider listing
+        /// backs. Without it a virtual presentation is left out of the
+        /// Responses listing; an exact offer is listed from the provider's own
+        /// entry instead, and this record is ignored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<CodexModelRecord>,
+    },
+}
+
+/// The fields of a Codex `/models` entry that toker cannot take from a
+/// provider listing. The client refuses a catalogue whose entry lacks any of
+/// the ones it requires, so each has a default here that is safe to list
+/// rather than being left out; the rendered entry is the slug, the
+/// presentation's label as `display_name`, and these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexModelRecord {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub visibility: CodexVisibility,
+    #[serde(default)]
+    pub shell_type: CodexShellType,
+    #[serde(default = "default_true")]
+    pub supported_in_api: bool,
+    #[serde(default)]
+    pub support_verbosity: bool,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_context_window: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexReasoningLevel {
+    /// The effort's name as the client spells it, such as `low` or `high`.
+    pub effort: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexVisibility {
+    #[default]
+    List,
+    Hide,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexShellType {
+    #[default]
+    UnifiedExec,
+    Disabled,
+}
+
+impl CodexModelRecord {
+    fn validate(&self, path: &str) -> Result<(), DocumentError> {
+        check_optional_description(&self.description, &field(path, "description"))?;
+        check_optional_string(
+            &self.default_reasoning_level,
+            &field(path, "default_reasoning_level"),
+        )?;
+        let levels = field(path, "supported_reasoning_levels");
+        check_collection(&self.supported_reasoning_levels, &levels)?;
+        for (index, level) in self.supported_reasoning_levels.iter().enumerate() {
+            let at = indexed(&levels, index);
+            if level.effort.is_empty() {
+                return Err(DocumentError::InvalidValue(field(&at, "effort")));
+            }
+            check_string(&level.effort, &field(&at, "effort"))?;
+            check_string(&level.description, &field(&at, "description"))?;
+        }
+        if let Some(default) = &self.default_reasoning_level
+            && !self
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| &level.effort == default)
+        {
+            return Err(DocumentError::InvalidValue(field(
+                path,
+                "default_reasoning_level",
+            )));
+        }
+        if let (Some(window), Some(max)) = (self.context_window, self.max_context_window)
+            && window > max
+        {
+            return Err(DocumentError::InvalidValue(field(path, "context_window")));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

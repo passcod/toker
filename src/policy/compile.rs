@@ -20,7 +20,7 @@ use super::{
     ClassifierId, CompactionPolicy, CompactionTarget, CompiledMatcher, CostClass, Diagnostic,
     DiagnosticCode, DiagnosticField, DiagnosticPath, FailureClass, FamilyClassifier,
     FrontendProtocol, FrontendScope, LaneTransitionPolicy, MatcherError, MatcherSpec,
-    ParsedVersion, PolicyFingerprint, PresentationId, PresentationSource, ProfileId,
+    ParsedVersion, PolicyFingerprint, Presentation, PresentationId, PresentationSource, ProfileId,
     REQUESTED_MODEL_PARAMETER, RewriteId, Route, RouteFingerprint, RouteId, RouteReference,
     RouteSemantics, SelectorOrdering, Severity, StableId, Template, TemplateError, UpgradePolicy,
     UpgradePolicyId, ValidatedPolicyDocument, VersionParserSpec, policy_fingerprint,
@@ -1259,6 +1259,7 @@ impl<'a> Compiler<'a> {
             }
             let base = path("presentations", index);
             let scope = ScopeKey::from(&item.scope);
+            self.codex_listing_diagnostics(item, &base);
             match &item.source {
                 PresentationSource::ExactOffer {
                     binding_id,
@@ -1973,6 +1974,37 @@ impl<'a> Compiler<'a> {
         self.diagnostics
             .push(diagnostic(code, Severity::Info, path, Some(record)));
     }
+
+    fn warning(&mut self, code: &str, path: DiagnosticPath, record: &StableId) {
+        self.diagnostics
+            .push(diagnostic(code, Severity::Warning, path, Some(record)));
+    }
+
+    /// The Codex client lists a model only from a catalogue entry carrying
+    /// fields toker cannot invent. A virtual presentation in a Responses scope
+    /// is listed from its `codex` metadata and left out without it; the record
+    /// is used for nothing else, so anywhere it cannot be used it is noise.
+    fn codex_listing_diagnostics(&mut self, item: &Presentation, base: &DiagnosticPath) {
+        let responses = protocol(&item.scope) == ProtocolId::OpenAiResponses;
+        let virtual_source = matches!(item.source, PresentationSource::Virtual { .. });
+        let record = matches!(
+            item.metadata,
+            Some(AdapterMetadata::Codex { model: Some(_) })
+        );
+        if responses && virtual_source && !record {
+            self.info(
+                "virtual-presentation-unlisted-in-responses",
+                base.clone().field(f("metadata")),
+                item.id.as_stable_id(),
+            );
+        } else if record && !(responses && virtual_source) {
+            self.warning(
+                "codex-model-record-unused",
+                base.clone().field(f("metadata")),
+                item.id.as_stable_id(),
+            );
+        }
+    }
 }
 
 fn generated_id_suffix(
@@ -2293,6 +2325,213 @@ mod tests {
                 .map(|presentation| presentation.id().as_str()),
             Some("profile"),
             "the exact-profile record replaces the inherited record"
+        );
+    }
+
+    fn responses_document() -> PolicyDocument {
+        let mut document = document();
+        let scope = FrontendScope::Protocol {
+            protocol: FrontendProtocol::OpenaiResponses,
+        };
+        document.defaults[0].scope = scope.clone();
+        document.presentations[0].scope = scope;
+        document.routes[0].chain.first = candidate(&CODEX_SUB_RESPONSES);
+        document
+    }
+
+    fn codex_record() -> CodexModelRecord {
+        CodexModelRecord {
+            description: Some("A model toker routes".to_owned()),
+            supported_reasoning_levels: vec![CodexReasoningLevel {
+                effort: "low".to_owned(),
+                description: "Fast".to_owned(),
+            }],
+            default_reasoning_level: Some("low".to_owned()),
+            visibility: CodexVisibility::List,
+            shell_type: CodexShellType::UnifiedExec,
+            supported_in_api: true,
+            support_verbosity: false,
+            priority: 3,
+            context_window: Some(100_000),
+            max_context_window: None,
+        }
+    }
+
+    fn codex_offer(model: &str) -> crate::catalog::offers::BackendOffer {
+        crate::catalog::offers::BackendOffer {
+            binding_id: CODEX_SUB_RESPONSES.id().clone(),
+            provider: "codex_sub".to_owned(),
+            backend_model_id: model.to_owned(),
+            binding: CODEX_SUB_RESPONSES.clone(),
+            context_window: Some(272_000),
+            chronology: None,
+            fetched_at_ms: 1,
+            raw: serde_json::json!({"slug": model, "display_name": "Provider's own"}),
+        }
+    }
+
+    fn responses_listing(
+        policy: &CompiledPolicy,
+        inventory: &OfferInventory,
+    ) -> Option<Vec<serde_json::Value>> {
+        match crate::catalog::offers::render_policy(
+            policy,
+            inventory,
+            None,
+            FrontendProtocol::OpenaiResponses,
+        ) {
+            crate::catalog::offers::PolicyPublication::Ready(body) => {
+                Some(body["models"].as_array().cloned().unwrap_or_default())
+            }
+            crate::catalog::offers::PolicyPublication::Unresolved => None,
+        }
+    }
+
+    #[test]
+    fn a_virtual_responses_presentation_is_listed_from_its_codex_record() {
+        let mut document = responses_document();
+        document.presentations[0].label = Some("Friendly".to_owned());
+        document.presentations[0].metadata = Some(AdapterMetadata::Codex {
+            model: Some(codex_record()),
+        });
+        let compilation = compile_document(document, PolicyOrigin::Authored);
+        assert!(
+            !codes(&compilation).contains(&"virtual-presentation-unlisted-in-responses"),
+            "{:?}",
+            codes(&compilation)
+        );
+        let policy = compilation.policy().expect("compiled");
+        let models = responses_listing(policy, &empty_inventory()).expect("a ready listing");
+        assert_eq!(models.len(), 1);
+        let entry = &models[0];
+        assert_eq!(entry["slug"], "friendly");
+        assert_eq!(entry["display_name"], "Friendly");
+        // The fields the Codex client's `ModelInfo` requires, so it parses the
+        // catalogue instead of discarding it.
+        for required in [
+            "slug",
+            "display_name",
+            "supported_reasoning_levels",
+            "shell_type",
+            "visibility",
+            "supported_in_api",
+            "priority",
+            "support_verbosity",
+            "truncation_policy",
+            "experimental_supported_tools",
+        ] {
+            assert!(entry.get(required).is_some(), "missing {required}: {entry}");
+        }
+        assert_eq!(entry["shell_type"], "unified_exec");
+        assert_eq!(entry["visibility"], "list");
+        assert_eq!(entry["context_window"], 100_000);
+    }
+
+    #[test]
+    fn a_virtual_responses_presentation_without_a_record_is_left_out_not_a_failure() {
+        let mut document = responses_document();
+        let mut exact = document.presentations[0].clone();
+        exact.id = PresentationId::new("exact").unwrap();
+        exact.slug = "exact-slug".to_owned();
+        exact.source = PresentationSource::ExactOffer {
+            binding_id: CODEX_SUB_RESPONSES.id().clone(),
+            model_id: "gpt-6-sol".to_owned(),
+        };
+        document.presentations.push(exact);
+        let compilation = compile_document(document, PolicyOrigin::Authored);
+        assert!(codes(&compilation).contains(&"virtual-presentation-unlisted-in-responses"));
+        let policy = compilation.policy().expect("compiled");
+
+        let inventory = OfferInventory::from_offers([codex_offer("gpt-6-sol")]);
+        let models = responses_listing(policy, &inventory).expect("the list is still answered");
+        let slugs: Vec<_> = models
+            .iter()
+            .map(|entry| entry["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(slugs, ["exact-slug"], "the virtual slug is not advertised");
+        assert_eq!(
+            models[0]["display_name"], "Provider's own",
+            "an exact offer keeps its provider's entry"
+        );
+
+        // A missing exact offer is still the listing's one failure.
+        assert!(responses_listing(policy, &empty_inventory()).is_none());
+    }
+
+    #[test]
+    fn a_codex_record_where_it_cannot_be_used_is_a_warning() {
+        let mut messages = document();
+        messages.presentations[0].metadata = Some(AdapterMetadata::Codex {
+            model: Some(codex_record()),
+        });
+        let mut exact = responses_document();
+        exact.presentations[0].source = PresentationSource::ExactOffer {
+            binding_id: CODEX_SUB_RESPONSES.id().clone(),
+            model_id: "gpt-6-sol".to_owned(),
+        };
+        exact.presentations[0].metadata = Some(AdapterMetadata::Codex {
+            model: Some(codex_record()),
+        });
+        for document in [messages, exact] {
+            let compilation = compile_document(document, PolicyOrigin::Authored);
+            let warning = compilation
+                .diagnostics()
+                .iter()
+                .find(|item| item.code.0.as_str() == "codex-model-record-unused")
+                .expect("the unused record is named");
+            assert_eq!(warning.severity, Severity::Warning);
+            assert_eq!(warning.path.as_str(), "/presentations/0/metadata");
+        }
+    }
+
+    #[test]
+    fn a_codex_adapter_without_a_record_is_unchanged_and_says_nothing() {
+        let mut document = responses_document();
+        document.presentations[0].metadata = Some(AdapterMetadata::Codex { model: None });
+        let bytes = serde_json::to_string(&document.presentations[0].metadata).unwrap();
+        assert_eq!(bytes, r#"{"adapter":"codex"}"#);
+        let decoded: Option<AdapterMetadata> = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(decoded, Some(AdapterMetadata::Codex { model: None }));
+    }
+
+    #[test]
+    fn an_invalid_codex_record_is_refused_at_its_path() {
+        let mut document = responses_document();
+        let mut record = codex_record();
+        record.default_reasoning_level = Some("high".to_owned());
+        document.presentations[0].metadata = Some(AdapterMetadata::Codex {
+            model: Some(record),
+        });
+        let error = document.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("/presentations/0/metadata/model/default_reasoning_level"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_virtual_chat_presentation_is_listed_by_slug() {
+        let mut document = document();
+        document.presentations[0].scope = FrontendScope::Protocol {
+            protocol: FrontendProtocol::OpenaiChat,
+        };
+        document.defaults[0].scope = document.presentations[0].scope.clone();
+        document.routes[0].chain.first = candidate(&OPENAI_API_CHAT);
+        let compilation = compile_document(document, PolicyOrigin::Authored);
+        let policy = compilation.policy().expect("compiled");
+        let crate::catalog::offers::PolicyPublication::Ready(listing) =
+            crate::catalog::offers::render_policy(
+                policy,
+                &empty_inventory(),
+                None,
+                FrontendProtocol::OpenaiChat,
+            )
+        else {
+            panic!("a virtual slug needs no inventory");
+        };
+        assert_eq!(
+            listing["data"],
+            serde_json::json!([{"id": "friendly", "object": "model", "owned_by": "toker"}])
         );
     }
 
