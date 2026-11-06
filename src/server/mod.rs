@@ -2714,6 +2714,24 @@ fn policy_transition(
                 .fallback_cache_transition
                 .expect("a fallback plan retains its crossed-edge consent"),
         },
+        // The client asked for something else: another route or candidate, or
+        // another model on a candidate that takes the client's own spelling.
+        // That choice carries the user's consent to lose the cache it leaves
+        // behind. Everything else that differs within a revision (an offer
+        // selector's winner moving, say) is the policy's doing and keeps the
+        // route's own cache rule.
+        crate::policy::LaneState::Existing {
+            pin: Some(current), ..
+        } if same_revision
+            && (current.route_fingerprint != prospective.route_fingerprint
+                || current.candidate_id != prospective.candidate_id
+                || (plan.baseline_from_request
+                    && current.baseline_model != prospective.baseline_model)) =>
+        {
+            crate::policy::TransitionCause::ExplicitUserChange {
+                cache: crate::policy::CacheTransitionPolicy::AllowCacheLoss,
+            }
+        }
         _ if same_revision => crate::policy::TransitionCause::ExplicitUserChange {
             cache: plan
                 .cache_transition
@@ -4955,6 +4973,77 @@ api_key = "ak-literal-test"
             super::cache_temperature(&lane, Some(no_ttl), now),
             CacheTemperature::Unknown,
             "an unattributed lane cannot borrow a binding's TTL"
+        );
+    }
+
+    fn messages_facts(server: &Server, model: &str) -> crate::policy::RequestFacts {
+        server.shadow_facts(
+            ProtocolId::AnthropicMessages,
+            None,
+            Some(model.to_owned()),
+            Some("lane".to_owned()),
+            1,
+            Some(3),
+            0,
+            Default::default(),
+            None,
+            crate::policy::RequestClass::Inference,
+        )
+    }
+
+    #[test]
+    fn a_model_switch_on_a_warm_pinned_lane_is_the_users_own_consent_to_lose_the_cache() {
+        use crate::policy::{CacheTemperature, LaneTransitionDecision, TransitionSource};
+
+        let dir = crate::setup::test_dir("explicit-model-switch");
+        let server = server(&dir);
+        let credentials = crate::policy::CredentialSnapshot::new();
+        let resolve = |stored: Option<&crate::store::Lane>, model: &str| {
+            let lane = stored.map(|stored| lane_facts(stored, CacheTemperature::Warm));
+            server.resolve_policy_attempt(
+                &messages_facts(&server, model),
+                &credentials,
+                stored,
+                lane.as_ref(),
+            )
+        };
+
+        let first = resolve(None, "claude-opus-4-8")
+            .expect("a new lane resolves")
+            .expect("an active policy resolves every lane");
+        let LaneTransitionDecision::FirstPin { new_pin, .. } = first.pin_transition else {
+            panic!("a new lane is pinned: {:?}", first.pin_transition);
+        };
+        let mut stored = unpinned_lane();
+        stored.pin_generation = 1;
+        stored.pin = Some(new_pin.into());
+
+        // Asking for the same model again changes nothing, warm or not.
+        let again = resolve(Some(&stored), "claude-opus-4-8")
+            .expect("the same model resolves")
+            .expect("active");
+        assert!(
+            matches!(again.pin_transition, LaneTransitionDecision::Keep { .. }),
+            "{:?}",
+            again.pin_transition
+        );
+
+        // Asking for another model is the user's choice: the warm cache it
+        // leaves behind is theirs to give up.
+        let switched = resolve(Some(&stored), "claude-sonnet-5")
+            .expect("a model switch resolves")
+            .expect("active");
+        assert!(
+            matches!(
+                &switched.pin_transition,
+                LaneTransitionDecision::Replace {
+                    new_pin,
+                    source: TransitionSource::ExplicitUserChange,
+                    ..
+                } if new_pin.effective_model == "claude-sonnet-5"
+            ),
+            "{:?}",
+            switched.pin_transition
         );
     }
 

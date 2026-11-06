@@ -102,7 +102,7 @@ policy path and what the legacy path did.
       coldness from the lane's recorded TTL for a lane pinned to that binding
 - [x] Compaction retarget rows record no `downgraded_from`/`downgraded_to`
       because policy picks the cheaper model first; derive them from the plan
-- [ ] `/model` switch on a warm pinned lane answers 502 "could not resolve":
+- [x] `/model` switch on a warm pinned lane answers 502 "could not resolve":
       route it as the existing `ExplicitUserChange` transition cause
 - [ ] Untranslatable body on a streaming request: decide SSE shape and row
       (currently plain JSON 400, no row)

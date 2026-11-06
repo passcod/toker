@@ -252,6 +252,11 @@ pub struct AttemptPlan {
     pub provider: String,
     pub requested_model: Option<String>,
     pub baseline_model: String,
+    /// Whether the client's own model spelling decided the baseline, as
+    /// opposed to a policy-owned exact model or an offer selector's winner.
+    /// A changed baseline on the same candidate is the client's doing only
+    /// when this holds; otherwise the policy moved it.
+    pub baseline_from_request: bool,
     pub upgraded_model: Option<String>,
     pub retargeted_model: Option<String>,
     pub aliased_model: Option<String>,
@@ -616,6 +621,7 @@ fn resolve_selected<L: LearningView>(
             provider,
             requested_model: facts.requested_model.clone(),
             baseline_model: model.to_owned(),
+            baseline_from_request: false,
             upgraded_model: None,
             retargeted_model: None,
             aliased_model: None,
@@ -814,6 +820,10 @@ fn resolve_selected<L: LearningView>(
             provider,
             requested_model: facts.requested_model.clone(),
             baseline_model: baseline,
+            baseline_from_request: matches!(
+                candidate.model(),
+                CompiledCandidateModel::RequestedModel | CompiledCandidateModel::Template(_)
+            ),
             upgraded_model: upgraded,
             retargeted_model: retargeted,
             aliased_model: aliased,

@@ -3360,6 +3360,37 @@ fn the_lane(lanes: Vec<toker::store::Lane>) -> toker::store::Lane {
     ours[0].clone()
 }
 
+/// `/model` mid-session on a lane whose cache is warm: the user chose the
+/// move, so it is served and the lane follows to the new model rather than
+/// the request being refused for the cache it would lose.
+#[tokio::test]
+async fn a_model_switch_mid_session_moves_the_warm_lane() {
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
+    let bearer = [("authorization", "Bearer claude-oauth-token")];
+
+    for model in ["claude-opus-5", "claude-sonnet-5"] {
+        let response = post_messages(addr, "/v1/messages", &bearer, &tools_body(model, true)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        response.bytes().await.expect("body");
+    }
+
+    let captured = mock.captured();
+    assert_eq!(captured.len(), 2, "both turns reached the upstream");
+    let sent: Vec<Value> = captured
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).expect("upstream body"))
+        .collect();
+    assert_eq!(sent[0]["model"], "claude-opus-5");
+    assert_eq!(sent[1]["model"], "claude-sonnet-5");
+
+    let lane = the_lane(wait_for_lanes(&store, 1).await);
+    let pin = lane.pin.expect("the lane is pinned");
+    assert_eq!(pin.baseline_model, "claude-sonnet-5");
+    assert_eq!(pin.effective_model, "claude-sonnet-5");
+    assert_eq!(pin.policy_revision_id, 1);
+}
+
 #[tokio::test]
 async fn lane_rows_written_on_response_upsert_not_duplicate() {
     let (mock, upstream) = spawn_mock().await;
