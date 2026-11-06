@@ -75,9 +75,9 @@ Changeset 12 left legacy routing reachable in production:
   - [x] tests/server_anthropic.rs (three src fixes found on the way; see
         Findings in `port-notes.md`)
   - [x] tests/server_awake.rs
-  - [ ] tests/server_codex.rs
+  - [x] tests/server_codex.rs
   - [x] tests/server_cold.rs
-  - [ ] tests/server_force_newest.rs
+  - [x] tests/server_force_newest.rs
   - [x] tests/server_session.rs
   - [x] tests/server_shutdown.rs
   - [x] unit tests: `mod tests` in src/server/{mod,anthropic,codex,inference,

@@ -152,3 +152,26 @@ server without an active revision (they compile and pass today).
 - Unlike the legacy sub, a subscription with no held token, no login and no
   client bearer is now refused locally (503, `route-unavailable` row) instead
   of forwarded to a 401. server_anthropic covers it.
+- Revision one authors presentations for the claude picker only, so a codex
+  profile (`/f/codex/v1/models`) answers `{"models":[]}`: the codex CLI sees
+  an empty list where legacy offered `codex_sub/<slug>` and `<slug>` with
+  context windows. server_codex covers the projection with a custom revision
+  that publishes the two slugs; decide whether revision-one generation should
+  author codex presentations (same question as the Chat finding above).
+- A body that does not canonicalise (an assistant-side image block, a
+  non-array `messages`) is refused 400 as plain JSON even when the client
+  asked to stream, and leaves no row: no policy route was chosen, so no
+  backend could be blamed. Legacy answered SSE and recorded an error row
+  against the default backend. Accepted as is; say if the SSE shape or a row
+  is wanted.
+- A cold, pinned Anthropic lane is never upgraded. `cache_temperature` is
+  `Unknown` for any binding with no cache clock (anthropic_sub, anthropic_api,
+  codex), and `choose_upgrade` only moves a known lane when it is `Cold`, so
+  once the first request has pinned a lane, force-newest cannot fire for it
+  however long it has idled (legacy used the lane's recorded TTL and idle
+  time). Upgrades still fire for a new lane (at most two messages) and for an
+  unlisted lane whose model nothing served for a full TTL, which is what
+  server_force_newest covers. Decide whether `shadow_lane` should derive the
+  temperature from the lane's recorded TTL for these bindings, as it already
+  does for compaction (`lane_is_cold`); a unit test pins `Unknown` for
+  anthropic_sub today.
