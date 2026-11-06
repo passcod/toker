@@ -986,6 +986,13 @@ detect active database ownership, stop generating new operational routing
 fields, and retain bootstrap provider configuration. Add explicit
 import-to-draft and update the periodic picker unit to reconcile active policy.
 
+Done (card E1). Setup activates revision one before it writes a config without
+routing fields, and a database-owned machine is never asked for defaults or
+replaced. The TUI's status view imports the legacy file into the draft. The
+picker timer is installed for any Claude frontend, and the legacy OpenRouter
+picker rendering and `toker picker defaults` were removed, which takes those
+items from changeset 18; the rest of 18 is unchanged.
+
 ### 18. Remove superseded runtime machinery and document internals
 
 Remove old model-map, default/prefix, hard-coded family, force-newest, and

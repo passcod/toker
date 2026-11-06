@@ -318,6 +318,37 @@ pub struct InitialPublication {
     pub state: PublicationState,
 }
 
+/// The publication rows a freshly activated revision starts with. Startup and
+/// setup both establish revision one, so both take the rows from here.
+pub fn publication_targets() -> Result<Vec<InitialPublication>> {
+    use crate::policy::{FrontendProtocol, FrontendScope};
+
+    let protocol = |protocol| FrontendScope::Protocol { protocol };
+    Ok(vec![
+        InitialPublication {
+            key: PublicationKey::new(
+                protocol(FrontendProtocol::OpenaiChat),
+                PublicationAdapter::new("dynamic_chat_models")?,
+            ),
+            state: PublicationState::Applied,
+        },
+        InitialPublication {
+            key: PublicationKey::new(
+                protocol(FrontendProtocol::OpenaiResponses),
+                PublicationAdapter::new("dynamic_responses_models")?,
+            ),
+            state: PublicationState::Applied,
+        },
+        InitialPublication {
+            key: PublicationKey::new(
+                protocol(FrontendProtocol::AnthropicMessages),
+                PublicationAdapter::new("claude_settings")?,
+            ),
+            state: PublicationState::Pending,
+        },
+    ])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingPublication {
     pub key: PublicationKey,

@@ -10,6 +10,10 @@
 //! is serialised with serde `toml` — deliberately not `toml_edit`:
 //! this is toker-owned machine config, not a hand-curated document.
 //!
+//! The file carries providers and the listener, not routing. The database
+//! owns routing, so the legacy routing fields are read (a first activation
+//! compiles them) but never written back.
+//!
 //! What that trades away, deliberately, with the tests below pinning
 //! each behaviour so it stays a decision and not an accident:
 //!
@@ -22,7 +26,7 @@
 //!   their resolved defaults (a wizard-written file says
 //!   `port = 18123` rather than implying it), `~`-paths are written
 //!   expanded (they already expanded at load), upstream URLs in their
-//!   parsed normalised form, model-map selectors in canonical form.
+//!   parsed normalised form.
 //!   The re-load-compare step proves each of these round-trips to the
 //!   same resolved config.
 //! - **A key this toker does not understand cannot be silently
@@ -49,47 +53,30 @@ use crate::setup::atomic::atomic_write_bytes;
 /// to the resolved [`Config`], re-validate, serialise, and put the
 /// result down atomically. `changes` may bail to refuse the write
 /// (nothing has been touched yet when it does).
+///
+/// The file holds the providers and the listener only. The legacy routing
+/// fields (protocol defaults, model maps, picker rules, `force_newest`,
+/// `compact_model`) are read from an existing file so a first activation
+/// can compile them, but are never written: the database owns routing, and
+/// [`legacy_routing_fields`] says what a rewrite drops. Protocol defaults
+/// are therefore not validated here.
 pub fn write_config(
     path: &Path,
-    changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    write_config_with_ownership(path, false, changes)
-}
-
-pub fn write_owned_config(
-    path: &Path,
-    changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    write_config_with_ownership(path, true, changes)
-}
-
-fn write_config_with_ownership(
-    path: &Path,
-    policy_owned: bool,
     changes: impl FnOnce(&mut Config) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut config = Config::load_from(path)
         .with_context(|| format!("reading the existing {}", path.display()))?;
     changes(&mut config).context("applying the wizard's config changes")?;
     config
-        .validate()
+        .validate_retained()
         .context("the wizard's config changes do not validate")?;
-    let file = if policy_owned {
-        config.to_owned_file()
-    } else {
-        config.to_file()
-    };
-    let text = toml::to_string_pretty(&file).context("serialising toker.toml")?;
+    let text = toml::to_string_pretty(&config.to_owned_file()).context("serialising toker.toml")?;
     let intended = config;
     atomic_write_bytes(path, text.as_bytes(), Some(0o600), move |temp, _written| {
         let reloaded = Config::load_from(temp).context("re-loading the written toker.toml")?;
-        let matches = if policy_owned {
-            toml::to_string(&reloaded.to_owned_file()).ok()
-                == toml::to_string(&intended.to_owned_file()).ok()
-        } else {
-            reloaded == intended
-        };
-        if !matches {
+        if toml::to_string(&reloaded.to_owned_file()).ok()
+            != toml::to_string(&intended.to_owned_file()).ok()
+        {
             bail!(
                 "the written toker.toml does not round-trip to the intended config — \
                  refusing to rename"
@@ -99,6 +86,41 @@ fn write_config_with_ownership(
     })
 }
 
+/// The legacy routing fields `text` carries: the ones a database-owned
+/// rewrite drops, because the active revision holds their compiled form.
+/// Unparseable text carries none.
+pub fn legacy_routing_fields(text: &str) -> Vec<String> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    for key in ["default_backend_anthropic", "default_backend_openai_chat"] {
+        if table.contains_key(key) {
+            fields.push(key.to_owned());
+        }
+    }
+    if let Some(gates) = table.get("gates").and_then(toml::Value::as_table) {
+        for key in ["force_newest", "compact_model"] {
+            if gates.contains_key(key) {
+                fields.push(format!("gates.{key}"));
+            }
+        }
+    }
+    if let Some(providers) = table.get("providers").and_then(toml::Value::as_table) {
+        for (name, block) in providers {
+            let Some(block) = block.as_table() else {
+                continue;
+            };
+            for key in ["model_map", "picker"] {
+                if block.contains_key(key) {
+                    fields.push(format!("providers.{name}.{key}"));
+                }
+            }
+        }
+    }
+    fields
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,7 +128,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use crate::middleware::model_map;
     use crate::setup::test_dir;
 
     /// The reference machine's real `toker.toml`, shape and prose
@@ -123,27 +144,12 @@ default_backend_anthropic = "codex_sub"
 "family:haiku" = "gpt-5.6-luna"
 "#;
 
-    /// The map the fixture above parses to, for comparing round-trips
-    /// semantically rather than by selector text.
-    fn expected_model_map() -> model_map::ModelMap {
-        model_map::parse_model_map(
-            r#"{
-                "family:opus": "gpt-5.6-sol",
-                "family:fable": "gpt-5.6-sol",
-                "family:sonnet": "gpt-5.6-terra",
-                "family:haiku": "gpt-5.6-luna"
-            }"#,
-        )
-        .expect("the expected map parses")
-        .expect("enabled")
-    }
-
     #[test]
     fn policy_owned_write_omits_operational_routing_fields() {
         let dir = test_dir("owned-config");
         let path = dir.join("toker.toml");
         fs::write(&path, REAL_MACHINE_TOML).expect("write fixture");
-        write_owned_config(&path, |_| Ok(())).expect("owned write");
+        write_config(&path, |_| Ok(())).expect("owned write");
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("default_backend_"));
         assert!(!text.contains("model_map"));
@@ -166,7 +172,6 @@ default_backend_anthropic = "codex_sub"
             );
             // A backend is enabled by its block: the flip adds one.
             config.anthropic_sub.get_or_insert_with(Default::default);
-            config.default_backend_anthropic = Some("anthropic_sub".to_owned());
             Ok(())
         })
         .expect("write the flip");
@@ -178,43 +183,22 @@ default_backend_anthropic = "codex_sub"
             !text.contains("# toker — local config"),
             "comments are dropped: the documented trade"
         );
-        // ...and what the resolver understands is now explicit —
-        // defaults included, because the wizard writes the whole file
-        // it understands.
+        // ...what the resolver understands is now explicit, defaults
+        // included, because the wizard writes the whole file it understands...
         assert!(
             text.contains("port = 18123"),
             "the default port is written explicitly"
         );
-        assert!(text.contains("default_backend_anthropic = \"anthropic_sub\""));
-        assert!(
-            text.contains("[providers.codex_sub.model_map]"),
-            "the map's table survived the rewrite"
-        );
-        assert!(text.contains("\"family:opus\" = \"gpt-5.6-sol\""));
+        // ...and the routing the database owns is not carried.
+        assert!(!text.contains("default_backend_anthropic"));
+        assert!(!text.contains("model_map"));
 
-        // The semantics that must survive: the flip, the map, and a
-        // re-loadable file.
         let reloaded = Config::load_from(&path).expect("the written file loads");
-        assert_eq!(
-            reloaded.default_backend_anthropic.as_deref(),
-            Some("anthropic_sub")
-        );
         assert_eq!(reloaded.port, 18_123);
-        assert_eq!(
-            reloaded
-                .codex_sub
-                .as_ref()
-                .expect("still enabled")
-                .model_map,
-            Some(expected_model_map())
-        );
-        assert!(
-            text.contains("[providers.anthropic_sub]"),
-            "the enabled backend's block is written"
-        );
+        assert!(reloaded.codex_sub.is_some() && reloaded.anthropic_sub.is_some());
         assert!(
             !text.contains("[providers.openrouter]") && !text.contains("[providers.anthropic_api]"),
-            "a disabled backend's block is not: writing it would enable it"
+            "a disabled backend's block is not written: it would enable it"
         );
 
         // Idempotence: a no-change re-run rewrites the same bytes.
@@ -225,6 +209,42 @@ default_backend_anthropic = "codex_sub"
             once,
             "byte-stable re-run"
         );
+    }
+
+    #[test]
+    fn several_backends_without_a_protocol_default_still_load_and_rewrite() {
+        let dir = test_dir("ambiguous");
+        let path = dir.join("toker.toml");
+        fs::write(&path, "[providers.anthropic_api]\n[providers.codex_sub]\n")
+            .expect("write fixture");
+        write_config(&path, |_| Ok(())).expect("the database owns the defaults");
+        let reloaded = Config::load_from(&path).expect("loads");
+        assert_eq!(reloaded.default_backend_anthropic, None);
+        assert!(
+            reloaded.validate().is_err(),
+            "routing input still needs one"
+        );
+    }
+
+    #[test]
+    fn legacy_routing_fields_lists_what_a_rewrite_drops() {
+        let fields = legacy_routing_fields(
+            "default_backend_openai_chat = \"openrouter\"\n\
+             [gates]\nforce_newest = false\ncold_min_tokens = 5\n\
+             [providers.codex_sub.model_map]\n\"family:opus\" = \"x\"\n\
+             [providers.openrouter]\npicker = []\n",
+        );
+        assert_eq!(
+            fields,
+            [
+                "default_backend_openai_chat",
+                "gates.force_newest",
+                "providers.codex_sub.model_map",
+                "providers.openrouter.picker",
+            ]
+        );
+        assert!(legacy_routing_fields("port = 1\n[providers.openrouter]\n").is_empty());
+        assert!(legacy_routing_fields("not toml = = =").is_empty());
     }
 
     #[test]
@@ -317,13 +337,13 @@ auth_path = "~/.codex/auth.json"
         let path = dir.join("toker.toml");
         fs::write(&path, "port = 19999\n").expect("write fixture");
         let error = write_config(&path, |config| {
-            config.default_backend_anthropic = Some("not-a-backend".to_owned());
+            config.ping_header_name = String::new();
             Ok(())
         })
         .expect_err("must refuse");
         let chain = format!("{error:#}");
         assert!(
-            chain.contains("do not validate") && chain.contains("default_backend_anthropic"),
+            chain.contains("do not validate") && chain.contains("ping_header_name"),
             "{chain}"
         );
         assert_eq!(fs::read(&path).expect("read back"), b"port = 19999\n");
@@ -411,46 +431,23 @@ auth_path = "~/.codex/auth.json"
     }
 
     #[test]
-    fn picker_rules_round_trip_and_absent_stays_distinct_from_empty() {
+    fn picker_rules_are_read_but_not_rewritten() {
         let dir = test_dir("picker");
-        let rules = dir.join("rules.toml");
+        let path = dir.join("toker.toml");
         fs::write(
-            &rules,
+            &path,
             "[providers.openrouter]\n\n\
              [[providers.openrouter.picker]]\n\
              match = [\"moonshotai/kimi-k*\"]\n\
-             exclude = [\"*-code\"]\n\
-             behaves_as = \"sonnet\"\n\
-             variant = \":floor\"\n\
-             keep = 2\n",
+             behaves_as = \"sonnet\"\n",
         )
         .expect("write fixture");
-        write_config(&rules, |_| Ok(())).expect("rewrite");
-        let picker = Config::load_from(&rules)
-            .expect("reload")
-            .openrouter
-            .expect("enabled")
-            .picker
-            .expect("rules kept");
-        assert_eq!(picker.len(), 1);
-        assert_eq!(picker[0].matches, ["moonshotai/kimi-k*"]);
-        assert_eq!(picker[0].exclude, ["*-code"]);
-        assert_eq!(picker[0].variant.as_deref(), Some(":floor"));
-        assert_eq!(picker[0].keep, 2);
-
-        // `[]` offers nothing; absent is the built-in set. A rewrite must
-        // never turn one into the other.
-        for (name, block, expected) in [("empty", "picker = []\n", Some(0)), ("absent", "", None)] {
-            let path = dir.join(format!("{name}.toml"));
-            fs::write(&path, format!("[providers.openrouter]\n{block}")).expect("write");
-            write_config(&path, |_| Ok(())).expect("rewrite");
-            let picker = Config::load_from(&path)
-                .expect("reload")
-                .openrouter
-                .expect("enabled")
-                .picker;
-            assert_eq!(picker.map(|rules| rules.len()), expected, "{name}");
-        }
+        let loaded = Config::load_from(&path).expect("loads");
+        assert_eq!(loaded.openrouter.expect("enabled").picker.unwrap().len(), 1);
+        write_config(&path, |_| Ok(())).expect("rewrite");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("picker"), "{text}");
+        assert!(text.contains("[providers.openrouter]"));
     }
 
     #[test]

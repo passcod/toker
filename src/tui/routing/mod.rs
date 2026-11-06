@@ -1,6 +1,7 @@
 //! Routing policy page with draft-led controls.
 
 mod client;
+mod import;
 mod model;
 mod reconcile;
 mod view;

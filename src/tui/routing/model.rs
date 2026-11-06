@@ -81,6 +81,8 @@ pub(super) enum Modal {
         binding: String,
         model: String,
     },
+    /// Replace the draft with the compiled legacy `toker.toml` routing.
+    Import,
     Conflict {
         daemon_generation: Option<u64>,
         daemon_draft: Value,
@@ -103,6 +105,7 @@ impl Modal {
             Self::Activate { .. } => "ACTIVATE DRAFT",
             Self::Reactivate { .. } => "REACTIVATE REVISION",
             Self::Promote { .. } => "PROMOTE LEARNED MODEL",
+            Self::Import => "IMPORT LEGACY CONFIG",
             Self::Conflict { .. } => "DRAFT CHANGED BY DAEMON",
         }
     }
@@ -125,6 +128,9 @@ pub(super) struct State {
     /// The exact typed edit batch that received a 409.  It remains intact until
     /// the user explicitly reloads or reapplies it against the daemon copy.
     conflicted_edits: Vec<Value>,
+    /// Compiles the legacy config into a policy document; replaceable so the
+    /// page's tests need no config file.
+    legacy_policy: fn() -> anyhow::Result<Value>,
 }
 
 impl Default for State {
@@ -141,6 +147,7 @@ impl Default for State {
             in_flight: false,
             modal: Modal::None,
             conflicted_edits: Vec::new(),
+            legacy_policy: super::import::legacy_policy,
         }
     }
 }
@@ -524,6 +531,10 @@ impl State {
                 self.open_promote();
                 None
             }
+            KeyCode::Char('i') if self.view == View::Status => {
+                self.modal = Modal::Import;
+                None
+            }
             _ => None,
         }
     }
@@ -900,6 +911,11 @@ impl State {
                     action,
                 )
             }
+            Modal::Import => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => (Modal::Import, ModalAction::Import),
+                KeyCode::Esc | KeyCode::Char('n') => return None,
+                _ => (Modal::Import, ModalAction::None),
+            },
             Modal::Conflict {
                 daemon_generation,
                 daemon_draft,
@@ -938,7 +954,31 @@ impl State {
                 force,
             } => self.reactivate(revision_id, scope, force),
             ModalAction::Promote { binding, model } => self.promote(&binding, &model),
+            ModalAction::Import => self.import(),
             ModalAction::Reapply => self.reapply_conflict(),
+        }
+    }
+
+    /// Replace the draft with the compiled legacy config. A config that does
+    /// not load or compile is reported and leaves the draft alone.
+    fn import(&mut self) -> Option<Command> {
+        let generation = self.generation?;
+        match (self.legacy_policy)() {
+            Ok(policy) => {
+                self.in_flight = true;
+                Some(command(
+                    "draft-replace",
+                    Method::PUT,
+                    "draft",
+                    "routing-draft-replace",
+                    json!({ "expected_generation": generation, "policy": policy }),
+                ))
+            }
+            Err(error) => {
+                self.modal = Modal::None;
+                self.error = Some(format!("import: {error:#}"));
+                None
+            }
         }
     }
 
@@ -1075,6 +1115,7 @@ enum ModalAction {
         binding: String,
         model: String,
     },
+    Import,
     Reapply,
 }
 
@@ -1313,6 +1354,7 @@ fn control_error(command: &Command, response: &Response) -> String {
 mod tests {
     use super::{Modal, State, View, candidate_count, move_candidate};
     use crate::tui::routing::client::{Command, Reply, Response};
+    use reqwest::Method;
 
     fn snapshot() -> serde_json::Value {
         serde_json::json!({
@@ -1499,6 +1541,71 @@ mod tests {
         assert_eq!(body["scope"], "new_and_cold_lanes");
         assert_eq!(body["force_cache_transition"], true);
         assert!(state.in_flight());
+    }
+
+    #[test]
+    fn import_waits_for_confirmation_then_replaces_the_draft_at_the_loaded_generation() {
+        let mut state = loaded(full_snapshot());
+        state.legacy_policy = || Ok(serde_json::json!({"format_version": 3, "marker": "legacy"}));
+        state.set_view(View::Status);
+        assert!(press(&mut state, KeyCode::Char('i')).is_none());
+        assert!(matches!(state.modal(), Modal::Import));
+        let command = press(&mut state, KeyCode::Char('y')).expect("confirmed");
+        assert_eq!(
+            (command.name, command.control),
+            ("draft-replace", "routing-draft-replace")
+        );
+        assert_eq!(command.method, Method::PUT);
+        let body = command.body.expect("body");
+        assert_eq!(body["expected_generation"], 3);
+        assert_eq!(body["policy"]["marker"], "legacy");
+        assert!(state.in_flight());
+    }
+
+    #[test]
+    fn import_is_offered_only_in_the_status_view_and_cancels_cleanly() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('i'));
+        assert!(!state.modal().active(), "not in the presentations view");
+        state.set_view(View::Status);
+        press(&mut state, KeyCode::Char('i'));
+        assert!(press(&mut state, KeyCode::Esc).is_none());
+        assert!(!state.modal().active());
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_imported_leaves_the_draft_alone() {
+        let mut state = loaded(full_snapshot());
+        state.legacy_policy = || Err(anyhow::anyhow!("toker.toml does not load"));
+        state.set_view(View::Status);
+        press(&mut state, KeyCode::Char('i'));
+        assert!(press(&mut state, KeyCode::Char('y')).is_none());
+        assert!(!state.modal().active());
+        assert!(!state.in_flight());
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.contains("toker.toml does not load")),
+            "{:?}",
+            state.error()
+        );
+        assert_eq!(state.generation(), Some(3));
+    }
+
+    #[test]
+    fn an_import_against_a_stale_draft_takes_the_conflict_path() {
+        let mut state = loaded(full_snapshot());
+        state.legacy_policy = || Ok(serde_json::json!({}));
+        state.set_view(View::Status);
+        press(&mut state, KeyCode::Char('i'));
+        press(&mut state, KeyCode::Char('y'));
+        state.receive(reply(
+            "draft-replace",
+            409,
+            serde_json::json!({"error": "stale_draft", "generation": 4, "draft": {"policy": {"description": "theirs"}}}),
+        ));
+        assert!(matches!(state.modal(), Modal::Conflict { .. }));
+        assert_eq!(state.generation(), Some(4), "the daemon draft is kept");
     }
 
     #[test]

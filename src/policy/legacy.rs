@@ -55,6 +55,53 @@ pub fn compile(
     ))
 }
 
+/// Compile and activate revision one from the legacy config, or load the
+/// revision that is already active without consulting the config. Startup and
+/// setup both go through here, so a machine setup activates is the machine the
+/// service would have activated itself.
+pub fn establish_revision_one(
+    store: &crate::store::Store,
+    config: &Config,
+    topology: &RouteRegistry,
+    inventory: &OfferInventory,
+    publication_generation: i64,
+    activated_ms: i64,
+) -> anyhow::Result<(crate::store::PolicyRevision, super::CompiledPolicy)> {
+    config.validate()?;
+    let document = validated(config, topology)?;
+    let generated = compile_document(document.clone(), topology, inventory)
+        .into_policy()
+        .map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "generated revision one has {} compile diagnostics",
+                diagnostics.len()
+            )
+        })?;
+    let activation = store.activate_revision_one(
+        &document,
+        activated_ms,
+        publication_generation,
+        &crate::store::publication_targets()?,
+    )?;
+    match activation {
+        crate::store::RevisionOneActivation::Activated { revision, .. } => {
+            Ok((revision, generated))
+        }
+        crate::store::RevisionOneActivation::AlreadyActive { revision, .. } => {
+            let policy = super::runtime::compile_stored_revision(&revision, topology, inventory)
+                .into_policy()
+                .map_err(|diagnostics| {
+                    anyhow::anyhow!(
+                        "active policy revision {} has {} compile diagnostics",
+                        revision.revision_id,
+                        diagnostics.len()
+                    )
+                })?;
+            Ok((revision, policy))
+        }
+    }
+}
+
 pub fn compile_document(
     document: super::ValidatedPolicyDocument,
     topology: &RouteRegistry,
@@ -160,7 +207,7 @@ impl<'a> LegacyBuilder<'a> {
     fn add_backend_routes(&mut self) -> anyhow::Result<()> {
         for binding in self.topology.bindings() {
             let route_id = backend_route_id(binding)?;
-            let alias_policy = model_map_for(self.topology, binding.provider())
+            let alias_policy = model_map_for(self.config, binding.provider())
                 .map(alias_policy)
                 .transpose()?;
             let upgrade_policy_id = supports_legacy_families(binding)
@@ -299,7 +346,7 @@ impl<'a> LegacyBuilder<'a> {
             .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
             .find(|route| {
                 self.topology.binding_is_configured(route.binding())
-                    && model_map_for(self.topology, route.binding().provider()).is_some()
+                    && model_map_for(self.config, route.binding().provider()).is_some()
             });
         let Some(route) = candidate else {
             return Ok(());
@@ -441,10 +488,15 @@ fn alias_policy(map: &ModelMap) -> anyhow::Result<AliasPolicy> {
     Ok(AliasPolicy { rules })
 }
 
-fn model_map_for<'a>(topology: &'a RouteRegistry, provider: &str) -> Option<&'a ModelMap> {
-    topology
-        .provider(provider)
-        .and_then(|provider| provider.model_map())
+/// The model map configured for `provider`, read from the config so that
+/// building revision one never needs a constructed (credentialed) provider.
+fn model_map_for<'a>(config: &'a Config, provider: &str) -> Option<&'a ModelMap> {
+    match provider {
+        "anthropic_sub" => config.anthropic_sub.as_ref()?.model_map.as_ref(),
+        "anthropic_api" => config.anthropic_api.as_ref()?.model_map.as_ref(),
+        "codex_sub" => config.codex_sub.as_ref()?.model_map.as_ref(),
+        _ => None,
+    }
 }
 
 fn requested_reference(route_id: RouteId) -> anyhow::Result<RouteReference> {
@@ -706,6 +758,39 @@ mod tests {
         let family = policy.rules[1].matcher.compile().unwrap();
         assert!(family.is_match("claude-3-7-opus").unwrap());
         assert!(family.is_match("claude-opus-4-5-20251101").unwrap());
+    }
+
+    #[test]
+    fn a_credential_free_topology_builds_the_same_document_as_the_providers() {
+        // Setup activates revision one without constructing providers, so
+        // it must not see a different document from the service's.
+        let config = load_config(
+            "default_backend_anthropic = \"anthropic_api\"\n\
+             [providers.anthropic_sub]\n\
+             [providers.anthropic_api]\n\
+             [providers.anthropic_api.model_map]\n\
+             \"family:sonnet\" = \"claude-sonnet-5\"\n\
+             [providers.openrouter]\n\
+             [[providers.openrouter.picker]]\n\
+             match = [\"lab/*\"]\n\
+             behaves_as = \"claude-sonnet-5\"\n",
+        );
+        let full = document(&config, &topology(&config)).unwrap();
+        let bare = document(
+            &config,
+            &RouteRegistry::configured_bindings(crate::picker::configured_bindings(&config)),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&full).unwrap(),
+            serde_json::to_value(&bare).unwrap()
+        );
+        assert!(
+            serde_json::to_string(&bare)
+                .unwrap()
+                .contains("claude-sonnet-5"),
+            "the model map is compiled"
+        );
     }
 
     #[test]

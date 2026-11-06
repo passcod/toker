@@ -181,17 +181,14 @@ enum Command {
 /// `toker picker` verbs.
 #[derive(Debug, Subcommand)]
 enum PickerCommand {
-    /// Fetch openrouter's models listing, apply the picker rules, and
-    /// write the rows into `~/.claude/settings.json` (setup and the daily
-    /// picker timer run this).
+    /// Write the active routing policy's `/model` rows into
+    /// `~/.claude/settings.json` (setup and the daily picker timer run
+    /// this).
     Sync {
         /// Print the rows; change nothing.
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Print the built-in picker rules as toker.toml text, to copy and
-    /// edit.
-    Defaults,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,10 +217,6 @@ fn main() -> anyhow::Result<()> {
         Command::Status => cmds::status(),
         Command::Picker { command } => match command {
             PickerCommand::Sync { dry_run } => cmds::picker_sync(dry_run),
-            PickerCommand::Defaults => {
-                print!("{}", toker::picker::defaults_toml());
-                Ok(())
-            }
         },
         Command::Import {
             from,

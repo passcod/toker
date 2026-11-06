@@ -70,12 +70,12 @@ use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
 use crate::secrets::SecretStore;
 use crate::setup::atomic::atomic_write_bytes;
-use crate::setup::config_writer::write_config;
+use crate::setup::config_writer::{legacy_routing_fields, write_config};
 use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
 use crate::setup::{Step, plan};
-use crate::store::Store;
+use crate::store::{PolicyRevisionSource, Store};
 use crate::timers::{self, HOLD_UNIT_FOR, PING_DELAY_MINUTES};
 
 /// The enabled unit (the socket). The service is never enabled
@@ -105,9 +105,9 @@ pub const HOLD_TIMER_UNIT: &str = "toker-hold.timer";
 pub const HOLD_SERVICE_UNIT: &str = "toker-hold.service";
 
 /// The picker USER timer: the daily `toker picker sync`, which keeps
-/// Claude Code's openrouter `/model` rows in step with openrouter's
-/// listing. The service cannot do it: it may not write outside the
-/// state dir.
+/// Claude Code's `/model` rows in step with the active routing policy and
+/// the cached catalogues. The service cannot do it: it may not write
+/// outside the state dir.
 pub const PICKER_TIMER_UNIT: &str = "toker-picker.timer";
 
 /// The picker USER service, which the timer starts and setup runs once.
@@ -389,6 +389,10 @@ pub struct Paths {
     /// opencode's plugin discovery dir — the toker-cost install target
     /// (`…/plugins/toker-cost/`; the offer is opt-out, detection-tied).
     pub opencode_plugins_dir: PathBuf,
+    /// The fetched-catalogue cache, which revision one's inventory and
+    /// publication generation are computed from. `None` reads as no
+    /// cached catalogue.
+    pub catalog_cache: Option<PathBuf>,
 }
 
 impl Paths {
@@ -414,6 +418,7 @@ impl Paths {
             codex_config: home.join(".codex").join("config.toml"),
             state_dir: data_home.join("toker"),
             opencode_plugins_dir: config_home.join("opencode").join("plugins"),
+            catalog_cache: crate::catalog::fetched::cache_dir().ok(),
         })
     }
 
@@ -432,6 +437,7 @@ impl Paths {
             codex_config: root.join(".codex/config.toml"),
             state_dir: root.join(".local/share/toker"),
             opencode_plugins_dir: root.join(".config/opencode/plugins"),
+            catalog_cache: None,
         }
     }
 
@@ -664,7 +670,7 @@ ExecStart="{exe}" hold --for={HOLD_UNIT_FOR}
 /// (`Persistent=true`): unlike a ping, a late sync is still right.
 pub fn picker_user_units(exe: &Path, claude_dir: &Path, state_dir: &Path) -> (String, String) {
     let timer = r#"[Unit]
-Description=toker picker timer (refreshes Claude Code's openrouter /model rows daily)
+Description=toker picker timer (refreshes Claude Code's /model rows daily)
 
 [Timer]
 OnCalendar=daily
@@ -677,7 +683,7 @@ WantedBy=timers.target
     .to_owned();
     let service = format!(
         r#"[Unit]
-Description=toker picker sync (Claude Code's openrouter /model rows)
+Description=toker picker sync (Claude Code's /model rows)
 
 [Service]
 Type=oneshot
@@ -994,6 +1000,28 @@ struct Detected {
     /// The codex CLI's login exists — `codex_sub` is offered when it
     /// does (there is nothing to configure; the login is shared).
     codex_auth: bool,
+    /// The ledger's active routing revision, when the database already
+    /// owns routing.
+    routing: Option<OwnedRouting>,
+}
+
+/// The active routing revision found in the ledger: routing is
+/// database-owned, and setup never replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnedRouting {
+    revision_id: i64,
+    source: PolicyRevisionSource,
+}
+
+impl OwnedRouting {
+    fn describe(self) -> String {
+        let source = match self.source {
+            PolicyRevisionSource::Legacy => "compiled from the legacy config",
+            PolicyRevisionSource::Draft => "from a draft",
+            PolicyRevisionSource::Reactivation => "reactivated",
+        };
+        format!("revision {} ({source})", self.revision_id)
+    }
 }
 
 /// One detected frontend and what its file currently says.
@@ -1035,10 +1063,12 @@ struct Choices {
     /// written config enables.
     backends: Vec<&'static str>,
     /// The anthropic protocol's default, among the ticked; `None` when
-    /// no anthropic backend is ticked.
+    /// no anthropic backend is ticked, or when the database already owns
+    /// routing and the question is not asked.
     anthropic_default: Option<&'static str>,
     /// The openai_chat protocol's default, among the ticked; `None` when
-    /// no Chat-capable backend is ticked.
+    /// no Chat-capable backend is ticked, or when the database already
+    /// owns routing.
     openai_chat_default: Option<&'static str>,
     /// Asked only when anthropic_api is ticked.
     anthropic_api_key: Option<KeyChoice>,
@@ -1137,9 +1167,17 @@ pub struct RunReport {
     pub wake_enabled: bool,
     /// Manual commands for the wake timer when not enabled.
     pub wake_manual: Vec<String>,
-    /// What became of the openrouter `/model` picker sync, when claude
-    /// is a frontend and there was anything to do.
+    /// What became of the Claude `/model` picker sync, when claude is a
+    /// frontend.
     pub picker: Option<String>,
+    /// The revision this run activated from the wizard's choices, when
+    /// the database did not own routing yet.
+    pub routing_activated: Option<i64>,
+    /// The revision the database already owned, when it did.
+    pub routing_owned: Option<i64>,
+    /// The legacy routing fields an owned rewrite dropped from the
+    /// config.
+    pub legacy_fields_dropped: Vec<String>,
 }
 
 // ── the wizard ──────────────────────────────────────────────────────────
@@ -1232,7 +1270,7 @@ impl<'a> Wizard<'a> {
             self.toggles_step(&detected, &current, &mut report)?;
             // Last, after the timers: it writes claude's settings, so it
             // must follow verify like the frontend patches do.
-            self.picker_step(&detected, &current, &mut report)?;
+            self.picker_step(&detected, &mut report)?;
         }
         self.finish(&report)?;
         Ok(report)
@@ -1289,6 +1327,15 @@ impl<'a> Wizard<'a> {
                     false,
                 ),
             };
+
+        let db_path = match &config {
+            Some(config) if db_explicit => config.db_path.clone(),
+            _ => self.paths.db_path(),
+        };
+        let routing = self.read_routing(&db_path).context(
+            "the wizard stopped without changing anything: \
+             reading the routing state from the ledger",
+        )?;
 
         let mut frontends = Vec::new();
         if self.paths.claude_settings.exists() {
@@ -1350,9 +1397,37 @@ impl<'a> Wizard<'a> {
             frontends,
             ctp_usage: self.paths.ctp_usage.exists(),
             codex_auth: self.paths.codex_auth.exists(),
+            routing,
         };
         self.state_summary(&detected)?;
         Ok(detected)
+    }
+
+    /// Whether the ledger at `db_path` already owns routing. No file, or a
+    /// ledger from before the policy tables, is not owned; a ledger that
+    /// cannot be read is an error, because writing a config over a
+    /// database in an unknown state could strand the machine.
+    fn read_routing(&self, db_path: &Path) -> Result<Option<OwnedRouting>> {
+        let store = match Store::open_read_only(db_path) {
+            Ok(store) => store,
+            Err(crate::store::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !store.schema_is_current()? {
+            return Ok(None);
+        }
+        let Some(revision_id) = store.load_routing_policy_state()?.active_revision_id else {
+            return Ok(None);
+        };
+        let revision = store
+            .load_policy_revision(revision_id)?
+            .with_context(|| format!("active policy revision {revision_id} is missing"))?;
+        Ok(Some(OwnedRouting {
+            revision_id,
+            source: revision.source,
+        }))
     }
 
     /// The state summary print (from [`Wizard::detect_state`], before
@@ -1362,18 +1437,10 @@ impl<'a> Wizard<'a> {
         self.say("toker setup — the state of this machine")?;
         let config_line = match (&detected.config, &detected.config_error) {
             (Some(config), _) => format!(
-                "{} — port {}, backends {}, anthropic → {}, openai_chat → {}, awake {}, db {}",
+                "{} — port {}, backends {}, awake {}, db {}",
                 self.paths.config_toml.display(),
                 config.port,
                 backends_list(config),
-                config
-                    .default_backend_anthropic
-                    .as_deref()
-                    .unwrap_or("none"),
-                config
-                    .default_backend_openai_chat
-                    .as_deref()
-                    .unwrap_or("none"),
                 on_off(config.awake),
                 config.db_path.display(),
             ),
@@ -1386,6 +1453,15 @@ impl<'a> Wizard<'a> {
             (None, None) => "none (fresh setup)".to_owned(),
         };
         self.say(&format!("  config      : {config_line}"))?;
+        match detected.routing {
+            Some(routing) => self.say(&format!(
+                "  routing     : database-owned, {} — edit it in `toker tui`",
+                routing.describe()
+            ))?,
+            None => self.say(
+                "  routing     : not in the database yet — setup activates it from the answers",
+            )?,
+        }
         match detected.socket_active {
             Some(true) => self.say(&format!("  systemd     : {SOCKET_UNIT} is active"))?,
             Some(false) => self.say(&format!("  systemd     : {SOCKET_UNIT} is not active"))?,
@@ -1566,8 +1642,7 @@ impl<'a> Wizard<'a> {
             }
             self.say(
                 "  note: the model routing that makes the translated route useful \
-                 ([providers.codex_sub.model_map] in toker.toml) is a deliberate \
-                 operator edit — the wizard writes none",
+                 is a deliberate operator edit in `toker tui` — the wizard writes none",
             )?;
         }
         let openrouter_key = if ticked("openrouter") {
@@ -1603,13 +1678,17 @@ impl<'a> Wizard<'a> {
             None
         };
 
-        // Each protocol's default, among the ticked backends that bind it.
+        // Each protocol's default, among the ticked backends that bind it,
+        // is only asked while the config still decides routing: once the
+        // database owns it, the routing TUI is where defaults live.
+        let owned = detected.routing.is_some();
         let candidates: Vec<&'static str> = ANTHROPIC_BACKENDS
             .iter()
             .copied()
             .filter(|name| ticked(name))
             .collect();
         let anthropic_default = match candidates.as_slice() {
+            _ if owned => None,
             [] => None,
             [only] => Some(*only),
             several => {
@@ -1634,6 +1713,7 @@ impl<'a> Wizard<'a> {
             .filter(|name| ticked(name))
             .collect();
         let openai_chat_default = match candidates.as_slice() {
+            _ if owned => None,
             [] => None,
             [only] => Some(*only),
             several => {
@@ -1893,14 +1973,27 @@ impl<'a> Wizard<'a> {
                 self.paths.config_toml.display()
             ))?;
             report.config_kept = true;
+            report.routing_owned = detected.routing.map(|routing| routing.revision_id);
             return Ok(config);
         };
         let mut choices = choices.clone();
         self.place_keys(&mut choices)?;
         let db_explicit = detected.db_explicit;
+        let before = std::fs::read_to_string(&self.paths.config_toml).unwrap_or_default();
+        let owned = detected.routing;
+        let paths = self.paths;
         let mut written: Option<Config> = None;
+        let mut activated: Option<i64> = None;
+        // The activation runs inside the writer's changes, so it happens
+        // after the choices are applied and validated against the existing
+        // file and before the file is replaced. A failure in either stops
+        // before the write. A failed write after it leaves a database-owned
+        // machine, and the next run writes the owned config.
         write_config(&self.paths.config_toml, |config| {
-            apply_choices(config, &choices, self.paths, db_explicit)?;
+            apply_choices(config, &choices, paths, db_explicit)?;
+            if owned.is_none() {
+                activated = Some(activate_revision_one(config, paths)?);
+            }
             written = Some(config.clone());
             Ok(())
         })?;
@@ -1912,17 +2005,31 @@ impl<'a> Wizard<'a> {
             on_off(config.awake),
             backends_list(&config),
         ))?;
-        self.say(&format!(
-            "  anthropic → {}; openai_chat → {}",
-            config
-                .default_backend_anthropic
-                .as_deref()
-                .unwrap_or("none"),
-            config
-                .default_backend_openai_chat
-                .as_deref()
-                .unwrap_or("none")
-        ))?;
+        match (owned, activated) {
+            (Some(routing), _) => {
+                report.routing_owned = Some(routing.revision_id);
+                self.say(&format!(
+                    "  routing: database-owned, {} — left as it is; edit it in `toker tui`",
+                    routing.describe()
+                ))?;
+            }
+            (None, Some(revision_id)) => {
+                report.routing_activated = Some(revision_id);
+                self.say(&format!(
+                    "  routing: activated revision {revision_id} from these choices — \
+                     edit it in `toker tui`"
+                ))?;
+            }
+            (None, None) => unreachable!("an unowned machine activates before the write"),
+        }
+        let dropped = legacy_routing_fields(&before);
+        if !dropped.is_empty() {
+            self.say(&format!(
+                "  routing fields no longer in the file (the database holds them): {}",
+                dropped.join(", ")
+            ))?;
+        }
+        report.legacy_fields_dropped = dropped;
         if let Some(api) = &config.anthropic_api {
             self.say(&key_line(
                 "anthropic_api",
@@ -2196,21 +2303,13 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    /// The openrouter `/model` rows in claude's settings, after the
-    /// timers: it writes claude's settings, which the ordering rule only
-    /// allows once the service is verified. With an
-    /// openrouter backend, the picker units go in, the timer is
-    /// enabled, and the service runs once now, so setup exercises the
-    /// same sandboxed path the timer will. Without one, a previous
-    /// run's units run one last time (taking toker's rows back out of
-    /// the picker) and are removed. Never fatal: the proxy works without
-    /// the picker.
-    fn picker_step(
-        &mut self,
-        detected: &Detected,
-        config: &Config,
-        report: &mut RunReport,
-    ) -> Result<()> {
+    /// Claude's `/model` rows, after the timers: it writes claude's
+    /// settings, which the ordering rule only allows once the service is
+    /// verified. Whenever claude is a frontend, the picker units go in, the
+    /// timer is enabled, and the service runs once now, so setup exercises
+    /// the same sandboxed path the timer will. Never fatal: the proxy works
+    /// without the picker.
+    fn picker_step(&mut self, detected: &Detected, report: &mut RunReport) -> Result<()> {
         if !detected
             .frontends
             .iter()
@@ -2218,29 +2317,6 @@ impl<'a> Wizard<'a> {
         {
             return Ok(());
         }
-        let installed = self.paths.units_dir.join(PICKER_TIMER_UNIT).exists();
-        let database_owned = Store::open(&config.db_path)
-            .ok()
-            .and_then(|store| store.load_routing_policy_state().ok())
-            .is_some_and(|state| state.active_revision_id.is_some());
-        if config.openrouter.is_none() && !database_owned {
-            if !installed {
-                return Ok(());
-            }
-            let cleared = self.run_picker_sync()?;
-            let retired = self.retire_user_timers(&[PICKER_TIMER_UNIT.to_owned()], report)?;
-            report.picker = Some(if cleared && retired {
-                "no openrouter backend: rows and timer removed".to_owned()
-            } else {
-                format!(
-                    "no OpenRouter backend: NOT fully removed — finish by hand: \
-                     systemctl --user start {PICKER_SERVICE_UNIT} && \
-                     systemctl --user disable --now {PICKER_TIMER_UNIT}"
-                )
-            });
-            return Ok(());
-        }
-
         let exe = std::env::current_exe().context("resolving the running binary's own path")?;
         let claude_dir = self
             .paths
@@ -2282,7 +2358,7 @@ impl<'a> Wizard<'a> {
         }
         let synced = ok && self.run_picker_sync()?;
         report.picker = Some(if synced {
-            format!("openrouter rows synced; {PICKER_TIMER_UNIT} refreshes them daily")
+            format!("Claude /model rows synced; {PICKER_TIMER_UNIT} refreshes them daily")
         } else if ok {
             format!(
                 "{PICKER_TIMER_UNIT} enabled, but the first sync failed — \
@@ -2895,6 +2971,16 @@ impl<'a> Wizard<'a> {
             format!("kept {} as is", self.paths.config_toml.display())
         };
         self.say(&format!("  config    : {config}"))?;
+        let routing = match (report.routing_activated, report.routing_owned) {
+            (Some(revision_id), _) => format!("activated revision {revision_id} from this setup"),
+            (None, Some(revision_id)) => {
+                format!("database-owned, revision {revision_id}, left as is")
+            }
+            (None, None) => {
+                "not in the database yet — the service compiles the config on start".to_owned()
+            }
+        };
+        self.say(&format!("  routing   : {routing}"))?;
         let units = if report.units_ok {
             format!(
                 "{}: {} installed; daemon-reload + enable --now ok",
@@ -2987,6 +3073,32 @@ impl<'a> Wizard<'a> {
 }
 
 // ── the wizard's free helpers ───────────────────────────────────────────
+
+/// Compile revision one from the config and activate it in the ledger the
+/// config names, exactly as the service would at its first start. Returns the
+/// revision now active.
+fn activate_revision_one(config: &Config, paths: &Paths) -> Result<i64> {
+    use crate::catalog::{fetched, offers};
+
+    let store = Store::open(&config.db_path)
+        .with_context(|| format!("opening the ledger at {}", config.db_path.display()))?;
+    let registry = crate::routing::RouteRegistry::configured_bindings(
+        crate::picker::configured_bindings(config),
+    );
+    // The same view the picker sync computes its generation over.
+    let catalogs = crate::picker::configured_catalogs(config, paths.catalog_cache.as_deref());
+    let inventory = offers::inventory(&registry, &catalogs);
+    let (revision, _policy) = crate::policy::legacy::establish_revision_one(
+        &store,
+        config,
+        &registry,
+        &inventory,
+        fetched::snapshot_generation(&catalogs),
+        jiff::Timestamp::now().as_millisecond(),
+    )
+    .context("activating the routing policy from the wizard's choices")?;
+    Ok(revision.revision_id)
+}
 
 /// Apply the wizard's choices to the config the config writer read
 /// (its read-merge-rewrite preserves everything not changed here). A
@@ -3496,6 +3608,19 @@ mod tests {
         outcomes
     }
 
+    /// The routing revision the scratch ledger has active, if any.
+    fn active_revision(paths: &Paths) -> Option<crate::store::PolicyRevision> {
+        let store = Store::open_read_only(paths.db_path()).ok()?;
+        let id = store.load_routing_policy_state().ok()?.active_revision_id?;
+        store.load_policy_revision(id).ok()?
+    }
+
+    /// The active revision's document, rendered for substring assertions.
+    fn active_document(paths: &Paths) -> String {
+        let revision = active_revision(paths).expect("a revision is active");
+        serde_json::to_string(revision.document.document()).expect("render the document")
+    }
+
     fn active() -> Result<Output> {
         outcome(true, "active\n", "")
     }
@@ -3993,8 +4118,12 @@ default_backend_anthropic = "codex_sub"
         // and no literal key.
         let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
         assert!(text.contains(&format!("port = {port}")));
-        assert!(text.contains("default_backend_anthropic = \"anthropic_sub\""));
-        assert!(text.contains("default_backend_openai_chat = \"openrouter\""));
+        assert!(
+            !text.contains("default_backend_"),
+            "routing is in the database"
+        );
+        assert_eq!(report.routing_activated, Some(1));
+        assert!(active_document(&rig.paths()).contains("openrouter"));
         assert!(text.contains("awake = true"));
         assert!(text.contains(&format!(
             "db_path = \"{}\"",
@@ -4429,7 +4558,7 @@ default_backend_anthropic = "codex_sub"
                 confirm(true),           // codex
                 confirm(false),          // wake/hold/ping timers: no
             ],
-            vec![active(), ok_empty(), ok_empty()],
+            with_picker(vec![active(), ok_empty(), ok_empty()]),
         );
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
         std::fs::write(rig.toml_path(), EXISTING_TOML).expect("seed the existing toml");
@@ -4444,17 +4573,24 @@ default_backend_anthropic = "codex_sub"
 
         // The reconfigured choices applied…
         let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
-        assert!(text.contains("default_backend_anthropic = \"codex_sub\""));
         assert!(text.contains(&format!("port = {port}")));
         assert!(text.contains("awake = true"));
-        // …and the hand-set model map survived the read-merge-rewrite.
-        assert!(text.contains("[providers.codex_sub.model_map]"));
-        assert!(text.contains("\"family:opus\" = \"gpt-5.6-sol\""));
-        assert!(text.contains("\"family:haiku\" = \"gpt-5.6-luna\""));
+        // …and the hand-set routing moved into the database: revision one
+        // compiled the model map before the file stopped carrying it.
+        assert!(!text.contains("model_map") && !text.contains("default_backend_"));
+        let revision = active_revision(&rig.paths()).expect("revision one is active");
+        assert_eq!(revision.revision_id, 1);
+        assert_eq!(revision.source, PolicyRevisionSource::Legacy);
+        assert!(active_document(&rig.paths()).contains("gpt-5.6-sol"));
+        assert_eq!(report.routing_activated, Some(1));
+        assert_eq!(
+            report.legacy_fields_dropped,
+            ["default_backend_anthropic", "providers.codex_sub.model_map"]
+        );
 
         // The existing config's enabled set was pre-ticked (codex_sub
         // alone, though claude's settings exist: the config wins over
-        // detection) — and the note about the deliberate model-map edit
+        // detection) — and the note about the deliberate routing edit
         // was printed.
         assert_eq!(rig.prompt.asked()[1].kind, "multi_select");
         assert_eq!(rig.prompt.asked()[1].default.as_deref(), Some("[2]"));
@@ -4462,10 +4598,20 @@ default_backend_anthropic = "codex_sub"
             !text.contains("[providers.openrouter]"),
             "not ticked, not enabled"
         );
+        let out = rig.out();
         assert!(
-            rig.out().contains("providers.codex_sub.model_map"),
-            "the codex_sub model-map note: {}",
-            rig.out()
+            out.contains("a deliberate operator edit in `toker tui`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("activated revision 1 from these choices"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "no longer in the file (the database holds them): default_backend_anthropic"
+            ),
+            "{out}"
         );
 
         assert!(report.config_written);
@@ -4493,6 +4639,167 @@ default_backend_anthropic = "codex_sub"
         assert!(codex.contains(&format!(
             "base_url = \"http://127.0.0.1:{port}/f/codex/v1\""
         )));
+    }
+
+    /// Seed the scratch config with `text` and activate revision one from
+    /// it, so the machine is database-owned before the wizard runs.
+    fn seed_owned(rig: &Rig, text: &str) -> crate::store::PolicyRevision {
+        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
+        std::fs::write(rig.toml_path(), text).expect("seed the toml");
+        let mut config = Config::load_from(&rig.toml_path()).expect("the seed loads");
+        config.db_path = rig.paths().db_path();
+        activate_revision_one(&config, &rig.paths()).expect("activate revision one");
+        active_revision(&rig.paths()).expect("revision one is active")
+    }
+
+    #[tokio::test]
+    async fn an_owned_machine_is_asked_no_defaults_and_keeps_its_revision() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "owned-reconfigure",
+            vec![
+                select(1),               // reconfigure
+                multi(&[0, 2]),          // anthropic_sub + codex_sub: two candidates
+                confirm(true),           // awake
+                text(&port.to_string()), // the scratch port
+                confirm(false),          // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let before = seed_owned(&rig, EXISTING_TOML);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(
+            !rig.prompt
+                .asked()
+                .iter()
+                .any(|asked| asked.message.contains("Default backend")),
+            "the database owns the defaults"
+        );
+        let after = active_revision(&rig.paths()).expect("still active");
+        assert_eq!(after.revision_id, before.revision_id);
+        assert_eq!(after.fingerprint, before.fingerprint);
+        assert_eq!(report.routing_owned, Some(before.revision_id));
+        assert_eq!(report.routing_activated, None);
+        assert_eq!(
+            report.legacy_fields_dropped,
+            ["default_backend_anthropic", "providers.codex_sub.model_map"]
+        );
+        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
+        assert!(!text.contains("model_map") && !text.contains("default_backend_"));
+        assert!(
+            text.contains("[providers.anthropic_sub]") && text.contains("[providers.codex_sub]")
+        );
+        let out = rig.out();
+        assert!(
+            out.contains("routing     : database-owned, revision 1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("routing fields no longer in the file"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeping_an_owned_machines_config_leaves_its_legacy_fields_alone() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "owned-keep",
+            vec![select(0), confirm(false)], // keep it as is; no timers
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let seeded = format!("port = {port}\n{EXISTING_TOML}");
+        seed_owned(&rig, &seeded);
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert!(report.config_kept && !report.config_written);
+        assert_eq!(
+            std::fs::read_to_string(rig.toml_path()).expect("read the toml"),
+            seeded
+        );
+        assert_eq!(report.routing_owned, Some(1));
+        assert!(rig.out().contains("routing     : database-owned"));
+    }
+
+    #[tokio::test]
+    async fn a_ledger_that_cannot_be_read_stops_setup_before_anything_changes() {
+        let mut rig = Rig::new("ledger-unreadable", vec![], vec![inactive()]);
+        std::fs::create_dir_all(rig.paths().state_dir).expect("create the state dir");
+        std::fs::write(rig.paths().db_path(), "this is not a database").expect("seed a bad ledger");
+        let before = seed_claude(&rig.root);
+
+        let error = rig.run(VERIFY_TIMEOUT).await.expect_err("must stop");
+
+        assert!(
+            format!("{error:#}").contains("without changing anything"),
+            "{error:#}"
+        );
+        assert!(!rig.toml_path().exists());
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_config_write_after_activation_is_recovered_by_the_next_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "write-fail",
+            vec![
+                select(1),               // reconfigure
+                multi(&[2]),             // codex_sub
+                confirm(true),           // awake
+                text(&port.to_string()), // the scratch port
+            ],
+            vec![inactive()],
+        );
+        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
+        std::fs::write(rig.toml_path(), EXISTING_TOML).expect("seed the toml");
+        let config_dir = rig
+            .toml_path()
+            .parent()
+            .expect("the config dir")
+            .to_path_buf();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make the config dir read-only");
+        if std::fs::write(config_dir.join("probe"), "").is_ok() {
+            return; // permissions do not bind this user (root): nothing to test
+        }
+
+        let error = rig.run(VERIFY_TIMEOUT).await.expect_err("the write fails");
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore the config dir");
+        assert!(!format!("{error:#}").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(rig.toml_path()).expect("read the toml"),
+            EXISTING_TOML,
+            "the old config is untouched"
+        );
+        let revision = active_revision(&rig.paths()).expect("activation had already happened");
+        assert_eq!(revision.revision_id, 1);
+
+        // The next run finds a database-owned machine and writes the owned config.
+        let mut next = Rig::at(
+            rig.root.clone(),
+            vec![
+                select(1),
+                multi_defaults(),
+                confirm(true),
+                text(&port.to_string()),
+                confirm(false),
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+        let report = next.run(VERIFY_TIMEOUT).await.expect("the recovery run");
+        assert_eq!(report.routing_owned, Some(1));
+        let text = std::fs::read_to_string(next.toml_path()).expect("read the toml");
+        assert!(!text.contains("model_map"));
     }
 
     #[tokio::test]
@@ -4783,7 +5090,6 @@ default_backend_anthropic = "codex_sub"
                 select(1),        // anthropic_api: still toker's
                 text(""),         // empty keeps the stored key
                 select(0),        // openrouter: the frontend's own
-                select(0),        // openai_chat default: openrouter
                 confirm(true),
                 text(&port.to_string()),
                 confirm(false),
@@ -4893,14 +5199,13 @@ default_backend_anthropic = "codex_sub"
             config.enabled_backends(),
             vec!["anthropic_sub", "codex_sub"]
         );
-        assert_eq!(
-            config.default_backend_anthropic.as_deref(),
-            Some("codex_sub")
+        // The defaults went to the database, not the file.
+        assert!(
+            !std::fs::read_to_string(rig.toml_path())
+                .expect("read the toml")
+                .contains("default_backend_")
         );
-        assert_eq!(
-            config.default_backend_openai_chat.as_deref(),
-            Some("codex_sub")
-        );
+        assert!(active_document(&rig.paths()).contains("codex_sub"));
         // codex_sub ticked without a login: said so.
         assert!(rig.out().contains("no codex login"), "{}", rig.out());
     }
@@ -4911,17 +5216,18 @@ default_backend_anthropic = "codex_sub"
         let mut rig = Rig::new(
             "state-dir-fail",
             vec![
-                multi(&[0, 3]), // backends: anthropic_sub + openrouter
-                select(2),      // openrouter key: an env var
-                text(""),
-                select(0), // openai_chat default: openrouter
-                confirm(true),
-                text(&port.to_string()),
+                select(0), // keep the config as it is
             ],
             // is-active only: with the state dir missing, nothing may
             // start, so reload and enable must never be called.
             vec![inactive()],
         );
+        std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
+        std::fs::write(
+            rig.toml_path(),
+            format!("port = {port}\n[providers.anthropic_sub]\n[providers.openrouter]\n"),
+        )
+        .expect("seed the existing toml");
         let before_claude = seed_claude(&rig.root);
         // A file where the state dir belongs: create_dir_all fails.
         let state_dir = rig.paths().state_dir;
@@ -4963,6 +5269,40 @@ default_backend_anthropic = "codex_sub"
         );
         assert!(out.contains(&format!("  {mkdir}")), "{out}");
         assert!(out.contains("no frontend was touched"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_ledger_that_cannot_be_opened_stops_setup_before_the_config_is_written() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "activation-fail",
+            vec![
+                multi(&[0]), // backends: anthropic_sub
+                confirm(true),
+                text(&port.to_string()),
+            ],
+            vec![inactive()],
+        );
+        let before_claude = seed_claude(&rig.root);
+        // A file where the state dir belongs: the ledger cannot be created.
+        let state_dir = rig.paths().state_dir;
+        std::fs::create_dir_all(state_dir.parent().expect("the data dir"))
+            .expect("create the data dir");
+        std::fs::write(&state_dir, "").expect("block the state dir");
+
+        let error = rig
+            .run(Duration::from_millis(300))
+            .await
+            .expect_err("activation cannot succeed");
+        assert!(
+            format!("{error:#}").contains("opening the ledger"),
+            "{error:#}"
+        );
+        assert!(!rig.toml_path().exists(), "no config was written");
+        assert_eq!(
+            std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
+            before_claude
+        );
     }
 
     #[tokio::test]
@@ -5451,14 +5791,13 @@ default_backend_anthropic = "codex_sub"
         assert_eq!(rig.runner.system_calls().len(), 2);
     }
 
-    /// With no openrouter backend, picker units an earlier run left run
-    /// once more (taking toker's rows back out of claude's picker) and
-    /// are removed. With neither, the step does nothing at all.
+    /// The picker is Claude publication, not an OpenRouter feature: with
+    /// claude as a frontend its units go in whatever backends are ticked.
     #[tokio::test]
-    async fn without_openrouter_an_earlier_picker_runs_once_more_and_goes() {
+    async fn claude_gets_the_picker_units_without_an_openrouter_backend() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
-            "picker-gone",
+            "picker-no-openrouter",
             vec![
                 multi(&[0]),             // backends: anthropic_sub only
                 confirm(true),           // awake
@@ -5466,40 +5805,52 @@ default_backend_anthropic = "codex_sub"
                 confirm(true),           // claude
                 confirm(false),          // wake/hold/ping timers: no
             ],
-            vec![
-                inactive(),
-                ok_empty(), // daemon-reload (units)
-                ok_empty(), // enable --now socket
-                ok_empty(), // start toker-picker.service: the last sync
-                ok_empty(), // disable --now toker-picker.timer
-            ],
+            with_picker(vec![inactive(), ok_empty(), ok_empty()]),
         );
+        let exe = std::env::current_exe().expect("the test binary");
         seed_claude(&rig.root);
-        seed_units(&rig, &[PICKER_TIMER_UNIT, PICKER_SERVICE_UNIT]);
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
         let calls = rig.runner.calls();
-        assert_eq!(
-            calls[calls.len() - 2..],
-            strings(vec![
-                vec!["start", PICKER_SERVICE_UNIT],
-                vec!["disable", "--now", PICKER_TIMER_UNIT],
-            ])
+        assert_eq!(calls[calls.len() - 3..], picker_calls());
+        assert!(
+            picker_installed(&rig, &exe)
+                .iter()
+                .all(|unit| rig.runner.installed().contains(unit)),
+            "the picker pair was installed"
         );
         assert_eq!(
-            rig.runner.removed(),
-            [PICKER_TIMER_UNIT, PICKER_SERVICE_UNIT]
+            report.picker.as_deref(),
+            Some("Claude /model rows synced; toker-picker.timer refreshes them daily")
         );
+    }
+
+    /// Without claude as a frontend the picker step does nothing.
+    #[tokio::test]
+    async fn no_claude_means_no_picker_units() {
+        let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
+        let mut rig = Rig::new(
+            "picker-no-claude",
+            vec![
+                multi(&[3]),             // backends: openrouter only
+                select(2),               // openrouter key: an env var
+                text(""),                // the default env var
+                confirm(true),           // awake
+                text(&port.to_string()), // the listener port
+                confirm(false),          // wake/hold/ping timers: no
+            ],
+            vec![inactive(), ok_empty(), ok_empty()],
+        );
+
+        let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
+
+        assert_eq!(report.picker, None);
         assert!(
             rig.runner
                 .installed()
                 .iter()
                 .all(|(name, _)| !name.starts_with("toker-picker."))
-        );
-        assert_eq!(
-            report.picker.as_deref(),
-            Some("no openrouter backend: rows and timer removed")
         );
     }
 
