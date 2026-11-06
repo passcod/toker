@@ -10,6 +10,7 @@ pub mod diagnostic;
 pub mod document;
 pub mod edit;
 pub mod family;
+pub mod force_newest;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;

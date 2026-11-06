@@ -199,7 +199,7 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
             frontend.as_deref(),
             Some(requested_model.clone()),
             lane_reference.clone(),
-            crate::middleware::force_newest::prompt_bound(original.len() as u64),
+            crate::policy::force_newest::prompt_bound(original.len() as u64),
             shape.req_messages,
             shape.req_tools,
             super::anthropic::required_capabilities(canonical_request),

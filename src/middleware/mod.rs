@@ -28,10 +28,6 @@
 //!   family parsing and day-based newest election) and the
 //!   in-memory recently-served map, plus the merge semantics the
 //!   `/_toker/models/merge` control endpoint carries;
-//! - [`force_newest`] — the force-newest model rewrite (the
-//!   target decision plus the block that sequences it): move a request onto its family's learned
-//!   newest, only where no cache can be lost, never down, sticky once
-//!   moved;
 //! - [`model_map`] — the model routing map: opaque
 //!   operator routing policy, the pure parse/match/rewrite interface the
 //!   `route-identity` parity case pins (config and server wiring are the
@@ -44,7 +40,6 @@
 pub mod awake;
 pub mod canonical;
 pub mod cold;
-pub mod force_newest;
 pub mod lanes;
 pub mod model_map;
 pub mod models;

@@ -9,8 +9,8 @@ use std::convert::Infallible;
 
 use thiserror::Error;
 
+use super::force_newest::{NEW_CONVERSATION_MESSAGES, idle_for_ttl};
 use crate::catalog::offers::OfferInventory;
-use crate::middleware::force_newest::{NEW_CONVERSATION_MESSAGES, idle_for_ttl};
 use crate::routing::Capabilities;
 
 use super::{

@@ -49,8 +49,7 @@ pub use crate::policy::family::family_of;
 use crate::policy::learning::requirement;
 use crate::store::{ModelEntry, RequestRow, Store, local_day};
 
-/// Is `a` a strictly newer version than `b`, within the same family?
-pub fn newer_than(a: &str, b: &str) -> bool {
+fn newer_than(a: &str, b: &str) -> bool {
     match (family_of(a), family_of(b)) {
         (Some(a), Some(b)) => a.is_newer_than(&b),
         _ => false,
@@ -653,24 +652,6 @@ impl ModelStore {
     ) -> crate::store::Result<Option<String>> {
         let entries = self.store.load_models()?;
         Ok(compaction_target_of(&entries, spec, prompt, map, declared))
-    }
-
-    /// The strictly-newer learned member of `model`'s family that a
-    /// request could be rewritten onto, proven at `prompt`
-    /// (the decision core lives in
-    /// [`crate::middleware::force_newest::force_target_of`], where the
-    /// sequencing that calls it is ported). A store error propagates; the
-    /// caller loses the upgrade, never the request (invariant 6).
-    pub fn force_target(
-        &self,
-        model: &str,
-        prompt: u64,
-        declared: DeclaredWindows,
-    ) -> crate::store::Result<Option<String>> {
-        let entries = self.store.load_models()?;
-        Ok(crate::middleware::force_newest::force_target_of(
-            &entries, model, prompt, declared,
-        ))
     }
 
     /// Read one exact learned entry without mutating the legacy table.
