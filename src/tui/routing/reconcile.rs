@@ -54,21 +54,9 @@ impl Reconciler {
 }
 
 fn run(sync: &SettingsSync) -> String {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return failure(&error.to_string()),
-    };
     // A panic must not leave the page claiming it is still reconciling.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(crate::picker::sync(
-            &sync.config,
-            &sync.settings,
-            &reqwest::Client::new(),
-            false,
-        ))
+        crate::picker::sync(&sync.config, &sync.settings, false)
     }));
     match result {
         Ok(Ok(report)) if report.changed => "Claude settings: updated".to_owned(),
@@ -97,6 +85,23 @@ mod tests {
         config.db_path = dir.join("toker.db");
         let settings = dir.join("settings.json");
         std::fs::write(&settings, "{}").unwrap();
+        // The sync publishes the active policy, so one must be active.
+        let store = crate::store::Store::open(&config.db_path).unwrap();
+        let registry = crate::routing::RouteRegistry::configured_bindings(
+            crate::picker::configured_bindings(&config),
+        );
+        let cache = crate::catalog::fetched::cache_dir().ok();
+        let catalogs = crate::picker::configured_catalogs(&config, cache.as_deref());
+        let inventory = crate::catalog::offers::inventory(&registry, &catalogs);
+        crate::policy::legacy::establish_revision_one(
+            &store,
+            &config,
+            &registry,
+            &inventory,
+            crate::catalog::fetched::snapshot_generation(&catalogs),
+            1,
+        )
+        .unwrap();
         (dir, SettingsSync { config, settings })
     }
 

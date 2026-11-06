@@ -25,15 +25,8 @@ use anyhow::bail;
 /// `serve`: config → store → server, with tracing on.
 pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
-    let config = Config::load_for_owned_service()?;
+    let config = Config::load()?;
     let store = Arc::new(Store::open(&config.db_path)?);
-    if store
-        .load_routing_policy_state()?
-        .active_revision_id
-        .is_none()
-    {
-        config.validate()?;
-    }
     tracing::info!(
         "serving anthropic → {}, openai_chat → {} (db: {})",
         config
@@ -189,34 +182,20 @@ fn key_sources_line(env: &str, sources: crate::config::KeySources) -> String {
     )
 }
 
-/// `picker sync`: the openrouter rows of Claude Code's `/model` picker,
-/// rebuilt from openrouter's listing (see [`crate::picker`]). Warnings
-/// go to stderr; a dry run prints the rows instead of writing them.
+/// `picker sync`: Claude Code's `/model` rows, rebuilt from the active routing
+/// policy (see [`crate::picker`]). A dry run prints the rows instead of
+/// writing them.
 pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
     let config = Config::load()?;
     let settings = crate::setup::wizard::Paths::real()?.claude_settings;
-    let report = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building the picker sync's runtime")?
-        .block_on(crate::picker::sync(
-            &config,
-            &settings,
-            &reqwest::Client::new(),
-            dry_run,
-        ))?;
-    for warning in &report.warnings {
-        eprintln!("warning: {warning}");
-    }
+    let report = crate::picker::sync(&config, &settings, dry_run)?;
     if dry_run {
         for row in &report.rows {
             println!("{}  {}  (as {})", row.model, row.label, row.behaves_as);
         }
     } else {
         println!(
-            "picker: {} openrouter rows in {} ({})",
+            "picker: {} Claude /model rows in {} ({})",
             report.rows.len(),
             settings.display(),
             if report.changed {

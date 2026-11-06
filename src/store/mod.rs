@@ -45,6 +45,7 @@ pub use state::{
     PingRecord, PolicyCompilerOrigin, PolicyDraft, PolicyRevision, PolicyRevisionSource,
     PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
     PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
+    publication_targets,
 };
 
 use std::env;
@@ -478,6 +479,16 @@ impl Store {
 
     pub fn load_policy_revisions(&self) -> Result<Vec<PolicyRevision>> {
         state::load_policy_revisions(&*self.conn()?)
+    }
+
+    /// Whether the ledger's schema has every migration applied. A reader that
+    /// opened it read-only uses this to tell an older ledger, which has no
+    /// routing ownership yet, from one it cannot read.
+    pub fn schema_is_current(&self) -> Result<bool> {
+        let version = self
+            .conn()?
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+        Ok(version >= schema::MIGRATIONS.len() as i64)
     }
 
     pub fn load_routing_policy_state(&self) -> Result<RoutingPolicyState> {

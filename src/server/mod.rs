@@ -384,8 +384,13 @@ impl Server {
     ) -> anyhow::Result<Server> {
         // The config's own validation, again: a Config built by hand (the
         // tests, any embedder) must not reach the registry with a default
-        // that names a disabled backend.
-        config.validate()?;
+        // that names a disabled backend. Under policy ownership the legacy
+        // defaults are not routing input, so only establishing revision one
+        // from them checks them.
+        match routing_ownership {
+            RoutingOwnership::LegacyShadow => config.validate()?,
+            RoutingOwnership::Policy => config.validate_retained()?,
+        }
         let http = upstream_client(UPSTREAM_IDLE_TIMEOUT)?;
         let openrouter = config.openrouter.as_ref().map(|openrouter| {
             Arc::new(OpenRouter::new(
@@ -550,39 +555,14 @@ impl Server {
                         let policy = compile_stored_policy(&revision, &registry, &inventory)?;
                         (revision, policy)
                     }
-                    None => {
-                        let document = crate::policy::legacy::validated(&config, &registry)?;
-                        let generated = crate::policy::legacy::compile_document(
-                            document.clone(),
-                            &registry,
-                            &inventory,
-                        )
-                        .into_policy()
-                        .map_err(|diagnostics| {
-                            anyhow::anyhow!(
-                                "generated revision one has {} compile diagnostics",
-                                diagnostics.len()
-                            )
-                        })?;
-                        let activation = store.activate_revision_one(
-                            &document,
-                            now_ms(),
-                            publication_generation,
-                            &publication_targets()?,
-                        )?;
-                        match activation {
-                            crate::store::RevisionOneActivation::Activated { revision, .. } => {
-                                (revision, generated)
-                            }
-                            crate::store::RevisionOneActivation::AlreadyActive {
-                                revision, ..
-                            } => {
-                                let policy =
-                                    compile_stored_policy(&revision, &registry, &inventory)?;
-                                (revision, policy)
-                            }
-                        }
-                    }
+                    None => crate::policy::legacy::establish_revision_one(
+                        &store,
+                        &config,
+                        &registry,
+                        &inventory,
+                        publication_generation,
+                        now_ms(),
+                    )?,
                 };
                 let runtime = crate::policy::PolicyRuntime::new_active_at_generation(
                     store.clone(),
@@ -1094,7 +1074,7 @@ impl Server {
                 expected_active_revision_id: snapshot.active_revision.revision_id,
                 document: &draft.document,
                 desired_inventory_generation: snapshot.inventory_generation,
-                publications: &publication_targets()?,
+                publications: &crate::store::publication_targets()?,
             })?;
         let runtime = self
             .policy_runtime
@@ -2112,7 +2092,7 @@ impl Server {
             {
                 Ok(policy) => {
                     let generation = publication_generation;
-                    if let Err(error) = publication_targets().and_then(|targets| {
+                    if let Err(error) = crate::store::publication_targets().and_then(|targets| {
                         self.store
                             .set_publications_desired(
                                 &targets,
@@ -2647,41 +2627,6 @@ fn compile_stored_policy(
             diagnostics.len()
         )
     })
-}
-
-fn publication_targets() -> crate::store::Result<Vec<crate::store::InitialPublication>> {
-    use crate::policy::{FrontendProtocol, FrontendScope};
-    use crate::store::{InitialPublication, PublicationAdapter, PublicationKey, PublicationState};
-
-    Ok(vec![
-        InitialPublication {
-            key: PublicationKey::new(
-                FrontendScope::Protocol {
-                    protocol: FrontendProtocol::OpenaiChat,
-                },
-                PublicationAdapter::new("dynamic_chat_models")?,
-            ),
-            state: PublicationState::Applied,
-        },
-        InitialPublication {
-            key: PublicationKey::new(
-                FrontendScope::Protocol {
-                    protocol: FrontendProtocol::OpenaiResponses,
-                },
-                PublicationAdapter::new("dynamic_responses_models")?,
-            ),
-            state: PublicationState::Applied,
-        },
-        InitialPublication {
-            key: PublicationKey::new(
-                FrontendScope::Protocol {
-                    protocol: FrontendProtocol::AnthropicMessages,
-                },
-                PublicationAdapter::new("claude_settings")?,
-            ),
-            state: PublicationState::Pending,
-        },
-    ])
 }
 
 fn availability_for(registry: &RouteRegistry, catalogs: &FetchedCatalogs) -> AvailabilitySnapshot {

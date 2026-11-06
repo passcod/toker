@@ -300,6 +300,11 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             if *field == 1 { format!("> model: {model}") } else { format!("  model: {model}") },
             "Tab selects · Ctrl+O completes from a daemon offer · Enter records · Esc cancels".to_owned(),
         ],
+        Modal::Import => vec![
+            "Replace the current draft with the routing in toker.toml?".to_owned(),
+            "The active revision does not change until the draft is activated.".to_owned(),
+            "y/Enter confirms · n/Esc cancels".to_owned(),
+        ],
         Modal::Conflict { daemon_generation, daemon_draft } => vec![
             "The daemon draft changed while this terminal was editing.".to_owned(),
             format!("daemon generation: {}", daemon_generation.map_or_else(|| "unknown".to_owned(), |value| value.to_string())),
@@ -331,6 +336,7 @@ fn render_legend(frame: &mut Frame) {
         "e  edit typed record; Ctrl+Enter saves JSON",
         "d  confirm removal; m orders route candidates",
         "v preview; V validate; a activate; x reactivate; p promote",
+        "i  import legacy toker.toml routing into the draft (status view)",
         "A missing daemon endpoint leaves the loaded read-only view usable",
         "? or Esc closes",
     ];

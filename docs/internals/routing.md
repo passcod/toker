@@ -16,8 +16,10 @@ serves them all, because the paths do not collide:
 | OpenAI Responses | `/v1/responses`, `/v1/models` | `codex_sub`, `openrouter`, `anthropic_api`, `anthropic_sub` (translated) |
 
 A backend is enabled by its `[providers.X]` block's presence in `toker.toml`.
-Each protocol has a default (`default_backend_anthropic`,
-`default_backend_openai_chat`), which bare model names go to. A model string can
+Each protocol has a default, which bare model names go to. The routing policy
+in the database owns it; `default_backend_anthropic` and
+`default_backend_openai_chat` in `toker.toml` are legacy fields, read only to
+compile revision one and by the TUI's import-to-draft. A model string can
 name its backend per request: `anthropic_sub/…`, `anthropic_api/…`,
 `anthropic/…` (the Messages protocol default), `openrouter/…`,
 `openai_api/…`, and `codex_sub/…` are stripped and routed where the shared
@@ -239,15 +241,18 @@ add models to `/model`; only one works on a subscription:
   model this Claude Code knows, whose client-side handling applies; without it
   a row for an unknown model is not offered.
 
-So toker writes `modelPicker` (`picker.rs`, `patchers::patch_model_picker`). The
-rows come from rules matched against openrouter's public listing, keeping each
-rule's newest matches, so a new model version replaces the old on the next sync.
-The service cannot write `~/.claude`, so `toker picker sync` runs as the user:
-setup runs it once through `toker-picker.service`, and `toker-picker.timer`
-repeats it daily, sandboxed to claude's settings dir and the state dir. A sync
-owns only rows whose model starts with `openrouter/`, rewrites the file only
-when the rows changed (Claude Code hot-reloads it into every session), and
-changes nothing when the listing cannot be fetched.
+So toker writes `modelPicker` (`picker.rs`, `patchers::reconcile_model_picker`).
+The rows are the active policy's Claude presentations, compiled against the
+cached catalogues, so a new model version replaces the old on the next sync. The
+service cannot write `~/.claude`, so `toker picker sync` runs as the user: setup
+runs it once through `toker-picker.service`, the routing TUI runs it after an
+activation, and `toker-picker.timer` repeats it daily, sandboxed to claude's
+settings dir and the state dir. The timer is installed whenever claude is a
+frontend, not only with an openrouter backend. A sync owns exactly the rows its
+last successful reconciliation recorded (`applied_identities`), rewrites the
+file only when the rows changed (Claude Code hot-reloads it into every
+session), and fails before touching the file when the database has no active
+revision or the catalogue changed under it.
 
 ## Inference routes are canonical
 

@@ -40,7 +40,9 @@ pub enum Step {
     ChooseBackends,
     /// Write `toker.toml`
     /// ([`config_writer::write_config`]) — the resolved config with
-    /// the wizard's choices applied, atomically.
+    /// the wizard's choices applied, atomically, once the database owns
+    /// routing: a machine that does not yet gets revision one activated
+    /// from the same choices first.
     WriteConfig,
     /// Install and start the systemd units (`toker.socket` first — the
     /// enabled unit — then `toker.service`). **This is where the

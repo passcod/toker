@@ -728,20 +728,9 @@ impl Config {
         Self::load_with_env(&ProcessEnvironment)
     }
 
-    pub(crate) fn load_for_owned_service() -> anyhow::Result<Config> {
-        Self::load_with_env_mode(&ProcessEnvironment, false)
-    }
-
     fn load_with_env(environment: &impl Environment) -> anyhow::Result<Config> {
-        Self::load_with_env_mode(environment, true)
-    }
-
-    fn load_with_env_mode(
-        environment: &impl Environment,
-        validate_routing: bool,
-    ) -> anyhow::Result<Config> {
         let path = config_path_with_env(environment)?;
-        let mut config = Self::load_from_mode(&path, validate_routing)?;
+        let mut config = Self::load_from(&path)?;
 
         // Env overrides (config file loses).
         if let Some(port) = environment.var_os("TOKER_PORT") {
@@ -772,9 +761,6 @@ impl Config {
         }
 
         config.validate_retained()?;
-        if validate_routing {
-            config.validate_routing()?;
-        }
         Ok(config)
     }
 
@@ -786,11 +772,13 @@ impl Config {
     /// file by a rewrite. A missing file is the defaults; a present
     /// file that does not parse or validate is an error — a
     /// hand-edited typo must not be silently clobbered.
+    ///
+    /// Loading does not check the legacy routing fields (the protocol
+    /// defaults) against the enabled backends: once the database owns
+    /// routing the file need not carry them, and every command that only
+    /// wants the providers and the listener must still load it. Whatever
+    /// reads them as routing input calls [`Config::validate`] first.
     pub fn load_from(path: &Path) -> anyhow::Result<Config> {
-        Self::load_from_mode(path, true)
-    }
-
-    fn load_from_mode(path: &Path, validate_routing: bool) -> anyhow::Result<Config> {
         let file = match fs::read_to_string(path) {
             Ok(text) => toml::from_str::<FileConfig>(&text)
                 .with_context(|| format!("parsing {}", path.display()))?,
@@ -801,9 +789,6 @@ impl Config {
         };
         let config = Self::resolve_file(file)?;
         config.validate_retained()?;
-        if validate_routing {
-            config.validate_routing()?;
-        }
         Ok(config)
     }
 
@@ -818,6 +803,7 @@ impl Config {
     /// slash), `~`-leading paths already expanded at load, model-map
     /// selectors canonical; comments and hand formatting are not
     /// carried.
+    #[cfg(test)]
     pub(crate) fn to_file(&self) -> FileConfig {
         self.to_file_with_routing(true)
     }
@@ -1094,7 +1080,6 @@ impl Config {
                 .ping_header_name
                 .unwrap_or_else(|| DEFAULT_PING_HEADER.to_owned()),
             default_backend_openai_chat: default_backend(
-                "default_backend_openai_chat",
                 file.default_backend_openai_chat.clone(),
                 if file.default_backend_openai_chat.is_some() {
                     &enabled_openai
@@ -1102,15 +1087,14 @@ impl Config {
                     &enabled_openai_legacy
                 },
                 Some("openrouter"),
-            )?,
+            ),
             openrouter,
             openai_api,
             default_backend_anthropic: default_backend(
-                "default_backend_anthropic",
                 file.default_backend_anthropic,
                 &enabled_anthropic,
                 Some("anthropic_sub"),
-            )?,
+            ),
             anthropic_sub,
             anthropic_api,
             codex_sub,
@@ -1146,7 +1130,7 @@ impl Config {
         self.validate_routing()
     }
 
-    fn validate_retained(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate_retained(&self) -> anyhow::Result<()> {
         // Session header names must be usable as header names, or the
         // per-request lookup by name would silently never match.
         for name in &self.session_header_names {
@@ -1288,28 +1272,23 @@ fn resolve_notices(
 /// A protocol's default backend: the named one when the file names it
 /// (checked against the enabled set by [`check_default`]), else the only
 /// enabled backend, else the historical default when it is among several
-/// enabled ones. Several enabled backends and no way to choose is an
-/// error rather than a guess: bare model names would otherwise route
-/// somewhere the operator never picked.
+/// enabled ones. Several enabled backends and no way to choose leaves it
+/// unset, and [`Config::validate`] refuses that rather than guess: bare
+/// model names would otherwise route somewhere the operator never picked.
 fn default_backend(
-    key: &str,
     named: Option<String>,
     enabled: &[&str],
     historical: Option<&str>,
-) -> anyhow::Result<Option<String>> {
+) -> Option<String> {
     if named.is_some() {
-        return Ok(named);
+        return named;
     }
     match enabled {
-        [] => Ok(None),
-        [only] => Ok(Some((*only).to_owned())),
+        [only] => Some((*only).to_owned()),
         several if historical.is_some_and(|name| several.contains(&name)) => {
-            Ok(historical.map(str::to_owned))
+            historical.map(str::to_owned)
         }
-        several => bail!(
-            "{key} is not set and several backends are enabled ({}): name one",
-            several.join(", ")
-        ),
+        _ => None,
     }
 }
 
@@ -1790,7 +1769,7 @@ mod tests {
         let dir = test_dir("default-enabled");
         let load = |text: &str| {
             fs::write(dir.join("toker.toml"), text).expect("write config");
-            load_result(&dir)
+            load_result(&dir).and_then(|config| config.validate().map(|()| config))
         };
 
         // A known backend whose block is absent: the error says the block
@@ -1826,7 +1805,7 @@ mod tests {
         // error rather than a guess.
         let error = load("[providers.anthropic_api]\n[providers.codex_sub]\n")
             .expect_err("an ambiguous default must fail");
-        assert!(format!("{error:#}").contains("name one"));
+        assert!(format!("{error:#}").contains("must name one"));
         let config = load(
             "default_backend_anthropic = \"codex_sub\"\n\
              [providers.anthropic_api]\n[providers.codex_sub]\n",
@@ -2363,7 +2342,9 @@ quota_enabled = false
             r#"default_backend_anthropic = "not-a-backend""#,
         )
         .expect("write config");
-        let error = load_result(&dir).expect_err("unroutable default must fail");
+        let error = load_result(&dir)
+            .and_then(|config| config.validate())
+            .expect_err("unroutable default must fail");
         assert!(error.to_string().contains("default_backend_anthropic"));
     }
 
@@ -2454,7 +2435,7 @@ quota_enabled = false
     }
 
     #[test]
-    fn owned_service_load_ignores_obsolete_default_validation() {
+    fn load_leaves_the_routing_defaults_to_validate() {
         let dir = test_dir("owned-service-config");
         let path = dir.join("toker.toml");
         fs::write(
@@ -2466,13 +2447,13 @@ default_backend_anthropic = "codex_sub"
         )
         .unwrap();
         let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
-        assert!(super::Config::load_with_env(&environment).is_err());
-        let config = super::Config::load_with_env_mode(&environment, false).unwrap();
+        let config = super::Config::load_with_env(&environment).unwrap();
         assert!(config.openrouter.is_some());
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
             Some("codex_sub")
         );
+        assert!(config.validate().is_err());
     }
 
     #[test]
