@@ -127,3 +127,63 @@ end it sat, the roles of the carrier and of the messages after it, and whether
 it began a line or shared its message with a tool result. Positions and booleans
 only, never text. A compaction the detector misses again leaves that object on
 a row with `summarising` false; the count of such rows is the check.
+
+## Choosing the model a cold compaction runs on
+
+Detection only says a request is a compaction. What it then runs on is routing's
+decision, and it is made by the active policy revision, not by a rule in the
+handler. The handler gives the resolver one content-free fact, the request class
+`Compaction` (`policy::RequestClass`), with the lane's own evidence of how cold
+it is; the marker text never reaches policy.
+
+**Coldness is proven from the lane's record.** `cold::lane_is_cold` reads the
+lane's `updated_ms` and its recorded TTL (and the configured minimum prompt and
+idle floor), the same clock the notice uses and not the notice's toggle, so the
+`/compact` a user runs after reading a cold notice still finds the lane cold. A
+compaction on a lane that is not cold by its own record has unknown temperature,
+which is enough to rule out every move below. It is also deliberately not the
+pin's job: once the recorded TTL has run out, no cache remains on any binding
+for a pin to protect.
+
+A revision's `compaction` section (`CompactionPolicy`) then has one of two
+targets, each with its own lane and cache transition policy:
+
+- **A route.** An authored revision can name a route. When the request is a
+  compaction and the lane is proven cold, that route replaces the ordinary
+  lookup, with provenance `compaction` (trace `lookup` source `compaction`), and
+  its candidates resolve like any other chain, fallback included. It can
+  therefore move a compaction to a different backend, not only a different
+  model. The route applies only to a lane proven cold; its transition policies
+  bound what else it may do.
+- **The revision-one overlay.** The generated revision one carries the behaviour
+  toker had before routing was a policy, as data: the document holds a
+  `RevisionOneLegacy` target (`model_spec`, from `[gates] compact_model` and
+  `sonnet` by default, and the Messages bindings it may apply to, which exclude
+  OpenRouter). Authored policy cannot select it, but it stays in revision one
+  and in any reactivation of it. It leaves the route the request would have
+  taken and only changes the model on it, and only when all of these hold: the
+  lane is cold, the body transform below would succeed, and the model it names
+  fits and is cheaper. A bare family name picks that family's newest model the
+  binding has learned under the same adaptive bar the upgrade election uses (see
+  [models.md](models.md)) and the catalogue can price; a full id is taken as
+  given. The target must hold the lane's recorded prompt (the offer's context
+  window, else the largest prompt the binding has served it) and its input rate
+  must be strictly below the source's, after aliasing. A model with no known
+  price is never a move. If any condition fails the compaction keeps its model
+  and only the transform applies.
+
+**The transform follows the choice.** After policy has picked, the compaction
+body is rewritten (`middleware::canonical::retarget_compaction`): cache
+breakpoints are stripped, because a cold lane would pay to write a cache nobody
+will read, and system messages are merged into a safe host. It is
+all-or-nothing, and the handler probes it on a clone before resolution so the
+overlay never moves a model for a body it could not then rewrite. Cache
+stripping is recorded in `cache_stripped` and `system_merged`; the model move is
+read off the attempt plan (`AttemptPlan::compaction_move`) into
+`downgraded_from` and `downgraded_to`, because by the time the transform runs
+the request is already on the new model and could not report it. A same-model
+strip records the flags and no move. A fallback attempt on a compaction
+re-applies the transform for the model it was given.
+
+Which wording and position were detected is unchanged by any of this: a
+compaction missed by detection is not retargeted, whatever the policy says.
