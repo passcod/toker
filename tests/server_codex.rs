@@ -952,7 +952,14 @@ async fn spawn_toker_with_policy(
     store
         .activate_revision_one(&policy, 1, 0, &[])
         .expect("activate policy fixture");
-    let server = Server::new_authoritative(config, store.clone()).expect("build server");
+    // Policy fixtures intentionally use exact fake model ids. Do not let the
+    // host's cached provider listings turn them into fresh-catalogue misses.
+    let server = Server::new_authoritative_with_catalogs(
+        config,
+        store.clone(),
+        toker::catalog::FetchedCatalogs::default(),
+    )
+    .expect("build server");
     serve_toker(server, store, dir).await
 }
 

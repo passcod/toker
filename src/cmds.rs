@@ -234,12 +234,22 @@ pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
 /// (Config::load already layered env over file).
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
+    // Without a resolvable home the routing page still edits and activates;
+    // it just cannot follow an activation with the settings sync.
+    let settings = crate::setup::wizard::Paths::real()
+        .ok()
+        .map(|paths| crate::tui::SettingsSync {
+            config: config.clone(),
+            settings: paths.claude_settings,
+        });
     let db_path = db.unwrap_or(config.db_path);
     crate::tui::run(
         &db_path,
         window_mins,
         &config.transcript_roots,
         &config.gates,
+        config.port,
+        settings,
     )
 }
 

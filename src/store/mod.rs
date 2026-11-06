@@ -30,13 +30,13 @@ mod schema;
 mod state;
 
 pub use ledger::{
-    AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, CostKind, DisplayRow,
-    JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow, MAX_ROUTING_TRACE_EVENTS,
-    MeterRow, ModelObservation, OBSERVATION_BUCKET_MS, PolicyRouteProvenance, PolicyRoutingOutcome,
-    RebuildRow, RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, RowKind,
-    SessionCostGroup, SessionLineage, SessionSummary, StoredCandidateState, StoredLadders,
-    StoredLookupSource, StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason,
-    is_api_measurement,
+    AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
+    DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
+    MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS,
+    PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource, RequestFilter,
+    RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, SessionSummary,
+    StoredCandidateState, StoredLadders, StoredLookupSource, StoredRoutingTrace,
+    StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
@@ -379,10 +379,23 @@ impl Store {
         ledger::session_summary(&*self.conn()?, session_id)
     }
 
+    /// One display parent's aggregate, including only its own raw rows and
+    /// children with explicit stored lineage. This does not alter raw lane or
+    /// cache identity.
+    pub fn display_session_summary(&self, session_id: &str) -> Result<SessionSummary> {
+        ledger::display_session_summary(&*self.conn()?, session_id)
+    }
+
     /// One session's newest API measurement row (see
     /// `ledger::latest_session_row`).
     pub fn latest_session_row(&self, session_id: &str) -> Result<Option<RequestRow>> {
         ledger::latest_session_row(&*self.conn()?, session_id)
+    }
+
+    /// The latest measurement attributed to a display parent, including only
+    /// explicit children. The returned row retains its raw child identity.
+    pub fn latest_display_session_row(&self, session_id: &str) -> Result<Option<RequestRow>> {
+        ledger::latest_display_session_row(&*self.conn()?, session_id)
     }
 
     /// Upsert one lane (caller owns the read-modify-write cycle).
@@ -1502,6 +1515,7 @@ mod tests {
                 attempt_group_id: None,
                 attempt_index: None,
                 session_id: Some("ses-abc".to_string()),
+                lineage: None,
                 tools_hash: Some("sha256:tool5".to_string()),
                 model: Some("z-ai/glm-5.3".to_string()),
                 provider: Some("openrouter".to_string()),
@@ -1532,6 +1546,7 @@ mod tests {
                 attempt_group_id: None,
                 attempt_index: None,
                 session_id: None,
+                lineage: None,
                 tools_hash: None,
                 model: None,
                 provider: None,
@@ -1549,6 +1564,21 @@ mod tests {
                 forced_to: None,
             }
         );
+    }
+
+    #[test]
+    fn display_rows_round_trip_explicit_lineage() {
+        let store = mem_store();
+        let mut row = bare_row(1);
+        row.session_id = Some("guardian:parent-session".to_owned());
+        row.lineage = SessionLineage::codex_guardian("guardian:parent-session");
+        store.record_request(&row).expect("record");
+
+        let display = store.display_rows_since(0, 10).expect("read");
+        assert_eq!(display.len(), 1);
+        let lineage = display[0].lineage.as_ref().expect("lineage");
+        assert_eq!(lineage.parent_session_id(), "parent-session");
+        assert_eq!(lineage.child_role().as_str(), "guardian");
     }
 
     #[test]
@@ -2050,6 +2080,40 @@ mod tests {
                 requests: 1,
                 cost_usd: Some(0.5)
             }]
+        );
+    }
+
+    #[test]
+    fn display_session_summary_includes_only_explicit_children() {
+        let store = mem_store();
+        let mut parent = bare_row(1_000);
+        parent.session_id = Some("parent".to_owned());
+        parent.input = Some(3);
+        store.record_request(&parent).expect("parent");
+
+        let mut child = bare_row(2_000);
+        child.session_id = Some("guardian:parent".to_owned());
+        child.lineage = SessionLineage::codex_guardian("guardian:parent");
+        child.input = Some(5);
+        store.record_request(&child).expect("child");
+
+        let mut unlinked = bare_row(3_000);
+        unlinked.session_id = Some("unlinked-nearby".to_owned());
+        unlinked.input = Some(7);
+        store.record_request(&unlinked).expect("unlinked");
+
+        let summary = store.display_session_summary("parent").expect("summary");
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.input, Some(8));
+        assert_eq!(summary.last_ts_ms, Some(2_000));
+        assert_eq!(
+            store
+                .latest_display_session_row("parent")
+                .expect("latest")
+                .expect("child row")
+                .session_id
+                .as_deref(),
+            Some("guardian:parent")
         );
     }
 
@@ -2819,6 +2883,7 @@ mod tests {
         let activated = store
             .activate_policy_revision(&ActivatePolicyRevision {
                 created_ms: 200,
+                expected_draft_generation: None,
                 description: Some("restore the initial routing"),
                 activation_scope: ActivationScope::Immediate,
                 forced_cache_transition: false,
@@ -2885,6 +2950,7 @@ mod tests {
             store
                 .activate_policy_revision(&ActivatePolicyRevision {
                     created_ms: 200,
+                    expected_draft_generation: None,
                     description: None,
                     activation_scope: ActivationScope::Immediate,
                     forced_cache_transition: false,

@@ -217,6 +217,7 @@ pub enum RevisionOneActivation {
 #[derive(Debug, Clone)]
 pub struct ActivatePolicyRevision<'a> {
     pub created_ms: i64,
+    pub expected_draft_generation: Option<i64>,
     pub description: Option<&'a str>,
     pub activation_scope: ActivationScope,
     pub forced_cache_transition: bool,
@@ -949,6 +950,13 @@ pub(super) fn activate_policy_revision(
             "active policy revision changed before activation".into(),
         ));
     }
+    if let Some(expected_generation) = activation.expected_draft_generation
+        && current.draft_generation != expected_generation
+    {
+        return Err(Error::InvalidRoutingState(
+            "routing draft generation changed before activation".into(),
+        ));
+    }
     if let Some(parent_revision_id) = activation.parent_revision_id
         && load_policy_revision(&tx, parent_revision_id)?.is_none()
     {
@@ -973,10 +981,22 @@ pub(super) fn activate_policy_revision(
     let changed = tx.execute(
         "UPDATE routing_policy_state SET active_revision_id = ?1,
              draft_generation = draft_generation + 1,
-             draft_base_revision_id = NULL, draft_document_json = NULL,
-             draft_fingerprint = NULL, draft_updated_ms = NULL
-         WHERE id = 1 AND active_revision_id = ?2",
-        rusqlite::params![revision.revision_id, active_revision_id],
+             draft_base_revision_id = ?1, draft_document_json = ?2,
+             draft_fingerprint = ?3, draft_updated_ms = ?4
+         WHERE id = 1 AND active_revision_id = ?5
+           AND (?6 IS NULL OR draft_generation = ?6)",
+        rusqlite::params![
+            revision.revision_id,
+            String::from_utf8(
+                policy_bytes(activation.document)
+                    .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
+            )
+            .map_err(|error| Error::InvalidPolicyDocument(error.to_string()))?,
+            revision.fingerprint.to_string(),
+            activation.created_ms,
+            active_revision_id,
+            activation.expected_draft_generation,
+        ],
     )?;
     if changed != 1 {
         return Err(Error::InvalidRoutingState(
