@@ -331,6 +331,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let mut shadow_retargeted: Option<String> = None;
     let mut shadow_compaction_applied = false;
     let mut policy_attempt: Option<super::PolicyAttempt> = None;
+    let mut batch_model_mappings: Option<serde_json::Value> = None;
     let mut cold_lane_key = None;
     let mut cold_lane = None;
     // The gate's meter snapshot, loaded at most once per request and only
@@ -509,6 +510,26 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         .iter()
                         .map(|plan| plan.effective_model.clone())
                         .collect::<Vec<_>>();
+                    // A batch has no single top-level model, so its
+                    // provenance is the per-request list of the entries
+                    // policy moved. Without it a failed batch's row could
+                    // not say where its requests went.
+                    let moved: Vec<serde_json::Value> = models
+                        .iter()
+                        .zip(&replacements)
+                        .enumerate()
+                        .filter(|(_, (requested, effective))| requested != effective)
+                        .map(|(index, (requested, effective))| {
+                            serde_json::json!({
+                                "requestIndex": index,
+                                "requestedModel": requested,
+                                "effectiveModel": effective,
+                            })
+                        })
+                        .collect();
+                    if !moved.is_empty() {
+                        batch_model_mappings = Some(serde_json::Value::Array(moved));
+                    }
                     let Some(rewritten) =
                         model_map::rewrite_model_positions(&original, "POST", path, &replacements)
                     else {
@@ -861,7 +882,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             system_merged: None,
             forced_from: None,
             forced_to: None,
-            model_mappings: None,
+            model_mappings: batch_model_mappings.take(),
             translation_report: None,
             policy_attempt: policy_attempt.clone().map(Arc::new),
         });
