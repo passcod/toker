@@ -200,7 +200,6 @@ impl<'a> LegacyBuilder<'a> {
         self.add_defaults()?;
         self.add_explicit_prefixes()?;
         self.add_anthropic_alias()?;
-        self.add_auxiliary_claude_route()?;
         self.add_picker()?;
         self.add_compaction()?;
         Ok(self.policy)
@@ -373,41 +372,6 @@ impl<'a> LegacyBuilder<'a> {
             model_matcher: MatcherSpec::Regex(r"^anthropic/(?P<model>.+)$".to_owned()),
             target: RouteReference {
                 route_id: backend_route_id(binding)?,
-                parameters: BTreeMap::from([(
-                    parameter(REQUESTED_ROUTE_PARAMETER)?,
-                    ArgumentBinding::RegexCaptureName {
-                        name: "model".to_owned(),
-                    },
-                )]),
-            },
-        });
-        Ok(())
-    }
-
-    fn add_auxiliary_claude_route(&mut self) -> anyhow::Result<()> {
-        if self.config.default_backend_anthropic.is_some() {
-            return Ok(());
-        }
-        let candidate = self
-            .topology
-            .routes()
-            .filter(|route| route.frontend() == ProtocolId::AnthropicMessages)
-            .find(|route| {
-                self.topology.binding_is_configured(route.binding())
-                    && model_map_for(self.config, route.binding().provider()).is_some()
-            });
-        let Some(route) = candidate else {
-            return Ok(());
-        };
-        self.policy.rewrites.push(RewriteRule {
-            id: RewriteId::new("legacy-auxiliary-claude")?,
-            scope: FrontendScope::Protocol {
-                protocol: FrontendProtocol::AnthropicMessages,
-            },
-            priority: 10_000,
-            model_matcher: MatcherSpec::Regex(r"^(?P<model>claude-.+)$".to_owned()),
-            target: RouteReference {
-                route_id: backend_route_id(route.binding())?,
                 parameters: BTreeMap::from([(
                     parameter(REQUESTED_ROUTE_PARAMETER)?,
                     ArgumentBinding::RegexCaptureName {
@@ -966,48 +930,6 @@ mod tests {
                 "compaction preserves the ordinarily selected route"
             );
         }
-    }
-
-    #[test]
-    fn auxiliary_bare_claude_routes_without_anthropic_default_via_model_map() {
-        let config = load_config(
-            "[providers.codex_sub]\n\
-             [providers.codex_sub.model_map]\n\
-             \"family:sonnet\" = \"gpt-5.6-luna\"\n",
-        );
-        // Codex construction needs a login, but topology is immutable; use a
-        // registry with no configured provider to inspect the generated raw
-        // policy after marking the config route through its map.
-        let codex_topology = RouteRegistry::new(std::iter::empty::<Arc<dyn Provider>>());
-        let generated = document(&config, &codex_topology).unwrap();
-        assert!(
-            generated
-                .rewrites
-                .iter()
-                .all(|rule| rule.id.as_str() != "legacy-auxiliary-claude")
-        );
-
-        let config = load_config(
-            "[providers.anthropic_api]\n\
-             [providers.anthropic_api.model_map]\n\
-             \"family:sonnet\" = \"claude-sonnet-5\"\n",
-        );
-        let mut config = config;
-        config.default_backend_anthropic = None;
-        let topology = topology(&config);
-        let generated = document(&config, &topology).unwrap();
-        let auxiliary = generated
-            .rewrites
-            .iter()
-            .find(|rule| rule.id.as_str() == "legacy-auxiliary-claude")
-            .expect("auxiliary route");
-        assert!(matches!(auxiliary.model_matcher, MatcherSpec::Regex(_)));
-        assert!(
-            compile(&config, &topology, &OfferInventory::default())
-                .unwrap()
-                .policy()
-                .is_some()
-        );
     }
 
     #[test]

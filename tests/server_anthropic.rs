@@ -4019,3 +4019,120 @@ async fn a_restarted_server_finds_the_lanes_baseline_in_the_ledger() {
         @r#"{"delta":0,"where":"block 0 (20021 → 20021 chars), 16-24 bytes from the end"}"#
     );
 }
+
+/// A config with one OpenRouter key and no Anthropic or codex backend.
+fn openrouter_only_config(openrouter: &reqwest::Url) -> Config {
+    let unused: reqwest::Url = "http://127.0.0.1:9/".parse().expect("unused url");
+    let mut config = openrouter_config(unused, openrouter);
+    config.anthropic_sub = None;
+    config.anthropic_api = None;
+    config.codex_sub = None;
+    config.default_backend_anthropic = None;
+    config
+}
+
+/// Claude Code's classifier, title and helper calls name bare `claude-*`
+/// models. With no Anthropic or codex backend there is no model to send
+/// them to (OpenRouter has no model map), and routing never inspects their
+/// shape to guess one: the answer is the not-configured refusal, nothing
+/// reaches an upstream and no row is written.
+#[tokio::test]
+async fn a_bare_claude_model_with_only_openrouter_configured_is_refused() {
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let (addr, store) = spawn_toker(openrouter_only_config(&openrouter_upstream)).await;
+
+    let body = br#"{"model":"claude-haiku-4-5","max_tokens":32,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"Hi"}]}"#;
+    let response = post_messages(addr, "/v1/messages", &[], body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-toker-not-configured")
+            .and_then(|value| value.to_str().ok()),
+        Some("anthropic")
+    );
+    assert!(openrouter.captured().is_empty(), "nothing is sent upstream");
+    assert_no_rows(&store).await;
+}
+
+/// The same calls route to a configured backend when the policy says how:
+/// a rewrite on the model name alone, no look at the request's content or
+/// shape, and no parentage invented for a side query.
+#[tokio::test]
+async fn a_policy_rewrite_routes_bare_claude_models_to_openrouter() {
+    use toker::policy::{MatcherSpec, RewriteId, RewriteRule};
+    use toker::routing::OPENROUTER_MESSAGES;
+
+    let (openrouter, openrouter_upstream) = spawn_mock().await;
+    let config = openrouter_only_config(&openrouter_upstream);
+    let route_id = RouteId::new("auxiliary").unwrap();
+    let policy = PolicyDocument {
+        format_version: CURRENT_FORMAT_VERSION,
+        description: Some("bare claude models to openrouter".to_owned()),
+        defaults: vec![],
+        presentations: vec![],
+        routes: vec![Route {
+            id: route_id.clone(),
+            display_name: "Auxiliary".to_owned(),
+            description: None,
+            parameters: vec![],
+            chain: RouteChain {
+                first: Candidate {
+                    id: CandidateId::new("primary").unwrap(),
+                    binding_id: OPENROUTER_MESSAGES.id().clone(),
+                    model: CandidateModel::Exact {
+                        model_id: "z-ai/glm-5.3-flash".to_owned(),
+                    },
+                    upgrade_policy_id: None,
+                    alias_policy: None,
+                    required_capabilities: Default::default(),
+                    enabled: true,
+                    health_circuits: vec![],
+                },
+                steps: vec![],
+            },
+            lane_transition: LaneTransitionPolicy::PreservePinned,
+        }],
+        rewrites: vec![RewriteRule {
+            id: RewriteId::new("bare-claude").unwrap(),
+            scope: FrontendScope::Protocol {
+                protocol: FrontendProtocol::AnthropicMessages,
+            },
+            priority: 100,
+            model_matcher: MatcherSpec::Regex(r"^claude-.+$".to_owned()),
+            target: RouteReference {
+                route_id,
+                parameters: Default::default(),
+            },
+        }],
+        classifiers: vec![],
+        upgrades: vec![],
+        compaction: None,
+    }
+    .validate()
+    .unwrap();
+    let (addr, store) = spawn_toker_with_policy_document(config, policy).await;
+
+    let body = messages_body("claude-haiku-4-5", false);
+    let response = post_messages(addr, "/v1/messages", &[], &body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = openrouter.captured();
+    assert_eq!(captured.len(), 1);
+    assert_canonical_request(&body, &captured[0].body, "z-ai/glm-5.3-flash");
+
+    let rows = wait_for_rows(&store, 1).await;
+    let row = &rows[0];
+    assert_eq!(row.provider.as_deref(), Some("openrouter"));
+    assert_eq!(row.requested_model.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(row.effective_model.as_deref(), Some("z-ai/glm-5.3-flash"));
+    assert_eq!(
+        row.policy_routing.as_ref().map(|routing| &routing.lookup),
+        Some(&toker::store::RequestLookupProvenance::ProtocolRewrite(
+            RewriteId::new("bare-claude").unwrap()
+        ))
+    );
+    assert_eq!(
+        row.lineage, None,
+        "a side query is never attached to a parent"
+    );
+}

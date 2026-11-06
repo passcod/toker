@@ -84,22 +84,21 @@ route is chosen by the call's role or shape. A bare `claude-*` model on these
 calls is looked up the way any model name is: presentation, then rewrite rules,
 then the profile default, then the protocol default.
 
-The case that needs care is a machine with no Anthropic default: the config
-names none and enables either no Anthropic-protocol backend or several without
-choosing one. A bare `claude-*` name then matches no default, and the request
-would fail as not configured even though the user has a working backend. The
-generated revision one handles it: when the config names no Anthropic default
-but a configured Messages binding has a model map, a rewrite rule
-(`legacy-auxiliary-claude`, matching `^(?P<model>claude-.+)$`, last in priority
-order) sends every bare `claude-*` request to that binding's route, where the
-route's alias policy rewrites the name through the same map. The whole mechanism
-runs on the model string alone, so a classifier, a title call and a helper reach
-the mapped backend without anything inspecting what they carry, and none is
-invented a parent. With no such binding and no default, the request has no route
-and gets the not-configured answer.
+The case that needs care is a machine with no Anthropic backend. Codex-only is
+the usual one: its Messages default is the codex route, and a bare `claude-*`
+name takes that default, where the route's alias policy rewrites it through the
+codex model map. Nothing inspects what the call carries, so a classifier, a
+title call and a helper all reach the mapped backend, and none is invented a
+parent.
 
-An authored policy owns this itself: a profile or protocol default, or a rewrite
-rule on the Claude names, decides where those calls go.
+A machine whose only backend is OpenRouter has no Messages default, and
+OpenRouter has no model map to say what a haiku-class call should become, so
+revision one generates no rule for it. A bare `claude-*` request there matches
+nothing and gets the not-configured answer: 502 with `x-toker-not-configured`,
+no upstream call and no row. Guessing a target (an `anthropic/claude-...` slug,
+say) would send a model the user never chose. An authored policy fixes it with a
+rewrite rule on the Claude names, which routes on the model string alone;
+`tests/server_anthropic.rs` pins both outcomes.
 
 ## Lineage is for display and accounting only
 
