@@ -69,6 +69,19 @@ Changeset 12 left legacy routing reachable in production:
       `capture_shadow`
 - [ ] Port server integration tests to an authoritative server with an active
       revision
+  - Done in the pilot: one authoritative constructor family (`Server::new`,
+    `Server::with_seams` + `Seams`), `tests/common` helpers, `server_proxy.rs`;
+    recipe in `port-notes.md`.
+  - [ ] tests/server_anthropic.rs
+  - [ ] tests/server_awake.rs
+  - [ ] tests/server_codex.rs
+  - [ ] tests/server_cold.rs
+  - [ ] tests/server_force_newest.rs
+  - [ ] tests/server_session.rs
+  - [ ] tests/server_shutdown.rs
+  - [ ] unit tests: `mod tests` in src/server/{mod,anthropic,codex,inference,
+        proxy,record,record_anthropic,attempt,cancel,control}.rs
+  - [ ] src/tui/routing/import.rs and src/cmds.rs tests
 - [ ] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
       `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
       `middleware/mod.rs`, `middleware/model_map.rs`)
