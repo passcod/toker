@@ -124,8 +124,9 @@ silently ignored option.
 with `valid` and `diagnostics`. Each diagnostic is a stable `code`, a
 `severity`, the `record_id` and a JSON-pointer `path` into the document. They
 are content free by construction: paths are built only from schema field names
-and bounded indices. Diagnostics come only from a compilation that failed; a
-draft that compiles has none, whatever it would warn about.
+and bounded indices. A draft that compiles can still carry notes (a binding that is
+not configured, an offer the catalogue does not list); they come back as `info`
+or `warning` diagnostics next to `"valid": true`.
 
 `preview` runs the resolver the request path uses, against the draft, for a
 described request: protocol, profile, model, optionally a lane key (whose real

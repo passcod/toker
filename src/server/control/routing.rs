@@ -212,7 +212,7 @@ pub(crate) async fn validate(State(server): State<Server>, request: Request) -> 
                 "toker": "routing-validate",
                 "ok": true,
                 "generation": validation.generation,
-                "valid": validation.diagnostics.is_empty(),
+                "valid": validation.valid,
                 "diagnostics": diagnostics_body(validation.diagnostics),
             })),
         )

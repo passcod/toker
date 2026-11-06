@@ -631,18 +631,14 @@ impl Server {
             .draft
             .as_ref()
             .map(|draft| {
-                compile_control_policy(
+                compile_control(
                     &draft.document,
                     revision.compiler_origin,
                     &self.registry,
                     &inventory,
                 )
-                .err()
-                .and_then(|error| match error {
-                    RoutingControlError::Compilation(diagnostics) => Some(diagnostics),
-                    _ => None,
-                })
-                .unwrap_or_default()
+                .diagnostics()
+                .to_vec()
             })
             .unwrap_or_default();
         let lane_impacts = self.routing_lane_impacts_locked(&state, now_ms())?;
@@ -726,19 +722,19 @@ impl Server {
             .state
             .draft
             .ok_or(RoutingControlError::DraftMissing)?;
-        let diagnostics = match compile_control_policy(
+        let compilation = compile_control(
             &draft.document,
             snapshot.active_revision.compiler_origin,
             &self.registry,
             &snapshot.inventory,
-        ) {
-            Ok(_) => Vec::new(),
-            Err(RoutingControlError::Compilation(diagnostics)) => diagnostics,
-            Err(error) => return Err(error),
-        };
+        );
+        // Info and warning findings ride along with a policy that compiled,
+        // so validate shows the notes (an unconfigured binding, an offer the
+        // catalogue lacks) the same way it shows the errors.
         Ok(RoutingDraftValidation {
             generation: snapshot.state.draft_generation,
-            diagnostics,
+            valid: compilation.policy().is_some(),
+            diagnostics: compilation.diagnostics().to_vec(),
         })
     }
 
@@ -2234,6 +2230,7 @@ pub(crate) struct RoutingLaneImpacts {
 #[derive(Debug)]
 pub(crate) struct RoutingDraftValidation {
     pub(crate) generation: i64,
+    pub(crate) valid: bool,
     pub(crate) diagnostics: Vec<crate::policy::Diagnostic>,
 }
 
@@ -2384,13 +2381,13 @@ fn preview_failure_code(error: &crate::policy::ResolveFailure) -> &'static str {
     }
 }
 
-fn compile_control_policy(
+fn compile_control(
     document: &crate::policy::ValidatedPolicyDocument,
     origin: PolicyCompilerOrigin,
     registry: &RouteRegistry,
     inventory: &crate::catalog::offers::OfferInventory,
-) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
-    let compilation = match origin {
+) -> crate::policy::Compilation {
+    match origin {
         PolicyCompilerOrigin::Authored => crate::policy::compile(
             document.clone(),
             registry,
@@ -2400,8 +2397,16 @@ fn compile_control_policy(
         PolicyCompilerOrigin::GeneratedRevisionOne => {
             crate::policy::legacy::compile_document(document.clone(), registry, inventory)
         }
-    };
-    compilation
+    }
+}
+
+fn compile_control_policy(
+    document: &crate::policy::ValidatedPolicyDocument,
+    origin: PolicyCompilerOrigin,
+    registry: &RouteRegistry,
+    inventory: &crate::catalog::offers::OfferInventory,
+) -> Result<crate::policy::CompiledPolicy, RoutingControlError> {
+    compile_control(document, origin, registry, inventory)
         .into_policy()
         .map_err(RoutingControlError::Compilation)
 }
