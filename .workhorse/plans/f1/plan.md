@@ -11,7 +11,7 @@ users, no live fleet, take the expedient path.
   upgrade, and lets the legacy resolver go entirely. No pin seeding.
 - In scope beyond changeset 18: the OpenRouter placeholder-bearer bug, moving
   the subscription signing checklist out of `docs/plans/`, and opencode session
-  lanes. Server safeguards stays planned and out of this card.
+  lanes. Server safeguards moved to its own card (G1).
 
 ## Findings that widen changeset 18
 
