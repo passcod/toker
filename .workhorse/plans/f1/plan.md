@@ -97,7 +97,7 @@ policy path and what the legacy path did.
       cancel, every unmatched Anthropic path answer 503 on the live config):
       add the exact-profile-then-protocol default resolution the design
       describes for model-free administrative paths
-- [ ] A pinned lane on a binding with no cache domain (anthropic_sub, api,
+- [x] A pinned lane on a binding with no cache domain (anthropic_sub, api,
       codex) is never `Cold`, so force-newest never fires for it: derive
       coldness from the lane's recorded TTL for a lane pinned to that binding
 - [ ] Compaction retarget rows record no `downgraded_from`/`downgraded_to`
