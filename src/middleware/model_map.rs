@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::windows::model_identity;
-use crate::middleware::models::family_of;
+use crate::policy::family::family_of;
 
 // ── the lexical JSON tree ────────────────────────────────────────────
 

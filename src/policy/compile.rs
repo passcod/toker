@@ -13,6 +13,7 @@ use crate::catalog::offers::OfferInventory;
 use crate::routing::{BackendBinding, Capabilities, ProtocolId, RouteRegistry};
 
 use super::canonical::generated_route_fingerprint;
+use super::family::{Family, family_of};
 use super::{
     AdapterMetadata, AliasPolicy, ArgumentBinding, BindingId, BoundaryConsent,
     CacheTransitionPolicy, Candidate, CandidateEdge, CandidateId, CandidateModel, CaptureSchema,
@@ -107,6 +108,15 @@ impl CompiledPolicy {
 
     pub fn classifier(&self, id: &ClassifierId) -> Option<&CompiledClassifier> {
         self.classifiers.get(id)
+    }
+
+    /// The family split revision one generated for `binding`, if it has one.
+    /// Revision-one compaction reads its model spec through this, so a
+    /// binding whose classifier was edited away has no compaction retarget.
+    pub fn family_split_for(&self, binding: &BindingId) -> Option<&CompiledClassifier> {
+        self.classifiers
+            .values()
+            .find(|classifier| classifier.legacy_family && classifier.binding_id == *binding)
     }
 
     pub fn upgrade(&self, id: &UpgradePolicyId) -> Option<&CompiledUpgradePolicy> {
@@ -535,9 +545,16 @@ impl CompiledClassifier {
         &self.parser
     }
 
+    /// The family split revision one's generated classifier reads, in place
+    /// of its stored regex. `None` for an authored classifier, which has
+    /// only its matcher.
+    pub fn family_split(&self, model: &str) -> Option<Family> {
+        self.legacy_family.then(|| family_of(model)).flatten()
+    }
+
     pub fn classify(&self, model: &str) -> Result<Option<ClassifiedModel>, ClassificationError> {
         if self.legacy_family {
-            let Some(family) = crate::middleware::models::family_of(model) else {
+            let Some(family) = family_of(model) else {
                 return Ok(None);
             };
             let version = family

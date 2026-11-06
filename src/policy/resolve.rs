@@ -1528,24 +1528,32 @@ fn choose_revision_one_compaction<L: LearningView>(
         return Ok(None);
     }
 
-    let family = crate::middleware::models::family_of(spec);
-    let target = match family {
+    // The binding's generated classifier splits the ids, so compaction reads
+    // the same family and version the upgrade election does.
+    let Some(classifier) = policy.family_split_for(candidate.binding_id()) else {
+        return Ok(None);
+    };
+    let target = match classifier.family_split(spec) {
         Some(family) if family.version.is_empty() => {
-            let mut best: Option<String> = None;
+            let mut best: Option<(String, super::family::Family)> = None;
             let Ok(models) = learning.known_models(candidate.binding_id()) else {
                 return Ok(None);
             };
             for model in models {
-                if crate::middleware::models::family_of(&model)
-                    .is_none_or(|candidate_family| candidate_family.name != family.name)
-                    || !learning_minimum(
-                        MinimumLearning::RevisionOneAdaptive,
-                        false,
-                        learning,
-                        candidate.binding_id(),
-                        &model,
-                    )
-                    .unwrap_or(false)
+                let Some(member) = classifier
+                    .family_split(&model)
+                    .filter(|member| member.name == family.name)
+                else {
+                    continue;
+                };
+                if !learning_minimum(
+                    MinimumLearning::RevisionOneAdaptive,
+                    false,
+                    learning,
+                    candidate.binding_id(),
+                    &model,
+                )
+                .unwrap_or(false)
                 {
                     continue;
                 }
@@ -1555,13 +1563,13 @@ fn choose_revision_one_compaction<L: LearningView>(
                     continue;
                 }
                 if best
-                    .as_deref()
-                    .is_none_or(|current| crate::middleware::models::newer_than(&model, current))
+                    .as_ref()
+                    .is_none_or(|(_, current)| member.is_newer_than(current))
                 {
-                    best = Some(model);
+                    best = Some((model, member));
                 }
             }
-            best
+            best.map(|(model, _)| model)
         }
         Some(_) => crate::catalog::model_identity(spec),
         None => None,
@@ -1632,7 +1640,7 @@ fn learning_minimum<L: LearningView>(
             let active_days = learning
                 .active_days(binding)
                 .map_err(|_| ResolveFailure::LearningUnavailable)?;
-            let needed = crate::middleware::models::requirement(active_days);
+            let needed = super::learning::requirement(active_days);
             Ok(evidence.is_some_and(|evidence| evidence.distinct_days().len() as f64 > needed))
         }
     }
@@ -3709,6 +3717,20 @@ mod tests {
             ),
             vec![],
         ));
+        document.classifiers.push(FamilyClassifier {
+            id: ClassifierId::new("family").unwrap(),
+            binding_id: ANTHROPIC_SUB_MESSAGES.id().clone(),
+            model_matcher: MatcherSpec::Regex(
+                r"^(?:claude-)?(?P<family>[a-z0-9][a-z0-9-]*?)-(?P<version>[0-9]+(?:-[0-9]+)*)$"
+                    .to_owned(),
+            ),
+            family_template: "${family}".to_owned(),
+            version_template: "${version}".to_owned(),
+            version_parser: VersionParserSpec::LegacyNumericTuple {
+                separator: "-".to_owned(),
+            },
+            legacy_hyphenated: true,
+        });
         document.compaction = Some(CompactionPolicy {
             target: CompactionTarget::RevisionOneLegacy {
                 model_spec: "sonnet".to_owned(),

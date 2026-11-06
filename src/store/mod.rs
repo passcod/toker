@@ -44,7 +44,7 @@ pub use state::{
     LanePin, LanePinCasResult, MetersSnapshot, ModelEntry, NewPolicyRevision, PingAction,
     PingRecord, PolicyCompilerOrigin, PolicyDraft, PolicyRevision, PolicyRevisionSource,
     PublicationAdapter, PublicationCasResult, PublicationKey, PublicationResultUpdate,
-    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication,
+    PublicationState, RevisionOneActivation, RoutingPolicyState, RoutingPublication, local_day,
     publication_targets,
 };
 

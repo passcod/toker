@@ -151,7 +151,7 @@ impl CompiledMatcher {
             Self::RevisionOneModel(expected) => Ok(crate::catalog::model_identity(input)
                 .is_some_and(|identity| identity == *expected)
                 .then(|| MatcherCaptures::empty(input))),
-            Self::RevisionOneFamily(expected) => Ok(crate::middleware::models::family_of(input)
+            Self::RevisionOneFamily(expected) => Ok(super::family::family_of(input)
                 .is_some_and(|family| family.name == *expected)
                 .then(|| MatcherCaptures::empty(input))),
         }

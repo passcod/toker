@@ -430,7 +430,7 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
         max_prompt,
     }) {
         Ok(MergeOutcome::Merged { entry, target }) => {
-            let family = crate::middleware::models::family_of(&entry.model_id)
+            let family = crate::policy::family::family_of(&entry.model_id)
                 .map(|family| family.name)
                 .unwrap_or_default();
             Json(json!({

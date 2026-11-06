@@ -9,6 +9,7 @@ pub mod compile;
 pub mod diagnostic;
 pub mod document;
 pub mod edit;
+pub mod family;
 pub mod learning;
 pub mod legacy;
 pub mod matcher;

@@ -45,108 +45,16 @@ use std::sync::{Arc, Mutex};
 use jiff::tz::TimeZone;
 
 use crate::catalog::windows::model_identity;
-use crate::store::{ModelEntry, RequestRow, Store};
-
-/// The ceiling on the requirement: a fortnight of daily use proves enough.
-pub const MAX_REQUIRED_DAYS: f64 = 7.0;
-
-/// A model id split into the family it belongs to and the version within
-/// it.
-///
-/// The family is the non-numeric remainder and the version is the trailing
-/// numbers, so `claude-opus-4-8` is opus [4, 8] and `claude-opus-5` is opus
-/// [5]. Published snapshot aliases fold first (via
-/// [`model_identity`]), while an unpublished dated identity has no family
-/// and can never become a rewrite target — a future model is not evidence
-/// that it inherited an earlier version's anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Family {
-    pub name: String,
-    pub version: Vec<u64>,
-}
+pub use crate::policy::family::family_of;
+use crate::policy::learning::requirement;
+use crate::store::{ModelEntry, RequestRow, Store, local_day};
 
 /// Is `a` a strictly newer version than `b`, within the same family?
-///
-/// Segment-wise and numeric, because string order gets this wrong twice
-/// over: `claude-opus-5` sorts before `claude-opus-4-8`, and `4-10` sorts
-/// before `4-8`. A missing segment counts as lower, so [5] beats [4, 8]
-/// and [5, 1] beats [5].
 pub fn newer_than(a: &str, b: &str) -> bool {
-    let (Some(fa), Some(fb)) = (family_of(a), family_of(b)) else {
-        return false;
-    };
-    if fa.name != fb.name {
-        return false;
+    match (family_of(a), family_of(b)) {
+        (Some(a), Some(b)) => a.is_newer_than(&b),
+        _ => false,
     }
-    for i in 0..fa.version.len().max(fb.version.len()) {
-        // A missing segment is lower than any present one.
-        let x = fa.version.get(i).map(|&v| v as i64).unwrap_or(-1);
-        let y = fb.version.get(i).map(|&v| v as i64).unwrap_or(-1);
-        if x != y {
-            return x > y;
-        }
-    }
-    false
-}
-
-/// An id ending in a dated suffix the alias table does not know: an
-/// *unpublished* snapshot. Matched only after alias folding, so a published
-/// dated identity like `claude-3-7-sonnet-20250219` folds to its dateless
-/// form and keeps its family.
-fn is_unpublished_claude_snapshot(model: &str) -> bool {
-    match model_identity(model) {
-        Some(id) => {
-            let bytes = id.as_bytes();
-            id.starts_with("claude-")
-                && bytes.len() >= 9
-                && bytes[bytes.len() - 9] == b'-'
-                && bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit)
-        }
-        None => false,
-    }
-}
-
-/// The family a model belongs to
-/// (ported exactly over the normalised identity; unknown stays `None`,
-/// never guessed).
-pub fn family_of(model: &str) -> Option<Family> {
-    if is_unpublished_claude_snapshot(model) {
-        return None;
-    }
-    let id = model_identity(model)?;
-    let stripped = id.strip_prefix("claude-").unwrap_or(&id);
-    let mut name = Vec::new();
-    let mut version = Vec::new();
-    for part in stripped.split('-') {
-        // Only a run of digits is a version segment.
-        if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
-            version.push(part.parse::<u64>().unwrap_or(u64::MAX));
-        } else {
-            name.push(part);
-        }
-    }
-    if name.is_empty() {
-        return None;
-    }
-    Some(Family {
-        name: name.join("-"),
-        version,
-    })
-}
-
-/// How many days a model must have been seen on to be trusted as its
-/// family's newest, given how many days there are to judge against.
-///
-/// Scaled rather than absolute: an absolute bar asks a young log for
-/// evidence it cannot possibly contain — on a fresh install nothing would
-/// qualify for a week, so the feature would be dormant exactly when someone
-/// is setting it up and watching it. Scaled, day one accepts whatever is
-/// present, and the bar tightens as history arrives. What keeps the weak
-/// early bar safe is not this function: it only decides WHICH model is a
-/// family's target; whether anything is rewritten at all is decided
-/// elsewhere, by rules that do not relax (the next unit's).
-pub fn requirement(active_days: usize) -> f64 {
-    (active_days as f64 / 2.0).min(MAX_REQUIRED_DAYS)
 }
 
 /// The parsed days of a learned entry: the JSON column's strings, deduped
@@ -300,17 +208,6 @@ pub fn compaction_target_of(
         return None;
     }
     Some(target)
-}
-
-/// The local calendar day of an epoch-millisecond timestamp, `YYYY-MM-DD`
-/// (the same shape an `en-CA` locale day renders as). The timezone is the
-/// caller's, so the grouping is a pure function of its inputs; the server
-/// passes the system zone, and tests pin theirs.
-pub fn local_day(at_ms: i64, tz: &TimeZone) -> Option<String> {
-    let zoned = jiff::Timestamp::from_millisecond(at_ms)
-        .ok()?
-        .to_zoned(tz.clone());
-    Some(zoned.date().to_string())
 }
 
 /// Every day the learned store holds for any model: the pool a promotion
@@ -866,8 +763,7 @@ pub fn merge_learned(
 mod tests {
     use super::{
         MergeIncoming, MergeOutcome, ModelStore, PromotionRefusal, compaction_target_of, days_of,
-        family_of, fits_context, local_day, newer_than, newest_in_family, plan_promotion,
-        requirement,
+        fits_context, local_day, newest_in_family, plan_promotion,
     };
     use crate::store::{ModelEntry, RequestRow, RowKind, Store};
     use jiff::tz::TimeZone;
@@ -971,95 +867,7 @@ mod tests {
         TimeZone::fixed(jiff::tz::Offset::from_hours(13).expect("offset"))
     }
 
-    // ── family parsing ──────────────────────────────────────────────
-
-    #[test]
-    fn families_parse_from_normalised_ids() {
-        let family = |model: &str| {
-            family_of(model).map(|f| {
-                assert!(
-                    f.version.iter().all(|v| *v < u64::MAX),
-                    "a sane id never saturates"
-                );
-                (f.name, f.version)
-            })
-        };
-        // The canonical trio, with the segment-wise versions.
-        assert_eq!(
-            family("claude-opus-4-8"),
-            Some(("opus".to_owned(), vec![4, 8]))
-        );
-        assert_eq!(family("claude-opus-5"), Some(("opus".to_owned(), vec![5])));
-        assert_eq!(
-            family("claude-sonnet-5"),
-            Some(("sonnet".to_owned(), vec![5]))
-        );
-        assert_eq!(
-            family("claude-haiku-4-5"),
-            Some(("haiku".to_owned(), vec![4, 5]))
-        );
-        assert_eq!(
-            family("claude-fable-5-1"),
-            Some(("fable".to_owned(), vec![5, 1]))
-        );
-        assert_eq!(
-            family("claude-mythos-preview"),
-            Some(("mythos-preview".to_owned(), vec![]))
-        );
-        // The claude- prefix folds; a non-claude id keeps its leading part.
-        assert_eq!(
-            family("claude-3-5-sonnet"),
-            Some(("sonnet".to_owned(), vec![3, 5]))
-        );
-        assert_eq!(
-            family("gpt-5.6-sol"),
-            Some(("gpt-5.6-sol".to_owned(), vec![])),
-            "5.6 is not a pure digit run: it stays family, not a version segment"
-        );
-        // Published snapshots fold to their dateless form and keep a family.
-        assert_eq!(
-            family("claude-3-7-sonnet-20250219"),
-            Some(("sonnet".to_owned(), vec![3, 7]))
-        );
-        // An unpublished dated identity has no family, never a rewrite
-        // target: a future model is not evidence about an earlier one.
-        assert_eq!(family("claude-opus-4-9-20261225"), None);
-        // Unknown stays unknown, never guessed (invariant 3).
-        assert_eq!(family(""), None);
-        assert_eq!(family("   "), None, "blank normalises to no identity");
-    }
-
-    #[test]
-    fn newer_is_segmentwise_and_numeric_never_stringwise() {
-        // String order gets this wrong: "claude-opus-5" < "claude-opus-4-8".
-        assert!(newer_than("claude-opus-5", "claude-opus-4-8"));
-        assert!(!newer_than("claude-opus-4-8", "claude-opus-5"));
-        // "4-10" must beat "4-8" numerically.
-        assert!(newer_than("claude-opus-4-10", "claude-opus-4-8"));
-        // A missing segment counts as lower: [5, 1] beats [5].
-        assert!(newer_than("claude-opus-5-1", "claude-opus-5"));
-        // Equal is not newer, and a family never crosses.
-        assert!(!newer_than("claude-opus-5", "claude-opus-5"));
-        assert!(!newer_than("claude-opus-5", "claude-sonnet-5"));
-        assert!(!newer_than("no-family-at-all", "claude-opus-5"));
-    }
-
     // ── the election bar ────────────────────────────────────────────
-
-    #[test]
-    fn the_bar_scales_with_the_log_both_sides() {
-        // Day one: whatever is present qualifies — a young log is not
-        // dormant (an absolute bar would ask a fresh install for a week of
-        // evidence it cannot contain).
-        assert_eq!(requirement(0), 0.0);
-        assert_eq!(requirement(1), 0.5);
-        assert_eq!(requirement(2), 1.0);
-        // It tightens as history arrives.
-        assert_eq!(requirement(6), 3.0);
-        // And caps at a fortnight of daily use.
-        assert_eq!(requirement(14), 7.0);
-        assert_eq!(requirement(400), 7.0);
-    }
 
     #[test]
     fn the_election_respects_the_bar_and_picks_the_newest() {
@@ -1117,22 +925,6 @@ mod tests {
             Some("claude-opus-4-8".to_owned()),
             "3 days against a 3.5 bar is still a trial, not an adoption"
         );
-    }
-
-    // ── local-day grouping ──────────────────────────────────────────
-
-    #[test]
-    fn days_group_by_local_calendar_day_never_utc() {
-        let tz = tz();
-        // 2026-10-02 14:00 UTC is 2026-10-03 03:00 at +13 — same instant,
-        // different local day, and the LOCAL one is what counts.
-        let utc_day = local_day(1_769_954_400_000, &TimeZone::UTC).expect("parses");
-        assert_eq!(utc_day, "2026-02-01");
-        let local = local_day(1_769_954_400_000, &tz).expect("parses");
-        assert_eq!(local, "2026-02-02", "+13:00 is already the next day");
-
-        // A timestamp that cannot exist answers None, never a guess.
-        assert_eq!(local_day(i64::MAX, &tz), None);
     }
 
     #[test]

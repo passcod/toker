@@ -11,6 +11,24 @@ use crate::store::{BindingLearning, Store};
 
 use super::BindingId;
 
+/// The ceiling on the requirement: a fortnight of daily use proves enough.
+pub const MAX_REQUIRED_DAYS: f64 = 7.0;
+
+/// How many days a model must have been seen on to be trusted as its
+/// family's newest, given how many days there are to judge against.
+///
+/// Scaled rather than absolute: an absolute bar asks a young log for
+/// evidence it cannot possibly contain: on a fresh install nothing would
+/// qualify for a week, so the feature would be dormant exactly when someone
+/// is setting it up and watching it. Scaled, day one accepts whatever is
+/// present, and the bar tightens as history arrives. What keeps the weak
+/// early bar safe is not this function: it only decides WHICH model is a
+/// family's target; whether anything is rewritten at all is decided
+/// elsewhere, by rules that do not relax.
+pub fn requirement(active_days: usize) -> f64 {
+    (active_days as f64 / 2.0).min(MAX_REQUIRED_DAYS)
+}
+
 /// Learned evidence for one exact backend model identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LearnedEvidence {
@@ -263,7 +281,7 @@ impl BindingLearningView {
         let Some(model_id) = exact_reported_model(reported_model) else {
             return Ok(());
         };
-        let Some(day) = crate::middleware::models::local_day(at_ms, tz) else {
+        let Some(day) = crate::store::local_day(at_ms, tz) else {
             return Ok(());
         };
         self.store
@@ -407,6 +425,21 @@ fn binding_evidence(entry: BindingLearning) -> LearnedEvidence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_bar_scales_with_the_log_both_sides() {
+        // Day one: whatever is present qualifies — a young log is not
+        // dormant (an absolute bar would ask a fresh install for a week of
+        // evidence it cannot contain).
+        assert_eq!(requirement(0), 0.0);
+        assert_eq!(requirement(1), 0.5);
+        assert_eq!(requirement(2), 1.0);
+        // It tightens as history arrives.
+        assert_eq!(requirement(6), 3.0);
+        // And caps at a fortnight of daily use.
+        assert_eq!(requirement(14), 7.0);
+        assert_eq!(requirement(400), 7.0);
+    }
+
     use std::collections::BTreeSet;
     use std::sync::Arc;
 

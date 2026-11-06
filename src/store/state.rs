@@ -14,7 +14,6 @@ use std::str::FromStr;
 
 use crate::catalog::DeclaredWindow;
 use crate::ir::Release;
-use crate::middleware::models::local_day;
 use crate::policy::{
     ActivationScope, BindingId, CandidateId, CanonicalLimits, PolicyFingerprint, RouteFingerprint,
     RouteId, StableId, ValidatedPolicyDocument, decode_policy, policy_bytes, policy_fingerprint,
@@ -2206,4 +2205,36 @@ pub(super) fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
         [key],
         |row| Ok(row.get(0)?),
     )
+}
+
+/// The local calendar day of an epoch-millisecond timestamp, `YYYY-MM-DD`
+/// (the same shape an `en-CA` locale day renders as). The timezone is the
+/// caller's, so the grouping is a pure function of its inputs; the server
+/// passes the system zone, and tests pin theirs.
+pub fn local_day(at_ms: i64, tz: &jiff::tz::TimeZone) -> Option<String> {
+    let zoned = jiff::Timestamp::from_millisecond(at_ms)
+        .ok()?
+        .to_zoned(tz.clone());
+    Some(zoned.date().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::tz::TimeZone;
+
+    use super::local_day;
+
+    #[test]
+    fn days_group_by_local_calendar_day_never_utc() {
+        let tz = TimeZone::fixed(jiff::tz::Offset::from_hours(13).expect("offset"));
+        // 2026-02-01 14:00 UTC is 2026-02-02 03:00 at +13: the same instant
+        // on a different local day, and the LOCAL one is what counts.
+        let utc_day = local_day(1_769_954_400_000, &TimeZone::UTC).expect("parses");
+        assert_eq!(utc_day, "2026-02-01");
+        let local = local_day(1_769_954_400_000, &tz).expect("parses");
+        assert_eq!(local, "2026-02-02", "+13:00 is already the next day");
+
+        // A timestamp that cannot exist answers None, never a guess.
+        assert_eq!(local_day(i64::MAX, &tz), None);
+    }
 }

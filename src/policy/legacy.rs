@@ -894,7 +894,7 @@ mod tests {
                 "claude-3-7-sonnet",
                 "claude-3-7-sonnet-20250219",
             ] {
-                let expected = crate::middleware::models::family_of(model).expect("legacy family");
+                let expected = crate::policy::family::family_of(model).expect("legacy family");
                 let classified = classifier
                     .classify(model)
                     .expect("classification succeeds")
