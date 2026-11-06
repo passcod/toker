@@ -64,7 +64,7 @@ Changeset 12 left legacy routing reachable in production:
       route only
 - [ ] Stop dual-writing the legacy `ModelStore`; remove `/_toker/models/merge`
       and test-only promotion planning
-- [ ] Remove shadow mode (`policy/shadow.rs`, `LegacyShadow` ownership, shadow
+- [x] Remove shadow mode (`policy/shadow.rs`, `LegacyShadow` ownership, shadow
       observers and callers); rename the live `shadow_*` helpers and
       `capture_shadow`
 - [ ] Port server integration tests to an authoritative server with an active
@@ -87,6 +87,9 @@ Changeset 12 left legacy routing reachable in production:
 - [ ] Clear stale cutover comments (`server/mod.rs`, `store/schema.rs`,
       `store/state.rs`, `anthropic.rs`, `policy/learning.rs`,
       `middleware/mod.rs`, `middleware/model_map.rs`)
+  - Done: `server/mod.rs`, `store/schema.rs`, `store/state.rs`,
+    `anthropic.rs`, `policy/learning.rs`. Left for the model-map and
+    ModelStore deletions: `middleware/mod.rs`, `middleware/model_map.rs`.
 
 ### Regressions the test port surfaced
 
