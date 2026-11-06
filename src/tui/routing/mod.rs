@@ -4,6 +4,7 @@ mod client;
 mod import;
 mod model;
 mod reconcile;
+mod template;
 mod view;
 
 use client::{Client, Command};

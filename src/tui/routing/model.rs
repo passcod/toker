@@ -50,9 +50,18 @@ pub(super) enum Modal {
     /// Existing typed records serialize exactly as the daemon's typed DTOs.
     /// This avoids lossy, path-addressed edits while still allowing every
     /// current and future field to be changed from the terminal.
+    ///
+    /// `adding` marks a record that does not exist yet: it saves as an add
+    /// rather than a replacement, and the daemon refuses an id already taken.
     Record {
         key: String,
         value: String,
+        adding: bool,
+    },
+    /// Which kind of record to add, in a view that lists several.
+    NewKind {
+        kinds: &'static [&'static str],
+        preselected: usize,
     },
     Remove {
         key: String,
@@ -98,7 +107,9 @@ impl Modal {
         match self {
             Self::None => "",
             Self::Description { .. } => "EDIT DRAFT DESCRIPTION",
-            Self::Record { .. } => "EDIT TYPED POLICY RECORD",
+            Self::Record { adding: false, .. } => "EDIT TYPED POLICY RECORD",
+            Self::Record { adding: true, .. } => "ADD TYPED POLICY RECORD",
+            Self::NewKind { .. } => "ADD POLICY RECORD",
             Self::Remove { .. } => "REMOVE POLICY RECORD",
             Self::CandidateOrder { .. } => "ORDER ROUTE CANDIDATES",
             Self::Preview { .. } | Self::PreviewResult(_) => "ROUTING PREVIEW",
@@ -517,6 +528,10 @@ impl State {
                 self.open_edit();
                 None
             }
+            KeyCode::Char('n') => {
+                self.open_add();
+                None
+            }
             KeyCode::Char('d') => {
                 self.open_remove();
                 None
@@ -573,11 +588,48 @@ impl State {
                 self.modal = Modal::Record {
                     key: record_key,
                     value: pretty(&value),
+                    adding: false,
                 };
             } else {
                 self.error = Some("this item is not a draft policy record".to_owned());
             }
         }
+    }
+
+    /// Start adding a record. A view that lists one kind goes straight to its
+    /// template; one that lists several asks which kind first, defaulting to
+    /// the kind under the cursor.
+    fn open_add(&mut self) {
+        let kinds = super::template::kinds(self.view);
+        match kinds {
+            [] => {
+                self.error = Some("there is nothing to add in this view".to_owned());
+            }
+            [kind] => self.open_template(kind),
+            _ => {
+                let preselected = self
+                    .entries()
+                    .get(self.selected)
+                    .and_then(|entry| kinds.iter().position(|kind| *kind == entry.key))
+                    .unwrap_or(0);
+                self.modal = Modal::NewKind { kinds, preselected };
+            }
+        }
+    }
+
+    fn open_template(&mut self, kind: &'static str) {
+        let route_id = self
+            .snapshot
+            .as_ref()
+            .and_then(draft_policy)
+            .and_then(|policy| array(policy, "routes").first())
+            .and_then(|route| route.get("id"))
+            .and_then(Value::as_str);
+        self.modal = Modal::Record {
+            key: kind.to_owned(),
+            value: pretty(&super::template::template(kind, route_id)),
+            adding: true,
+        };
     }
 
     fn open_remove(&mut self) {
@@ -709,40 +761,53 @@ impl State {
             Modal::Record {
                 key: record_key,
                 mut value,
+                adding,
             } => {
+                let mut action = ModalAction::None;
                 if key.code == KeyCode::Esc {
-                    (Modal::None, ModalAction::None)
+                    return None;
                 } else if key.code == KeyCode::Enter
                     && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     match serde_json::from_str::<Value>(&value) {
-                        Ok(record) => (
-                            Modal::Record {
-                                key: record_key.clone(),
-                                value,
-                            },
-                            ModalAction::Edit(vec![replace_edit(&record_key, record)]),
-                        ),
-                        Err(error) => {
-                            self.error = Some(format!("record JSON: {error}"));
-                            (
-                                Modal::Record {
-                                    key: record_key,
-                                    value,
-                                },
-                                ModalAction::None,
-                            )
+                        Ok(record) => {
+                            action = ModalAction::Edit(vec![if adding {
+                                add_edit(&record_key, record)
+                            } else {
+                                replace_edit(&record_key, record)
+                            }]);
                         }
+                        Err(error) => self.error = Some(format!("record JSON: {error}")),
                     }
                 } else {
                     text_key(&mut value, key);
-                    (
-                        Modal::Record {
-                            key: record_key,
-                            value,
-                        },
-                        ModalAction::None,
-                    )
+                }
+                (
+                    Modal::Record {
+                        key: record_key,
+                        value,
+                        adding,
+                    },
+                    action,
+                )
+            }
+            Modal::NewKind { kinds, preselected } => {
+                let chosen = match key.code {
+                    KeyCode::Esc => return None,
+                    KeyCode::Enter => Some(preselected),
+                    KeyCode::Char(digit) => digit
+                        .to_digit(10)
+                        .and_then(|digit| usize::try_from(digit).ok())
+                        .and_then(|digit| digit.checked_sub(1))
+                        .filter(|index| *index < kinds.len()),
+                    _ => None,
+                };
+                match chosen.and_then(|index| kinds.get(index)) {
+                    Some(kind) => {
+                        self.open_template(kind);
+                        return None;
+                    }
+                    None => (Modal::NewKind { kinds, preselected }, ModalAction::None),
                 }
             }
             Modal::Remove {
@@ -1213,6 +1278,21 @@ fn replace_edit(key: &str, value: Value) -> Value {
         "rewrites" => json!({ "kind": "replace_rewrite", "id": id, "rewrite": value }),
         "classifiers" => json!({ "kind": "replace_classifier", "id": id, "classifier": value }),
         "upgrades" => json!({ "kind": "replace_upgrade", "id": id, "upgrade": value }),
+        _ => Value::Null,
+    }
+}
+
+/// The typed addition of a new record. It carries no id of its own to
+/// compare against: the daemon refuses an id or scope already taken.
+pub(super) fn add_edit(key: &str, value: Value) -> Value {
+    match key {
+        "presentations" => json!({ "kind": "add_presentation", "presentation": value }),
+        "routes" => json!({ "kind": "add_route", "route": value }),
+        "defaults" => json!({ "kind": "add_default", "default": value }),
+        "rewrites" => json!({ "kind": "add_rewrite", "rewrite": value }),
+        "classifiers" => json!({ "kind": "add_classifier", "classifier": value }),
+        "upgrades" => json!({ "kind": "add_upgrade", "upgrade": value }),
+        "compaction" => json!({ "kind": "add_compaction", "compaction": value }),
         _ => Value::Null,
     }
 }
@@ -2056,5 +2136,224 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "operations": operations }))
                 .expect("every emitted operation is a typed PolicyEdit operation");
         assert_eq!(edit.operations.len(), 4);
+    }
+
+    const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+    #[test]
+    fn adding_a_presentation_sends_the_typed_addition_at_the_loaded_generation() {
+        let mut state = loaded(full_snapshot());
+        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        let Modal::Record { key, value, adding } = state.modal().clone() else {
+            panic!("a one-kind view opens the template directly");
+        };
+        assert_eq!((key.as_str(), adding), ("presentations", true));
+        assert!(value.contains("new-presentation"), "{value}");
+        let command = state.key(CTRL_ENTER).expect("add command");
+        assert_eq!(command.name, "draft-edit");
+        assert_eq!(command.method, Method::PATCH);
+        let body = command.body.expect("body");
+        assert_eq!(body["expected_generation"], 3);
+        let operation = &body["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "add_presentation");
+        assert_eq!(operation["presentation"]["id"], "new-presentation");
+        assert!(state.in_flight());
+        // The draft the daemon answers with closes the form.
+        state.receive(reply(
+            "draft-edit",
+            200,
+            serde_json::json!({"generation": 4}),
+        ));
+        assert!(!state.modal().active());
+    }
+
+    #[test]
+    fn an_added_record_is_the_text_that_was_edited_not_the_template() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('n'));
+        let Modal::Record { value, .. } = state.modal().clone() else {
+            panic!("record form");
+        };
+        // Clear the template, then type a record of our own.
+        for _ in 0..value.chars().count() {
+            press(&mut state, KeyCode::Backspace);
+        }
+        typed(&mut state, r#"{"id":"mine","slug":"m"}"#);
+        let command = state.key(CTRL_ENTER).expect("add command");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["presentation"]["id"], "mine");
+    }
+
+    #[test]
+    fn a_bad_new_record_stays_open_and_sends_nothing() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('n'));
+        typed(&mut state, "}");
+        assert!(state.key(CTRL_ENTER).is_none());
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.starts_with("record JSON"))
+        );
+        assert!(matches!(state.modal(), Modal::Record { adding: true, .. }));
+        assert!(!state.in_flight());
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.modal().active());
+    }
+
+    #[test]
+    fn adding_a_record_whose_id_exists_shows_the_daemons_refusal_in_the_form() {
+        let mut state = loaded(full_snapshot());
+        state.set_view(View::Routes);
+        press(&mut state, KeyCode::Char('n'));
+        press(&mut state, KeyCode::Char('1'));
+        assert!(state.key(CTRL_ENTER).is_some());
+        // The refusal text is the daemon's own: the template's route added
+        // to a draft that already holds a route of that id.
+        let record = crate::tui::routing::template::template("routes", None);
+        let draft: crate::policy::PolicyDocument = serde_json::from_value(serde_json::json!({
+            "format_version": 3, "routes": [record.clone()],
+        }))
+        .expect("document");
+        let duplicate: crate::policy::PolicyEdit = serde_json::from_value(
+            serde_json::json!({ "operations": [super::add_edit("routes", record)] }),
+        )
+        .expect("edit");
+        let refusal = duplicate.apply(&draft).expect_err("the id is taken");
+        state.receive(reply(
+            "draft-edit",
+            422,
+            serde_json::json!({
+                "error": "invalid_policy_edit",
+                "detail": refusal.to_string(),
+            }),
+        ));
+        assert!(
+            matches!(state.modal(), Modal::Record { adding: true, .. }),
+            "the form stays open so the id can be changed"
+        );
+        assert!(!state.in_flight());
+        let error = state.error().expect("the refusal is shown");
+        assert!(error.contains("invalid_policy_edit"), "{error}");
+        assert!(error.contains("already exists"), "{error}");
+        assert!(
+            state.conflicted_edits.is_empty(),
+            "a refused edit is not offered for reapply"
+        );
+        // Fixing the id and saving again is an ordinary second attempt.
+        assert!(state.key(CTRL_ENTER).is_some());
+    }
+
+    #[test]
+    fn a_conflict_on_an_add_reapplies_the_addition_to_the_daemon_copy() {
+        let mut state = loaded(full_snapshot());
+        press(&mut state, KeyCode::Char('n'));
+        state.key(CTRL_ENTER).expect("add command");
+        state.receive(reply(
+            "draft-edit",
+            409,
+            serde_json::json!({"error": "stale_draft", "generation": 9,
+                "draft": {"policy": {"description": "theirs"}}}),
+        ));
+        assert!(matches!(state.modal(), Modal::Conflict { .. }));
+        let command = press(&mut state, KeyCode::Char('a')).expect("reapply command");
+        let body = command.body.expect("body");
+        assert_eq!(body["expected_generation"], 9);
+        assert_eq!(body["edit"]["operations"][0]["kind"], "add_presentation");
+    }
+
+    #[test]
+    fn a_view_with_several_kinds_asks_which_to_add() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Routes);
+        // The cursor is on a route, so a route is the preselected kind.
+        press(&mut state, KeyCode::Char('n'));
+        assert!(matches!(
+            state.modal(),
+            Modal::NewKind { preselected: 0, .. }
+        ));
+        assert!(press(&mut state, KeyCode::Char('x')).is_none());
+        assert!(matches!(state.modal(), Modal::NewKind { .. }));
+        press(&mut state, KeyCode::Enter);
+        let Modal::Record { key, adding, .. } = state.modal().clone() else {
+            panic!("Enter picks the preselected kind");
+        };
+        assert_eq!((key.as_str(), adding), ("routes", true));
+        press(&mut state, KeyCode::Esc);
+
+        // With the cursor on a default, a default is the preselected kind.
+        state.move_selection(1);
+        press(&mut state, KeyCode::Char('n'));
+        assert!(matches!(
+            state.modal(),
+            Modal::NewKind { preselected: 1, .. }
+        ));
+        press(&mut state, KeyCode::Esc);
+        assert!(!state.modal().active());
+
+        // A number picks a kind whatever the cursor is on.
+        press(&mut state, KeyCode::Char('n'));
+        press(&mut state, KeyCode::Char('9'));
+        assert!(matches!(state.modal(), Modal::NewKind { .. }));
+        press(&mut state, KeyCode::Char('2'));
+        assert!(matches!(state.modal(), Modal::Record { key, .. } if key == "defaults"));
+    }
+
+    #[test]
+    fn every_kind_in_the_rewrites_view_can_be_added() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Rewrites);
+        for (digit, kind, operation) in [
+            ('1', "rewrites", "add_rewrite"),
+            ('2', "classifiers", "add_classifier"),
+            ('3', "upgrades", "add_upgrade"),
+            ('4', "compaction", "add_compaction"),
+        ] {
+            press(&mut state, KeyCode::Char('n'));
+            press(&mut state, KeyCode::Char(digit));
+            assert!(matches!(state.modal(), Modal::Record { key, .. } if key == kind));
+            let command = state.key(CTRL_ENTER).expect("add command");
+            assert_eq!(
+                command.body.expect("body")["edit"]["operations"][0]["kind"],
+                operation
+            );
+            state.receive(reply(
+                "draft-edit",
+                200,
+                serde_json::json!({"generation": 6}),
+            ));
+        }
+    }
+
+    #[test]
+    fn a_new_default_starts_from_the_drafts_first_route_and_adds_by_scope() {
+        let mut state = loaded(defaults_snapshot());
+        state.set_view(View::Routes);
+        press(&mut state, KeyCode::Char('n'));
+        press(&mut state, KeyCode::Char('2'));
+        let Modal::Record { value, .. } = state.modal().clone() else {
+            panic!("record form");
+        };
+        let template: serde_json::Value = serde_json::from_str(&value).expect("JSON template");
+        assert_eq!(template["target"]["route_id"], "route-a");
+        let command = state.key(CTRL_ENTER).expect("add command");
+        let operation = &command.body.expect("body")["edit"]["operations"][0];
+        assert_eq!(operation["kind"], "add_default");
+        assert_eq!(operation["default"], template);
+    }
+
+    #[test]
+    fn adding_is_not_offered_in_the_status_view_or_while_busy() {
+        let mut state = loaded(full_snapshot());
+        state.set_view(View::Status);
+        assert!(press(&mut state, KeyCode::Char('n')).is_none());
+        assert!(!state.modal().active());
+        assert!(state.error().is_some());
+        state.set_view(View::Presentations);
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Char('y'));
+        assert!(state.in_flight());
+        press(&mut state, KeyCode::Char('n'));
+        assert!(!matches!(state.modal(), Modal::Record { .. }));
     }
 }

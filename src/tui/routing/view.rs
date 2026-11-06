@@ -10,6 +10,7 @@ use ratatui::{
 use serde_json::Value;
 
 use super::model::{Entry, Modal, State, View};
+use super::template::singular;
 
 /// The page areas that the loop needs for click handling.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -202,7 +203,7 @@ fn footer_text(state: &State) -> String {
         .map(|note| format!("{note} · "))
         .unwrap_or_default();
     format!(
-        "{generation}{busy}{settings}←/→ or 1–4 view · ↑/↓ select · e edit · d remove · v preview · V validate · a activate · p promote · r refresh · Tab dashboard · ? help"
+        "{generation}{busy}{settings}←/→ or 1–4 view · ↑/↓ select · n new · e edit · d remove · v preview · V validate · a activate · p promote · r refresh · Tab dashboard · ? help"
     )
 }
 
@@ -265,11 +266,24 @@ fn modal_lines(modal: &Modal) -> Vec<String> {
             "Type a description; Enter saves, Esc cancels.".to_owned(),
             value.clone(),
         ],
-        Modal::Record { key, value } => vec![
-            format!("{key}: edit its typed JSON record."),
+        Modal::Record { key, value, adding } => vec![
+            if *adding {
+                format!("{key}: fill in the new typed JSON record; its id must be unused.")
+            } else {
+                format!("{key}: edit its typed JSON record.")
+            },
             "Ctrl+Enter saves; Esc cancels. The daemon validates all fields.".to_owned(),
             value.clone(),
         ],
+        Modal::NewKind { kinds, preselected } => {
+            let mut lines = vec!["Add which kind of record? The number or Enter picks it.".to_owned()];
+            lines.extend(kinds.iter().enumerate().map(|(index, kind)| {
+                let mark = if index == *preselected { ">" } else { " " };
+                format!("{mark} {} {}", index + 1, singular(kind))
+            }));
+            lines.push("Esc cancels".to_owned());
+            lines
+        }
         Modal::Remove { key, value } => vec![
             format!("Remove this {key} record? This changes only the draft."),
             short(value),
@@ -340,8 +354,10 @@ fn render_legend(frame: &mut Frame) {
         "Tab  return to dashboard",
         "1–4, ←/→  change routing view",
         "↑/↓, j/k  select an item",
-        "e  edit typed record; Ctrl+Enter saves JSON",
+        "n  add a record from a template (asks which kind where a view has several)",
+        "e  edit typed record; Ctrl+Enter saves JSON, in an add too",
         "d  confirm removal; m orders route candidates",
+        "defaults (routes view) and compaction (rewrites view) take n, e and d",
         "v preview; V validate; a activate; x reactivate; p promote",
         "i  import legacy toker.toml routing into the draft (status view)",
         "A missing daemon endpoint leaves the loaded read-only view usable",
@@ -442,5 +458,57 @@ mod tests {
                 .is_some_and(|line| line.contains("confirms")),
             "the confirmation prompt stays above the refusal: {text}"
         );
+    }
+
+    /// Every key the page acts on is named in the legend, so a key that was
+    /// added cannot stay undocumented.
+    #[test]
+    fn the_legend_names_every_record_key() {
+        let backend = TestBackend::new(140, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render(frame, &State::default(), true);
+            })
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for key_help in [
+            "n  add a record",
+            "e  edit typed record",
+            "d  confirm removal",
+            "defaults (routes view)",
+            "i  import",
+        ] {
+            assert!(text.contains(key_help), "{key_help}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_add_forms_say_what_they_do() {
+        let mut state = State::default();
+        state.receive(Reply::Command(
+            Command::snapshot(),
+            Ok(Response {
+                status: 200,
+                body: serde_json::json!({
+                    "draft_generation": 2,
+                    "draft": {"policy": {"routes": []}},
+                }),
+            }),
+        ));
+        state.set_view(super::View::Routes);
+        state.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let text = modal_text(&state).join("\n");
+        assert!(text.contains("1 route"), "{text}");
+        assert!(text.contains("2 default"), "{text}");
     }
 }

@@ -403,7 +403,7 @@ pub fn run(
                     && matches!(
                         code,
                         crossterm::event::KeyCode::Char(
-                            'e' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p'
+                            'e' | 'n' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p'
                         )
                     ) =>
                 {
