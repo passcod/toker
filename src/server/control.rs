@@ -41,8 +41,9 @@ use serde_json::{Value, json};
 pub(super) mod routing;
 
 use super::Server;
+use crate::middleware::cold::ttl_of;
 use crate::middleware::models::{MergeIncoming, MergeOutcome};
-use crate::store::SessionSummary;
+use crate::store::{Lane, SessionSummary};
 
 const CONTROL_HEADER: &str = "x-toker-control";
 
@@ -174,6 +175,11 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
 /// with `null`s — the endpoint cannot distinguish "absent session" from
 /// "session that measured nothing", and the plugin renders nothing
 /// either way. No content and no credentials leave (invariants 1-2).
+///
+/// `lanes` is the session's rows from the lane table (exact session id,
+/// newest first), each with a state computed now (see `lane_body`). A
+/// session the table does not know, or has pruned, answers `[]`, never an
+/// invented cold lane.
 pub(crate) async fn session(State(server): State<Server>, request: Request) -> Response {
     if !control_token_ok(request.headers(), "session") {
         return forbidden();
@@ -189,15 +195,26 @@ pub(crate) async fn session(State(server): State<Server>, request: Request) -> R
         )
             .into_response();
     };
-    match server.store.session_summary(&session_id) {
-        Ok(summary) => Json(session_body(&session_id, &summary)).into_response(),
-        Err(error) => store_error(error),
-    }
+    let summary = match server.store.session_summary(&session_id) {
+        Ok(summary) => summary,
+        Err(error) => return store_error(error),
+    };
+    let lanes = match server.store.load_session_lanes(&session_id) {
+        Ok(lanes) => lanes,
+        Err(error) => return store_error(error),
+    };
+    Json(session_body(
+        &session_id,
+        &summary,
+        &lanes,
+        super::record::now_ms(),
+    ))
+    .into_response()
 }
 
-/// The `/_toker/session` reply body. The breakdowns are arrays — empty
-/// when there is nothing to break down, never `null`.
-fn session_body(session_id: &str, summary: &SessionSummary) -> Value {
+/// The `/_toker/session` reply body. The breakdowns and `lanes` are arrays
+/// — empty when there is nothing to break down, never `null`.
+fn session_body(session_id: &str, summary: &SessionSummary, lanes: &[Lane], now_ms: i64) -> Value {
     let per_provider: Vec<Value> = summary
         .per_provider
         .iter()
@@ -237,6 +254,60 @@ fn session_body(session_id: &str, summary: &SessionSummary) -> Value {
             "per_provider": per_provider,
             "per_model": per_model,
         },
+        "lanes": lanes.iter().map(|lane| lane_body(lane, now_ms)).collect::<Vec<_>>(),
+    })
+}
+
+/// How many leading characters of a lane's tool-set digest identify it in
+/// the reply. The digest is already a one-way hash of the tool list; the
+/// reply carries a short prefix so a client can tell lanes apart without
+/// holding the lane key.
+const TOOLS_ID_CHARS: usize = 6;
+
+/// One lane as the session reply shows it: the operational metadata the
+/// `lanes` row already keeps, plus a state computed at query time. Never
+/// content (invariant 1), and a field the lane never recorded is `null`,
+/// not zero (invariant 3's absence rule).
+///
+/// - `state`: `ping` for a ping lane (its cache is not the conversation's,
+///   so it is never called warm or cold), else `cold` once the idle time
+///   has reached the cache's lifetime (`cold::ttl_of`, the gate's own
+///   reading, so an unrecorded tier is the long one) and `warm` before.
+///   A lane stamped in the future (a clock that moved) has no idle time
+///   to measure: `null`, as the cold gate treats it.
+/// - `warm_remaining_ms`: only for a warm lane whose TTL was actually
+///   recorded. An unrecorded tier gives the gate a long default but
+///   gives this view nothing to count down from.
+/// - `forced`: the sticky model transition, `null` when the lane has none.
+fn lane_body(lane: &Lane, now_ms: i64) -> Value {
+    let idle_ms = (now_ms >= lane.updated_ms).then(|| now_ms - lane.updated_ms);
+    let ttl_ms = ttl_of(lane);
+    let state = match idle_ms {
+        _ if lane.ping == Some(true) => Some("ping"),
+        None => None,
+        Some(idle) if idle >= ttl_ms => Some("cold"),
+        Some(_) => Some("warm"),
+    };
+    let warm_remaining_ms = match (state, idle_ms, lane.ttl) {
+        (Some("warm"), Some(idle), Some(_)) => Some(ttl_ms - idle),
+        _ => None,
+    };
+    let forced = (lane.forced_from.is_some() || lane.forced_to.is_some())
+        .then(|| json!({"from": lane.forced_from, "to": lane.forced_to}));
+    json!({
+        "tools_id": lane
+            .tools_hash
+            .as_ref()
+            .map(|hash| hash.chars().take(TOOLS_ID_CHARS).collect::<String>()),
+        "state": state,
+        "ping": lane.ping == Some(true),
+        "updated_ms": lane.updated_ms,
+        "idle_ms": idle_ms,
+        "prompt_tokens": lane.prompt_tokens,
+        "ttl_ms": lane.ttl,
+        "warm_remaining_ms": warm_remaining_ms,
+        "noticed_ms": lane.noticed_at,
+        "forced": forced,
     })
 }
 
@@ -564,5 +635,106 @@ mod tests {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
         assert_eq!(percent_decode("%2"), "%2");
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use serde_json::{Value, json};
+
+    use super::lane_body;
+    use crate::store::Lane;
+
+    const NOW: i64 = 10_000_000;
+    const MIN: i64 = 60_000;
+
+    fn lane(updated_ms: i64, ttl: Option<i64>) -> Lane {
+        Lane {
+            key: "ses|0123456789ab".to_owned(),
+            session_id: Some("ses".to_owned()),
+            tools_hash: Some("0123456789ab".to_owned()),
+            updated_ms,
+            prompt_tokens: Some(180_000),
+            ttl,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin_generation: 0,
+            pin: None,
+        }
+    }
+
+    #[test]
+    fn a_warm_lane_counts_down_its_recorded_ttl() {
+        let body = lane_body(&lane(NOW - 2 * MIN, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "warm");
+        assert_eq!(body["idle_ms"], 2 * MIN);
+        assert_eq!(body["warm_remaining_ms"], 3 * MIN);
+        assert_eq!(body["ttl_ms"], 5 * MIN);
+        assert_eq!(body["tools_id"], "012345", "a short prefix, not the digest");
+        assert_eq!(body["prompt_tokens"], 180_000);
+        assert_eq!(body["forced"], Value::Null);
+        assert_eq!(body["noticed_ms"], Value::Null);
+    }
+
+    #[test]
+    fn a_lane_is_cold_at_exactly_its_ttl() {
+        let body = lane_body(&lane(NOW - 5 * MIN, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "cold");
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        let body = lane_body(&lane(NOW - 5 * MIN + 1, Some(5 * MIN)), NOW);
+        assert_eq!(body["state"], "warm");
+        assert_eq!(body["warm_remaining_ms"], 1);
+    }
+
+    #[test]
+    fn an_unrecorded_ttl_reads_the_gates_long_tier_but_counts_nothing_down() {
+        let body = lane_body(&lane(NOW - 20 * MIN, None), NOW);
+        assert_eq!(body["state"], "warm", "ttl_of's long default, as the gate");
+        assert_eq!(body["ttl_ms"], Value::Null);
+        assert_eq!(
+            body["warm_remaining_ms"],
+            Value::Null,
+            "no recorded tier, no invented countdown"
+        );
+        let body = lane_body(&lane(NOW - 61 * MIN, None), NOW);
+        assert_eq!(body["state"], "cold");
+    }
+
+    #[test]
+    fn a_ping_lane_is_never_warm_or_cold() {
+        let mut ping = lane(NOW - MIN, Some(5 * MIN));
+        ping.ping = Some(true);
+        let body = lane_body(&ping, NOW);
+        assert_eq!(body["state"], "ping");
+        assert_eq!(body["ping"], true);
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        ping.updated_ms = NOW - 3 * 3_600_000;
+        assert_eq!(lane_body(&ping, NOW)["state"], "ping", "idle or not");
+    }
+
+    #[test]
+    fn a_future_stamp_has_no_state_and_missing_fields_stay_null() {
+        let mut future = lane(NOW + MIN, Some(5 * MIN));
+        future.prompt_tokens = None;
+        future.tools_hash = None;
+        let body = lane_body(&future, NOW);
+        assert_eq!(body["state"], Value::Null);
+        assert_eq!(body["idle_ms"], Value::Null);
+        assert_eq!(body["warm_remaining_ms"], Value::Null);
+        assert_eq!(body["prompt_tokens"], Value::Null, "not zero");
+        assert_eq!(body["tools_id"], Value::Null);
+    }
+
+    #[test]
+    fn the_sticky_model_transition_and_notice_time_ride_along_when_present() {
+        let mut moved = lane(NOW - MIN, Some(5 * MIN));
+        moved.noticed_at = Some(NOW - 30_000);
+        moved.forced_from = Some("model-a".to_owned());
+        moved.forced_to = Some("model-b".to_owned());
+        let body = lane_body(&moved, NOW);
+        assert_eq!(body["forced"], json!({"from": "model-a", "to": "model-b"}));
+        assert_eq!(body["noticed_ms"], NOW - 30_000);
     }
 }

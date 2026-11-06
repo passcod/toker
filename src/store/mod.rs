@@ -620,6 +620,11 @@ impl Store {
         state::load_binding_learnings(&*self.conn()?, binding_id)
     }
 
+    /// One session's lanes, newest first, through the session index.
+    pub fn load_session_lanes(&self, session_id: &str) -> Result<Vec<Lane>> {
+        state::load_session_lanes(&*self.conn()?, session_id)
+    }
+
     /// Age and cap the lanes table (see `state::prune_lanes`): future-dated
     /// rows, rows older than `max_age_ms`, and everything beyond the
     /// newest `max_lanes` go. The caller owns the cadence — the prune
@@ -1981,6 +1986,62 @@ mod tests {
         let summary = store.session_summary("ses-attempts").unwrap();
         assert_eq!(summary.requests, 1);
         assert_eq!(summary.input, Some(8));
+    }
+
+    #[test]
+    fn session_lanes_are_exact_newest_first_and_indexed() {
+        let store = mem_store();
+        let lane = |session: &str, tools: &str, updated_ms: i64| Lane {
+            key: format!("{session}|{tools}"),
+            session_id: Some(session.to_owned()),
+            tools_hash: Some(tools.to_owned()),
+            updated_ms,
+            prompt_tokens: None,
+            ttl: None,
+            ping: None,
+            noticed_at: None,
+            forced_from: None,
+            forced_to: None,
+            pin: None,
+            pin_generation: 0,
+        };
+        for lane in [
+            lane("s1", "aaaa", 1_000),
+            lane("s1", "bbbb", 3_000),
+            lane("s1", "cccc", 3_000),
+            lane("s10", "aaaa", 9_000),
+        ] {
+            store.upsert_lane(&lane).expect("upsert");
+        }
+
+        let keys: Vec<String> = store
+            .load_session_lanes("s1")
+            .expect("lanes")
+            .into_iter()
+            .map(|lane| lane.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["s1|bbbb", "s1|cccc", "s1|aaaa"],
+            "exact session, newest first, key breaks the tie"
+        );
+        assert!(store.load_session_lanes("nope").expect("lanes").is_empty());
+
+        let conn = store.conn().expect("conn");
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key FROM lanes
+                 WHERE session_id = ?1 ORDER BY updated_ms DESC, key",
+            )
+            .expect("prepare")
+            .query_map(["s1"], |row| row.get::<_, String>(3))
+            .expect("plan")
+            .map(|detail| detail.expect("detail"))
+            .collect();
+        assert!(
+            plan.iter().any(|step| step.contains("lanes_session_idx")),
+            "the read uses the session index: {plan:?}"
+        );
     }
 
     #[test]

@@ -46,6 +46,25 @@ Force-newest reads an unknown lane through the same bound. Anything else that
 reads a lane to judge a request should ask whether the request could be the
 thing the lane describes.
 
+## The session endpoint's lane view
+
+`GET /_toker/session?session=<id>` carries a `lanes` array for the opencode
+plugin, read from the lane table through `lanes_session_idx` (exact session id,
+newest first), not from the ledger and not by filtering every lane. Each entry
+is the lane's recorded metadata plus a state worked out at query time:
+`tools_id` (the first six characters of the tool-set digest), `state`,
+`prompt_tokens`, `ttl_ms`, `idle_ms`, `warm_remaining_ms`, `noticed_ms`, and
+`forced` (`{from, to}`, the sticky model transition).
+
+- `state` is `ping` for a ping lane, which is never called warm or cold because
+  its cache is not the conversation's. Otherwise it is `cold` once idle time
+  reaches `cold::ttl_of`, the gate's own reading, and `warm` before. A lane
+  stamped in the future has no idle time, so its state is null.
+- `warm_remaining_ms` needs a recorded TTL. An unrecorded tier reads as the long
+  one for `state`, as it does in the gate, but gives nothing to count down from.
+- A session with no lane rows, or whose lanes were pruned, answers `[]`. Fields
+  a lane never recorded are null, not zero.
+
 ## Lanes toker keys differently
 
 ctp collapsed a missing session or tool hash into a shared `?` lane. toker does

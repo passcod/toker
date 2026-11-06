@@ -842,6 +842,13 @@ pub(super) const MIGRATIONS: &[&str] = &[
     SET compiler_origin = 'generated_revision_one'
     WHERE revision_id IN (SELECT revision_id FROM generated_lineage);
     "#,
+    // v16 — a session index on the lane table. The lane key is the composite
+    // `session|tools`, so a session's lanes were only reachable by scanning
+    // every lane; the opencode plugin asks for one session's lanes every
+    // couple of seconds. Newest first matches that read's order.
+    r#"
+    CREATE INDEX lanes_session_idx ON lanes (session_id, updated_ms);
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

@@ -600,6 +600,21 @@ pub(super) fn load_lanes(conn: &Connection) -> Result<Vec<Lane>> {
     )
 }
 
+/// One session's lanes, newest first (`updated_ms` descending, key as the
+/// tie-break so the order is stable). Exact on the `session_id` column,
+/// never a prefix of the key: "s1" must not collect "s10"'s lanes.
+pub(super) fn load_session_lanes(conn: &Connection, session_id: &str) -> Result<Vec<Lane>> {
+    rows_of(
+        conn,
+        &format!(
+            "SELECT {LANE_COLUMNS} FROM lanes
+             WHERE session_id = ?1 ORDER BY updated_ms DESC, key"
+        ),
+        [session_id],
+        read_lane,
+    )
+}
+
 fn read_lane(row: &rusqlite::Row<'_>) -> Result<Lane> {
     let revision: Option<i64> = row.get("policy_revision_id")?;
     let route: Option<String> = row.get("policy_route_id")?;
