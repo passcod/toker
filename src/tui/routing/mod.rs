@@ -13,6 +13,16 @@ use model::State;
 use reconcile::Reconciler;
 pub use reconcile::SettingsSync;
 
+/// The keys the routing page acts on itself, outside a modal. The dashboard
+/// loop forwards exactly these, so a key the page handles but this list lacks
+/// is silently dead.
+pub(super) fn owns_key(code: crossterm::event::KeyCode) -> bool {
+    matches!(
+        code,
+        crossterm::event::KeyCode::Char('e' | 'n' | 'd' | 'm' | 'v' | 'V' | 'a' | 'x' | 'p' | 'i')
+    )
+}
+
 /// Page-owned state, including the bounded control worker.
 pub(super) struct Page {
     client: Client,
@@ -97,5 +107,20 @@ impl Page {
 
     pub(super) fn render(&self, frame: &mut ratatui::Frame, legend: bool) -> view::Drawn {
         view::render(frame, &self.state, legend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+
+    use super::owns_key;
+
+    #[test]
+    fn every_key_the_legend_documents_reaches_the_page() {
+        for key in ['e', 'n', 'd', 'm', 'v', 'V', 'a', 'x', 'p', 'i'] {
+            assert!(owns_key(KeyCode::Char(key)), "{key}");
+        }
+        assert!(!owns_key(KeyCode::Char('q')), "q still quits");
     }
 }
