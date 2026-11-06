@@ -724,7 +724,11 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .or_else(|| target.effective_model().map(str::to_owned));
         shadow_baseline.clone_from(&effective_model);
         let mut transformed = false;
-        if effective_model.as_deref() != model.as_deref()
+        // A batch has no top-level model: its per-request positions were
+        // already rewritten above, and writing one here would add a body
+        // position the client never sent.
+        if path != "/v1/messages/batches"
+            && effective_model.as_deref() != model.as_deref()
             && let Some(effective) = effective_model.as_deref()
         {
             // A deliberate routing transform: the registry removed only
