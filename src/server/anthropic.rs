@@ -710,12 +710,13 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     );
                 }
             }
-        } else {
-            target = match legacy_target {
-                Ok(target) => target,
-                Err(_) => return super::anthropic_not_configured(),
-            };
+        } else if let Ok(legacy) = legacy_target {
+            target = legacy;
         }
+        // Otherwise the body did not canonicalise, so policy has nothing to
+        // route on. The placeholder target stands in until the translation
+        // error answers 400; a 404 "not configured" would blame the config
+        // for a client mistake.
         backend = target.provider().clone();
         let effective_model = policy_attempt
             .as_ref()
