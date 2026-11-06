@@ -221,10 +221,20 @@ overwrite a newer handoff or a success.
 ## The routing page
 
 `toker tui` has a second page, entered from the header, with four views:
-presentations, routes and candidates, rewrites, families and upgrades, and a
-status view for preview, revisions and activation. It is built from the
-endpoints above and holds no state of its own beyond the last snapshot and the
-user's typed input.
+presentations; routes, candidates and defaults; rewrites, families, upgrades and
+the compaction policy; and a status view for preview, revisions and activation.
+It is built from the endpoints above and holds no state of its own beyond the
+last snapshot and the user's typed input.
+
+- `n` adds a record, `e` edits the selected one and `d` removes it, for every
+  kind the first three views list, defaults and the compaction policy included.
+  `n` opens the record's JSON as a template for the user to fill in (after
+  asking which kind, in a view that lists several), and an edit opens the
+  existing record. Ctrl+Enter saves either as one typed operation, `add_*` or
+  `replace_*`; a removal sends `remove_*` after a confirmation. A default is
+  addressed by its scope and the compaction policy by being the only one. A refused add (an id or scope already taken, say)
+  leaves the form open with the daemon's `detail`, and a 409 takes the conflict
+  path like any other edit.
 
 - All traffic runs on one worker thread with a small bounded queue. Key presses
   only enqueue; the terminal never waits on HTTP, and a daemon that is down or
