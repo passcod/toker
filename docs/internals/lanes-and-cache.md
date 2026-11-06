@@ -74,6 +74,14 @@ seeds a pin from guesswork, because the cache such a lane may hold cannot be
 attributed to a binding. A proven-cold temperature is the one thing kept,
 because the compaction route needs it.
 
+The limit this leaves: a session already mid-conversation at the upgrade whose
+history carries provider-owned state (signed or redacted thinking, OpenRouter
+`reasoning_details`, Codex encrypted reasoning) has no pin to say which binding
+produced it, so its next request is refused with a 400 ("unknown binding
+affinity") on every protocol. Only the binding that made the state can replay
+it, and nothing records which that was. Starting a new session clears it; a
+plain conversation with no such state is unaffected.
+
 Pins live in the lane row, so they go with it: a lane pruned at 4000 lanes or 30
 days has no pin, and the next request is a new lane.
 

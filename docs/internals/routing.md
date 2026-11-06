@@ -50,7 +50,7 @@ requires a full `ModelInfo` entry, so foreign providers remain explicitly
 routable but are not advertised in its models response until their metadata
 projection is verified. When no usable catalogue has arrived, or a presented
 offer is not in the inventory, the endpoint returns 503, not a false empty list.
-Unknown and unprefixed profiles keep path-driven forwarding. The service loads
+The service loads
 cached catalogues before serving, then refreshes in the background, and each
 refresh recompiles the active revision against the new inventory. OpenRouter's
 public listing needs no key; OpenAI's `/v1/models` listing uses the configured
