@@ -161,8 +161,5 @@ binding has learned the exact identity it is inferred; otherwise `--binding
 changes only the sticky `explicitly_promoted` bit: observed days, prompt
 ceilings, and context declarations remain provider evidence.
 
-Until compiled policy becomes authoritative, this evidence does not change the
-legacy live rewrite path. The predecessor-compatible `/_toker/models/merge`
-endpoint remains available to existing clients, but this CLI no longer calls it
-or writes the unattributable `models` table. The binding-aware daemon endpoint
-lands with the later routing control surface.
+The predecessor's `/_toker/models/merge` endpoint is gone; promotion goes
+through this CLI and the routing control surface.

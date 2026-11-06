@@ -1388,25 +1388,33 @@ async fn control_status_is_gated_and_secret_free() {
     // The status request itself is not an upstream exchange.
     assert_eq!(value["in_flight"], 0);
 
-    // The merge endpoint is gated the same way: no verb → 403, and the
-    // verb alone is not enough — a JSON content type is demanded too, so
-    // a
-    // browser cannot drive it without an unanswered preflight. The real
-    // merge behaviour is the anthropic suite's (models are learned from
-    // anthropic responses).
+    // The mutating endpoints are gated the same way: no verb is a 403, and
+    // the verb alone is not enough, because a JSON content type is demanded
+    // too, so a browser cannot drive one without an unanswered preflight.
     let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
+        .post(toker_url(addr, "/_toker/shutdown"))
         .send()
         .await
-        .expect("merge request");
+        .expect("shutdown request");
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = client()
+        .post(toker_url(addr, "/_toker/shutdown"))
+        .header("x-toker-control", "shutdown")
+        .send()
+        .await
+        .expect("shutdown request");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // The retired promote-model endpoint is a local 404, not a forward.
     let response = client()
         .post(toker_url(addr, "/_toker/models/merge"))
         .header("x-toker-control", "models-merge")
+        .header("content-type", "application/json")
+        .body("{}")
         .send()
         .await
         .expect("merge request");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -3,8 +3,8 @@
 //! cannot drive it without an unanswered preflight)").
 //!
 //! Gate: the `x-toker-control` header must carry the operation's verb
-//! (`status`, `models-merge`, `session`, `shutdown`). A page that cannot set a custom
-//! header without an unanswered CORS preflight can never pass the gate. A
+//! (`status`, `session`, `shutdown`, and one per routing operation). A page
+//! that cannot set a custom header without an unanswered CORS preflight can never pass the gate. A
 //! wrong or missing gate is a 403 naming what is missing — loopback-only, no
 //! discovery value to suppress.
 //!
@@ -15,19 +15,11 @@
 //! token-vector join is retired. The reply is counts, sums, and labels the rows already
 //! carry: no content, no credentials (invariants 1-2).
 //!
-//! `/_toker/models/merge` is the promote-model handover
-//! (the predecessor's control-merge semantics, made real):
-//! the promote-model tool grants days to
-//! a model the proxy has already served, so a promotion applies to the
-//! running process instead of waiting for a restart. It can only add to
-//! what the store already knows, and only for models it has served — the
-//! worst it can do is what promote-model does on purpose. The custom
-//! header and the JSON content type are what keep a web page out.
-//!
 //! `/_toker/shutdown` is `toker restart`'s second step: the CLI waits
 //! for a quiet moment on `status`, then asks this instance, by the id
 //! `status` gave it, to drain and exit; systemd starts the next one. It
-//! is gated exactly like `models/merge`. The worst a caller can do with
+//! is gated exactly like the other mutating endpoints (verb header and a JSON
+//! content type). The worst a caller can do with
 //! it is what `systemctl --user restart` does: by default the drain lets
 //! every response under way finish, and with `force` they are cut, but
 //! the exit is the normal one either way.
@@ -42,13 +34,12 @@ pub(super) mod routing;
 
 use super::Server;
 use crate::middleware::cold::ttl_of;
-use crate::middleware::models::{MergeIncoming, MergeOutcome};
 use crate::store::{Lane, SessionSummary};
 
 const CONTROL_HEADER: &str = "x-toker-control";
 
-/// A control body larger than this is a client bug, not a promotion —
-/// the handover carries one model's days and ceiling.
+/// A control body larger than this is a client bug: the largest one is a
+/// routing policy document.
 const MAX_CONTROL_BODY: usize = 1024 * 1024;
 
 /// `GET /_toker/status` — the resolved config (sans secrets), ledger row
@@ -345,136 +336,6 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `POST /_toker/models/merge` — the promote-model handover
-/// (replaces the phase-1
-/// 501 stub).
-///
-/// Body: one entry, `{"model": id, "days": [...], "maxPrompt": n}` — the
-/// single-model shape of the store merge, with the
-/// day-list validation: `days` must be an array of day strings (non-strings and
-/// empties dropped, the rest deduped and sorted), `maxPrompt` a finite
-/// number when present. Validation failures answer 400 (`unparseable
-/// store`, the frozen wording); a wrong control verb, method, or content type
-/// answers 403 (`not a control request`).
-///
-/// The semantics are `mergeSeen(into, from, {only: true})`: days union and
-/// the higher `maxPrompt` for a model **already served**, nothing for one
-/// the store has never seen (never invents). The predecessor answered 200
-/// with the unknown model on its `refused` list; toker answers **404** with
-/// the `known` list, so the caller learns the typo instead of a silent
-/// no-op.
-///
-/// Every granted day must be one the store already holds for some model.
-/// The predecessor's promote tool only ever sent such days, but its
-/// endpoint took any strings; here a day outside the store answers **400**
-/// `invented days` naming them, and nothing is written. An invented day
-/// enlarges the bar's denominator for every family at once.
-///
-/// The reply carries the effect, not the intent: `target` is what the
-/// family's election now names, because a promotion does not guarantee the
-/// slot — a newer version may already hold it, and saying so beats leaving
-/// the caller to discover it. The path is never forwarded, whatever the
-/// outcome.
-pub(crate) async fn models_merge(State(server): State<Server>, request: Request) -> Response {
-    if !control_token_ok(request.headers(), "models-merge") {
-        return forbidden();
-    }
-    let (parts, body) = request.into_parts();
-    // All three are checked up front and answered alike: method, verb,
-    // content type. The verb check already ran above.
-    if parts.method != Method::POST || !json_content_type(&parts.headers) {
-        return forbidden();
-    }
-    let bytes = match axum::body::to_bytes(body, MAX_CONTROL_BODY).await {
-        Ok(bytes) => bytes,
-        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
-    };
-
-    // The incoming entry is validated before anything else: a store that
-    // does not
-    // validate is a store that does not apply, never a best-effort guess.
-    let incoming: Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return merge_error(StatusCode::BAD_REQUEST, "unparseable store"),
-    };
-    let Some(model) = incoming.get("model").and_then(Value::as_str) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let Some(model) = crate::catalog::windows::model_identity(model) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let Some(days) = incoming.get("days").and_then(Value::as_array) else {
-        return merge_error(StatusCode::BAD_REQUEST, "unparseable store");
-    };
-    let days: Vec<String> = {
-        let mut days: Vec<String> = days
-            .iter()
-            .filter_map(|day| day.as_str().map(str::to_owned))
-            .filter(|day| !day.is_empty())
-            .collect();
-        days.sort();
-        days.dedup();
-        days
-    };
-    // A non-finite or absent maxPrompt reads as 0 — the
-    // merge then simply cannot raise the ceiling, only the days.
-    let max_prompt = incoming
-        .get("maxPrompt")
-        .and_then(Value::as_f64)
-        .filter(|prompt| prompt.is_finite())
-        .map(|prompt| prompt.max(0.0) as i64);
-
-    match server.models.merge(&MergeIncoming {
-        model_id: model,
-        days,
-        max_prompt,
-    }) {
-        Ok(MergeOutcome::Merged { entry, target }) => {
-            let family = crate::policy::family::family_of(&entry.model_id)
-                .map(|family| family.name)
-                .unwrap_or_default();
-            Json(json!({
-                "toker": "models-merge",
-                "ok": true,
-                "merged": [entry.model_id],
-                "refused": [],
-                // The `targets` map, one family touched: what the election
-                // names now, so the caller reports the effect.
-                "targets": {family: target},
-            }))
-            .into_response()
-        }
-        Ok(MergeOutcome::Unseen) => {
-            // The frozen reason word ("unseen") and the `known` list, on
-            // a status that cannot be mistaken for success.
-            let known = server.models.known_models().unwrap_or_default();
-            let mut reply = json!({
-                "toker": "models-merge",
-                "ok": false,
-                "error": "unseen",
-            });
-            reply["known"] = json!(known);
-            (StatusCode::NOT_FOUND, Json(reply)).into_response()
-        }
-        Ok(MergeOutcome::InventedDays(invented)) => {
-            // A grant may only hand over days the store already holds:
-            // an invented one enlarges every family's bar denominator.
-            // Refused whole, so a caller never half-applies a promotion.
-            let mut reply = json!({
-                "toker": "models-merge",
-                "ok": false,
-                "error": "invented days",
-            });
-            reply["days"] = json!(invented);
-            (StatusCode::BAD_REQUEST, Json(reply)).into_response()
-        }
-        Err(error) => {
-            tracing::error!(%error, "models merge store failure");
-            merge_error(StatusCode::INTERNAL_SERVER_ERROR, "store failure")
-        }
-    }
-}
-
 /// `POST /_toker/shutdown` — drain and exit, for `toker restart`.
 ///
 /// Body: `{"instance": id}`, the id `/_toker/status` reported, and
@@ -482,7 +343,7 @@ pub(crate) async fn models_merge(State(server): State<Server>, request: Request)
 /// under way (see [`Server::serve_listener`]): the restart's second
 /// request, once the drain it asked for first has had its time. Any other
 /// `force` is a 400. The gate is
-/// `models/merge`'s: a wrong verb, method, or content type is a 403. A body
+/// the other mutating endpoints': a wrong verb, method, or content type is a 403. A body
 /// that is not that object is a 400; an id that is not this instance's is
 /// a 409 carrying the current one, so a restart that raced another never
 /// stops an instance it did not see. Otherwise the answer is 202 and the
@@ -556,20 +417,6 @@ fn json_content_type(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("application/json"))
-}
-
-/// The error replies: `{toker: "models-merge", ok: false, error}` — the
-/// reply signed with the proxy's own name.
-fn merge_error(status: StatusCode, error: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "toker": "models-merge",
-            "ok": false,
-            "error": error,
-        })),
-    )
-        .into_response()
 }
 
 /// The gate check: the control header's value names the operation.

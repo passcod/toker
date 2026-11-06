@@ -3455,18 +3455,17 @@ async fn lane_rows_written_on_response_upsert_not_duplicate() {
     // shorten the 1h prefix the lane already holds.
     assert_eq!(lane.ttl, Some(3_600_000));
 
-    // The served model was learned: the response identity (fixture 04
-    // names claude-opus-5), with today's local day and the held prompt as
-    // the empirical ceiling.
-    let models = store.load_models().expect("models");
+    // The served model was learned on its binding: the response identity
+    // (fixture 04 names claude-opus-5), with today's local day and the held
+    // prompt as the empirical ceiling.
+    let models = store.load_all_binding_learnings().expect("learning");
     assert_eq!(models.len(), 1, "both fixtures served the same identity");
     assert_eq!(models[0].model_id, "claude-opus-5");
-    let days = models[0]
-        .days_json
-        .as_ref()
-        .and_then(Value::as_array)
-        .expect("days recorded");
-    assert_eq!(days.len(), 1, "both responses landed on one local day");
+    assert_eq!(
+        models[0].days.len(),
+        1,
+        "both responses landed on one local day"
+    );
     assert_eq!(
         models[0].max_prompt,
         Some(83_625),
@@ -3659,203 +3658,6 @@ async fn lanes_reseed_on_restart_from_the_requests_table() {
     assert_eq!(lane.ttl, live_ttl, "the stickiness rule replays over rows");
     assert_eq!(lane.noticed_at, None);
     assert_eq!(mock.captured().len(), 2, "the restart forwarded nothing");
-}
-
-#[tokio::test]
-async fn models_merge_endpoint_merges_served_models_and_moves_the_election() {
-    let (_mock, upstream) = spawn_mock().await;
-    let (addr, store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
-
-    // The learned store as weeks of history would leave it: an incumbent
-    // with eight days, a newcomer with one. The bar is min(7, 9/2) = 4.5,
-    // so the newcomer's single day is a trial, not an adoption.
-    let incumbent_days: Vec<String> = (0..8).map(|i| format!("2026-09-2{}", i)).collect();
-    let incumbent_refs: Vec<&str> = incumbent_days.iter().map(String::as_str).collect();
-    store
-        .upsert_model(&toker::store::ModelEntry {
-            model_id: "claude-opus-5".to_owned(),
-            days_json: Some(json!(incumbent_refs)),
-            max_prompt: Some(150_000),
-            context_window_json: None,
-        })
-        .expect("upsert incumbent");
-    store
-        .upsert_model(&toker::store::ModelEntry {
-            model_id: "claude-opus-5-5".to_owned(),
-            days_json: Some(json!(["2026-10-01"])),
-            max_prompt: Some(180_000),
-            context_window_json: None,
-        })
-        .expect("upsert newcomer");
-
-    // A merge for the incumbent changes nothing it did not already have,
-    // and reports the family's target as it stands: the newcomer is below
-    // the bar, so the incumbent holds the family.
-    let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
-        .header("x-toker-control", "models-merge")
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&json!({"model": "claude-opus-5", "days": [], "maxPrompt": 100}))
-        .send()
-        .await
-        .expect("merge incumbent");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("body");
-    assert_eq!(body["ok"], json!(true));
-    assert_eq!(body["merged"], json!(["claude-opus-5"]));
-    assert_eq!(body["targets"], json!({"opus": "claude-opus-5"}));
-    // Only adds: a LOWER maxPrompt cannot shrink the ceiling.
-    assert_eq!(
-        store
-            .load_model("claude-opus-5")
-            .expect("load")
-            .expect("entry")
-            .max_prompt,
-        Some(150_000)
-    );
-
-    // The promotion: grant the newcomer days the log already has. The
-    // union clears the bar and the election moves — the reply reports the
-    // effect, not the intent.
-    let granted = incumbent_days[..5].to_vec();
-    let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
-        .header("x-toker-control", "models-merge")
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&json!({"model": "claude-opus-5-5", "days": granted, "maxPrompt": 200_000}))
-        .send()
-        .await
-        .expect("merge newcomer");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("body");
-    assert_eq!(body["ok"], json!(true));
-    assert_eq!(body["targets"], json!({"opus": "claude-opus-5-5"}));
-    let entry = store
-        .load_model("claude-opus-5-5")
-        .expect("load")
-        .expect("entry");
-    // Days union (1 + 5 granted = 6), the higher ceiling kept.
-    assert_eq!(
-        entry.days_json,
-        Some(json!([
-            "2026-09-20",
-            "2026-09-21",
-            "2026-09-22",
-            "2026-09-23",
-            "2026-09-24",
-            "2026-10-01"
-        ])),
-        "days union, sorted and deduped"
-    );
-    assert_eq!(entry.max_prompt, Some(200_000));
-
-    // Invented days: a date no model was served on is refused whole, so
-    // the bar's denominator (every held day) cannot be enlarged through
-    // the endpoint, and nothing in the grant is written.
-    let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
-        .header("x-toker-control", "models-merge")
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "model": "claude-opus-5-5",
-            "days": ["2026-09-25", "2026-10-02", "2026-10-03"],
-            "maxPrompt": 900_000,
-        }))
-        .send()
-        .await
-        .expect("merge invented days");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("body");
-    assert_eq!(body["ok"], json!(false));
-    assert_eq!(body["error"], json!("invented days"));
-    assert_eq!(body["days"], json!(["2026-10-02", "2026-10-03"]));
-    let after = store
-        .load_model("claude-opus-5-5")
-        .expect("load")
-        .expect("entry");
-    assert_eq!(after, entry, "a refused grant writes nothing");
-
-    // Unknown model: 4xx naming the store's known identities — never a
-    // silent refusal, never an invented entry.
-    let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
-        .header("x-toker-control", "models-merge")
-        .header(header::CONTENT_TYPE, "application/json")
-        .json(&json!({"model": "claude-fable-9", "days": ["2026-10-01"]}))
-        .send()
-        .await
-        .expect("merge unknown");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let body: Value = response.json().await.expect("body");
-    assert_eq!(body["ok"], json!(false));
-    assert_eq!(body["error"], json!("unseen"));
-    assert_eq!(body["known"], json!(["claude-opus-5", "claude-opus-5-5"]));
-    assert_eq!(
-        store.load_model("claude-fable-9").expect("load"),
-        None,
-        "a model the proxy never served is never invented"
-    );
-}
-
-#[tokio::test]
-async fn models_merge_endpoint_gates_and_validates_the_body() {
-    let (_mock, upstream) = spawn_mock().await;
-    let (addr, _store) = spawn_toker(test_config(upstream, None, "anthropic_sub")).await;
-
-    // Control-merge gating: a wrong verb, method, or
-    // content type is 403 "not a control request" — the two halves (custom
-    // header + JSON content type) are what keep a web page out.
-    for headers in [
-        vec![],
-        vec![("x-toker-control", "status")],
-        vec![("x-toker-control", "models-merge")],
-    ] {
-        let mut request = client().post(toker_url(addr, "/_toker/models/merge"));
-        for (name, value) in &headers {
-            request = request.header(*name, *value);
-        }
-        let response = request.send().await.expect("merge request");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "headers {headers:?} do not pass the gate"
-        );
-    }
-
-    // Right gate, unparseable store: the 400.
-    let response = client()
-        .post(toker_url(addr, "/_toker/models/merge"))
-        .header("x-toker-control", "models-merge")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(b"not json"[..].to_vec())
-        .send()
-        .await
-        .expect("merge request");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("body");
-    assert_eq!(body["error"], json!("unparseable store"));
-
-    // Parseable but not a valid entry (no days array): the same 400 —
-    // The merge drops what does not validate rather than guessing.
-    for body in [
-        json!({"days": []}),
-        json!({"model": "claude-opus-5", "days": "2026-10-01"}),
-        json!({"model": "", "days": []}),
-    ] {
-        let response = client()
-            .post(toker_url(addr, "/_toker/models/merge"))
-            .header("x-toker-control", "models-merge")
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .expect("merge request");
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "body {body} is an unparseable store"
-        );
-    }
 }
 
 /// A tooled, non-streaming body whose system prompt is long enough to cut

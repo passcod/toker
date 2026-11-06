@@ -98,14 +98,13 @@ Serialisation purity and prefix stability are covered by
 
 4. **Bind `127.0.0.1` only.** The listener binds loopback (`server/mod.rs`, and
    `ListenStream=127.0.0.1:…` in the socket unit). toker answers
-   `/_toker/status`, `/_toker/models/merge`, `/_toker/session`,
-   `/_toker/shutdown` and the `/_toker/routing/` endpoints itself; any other
+   `/_toker/status`, `/_toker/session`, `/_toker/shutdown` and the
+   `/_toker/routing/` endpoints itself; any other
    `/_toker/` path is a local 404 and never leaves the proxy. Each demands its
    own verb in the `x-toker-control` header (`server/control.rs`,
    `server/control/routing.rs`), and every mutation also a JSON body, so that
    a web page, which can reach loopback, cannot drive one without a preflight
-   nothing here answers. `models/merge` can only add to the model store, for
-   models already served. The routing endpoints edit, preview and activate the
+   nothing here answers. The routing endpoints edit, preview and activate the
    policy the TUI drives (see [routing.md](routing.md)). `shutdown`
    (`toker restart`'s) names the instance `status` reported and only stops it:
    the listener closes, every response under way finishes (or, with `force`,

@@ -24,10 +24,6 @@
 //!   Linux → `systemd-inhibit --what=idle --mode=block`), the detached
 //!   PID-watching child, the 5-minute retry backoff, and the held/want
 //!   flip bookkeeping — Linux v1, idle-only on purpose;
-//! - [`models`] — the learned model store (days served + maxPrompt — the
-//!   family parsing and day-based newest election) and the
-//!   in-memory recently-served map, plus the merge semantics the
-//!   `/_toker/models/merge` control endpoint carries;
 //! - [`model_map`] — the model routing map: opaque
 //!   operator routing policy, the pure parse/match/rewrite interface the
 //!   `route-identity` parity case pins (config and server wiring are the
@@ -42,7 +38,6 @@ pub mod canonical;
 pub mod cold;
 pub mod lanes;
 pub mod model_map;
-pub mod models;
 pub mod notice;
 pub mod quota;
 pub mod system_change;

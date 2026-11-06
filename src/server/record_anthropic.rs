@@ -263,23 +263,12 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 6) — it is logged as the visible breakage it is.
-///
-/// Every row the API answered also marks its model served, on the
-/// identity the RESPONSE named (the predecessor's `appendRow` did this
-/// for every row). The mark before sending covers a lane deciding while
-/// this request is in flight; this one covers what the upstream actually
-/// served, which a host-side alias or an upstream substitution can make
-/// differ from what was sent — and recency must follow the served
-/// identity. In-memory and infallible, so it cannot cost the row.
+/// (invariant 3) — it is logged as the visible breakage it is.
 fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
         tracing::error!(%error, "ledger insert failed");
     }
-    ctx.server
-        .models
-        .note_served(row.raw_model.as_deref().or(row.model.as_deref()), row.ts_ms);
 }
 
 /// Whether the capture carries any usage metric at all. Only responses
@@ -332,14 +321,8 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
     let held_observed =
         (presence.input || presence.cache_read || presence.cache_write_total).then_some(held);
 
-    // A model is "seen" when a response named it. Days
-    // are local calendar days; the system zone is the server's, read once
-    // per response.
+    // A model is "seen" when a response named it.
     if let Some(model) = capture.model() {
-        let tz = jiff::tz::TimeZone::system();
-        if let Err(error) = ctx.server.models.note_seen(model, ts_ms, held, &tz) {
-            tracing::error!(%error, "learned model update failed");
-        }
         ctx.server
             .note_binding_observed(&ctx.binding_id, Some(model), ts_ms, held_observed);
     }
@@ -1384,23 +1367,6 @@ pub(crate) fn record_responses_measurement(
     let held = held_input.unwrap_or(0)
         + i64::try_from(cached.unwrap_or(0)).unwrap_or(i64::MAX)
         + i64::try_from(written.unwrap_or(0)).unwrap_or(i64::MAX);
-    // Legacy learning retains its effective-model fallback. The binding-local
-    // component deliberately does not: only a provider-reported raw model is
-    // an observation.
-    let model = capture
-        .model()
-        .map(str::to_owned)
-        .or_else(|| ctx.effective_model.clone());
-    if let Some(model) = model.as_deref() {
-        let tz = jiff::tz::TimeZone::system();
-        if let Err(error) =
-            ctx.server
-                .models
-                .note_seen(model, ts_ms, u64::try_from(held).unwrap_or(u64::MAX), &tz)
-        {
-            tracing::error!(%error, "learned model update failed");
-        }
-    }
     ctx.server.note_binding_observed(
         &ctx.binding_id,
         capture.model(),

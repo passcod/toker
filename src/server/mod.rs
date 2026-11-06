@@ -21,8 +21,8 @@
 //!     so they record nothing in practice ([`anthropic`]).
 //!   - The batch-result GETs (and cancel) — transparent forwarding to the
 //!     binding the active revision's default route names, no recording.
-//! - `GET /_toker/status`, `POST /_toker/models/merge`,
-//!   `GET /_toker/session`, `POST /_toker/shutdown` — the control
+//! - `GET /_toker/status`, `GET /_toker/session`,
+//!   `POST /_toker/shutdown` — the control
 //!   endpoints, gated by a custom header ([`control`]); `session` is the
 //!   attribution plugin's query, `shutdown` is `toker restart`'s drain.
 //!   Any other `/_toker/` path is a local 404.
@@ -88,7 +88,6 @@ use crate::catalog::offers;
 use crate::config::Config;
 use crate::middleware::awake::{self, AwakeState, LockSpawner};
 use crate::middleware::lanes;
-use crate::middleware::models::ModelStore;
 use crate::policy::{
     AvailabilitySnapshot, BindingAvailability, CatalogueAvailability, Evidence, FrontendProtocol,
     LaneFacts, ProfileId, RequestClass, RequestFacts,
@@ -268,10 +267,6 @@ fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
 pub struct Server {
     pub(crate) store: Arc<Store>,
     pub(crate) config: Arc<Config>,
-    /// The learned model store (days served + maxPrompt, the day-based
-    /// family election) with its in-memory recently-served map, seeded
-    /// from the ledger tail at startup.
-    pub(crate) models: Arc<ModelStore>,
     /// Binding-attributed observations and recently-sent targets: the
     /// learning evidence policy resolves against.
     pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
@@ -445,20 +440,12 @@ impl Server {
             Arc::new(Mutex::new(state))
         });
 
-        // The startup seed: the newest ledger rows, read
-        // once, feed both state stores (lanes and served-models).
-        // Reseeding is idempotent, so every
-        // Server::new — serve, tests, restarts — rebuilds the same state.
-        let total = store.count_requests()?;
+        // The startup seed: the newest ledger rows, read once, feed both
+        // state stores (lanes and binding learning). Reseeding is
+        // idempotent, so every Server::new (serve, tests, restarts)
+        // rebuilds the same state.
         let seed = store.requests_since(0, SEED_ROWS)?;
-        // How far the served map vouches: the tail read everything (no
-        // cut) →
-        // the served map vouches from the beginning;
-        // else only from the oldest row the tail kept.
-        let covered =
-            (total as u64 > SEED_ROWS).then(|| seed.first().map_or_else(now_ms, |row| row.ts_ms));
         lanes::reseed(&store, &seed)?;
-        let models = Arc::new(ModelStore::seeded(store.clone(), &seed, covered));
         let binding_learning = Arc::new(crate::policy::BindingLearningView::seeded(
             store.clone(),
             &seed,
@@ -513,7 +500,6 @@ impl Server {
             http,
             registry,
             codex_turn,
-            models,
             binding_learning,
             catalogs: Arc::new(std::sync::RwLock::new(initial_catalogs)),
             catalog_dir,
@@ -1666,7 +1652,6 @@ impl Server {
             )
             .route("/_toker/status", get(control::status))
             .route("/_toker/session", get(control::session))
-            .route("/_toker/models/merge", post(control::models_merge))
             .route("/_toker/shutdown", post(control::shutdown))
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
             .route("/_toker/routing/draft", any(control::routing::draft))
@@ -4900,12 +4885,11 @@ api_key = "ak-literal-test"
         );
     }
 
-    /// The mark before sending names what toker sent; the response may name
-    /// another identity (a host alias, an upstream substitution), and
-    /// recency must follow what actually served — as the predecessor's
-    /// every-row mark did.
+    /// The response may name another identity than the one toker sent (a
+    /// host alias, an upstream substitution), and what the binding learns
+    /// must follow what actually served.
     #[test]
-    fn a_recorded_response_marks_the_model_it_named_as_served() {
+    fn a_recorded_response_teaches_the_binding_the_model_it_named() {
         use crate::server::record_anthropic::{AnthropicRecordCtx, record_anthropic_measurement};
         let dir = crate::setup::test_dir("served-mark");
         let server = server(&dir);
@@ -4947,7 +4931,14 @@ api_key = "ak-literal-test"
         observer.observe_json(
             br#"{"type":"message","model":"claude-sonnet-5","usage":{"input_tokens":3,"output_tokens":1}}"#,
         );
-        assert_eq!(server.models.last_served("claude-sonnet-5"), None);
+        use crate::policy::LearningView;
+        let learned = |model: &str| {
+            server
+                .binding_learning
+                .learned(&ctx.binding_id, model)
+                .expect("learning readable")
+        };
+        assert!(learned("claude-sonnet-5").is_none());
         let (reported_model, capture) = observer.finish_parts();
         record_anthropic_measurement(&ctx, capture.as_ref(), reported_model.as_deref(), None, 200);
         let rows = server.store.requests_since(0, 10).expect("ledger rows");
@@ -4956,13 +4947,12 @@ api_key = "ak-literal-test"
         assert_eq!(rows[0].policy_routing, None);
         assert_eq!(rows[0].lineage, None);
         assert!(
-            server.models.last_served("claude-sonnet-5").is_some(),
-            "the served identity is marked from the response"
+            learned("claude-sonnet-5").is_some(),
+            "the served identity is learned from the response"
         );
-        assert_eq!(
-            server.models.last_served("claude-opus-5"),
-            None,
-            "the sent identity is not what the row marks"
+        assert!(
+            learned("claude-opus-5").is_none(),
+            "the sent identity is not what the response teaches"
         );
     }
 }

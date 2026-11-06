@@ -32,11 +32,10 @@ mod state;
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
-    MAX_ROUTING_TRACE_EVENTS, MeterRow, ModelObservation, OBSERVATION_BUCKET_MS,
-    PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow, RelationSource, RequestFilter,
-    RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup, SessionLineage, SessionSummary,
-    StoredCandidateState, StoredLadders, StoredLookupSource, StoredRoutingTrace,
-    StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
+    MAX_ROUTING_TRACE_EVENTS, MeterRow, PolicyRouteProvenance, PolicyRoutingOutcome, RebuildRow,
+    RelationSource, RequestFilter, RequestLookupProvenance, RequestRow, RowKind, SessionCostGroup,
+    SessionLineage, SessionSummary, StoredCandidateState, StoredLadders, StoredLookupSource,
+    StoredRoutingTrace, StoredRoutingTraceEvent, StoredSkipReason, is_api_measurement,
 };
 pub use state::{
     ActivatePolicyRevision, ActivatedPolicyRevision, Allowance, BindingLearning,
@@ -204,12 +203,6 @@ impl Store {
     pub fn record_requests(&self, rows: &[RequestRow]) -> Result<(Option<i64>, Option<i64>)> {
         let mut conn = self.conn()?;
         ledger::insert_batch(&mut conn, rows)
-    }
-
-    /// Every served model's largest prompt per quarter hour, over the whole
-    /// ledger (see `ledger::model_observations`).
-    pub fn model_observations(&self) -> Result<Vec<ModelObservation>> {
-        ledger::model_observations(&*self.conn()?)
     }
 
     /// Rows with `ts_ms >= ts_ms`, oldest first; when the window holds more
