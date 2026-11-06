@@ -3253,6 +3253,19 @@ api_key = "sk-test"
     }
 
     async fn policy_chat_fallback_server() -> (Server, ChatBodies, ChatBodies) {
+        policy_chat_fallback_server_with_openrouter_key(true).await
+    }
+
+    /// Without a stored OpenRouter key, a credential on the request is the
+    /// one that signs; with one, it replaces whatever the request carried.
+    async fn policy_chat_fallback_server_with_openrouter_key(
+        stored_key: bool,
+    ) -> (Server, ChatBodies, ChatBodies) {
+        let openrouter_key = if stored_key {
+            "api_key = \"sk-or-test\""
+        } else {
+            ""
+        };
         let primary: ChatBodies = Arc::default();
         primary.response_mode.store(CHAT_FAILURE, Ordering::Relaxed);
         let backup: ChatBodies = Arc::default();
@@ -3293,7 +3306,7 @@ default_backend_openai_chat = "openrouter"
 [providers.openrouter]
 upstream = "http://{primary_address}/v1"
 api_key_env = "TOKER_TEST_NO_SUCH_KEY_VAR"
-api_key = "sk-or-test"
+{openrouter_key}
 
 [providers.anthropic_api]
 upstream = "http://{backup_address}"
@@ -4424,7 +4437,8 @@ api_key = "sk-proj-test"
 
     #[tokio::test]
     async fn request_native_auth_failure_does_not_open_a_shared_circuit() {
-        let (server, primary, backup) = policy_chat_fallback_server().await;
+        let (server, primary, backup) =
+            policy_chat_fallback_server_with_openrouter_key(false).await;
         primary
             .response_mode
             .store(CHAT_AUTH_FAILURE, Ordering::Relaxed);

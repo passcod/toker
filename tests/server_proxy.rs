@@ -891,7 +891,8 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
         "no client auth → the resolved key is injected"
     );
 
-    // Present client auth → verbatim pass-through, the stored key unused.
+    // With a stored key the client's credential is only there to satisfy the
+    // client (claude's settings carry a placeholder), so the stored key signs.
     let response = client()
         .post(toker_url(addr, "/v1/chat/completions"))
         .header(header::AUTHORIZATION, "Bearer client-own-token")
@@ -900,9 +901,28 @@ async fn auth_passes_through_when_present_and_injects_when_absent() {
         .await
         .expect("chat request");
     assert_eq!(response.status(), StatusCode::OK);
-    let captured = mock.captured();
     assert_eq!(
-        captured[1]
+        mock.captured()[1]
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-literal-test"),
+        "the stored key replaces the frontend's credential"
+    );
+
+    // With none stored, the frontend's credential passes through verbatim.
+    let (mock, upstream) = spawn_mock().await;
+    let (addr, _store) = spawn_toker(test_config(upstream, UNSET_KEY_ENV, None)).await;
+    let response = client()
+        .post(toker_url(addr, "/v1/chat/completions"))
+        .header(header::AUTHORIZATION, "Bearer client-own-token")
+        .body(chat_body("z-ai/glm-5.3", false))
+        .send()
+        .await
+        .expect("chat request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        mock.captured()[0]
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
@@ -1179,7 +1199,8 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
         "x-api-key never reaches openrouter"
     );
 
-    // The frontend's own openrouter key still passes through verbatim.
+    // Nothing the client sends is openrouter's to see while toker holds its
+    // own key, the client's own openrouter key included.
     let response = client()
         .get(toker_url(addr, "/v1/models"))
         .header(header::AUTHORIZATION, "Bearer sk-or-v1-client")
@@ -1192,7 +1213,7 @@ async fn models_never_carries_an_anthropic_credential_to_openrouter() {
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()),
-        Some("Bearer sk-or-v1-client")
+        Some("Bearer sk-or-stored")
     );
 }
 
