@@ -181,6 +181,15 @@ cold licence is the lane's. Which model a cold compaction moves to is the
 policy's compaction target; the cold gate keeps what it does to the body (the
 cache-write strip and the system merge, all or nothing).
 
+The notice names the same target. The turn it stops is an ordinary one, whose
+plan is not a compaction plan, so the handler resolves a second time as a
+compaction for the same session, under the revision and lane the real
+compaction will meet, and reads the move off that plan. Resolution is pure, so
+the question costs the lane nothing, and the answer is the model the
+`/compact` the notice recommends will then be given, not a configured guess.
+With no compaction target in the policy, or none that moves the model, the
+notice says nothing about one.
+
 ## A lane's TTL is its longest-lived breakpoint
 
 How long a lane's cache survives comes from the tier it was seen writing

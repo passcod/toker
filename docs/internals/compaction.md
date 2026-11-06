@@ -185,5 +185,14 @@ the request is already on the new model and could not report it. A same-model
 strip records the flags and no move. A fallback attempt on a compaction
 re-applies the transform for the model it was given.
 
+The cold notice (see [cold-gate.md](cold-gate.md)) quotes this decision ahead of
+time. When it stops an ordinary turn it resolves the session once more with the
+`Compaction` class and the same facts, and names the model the plan's
+`compaction_move` gives. The evidence it passes (lane cold, the lane's prompt,
+whether the transform applies to the body) is built by the same function the
+real compaction uses, so the two cannot disagree about eligibility; the
+transform is probed on the ordinary request's messages, which is what the
+compaction will carry plus its prompt.
+
 Which wording and position were detected is unchanged by any of this: a
 compaction missed by detection is not retargeted, whatever the policy says.

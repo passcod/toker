@@ -67,13 +67,15 @@ session's context size is stated when the lane table knows it (the largest lane,
 `lanes::session_prompt`) and dropped when it does not, rather than printed as a
 zero that would read as a measurement.
 
-The cold notice names a compaction model only when the policy's plan for the
-very request it is stopping is a compaction plan (`AttemptPlan::compaction`),
+The cold notice names a compaction model only when the active policy has one,
 since a proxy promising a cheap compaction it has not resolved would be the
-feature lying about its configuration. The notice fires on an ordinary turn
-after the idle spell, and the plan for an ordinary turn is not a compaction
-plan, so the Anthropic notice currently says nothing about a target; what a
-compaction runs on is decided when the compaction itself arrives (see
-[compaction.md](compaction.md)). It states the re-read's cache-write multiple
-only when the lane recorded its tier. The openai path's cold notice names no
-compaction target at all, because that path never retargets one.
+feature lying about its configuration. The plan for the turn the notice is
+stopping is an ordinary turn's, so the handler asks the resolver again with the
+compaction class and the same facts (profile, protocol, requested model, the
+lane), and names the model that plan moves the compaction to
+(`AttemptPlan::compaction_move`). That is a different model from the one the
+session is on: a policy with no compaction target, or one that would keep the
+model, leaves the notice without the sentence. The question is answered by
+resolution alone and changes no lane state. It states the re-read's cache-write
+multiple only when the lane recorded its tier. The openai path's cold notice
+names no compaction target at all, because that path never retargets one.
