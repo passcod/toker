@@ -41,6 +41,7 @@
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
 
+mod config;
 pub(crate) mod control;
 mod detail;
 mod labels;
@@ -128,6 +129,7 @@ const ROW_CAP: u64 = 10_000;
 enum Page {
     Dashboard,
     Routing,
+    Config,
 }
 
 /// `toker tui --window-mins <m>`: open the ledger and run the dashboard
@@ -172,6 +174,7 @@ pub fn run(
     let mut drawn = view::Drawn::default();
     let mut page = Page::Dashboard;
     let mut routing = routing::Page::new(port, settings);
+    let mut config = config::Page::new(port);
     // The transcript roots, resolved once: session labels read only
     // these, read-only, one tail per session per display read.
     let mut labels = labels::Labels::new(labels::transcript_roots(extra_transcript_roots));
@@ -253,6 +256,7 @@ pub fn run(
             next_tick = Instant::now() + TICK;
         }
         routing.poll();
+        config.poll();
         terminal.draw(|frame| match page {
             Page::Dashboard => {
                 drawn = view::render(frame, &snapshot, &clock(&ui.fmt), &tz, &ui);
@@ -262,6 +266,7 @@ pub fn run(
                 drawn.legend_button = routing_drawn.legend_button;
                 drawn.routing_button = routing_drawn.routing_button;
             }
+            Page::Config => config.render(frame),
         })?;
         // The list may have shrunk under its offset since the last
         // frame: hold the offset at what the frame could show.
@@ -287,6 +292,17 @@ pub fn run(
         // click opens a session's detail, or acts in the open one.
         if let crossterm::event::Event::Mouse(mouse) = event {
             let at = ratatui::layout::Position::new(mouse.column, mouse.row);
+            if page == Page::Config {
+                match mouse.kind {
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        config.click(at)
+                    }
+                    crossterm::event::MouseEventKind::ScrollDown => config.wheel(1),
+                    crossterm::event::MouseEventKind::ScrollUp => config.wheel(-1),
+                    _ => {}
+                }
+                continue;
+            }
             if page == Page::Routing {
                 // Both header actions remain available on both pages; the
                 // body takes clicks and the wheel for the list, the detail
@@ -381,6 +397,12 @@ pub fn run(
                 routing.key(key);
                 continue;
             }
+            // A text entry owns every key, including Tab and Esc, so typing
+            // an endpoint cannot switch pages halfway through it.
+            if page == Page::Config && config.editing() {
+                config.key(key);
+                continue;
+            }
             match key.code {
                 crossterm::event::KeyCode::Tab => {
                     page = match page {
@@ -392,19 +414,30 @@ pub fn run(
                         }
                         Page::Routing => {
                             ui.legend = false;
+                            config.refresh();
+                            Page::Config
+                        }
+                        Page::Config => {
+                            ui.legend = false;
                             Page::Dashboard
                         }
                     };
                 }
                 crossterm::event::KeyCode::Char('?') => toggle_legend(&mut ui),
                 crossterm::event::KeyCode::Esc if ui.legend => ui.legend = false,
-                crossterm::event::KeyCode::Esc if page == Page::Routing => {
+                crossterm::event::KeyCode::Esc if page == Page::Routing || page == Page::Config => {
                     page = Page::Dashboard;
                 }
                 crossterm::event::KeyCode::Char('r')
                     if page == Page::Routing && !routing.modal_active() =>
                 {
                     routing.refresh()
+                }
+                crossterm::event::KeyCode::Char('r') if page == Page::Config => config.refresh(),
+                crossterm::event::KeyCode::Up if page == Page::Config => config.move_selection(-1),
+                crossterm::event::KeyCode::Down if page == Page::Config => config.move_selection(1),
+                code if page == Page::Config && config::owns_key(code) => {
+                    config.key(key);
                 }
                 code if page == Page::Routing && routing::owns_key(code) => {
                     routing.key(key);

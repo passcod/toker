@@ -56,9 +56,9 @@ Each phase compiles and keeps the suite green.
 
 ### 6. Dashboard pages
 
-- [ ] Providers page
-- [ ] Settings page
-- [ ] Both report the service not answering rather than offering dead forms
+- [x] Providers page
+- [x] Settings page
+- [x] Both report the service not answering rather than offering dead forms
 
 ### 7. Removals
 

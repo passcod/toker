@@ -63,11 +63,11 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## The dashboard pages
 
-- [ ] The providers page shows every provider, enabled or not, with endpoint and credential source (verifies spec: UTUI)
-- [ ] A credential is shown as set or not set, never as its value (verifies spec: UTUI, SEC)
-- [ ] A provider whose credential does not resolve shows as not configured, naming the source (verifies spec: UTUI)
-- [ ] The settings page shows the store path and port without offering to edit them (verifies spec: UTUI)
-- [ ] Both pages report the service not answering rather than offering values to edit (verifies spec: UTUI)
+- [x] The providers page shows every provider, enabled or not, with endpoint and credential source (verifies spec: UTUI)
+- [x] A credential is shown as set or not set, never as its value (verifies spec: UTUI, SEC)
+- [x] A provider whose credential does not resolve shows as not configured, naming the source (verifies spec: UTUI)
+- [x] The settings page shows the store path and port without offering to edit them (verifies spec: UTUI)
+- [x] Both pages report the service not answering rather than offering values to edit (verifies spec: UTUI)
 
 ## Credentials
 
