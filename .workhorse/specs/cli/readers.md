@@ -38,7 +38,7 @@ Export MAY add a human-readable form of the row's timestamp, and MUST add nothin
 
 ## Import
 
-Import MUST map a predecessor's log into the ledger as [SROWS](../store/ledger.md#imported-rows) specifies.
+Import MUST map a predecessor's log into the ledger as [SLEDGR](../store/ledger.md#imported-rows) specifies.
 
 Import MUST keep a checkpoint, so that a repeated run continues rather than duplicates.
 

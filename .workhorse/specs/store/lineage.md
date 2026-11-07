@@ -97,4 +97,4 @@ A query answering a client's question about a session MUST match that session ex
 > A client asking about a session gets that session, not its children.
 
 Rows written before lineage was recorded carry none, so a session that was a child before then shows as its own.
-That is an absence of evidence rather than evidence of absence, as [SROWS](ledger.md) requires of every such field.
+That is an absence of evidence rather than evidence of absence, as [SLEDGR](ledger.md) requires of every such field.

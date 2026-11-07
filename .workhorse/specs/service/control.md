@@ -53,7 +53,7 @@ A control path added later MUST take the same two checks, MUST carry an operatio
 | routing promote | mark a learned model eligible for upgrades |
 | routing publication | record a failed or unsupported publication |
 
-What each routing operation means is specified by [RPOL](../policy/overview.md#lifecycle), and the publication handoff by [RPUB](../policy/publication.md#publication-state).
+What each routing operation means is specified by [RREV](../policy/revisions.md), and the publication handoff by [RPUB](../policy/publication.md#publication-state).
 
 The publication operation MUST record only a failure or a lack of support.
 

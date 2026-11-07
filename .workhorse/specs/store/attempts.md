@@ -30,7 +30,7 @@ A refusal prompting a renegotiation MUST NOT open a health circuit.
 > [!NOTE]
 > A model asking for a different thinking mode is working.
 
-Which failures may fall back, and what fallback may do, is specified by [RPOL](../policy/overview.md#fallback-and-commitment).
+Which failures may fall back, and what fallback may do, is specified by [RFALL](../policy/fallback.md).
 Where the resolver or the lane's transition rules refuse a fall, the failed response MUST be forwarded and the group MUST end there.
 
 A gate notice is decided once for the whole request, and MUST NOT be decided again for a later attempt.
@@ -118,4 +118,4 @@ The quota fit, the meter reads, the cache-rebuild walk and learning MUST each ta
 > [!NOTE]
 > A total across a group would be a number no provider ever reported.
 
-Which rows predate attempt identity, and what a reader owes a reader when a range reaches back past it, is specified by [SROWS](ledger.md).
+Which rows predate attempt identity, and what a reader owes a reader when a range reaches back past it, is specified by [SLEDGR](ledger.md).

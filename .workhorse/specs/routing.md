@@ -6,7 +6,7 @@ id: ROUTE
 
 Toker serves several protocols on one loopback port and forwards each request to one of several configured providers.
 This spec covers the paths, the topology a request is resolved onto, what each provider does to a request's credentials, and how a request with nowhere to go is answered.
-Which binding and model a request takes is decided by [RPOL](policy/overview.md).
+Which binding and model a request takes is decided by [RSOLV](policy/resolver.md).
 How an inference request's body is rendered is specified by [CANON](canonical.md).
 
 ## Protocols

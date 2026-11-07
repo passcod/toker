@@ -38,7 +38,7 @@ These are the only transformations that may change a canonical request's meaning
 
 Changing any other position of the body is a defect.
 
-Release markers are specified by [GQUOTA](gates/quota.md), compaction by [GCOMP](gates/compaction.md), and model selection by [RPOL](policy/overview.md).
+Release markers are specified by [GQUOTA](gates/quota.md), compaction by [GCOMP](gates/compaction.md), and model selection by [RSOLV](policy/resolver.md#shaping-the-model).
 
 Stripping release markers MUST happen on every Messages request regardless of whether the gate is enabled.
 

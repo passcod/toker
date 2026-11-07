@@ -69,7 +69,7 @@ The first revision needs matchers, classifiers and bars that authored policy can
 
 Each MUST be marked as generated at compile time, and the compiler MUST refuse every one of them from an authored document.
 
-A revision MUST record its compiler origin, and an edit or a reactivation of a generated revision MUST inherit it, as [RPOL](../policy/overview.md#history-and-reactivation) requires.
+A revision MUST record its compiler origin, and an edit or a reactivation of a generated revision MUST inherit it, as [RREV](../policy/revisions.md#history-and-reactivation) requires.
 
 A field no longer written MUST be kept in the document type.
 

@@ -70,12 +70,12 @@ Defined in [CANON](canonical.md).
 ### Store
 
 The database Toker keeps its state in, holding the ledger alongside the lanes, the policy revisions, the learned models, the allowances, the ping runs and the meter snapshots.
-Defined in [SROWS](store/ledger.md).
+Defined in [STORE](store/overview.md).
 
 ### Ledger
 
 The append-only record of requests within the store, one row per attempt or proxy decision.
-Defined in [SROWS](store/ledger.md).
+Defined in [SLEDGR](store/ledger.md).
 
 ### Offer
 

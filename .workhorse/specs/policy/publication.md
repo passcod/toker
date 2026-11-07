@@ -78,7 +78,7 @@ An inventory generation MUST be a deterministic digest over every cached catalog
 
 An empty cache MUST have a fixed generation.
 
-A catalogue refresh MUST replace the catalogues, the offer inventory, the availability snapshot and the compiled policy as one update, under the lock the control operations take.
+A catalogue refresh MUST replace the catalogues, the offer inventory, the availability snapshot and the [compiled policy](overview.md#the-compiled-policy) as one update, under the lock the control operations take.
 A reader MUST see the old set or the new set, and MUST NOT see a mixture.
 
 ## Publication state

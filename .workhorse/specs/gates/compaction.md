@@ -71,12 +71,12 @@ That record MUST carry positions and flags only, and MUST NOT carry message text
 > A compaction the detector misses leaves this record on a row marked as not a compaction, so the count of such rows is the check that detection still works.
 
 A count of compactions reaching back before the detection field existed is a floor, and MUST be reported as one.
-Which rows predate which fields is specified by [SROWS](../store/ledger.md).
+Which rows predate which fields is specified by [SLEDGR](../store/ledger.md).
 
 ## Retargeting a cold compaction
 
 Detection establishes only that a request is a compaction.
-Which route and model it runs on MUST be decided by the active policy, as [RPOL](../policy/overview.md) specifies.
+Which route and model it runs on MUST be decided by the active policy, as [RSOLV](../policy/resolver.md#lookup-order) specifies.
 
 Toker MUST pass the resolver the request's class and the lane's own evidence of how cold it is.
 Toker MUST NOT let the marker text reach policy.

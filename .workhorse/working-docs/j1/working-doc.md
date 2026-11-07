@@ -45,33 +45,26 @@ Four destinations, decided per sentence rather than per file:
 ├── translation.md       Messages <-> Responses, purity, prefix stability
 ├── gates/
 │   ├── overview.md      what may stop a request, and what feeds a gate
-│   ├── quota.md         windows, weights, releases, allowances
-│   ├── cold.md          the cold-cache gate, two clocks, the recap
-│   ├── notices.md       notice styles per profile, byte stability
-│   ├── compaction.md    detecting a compaction, the wordings
-│   ├── forecasting.md   projecting a window, totalling a span
-│   └── pinging.md       opening a window buys phase
+│   ├── quota.md, cold.md, notices.md, compaction.md, forecasting.md, pinging.md
 ├── policy/
-│   ├── overview.md      the document, lifecycle, the resolver, fallback
-│   ├── models.md        learning, election, upgrades, context ceilings
-│   └── publication.md   what each profile lists, generations, Claude's settings
+│   ├── overview.md      frontend scope, binding naming, the compiled policy
+│   ├── document.md      the collections, parsing, fingerprints, validity
+│   ├── revisions.md     draft, preview, activation, history, refresh
+│   ├── resolver.md      facts, lookup, the route walk, circuits
+│   ├── fallback.md      which failures fall back, and commitment
+│   ├── provenance.md    what a policy-routed row records
+│   ├── models.md        learning, election, upgrades, context fit
+│   └── publication.md   what each profile lists, generations, settings
 ├── store/
 │   ├── overview.md      what the store holds, migrations, absent values
-│   ├── ledger.md        row kinds, fields, old rows, imported rows
-│   ├── migration.md     routing moving from the file into the store
-│   ├── lanes.md         lane identity, cache identity, pins
-│   ├── attempts.md      a logical request and its attempts
-│   └── lineage.md       the evidence of descent between sessions
+│   ├── ledger.md        row kinds, fields, eras, imported rows
+│   ├── lanes.md, attempts.md, lineage.md, migration.md
 ├── service/
-│   ├── lifecycle.md     socket activation, drain, restart, the sleep lock
-│   ├── config.md        toker.toml: providers, credential sources, the listener
-│   └── control.md       /_toker/ endpoints and the header gate
+│   └── lifecycle.md, config.md, control.md
 ├── cli/
-│   ├── commands.md      the CLI surface
-│   ├── setup.md         the wizard, frontend patching, units
-│   └── readers.md       import, export, watch-context-window
+│   └── commands.md, setup.md, readers.md
 └── tui/
-    └── dashboard.md     views, session detail, gate controls
+    └── dashboard.md
 ```
 
 ### Root spec
@@ -206,14 +199,19 @@ the whole project is a proxy.
 | `gates/forecasting.md` | `GCAST` |
 | `gates/pinging.md` | `GPING` |
 | `policy/overview.md` | `RPOL` |
+| `policy/document.md` | `RDOC` |
+| `policy/revisions.md` | `RREV` |
+| `policy/resolver.md` | `RSOLV` |
+| `policy/fallback.md` | `RFALL` |
+| `policy/provenance.md` | `RPROV` |
 | `policy/models.md` | `RMODEL` |
 | `policy/publication.md` | `RPUB` |
 | `store/overview.md` | `STORE` |
-| `store/ledger.md` | `SROWS` |
-| `store/migration.md` | `SMIG` |
+| `store/ledger.md` | `SLEDGR` |
 | `store/lanes.md` | `SLANE` |
 | `store/attempts.md` | `SATT` |
 | `store/lineage.md` | `SLIN` |
+| `store/migration.md` | `SMIG` |
 | `service/lifecycle.md` | `DLIFE` |
 | `service/config.md` | `DCONF` |
 | `service/control.md` | `DCTRL` |
@@ -222,9 +220,9 @@ the whole project is a proxy.
 | `cli/readers.md` | `UREAD` |
 | `tui/dashboard.md` | `UTUI` |
 
-`SLANE` and `SLIN` are the closest pair, both opening `SL` on adjacent
-subjects. `SEC` is unprefixed but opens with the store's letter, which the
-unprefixed convention has to carry.
+`SLEDGR`, `SLANE` and `SLIN` all open `SL`, though their lengths separate them.
+`SEC` is unprefixed but opens with the store's letter, which the unprefixed
+convention has to carry.
 
 The prefix is a reading aid and not a guarantee. An id never changes, but a
 family can be redrawn, so a spec that moves keeps a letter that no longer

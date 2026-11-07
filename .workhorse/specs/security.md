@@ -22,9 +22,9 @@ A detection marker MUST be a string chosen in advance, and only whether it match
 
 A label a display reads from a client's own files MUST be read when the display renders and MUST NOT reach the store.
 
-An import MUST report the names of fields it did not map and MUST NOT report their values, as [SROWS](store/ledger.md#imported-rows) specifies.
+An import MUST report the names of fields it did not map and MUST NOT report their values, as [SLEDGR](store/ledger.md#imported-rows) specifies.
 
-A routing diagnostic's path MUST be built only from static field names and bounded indices, as [RPOL](policy/overview.md#validation) specifies, so that a request or a model string cannot appear in one.
+A routing diagnostic's path MUST be built only from static field names and bounded indices, as [RDOC](policy/document.md#validation) specifies, so that a request or a model string cannot appear in one.
 
 An export MUST carry nothing that is not a ledger column, as [UREAD](cli/readers.md#export) specifies.
 
