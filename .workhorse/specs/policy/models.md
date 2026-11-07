@@ -120,7 +120,7 @@ A lane with no evidence MUST NOT be treated as a new session.
 Idleness MUST be keyed on the model.
 
 > [!NOTE]
-> A cache belongs to the model it was written on.
+> On the providers Toker serves, a cache belongs to the model it was written on.
 > Keying on the tool set looked workable, since the tool list opens the prompt, but a client changes tools mid-conversation and the cache survives.
 
 A compaction MUST NOT be upgraded by this election.

@@ -20,7 +20,8 @@ Because rendering is deterministic, a conversation that only appends reproduces 
 Toker MUST preserve that property: where the conversation up to a point has not changed, the rendered body up to that point MUST be byte-identical to the previous turn's.
 
 > [!NOTE]
-> An upstream charges a cached read only where the bytes it holds match the request's prefix exactly, so a renderer that reorders a map or formats a number differently between turns silently converts every cached read into a full one.
+> Every provider Toker serves keys its prompt cache on an exact byte prefix, charging a cached read only where the bytes it holds match.
+> A renderer that reorders a map or formats a number differently between turns then silently converts every cached read into a full one.
 
 ## Licensed transformations
 
@@ -53,7 +54,7 @@ Stripping a message's reasoning effort MUST leave any other content of that mess
 
 Removing a request's cache breakpoints requires a licence beyond the transformation that rewrites the body, and there are two.
 
-Toker MAY drop cache breakpoints where the model has changed, because a cache is keyed per model and there is none for the new model to lose.
+Toker MAY drop cache breakpoints where the model has changed, since a cache identity includes the model sent, as [LLANE](ledger/lanes.md#cache-identity) specifies, leaving none for the new model to lose.
 Toker MAY drop cache breakpoints where the caller has asserted that the request's cache is already cold.
 Where neither holds, retargeting MUST leave the breakpoints in place.
 

@@ -58,7 +58,7 @@ A cache identity is the binding together with the exact model sent upstream.
 A lane MUST have one cache identity at a time.
 
 > [!NOTE]
-> The same lane sent to another provider, or to the same provider on another model, reads nothing of what was written, however stable the client's own model string stayed.
+> On the providers Toker serves, the same lane sent to another provider, or to the same provider on another model, reads nothing of what was written, however stable the client's own model string stayed.
 > A virtual slug whose route was edited to another provider otherwise makes two unrelated provider contexts look like one warm lane.
 
 A binding MAY declare a cache domain, being an identifier and a verified cache lifetime.

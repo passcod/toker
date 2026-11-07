@@ -15,8 +15,8 @@ A gate MUST render that turn in the wire form the request asked for.
 A gate MUST NOT answer with an error status.
 
 > [!NOTE]
-> Clients handle error statuses on the user's behalf: a 529 is retried silently, a 429 is reported as a rate limit, and a 403 as broken credentials.
-> An assistant turn is the only answer every client shows the user as written.
+> A client handles error statuses on the user's behalf, and among those Toker serves a 529 is retried silently, a 429 reported as a rate limit, and a 403 as broken credentials.
+> An assistant turn is the one answer a client is certain to show the user as written.
 
 ## A notice is byte-stable
 
@@ -31,7 +31,7 @@ The block style's width MUST be fixed.
 A notice MUST NOT contain an em dash.
 
 > [!NOTE]
-> A terminal renders an em dash two cells wide, so the surrounding lines read as misaligned.
+> A terminal that renders an em dash two cells wide leaves the surrounding lines misaligned.
 
 Changing a notice's text changes a model-visible byte in every conversation that later carries it.
 
