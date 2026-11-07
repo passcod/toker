@@ -113,7 +113,7 @@ An average over rows MUST take the row as its unit.
 
 Everything reading a provider's evidence MUST read it per attempt.
 
-The quota fit, the meter reads, the cache-rebuild walk and learning MUST each take the individual row's own snapshot or reported identity.
+The quota fit, the meter reads, the cache-rebuild walk and learning MUST each take the individual row's own snapshot or [served model](../policy/models.md#served-model).
 
 > [!NOTE]
 > A total across a group would be a number no provider ever reported.

@@ -46,7 +46,7 @@ Toker MUST treat a fall as a restart only where the value does not return, and o
 Where a window's length is known, Toker MUST reconstruct its start as a reading of zero.
 Where a window's length is not known, Toker MUST NOT assume where it began.
 
-A window whose length is unknown and whose first day holds less than a day of history MUST report that it cannot project, rather than project from what it has.
+A window whose length is unknown and whose first day holds less than a day of history MUST report that it cannot project, rather than project from the history it has.
 
 ## Projecting across a day
 
@@ -69,7 +69,7 @@ Where even that ceiling does not reach the wall before the reset, Toker MUST rep
 
 ## Totalling a span
 
-A span total answers what a fixed stretch of wall clock cost.
+A span total answers the cost of a fixed stretch of wall clock.
 
 The baseline MUST be the reading before the span, and MUST NOT be the first reading inside it.
 

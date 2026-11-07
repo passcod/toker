@@ -66,7 +66,7 @@ The quota notice MUST carry the caution level, and the cold notice the warning l
 > [!NOTE]
 > A quota block stops a session until the operator acts, where a cold notice is advice the operator may act on or ignore.
 
-## What the quota notice states
+## The quota notice
 
 The quota notice is the only place the operator learns that the gate fired, so it MUST state which meter was hit, when that meter clears, and how to resume.
 
@@ -76,7 +76,7 @@ The notice MUST state the session's context size where the lane table holds it, 
 
 The quota gate is specified by [GQUOTA](quota.md).
 
-## What the cold notice states
+## The cold notice
 
 The cold notice MUST name the model a compaction would move to only where the active policy resolves one, and only where that model differs from the model the session is on.
 

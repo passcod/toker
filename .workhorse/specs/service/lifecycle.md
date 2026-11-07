@@ -57,7 +57,7 @@ After a second failure Toker MUST report rather than force again.
 
 A shutdown request MUST name the last instance that answered status, so a service that never answered has nothing to address and the operator is told to use the supervisor directly.
 
-Waiting for a quiet moment is not what keeps streams whole; the drain does that alone.
+Waiting for a quiet moment does not keep streams whole; the drain does that alone.
 
 > [!NOTE]
 > The wait keeps new requests from queueing behind a long one, since nothing accepts them between the listener closing and the old process exiting.

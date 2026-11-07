@@ -60,7 +60,7 @@ Toker MUST refuse a candidate message that carries a tool result, whether or not
 The continuation marker MUST be counted anywhere within the first message.
 A first message quoting that marker therefore over-counts.
 
-## Recording what was nearly a compaction
+## Recording an unmatched wording
 
 Toker MUST record, on every request, whether any wording appeared anywhere in the last few messages, whether or not it matched.
 

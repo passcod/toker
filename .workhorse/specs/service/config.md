@@ -12,9 +12,9 @@ It lives in the ledger as policy revisions, as [RPOL](../policy/overview.md) spe
 
 ## The file
 
-The file MUST hold only what cannot be read from the ledger or must be known before the ledger is opened.
+The file MUST hold only the settings that cannot be read from the ledger, or that must be known before the ledger is opened.
 
-| what | why it is here |
+| setting | why it is here |
 | --- | --- |
 | the listener's port | needed before anything is served |
 | the ledger's path | cannot be stored in the ledger |
@@ -59,7 +59,7 @@ Toker MUST write anything new it keeps into the state directory.
 
 Refreshing a login that Toker shares with another program on the same machine rewrites that program's own credential file, which lies outside the state directory.
 
-Where such a provider is enabled, setup MUST add that directory to what the service may write, and MUST add nothing else.
+Where such a provider is enabled, setup MUST add that directory to the paths the service may write, and MUST add nothing else.
 
 The refresh MUST re-read the file immediately before writing and MUST adopt the other program's tokens where they moved.
 

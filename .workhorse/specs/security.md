@@ -14,7 +14,7 @@ Toker MUST record only counts, lengths, digests, and whether a marker string it 
 
 Toker MUST parse a response body for its reported usage and MUST discard the rest.
 
-A detection marker MUST be a string chosen in advance, and only whether it matched MUST be recorded, as [GCOMP](gates/compaction.md#recording-what-was-nearly-a-compaction) specifies.
+A detection marker MUST be a string chosen in advance, and only whether it matched MUST be recorded, as [GCOMP](gates/compaction.md#recording-an-unmatched-wording) specifies.
 
 > [!NOTE]
 > Whether a known string matched is a derived fact, as a hash is.

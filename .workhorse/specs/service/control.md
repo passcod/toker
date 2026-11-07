@@ -16,7 +16,7 @@ The listener binds loopback only, but a page in the operator's browser can reach
 
 Every endpoint MUST name its operation in a dedicated header, compared case-insensitively against the operation it expects.
 
-A request MUST be refused with a 403 and a plain-text body naming what is required where it carries no such header, the wrong operation, the wrong method, or, for a request with a body, no JSON content type.
+A request MUST be refused with a 403 and a plain-text body naming the operation and method required, where it carries no such header, the wrong operation, the wrong method, or, for a request with a body, no JSON content type.
 
 That check MUST run before the body is read.
 

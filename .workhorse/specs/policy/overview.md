@@ -150,7 +150,7 @@ Reactivating an earlier revision MUST copy it into a new revision rather than mo
 
 Reactivation MUST check consent and compilation before replacing the draft, so that a refused reactivation leaves the draft and its generation untouched.
 
-What operation produced a revision and what its document means are separate properties, and both MUST be stored.
+The operation that produced a revision and the meaning of its document are separate properties, and both MUST be stored.
 
 > [!NOTE]
 > Restoring a generated revision keeps the generated semantics only because its compiler origin travels with it, independently of the fact that a reactivation produced it.
@@ -282,7 +282,7 @@ An authentication failure MUST NOT open a circuit where the credential that fail
 Fallback answers a candidate failing after its request was sent.
 A request is a group of attempts, one ledger row each, each charged to the provider that received it.
 
-### What may fall back
+### Failures that may fall back
 
 Only a failure classified without reading message text, and listed by the crossed edge, MUST be eligible to fall back.
 
@@ -331,11 +331,11 @@ An affinity keeps such a request on its binding, which may leave nothing to fall
 The retry that renegotiates a refused thinking mode is not fallback.
 It is a second send to the same target within one attempt, as [CANON](../canonical.md#thinking-that-cannot-be-turned-off) specifies.
 
-## What is recorded
+## Provenance
 
 Provenance MUST be content-free and identity-only.
 
-Each row of a policy-routed request MUST carry the revision, the route's identifier and fingerprint, the presentation or rewrite that matched, the candidate and binding, every stage of the model's spelling, the model the response reported, and its attempt group, index and reason.
+Each row of a policy-routed request MUST carry the revision, the route's identifier and fingerprint, the presentation or rewrite that matched, the candidate and binding, the model at each stage of its shaping, the [served model](models.md#served-model), and its attempt group, index and reason.
 
 A routing trace MUST be a bounded structure recording how the route was found, each candidate with its binding and either its availability or a closed reason for skipping it, and each upgrade and alias from and to.
 
@@ -344,6 +344,6 @@ Where a trace would exceed its bound, candidate model spellings MUST be dropped 
 A trace written by an earlier version MUST remain valid history.
 
 A response MUST echo the model the client requested rather than the model that served it.
-The ledger MUST keep the requested, effective and reported spellings separately.
+The ledger MUST keep the requested, effective and served models separately.
 
-Where a provider's response names no model, the reported identity MUST be absent, and MUST NOT be filled in from the effective model.
+Where a provider's response names no model, the served model MUST be absent, and MUST NOT be filled in from the effective model.

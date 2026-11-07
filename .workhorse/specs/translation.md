@@ -42,7 +42,7 @@ Where the target binding declares a semantic unsupported, the translation MUST r
 
 Which semantics a binding can represent is declared by the binding, as [ROUTE](routing.md#bindings) specifies.
 
-## Replaying what Toker does not understand
+## Opaque replay
 
 A translation MUST replay a provider's own input items, tool kinds and response items opaquely through the canonical request, without interpreting their contents.
 This MUST include encrypted reasoning and incremental tool declarations.

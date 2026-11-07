@@ -13,7 +13,7 @@ Toker MUST record such a relation only where the wire states it, and MUST NOT in
 
 A request's raw session is the identity it arrived with: the first of the configured session headers it carries, or, on a protocol that supplies one, the body's prompt cache key.
 
-The raw session MUST be stored whole, and MUST be what the lane table, the allowances and the prompt cache are keyed on.
+The raw session MUST be stored whole, and MUST be the key the lane table, the allowances and the prompt cache use.
 
 > [!NOTE]
 > A cache belongs to one conversation's prefix, and two sessions never share one. [LLANE](lanes.md) has the consequences.
@@ -26,7 +26,7 @@ A parent MUST NOT replace the raw session.
 > [!NOTE]
 > A child shown under its parent still has its own lane, its own cache and its own allowance.
 
-## What counts as evidence
+## Admissible evidence
 
 Toker MUST recognise only a relation a client states in a field its protocol defines for the purpose.
 
@@ -55,7 +55,7 @@ A row Toker writes about itself, such as a notice or a release, MUST NOT carry o
 
 ### Why nothing else counts
 
-None of these MUST be treated as evidence of a relation: when a request arrived, which model it named, how many messages or tools it carried, whether a transcript exists for it, which connection it used, or what its body contains.
+None of these MUST be treated as evidence of a relation: when a request arrived, which model it named, how many messages or tools it carried, whether a transcript exists for it, which connection it used, or its body's contents.
 
 > [!NOTE]
 > Each is a guess that is right until the day it is wrong, and a wrong lineage is worse than none, because it moves one conversation's tokens and cost into another's.
@@ -66,7 +66,7 @@ A header naming a request's class MAY label a role, and MUST NOT establish a par
 
 ### Routing never reads the role
 
-Policy MUST resolve a request from content-free facts alone, and MUST NOT recognise a request by its role or by what its prompt contains.
+Policy MUST resolve a request from content-free facts alone, and MUST NOT recognise a request by its role or by its prompt's contents.
 
 > [!NOTE]
 > A client's classifier, title and helper calls are therefore routed exactly as any other request naming the same model is.

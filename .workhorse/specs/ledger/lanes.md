@@ -48,8 +48,8 @@ A lane narrows a session to a tool set and no further.
 > [!NOTE]
 > Subagents share their parent's session, so a fresh subagent whose tool set matches an earlier sibling's lands in that sibling's lane.
 
-A lane records what was cached.
-Only the request says what this send would re-read, so anything reading a lane to judge a request MUST also ask whether the request could be what the lane describes.
+A lane records the cache that was written.
+Only the request bounds the prefix this send would re-read, so anything reading a lane to judge a request MUST also ask whether the request could be the one the lane describes.
 
 ## Cache identity
 
@@ -201,7 +201,7 @@ Activation consent MUST count lanes by the first question above, and MUST count 
 
 A ledger that cannot be read MUST refuse the activation, and MUST NOT read as having no warm lanes.
 
-## What fallback does to a pin
+## Fallback and the pin
 
 A fallback to a candidate on another binding is a change of cache identity.
 

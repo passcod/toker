@@ -44,7 +44,7 @@ Import MUST keep a checkpoint, so that a repeated run continues rather than dupl
 
 ## Reporting a context window
 
-This command MUST claim only what a served response proves: a prompt exceeding a provider-declared ceiling, or a prompt large enough to prove an exact larger window.
+This command MUST claim only the window a served response proves: a prompt exceeding a provider-declared ceiling, or a prompt large enough to prove an exact larger window.
 
 An unknown window and a prompt below the threshold MUST say nothing.
 

@@ -39,7 +39,7 @@ A view whose range reaches back past a field's introduction MUST say so rather t
 
 ## Row kinds
 
-A row with no kind is a measurement of what the provider reported.
+A row with no kind is a measurement of a provider's own report.
 Any other kind is a row Toker wrote about itself.
 
 That rule MUST be kept in one place, so that every consumer classifies identically.
@@ -49,7 +49,7 @@ A reader MUST exclude Toker's own rows by the presence of a kind, and MUST NOT e
 > [!NOTE]
 > Listing kinds is how a kind added later slips into a quota fit and into per-request averages.
 
-Any measurement of what the provider reported, and when, MUST exclude them.
+Any measurement of a provider's own reports, and of when they arrived, MUST exclude them.
 
 > [!NOTE]
 > Counting them reports the proxy's own staleness back as the provider's.
@@ -75,10 +75,10 @@ A row recording the sleep lock MUST carry no profile, provider or route.
 
 ## Model identity
 
-A row MUST carry the requested, effective and served identities separately, as [RMODEL](../policy/models.md#three-identities) specifies, together with the pricing-normalised form of the served one.
+A row MUST carry the [requested model](../policy/models.md#requested-model), the [effective model](../policy/models.md#effective-model) and the [served model](../policy/models.md#served-model) separately, together with the pricing-normalised form of the served one.
 
-A response naming no model MUST leave the served identity absent.
-Nothing MUST fill it from the effective identity.
+A response naming no model MUST leave the served model absent.
+Nothing MUST fill it from the effective model.
 
 ## Fields that need care
 

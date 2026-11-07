@@ -81,7 +81,7 @@ A binding MUST be a declaration verified against the provider, and MUST NOT be i
 The set of bindings is fixed topology and MUST NOT depend on configuration or on policy.
 
 A capability MUST be read from the binding that will serve the request.
-A frontend MUST NOT decide at parse time what a provider will refuse.
+A frontend MUST NOT decide at parse time which semantics a provider will refuse.
 
 ## Frontend profiles
 
@@ -166,7 +166,6 @@ Toker MUST feed meters from every response a meter-bearing provider returns, inc
 The Anthropic rate limit headers on `anthropic_sub` MUST be the quota gate's only source.
 `anthropic_api` returns request-rate headers which are not quota meters, and they MUST NOT overwrite the gate's snapshot.
 
-The cost kinds MUST NOT be conflated with one another.
 A model, service tier or token category Toker has no verified price for MUST leave the row's cost unrecorded rather than record a zero.
 
 The quota gate is specified by [GQUOTA](gates/quota.md), and the cold gate by [GCOLD](gates/cold.md).

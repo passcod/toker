@@ -14,7 +14,7 @@ This spec covers what a window meters, how that is fitted from the ledger, when 
 | claim | the window a provider names as representative of a reading, reported in its rate limit headers |
 | overage | spend beyond a subscription plan's included allotment, billed separately |
 
-## What a window meters
+## Metered consumption
 
 A rate limit window meters fresh prompt tokens, which are uncached input together with cache writes, and output tokens.
 Both are weighted per model.

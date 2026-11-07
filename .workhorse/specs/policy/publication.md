@@ -126,7 +126,7 @@ The service MUST NOT write it.
 A user-side writer MUST perform that reconciliation, and MUST run at least on an activation and on a recurring schedule.
 Activation MUST NOT wait for it, and a failed write MUST leave the activation standing with the row recording the failure.
 
-### What a reconciliation does
+### Reconciling
 
 A reconciliation MUST load the row and the revision it names, and MUST recompute the inventory generation over the cached catalogues of the enabled providers.
 Where that generation differs from the one recorded, it MUST fail before touching the file.

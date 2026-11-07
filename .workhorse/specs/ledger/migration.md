@@ -7,7 +7,7 @@ id: LMIG
 Routing was once configuration interpreted per request, and is now a series of revisions in the ledger.
 This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, and how a file may be read deliberately afterwards.
 
-## What the file keeps
+## The file
 
 The configuration file is bootstrap.
 It holds the listener, the ledger's path, which providers are enabled and where they are reached, where each credential comes from, the header names, and the toggles and styles that are not routing.

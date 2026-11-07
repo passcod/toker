@@ -92,7 +92,7 @@ A recap MUST be detected under the same position rules as a compaction, which [G
 
 ## Two clocks
 
-A lane carries two timestamps, and they MUST NOT be conflated.
+A lane carries two timestamps.
 
 | clock | meaning | moves |
 | --- | --- | --- |

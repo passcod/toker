@@ -19,16 +19,16 @@ A table MUST shed columns before its content is truncated.
 A number shown to a person MAY be formatted to the host's locale.
 That formatting MUST NOT reach a gate notice, as [GNOTE](../gates/notices.md#a-notice-is-byte-stable) requires.
 
-## What it shows
+## The views
 
 The dashboard MUST show the sessions active within its window, the cache rebuilds within it, spend, and the state of each meter.
 
-A session's row MUST take its model and the context ceiling derived from it from the served identity of the latest row that named one, and MUST NOT take them from the model that was requested.
+A session's row MUST take its model and the context ceiling derived from it from the [served model](../policy/models.md#served-model) of the latest row that named one, and MUST NOT take them from the requested model.
 
 > [!NOTE]
 > A context window belongs to the model that served, not to the one that was asked for.
 
-A session detail MUST show the requested, sent and reported identities separately, and MUST show the reported one as absent where the response named no model.
+A session detail MUST show the requested, effective and served models separately, and MUST show the served one as absent where the response named no model.
 
 > [!NOTE]
 > Showing all three is only useful because they can disagree, which is exactly what a fallback or an alias produces.
