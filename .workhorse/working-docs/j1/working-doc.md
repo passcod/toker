@@ -220,6 +220,25 @@ and lineage are accounting identity, which `ledger/schema.md` already carries
 sections for, so they join the ledger. `/_toker/` is service administration and
 never reaches an upstream, so `DCTRL`.
 
+## Pilot
+
+`overview.md` (`TOK`) and `routing.md` (`ROUTE`) are written, 195 lines for the
+pilot against 433 of internals prose. Awaiting sign-off on the voice before
+anything else is drafted.
+
+Carved out of internals' `routing.md` and left for their own specs: canonical
+rendering and the thinking-disabled retry (`CANON`), the codex and OpenRouter
+translation paths (`TRANS`), the drain-and-restart sequence (`DLIFE`), the
+`/model` picker (`RPUB`), and the live routing controls (`DCTRL`).
+
+Cut rather than carried: the ctp comparisons, the dated live-probe narratives
+(a probe is evidence for a capability claim, and the claim is what the spec
+states; the date belongs with the code's `VERIFIED_ON`), and the reasoning
+about why Claude Code's three picker mechanisms do not work.
+
+The glossary defines eleven terms so far. It grows as each spec is written,
+since a term is defined by the spec that owns it.
+
 ## Open questions
 
 - [ ] The area tree: how the subjects group into directories. Three joints are
