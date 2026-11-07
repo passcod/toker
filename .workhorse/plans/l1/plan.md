@@ -50,7 +50,7 @@ Each phase compiles and keeps the suite green.
 ### 5. Setup
 
 - [x] Import: rows and revision one in one transaction, then delete the file
-- [ ] Fresh machine: ask one provider and its credential, nothing more
+- [x] Fresh machine: setup asks only what the dashboard cannot change (the spec's "one provider" was wrong — the port and schedule slots reach the units, not the store, so they cannot be deferred)
 - [x] Discover the Claude and codex directories their own way, carry them into the unit
 - [x] Re-exec into the dashboard at the end
 
@@ -64,7 +64,7 @@ Each phase compiles and keeps the suite green.
 
 - [x] Codex `originator` becomes a constant
 - [x] `claude_credentials_path` and codex `auth_path` become discovery
-- [ ] Prune what `config.rs` no longer needs
+- [x] Prune what `config.rs` no longer needs
 
 ## Decisions worth keeping
 

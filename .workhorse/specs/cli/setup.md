@@ -40,10 +40,13 @@ Where a configuration file exists, setup MUST report what it read from that file
 
 The order in which setup writes the store and removes the file is specified by [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together).
 
-Where no configuration file exists, setup MUST ask only what the machine needs in order to serve, being one provider and where that provider's credential comes from.
+Setup MUST ask only what the dashboard cannot later change, and what the machine needs in order to serve.
+
+That is the listener port and the schedule slots, which reach the units rather than the store, and the providers the machine serves with where each one's credential comes from.
 
 > [!NOTE]
-> Everything else is edited in the dashboard, so asking for it here would be two surfaces to keep agreeing with each other.
+> A setting the dashboard can change is a setting setup asking for is a second surface to keep agreeing with the first.
+> The port is not one of those: the socket unit is what listens, so a port the dashboard could change would disagree with the unit it was installed with.
 
 Where setup found an active listener on the configured port, it MUST replace the running instance by the path [DLIFE](../service/lifecycle.md#replacing-the-running-instance) specifies.
 
