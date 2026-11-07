@@ -76,6 +76,3 @@ A control path added later MUST take the same checks.
 Observing and recording a request MUST NOT be able to fail it, as [LATT](ledger/attempts.md) and [GQUOTA](gates/quota.md#firing) specify.
 
 Only a gate MUST be able to stop a session, and every gate decision MUST be taken at one place.
-
-> [!NOTE]
-> A request dropped anywhere else is the defect this property exists to catch.

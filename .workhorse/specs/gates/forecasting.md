@@ -64,7 +64,6 @@ A meter's quantisation gives an unmoved meter's rate a ceiling.
 Where even that ceiling does not reach the wall before the reset, Toker MUST report the meter as on track.
 
 > [!NOTE]
-> That is a measurement, not an absence of one.
 > Reporting an estimate for every unmoved meter would make a rarely-moving meter's line permanently useless.
 
 ## Totalling a span

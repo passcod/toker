@@ -28,7 +28,7 @@ A translated conversation that only appends MUST reproduce its earlier upstream 
 The first turn an existing conversation sends over a translated route rebuilds the upstream's cache once.
 
 > [!NOTE]
-> That rebuild is not a defect of the translation: the upstream's prefix genuinely changed, because the conversation's earlier turns were never sent in this protocol.
+> The upstream's prefix genuinely changed, because the conversation's earlier turns were never sent in this protocol.
 
 ## Resolving a capability the target lacks
 

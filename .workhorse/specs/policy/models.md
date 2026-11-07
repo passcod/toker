@@ -29,8 +29,7 @@ The effective model MUST be read only to decide which model a cache belongs to.
 
 The requested model MUST be read only as routing provenance.
 
-> [!NOTE]
-> A candidate's alias target is an opaque destination rather than evidence of capability or price, and the same separation covers a provider that quietly serves a model nobody asked for.
+A candidate's alias target is an opaque identifier.
 
 ## Learned evidence
 

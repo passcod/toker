@@ -61,7 +61,4 @@ A ping the policy sent to another provider, or that failed over from the subscri
 
 Each ping run MUST be recorded with the boundary it predicted, the boundary the ledger subsequently reported, and whether the two matched.
 
-> [!NOTE]
-> Whether the schedule held is then a query rather than a recollection.
-
 A readback MUST consider only rows logged after the ping began.
