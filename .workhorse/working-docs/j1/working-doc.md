@@ -34,6 +34,46 @@ Four destinations, decided per sentence rather than per file:
 - **Cut** — point-in-time material, ctp comparisons kept only as history, and
   anything whose only reader was someone tracking how the code got here.
 
+### The tree
+
+```
+.workhorse/specs/
+├── overview.md          notation, external documents, terminology
+├── security.md          the properties, each naming its upholding mechanism
+├── proxy/
+│   ├── routing.md       protocols, providers, bindings, the /f/<name> prefix
+│   ├── canonical.md     canonical rendering, what may alter a body
+│   └── translation.md   Messages <-> Responses, purity, prefix stability
+├── gates/
+│   ├── quota.md         windows, weights, releases, allowances
+│   ├── cold.md          the cold-cache gate, two clocks, the recap
+│   ├── notices.md       notice styles per profile, byte stability
+│   ├── forecasting.md   projecting a window, totalling a span
+│   └── pinging.md       opening a window buys phase
+├── session/
+│   ├── lanes.md         lane identity, cache identity, pins
+│   ├── attempts.md      a logical request and its attempts
+│   ├── lineage.md       what counts as evidence of descent
+│   └── compaction.md    detecting a compaction, the wordings
+├── policy/
+│   ├── overview.md      the document, lifecycle, the resolver, fallback
+│   ├── models.md        learning, election, upgrades, context ceilings
+│   └── publication.md   what each profile lists, generations, Claude's settings
+├── ledger/
+│   ├── schema.md        row kinds, fields, old rows, imported rows
+│   └── migration.md     append-only migrations, revision one, activation
+├── service/
+│   ├── lifecycle.md     socket activation, drain, restart, the sleep lock
+│   ├── config.md        toker.toml: providers, credential sources, the listener
+│   └── control.md       /_toker/ endpoints and the header gate
+├── cli/
+│   ├── commands.md      the CLI surface
+│   ├── setup.md         the wizard, frontend patching, units
+│   └── readers.md       import, export, watch-context-window
+└── tui/
+    └── dashboard.md     views, session detail, gate controls
+```
+
 ### Root spec
 
 `.workhorse/specs/overview.md` is a meta spec and nothing else: one sentence
@@ -85,12 +125,72 @@ fail quietly, so the vendored ctp reference fixture
 checking by eye. The code is already close to the settled terms, so the sweep
 is expected to be small.
 
-## Proposed ids
+## Ids
 
-Short uppercase, no project prefix. `TOK` (root), `SEC`, `RTG`, `CANON`,
-`XLAT`, `CTRL`, `NTC`, `LANE`, `ATT`, `LIN`, `CMPT`, `QUOT`, `COLD`, `FCST`,
-`PING`, `POL`, `MDL`, `PUB`, `LEDG`, `MIGR`, `SVC`, `CFG`, `CLI`, `SETUP`,
-`RDR`, `TUI`.
+Three to six characters, uppercase. The first letter is the area, as a loose
+convention: it makes a citation readable without looking the spec up, and
+groups the corpus when ids are listed. Root specs carry no prefix, which is how
+a reader tells a corpus-wide spec from an area one.
+
+| Area | Prefix |
+| --- | --- |
+| (root) | none |
+| `proxy/` | `P` |
+| `gates/` | `G` |
+| `session/` | `S` |
+| `policy/` | `M`, for the model routing it decides |
+| `ledger/` | `L` |
+| `service/` | `D`, for daemon |
+| `cli/` | `C` |
+| `tui/` | `T` |
+
+Proxy and policy both want `P`, and session, service, security and setup all
+want `S`, so policy takes `M` and service takes `D`.
+
+| Spec | Id |
+| --- | --- |
+| `overview.md` | `TOK` |
+| `security.md` | `SEC` |
+| `proxy/routing.md` | `PROUTE` |
+| `proxy/canonical.md` | `PCANON` |
+| `proxy/translation.md` | `PTRANS` |
+| `gates/quota.md` | `GQUOTA` |
+| `gates/cold.md` | `GCOLD` |
+| `gates/notices.md` | `GNOTE` |
+| `gates/forecasting.md` | `GCAST` |
+| `gates/pinging.md` | `GPING` |
+| `session/lanes.md` | `SLANE` |
+| `session/attempts.md` | `SATT` |
+| `session/lineage.md` | `SLIN` |
+| `session/compaction.md` | `SCOMP` |
+| `policy/overview.md` | `MPOL` |
+| `policy/models.md` | `MLEARN` |
+| `policy/publication.md` | `MPUB` |
+| `ledger/schema.md` | `LROWS` |
+| `ledger/migration.md` | `LMIGR` |
+| `service/lifecycle.md` | `DLIFE` |
+| `service/config.md` | `DCONF` |
+| `service/control.md` | `DCTRL` |
+| `cli/commands.md` | `CCMD` |
+| `cli/setup.md` | `CSETUP` |
+| `cli/readers.md` | `CREAD` |
+| `tui/dashboard.md` | `TDASH` |
+
+The prefix is a reading aid and not a guarantee. An id never changes, but an
+area can be reorganised, so a spec that moves keeps a prefix that no longer
+matches. That is accepted rather than fixed, because renaming an id breaks
+every `// spec:` citation pointing at it.
+
+> [!NOTE]
+> This diverges from the spec-voice house style, which bans prefixed ids. Its
+> rationale is about project prefixes such as `BLI-CHN`, which record that the
+> specs were once part of something larger. An area prefix records live
+> structure instead, and trades id stability for readability knowingly.
+
+Deriving the scheme moved two specs. `notices.md` was under `proxy/`, but a
+gate notice is gate output and nothing else produces one, so it is `GNOTE`.
+`control.md` was under `proxy/`, but `/_toker/` is service administration and
+never reaches an upstream, so it is `DCTRL`.
 
 ## Open questions
 
@@ -98,8 +198,6 @@ Short uppercase, no project prefix. `TOK` (root), `SEC`, `RTG`, `CANON`,
       uncertain: whether `routing.md` splits three ways, whether `session/` is
       a real grouping, and whether `ledger/schema.md` wants splitting once
       converted.
-- [ ] Sign off the proposed ids, or object to any that read badly. `CMPT` for
-      compaction is the weakest.
 - [ ] Confirm a link and anchor checker goes in as a test under `tests/`, since
       there is no CI and deep links break silently when a heading is reworded.
 - [ ] What `dialect` is, precisely, and whether it needs a glossary entry.
