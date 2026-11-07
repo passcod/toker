@@ -40,28 +40,26 @@ Four destinations, decided per sentence rather than per file:
 .workhorse/specs/
 ├── overview.md          notation, external documents, terminology
 ├── security.md          the properties, each naming its upholding mechanism
-├── proxy/
-│   ├── routing.md       protocols, providers, bindings, the /f/<name> prefix
-│   ├── canonical.md     canonical rendering, what may alter a body
-│   └── translation.md   Messages <-> Responses, purity, prefix stability
+├── routing.md           protocols, providers, bindings, the /f/<name> prefix
+├── canonical.md         canonical rendering, what may alter a body
+├── translation.md       Messages <-> Responses, purity, prefix stability
 ├── gates/
 │   ├── quota.md         windows, weights, releases, allowances
 │   ├── cold.md          the cold-cache gate, two clocks, the recap
 │   ├── notices.md       notice styles per profile, byte stability
+│   ├── compaction.md    detecting a compaction, the wordings
 │   ├── forecasting.md   projecting a window, totalling a span
 │   └── pinging.md       opening a window buys phase
-├── session/
-│   ├── lanes.md         lane identity, cache identity, pins
-│   ├── attempts.md      a logical request and its attempts
-│   ├── lineage.md       what counts as evidence of descent
-│   └── compaction.md    detecting a compaction, the wordings
 ├── policy/
 │   ├── overview.md      the document, lifecycle, the resolver, fallback
 │   ├── models.md        learning, election, upgrades, context ceilings
 │   └── publication.md   what each profile lists, generations, Claude's settings
 ├── ledger/
 │   ├── schema.md        row kinds, fields, old rows, imported rows
-│   └── migration.md     append-only migrations, revision one, activation
+│   ├── migration.md     append-only migrations, revision one, activation
+│   ├── lanes.md         lane identity, cache identity, pins
+│   ├── attempts.md      a logical request and its attempts
+│   └── lineage.md       what counts as evidence of descent
 ├── service/
 │   ├── lifecycle.md     socket activation, drain, restart, the sleep lock
 │   ├── config.md        toker.toml: providers, credential sources, the listener
@@ -127,70 +125,73 @@ is expected to be small.
 
 ## Ids
 
-Three to six characters, uppercase. The first letter is the area, as a loose
-convention: it makes a citation readable without looking the spec up, and
-groups the corpus when ids are listed. Root specs carry no prefix, which is how
-a reader tells a corpus-wide spec from an area one.
+Three to six characters, uppercase. The first letter names a family, as a loose
+convention: it makes a citation readable without looking the spec up.
 
-| Area | Prefix |
+A family is not a folder. `cli/` and `tui/` are both interfaces and share `U`,
+so a later GUI joins the family wherever it sits. Unprefixed means the spec is
+about what toker is, rather than a part of it, which is why the wire specs
+carry no letter: prefixing them with a proxy letter would say nothing, since
+the whole project is a proxy.
+
+| Family | Prefix |
 | --- | --- |
-| (root) | none |
-| `proxy/` | `P` |
-| `gates/` | `G` |
-| `session/` | `S` |
-| `policy/` | `M`, for the model routing it decides |
-| `ledger/` | `L` |
-| `service/` | `D`, for daemon |
-| `cli/` | `C` |
-| `tui/` | `T` |
-
-Proxy and policy both want `P`, and session, service, security and setup all
-want `S`, so policy takes `M` and service takes `D`.
+| What toker is | none |
+| Gates | `G` |
+| Routing policy | `R` |
+| Ledger and accounting | `L` |
+| Daemon | `D` |
+| Interfaces | `U` |
 
 | Spec | Id |
 | --- | --- |
 | `overview.md` | `TOK` |
 | `security.md` | `SEC` |
-| `proxy/routing.md` | `PROUTE` |
-| `proxy/canonical.md` | `PCANON` |
-| `proxy/translation.md` | `PTRANS` |
+| `routing.md` | `ROUTE` |
+| `canonical.md` | `CANON` |
+| `translation.md` | `TRANS` |
 | `gates/quota.md` | `GQUOTA` |
 | `gates/cold.md` | `GCOLD` |
 | `gates/notices.md` | `GNOTE` |
+| `gates/compaction.md` | `GCOMP` |
 | `gates/forecasting.md` | `GCAST` |
 | `gates/pinging.md` | `GPING` |
-| `session/lanes.md` | `SLANE` |
-| `session/attempts.md` | `SATT` |
-| `session/lineage.md` | `SLIN` |
-| `session/compaction.md` | `SCOMP` |
-| `policy/overview.md` | `MPOL` |
-| `policy/models.md` | `MLEARN` |
-| `policy/publication.md` | `MPUB` |
+| `policy/overview.md` | `RPOL` |
+| `policy/models.md` | `RMODEL` |
+| `policy/publication.md` | `RPUB` |
 | `ledger/schema.md` | `LROWS` |
-| `ledger/migration.md` | `LMIGR` |
+| `ledger/migration.md` | `LMIG` |
+| `ledger/lanes.md` | `LLANE` |
+| `ledger/attempts.md` | `LATT` |
+| `ledger/lineage.md` | `LLIN` |
 | `service/lifecycle.md` | `DLIFE` |
 | `service/config.md` | `DCONF` |
 | `service/control.md` | `DCTRL` |
-| `cli/commands.md` | `CCMD` |
-| `cli/setup.md` | `CSETUP` |
-| `cli/readers.md` | `CREAD` |
-| `tui/dashboard.md` | `TDASH` |
+| `cli/commands.md` | `UCLI` |
+| `cli/setup.md` | `USETUP` |
+| `cli/readers.md` | `UREAD` |
+| `tui/dashboard.md` | `UTUI` |
 
-The prefix is a reading aid and not a guarantee. An id never changes, but an
-area can be reorganised, so a spec that moves keeps a prefix that no longer
+`LLANE` and `LLIN` are the weakest pair: both open `LL` and sit on adjacent
+subjects. Watch for one being cited where the other was meant.
+
+The prefix is a reading aid and not a guarantee. An id never changes, but a
+family can be redrawn, so a spec that moves keeps a letter that no longer
 matches. That is accepted rather than fixed, because renaming an id breaks
 every `// spec:` citation pointing at it.
 
 > [!NOTE]
 > This diverges from the spec-voice house style, which bans prefixed ids. Its
 > rationale is about project prefixes such as `BLI-CHN`, which record that the
-> specs were once part of something larger. An area prefix records live
+> specs were once part of something larger. A family prefix records live
 > structure instead, and trades id stability for readability knowingly.
 
-Deriving the scheme moved two specs. `notices.md` was under `proxy/`, but a
-gate notice is gate output and nothing else produces one, so it is `GNOTE`.
-`control.md` was under `proxy/`, but `/_toker/` is service administration and
-never reaches an upstream, so it is `DCTRL`.
+Settling the families moved four specs out of where a folder-shaped scheme had
+put them. Gate notices are gate output, so `GNOTE`. Compaction detection feeds
+the cold gate rather than accounting for anything, so `GCOMP`. Lanes, attempts
+and lineage are accounting identity, which `ledger/schema.md` already carries
+sections for, so they join the ledger. `/_toker/` is service administration and
+never reaches an upstream, so `DCTRL`.
 
 ## Open questions
 
