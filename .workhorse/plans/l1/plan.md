@@ -21,10 +21,10 @@ Each phase compiles and keeps the suite green.
 
 ### 1. Store tables and the row layer
 
-- [ ] Migration appending `config_providers`, `config_settings`, `config_notices`
-- [ ] `store::config` read and write for each table
+- [x] Migration appending `config_providers`, `config_settings`, `config_notices`
+- [x] `store::config` read and write for each table
 - [ ] `Config::from_store`, and the env resolution beside it
-- [ ] State directory forced to owner-only on open
+- [x] State directory forced to owner-only on open
 
 ### 2. The file becomes import-only
 

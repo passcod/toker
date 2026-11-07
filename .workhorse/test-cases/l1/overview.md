@@ -4,18 +4,18 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Resolving what is not stored
 
-- [ ] The store path defaults under the user data directory, and `TOKER_DB` overrides it (verifies spec: DCONF)
-- [ ] The listener port defaults, and `PORT` overrides it (verifies spec: DCONF)
+- [x] The store path defaults under the user data directory, and `TOKER_DB` overrides it (verifies spec: DCONF)
+- [x] The listener port defaults, and `PORT` overrides it (verifies spec: DCONF)
 - [ ] The service, a command and the dashboard resolve the same port and store path from the same environment (verifies spec: DCONF)
 - [ ] A command that cannot reach the service names the port it tried (verifies spec: DCONF)
 
 ## Reading configuration from the store
 
-- [ ] A store with no configuration rows yields a usable config with every provider disabled (verifies spec: DCONF)
-- [ ] A provider row round-trips its enablement, endpoint and credential source (verifies spec: DCONF)
-- [ ] Disabling a provider keeps its endpoint and credential source (verifies spec: DCONF)
-- [ ] Gate settings, notice styles, header names, the sleep lock and transcript roots round-trip (verifies spec: DCONF)
-- [ ] Opening the store makes its directory owner-only, including a directory that was not (verifies spec: DCONF)
+- [x] A store with no configuration rows yields a usable config with every provider disabled (verifies spec: DCONF)
+- [x] A provider row round-trips its enablement, endpoint and credential source (verifies spec: DCONF)
+- [x] Disabling a provider keeps its endpoint and credential source (verifies spec: DCONF)
+- [x] Gate settings, notice styles, header names, the sleep lock and transcript roots round-trip (verifies spec: DCONF)
+- [x] Opening the store makes its directory owner-only, including a directory that was not (verifies spec: DCONF)
 
 ## Configuration never refuses a start
 
