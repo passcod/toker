@@ -4,10 +4,24 @@ id: RMODEL
 
 # Learning models and electing upgrades
 
-Which version of a model family is current is decided from what each binding has served, rather than from a maintained list.
-This spec covers what is learned, how a family's target is elected, when a request may be moved to it, and which declared facts decide whether a model fits.
+Which version of a model family is current is decided from the models each binding has served, rather than from a maintained list.
+This spec covers the evidence Toker learns, how a family's target is elected, when a request may be moved to it, and which declared facts decide whether a model fits.
 
-## Which identity may be read for what
+## Terminology
+
+### Requested model
+
+The model identity a client named in its request.
+
+### Effective model
+
+The model identity Toker sent upstream.
+
+### Served model
+
+The model identity a provider's response reports as having served it.
+
+## Which identity is authoritative
 
 Only the served model MUST add a day's evidence, raise a learned prompt size, select a context ceiling, or choose a price.
 
@@ -18,7 +32,7 @@ The requested model MUST be read only as routing provenance.
 > [!NOTE]
 > A candidate's alias target is an opaque destination rather than evidence of capability or price, and the same separation covers a provider that quietly serves a model nobody asked for.
 
-## What is learned
+## Learned evidence
 
 Learning MUST be keyed by binding and exact model identity together.
 
@@ -115,7 +129,7 @@ It has its own retarget, which [GCOMP](../gates/compaction.md#choosing-the-targe
 
 ### The recency record
 
-The record of what was last sent MUST be kept apart from the lane table.
+The record of the model last sent MUST be kept apart from the lane table.
 
 > [!NOTE]
 > It must not forget within the period it answers for, which a lane table makes no promise about.
