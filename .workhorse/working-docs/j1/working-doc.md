@@ -220,6 +220,18 @@ and lineage are accounting identity, which `ledger/schema.md` already carries
 sections for, so they join the ledger. `/_toker/` is service administration and
 never reaches an upstream, so `DCTRL`.
 
+## Where a cross-reference goes
+
+A pointer to another spec belongs in the summary, where the spec says what it
+does not cover. Trailing one at the end of a section puts another spec's
+subject under that section's heading, where a reader looking for the section's
+own subject meets it.
+
+Watch for the shape that produces one: a section specifying how X is handled,
+followed by a sentence saying Y is handled elsewhere. The contrast is usually
+an absence too, so both the sentence and the pointer go, and the pointer comes
+back in the summary.
+
 ## When a note earns its place
 
 A `> [!NOTE]` survives only where cutting it would let someone build a

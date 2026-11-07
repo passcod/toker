@@ -7,6 +7,7 @@ id: ROUTE
 Toker serves several protocols on one loopback port and forwards each request to one of several configured providers.
 This spec covers the paths, the topology a request is resolved onto, what each provider does to a request's credentials, and how a request with nowhere to go is answered.
 Which binding and model a request takes is decided by [RPOL](policy/overview.md).
+How an inference request's body is rendered is specified by [CANON](canonical.md).
 
 ## Protocols
 
@@ -183,10 +184,7 @@ What each protocol's listing contains is specified by [RPUB](policy/publication.
 
 Token counting and batch creation MUST resolve only their first candidate, and MUST require a binding that declares the operation.
 
-These requests are not rendered canonically.
-Toker MUST retain the client's bytes and MUST replace only the model at the positions each operation documents.
+Toker MUST retain the client's bytes on these requests, and MUST replace only the model at the positions each operation documents.
 A batch whose requests resolve to more than one binding MUST be refused with a 400.
 
 Batch reads, batch cancellation and unmatched administrative paths MUST stream through without inference observation.
-
-Inference requests are rendered canonically instead, as [CANON](canonical.md) specifies.
