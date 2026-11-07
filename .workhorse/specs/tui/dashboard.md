@@ -23,7 +23,7 @@ That formatting MUST NOT reach a gate notice, as [GNOTE](../gates/notices.md#a-n
 
 The dashboard MUST show the sessions active within its window, the cache rebuilds within it, spend, and the state of each meter.
 
-A session's row MUST take its model and the context ceiling derived from it from the [served model](../policy/models.md#served-model) of the latest row that named one, and MUST NOT take them from the requested model.
+A session's row MUST take its model and the context ceiling derived from it from the [served model](../routing/models.md#served-model) of the latest row that named one, and MUST NOT take them from the requested model.
 
 > [!NOTE]
 > A context window belongs to the model that served, not to the one that was asked for.
@@ -56,7 +56,7 @@ The page MUST be able to validate, preview, activate and reactivate, through the
 
 An activation MUST NOT wait on reconciling a client's settings, and a slow or failed reconciliation MUST be reported on the page without undoing or delaying the activation.
 
-The page MAY import a configuration file into the draft, behind a confirmation, as [SMIG](../store/migration.md#importing-a-file-deliberately) specifies.
+The page MAY import a configuration file into the draft, behind a confirmation, as [RMIG](../routing/migration.md#importing-a-file-deliberately) specifies.
 
 ## Cost
 

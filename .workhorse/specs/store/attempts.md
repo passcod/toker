@@ -23,14 +23,14 @@ Two things add an attempt.
 | falling back to the next candidate | the failure class that caused the fall |
 
 The refusal that prompts a renegotiation MUST be recorded as an error row at its own index, with the provider's own error type, and the retry MUST be the next index.
-What that retry may change is specified by [CANON](../routing/canonical.md#thinking-that-cannot-be-turned-off).
+What that retry may change is specified by [WCANON](../wire/canonical.md#thinking-that-cannot-be-turned-off).
 
 A refusal prompting a renegotiation MUST NOT open a health circuit.
 
 > [!NOTE]
 > A model asking for a different thinking mode is working.
 
-Which failures may fall back, and what fallback may do, is specified by [RFALL](../policy/fallback.md).
+Which failures may fall back, and what fallback may do, is specified by [RFALL](../routing/fallback.md).
 Where the resolver or the lane's transition rules refuse a fall, the failed response MUST be forwarded and the group MUST end there.
 
 A gate notice is decided once for the whole request, and MUST NOT be decided again for a later attempt.
@@ -113,7 +113,7 @@ An average over rows MUST take the row as its unit.
 
 Everything reading a provider's evidence MUST read it per attempt.
 
-The quota fit, the meter reads, the cache-rebuild walk and learning MUST each take the individual row's own snapshot or [served model](../policy/models.md#served-model).
+The quota fit, the meter reads, the cache-rebuild walk and learning MUST each take the individual row's own snapshot or [served model](../routing/models.md#served-model).
 
 > [!NOTE]
 > A total across a group would be a number no provider ever reported.

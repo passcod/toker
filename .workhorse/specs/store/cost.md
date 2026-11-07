@@ -1,5 +1,5 @@
 ---
-id: COST
+id: SCOST
 ---
 
 # Meters and cost

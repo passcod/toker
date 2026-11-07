@@ -1,5 +1,5 @@
 ---
-id: SMIG
+id: RMIG
 ---
 
 # Migrating routing into the store
@@ -7,19 +7,15 @@ id: SMIG
 Routing was once configuration interpreted per request, and is now a series of revisions in the store.
 This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, and how a file may be read deliberately afterwards.
 
-## The file
+## The routing fields
 
-The configuration file is bootstrap.
-It holds the listener, the store's path, which providers are enabled and where they are reached, where each credential comes from, the header names, and the toggles and styles that are not routing.
-
-None of those is a per-request decision.
-
-Enabling a provider is the one fact policy cannot supply.
+What the configuration file holds is specified by [DCONF](../service/config.md#the-file).
+Enabling a provider stays there, being the one fact policy cannot supply.
 
 > [!NOTE]
 > A revision may route to a provider the configuration has since switched off, and the candidate then answers that it is not configured, rather than the revision failing to load.
 
-A file carrying routing fields MUST still load.
+A file carrying the routing fields of an earlier version MUST still load.
 
 > [!NOTE]
 > A file written by an earlier version has to be readable by a later one.
@@ -69,7 +65,7 @@ The first revision needs matchers, classifiers and bars that authored policy can
 
 Each MUST be marked as generated at compile time, and the compiler MUST refuse every one of them from an authored document.
 
-A revision MUST record its compiler origin, and an edit or a reactivation of a generated revision MUST inherit it, as [RREV](../policy/revisions.md#history-and-reactivation) requires.
+A revision MUST record its compiler origin, and an edit or a reactivation of a generated revision MUST inherit it, as [RREV](revisions.md#history-and-reactivation) requires.
 
 A field no longer written MUST be kept in the document type.
 
@@ -145,4 +141,4 @@ Where a publication adapter has applied rows without recording which identities 
 
 Such a row MUST be returned to pending with a stable detail code, and the next reconciliation MUST adopt, once, only the rows matching the pattern the earlier version used.
 
-Every reconciliation after that MUST work from recorded identities alone, as [RPUB](../policy/publication.md#ownership-is-exact) requires.
+Every reconciliation after that MUST work from recorded identities alone, as [RPUB](publication.md#ownership-is-exact) requires.

@@ -1,12 +1,12 @@
 ---
-id: CANON
+id: WCANON
 ---
 
 # Canonical rendering
 
 Toker parses every inference request into a canonical request and renders the outgoing body from it, rather than forwarding the client's bytes.
 This spec covers what rendering guarantees, which transformations may change a request's meaning, and how a body that cannot cross the canonical boundary is answered.
-Administrative paths keep the client's bytes instead, as [ROUTE](administrative.md) specifies.
+Administrative paths keep the client's bytes instead, as [ROUTE](../routing/overview.md) specifies.
 
 ## Rendering
 
@@ -38,7 +38,7 @@ These are the only transformations that may change a canonical request's meaning
 
 Changing any other position of the body is a defect.
 
-Release markers are specified by [GQUOTA](../gates/quota.md), compaction by [GCOMP](../gates/compaction.md), and model selection by [RSOLV](../policy/resolver.md#shaping-the-model).
+Release markers are specified by [GQUOTA](../gates/quota.md), compaction by [GCOMP](../gates/compaction.md), and model selection by [RSOLV](../routing/resolver.md#shaping-the-model).
 
 Stripping release markers MUST happen on every Messages request regardless of whether the gate is enabled.
 

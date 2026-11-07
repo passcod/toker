@@ -52,7 +52,7 @@ A row recording the sleep lock MUST carry no profile, provider or route.
 
 ## Model identity
 
-A row MUST carry the [requested model](../policy/models.md#requested-model), the [effective model](../policy/models.md#effective-model) and the [served model](../policy/models.md#served-model) separately, together with the pricing-normalised form of the served one.
+A row MUST carry the [requested model](../routing/models.md#requested-model), the [effective model](../routing/models.md#effective-model) and the [served model](../routing/models.md#served-model) separately, together with the pricing-normalised form of the served one.
 
 A response naming no model MUST leave the served model absent.
 Nothing MUST fill it from the effective model.

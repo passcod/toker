@@ -30,12 +30,12 @@ A program that sends inference requests to Toker rather than to a provider.
 ### Frontend profile
 
 A named variant of the API Toker offers clients, selected by a request's `/f/<name>` prefix, shaped to suit one client.
-Defined in [ROUTE](routing/addressing.md#frontend-profiles).
+Defined in [ROUTE](frontend/profiles.md).
 
 ### Protocol
 
 A broad wire shape a request and its response take.
-Defined in [ROUTE](routing/overview.md#protocols).
+Defined in [ROUTE](frontend/overview.md#protocols).
 
 ### Dialect
 
@@ -60,12 +60,12 @@ Defined in [ROUTE](routing/overview.md#bindings).
 ### Route
 
 A binding a request has been resolved onto, together with the model it will be sent as.
-Defined in [ROUTE](routing/addressing.md#resolving-a-route).
+Defined in [ROUTE](routing/resolver.md#a-route).
 
 ### Canonical request
 
 The representation a request is parsed into, from which the outgoing body is rendered.
-Defined in [CANON](routing/canonical.md).
+Defined in [WCANON](wire/canonical.md).
 
 ### Store
 
@@ -80,9 +80,9 @@ Defined in [SLEDGR](store/ledger.md).
 ### Offer
 
 A model a provider serves, as a provider identifier paired with what Toker knows of its window and pricing.
-Defined in [RPUB](policy/publication.md).
+Defined in [RPUB](routing/publication.md).
 
 ### Inventory
 
 The set of offers Toker holds, joined across every provider catalogue it has fetched.
-Defined in [RPUB](policy/publication.md).
+Defined in [RPUB](routing/publication.md).

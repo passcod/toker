@@ -169,7 +169,7 @@ An identity set that has never been recorded MUST NOT be treated as an empty set
 
 > [!NOTE]
 > Treating unknown ownership as none makes the next reconciliation read Toker's earlier rows as the operator's and refuse forever; treating it as everything deletes the operator's rows.
-> Carrying an earlier install across is a migration, which [SMIG](../store/migration.md) specifies.
+> Carrying an earlier install across is a migration, which [RMIG](migration.md) specifies.
 
 An identity set MUST be stored in a canonical order, bounded in size and free of duplicates.
 A set that does not parse that way MUST be a stored-state error rather than an empty set.

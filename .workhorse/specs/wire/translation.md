@@ -1,12 +1,12 @@
 ---
-id: TRANS
+id: WTRANS
 ---
 
 # Translated routes
 
 A translated route carries a request to a provider that speaks a different protocol from the client.
 This spec covers which routes translate, what a translation may and may not depend on, and how a capability the target lacks is resolved.
-The canonical request every translation reads from is specified by [CANON](canonical.md).
+The canonical request every translation reads from is specified by [WCANON](canonical.md).
 
 ## Routes that translate
 
@@ -23,7 +23,7 @@ Every other stage of the request pipeline MUST run before translation, so that t
 A translation MUST read no clock and no stored state.
 A translation MUST take the model identifier and the prompt cache key as inputs rather than resolving them itself.
 
-A translated conversation that only appends MUST reproduce its earlier upstream bytes exactly, as [CANON](canonical.md#rendering) requires of any rendering.
+A translated conversation that only appends MUST reproduce its earlier upstream bytes exactly, as [WCANON](canonical.md#rendering) requires of any rendering.
 
 The first turn an existing conversation sends over a translated route rebuilds the upstream's cache once.
 
@@ -40,7 +40,7 @@ Where the target binding declares a semantic unsupported, the translation MUST r
 | sampling parameters | drop them |
 | another provider's reasoning blocks | drop them |
 
-Which semantics a binding can represent is declared by the binding, as [ROUTE](overview.md#bindings) specifies.
+Which semantics a binding can represent is declared by the binding, as [ROUTE](../routing/overview.md#bindings) specifies.
 
 ## Opaque replay
 

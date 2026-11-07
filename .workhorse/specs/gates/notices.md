@@ -49,7 +49,7 @@ The quota notice MAY name the overage marker while the blocked meter's plan stil
 
 ## Styles
 
-A request's frontend profile selects its notice style, as [ROUTE](../routing/addressing.md#frontend-profiles) specifies.
+A request's frontend profile selects its notice style, as [ROUTE](../frontend/profiles.md) specifies.
 
 | style | rendering |
 | --- | --- |

@@ -1,5 +1,5 @@
 ---
-id: ADMIN
+id: FADMIN
 ---
 
 # Administrative paths
@@ -14,7 +14,7 @@ A `/v1/models` response MUST be projected from the active policy and the offer i
 Each model listed MUST have a complete route to the profile that asked for it.
 Where no usable catalogue has been loaded, or a presented offer is absent from the inventory, the endpoint MUST answer 503 rather than an empty list.
 
-What each protocol's listing contains is specified by [RPUB](../policy/publication.md).
+What each protocol's listing contains is specified by [RPUB](../routing/publication.md).
 
 ## Token counting and batches
 

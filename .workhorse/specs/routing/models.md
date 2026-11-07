@@ -124,7 +124,7 @@ Idleness MUST be keyed on the model.
 > Keying on the tool set looked workable, since the tool list opens the prompt, but a client changes tools mid-conversation and the cache survives.
 
 A compaction MUST NOT be upgraded by this election.
-It has its own retarget, which [GCOMP](../gates/compaction.md#choosing-the-target) specifies.
+It has its own retarget, which [GCOMP](../routing/compaction.md#choosing-the-target) specifies.
 
 ### The recency record
 

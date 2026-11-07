@@ -12,12 +12,24 @@ What happens when a candidate fails after its request was sent is specified by [
 The resolver MUST be pure.
 It MUST read no clock, no store, no provider and no request body, taking the present moment as one of its inputs, so that the control surface can run the same function the request path does.
 
+## A route
+
+A route is a binding a request has been resolved onto, together with the model it will be sent as.
+
+A resolved route MUST keep the provider, the binding, the model the client requested and the model that will be sent distinct from one another.
+
 ## Facts in
 
 The facts the resolver receives MUST be content-free: the profile and protocol, the requested model, the lane key, an upper bound on the prompt size, message and tool counts, the capabilities the request needs, a binding affinity, the request's class, and the present moment.
 
 A request carrying provider-owned state, such as signed or redacted thinking or a provider's encrypted reasoning, MUST set a binding affinity, because only the binding that produced that state can replay it.
 Such a request on a lane with no pin MUST be refused.
+
+## Provider prefixes
+
+Where a model identifier carries a provider prefix that policy recognises, the request MUST resolve to that provider.
+A prefixed identifier naming a disabled provider MUST be answered as having no available route, and MUST NOT be sent to a default binding with the prefix still attached.
+A prefix policy does not recognise MUST be treated as part of the provider's own model identifier and MUST be left intact.
 
 ## Lookup order
 
@@ -27,7 +39,7 @@ The first of these to match MUST decide the route.
 2. a rewrite, for the profile, then for the protocol, in ascending priority
 3. the profile's default, then the protocol's default
 
-A compaction on a lane proven cold, under a policy naming a route for compactions, MUST resolve to that route instead, as [GCOMP](../gates/compaction.md#choosing-the-target) specifies.
+A compaction on a lane proven cold, under a policy naming a route for compactions, MUST resolve to that route instead, as [GCOMP](../routing/compaction.md#choosing-the-target) specifies.
 
 A request carrying no model MUST resolve only through a default, MUST take that route's first candidate with no model, upgrade, alias or fallback, and MUST refuse a request that does carry a model.
 
@@ -79,10 +91,17 @@ The plan MUST keep every stage distinctly, together with whether the client's ow
 
 ## When nothing serves
 
-A route with no surviving candidate MUST be answered as having no available route, carrying the trace.
-A revision with no default for the protocol MUST be answered as not configured, since no binding was ever a candidate.
+Each of these MUST produce an error in the shape of the protocol the client spoke, and MUST write a route-unavailable row to the ledger.
 
-Both MUST leave a route-unavailable row, as [ROUTE](../routing/addressing.md#when-no-route-is-available) specifies.
+| condition | status | row |
+| --- | --- | --- |
+| no binding is presented, rewritten or defaulted to for this protocol | a not-configured error carrying the `x-toker-not-configured` header | carries no route |
+| the lane's pin refuses the move to the resolved route | 502 | names the route refused |
+| every candidate is unavailable, through an absent provider block, a missing credential or an open circuit | 503 | carries the trace of what was tried |
+
+A request answered in any of these ways MUST NOT reach an upstream.
+
+A path the route table does not match MUST be forwarded to the binding its protocol's default route names first, without a model being resolved, rewritten or upgraded.
 
 ## Resolving a single candidate
 

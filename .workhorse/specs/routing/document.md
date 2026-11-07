@@ -24,7 +24,7 @@ A policy holds eight collections.
 | compaction | where a cold compaction goes |
 | description | free text |
 
-A collection scoped to a frontend follows the precedence [RPOL](overview.md#frontend-scope) specifies, and names a binding as [RPOL](overview.md#naming-a-binding) specifies.
+A collection scoped to a frontend follows the precedence [ROUTE](overview.md#frontend-scope) specifies, and names a binding as [ROUTE](overview.md#naming-a-binding) specifies.
 
 ## Parsing
 

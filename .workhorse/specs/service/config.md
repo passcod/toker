@@ -8,7 +8,7 @@ Toker reads a configuration file for what it needs before it can reach its store
 This spec covers what the file holds, where a credential may live, and which directories the service may write.
 
 Routing is not configuration.
-It lives in the store as policy revisions, as [RREV](../policy/revisions.md) specifies, and how a machine's routing moved there is specified by [SMIG](../store/migration.md).
+It lives in the store as policy revisions, as [RREV](../routing/revisions.md) specifies, and how a machine's routing moved there is specified by [RMIG](../routing/migration.md).
 
 ## The file
 
@@ -28,7 +28,7 @@ A provider MUST be enabled by the presence of its block and disabled by its abse
 
 The file MUST be parsed strictly, refusing a value it does not recognise rather than ignoring it.
 
-A notice style naming a profile outside the permitted character set MUST be refused when the file is read, as [ROUTE](../routing/addressing.md#frontend-profiles) requires.
+A notice style naming a profile outside the permitted character set MUST be refused when the file is read, as [ROUTE](../frontend/profiles.md) requires.
 
 Where a setting may also be given by environment variable, naming both MUST be a configuration error rather than a silent precedence.
 
@@ -42,7 +42,7 @@ Toker MUST report which source supplies a credential and MUST NOT report its val
 
 A debug rendering of a credential-bearing value MUST redact it.
 
-Which credential reaches which provider is specified by [ROUTE](../routing/credentials.md).
+Which credential reaches which provider is specified by [ROUTE](../routing/overview.md).
 
 ## State
 

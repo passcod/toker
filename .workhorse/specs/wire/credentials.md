@@ -1,5 +1,5 @@
 ---
-id: CRED
+id: WCRED
 ---
 
 # Credentials on the wire

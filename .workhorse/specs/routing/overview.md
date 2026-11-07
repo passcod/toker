@@ -4,29 +4,13 @@ id: ROUTE
 
 # Routing
 
-Toker serves several protocols on one loopback port and forwards each request to one of several configured providers.
-This spec covers the topology a request is resolved onto: the protocols it may speak, the providers it may reach, and the bindings between them.
+Routing decides which provider serves a request and on which model.
+This spec covers the topology every routing decision is made over, and the terms the rest of the family shares.
 
-How a request names where it is going is specified by [ADDR](addressing.md), and which binding and model it takes by [RSOLV](../policy/resolver.md).
+The protocols a client speaks are specified by [FRONT](../frontend/overview.md), and the document that decides a route by [RDOC](document.md).
 
-## Protocols
-
-A protocol is a broad wire shape.
-Toker MUST serve these three protocols:
-
-| protocol | paths |
-| --- | --- |
-| `anthropic` | `/v1/messages`, `/v1/messages/count_tokens`, `/v1/messages/batches` and below |
-| `openai_chat` | `/v1/chat/completions`, `/v1/models` |
-| `openai_responses` | `/v1/responses`, `/v1/models` |
-
-No two protocols claim the same inference path, so one listener serves them all.
-
-Toker MUST determine an inference request's protocol from its path alone.
-Where a path is claimed by more than one protocol, as `/v1/models` is, Toker MUST determine the protocol from the frontend profile instead.
-
-The `/_toker/` namespace is not a protocol and MUST NOT leave the proxy.
-Its endpoints are specified by [DCTRL](../service/control.md).
+There MUST be no router other than the active revision of the routing policy.
+A change to the policy MUST reach live traffic by activation, without restarting the service.
 
 ## Providers
 
@@ -83,3 +67,25 @@ The set of bindings is fixed topology and MUST NOT depend on configuration or on
 A capability MUST be read from the binding that will serve the request.
 A frontend MUST NOT decide at parse time which semantics a provider will refuse.
 
+
+## Frontend scope
+
+A frontend scope is a protocol, or a frontend profile together with a protocol.
+
+A profile entry MUST take precedence over a protocol entry of the same kind.
+
+## Naming a binding
+
+A binding is named by its provider and dialect together.
+
+Renaming one MUST be treated as a migration rather than a change of display.
+
+## The compiled policy
+
+Compilation closes a validated document against the route topology and one immutable offer inventory, and the result MUST be immutable.
+
+A document MUST NOT carry an inventory winner.
+A winner MUST be looked up when the policy is compiled, for a presentation, or when a request is resolved, for a candidate selector.
+
+> [!NOTE]
+> The same revision then follows the catalogue instead of freezing a model list at the moment it was authored.

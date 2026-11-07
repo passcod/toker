@@ -38,37 +38,33 @@ Four destinations, decided per sentence rather than per file:
 
 ```
 .workhorse/specs/
-├── overview.md          notation, external documents, terminology
-├── security.md          the properties, each naming its upholding mechanism
-├── routing/
-│   ├── overview.md      protocols, providers, dialects, bindings
-│   ├── addressing.md    profiles, the /f/ prefix, model prefixes, no route
-│   ├── credentials.md   what is kept, removed and added on the wire
-│   ├── cost.md          meters per provider, and the cost kinds
-│   ├── administrative.md  model listings, token counting, batches
-│   ├── canonical.md     canonical rendering, what may alter a body
-│   └── translation.md   Messages <-> Responses, purity, prefix stability
-├── gates/
-│   ├── overview.md      what may stop a request, and what feeds a gate
-│   └── quota.md, cold.md, notices.md, compaction.md, forecasting.md, pinging.md
-├── policy/
-│   ├── overview.md      frontend scope, binding naming, the compiled policy
-│   ├── document.md      the collections, parsing, fingerprints, validity
-│   ├── revisions.md     draft, preview, activation, history, refresh
-│   ├── resolver.md      facts, lookup, the route walk, circuits
-│   ├── fallback.md      which failures fall back, and commitment
-│   ├── provenance.md    what a policy-routed row records
-│   └── models.md, publication.md
-├── store/
-│   ├── overview.md      what the store holds, migrations, absent values
-│   ├── ledger.md        row kinds, fields, eras, imported rows
-│   └── lanes.md, attempts.md, lineage.md, migration.md
-├── service/
-│   └── lifecycle.md, config.md, control.md
-├── cli/
-│   └── commands.md, setup.md, readers.md
-└── tui/
-    └── dashboard.md
+├── overview.md          TOK     notation, external documents, terminology
+├── security.md          SEC     the properties, each naming its mechanism
+├── frontend/                    what Toker exposes to clients
+│   ├── overview.md      FRONT   the protocols and their paths
+│   ├── profiles.md      FPROF   profiles and the /f/ prefix
+│   └── administrative.md FADMIN model listings, token counting, batches
+├── wire/                        what goes out to a provider and comes back
+│   ├── canonical.md     WCANON  rendering, the licensed transformations
+│   ├── translation.md   WTRANS  Messages <-> Responses, purity
+│   └── credentials.md   WCRED   what is kept, removed and added
+├── routing/                     which provider serves a request, on which model
+│   ├── overview.md      ROUTE   providers, dialects, bindings, scope
+│   ├── document.md      RDOC    the collections, parsing, validity
+│   ├── revisions.md     RREV    draft, activation, history
+│   ├── resolver.md      RSOLV   a route, prefixes, lookup, the walk
+│   ├── fallback.md      RFALL   which failures fall back, commitment
+│   ├── pins.md          RPIN    revision selection, transition consent
+│   ├── compaction.md    RCOMP   where a cold compaction is sent
+│   ├── models.md        RMODEL  learning, election, upgrades
+│   ├── publication.md   RPUB    what a profile is shown
+│   ├── provenance.md    RPROV   what a routed row records
+│   └── migration.md     RMIG    routing moving from the file into the store
+├── gates/               G       quota, cold, notices, compaction detection,
+│                                forecasting, pinging
+├── store/               S       ledger, lanes, attempts, lineage, cost
+├── service/             D       lifecycle, config, control
+└── cli/ tui/            U       commands, setup, readers, dashboard
 ```
 
 ### Root spec
@@ -292,6 +288,156 @@ The repo is currently lowercase throughout, so the sweep covers README.md (8
 mentions), AGENTS.md (20), the module doc comments, and any TUI display string.
 Binary names and paths in code, such as `reexec.rs`'s `toker` and `toker.new`,
 stay as they are.
+
+## House rules settled in review
+
+Each was a correction to one sentence that turned out to be a rule about a
+class of them, and was swept across the corpus.
+
+### Requirements bind the system, not the reader
+
+A requirement that the reader not misunderstand something is not a
+requirement. "A row carries three model identities, and they MUST NOT be
+conflated" names no actor and constrains no behaviour: the terms belong in a
+glossary and the rules about which may be read for what carry the force. The
+same sentence appeared in `GCOLD` about its two clocks and in the routing specs
+about cost kinds, where it also duplicated a claim the ledger owns.
+
+Distinguish it from a genuine default, which looks similar: "a binding with no
+cache domain MUST NOT be treated as uncached" tells an implementation what to
+do with a missing value.
+
+### A heading is a noun phrase
+
+A heading names its section's subject. It is not a question the section
+answers, and not a stand-in for the subject's name.
+
+`## What is learned` became `## Learned evidence`, fourteen headings in all.
+Then the interrogatives, which are the same defect in a different word:
+`## Which identity is authoritative` became `## Identity authority`, and nine
+more followed. "Which" with its noun is not exempt; the test is whether the
+heading is a question.
+
+Renaming exposes positional references. A question-shaped heading invites prose
+that points at it by position ("the first question above"), which loses its
+antecedent once the heading is a noun, and naming the thing is better prose
+anyway.
+
+Still clauses rather than noun phrases, and not yet converted: the conditional
+scope headings (`## When a window has restarted`) and the declarative
+assertions (`## A notice is byte-stable`).
+
+### Do not refute an objection nobody had
+
+A note that raises a concern only to deny it plants the concern. If the note
+has to introduce the idea in order to reject it, the idea was not there.
+
+The test: would a reader have had this thought before reading the note? A note
+naming a failure a re-implementer would actually hit is doing its job; one
+answering an interpretation only the note proposes is not. The fix is the
+positive statement, which is usually shorter and often normative. "A
+candidate's alias target is an opaque destination rather than evidence of
+capability or price" became "A candidate's alias target is an opaque
+identifier", in the body rather than a note.
+
+Five went this way, including a note calling a behaviour "not a defect", one
+calling a verdict "a measurement, not an absence of one", and one in `DLIFE`
+that raised the operator's browser to justify binding loopback. The browser
+belongs to the control spec, where it is the threat the gate exists for; the
+real reason loopback matters is that Toker signs with credentials it holds.
+
+This is the inverse of the note test already recorded. That one asks whether a
+note prevents a wrong build; this one asks whether anyone would have built it.
+
+There is no lexical tell for it. Scanning for notes whose vocabulary is foreign
+to their requirement flags nearly every good note, because a note that earns
+its place is precisely one introducing a mechanism the requirement does not
+state.
+
+### Do not legislate someone else's API
+
+A spec may state how Toker behaves. It may not state how a third party's API
+behaves, beyond what has been verified against the providers Toker serves.
+
+"An upstream charges a cached read only where the bytes it holds match the
+request's prefix exactly" is accurate for two providers and is not a property
+of prompt caching in general. Four cache-keying claims were scoped this way,
+and one was better grounded in Toker's own `cache identity` than in any
+provider's behaviour. Claims already hedged with "may" were left: they lean
+toward giving the provider more latitude, which costs nothing.
+
+The shape reaches past providers, to clients and to terminals.
+
+### Glossaries are scoped
+
+A spec defines the terms it owns, in its own `## Terminology` section. The root
+glossary is not the only one, and a term whose subject is one spec's belongs
+there rather than at the root, where a reader meets it away from the rules that
+use it. Another spec links a term by its anchor on first use.
+
+`RMODEL` defines requested, effective and served model. Three specs had drifted
+to "reported" and "sent" for two of them, which only the move surfaced:
+distance from the usage is what lets usage drift.
+
+### The store is not the ledger
+
+The **store** is the SQLite database. The **ledger** is the append-only record
+of requests inside it. The store also holds the lanes, the policy revisions,
+the learned models, the allowances, the ping runs and the meter snapshots, and
+none of that is the ledger.
+
+The repo conflates the two, AGENTS.md included, and the first draft inherited
+it: policy revisions were described as living "in the ledger", which would mean
+appending a routing document to the record of requests. Around twenty sites
+were corrected. The folder became `store/` and `schema.md` became `ledger.md`,
+so the structure states the relationship.
+
+### An overview carries little
+
+An `overview.md` holds what is cross-cutting and nothing a sibling could own.
+A folder with more than three siblings needs one.
+
+`gates/` and `store/` had none, so their material sat in a sibling: the store's
+own description was inside the ledger spec, and four specs each restated that
+only a gate may stop a session because there was nowhere for the claim to live.
+A missing overview is not just absent orientation; it forces a
+one-home-per-claim violation across the family.
+
+The routing overview had the opposite problem at 349 lines, carrying the
+document, the lifecycle, the resolver, fallback and provenance. Split, it keeps
+the topology and the shared terms. The signal that it worked: nothing links to
+it any more, because every cross-reference found a more specific home.
+
+Splitting reliably produces wrapper sections, where a spec repeats its own
+title as a heading. That is an artefact of lifting a section out of a parent,
+where the heading did real work.
+
+### Routing had no home, so it leaked
+
+The first pass made routing unprefixed, reasoning that toker is a proxy so a
+proxy prefix says nothing. Wrong twice: routing is a core part of Toker and not
+the whole of it, and treating it as the whole meant everything near it got
+swept in.
+
+The audit found routing in two folders, with five non-routing specs in one of
+them. The policy family was routing, prefixed `R` for routing policy from the
+start. And `routing/` held cost, credentials, the administrative paths,
+canonical rendering and translation, none of which decides where a request
+goes.
+
+It had leaked outward too. `SLANE` carried revision selection and the
+transition decision because the pin is stored on the lane. The migration spec
+carried the first revision and ownership because it lives in the store.
+`GCOMP` carried retargeting because the gate proves the lane cold. Each put a
+routing decision in the spec that happens to hold its data.
+
+Three subjects got their own areas. `routing/` is the decisions, `R` prefixed.
+`frontend/` is what Toker exposes: the protocols, the profiles and the `/f/`
+prefix, the administrative paths. `wire/` is what goes out and comes back:
+rendering, translation, credentials. Cost went to the store as accounting.
+
+The test that stuck: a spec holds the subject it owns, not the subject whose
+data it stores.
 
 ## Rollout
 

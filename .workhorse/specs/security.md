@@ -24,7 +24,7 @@ A label a display reads from a client's own files MUST be read when the display 
 
 An import MUST report the names of fields it did not map and MUST NOT report their values, as [SLEDGR](store/ledger.md#imported-rows) specifies.
 
-A routing diagnostic's path MUST be built only from static field names and bounded indices, as [RDOC](policy/document.md#validation) specifies, so that a request or a model string cannot appear in one.
+A routing diagnostic's path MUST be built only from static field names and bounded indices, as [RDOC](routing/document.md#validation) specifies, so that a request or a model string cannot appear in one.
 
 An export MUST carry nothing that is not a ledger column, as [UREAD](cli/readers.md#export) specifies.
 
@@ -38,7 +38,7 @@ Toker MUST report which source supplies a credential and MUST NOT report the val
 
 A debug rendering of a credential-bearing value MUST redact it, as [DCONF](service/config.md#credentials) specifies.
 
-Toker MUST read request headers by name and MUST NOT capture them wholesale, as [ROUTE](routing/credentials.md) specifies.
+Toker MUST read request headers by name and MUST NOT capture them wholesale, as [ROUTE](routing/overview.md) specifies.
 
 > [!NOTE]
 > Headers carry the client's bearer, so a wholesale capture puts it wherever the capture goes.
@@ -47,7 +47,7 @@ A credential Toker holds MUST live in the operating system's keyring, in an envi
 
 ## A credential reaches only the party it was meant for
 
-A credential a client supplied for one provider MUST be removed before the request reaches a different one, as [ROUTE](routing/credentials.md) specifies.
+A credential a client supplied for one provider MUST be removed before the request reaches a different one, as [ROUTE](routing/overview.md) specifies.
 
 A provider that signs its own requests MUST strip whatever the client sent first.
 
