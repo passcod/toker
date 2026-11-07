@@ -42,10 +42,10 @@ Each phase compiles and keeps the suite green.
 
 ### 4. Live edits
 
-- [ ] Server holds the config behind a swap, as `PolicyRuntime` holds the active revision
-- [ ] `config snapshot`, `config edit`, `config credential` control operations
-- [ ] Edit-time validation: refuse the value, leave the row as it was
-- [ ] A stored setting that cannot be used disables what it describes and never stops a start
+- [x] Server holds the config behind a swap, as `PolicyRuntime` holds the active revision
+- [x] `config snapshot`, `config edit`, `config credential` control operations
+- [x] Edit-time validation: refuse the value, leave the row as it was
+- [x] A stored setting that cannot be used disables what it describes and never stops a start
 
 ### 5. Setup
 

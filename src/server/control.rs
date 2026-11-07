@@ -27,6 +27,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+pub(super) mod config;
 pub(crate) mod derived;
 pub(super) mod routing;
 
@@ -56,7 +57,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
     };
     // Enabled backends only: an absent block is a disabled backend, with
     // nothing to report.
-    let config = &server.config;
+    let config = &server.config();
     let mut providers = serde_json::Map::new();
     if let Some(sub) = &config.anthropic_sub {
         let sources = sub.oauth_sources();

@@ -518,8 +518,8 @@ fn measurement_row(
         // The armed state of each gate rides every row, because readers
         // cannot see the service's config (a `?` row would be a gate that
         // may simply have been off).
-        gate_on: Some(ctx.server.config.gates.quota_enabled),
-        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        gate_on: Some(ctx.server.config().gates.quota_enabled),
+        cold_on: Some(ctx.server.config().gates.cold_enabled),
         // The adaptive rewrite's provenance, independent from host
         // mapping. The predecessor recorded `forcedTo` only when the host
         // map also
@@ -652,8 +652,8 @@ fn error_row(
         system_change: None,
         system_ladder: None,
         system_tail: None,
-        gate_on: Some(ctx.server.config.gates.quota_enabled),
-        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        gate_on: Some(ctx.server.config().gates.quota_enabled),
+        cold_on: Some(ctx.server.config().gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,
@@ -715,7 +715,7 @@ pub(crate) fn record_anthropic_released(
         release,
         grant,
         stale_meters,
-        &server.config.gates,
+        &server.config().gates,
         now_ms(),
     );
     row.frontend = Some(frontend_protocol.to_owned());
@@ -838,7 +838,7 @@ pub(crate) fn record_quota_blocked(record: QuotaBlockedRecord<'_>) {
         // A block proves the quota gate was armed; the cold gate's state
         // is the config at request time, like every other row.
         gate_on: Some(true),
-        cold_on: Some(record.server.config.gates.cold_enabled),
+        cold_on: Some(record.server.config().gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,
@@ -1328,8 +1328,8 @@ pub(crate) fn record_responses_measurement(
         system_change: None,
         system_ladder: shape.and_then(|s| ladder_json(&s.system_ladder)),
         system_tail: shape.and_then(|s| ladder_json(&s.system_tail)),
-        gate_on: Some(ctx.server.config.gates.quota_enabled),
-        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        gate_on: Some(ctx.server.config().gates.quota_enabled),
+        cold_on: Some(ctx.server.config().gates.cold_enabled),
         forced_from: ctx.forced_from.clone(),
         forced_to: ctx.forced_to.clone(),
         downgraded_from: ctx.downgraded_from.clone(),
@@ -1479,8 +1479,8 @@ pub(crate) fn record_codex_error(
         system_change: None,
         system_ladder: None,
         system_tail: None,
-        gate_on: Some(ctx.server.config.gates.quota_enabled),
-        cold_on: Some(ctx.server.config.gates.cold_enabled),
+        gate_on: Some(ctx.server.config().gates.quota_enabled),
+        cold_on: Some(ctx.server.config().gates.cold_enabled),
         forced_from: None,
         forced_to: None,
         downgraded_from: None,

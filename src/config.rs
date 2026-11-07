@@ -731,12 +731,25 @@ impl Config {
     /// defaults, and generates revision one from the enabled providers
     /// alone, which is what a fresh machine should get.
     pub fn from_store(store: &crate::store::Store) -> anyhow::Result<Config> {
-        Self::from_configuration(&store.load_configuration()?, &ProcessEnvironment)
+        Self::from_configuration(
+            &store.load_configuration()?,
+            &ProcessEnvironment,
+            Strictness::Degrade,
+        )
+    }
+
+    /// Resolve rows that are not (yet) in the store. The control surface
+    /// resolves a candidate this way before writing it, so a value it
+    /// cannot use is refused with the stored one left as it was
+    /// (spec: DCONF#editing).
+    pub(crate) fn resolve(configuration: &crate::store::Configuration) -> anyhow::Result<Config> {
+        Self::from_configuration(configuration, &ProcessEnvironment, Strictness::Refuse)
     }
 
     fn from_configuration(
         configuration: &crate::store::Configuration,
         environment: &impl Environment,
+        strictness: Strictness,
     ) -> anyhow::Result<Config> {
         let row = |name: &str| {
             configuration
@@ -761,7 +774,8 @@ impl Config {
                     picker: None,
                 })
             })
-            .transpose()?;
+            .transpose();
+        let openrouter = strictness.usable("openrouter", openrouter)?;
         let openai_api = row("openai_api")
             .map(|row| -> anyhow::Result<OpenAiApiConfig> {
                 Ok(OpenAiApiConfig {
@@ -774,7 +788,8 @@ impl Config {
                     api_key: row.cred_literal.clone(),
                 })
             })
-            .transpose()?;
+            .transpose();
+        let openai_api = strictness.usable("openai_api", openai_api)?;
         let anthropic_sub = row("anthropic_sub")
             .map(|row| -> anyhow::Result<AnthropicSubConfig> {
                 Ok(AnthropicSubConfig {
@@ -789,7 +804,8 @@ impl Config {
                     claude_credentials_path: Some(default_claude_credentials_path()),
                 })
             })
-            .transpose()?;
+            .transpose();
+        let anthropic_sub = strictness.usable("anthropic_sub", anthropic_sub)?;
         let anthropic_api = row("anthropic_api")
             .map(|row| -> anyhow::Result<AnthropicApiConfig> {
                 Ok(AnthropicApiConfig {
@@ -803,7 +819,8 @@ impl Config {
                     api_key: row.cred_literal.clone(),
                 })
             })
-            .transpose()?;
+            .transpose();
+        let anthropic_api = strictness.usable("anthropic_api", anthropic_api)?;
         let codex_sub = row("codex_sub")
             .map(|row| -> anyhow::Result<CodexSubConfig> {
                 Ok(CodexSubConfig {
@@ -820,19 +837,25 @@ impl Config {
                     version_probe: row.version_probe.unwrap_or(true),
                 })
             })
-            .transpose()?;
+            .transpose();
+        let codex_sub = strictness.usable("codex_sub", codex_sub)?;
 
         let settings = &configuration.settings;
         let mut notices = NoticesConfig::default();
-        if let Some(style) = &settings.notice_default {
-            notices.default = parse_notice_style(style)?;
+        if let Some(style) = &settings.notice_default
+            && let Some(style) =
+                strictness.usable("notices", parse_notice_style(style).map(Some))?
+        {
+            notices.default = style;
         }
         if !configuration.notices.is_empty() {
             notices.frontends.clear();
             for (profile, style) in &configuration.notices {
-                notices
-                    .frontends
-                    .insert(profile.clone(), parse_notice_style(style)?);
+                if let Some(style) =
+                    strictness.usable("notices", parse_notice_style(style).map(Some))?
+                {
+                    notices.frontends.insert(profile.clone(), style);
+                }
             }
         }
 
@@ -1079,7 +1102,11 @@ impl Config {
         let db_path = resolve_db_path(&environment)?;
         let store = crate::store::Store::open(&db_path)
             .with_context(|| format!("opening the store at {}", db_path.display()))?;
-        let config = Self::from_configuration(&store.load_configuration()?, &environment)?;
+        let config = Self::from_configuration(
+            &store.load_configuration()?,
+            &environment,
+            Strictness::Degrade,
+        )?;
         config.validate_retained()?;
         Ok(config)
     }
@@ -1595,6 +1622,44 @@ fn resolve_notices(
 /// enabled ones. Several enabled backends and no way to choose leaves it
 /// unset, and [`Config::validate`] refuses that rather than guess: bare
 /// model names would otherwise route somewhere the operator never picked.
+/// What to do with a stored value that cannot be used.
+///
+/// A load degrades and an edit refuses. Strictness sits at the edit because
+/// that is where there is someone to tell: the dashboard reaches
+/// configuration through the service, so a service that refused to start over
+/// a row would leave no way to correct that row
+/// (spec: DCONF#configuration-never-refuses-a-start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strictness {
+    /// Refuse the whole configuration, naming what could not be used.
+    Refuse,
+    /// Disable only what the value describes, and say so in the log.
+    Degrade,
+}
+
+impl Strictness {
+    fn usable<T>(
+        self,
+        setting: &str,
+        resolved: anyhow::Result<Option<T>>,
+    ) -> anyhow::Result<Option<T>> {
+        match resolved {
+            Ok(value) => Ok(value),
+            Err(error) if self == Strictness::Refuse => {
+                Err(error.context(format!("the {setting} setting")))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    setting,
+                    "stored configuration cannot be used: leaving it off"
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
 /// The notice style a stored name spells. The store's own CHECK admits only
 /// these, so a failure here is a row written around it.
 fn parse_notice_style(name: &str) -> anyhow::Result<NoticeStyle> {
@@ -2040,9 +2105,12 @@ mod tests {
         let from_file = super::Config::load_from(&path).expect("the file loads");
 
         let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
-        let from_rows =
-            super::Config::from_configuration(&from_file.to_configuration(), &environment)
-                .expect("the rows resolve");
+        let from_rows = super::Config::from_configuration(
+            &from_file.to_configuration(),
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect("the rows resolve");
         (from_file, from_rows)
     }
 
@@ -2178,8 +2246,12 @@ cold_idle_min = 7.5
     #[test]
     fn an_empty_store_is_every_default_with_nothing_enabled() {
         let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
-        let config = super::Config::from_configuration(&Default::default(), &environment)
-            .expect("resolve an empty configuration");
+        let config = super::Config::from_configuration(
+            &Default::default(),
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect("resolve an empty configuration");
 
         assert_eq!(config.port, DEFAULT_PORT);
         assert!(config.openrouter.is_none());
@@ -2205,6 +2277,7 @@ cold_idle_min = 7.5
         let config = super::Config::from_configuration(
             &configured(vec![off], Default::default()),
             &environment,
+            super::Strictness::Refuse,
         )
         .expect("resolve");
         assert!(config.openrouter.is_none(), "a row saying off is off");
@@ -2223,6 +2296,7 @@ cold_idle_min = 7.5
         let config = super::Config::from_configuration(
             &configured(vec![row], Default::default()),
             &environment,
+            super::Strictness::Refuse,
         )
         .expect("resolve");
 
@@ -2239,6 +2313,7 @@ cold_idle_min = 7.5
         let config = super::Config::from_configuration(
             &configured(vec![enabled("openrouter")], Default::default()),
             &environment,
+            super::Strictness::Refuse,
         )
         .expect("resolve");
 
@@ -2255,9 +2330,13 @@ cold_idle_min = 7.5
     fn the_port_is_the_default_until_port_names_another() {
         let base = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
         assert_eq!(
-            super::Config::from_configuration(&Default::default(), &base)
-                .expect("resolve")
-                .port,
+            super::Config::from_configuration(
+                &Default::default(),
+                &base,
+                super::Strictness::Refuse
+            )
+            .expect("resolve")
+            .port,
             DEFAULT_PORT
         );
 
@@ -2265,9 +2344,13 @@ cold_idle_min = 7.5
             .with("TOKER_DB", "/tmp/toker-test.db")
             .with("PORT", "19999");
         assert_eq!(
-            super::Config::from_configuration(&Default::default(), &overridden)
-                .expect("resolve")
-                .port,
+            super::Config::from_configuration(
+                &Default::default(),
+                &overridden,
+                super::Strictness::Refuse,
+            )
+            .expect("resolve")
+            .port,
             19_999
         );
     }
@@ -2277,16 +2360,24 @@ cold_idle_min = 7.5
         let environment = TestEnvironment::default()
             .with("TOKER_DB", "/tmp/toker-test.db")
             .with("PORT", "http");
-        let error = super::Config::from_configuration(&Default::default(), &environment)
-            .expect_err("a mistyped PORT must not silently read as the default");
+        let error = super::Config::from_configuration(
+            &Default::default(),
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect_err("a mistyped PORT must not silently read as the default");
         assert!(format!("{error:#}").contains("PORT"), "{error:#}");
     }
 
     #[test]
     fn toker_db_names_the_store() {
         let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/elsewhere/toker.db");
-        let config =
-            super::Config::from_configuration(&Default::default(), &environment).expect("resolve");
+        let config = super::Config::from_configuration(
+            &Default::default(),
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect("resolve");
         assert_eq!(config.db_path, PathBuf::from("/tmp/elsewhere/toker.db"));
     }
 
@@ -2303,8 +2394,12 @@ cold_idle_min = 7.5
                 .collect(),
             ..Default::default()
         };
-        let config =
-            super::Config::from_configuration(&configuration, &environment).expect("resolve");
+        let config = super::Config::from_configuration(
+            &configuration,
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect("resolve");
 
         assert_eq!(config.notices.default, NoticeStyle::Plain);
         assert_eq!(
@@ -2317,6 +2412,58 @@ cold_idle_min = 7.5
     }
 
     #[test]
+    fn a_stored_value_that_cannot_be_used_disables_only_what_it_describes() {
+        let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
+        let broken = crate::store::ProviderConfigRow {
+            upstream: Some("not a url at all".to_owned()),
+            ..enabled("openrouter")
+        };
+        let configuration = configured(vec![broken, enabled("anthropic_sub")], Default::default());
+
+        // Loading degrades: the dashboard reaches configuration through the
+        // service, so refusing to start would leave no way to fix the row.
+        let config = super::Config::from_configuration(
+            &configuration,
+            &environment,
+            super::Strictness::Degrade,
+        )
+        .expect("a bad row must not stop the service starting");
+        assert!(config.openrouter.is_none(), "only the bad provider is off");
+        assert!(config.anthropic_sub.is_some(), "its neighbour is untouched");
+
+        // Editing refuses, because that is where there is someone to tell.
+        let error = super::Config::from_configuration(
+            &configuration,
+            &environment,
+            super::Strictness::Refuse,
+        )
+        .expect_err("an edit naming it must be refused");
+        assert!(format!("{error:#}").contains("openrouter"), "{error:#}");
+    }
+
+    #[test]
+    fn a_stored_notice_style_that_cannot_be_used_falls_back_rather_than_stopping_the_start() {
+        let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
+        let configuration = crate::store::Configuration {
+            settings: crate::store::SettingsConfigRow {
+                notice_default: Some("sparkle".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = super::Config::from_configuration(
+            &configuration,
+            &environment,
+            super::Strictness::Degrade,
+        )
+        .expect("loads");
+        assert_eq!(
+            config.notices.default,
+            super::NoticesConfig::default().default
+        );
+    }
+
+    #[test]
     fn the_routing_fields_are_empty_on_a_store_loaded_config() {
         let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
         let config = super::Config::from_configuration(
@@ -2325,6 +2472,7 @@ cold_idle_min = 7.5
                 Default::default(),
             ),
             &environment,
+            super::Strictness::Refuse,
         )
         .expect("resolve");
 

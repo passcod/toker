@@ -92,8 +92,8 @@ pub(crate) async fn responses(State(server): State<Server>, request: Request) ->
         }
     };
     let in_flight = Some(server.begin_in_flight());
-    let header_session = session_id(&server.config.session_header_names, &parts.headers);
-    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    let header_session = session_id(&server.config().session_header_names, &parts.headers);
+    let ping = lanes::is_ping(&parts.headers, &server.config().ping_header_name);
     let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
     let thread_id = parts
         .headers

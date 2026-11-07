@@ -19,9 +19,9 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Configuration never refuses a start
 
-- [ ] A provider whose credential does not resolve is treated as not configured, and a request reaching it is answered as such (verifies spec: DCONF)
+- [x] A provider whose credential does not resolve is treated as not configured, and a request reaching it is answered as such (verifies spec: DCONF)
 - [ ] A machine with no provider enabled starts and serves, answering that nothing is configured (verifies spec: DCONF)
-- [ ] A stored setting the service cannot use disables only what it describes (verifies spec: DCONF)
+- [x] A stored setting the service cannot use disables only what it describes (verifies spec: DCONF)
 
 ## The file gate
 
@@ -41,11 +41,11 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Editing live
 
-- [ ] An edit through the control surface changes the row and the service's running state together, with no restart (verifies spec: DCONF, DCTRL)
-- [ ] A refused value leaves the stored value as it was and names the setting (verifies spec: DCTRL)
-- [ ] A notice style naming a profile outside the permitted character set is refused when set (verifies spec: FPROF)
-- [ ] A credential value reaches Toker only through the credential operation (verifies spec: DCTRL)
-- [ ] No control operation returns a credential value (verifies spec: DCTRL, SEC)
+- [x] An edit through the control surface changes the row and the service's running state together, with no restart (verifies spec: DCONF, DCTRL)
+- [x] A refused value leaves the stored value as it was and names the setting (verifies spec: DCTRL)
+- [x] A notice style naming a profile outside the permitted character set is refused when set (verifies spec: FPROF)
+- [x] A credential value reaches Toker only through the credential operation (verifies spec: DCTRL)
+- [x] No control operation returns a credential value (verifies spec: DCTRL, SEC)
 - [ ] Enabling a provider takes effect for the next request without a restart (verifies spec: DCONF)
 
 ## Setup on a fresh machine

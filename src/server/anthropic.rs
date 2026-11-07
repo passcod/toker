@@ -217,12 +217,12 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
 
     // Session identity and betas, read by name only — request headers are
     // never captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-or-displayed).
-    let session_id = session_id(&server.config.session_header_names, &parts.headers);
+    let session_id = session_id(&server.config().session_header_names, &parts.headers);
     let betas = request_betas(&parts.headers);
     // Ping tagging: a lane whose request carried the
     // ping header is recorded but excluded from liveness — the window
     // pinger's probe must never hold the sleep lock.
-    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    let ping = lanes::is_ping(&parts.headers, &server.config().ping_header_name);
     // The frontend's name from its base-URL prefix: picks the notices'
     // style, nothing else.
     let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
@@ -600,7 +600,8 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                 ProtocolId::AnthropicMessages,
                 facts.now_ms,
             );
-            if class == crate::policy::RequestClass::Inference && server.config.gates.cold_enabled {
+            if class == crate::policy::RequestClass::Inference && server.config().gates.cold_enabled
+            {
                 compaction_probe = Some((facts.clone(), credentials.clone()));
             }
             let lane = server.lane_facts(
@@ -914,7 +915,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     // nor a lane (the same verdict the `?`-lane miss reaches).
     // Every failure below is "a lost notice, never a lost request": a
     // store error reads as absence and the request forwards.
-    let cold_armed = path == "/v1/messages" && server.config.gates.cold_enabled;
+    let cold_armed = path == "/v1/messages" && server.config().gates.cold_enabled;
     if cold_lane_key.is_none() {
         cold_lane_key = gate_shape
             .as_ref()
@@ -925,7 +926,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .and_then(|key| server.store.load_lane(key).ok().flatten());
     }
     if cold_armed {
-        let gates = &server.config.gates;
+        let gates = &server.config().gates;
         let now = now_ms();
         let min_idle_ms = cold_idle_ms(gates);
         let turn = match gate_shape.as_ref() {
@@ -1024,7 +1025,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         .and_then(|shape| shape.req_messages)
                         .map(|messages| messages as i64),
                     compact_target: None,
-                    gate_on: server.config.gates.quota_enabled,
+                    gate_on: server.config().gates.quota_enabled,
                 });
                 let rendering = if client_wants_json {
                     Rendering::Json
@@ -1065,7 +1066,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                     writes_free: false,
                     req_messages: None,
                     compact_target: None,
-                    gate_on: server.config.gates.quota_enabled,
+                    gate_on: server.config().gates.quota_enabled,
                 });
             }
             cold::ColdDecision::Notice {
@@ -1096,7 +1097,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         writes_free: true,
                         req_messages: None,
                         compact_target: None,
-                        gate_on: server.config.gates.quota_enabled,
+                        gate_on: server.config().gates.quota_enabled,
                     });
                 } else {
                     // The compact model is resolved, not assumed: the notice
@@ -1129,7 +1130,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         outlook.as_ref(),
                         now,
                         &jiff::tz::TimeZone::system(),
-                        server.config.notices.style_for(frontend.as_deref()),
+                        server.config().notices.style_for(frontend.as_deref()),
                     );
                     let rendering = if client_wants_json {
                         Rendering::Json
@@ -1167,7 +1168,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
                         compact_target: compact_on.as_deref(),
                         outlook: outlook.as_ref(),
                         writes_free: false,
-                        gate_on: server.config.gates.quota_enabled,
+                        gate_on: server.config().gates.quota_enabled,
                     });
                     let mut headers = HeaderMap::new();
                     headers.insert(
@@ -1219,7 +1220,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             .as_ref()
             .is_some_and(AnthropicShape::is_compaction)
     {
-        let gates = &server.config.gates;
+        let gates = &server.config().gates;
         let now = now_ms();
         let min_idle_ms = cold_idle_ms(gates);
         let lane_cold =
@@ -1586,8 +1587,8 @@ fn legacy_compaction_facts(
     crate::policy::LegacyCompactionFacts {
         lane_cold: cold::lane_is_cold(
             lane,
-            server.config.gates.cold_min_tokens,
-            cold_idle_ms(&server.config.gates),
+            server.config().gates.cold_min_tokens,
+            cold_idle_ms(&server.config().gates),
             now_ms,
         ),
         prompt_tokens: lane
