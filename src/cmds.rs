@@ -61,6 +61,23 @@ pub fn setup() -> anyhow::Result<()> {
             )
             .run(),
         )?;
+
+    // The machine is serving by now, and everything still to configure is
+    // edited in the dashboard, so the wizard ends at the next step rather
+    // than describing it (spec: USETUP#handing-off).
+    hand_off_to_dashboard()
+}
+
+/// Replace setup with `toker tui`. A failure to exec is reported and is not
+/// a failed setup: the run itself is complete either way.
+fn hand_off_to_dashboard() -> anyhow::Result<()> {
+    let Ok(exe) = std::env::current_exe() else {
+        println!("\nrun `toker tui` to configure the rest");
+        return Ok(());
+    };
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(exe).arg("tui").exec();
+    println!("\ncould not start the dashboard ({error}) — run `toker tui`");
     Ok(())
 }
 

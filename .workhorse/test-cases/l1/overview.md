@@ -52,12 +52,12 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 - [ ] Setup asks for one provider and its credential and nothing further (verifies spec: USETUP)
 - [x] Setup writes rows and no configuration file (verifies spec: USETUP)
-- [ ] Setup ends by replacing itself with the dashboard (verifies spec: USETUP)
+- [x] Setup ends by replacing itself with the dashboard (verifies spec: USETUP)
 - [x] Setup on an owned machine reports routing is owned by the store and does not ask for a protocol default (verifies spec: RMIG)
 
 ## Discovery instead of configured paths
 
-- [ ] The Claude and codex directories are found the way those programs find them (verifies spec: DCONF)
+- [x] The Claude and codex directories are found the way those programs find them (verifies spec: DCONF)
 - [ ] The service resolves them the same way a command in the operator's shell does (verifies spec: DCONF)
 - [ ] Setup adds the discovered directory to the paths the service may write, and nothing else (verifies spec: DCONF)
 

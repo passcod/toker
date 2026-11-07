@@ -828,7 +828,7 @@ impl Config {
                 Ok(CodexSubConfig {
                     upstream: upstream(row, DEFAULT_CODEX_UPSTREAM)?,
                     originator: DEFAULT_CODEX_ORIGINATOR.to_owned(),
-                    auth_path: expand_tilde(DEFAULT_CODEX_AUTH_PATH),
+                    auth_path: default_codex_auth_path(),
                     refresh_url: parse_upstream(
                         row.refresh_url
                             .as_deref()
@@ -1996,11 +1996,47 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn default_claude_credentials_path() -> PathBuf {
-    env::var_os("CLAUDE_CONFIG_DIR")
+/// Where the codex CLI keeps the login toker shares with it: `CODEX_HOME`
+/// when set, else `~/.codex` — the way codex itself finds it
+/// (spec: DCONF#in-the-store).
+///
+/// Discovered rather than configured, so the path follows from how codex is
+/// installed rather than from what toker was told, and the two cannot be
+/// configured into disagreeing. The service does not share the operator's
+/// shell, so setup carries `CODEX_HOME` into the unit for them to agree.
+fn default_codex_auth_path() -> PathBuf {
+    codex_auth_path_in(&ProcessEnvironment)
+}
+
+fn codex_auth_path_in(environment: &impl Environment) -> PathBuf {
+    environment
+        .var_os("CODEX_HOME")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| expand_tilde("~/.claude"))
+        .unwrap_or_else(|| home_relative(environment, ".codex"))
+        .join("auth.json")
+}
+
+/// `name` under the operator's home.
+fn home_relative(environment: &impl Environment, name: &str) -> PathBuf {
+    environment
+        .var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(name)
+}
+
+fn default_claude_credentials_path() -> PathBuf {
+    claude_credentials_path_in(&ProcessEnvironment)
+}
+
+fn claude_credentials_path_in(environment: &impl Environment) -> PathBuf {
+    environment
+        .var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_relative(environment, ".claude"))
         .join(".credentials.json")
 }
 
@@ -2407,6 +2443,36 @@ cold_idle_min = 7.5
         // The built-in claude entry is not merged under a stored table: the
         // rows are the whole of what the operator set.
         assert_eq!(config.notices.style_for(Some("claude")), NoticeStyle::Plain);
+    }
+
+    #[test]
+    fn the_other_programs_directories_are_found_the_way_those_programs_find_them() {
+        // Discovered, never configured, so the path follows from how the
+        // program is installed rather than from what toker was told
+        // (spec: DCONF#in-the-store).
+        let plain = TestEnvironment::default().with("HOME", "/home/example");
+        assert_eq!(
+            super::codex_auth_path_in(&plain),
+            PathBuf::from("/home/example/.codex/auth.json")
+        );
+        assert_eq!(
+            super::claude_credentials_path_in(&plain),
+            PathBuf::from("/home/example/.claude/.credentials.json")
+        );
+
+        // Each program's own variable moves it, the way the program does.
+        let moved = TestEnvironment::default()
+            .with("HOME", "/home/example")
+            .with("CODEX_HOME", "/elsewhere/codex")
+            .with("CLAUDE_CONFIG_DIR", "/elsewhere/claude");
+        assert_eq!(
+            super::codex_auth_path_in(&moved),
+            PathBuf::from("/elsewhere/codex/auth.json")
+        );
+        assert_eq!(
+            super::claude_credentials_path_in(&moved),
+            PathBuf::from("/elsewhere/claude/.credentials.json")
+        );
     }
 
     #[test]

@@ -51,8 +51,8 @@ Each phase compiles and keeps the suite green.
 
 - [x] Import: rows and revision one in one transaction, then delete the file
 - [ ] Fresh machine: ask one provider and its credential, nothing more
-- [ ] Discover the Claude and codex directories their own way, carry them into the unit
-- [ ] Re-exec into the dashboard at the end
+- [x] Discover the Claude and codex directories their own way, carry them into the unit
+- [x] Re-exec into the dashboard at the end
 
 ### 6. Dashboard pages
 
@@ -62,8 +62,8 @@ Each phase compiles and keeps the suite green.
 
 ### 7. Removals
 
-- [ ] Codex `originator` becomes a constant
-- [ ] `claude_credentials_path` and codex `auth_path` become discovery
+- [x] Codex `originator` becomes a constant
+- [x] `claude_credentials_path` and codex `auth_path` become discovery
 - [ ] Prune what `config.rs` no longer needs
 
 ## Decisions worth keeping
