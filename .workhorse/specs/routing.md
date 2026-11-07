@@ -4,14 +4,14 @@ id: ROUTE
 
 # Routing
 
-toker serves several protocols on one loopback port and forwards each request to one of several configured providers.
+Toker serves several protocols on one loopback port and forwards each request to one of several configured providers.
 This spec covers the paths, the topology a request is resolved onto, what each provider does to a request's credentials, and how a request with nowhere to go is answered.
 Which binding and model a request takes is decided by [RPOL](policy/overview.md).
 
 ## Protocols
 
 A protocol is a broad wire shape.
-toker MUST serve these three protocols:
+Toker MUST serve these three protocols:
 
 | protocol | paths |
 | --- | --- |
@@ -21,8 +21,8 @@ toker MUST serve these three protocols:
 
 No two protocols claim the same inference path, so one listener serves them all.
 
-toker MUST determine an inference request's protocol from its path alone.
-Where a path is claimed by more than one protocol, as `/v1/models` is, toker MUST determine the protocol from the frontend profile instead.
+Toker MUST determine an inference request's protocol from its path alone.
+Where a path is claimed by more than one protocol, as `/v1/models` is, Toker MUST determine the protocol from the frontend profile instead.
 
 The `/_toker/` namespace is not a protocol and MUST NOT leave the proxy.
 Its endpoints are specified by [DCTRL](service/control.md).
@@ -87,10 +87,10 @@ A frontend MUST NOT decide at parse time what a provider will refuse.
 
 ## Frontend profiles
 
-A frontend profile is a named variant of the API toker offers clients, shaped to suit one client.
+A frontend profile is a named variant of the API Toker offers clients, shaped to suit one client.
 
 Every route MUST also answer under a `/f/<name>` prefix.
-toker MUST strip the prefix before matching the path, and MUST retain the name for the rest of the request.
+Toker MUST strip the prefix before matching the path, and MUST retain the name for the rest of the request.
 
 A profile name MUST consist of lowercase ASCII letters, digits, `-` and `_`.
 A configured notice style whose name falls outside that set MUST be refused when the configuration is read.
@@ -99,7 +99,7 @@ A request's profile name MUST select its gate notice style, which [GNOTE](gates/
 The name MUST also scope policy, so that a presentation, rewrite or default scoped to one profile applies to that profile alone.
 
 A request that arrives without a prefix MUST be treated as the profile named `unprefixed`.
-A prefix naming a profile toker does not recognise MUST NOT be resolved to a recognised one.
+A prefix naming a profile Toker does not recognise MUST NOT be resolved to a recognised one.
 
 ## Resolving a route
 
@@ -132,14 +132,14 @@ Lane pins are specified by [LLANE](ledger/lanes.md).
 
 A request that brings its own credential for the provider it reaches keeps it.
 A credential meant for one provider MUST be removed before the request reaches a different one.
-toker MUST NOT log a credential value, and MUST NOT write one to the ledger.
-toker MUST read request headers by name, and MUST NOT capture them wholesale.
+Toker MUST NOT log a credential value, and MUST NOT write one to the ledger.
+Toker MUST read request headers by name, and MUST NOT capture them wholesale.
 
-| provider | what toker does |
+| provider | what Toker does |
 | --- | --- |
-| `anthropic_sub` | passes a Claude bearer through on a native Messages request. For any other protocol it replaces the client's bearer with a toker-held OAuth token, or failing that an unexpired Claude login. |
+| `anthropic_sub` | passes a Claude bearer through on a native Messages request. For any other protocol it replaces the client's bearer with a Toker-held OAuth token, or failing that an unexpired Claude login. |
 | `anthropic_api` | injects `x-api-key` only when the request carries neither `x-api-key` nor `authorization`. |
-| `openrouter` | drops `x-api-key` always, and drops a bearer whenever toker holds an OpenRouter key or the bearer is Anthropic's, then injects the stored key. With no stored key, a client's own OpenRouter key passes through. |
+| `openrouter` | drops `x-api-key` always, and drops a bearer whenever Toker holds an OpenRouter key or the bearer is Anthropic's, then injects the stored key. With no stored key, a client's own OpenRouter key passes through. |
 | `openai_api` | drops Anthropic and OpenRouter credentials, then injects the configured bearer only when the request carries no native bearer. An unrecognised bearer on its native Chat wire passes through. |
 | `codex_sub` | strips whatever `authorization` the request carried and signs the upstream itself. |
 
@@ -147,15 +147,15 @@ toker MUST read request headers by name, and MUST NOT capture them wholesale.
 > A client's bearer on a Messages request is the subscription's, so forwarding it to any upstream other than Anthropic would hand a third party the subscription credential.
 > Claude Code's own settings carry a placeholder bearer, so the presence of one proves nothing about its origin.
 
-Where `anthropic_sub` serves a request that did not bring a usable Claude bearer, toker MUST resolve its own token from, in order: the configured environment variable, the keyring entry, a literal in the configuration file, and the Claude login file at its configured path.
-toker MUST read that login file once per request rather than caching it, so that a refreshed or revoked login takes effect without a restart.
-toker MUST NOT send a token it can see has expired.
+Where `anthropic_sub` serves a request that did not bring a usable Claude bearer, Toker MUST resolve its own token from, in order: the configured environment variable, the keyring entry, a literal in the configuration file, and the Claude login file at its configured path.
+Toker MUST read that login file once per request rather than caching it, so that a refreshed or revoked login takes effect without a restart.
+Toker MUST NOT send a token it can see has expired.
 
 ## Meters and cost
 
 A meter is a provider's own report of what a rate limit window has left.
 
-toker MUST feed meters from every response a meter-bearing provider returns, including errors and requests toker made for itself.
+Toker MUST feed meters from every response a meter-bearing provider returns, including errors and requests Toker made for itself.
 
 | provider | meters | cost kind |
 | --- | --- | --- |
@@ -169,7 +169,7 @@ The Anthropic rate limit headers on `anthropic_sub` MUST be the quota gate's onl
 `anthropic_api` returns request-rate headers which are not quota meters, and they MUST NOT overwrite the gate's snapshot.
 
 The cost kinds MUST NOT be conflated with one another.
-A model, service tier or token category toker has no verified price for MUST leave the row's cost unrecorded rather than record a zero.
+A model, service tier or token category Toker has no verified price for MUST leave the row's cost unrecorded rather than record a zero.
 
 The quota gate is specified by [GQUOTA](gates/quota.md), and the cold gate by [GCOLD](gates/cold.md).
 
@@ -187,7 +187,7 @@ What each protocol's listing contains is specified by [RPUB](policy/publication.
 Token counting and batch creation MUST resolve only their first candidate, and MUST require a binding that declares the operation.
 
 These requests are not rendered canonically.
-toker MUST retain the client's bytes and MUST replace only the model at the positions each operation documents.
+Toker MUST retain the client's bytes and MUST replace only the model at the positions each operation documents.
 A batch whose requests resolve to more than one binding MUST be refused with a 400.
 
 Batch reads, batch cancellation and unmatched administrative paths MUST stream through without inference observation.
