@@ -2,13 +2,13 @@
 id: TOK
 ---
 
-# toker
+# Toker
 
-toker is a local proxy and ledger for LLM traffic.
+Toker is a local proxy and ledger for LLM traffic.
 
 ## Requirements notation
 
-The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED, NOT RECOMMENDED, MAY and OPTIONAL in toker's specifications are to be interpreted as described in BCP 14 ([RFC 2119](https://www.rfc-editor.org/rfc/rfc2119), [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)) when, and only when, they appear in all capitals, as here.
+The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED, NOT RECOMMENDED, MAY and OPTIONAL in Toker's specifications are to be interpreted as described in BCP 14 ([RFC 2119](https://www.rfc-editor.org/rfc/rfc2119), [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)) when, and only when, they appear in all capitals, as here.
 
 ## External documents
 
@@ -25,11 +25,11 @@ The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RE
 
 ### Client
 
-A program that sends inference requests to toker rather than to a provider.
+A program that sends inference requests to Toker rather than to a provider.
 
 ### Frontend profile
 
-A named variant of the API toker offers clients, selected by a request's `/f/<name>` prefix, shaped to suit one client.
+A named variant of the API Toker offers clients, selected by a request's `/f/<name>` prefix, shaped to suit one client.
 Defined in [ROUTE](routing.md#frontend-profiles).
 
 ### Protocol
@@ -69,10 +69,10 @@ Defined in [CANON](canonical.md).
 
 ### Offer
 
-A model a provider serves, as a provider identifier paired with what toker knows of its window and pricing.
+A model a provider serves, as a provider identifier paired with what Toker knows of its window and pricing.
 Defined in [RPUB](policy/publication.md).
 
 ### Inventory
 
-The set of offers toker holds, joined across every provider catalogue it has fetched.
+The set of offers Toker holds, joined across every provider catalogue it has fetched.
 Defined in [RPUB](policy/publication.md).

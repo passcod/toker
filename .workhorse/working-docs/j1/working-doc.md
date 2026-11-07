@@ -220,6 +220,22 @@ and lineage are accounting identity, which `ledger/schema.md` already carries
 sections for, so they join the ledger. `/_toker/` is service administration and
 never reaches an upstream, so `DCTRL`.
 
+## Capitalisation
+
+Toker is an ordinary name and takes ordinary capitalisation. `toker` lowercase
+where it is a token the machine reads: the command, the crate, `toker.toml`,
+`/_toker/`, `x-toker-*` headers, `~/.config/toker/`, Rust identifiers. `Toker`
+capitalised in prose and in TUI chrome.
+
+In markdown the backtick is the signal, so the rule applies mechanically:
+inside backticks it is lowercase, outside it is capitalised. Rust doc comments
+have no such marker and need reading, since a bare `toker` there may be either.
+
+The repo is currently lowercase throughout, so the sweep covers README.md (8
+mentions), AGENTS.md (20), the module doc comments, and any TUI display string.
+Binary names and paths in code, such as `reexec.rs`'s `toker` and `toker.new`,
+stay as they are.
+
 ## Pilot
 
 `overview.md` (`TOK`) and `routing.md` (`ROUTE`) are written, 195 lines for the
