@@ -107,12 +107,39 @@ Settled:
 `routing.md` heads a column "Backends" over a list of providers, which is the
 kind of error the rewrite is for.
 
-**dialect** (`DialectId`) is a fourth level under protocol, not yet understood
-well enough to gloss. Check it during the pilot.
+- **dialect** is a provider's concrete rendering and interpretation rules
+  within a protocol: `anthropic_messages`, `openrouter_messages`,
+  `openrouter_chat_completions`, `openrouter_responses`,
+  `openai_chat_completions`, `codex_responses`. A dialect is never inferred
+  from a protocol alone. Distinct from backend adapter, which has four
+  variants to dialect's six.
 
-Coined terms still to check for the same defects: *release*, *allowance*,
-*claim*, *outlook*, *recap*, *generation*, *election*, *promotion*, *offer*,
-*inventory*, *meter*, *pin*, *lane*, *attempt*.
+**claim** is borrowed, not coined. It comes from Anthropic's
+`anthropic-ratelimit-unified-representative-claim` header, whose values are
+window names such as `5h`. It goes in a `## Borrowed terms` table in the quota
+spec citing that header, never in the root glossary.
+
+### Compound terms
+
+A term may be more than one word, and a shared head noun is not a conflation.
+*Inventory generation* (a deterministic digest of the catalogue snapshot, so a
+second process can detect that the cache moved) and *compaction generation*
+(the count of continuation preambles, the TUI's `cmpct` column) are two terms
+that happen to share a head, the way sea water and sea foam do. Both get
+glossary entries; the bare head noun never appears on its own.
+
+The same shape covers *quota outlook* and *cold outlook*, *lane pin* and
+*release marker*. Checked and sound: *release* (the grant) against *allowance*
+(the row recording it), *offer* against *inventory*, and *meter*, *recap*,
+*election*, *promotion*, *lane*, *attempt*, used consistently throughout.
+
+### Citing specs from code
+
+Citations go at the rule they implement, with a `#section` anchor, not in a
+module header: `// spec: ROUTE` atop `routing.rs` says nothing the filename
+does not. The six `//!` comments currently pointing at `docs/internals/` paths
+are deleted rather than converted, and citations are placed where a reader
+auditing a requirement would want them.
 
 ### Sweeping names into code
 
