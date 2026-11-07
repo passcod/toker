@@ -41,6 +41,7 @@
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
 
+pub(crate) mod control;
 mod detail;
 mod labels;
 mod locale;

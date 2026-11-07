@@ -4,8 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use super::client::{Command, Reply, Response};
 use super::form::{Context, Form, Outcome, Purpose};
+use crate::tui::control::{Command, Reply, Response};
 
 /// Lines a page key moves the detail pane.
 const DETAIL_PAGE: i32 = 10;
@@ -926,7 +926,7 @@ impl State {
                 KeyCode::Char('r') => {
                     self.conflicted_edits.clear();
                     self.modal = Modal::None;
-                    return Some(Command::snapshot());
+                    return Some(Command::snapshot("routing-snapshot"));
                 }
                 KeyCode::Char('a') => (
                     Modal::Conflict {
@@ -1467,7 +1467,7 @@ fn control_error(command: &Command, response: &Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Modal, State, View};
-    use crate::tui::routing::client::{Command, Reply, Response};
+    use crate::tui::control::{Command, Reply, Response};
     use crate::tui::routing::form::Purpose;
     use reqwest::Method;
 
@@ -1487,7 +1487,7 @@ mod tests {
     fn draft_entries_and_generation_win_over_the_active_revision() {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: snapshot(),
@@ -1502,7 +1502,7 @@ mod tests {
     fn conflict_preserves_edits_and_offers_reapply() {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: snapshot(),
@@ -1564,14 +1564,14 @@ mod tests {
     fn loaded(body: serde_json::Value) -> State {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response { status: 200, body }),
         ));
         state
     }
 
     fn reply(name: &'static str, status: u16, body: serde_json::Value) -> Reply {
-        let mut command = Command::snapshot();
+        let mut command = Command::snapshot("routing-snapshot");
         command.name = name;
         Reply::Command(command, Ok(Response { status, body }))
     }
@@ -1619,7 +1619,10 @@ mod tests {
         let mut state = loaded(full_snapshot());
         assert!(state.begin_refresh());
         assert!(!state.begin_refresh(), "one refresh at a time");
-        state.receive(Reply::Command(Command::snapshot(), Err("down".to_owned())));
+        state.receive(Reply::Command(
+            Command::snapshot("routing-snapshot"),
+            Err("down".to_owned()),
+        ));
         assert!(state.error().is_some_and(|error| error.contains("down")));
         assert_eq!(state.entries().len(), 2);
         assert!(state.begin_refresh(), "refresh can resume once it settled");
