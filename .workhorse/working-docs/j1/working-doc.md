@@ -284,16 +284,24 @@ stay as they are.
 
 ## Rollout
 
-The pilot (`TOK`, `ROUTE`) was signed off on the voice. Ten of the 26 specs are
-written: the unprefixed core and the whole gates family.
+All 26 specs are written: 3195 lines against 4447 of internals prose. Every
+file link and every heading anchor resolves.
 
 Cut rather than carried, throughout: the ctp comparisons, the dated live-probe
 narratives (a probe is evidence for a capability claim, and the claim is what
-the spec states; the date belongs with the code's `VERIFIED_ON`), and the
-maintainer guidance about which optimisations not to attempt.
+the spec states; the date belongs with the code's `VERIFIED_ON`), the
+maintainer guidance about which optimisations not to attempt, and the
+repository layout.
 
-The glossary grows as each spec is written, since a term is defined by the spec
-that owns it.
+### What remains
+
+- The code sweep: `// spec:` citations at the rule, the plan and invariant
+  references, and the identifier renames
+- The whole-repo markdown reflow, and the AGENTS.md rewrite
+- CI, carrying the test suite and the link and anchor check
+- Verifying the external documents table's URLs and titles
+- `ledger/schema.md` held as one spec at 164 lines, so the question of
+  splitting it did not arise
 
 ### Where the spec leads the code
 
@@ -320,16 +328,22 @@ the meter and cost rules in `ROUTE` are already per-provider tables.
 
 ### Note density
 
-The gates specs carry far more `> [!NOTE]` blocks than the core: `GCOLD` twelve
-in 135 lines against `ROUTE`'s one in 190. That is the source material rather
-than laxity. The gate topics are almost entirely a record of traps, and each
-note names the specific wrong implementation a reader would otherwise build.
-Worth a second opinion all the same, since the test is meant to be strict.
+204 notes across the corpus, and they are not evenly spread. `ROUTE` carries
+one in 190 lines; `RMODEL` nineteen in 196, `LLANE` sixteen in 217, `DLIFE`
+fifteen in 121.
+
+The split tracks what kind of knowledge a topic holds rather than how carefully
+it was written. Topology specs describe arrangements a reader cannot get wrong
+for long, because the wrong arrangement fails immediately. The learning,
+caching and lifecycle specs encode measurements where the wrong implementation
+works, looks right and is quietly false, and there each note names the specific
+wrong build a reader would otherwise produce.
 
 Audited on conversion, two kinds were cut: a note restating the consequence of
 the requirement above it, and a note repeating a claim another spec owns.
 `GCOLD` lost a closing section that cross-referenced `GNOTE` and then restated
-`GNOTE`'s own past-tense requirement.
+`GNOTE`'s own past-tense requirement. Still worth a second opinion, since the
+test is meant to be strict and the density is high.
 
 ## Open questions
 
