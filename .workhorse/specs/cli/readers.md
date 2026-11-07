@@ -7,7 +7,7 @@ id: UREAD
 Three commands read the ledger without serving traffic: one ingests a predecessor's log, one emits rows, and one reports proof of a context window.
 This spec covers what each guarantees.
 
-A command that does not write MUST open the store read-only, as [LROWS](../ledger/schema.md#opening-the-store) requires.
+A command that does not write MUST open the store read-only, as [SROWS](../store/ledger.md#opening-the-store) requires.
 
 ## Export
 
@@ -38,7 +38,7 @@ Export MAY add a human-readable form of the row's timestamp, and MUST add nothin
 
 ## Import
 
-Import MUST map a predecessor's log into the ledger as [LROWS](../ledger/schema.md#imported-rows) specifies.
+Import MUST map a predecessor's log into the ledger as [SROWS](../store/ledger.md#imported-rows) specifies.
 
 Import MUST keep a checkpoint, so that a repeated run continues rather than duplicates.
 

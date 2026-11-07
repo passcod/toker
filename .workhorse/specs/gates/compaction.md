@@ -71,7 +71,7 @@ That record MUST carry positions and flags only, and MUST NOT carry message text
 > A compaction the detector misses leaves this record on a row marked as not a compaction, so the count of such rows is the check that detection still works.
 
 A count of compactions reaching back before the detection field existed is a floor, and MUST be reported as one.
-Which rows predate which fields is specified by [LROWS](../ledger/schema.md).
+Which rows predate which fields is specified by [SROWS](../store/ledger.md).
 
 ## Retargeting a cold compaction
 

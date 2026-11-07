@@ -68,7 +68,7 @@ A fit MUST read each attempt's own row, and MUST read only the rows of the provi
 A fit MUST NOT read a total grouped across providers.
 
 A request that failed over from the subscription therefore contributes the attempts the subscription served and nothing another provider did.
-Attempts are specified by [LATT](../ledger/attempts.md).
+Attempts are specified by [SATT](../store/attempts.md).
 
 ## Firing
 

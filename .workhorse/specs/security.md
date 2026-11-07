@@ -22,7 +22,7 @@ A detection marker MUST be a string chosen in advance, and only whether it match
 
 A label a display reads from a client's own files MUST be read when the display renders and MUST NOT reach the store.
 
-An import MUST report the names of fields it did not map and MUST NOT report their values, as [LROWS](ledger/schema.md#imported-rows) specifies.
+An import MUST report the names of fields it did not map and MUST NOT report their values, as [SROWS](store/ledger.md#imported-rows) specifies.
 
 A routing diagnostic's path MUST be built only from static field names and bounded indices, as [RPOL](policy/overview.md#validation) specifies, so that a request or a model string cannot appear in one.
 
@@ -60,6 +60,9 @@ Where Toker borrows a passing credential for a request of its own, that request 
 
 Toker MUST bind loopback only, as [DLIFE](service/lifecycle.md#binding) specifies.
 
+> [!NOTE]
+> Toker signs requests with the credentials it holds, so anything that reaches it is served on the operator's own account without presenting a credential of its own.
+
 ## A web page cannot drive the control surface
 
 A page in the operator's browser can reach loopback, so every control endpoint MUST demand a custom header naming its operation, and every mutation MUST additionally demand its method and a JSON content type.
@@ -73,6 +76,6 @@ A control path added later MUST take the same checks.
 
 ## Accounting cannot stop a session
 
-Observing and recording a request MUST NOT be able to fail it, as [LATT](ledger/attempts.md) and [GQUOTA](gates/quota.md#firing) specify.
+Observing and recording a request MUST NOT be able to fail it, as [SATT](store/attempts.md) and [GQUOTA](gates/quota.md#firing) specify.
 
 Only a gate MUST be able to stop a session, and every gate decision MUST be taken at one place.

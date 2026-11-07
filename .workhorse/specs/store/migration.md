@@ -1,5 +1,5 @@
 ---
-id: LMIG
+id: SMIG
 ---
 
 # Migrating routing into the store

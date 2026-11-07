@@ -54,12 +54,12 @@ Four destinations, decided per sentence rather than per file:
 │   ├── overview.md      the document, lifecycle, the resolver, fallback
 │   ├── models.md        learning, election, upgrades, context ceilings
 │   └── publication.md   what each profile lists, generations, Claude's settings
-├── ledger/
-│   ├── schema.md        row kinds, fields, old rows, imported rows
-│   ├── migration.md     append-only migrations, revision one, activation
+├── store/
+│   ├── ledger.md        row kinds, fields, old rows, imported rows
+│   ├── migration.md     routing moving from the file into the store
 │   ├── lanes.md         lane identity, cache identity, pins
 │   ├── attempts.md      a logical request and its attempts
-│   └── lineage.md       what counts as evidence of descent
+│   └── lineage.md       the evidence of descent between sessions
 ├── service/
 │   ├── lifecycle.md     socket activation, drain, restart, the sleep lock
 │   ├── config.md        toker.toml: providers, credential sources, the listener
@@ -185,7 +185,7 @@ the whole project is a proxy.
 | What toker is | none |
 | Gates | `G` |
 | Routing policy | `R` |
-| Ledger and accounting | `L` |
+| The store | `S` |
 | Daemon | `D` |
 | Interfaces | `U` |
 
@@ -205,11 +205,11 @@ the whole project is a proxy.
 | `policy/overview.md` | `RPOL` |
 | `policy/models.md` | `RMODEL` |
 | `policy/publication.md` | `RPUB` |
-| `ledger/schema.md` | `LROWS` |
-| `ledger/migration.md` | `LMIG` |
-| `ledger/lanes.md` | `LLANE` |
-| `ledger/attempts.md` | `LATT` |
-| `ledger/lineage.md` | `LLIN` |
+| `store/ledger.md` | `SROWS` |
+| `store/migration.md` | `SMIG` |
+| `store/lanes.md` | `SLANE` |
+| `store/attempts.md` | `SATT` |
+| `store/lineage.md` | `SLIN` |
 | `service/lifecycle.md` | `DLIFE` |
 | `service/config.md` | `DCONF` |
 | `service/control.md` | `DCTRL` |
@@ -218,8 +218,9 @@ the whole project is a proxy.
 | `cli/readers.md` | `UREAD` |
 | `tui/dashboard.md` | `UTUI` |
 
-`LLANE` and `LLIN` are the weakest pair: both open `LL` and sit on adjacent
-subjects. Watch for one being cited where the other was meant.
+`SLANE` and `SLIN` are the closest pair, both opening `SL` on adjacent
+subjects. `SEC` is unprefixed but opens with the store's letter, which the
+unprefixed convention has to carry.
 
 The prefix is a reading aid and not a guarantee. An id never changes, but a
 family can be redrawn, so a spec that moves keeps a letter that no longer
@@ -235,7 +236,7 @@ every `// spec:` citation pointing at it.
 Settling the families moved four specs out of where a folder-shaped scheme had
 put them. Gate notices are gate output, so `GNOTE`. Compaction detection feeds
 the cold gate rather than accounting for anything, so `GCOMP`. Lanes, attempts
-and lineage are accounting identity, which `ledger/schema.md` already carries
+and lineage are accounting identity, which `store/ledger.md` already carries
 sections for, so they join the ledger. `/_toker/` is service administration and
 never reaches an upstream, so `DCTRL`.
 
@@ -300,7 +301,7 @@ repository layout.
 - The whole-repo markdown reflow, and the AGENTS.md rewrite
 - CI, carrying the test suite and the link and anchor check
 - Verifying the external documents table's URLs and titles
-- `ledger/schema.md` held as one spec at 164 lines, so the question of
+- `store/ledger.md` held as one spec at 164 lines, so the question of
   splitting it did not arise
 
 ### Where the spec leads the code
@@ -329,7 +330,7 @@ the meter and cost rules in `ROUTE` are already per-provider tables.
 ### Note density
 
 204 notes across the corpus, and they are not evenly spread. `ROUTE` carries
-one in 190 lines; `RMODEL` nineteen in 196, `LLANE` sixteen in 217, `DLIFE`
+one in 190 lines; `RMODEL` nineteen in 196, `SLANE` sixteen in 217, `DLIFE`
 fifteen in 121.
 
 The split tracks what kind of knowledge a topic holds rather than how carefully
@@ -349,7 +350,7 @@ test is meant to be strict and the density is high.
 
 - [ ] The area tree: how the subjects group into directories. Three joints are
       uncertain: whether `routing.md` splits three ways, whether `session/` is
-      a real grouping, and whether `ledger/schema.md` wants splitting once
+      a real grouping, and whether `store/ledger.md` wants splitting once
       converted.
 - [ ] Confirm a link and anchor checker goes in as a test under `tests/`, since
       there is no CI and deep links break silently when a heading is reworded.

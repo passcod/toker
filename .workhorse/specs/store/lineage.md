@@ -1,5 +1,5 @@
 ---
-id: LLIN
+id: SLIN
 ---
 
 # Session lineage
@@ -16,7 +16,7 @@ A request's raw session is the identity it arrived with: the first of the config
 The raw session MUST be stored whole, and MUST be the key the lane table, the allowances and the prompt cache use.
 
 > [!NOTE]
-> A cache belongs to one conversation's prefix, and two sessions never share one. [LLANE](lanes.md) has the consequences.
+> A cache belongs to one conversation's prefix, and two sessions never share one. [SLANE](lanes.md) has the consequences.
 
 A display parent is a second, optional identity, carried with the kind of child it is and the evidence that established it.
 Those three values MUST be all present or all absent.
@@ -97,4 +97,4 @@ A query answering a client's question about a session MUST match that session ex
 > A client asking about a session gets that session, not its children.
 
 Rows written before lineage was recorded carry none, so a session that was a child before then shows as its own.
-That is an absence of evidence rather than evidence of absence, as [LROWS](schema.md) requires of every such field.
+That is an absence of evidence rather than evidence of absence, as [SROWS](ledger.md) requires of every such field.

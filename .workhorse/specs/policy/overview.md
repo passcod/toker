@@ -10,7 +10,7 @@ This spec covers the document, how a revision is drafted and activated, and how 
 There MUST be no other router.
 A change to the policy MUST reach live traffic by activation, without restarting the service.
 
-Which bytes a route may alter is specified by [CANON](../canonical.md), what a lane pin is by [LLANE](../ledger/lanes.md), and how models are learned and upgraded by [RMODEL](models.md).
+Which bytes a route may alter is specified by [CANON](../canonical.md), what a lane pin is by [SLANE](../store/lanes.md), and how models are learned and upgraded by [RMODEL](models.md).
 
 ## The document
 
@@ -158,7 +158,7 @@ The operation that produced a revision and the meaning of its document are separ
 A revision MUST record its compiler origin, and a revision derived from another MUST inherit it.
 Semantics marked as generated MUST be refused in an authored document.
 
-What the generated first revision contains is specified by [LMIG](../ledger/migration.md).
+What the generated first revision contains is specified by [SMIG](../store/migration.md).
 
 ### Catalogue refresh
 

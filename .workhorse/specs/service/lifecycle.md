@@ -11,9 +11,6 @@ This spec covers how it starts, how it is replaced without cutting a response, a
 
 Toker MUST bind loopback only.
 
-> [!NOTE]
-> Every control path is reachable from the operator's browser as it is; binding elsewhere would offer the proxy to the network.
-
 Toker MUST accept a listening socket from its supervisor where one is handed over, so that connections arriving while no instance is running queue in the kernel rather than being refused.
 
 Each running instance MUST have an identity distinguishable from its successor's.

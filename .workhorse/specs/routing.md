@@ -124,7 +124,7 @@ Each of these MUST produce an error in the shape of the protocol the client spok
 
 A request answered in any of these ways MUST NOT reach an upstream.
 
-Lane pins are specified by [LLANE](ledger/lanes.md).
+Lane pins are specified by [SLANE](store/lanes.md).
 
 ## Credentials
 

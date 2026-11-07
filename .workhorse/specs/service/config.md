@@ -8,7 +8,7 @@ Toker reads a configuration file for what it needs before it can reach its store
 This spec covers what the file holds, where a credential may live, and which directories the service may write.
 
 Routing is not configuration.
-It lives in the store as policy revisions, as [RPOL](../policy/overview.md) specifies, and how a machine's routing moved there is specified by [LMIG](../ledger/migration.md).
+It lives in the store as policy revisions, as [RPOL](../policy/overview.md) specifies, and how a machine's routing moved there is specified by [SMIG](../store/migration.md).
 
 ## The file
 

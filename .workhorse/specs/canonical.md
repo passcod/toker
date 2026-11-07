@@ -54,7 +54,7 @@ Stripping a message's reasoning effort MUST leave any other content of that mess
 
 Removing a request's cache breakpoints requires a licence beyond the transformation that rewrites the body, and there are two.
 
-Toker MAY drop cache breakpoints where the model has changed, since a cache identity includes the model sent, as [LLANE](ledger/lanes.md#cache-identity) specifies, leaving none for the new model to lose.
+Toker MAY drop cache breakpoints where the model has changed, since a cache identity includes the model sent, as [SLANE](store/lanes.md#cache-identity) specifies, leaving none for the new model to lose.
 Toker MAY drop cache breakpoints where the caller has asserted that the request's cache is already cold.
 Where neither holds, retargeting MUST leave the breakpoints in place.
 
@@ -94,7 +94,7 @@ A refusal of a request that asked to stream MUST be delivered in that protocol's
 A body that is not JSON cannot carry a stream preference, and MUST be refused with the protocol's plain error instead.
 
 A refusal before any attempt MUST leave an error row naming local preparation, carrying no attempt, provider, route or binding.
-Attempts and their rows are specified by [LATT](ledger/attempts.md).
+Attempts and their rows are specified by [SATT](store/attempts.md).
 
 A malformed body MUST retain a wire-shaped view for the quota decision and for presenting the error, and MUST NOT have that view used for inference or for extracting the request's shape.
 

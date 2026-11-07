@@ -33,12 +33,12 @@ A session detail MUST show the requested, effective and served models separately
 > [!NOTE]
 > Showing all three is only useful because they can disagree, which is exactly what a fallback or an alias produces.
 
-Counting rules for requests, attempts and failures are specified by [LATT](../ledger/attempts.md#reading-the-rows), and the measurement rules by [GCAST](../gates/forecasting.md).
+Counting rules for requests, attempts and failures are specified by [SATT](../store/attempts.md#reading-the-rows), and the measurement rules by [GCAST](../gates/forecasting.md).
 
 A session MUST be marked where its newest decision was a gate stopping it, and that mark MUST be cleared by a later measurement or release.
 An error, a sleep-lock change and a withheld notice are not decisions, and MUST neither set nor clear it.
 
-A session grouped with its children MUST follow [LLIN](../ledger/lineage.md#lineage-is-for-display-and-accounting-only).
+A session grouped with its children MUST follow [SLIN](../store/lineage.md#lineage-is-for-display-and-accounting-only).
 
 ## Gate controls
 
@@ -56,7 +56,7 @@ The page MUST be able to validate, preview, activate and reactivate, through the
 
 An activation MUST NOT wait on reconciling a client's settings, and a slow or failed reconciliation MUST be reported on the page without undoing or delaying the activation.
 
-The page MAY import a configuration file into the draft, behind a confirmation, as [LMIG](../ledger/migration.md#importing-a-file-deliberately) specifies.
+The page MAY import a configuration file into the draft, behind a confirmation, as [SMIG](../store/migration.md#importing-a-file-deliberately) specifies.
 
 ## Cost
 

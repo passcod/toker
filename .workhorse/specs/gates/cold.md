@@ -132,4 +132,4 @@ An unrecorded tier MUST be read as the longest.
 
 > [!NOTE]
 > Guessing short fires on a live cache and costs the operator a turn; guessing long only delays a notice that was true.
-> The policy's lane transitions answer a different question and default the other way, as [LLANE](../ledger/lanes.md) specifies, because a wrong verdict there loses a cache rather than costing a turn.
+> The policy's lane transitions answer a different question and default the other way, as [SLANE](../store/lanes.md) specifies, because a wrong verdict there loses a cache rather than costing a turn.

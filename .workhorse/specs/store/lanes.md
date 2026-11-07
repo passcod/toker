@@ -1,5 +1,5 @@
 ---
-id: LLANE
+id: SLANE
 ---
 
 # Lanes, cache identity and pins

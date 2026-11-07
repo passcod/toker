@@ -1,5 +1,5 @@
 ---
-id: LATT
+id: SATT
 ---
 
 # Attempts
@@ -118,4 +118,4 @@ The quota fit, the meter reads, the cache-rebuild walk and learning MUST each ta
 > [!NOTE]
 > A total across a group would be a number no provider ever reported.
 
-Which rows predate attempt identity, and what a reader owes a reader when a range reaches back past it, is specified by [LROWS](schema.md).
+Which rows predate attempt identity, and what a reader owes a reader when a range reaches back past it, is specified by [SROWS](ledger.md).
