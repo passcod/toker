@@ -276,6 +276,20 @@ maintainer guidance about which optimisations not to attempt.
 The glossary grows as each spec is written, since a term is defined by the spec
 that owns it.
 
+### Where the spec leads the code
+
+`GPING` requires that no ping be scheduled where no configured provider anchors
+a window to its opening request. The ping verb is already scoped to the
+subscription, bounding both its skip decision and its readback, but setup is
+not: the wizard offers and installs the wake, hold and ping timers on the
+strength of what is already installed, without consulting the configured
+providers. A machine running only openrouter or codex_sub can therefore wake on
+weekdays to send pings that open nothing. Filed as #K1.
+
+Scoping a spec to the provider behaviour it depends on is worth doing wherever
+a topic reads as general and is not. Window anchoring is the clearest case, and
+the meter and cost rules in `ROUTE` are already per-provider tables.
+
 ### Note density
 
 The gates specs carry far more `> [!NOTE]` blocks than the core: `GCOLD` twelve

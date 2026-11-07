@@ -4,8 +4,20 @@ id: GPING
 
 # Pinging a window open
 
-A rate limit window is anchored to the request that opens it, so sending a request at a chosen time places that window's boundary.
-This spec covers how a boundary is predicted, when a ping is sent or skipped, and how a run records whether the schedule held.
+Where a provider anchors a rate limit window to the request that opens it, sending a request at a chosen time places that window's boundary.
+This spec covers which providers that applies to, how a boundary is predicted, when a ping is sent or skipped, and how a run records whether the schedule held.
+
+## Scope
+
+Pinging applies only to a provider that anchors a rate limit window to the request opening it.
+Among the providers [ROUTE](../routing.md#providers) specifies, the Anthropic subscription alone meters windows this way.
+
+Toker MUST NOT schedule a ping where no configured provider anchors a window to its opening request.
+
+> [!NOTE]
+> A provider that meters without anchoring, or that does not meter at all, gains nothing from a request sent at a chosen time, so a schedule against one would wake the machine for no effect.
+
+Every requirement below is about such a provider's windows.
 
 ## Where a boundary falls
 
