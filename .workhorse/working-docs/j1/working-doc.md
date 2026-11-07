@@ -220,6 +220,21 @@ and lineage are accounting identity, which `ledger/schema.md` already carries
 sections for, so they join the ledger. `/_toker/` is service administration and
 never reaches an upstream, so `DCTRL`.
 
+## When a note earns its place
+
+A `> [!NOTE]` survives only where cutting it would let someone build a
+plausible non-interoperable or insecure variant. A note that explains why the
+requirement above it is sensible, or restates its consequence, is cut: the
+requirement already says the thing, and the surrounding tables usually show it.
+
+Worked through on the pilot. The note under the dialect rule said that two
+providers on one protocol diverge, so guessing the rules produces a refused
+body. That is the consequence of the MUST NOT above it, and the dialect table
+already shows six dialects over three protocols, so it went. The note under the
+credential table stayed: without it a re-implementer forwards a bearer the
+client supplied, because nothing else says that a Messages bearer is the
+subscription's and that Claude Code sends a placeholder one.
+
 ## Capitalisation
 
 Toker is an ordinary name and takes ordinary capitalisation. `toker` lowercase
