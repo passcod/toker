@@ -7,7 +7,8 @@ id: DCONF
 Toker's configuration lives in its store, beside the policy revisions and the ledger, and is edited from the dashboard.
 This spec covers the two settings that cannot live there, what the store holds instead, where a credential may be kept, and which directories the service may write.
 
-There MUST be no configuration file.
+Toker MUST NOT write a configuration file.
+One left by an earlier version is read only to move the machine off it.
 
 Routing is not configuration.
 It lives in the store as policy revisions, as [RREV](../routing/revisions.md) specifies, and how a machine's routing moved there is specified by [RMIG](../routing/migration.md).
