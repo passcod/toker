@@ -11,7 +11,7 @@ Every route MUST also answer under a `/f/<name>` prefix.
 Toker MUST strip the prefix before matching the path, and MUST retain the name for the rest of the request.
 
 A profile name MUST consist of lowercase ASCII letters, digits, `-` and `_`.
-A configured notice style whose name falls outside that set MUST be refused when the configuration is read.
+A notice style whose name falls outside that set MUST be refused when it is set, as [DCONF](../service/config.md#editing) specifies.
 
 A request's profile name MUST select its gate notice style, which [GNOTE](../gates/notices.md) specifies.
 A request's profile name MUST be recorded on the request's ledger row.

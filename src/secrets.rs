@@ -5,7 +5,7 @@
 //! [`SecretStore`] so no test ever touches the real keyring: the wizard's
 //! tests and the server's inject a map-backed store instead.
 //!
-//! spec: SEC#a-credential-is-never-logged-stored-or-displayed (credentials): a key read here only ever becomes the
+//! spec: SEC#a-credential-is-never-logged-or-displayed (credentials): a key read here only ever becomes the
 //! provider's injected credential. It is never logged, and the errors
 //! below name the account, never the value.
 

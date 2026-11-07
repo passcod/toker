@@ -33,7 +33,7 @@
 //! ([`patchers`]). A fully-wired machine re-run detects everything,
 //! changes nothing, and says so.
 //!
-//! Credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed): a pasted key goes only into the OS keyring
+//! Credentials (spec: SEC#a-credential-is-never-logged-or-displayed): a pasted key goes only into the OS keyring
 //! ([`SecretStore`] — tests inject a map) or, when there is none, the
 //! 0600 `toker.toml` — never into a prompt message, never into the
 //! wizard's output, never into a unit file. Tests pin the rule with a
@@ -202,7 +202,7 @@ pub trait Prompt {
     /// when one is given (the wizard resolves empties itself, so the
     /// real UI and the fake agree). `secret: true` is key entry: the
     /// real UI renders a password prompt and never echoes the answer;
-    /// the wizard stores it but never prints it (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// the wizard stores it but never prints it (spec: SEC#a-credential-is-never-logged-or-displayed).
     fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String>;
 }
 
@@ -1108,7 +1108,7 @@ const BACKENDS: &[(&str, &str)] = &[
 /// What one wizard run did — the finish summary's data, returned for
 /// tests and any future caller. Holds no secrets by construction:
 /// credential fields appear only as key *sources*, never values
-/// (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// (spec: SEC#a-credential-is-never-logged-or-displayed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunReport {
     /// The port this run configured (the written or kept config's).
@@ -3285,7 +3285,7 @@ fn toml_has_db_path(text: &str) -> bool {
 }
 
 /// A provider's key line for the config summary — sources only, never
-/// values (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// values (spec: SEC#a-credential-is-never-logged-or-displayed).
 fn key_line(provider: &str, sources: crate::config::KeySources, env: &str) -> String {
     let stored = if sources.keyring_configured {
         ", else the OS keyring"

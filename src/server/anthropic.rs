@@ -216,7 +216,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let (parts, body) = request.into_parts();
 
     // Session identity and betas, read by name only — request headers are
-    // never captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    // never captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-or-displayed).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
     let betas = request_betas(&parts.headers);
     // Ping tagging: a lane whose request carried the
@@ -1752,7 +1752,7 @@ async fn transparent_to(server: Server, request: Request, target: ModelTarget) -
 
 /// The `anthropic-beta` request header, split into its flags:
 /// a comma-separated list of feature flags and nothing
-/// else, read by name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed). Worth recording because flags
+/// else, read by name only (spec: SEC#a-credential-is-never-logged-or-displayed). Worth recording because flags
 /// change what a request costs and how it is bounded. `None` when the
 /// header is absent — absent ≠ empty; a present-but-empty header is a
 /// real empty list. spec: SEC#no-prompt-or-completion-content-is-recorded: the flags are fixed feature names

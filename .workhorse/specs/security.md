@@ -30,9 +30,11 @@ An export MUST carry nothing that is not a ledger column, as [UREAD](cli/readers
 
 Policy data and diagnostics MUST carry no prompt, completion or provider error body, as [DCTRL](service/control.md#the-operations) specifies.
 
-## A credential is never logged, stored or displayed
+## A credential is never logged or displayed
 
-Toker MUST NOT write a credential's value to a log, to the store, or to any output.
+Toker MUST NOT write a credential's value to a log or to any output.
+
+A credential that passes through Toker MUST NOT be recorded, cached or kept.
 
 Toker MUST report which source supplies a credential and MUST NOT report the value, as [UCLI](cli/commands.md#status) specifies.
 
@@ -43,7 +45,12 @@ Toker MUST read request headers by name and MUST NOT capture them wholesale, as 
 > [!NOTE]
 > Headers carry the client's bearer, so a wholesale capture puts it wherever the capture goes.
 
-A credential Toker holds MUST live in the operating system's keyring, in an environment variable, or as a literal in a file readable only by its owner.
+A credential Toker holds MUST live in the operating system's keyring, in an environment variable, or as a literal in the store.
+
+Where a credential is held as a literal, it MUST lie in a directory readable only by its owner, as [DCONF](service/config.md#state) requires.
+
+> [!NOTE]
+> Toker holds a credential only where the operator put it, and the three places are the operator's choice between the keyring's protection and not needing one unlocked.
 
 ## A credential reaches only the party it was meant for
 

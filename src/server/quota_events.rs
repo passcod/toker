@@ -29,7 +29,7 @@
 //! the store cannot read seeds nothing, which is ctp's behaviour.
 //!
 //! Only meter values, claim names and status strings are logged
-//! (spec: SEC#no-prompt-or-completion-content-is-recorded, spec: SEC#a-credential-is-never-logged-stored-or-displayed). Nothing here may break a request (spec: STORE#not-recorded-is-not-zero):
+//! (spec: SEC#no-prompt-or-completion-content-is-recorded, spec: SEC#a-credential-is-never-logged-or-displayed). Nothing here may break a request (spec: STORE#not-recorded-is-not-zero):
 //! the server calls [`QuotaEvents::note`] under `catch_unwind`, and the
 //! latch lock recovers from poisoning.
 

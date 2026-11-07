@@ -153,7 +153,7 @@ pub fn status() -> anyhow::Result<()> {
 }
 
 /// One api-key backend's key sources for `status`: which are set,
-/// never a value (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// never a value (spec: SEC#a-credential-is-never-logged-or-displayed).
 ///
 /// The env verdict is this shell's environment, which the service does
 /// not share (it sees the systemd user manager's), so the line says so.

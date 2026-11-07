@@ -53,8 +53,22 @@ A control path added later MUST require a JSON body where it mutates.
 | routing reactivate | copy a historical revision into a new active one |
 | routing promote | mark a learned model eligible for upgrades |
 | routing publication | record a failed or unsupported publication |
+| config snapshot | everything the configuration pages show, carrying no credential value |
+| config edit | apply a typed edit to a configuration row |
+| config credential | choose where a provider's credential comes from, and set the literal where that is the source |
 
 The meaning of each routing operation is specified by [RREV](../routing/revisions.md), and the publication handoff by [RPUB](../routing/publication.md#publication-state).
+
+What configuration holds is specified by [DCONF](../service/config.md#in-the-store).
+
+A configuration operation MUST apply its change to the service's own running state in the same operation, as [DCONF](../service/config.md#editing) requires.
+
+A configuration operation MUST refuse a value it cannot use, naming the setting, and MUST leave the stored value as it was.
+
+A credential value MUST reach Toker only through the credential operation, and no operation MUST return one.
+
+> [!NOTE]
+> The edit operation then never carries a secret in either direction, so neither does anything that logs or replays it.
 
 The publication operation MUST record only a failure or a lack of support.
 

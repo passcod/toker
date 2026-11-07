@@ -91,7 +91,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let (parts, body) = request.into_parts();
 
     // Session identity, read by name only — request headers are never
-    // captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    // captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-or-displayed).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
     // Ping tagging: a lane whose request carried the
     // ping header is recorded but excluded from liveness — the window
@@ -1036,7 +1036,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
 }
 
 /// The session identity from the configured header names, in priority
-/// order, read by name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// order, read by name only (spec: SEC#a-credential-is-never-logged-or-displayed).
 pub(crate) fn session_id(names: &[String], headers: &HeaderMap) -> Option<String> {
     for name in names {
         if let Some(value) = headers
@@ -1266,7 +1266,7 @@ pub(crate) fn error_response(
 /// The 502 for a request that never got an upstream response (a refused
 /// connection, the read timeout before the headers). The transport's own
 /// error names what failed; it carries the URL but no credential, which
-/// travels in headers (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// travels in headers (spec: SEC#a-credential-is-never-logged-or-displayed).
 pub(crate) fn transport_failure(wire: ErrorWire, error: &dyn std::fmt::Display) -> Response {
     upstream_failure(wire, &format!("toker upstream error: {error}"))
 }

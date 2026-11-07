@@ -72,7 +72,7 @@ pub(crate) struct AnthropicRecordCtx {
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub(crate) session_id: Option<String>,
     /// Verified frontend-derived lineage; never inferred from backend routing.
     pub(crate) lineage: Option<SessionLineage>,
@@ -747,7 +747,7 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached (the gate's own).
     pub(crate) backend_id: &'a str,
@@ -1022,7 +1022,7 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached.
     pub(crate) backend_id: &'a str,

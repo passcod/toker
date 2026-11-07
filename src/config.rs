@@ -8,7 +8,7 @@
 //! env overrides over it (`TOKER_PORT`, `TOKER_DB`, `TOKER_UPSTREAM`), and
 //! expose a [`Config`] the server and CLI can use.
 //!
-//! spec: SEC#a-credential-is-never-logged-stored-or-displayed (credentials): the resolved config holds the key sources
+//! spec: SEC#a-credential-is-never-logged-or-displayed (credentials): the resolved config holds the key sources
 //! (env var name, whether the key is in the keyring, optional literal),
 //! and `toker status` reports only which sources are set — never the key
 //! values. The keyring itself is read only by the service
@@ -29,7 +29,7 @@ use crate::store;
 pub const DEFAULT_PORT: u16 = 18_123;
 
 /// Default session-attribution header names, read by name only (plan:
-/// Attribution, headers-first; spec: SEC#a-credential-is-never-logged-stored-or-displayed — request headers are never
+/// Attribution, headers-first; spec: SEC#a-credential-is-never-logged-or-displayed — request headers are never
 /// captured wholesale). `x-claude-code-session-id` is claude's own
 /// header; `x-toker-session` is what setup injects into opencode.
 pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
@@ -40,7 +40,7 @@ pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
 
 /// The default ping-tagging header. The window
 /// pinger injects it via `ANTHROPIC_CUSTOM_HEADERS`, read by name only
-/// (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// (spec: SEC#a-credential-is-never-logged-or-displayed).
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
 
 /// OpenRouter's upstream base, including the `/v1` prefix.
@@ -328,7 +328,7 @@ impl OpenRouterConfig {
         )
     }
 
-    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-stored-or-displayed: never
+    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-or-displayed: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
         self.key_sources_with_env(&ProcessEnvironment)
@@ -475,7 +475,7 @@ impl AnthropicApiConfig {
         )
     }
 
-    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub fn key_sources(&self) -> KeySources {
         self.key_sources_with_env(&ProcessEnvironment)
     }
@@ -493,7 +493,7 @@ impl AnthropicApiConfig {
 /// The codex subscription provider block, resolved. No key sources:
 /// auth is the shared `auth.json` login (see [`crate::providers::codex`]
 /// — always toker-signed, never pass-through), reported by presence
-/// only (spec: SEC#a-credential-is-never-logged-stored-or-displayed: never the values).
+/// only (spec: SEC#a-credential-is-never-logged-or-displayed: never the values).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexSubConfig {
     /// Upstream base — the codex backend root, no `/responses` suffix.
@@ -678,7 +678,7 @@ fn resolve_api_key(
 }
 
 /// Which key sources are set — the whole of what status may report about
-/// credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed). The keyring is reported as configured, not
+/// credentials (spec: SEC#a-credential-is-never-logged-or-displayed). The keyring is reported as configured, not
 /// read: only the service reads it.
 fn key_sources_of(
     environment: &impl Environment,
