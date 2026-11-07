@@ -15,7 +15,7 @@
 //! production behaviours of the predecessor proxy, ctp — the Node proxy this
 //! toolsuite replaces. They are ported, not improved: the behaviours were
 //! measured over weeks of live traffic, and the marker rule is a frozen
-//! public API (invariant 4). The ported pieces:
+//! public API (spec: WCANON#rendering). The ported pieces:
 //!
 //! - the request shape (counts, lengths, digests) and the prefix ladders,
 //!   compaction markers, and detection helpers behind it;
@@ -28,7 +28,7 @@
 //! views never assume a top-level `messages` exists: a missing or
 //! non-array `messages` reads as absent ([`AnthropicBody::messages`] is
 //! empty, [`AnthropicShape::req_messages`] is `None`), never as zero
-//! (invariant 3).
+//! (spec: STORE#not-recorded-is-not-zero).
 
 use std::borrow::Cow;
 
@@ -72,7 +72,7 @@ impl Release {
 
 // Fixed strings Claude Code itself emits around a
 // compaction. Only whether they matched is recorded, never the surrounding
-// text (invariant 1). The instruction is matched by the opening all three
+// text (spec: SEC#no-prompt-or-completion-content-is-recorded). The instruction is matched by the opening all three
 // compaction wordings share, and the tool-refusal preamble every one of
 // them carries, independently: a rewording of one does not take the
 // detection with it. Either is enough (measured against the predecessor's
@@ -84,7 +84,7 @@ pub(crate) const COMPACT_PERFORMING: &[&str] = &[
 const COMPACT_RESUMED: &str = "This session is being continued from a previous conversation";
 // The opening sentence of Claude Code's recap prompt (its "away summary"),
 // matched at a line start in the last turn like the compaction wordings.
-// Only whether it matched is recorded (invariant 1).
+// Only whether it matched is recorded (spec: SEC#no-prompt-or-completion-content-is-recorded).
 const RECAP_PROMPT: &str = "The user stepped away and is coming back.";
 
 // Ladder geometry. `pub(crate)`: the TUI's
@@ -172,7 +172,7 @@ impl<'a> AnthropicBody<'a> {
 
     /// The content-free request shape for the ledger and lanes:
     /// counts, lengths, and digests
-    /// only, never prompt, message, or tool text (invariant 1).
+    /// only, never prompt, message, or tool text (spec: SEC#no-prompt-or-completion-content-is-recorded).
     ///
     /// The predecessor gates this on `POST` + `/v1/messages*`; that is the
     /// server's
@@ -224,7 +224,7 @@ impl<'a> AnthropicBody<'a> {
         AnthropicShape {
             req_bytes: self.request.req_bytes,
             // Row parity: null when `messages` is missing or not an array,
-            // not zero (absence ≠ zero, invariant 3).
+            // not zero (absence ≠ zero, spec: STORE#not-recorded-is-not-zero).
             req_messages: value
                 .get("messages")
                 .and_then(Value::as_array)
@@ -274,7 +274,7 @@ impl<'a> AnthropicBody<'a> {
 
 impl AnthropicBodyMut<'_> {
     /// Set the top-level `model`. With `preserve_order` this is the
-    /// deliberate once-per-change byte edit invariant 4 requires: an
+    /// deliberate once-per-change byte edit spec: WCANON#rendering requires: an
     /// existing key keeps its position (only its value's bytes change), an
     /// absent key is inserted at the end, and nothing else moves. A body
     /// whose top level is not an object is left untouched (the protocol
@@ -673,7 +673,7 @@ impl<'a> Tool<'a> {
 
 /// The content-free request shape for the ledger and lanes:
 /// counts, lengths, and digests only —
-/// never prompt, message, or tool text (invariant 1). The server unit
+/// never prompt, message, or tool text (spec: SEC#no-prompt-or-completion-content-is-recorded). The server unit
 /// copies these into the `requests` row.
 ///
 /// Length unit parity: JS strings are UTF-16, and the ledger must
@@ -684,7 +684,7 @@ pub struct AnthropicShape {
     /// The original wire buffer's length, passed through from parse.
     pub req_bytes: u64,
     /// Message count; `None` when `messages` is missing or not an array
-    /// (absence ≠ zero, invariant 3) — including batches bodies.
+    /// (absence ≠ zero, spec: STORE#not-recorded-is-not-zero) — including batches bodies.
     pub req_messages: Option<u64>,
     /// Tool count (0 when `tools` is absent — row parity).
     pub req_tools: u64,
@@ -878,7 +878,7 @@ impl AnthropicShape {
     }
 }
 
-/// One system block's digest and length (no content — invariant 1).
+/// One system block's digest and length (no content — spec: SEC#no-prompt-or-completion-content-is-recorded).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemBlockDigest {
     /// The block's length in UTF-16 code units (unit parity — JS strings).
@@ -959,7 +959,7 @@ const MARKER_SCAN: usize = 4;
 /// Where a summarisation wording sits near the end of the conversation,
 /// matched or not, so the next change to Claude Code's layout leaves
 /// evidence in the ledger instead of silence. Positions and booleans
-/// only, never text (invariant 1).
+/// only, never text (spec: SEC#no-prompt-or-completion-content-is-recorded).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactMarker {
     /// Messages between the carrier and the end: 0 when it is the last.

@@ -1,6 +1,5 @@
 //! The fetched model catalogues — the providers' own models listings,
-//! cached (plan: Model catalogues — the live counterpart to
-//! [`super::windows`]).
+//! cached.
 //!
 //! The hand-verified catalogue is the ceiling source of record, but it
 //! can only know what a hand verified. The backends also expose a
@@ -54,7 +53,7 @@
 //! fresh curl) and the same parse functions run at load: a parse-rule
 //! fix applies to cached data with no migration.
 //!
-//! ## Auth per source (invariant 2)
+//! ## Auth per source (spec: SEC#a-credential-is-never-logged-stored-or-displayed)
 //!
 //! - openrouter's `/models` is public — fetched with no credential.
 //! - anthropic's `/v1/models` requires auth. With an `anthropic_api`
@@ -71,7 +70,7 @@
 //!   stored login is used as-is, **no refresh attempt** — a stale
 //!   token simply fails into the fallback.
 //!
-//! Absence ≠ zero (invariant 3): every failure path degrades to the
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): every failure path degrades to the
 //! stale cache or an empty catalogue — [`FetchedCatalog::context_window_of`]
 //! answering `None` — never to a guessed window.
 
@@ -184,7 +183,7 @@ impl FetchedCatalog {
     /// dated snapshot never inherits its dateless model's window and a
     /// sibling never shares one (the exact-identity discipline,
     /// [`super::windows`]; an unmatched id stays `None`, never a
-    /// guess — invariant 3).
+    /// guess — spec: STORE#not-recorded-is-not-zero).
     pub fn context_window_of(&self, model: &str) -> Option<u64> {
         self.models
             .iter()
@@ -218,7 +217,7 @@ impl FetchedCatalog {
     /// catalogue, its entry carries no `pricing` object to read at all
     /// (the anthropic and codex listings), or its write
     /// price is present but will not parse — absence is never a free
-    /// verdict (invariant 3): unknown reads as charged, the
+    /// verdict (spec: STORE#not-recorded-is-not-zero): unknown reads as charged, the
     /// conservative direction for a gate that fires.
     pub fn cache_writes_free(&self, model: &str) -> Option<bool> {
         let entry = self.models.iter().find(|entry| entry.id == model)?;

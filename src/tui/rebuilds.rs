@@ -1,5 +1,5 @@
-//! The CACHE REBUILDS panel's aggregation (plan: TUI — "the panel to
-//! watch"): a port of the predecessor's lane walk, cause classification,
+//! The CACHE REBUILDS panel's aggregation: a port of the predecessor's lane
+//! walk, cause classification,
 //! and system-change localisation.
 //!
 //! The walk ([`classify`]) is the reference dashboard's lane walk with
@@ -65,7 +65,7 @@
 //! do not bound: no rungs, no claim, and the line says the position is
 //! unknown.
 //!
-//! Absence ≠ zero (invariant 3) throughout: a NULL `cache_write_total`
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero) throughout: a NULL `cache_write_total`
 //! is an unmeasurable rewrite (counted, never zero-filled), and the
 //! panel's denominators keep the measured count separate from the
 //! unknown one.

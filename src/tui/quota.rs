@@ -1,4 +1,4 @@
-//! The rate & quota panel's aggregation (plan: TUI — "rate & quota"), a
+//! The rate & quota panel's aggregation, a
 //! faithful port of the predecessor pieces that panel rendered from:
 //!
 //! - the three panel meters. The
@@ -23,7 +23,7 @@
 //!   window's reset passes ([`exhausted_meters`] carries `now`), and
 //!   the `?` marks a gate state assumed from rows predating `gate_on`.
 //!
-//! Absence ≠ zero (invariant 3) decides the panel's presence too: rows
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero) decides the panel's presence too: rows
 //! without meter snapshots produce no section at all — nothing renders,
 //! never zeros — which is also the per-backend panel rule (an openai
 //! window has no quota meters and no quota panel).
@@ -82,7 +82,7 @@ const PANEL_METERS: [PanelMeter; 3] = [
 
 /// The quota section of the dashboard snapshot. `None` when the
 /// lookback holds no meter snapshot at all — the panel renders nothing
-/// rather than zeros (invariant 3's per-backend panel rule).
+/// rather than zeros (spec: STORE#not-recorded-is-not-zero's per-backend panel rule).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QuotaAgg {
     /// The meters the newest reading carries, in render order.
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn no_meter_rows_leave_the_section_absent() {
         // Rows without meter snapshots: no section at all — the panel
-        // renders nothing, never zero-filled meters (invariant 3's
+        // renders nothing, never zero-filled meters (spec: STORE#not-recorded-is-not-zero's
         // per-backend panel rule: an openai window has no quota panel).
         assert_eq!(
             quota(&[meter_bare(NOW - MIN), meter_bare(NOW - 2 * MIN)]),
@@ -1281,7 +1281,7 @@ mod tests {
         let Some(quota) = quota else {
             // Absence is a verdict here, not a failure: a ledger whose
             // rows carry no meter snapshots renders no quota panel
-            // (invariant 3), which is what production shows today.
+            // (spec: STORE#not-recorded-is-not-zero), which is what production shows today.
             eprintln!(
                 "no meter snapshots in the production ledger — the panel \
                  renders nothing (absence ≠ zero)"

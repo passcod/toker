@@ -7,8 +7,7 @@
 //! silently overcharge those models 4×. Every rate the ledger needs is a
 //! table entry, never arithmetic on another entry.
 //!
-//! Not ported from the predecessor (plan: the plan/overage layer died
-//! with ctp): `PLAN_USD_PER_MONTH`, `PLAN_PRO_MULTIPLE`,
+//! Not ported from the predecessor: `PLAN_USD_PER_MONTH`, `PLAN_PRO_MULTIPLE`,
 //! `OVERAGE_RATE_MULTIPLIER`,
 //! `ALT_PLAN`. Only per-token prices, the fast-mode table, the web-search
 //! per-call price, and the US-geo multiplier survive into toker.

@@ -11,8 +11,7 @@
 //!   (cache-read is never derived as a ratio of input: some models read at
 //!   0.025×), fast-mode repricing, the US-geo 1.1× multiplier, and the
 //!   web-search per-call price. The predecessor's plan/overage constants
-//!   are deliberately NOT ported (plan: "Legacy ctp tooling … the
-//!   plan/overage constants die with ctp").
+//!   are deliberately NOT ported.
 //! - [`windows`]: the context-window catalogue — exact
 //!   identities, fixed/beta/declared capabilities, dated phases for
 //!   historical rows, and the reconciliation rules that decide
@@ -31,7 +30,7 @@
 //! carry their own freshness (`fetched_at_ms`, a TTL, and a
 //! refresh cycle) — machine-fresh, not hand-verified.
 //!
-//! Unknown stays unknown everywhere (invariant 3): a model missing from a
+//! Unknown stays unknown everywhere (spec: STORE#not-recorded-is-not-zero): a model missing from a
 //! table returns `None`/`Unknown`, never a guess. The caller records the
 //! absence (a NULL cost plus a one-time warning) rather than inventing a
 //! number.

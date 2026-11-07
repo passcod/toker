@@ -1,7 +1,7 @@
 //! The proxy routes: chat completions (the usage path, fully recorded) and
 //! locally projected model discovery.
 //!
-//! Chat completions, in order (plan: Server core):
+//! Chat completions, in order:
 //!
 //! 1. Buffer the request body fully.
 //! 2. Parse the frontend wire into canonical IR. An invalid Chat body gets a
@@ -9,7 +9,7 @@
 //! 3. Routing: the active policy revision resolves the model to a binding
 //!    and the effective model to send.
 //! 4. The selected backend adapter renders the request deterministically.
-//! 5. **The cold-cache notice** (plan: Middleware — cold gate): the
+//! 5. **The cold-cache notice**: the
 //!    OpenRouter Chat binding's gate, on the lane the request itself keys (session ×
 //!    tools-hash) and the post-routing model. A summarising request is
 //!    exempt, as on the anthropic path. No quota outlook is applied on the
@@ -91,9 +91,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let (parts, body) = request.into_parts();
 
     // Session identity, read by name only — request headers are never
-    // captured wholesale: they carry credentials (invariant 2).
+    // captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
-    // Ping tagging (plan: Middleware): a lane whose request carried the
+    // Ping tagging: a lane whose request carried the
     // ping header is recorded but excluded from liveness — the window
     // pinger's probe must never hold the sleep lock, on this path like
     // the anthropic one.
@@ -614,7 +614,7 @@ pub(crate) async fn send_upstream_to(
     path: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = provider.endpoint(path);
-    // Pass-through-when-present (plan: Credentials): a frontend that
+    // Pass-through-when-present: a frontend that
     // brings its own credential keeps it verbatim; the stored credential
     // is injected only when the request carries none. If neither exists
     // the request goes unauthenticated and the upstream's 401 body passes
@@ -1036,7 +1036,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
 }
 
 /// The session identity from the configured header names, in priority
-/// order, read by name only (invariant 2).
+/// order, read by name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 pub(crate) fn session_id(names: &[String], headers: &HeaderMap) -> Option<String> {
     for name in names {
         if let Some(value) = headers
@@ -1266,7 +1266,7 @@ pub(crate) fn error_response(
 /// The 502 for a request that never got an upstream response (a refused
 /// connection, the read timeout before the headers). The transport's own
 /// error names what failed; it carries the URL but no credential, which
-/// travels in headers (invariant 2).
+/// travels in headers (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 pub(crate) fn transport_failure(wire: ErrorWire, error: &dyn std::fmt::Display) -> Response {
     upstream_failure(wire, &format!("toker upstream error: {error}"))
 }

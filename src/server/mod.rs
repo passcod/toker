@@ -57,7 +57,7 @@
 //! response is aborted rather than ended (no row either way).
 //!
 //! [`RecordCtx`]-based recording notes the clock is used **only** for row
-//! fields (ts, duration) — never for bytes (invariant 4); serialisation
+//! fields (ts, duration) — never for bytes (spec: WCANON#rendering); serialisation
 //! decisions never consult runtime state.
 
 pub(crate) mod anthropic;
@@ -647,7 +647,7 @@ impl Server {
     /// backend's quota (see [`quota_events`]). Call it before the
     /// snapshot is saved: the first reading after a restart seeds its
     /// latch from the one the store still holds. Never fails and never
-    /// panics out (invariant 3): a lost announcement is the worst case.
+    /// panics out (spec: GATE#only-a-gate-stops-a-session): a lost announcement is the worst case.
     pub(crate) fn note_quota(&self, backend: &str, snapshot: &serde_json::Value) {
         let announced = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let prior = || match self.store.load_meters(backend) {
@@ -1963,7 +1963,7 @@ impl Server {
             loop {
                 timer.tick().await;
                 let now = record::now_ms();
-                // Either prune is never worth a request (invariant 3
+                // Either prune is never worth a request (spec: STORE#not-recorded-is-not-zero
                 // spirit): a failure retries on the next tick.
                 match store.prune_lanes(now, lanes::LANE_MAX, lanes::LANE_MAX_AGE_MS) {
                     Ok(0) => {}
@@ -2746,7 +2746,7 @@ fn split_frontend(path: &str) -> Option<(&str, &str)> {
 /// The router's first step: strip a `/f/<frontend>` prefix off the
 /// request path (the query rides along untouched) and record the name.
 /// Never fails a request: a URI that would not rebuild is passed on as
-/// it came (invariant 3 — accounting never breaks a session).
+/// it came (spec: STORE#not-recorded-is-not-zero — accounting never breaks a session).
 async fn strip_frontend_prefix(mut request: axum::extract::Request) -> axum::extract::Request {
     let Some((name, rest)) = split_frontend(request.uri().path()) else {
         return request;

@@ -1,6 +1,5 @@
 //! The quota gate: meters → block-or-forward, plus the synthetic assistant
-//! turn a block is answered with (plan: Middleware — "Quota gate + release
-//! marker", the anthropic_sub backend being today's only meter source).
+//! turn a block is answered with.
 //!
 //! Everything here is a faithful port of the predecessor proxy's quota
 //! gate, measured over weeks of live traffic — ported, not improved.
@@ -26,7 +25,7 @@
 //! names a
 //! wall-clock time — is made an *input* here: the caller passes the
 //! [`jiff::tz::TimeZone`] to render in, so the notice text stays a pure
-//! function of its arguments (invariant 4 — a gate notice enters replayed
+//! function of its arguments (spec: GNOTE#a-notice-is-byte-stable — a gate notice enters replayed
 //! history and must be byte-stable forever).
 //!
 //! Units: meter resets are **epoch seconds** (the wire form in the
@@ -34,7 +33,7 @@
 //! milliseconds** (a `Date.now()`-style convention, kept so the vendored
 //! contract fixture's `now` values dispatch unchanged).
 //!
-//! Absence ≠ a limit (invariant 3): unknown meters forward. A proxy that
+//! Absence ≠ a limit (spec: STORE#not-recorded-is-not-zero): unknown meters forward. A proxy that
 //! has seen no response yet knows nothing about the window, and blocking on
 //! that would stop every session on a cold start.
 
@@ -108,7 +107,7 @@ impl Meter {
 /// only the fields the gate decides on: util/reset per window, whether
 /// spend has shifted to overage, and the binding claim.
 ///
-/// Every read is absent-when-missing, never zero (invariant 3). Resets are
+/// Every read is absent-when-missing, never zero (spec: STORE#not-recorded-is-not-zero). Resets are
 /// epoch seconds, always integral on the wire; a non-integral reset value
 /// reads as absent, which the gate treats as a window it cannot see (a
 /// spent util with an unreadable reset blocks with `resets_at: None`, the
@@ -389,7 +388,7 @@ impl Blocking {
     /// server resolves it from the request's `/f/<frontend>` prefix
     /// through `[notices]`); here it is just one more input.
     ///
-    /// Pure function of its inputs, style included (invariant 4): the
+    /// Pure function of its inputs, style included (spec: GNOTE#a-notice-is-byte-stable): the
     /// reset time renders in the passed timezone, to the minute (`%H:%M`,
     /// 24-hour — the predecessor followed the process locale's hour
     /// cycle, which has
@@ -568,7 +567,7 @@ fn sse_event(out: &mut String, event: &str, data: &Value) {
 
 /// Comma-grouped digit rendering: deliberately
 /// NOT locale-moving — these figures land in notices whose bytes are
-/// pinned by tests and replayed in history (invariant 4). Shared with the
+/// pinned by tests and replayed in history (spec: GNOTE#a-notice-is-byte-stable). Shared with the
 /// cold gate's notice.
 pub(crate) fn group(n: u64) -> String {
     let digits = n.to_string();
@@ -1002,7 +1001,7 @@ mod tests {
         );
     }
 
-    // ── absence is not a limit (invariant 3) ───────────────────────────
+    // ── absence is not a limit (spec: STORE#not-recorded-is-not-zero) ───────────────────────────
 
     #[test]
     fn unknown_meters_forward() {
@@ -1125,7 +1124,7 @@ mod tests {
 
     #[test]
     fn the_notice_is_a_pure_function_of_its_inputs() {
-        // Invariant 4: a gate notice enters replayed history, so the same
+        // spec: GNOTE#a-notice-is-byte-stable: a gate notice enters replayed history, so the same
         // inputs (style included) must render the same bytes, forever, on
         // every call. Pinned in the DEFAULT style, the generic GFM alert —
         // the wrapper the client actually carries is part of the pinned
@@ -1291,7 +1290,7 @@ mod tests {
         assert_ne!(sse, json);
 
         // The turn is pure too: identical inputs, identical bytes, any
-        // number of calls (invariant 4 — the turn enters the client's
+        // number of calls (spec: WCANON#rendering — the turn enters the client's
         // transcript, which replays it on every later request).
         for _ in 0..3 {
             assert_eq!(
@@ -1305,7 +1304,7 @@ mod tests {
     fn the_rendered_notice_rides_in_both_turn_renderings() {
         // The wiring the server does — notice(style) → blocked_turn —
         // carries the RENDERED notice, block and all: the toker block
-        // is part of both the SSE and the JSON body bytes (invariant 4).
+        // is part of both the SSE and the JSON body bytes (spec: GNOTE#a-notice-is-byte-stable).
         // JSON escapes the block's newlines as `\n`; everything else
         // (the star, the dashes) rides the text field raw.
         let tz = utc();

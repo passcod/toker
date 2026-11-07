@@ -1,4 +1,4 @@
-//! The openrouter backend (plan: "Backend providers") — OpenAI-chat
+//! The openrouter backend — OpenAI-chat
 //! protocol, API-key auth, real billed `usage.cost` plus the serving
 //! provider captured verbatim (ledger parity).
 
@@ -44,7 +44,7 @@ pub struct OpenRouter {
     upstream: Url,
     /// The API key, resolved once at startup (env first, then the config
     /// literal — see [`crate::config::OpenRouterConfig::api_key`]). Never
-    /// logged, never in the ledger (invariant 2).
+    /// logged, never in the ledger (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     api_key: Option<String>,
 }
 

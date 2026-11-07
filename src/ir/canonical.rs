@@ -565,7 +565,7 @@ pub enum CanonStopReason {
 /// is for whoever wants the wire's own shape (the ledger's verbatim
 /// column, a future frontend that passes usage through).
 ///
-/// Absence ≠ zero (invariant 3): every bucket is an `Option`
+/// Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): every bucket is an `Option`
 /// because a backend may not report it — the codex wire always
 /// carries `input`/`output` as plain numbers, but the canonical
 /// never assumes any backend's reporting shape. `reasoning` rides
@@ -645,7 +645,7 @@ pub struct CanonError {
 /// Protocol-neutral and frontend-agnostic: no SSE, no
 /// `message_start`, no content blocks — a text part is a text part,
 /// wherever it streams to. Everything is a pure function of the
-/// events the backend emits (invariant 4): no ids minted, no parts
+/// events the backend emits (spec: WCANON#rendering): no ids minted, no parts
 /// invented, no ordering but the arrival order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanonEvent {
@@ -691,7 +691,7 @@ pub enum CanonEvent {
     ThinkingEnded,
     /// The turn ended — normally or short — with the stop reason and
     /// the usage when the turn reported one (absent stays absent,
-    /// never zeroed — invariant 3).
+    /// never zeroed — spec: STORE#not-recorded-is-not-zero).
     TurnEnded {
         stop_reason: CanonStopReason,
         usage: Option<CanonicalUsage>,

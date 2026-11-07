@@ -1,4 +1,4 @@
-//! The `requests` ledger: one row per request, insert-only (plan: Storage).
+//! The `requests` ledger: one row per request, insert-only.
 //!
 //! There is no `UPDATE` on `requests` anywhere in toker and the [Store API
 //! exposed for it](super::Store) has no update or delete method — the ledger
@@ -20,7 +20,7 @@ use crate::policy::{
 use super::{Error, Result, rows_of};
 use rusqlite::Connection;
 
-/// Proxy-written row kinds (plan: Storage). A real API measurement is **not**
+/// Proxy-written row kinds. A real API measurement is **not**
 /// a variant — it is `None`, which is why [RequestRow::kind] is
 /// `Option<RowKind>` and why [is_api_measurement] takes the `Option`.
 /// Keep the string forms in sync with the `kind` column comment in the
@@ -43,7 +43,7 @@ pub enum RowKind {
     Error,
     /// Every policy candidate failed preflight, so no upstream send occurred.
     RouteUnavailable,
-    /// Re-serialisation drifted from the request bytes (invariant 5); `drift_digest` set.
+    /// Re-serialisation drifted from the request bytes (spec: WCANON#rendering); `drift_digest` set.
     FidelityDrift,
     /// A session's allowances were deleted from the TUI: its gate applies again.
     Revoked,
@@ -84,7 +84,7 @@ impl RowKind {
     }
 }
 
-/// Cost in three explicit kinds, never conflated (plan: Storage).
+/// Cost in three explicit kinds, never conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostKind {
     /// Provider-reported cost (openrouter today).
@@ -128,7 +128,7 @@ impl std::str::FromStr for CostKind {
     }
 }
 
-/// Invariant 3: proxy-written rows are never API measurements. A row is an
+/// spec: STORE#not-recorded-is-not-zero: proxy-written rows are never API measurements. A row is an
 /// API measurement iff its kind is `None` — that is the whole rule, kept in
 /// one place so every consumer (TUI, export) classifies identically.
 pub fn is_api_measurement(kind: Option<RowKind>) -> bool {
@@ -893,8 +893,8 @@ impl PolicyRouteProvenance {
 /// One `requests` row: the complete column list as a single struct. Field
 /// names match their SQL columns one-to-one. Every field except `ts_ms` is
 /// an `Option` — absence is stored and read back as NULL, never as zero or
-/// `""` (invariant 3) — and no field carries prompt/completion/system/tool
-/// text, only digests, counts, and lengths (invariant 1).
+/// `""` (spec: STORE#not-recorded-is-not-zero) — and no field carries prompt/completion/system/tool
+/// text, only digests, counts, and lengths (spec: SEC#no-prompt-or-completion-content-is-recorded).
 ///
 /// Where a kind carries a kind-specific payload, the common kinds get
 /// explicit columns (gate provenance, `drift_digest`, the `error` triple)
@@ -1376,7 +1376,7 @@ pub(super) fn insert(conn: &Connection, row: &RequestRow) -> Result<()> {
 }
 
 /// Insert many rows in one transaction — the `toker import` batch path
-/// (plan: Storage). One transaction per batch keeps a 54 MB ingest from
+/// . One transaction per batch keeps a 54 MB ingest from
 /// holding one giant write transaction, while a failure can never expose
 /// a partial batch: the transaction commits whole or not at all. Returns
 /// the first and last assigned row ids (`(None, None)` for an empty
@@ -1412,7 +1412,7 @@ pub(super) fn insert_batch(
 /// cadence). If the aggregation needs another column, widen it
 /// consciously and say why.
 ///
-/// Absence stays absence (invariant 3): the gate-flag arm of the
+/// Absence stays absence (spec: STORE#not-recorded-is-not-zero): the gate-flag arm of the
 /// filter fetches rows that carry no snapshot at all, so `rate_limits`
 /// is `None` there — never an empty object — and the scalars round-trip
 /// NULL as `None`.
@@ -1520,7 +1520,7 @@ pub(super) fn ping_landed(conn: &Connection, provider: &str, ts_ms: i64) -> Resu
 /// Read one narrow meter row by column name. Unknown `kind` values are
 /// an error, not a silent `None` — the kind column drives the span
 /// total's proxy-row exclusion, and a corrupted value must never
-/// reclassify a row as an API measurement (invariant 3), same as the
+/// reclassify a row as an API measurement (spec: STORE#not-recorded-is-not-zero), same as the
 /// full-row read.
 fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
     Ok(MeterRow {
@@ -1582,7 +1582,7 @@ fn read_meter_row(row: &rusqlite::Row<'_>) -> Result<MeterRow> {
 ///   multi-request sessions held more than one lane. A TEXT column,
 ///   but a short digest read as one string per row.
 ///
-/// Absence stays absence (invariant 3): every field except `ts_ms`
+/// Absence stays absence (spec: STORE#not-recorded-is-not-zero): every field except `ts_ms`
 /// round-trips NULL as `None`, never as zero or `""`. That includes
 /// `cache_write_*` — an openai-chat backend has no cache-write metric,
 /// and a NULL there is an explicit "not reported", which the
@@ -1687,7 +1687,7 @@ pub(super) fn display_rows_since(
 /// `cost_kind` strings are an error, not a silent `None` — the kind
 /// column decides whether a row is an API measurement at all, and the
 /// cost kind decides billed vs priced-but-not-billed, so a corrupted
-/// value must never silently reclassify a row (invariant 3); same rule
+/// value must never silently reclassify a row (spec: STORE#not-recorded-is-not-zero); same rule
 /// as the full-row and meter reads.
 fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
     Ok(DisplayRow {
@@ -1778,7 +1778,7 @@ fn read_display_row(row: &rusqlite::Row<'_>) -> Result<DisplayRow> {
 /// attributes the next rebuild to a changed system prompt
 /// (a proxy-written row is not evidence about any prompt).
 /// Absence stays absence on every other column
-/// (invariant 3): a NULL `cache_write_total` is an unmeasurable
+/// (spec: STORE#not-recorded-is-not-zero): a NULL `cache_write_total` is an unmeasurable
 /// rewrite, counted as such, never a zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RebuildRow {
@@ -1921,7 +1921,7 @@ pub(super) fn localisation_rows(conn: &Connection, ids: &[i64]) -> Result<Vec<Lo
             // A rung list that is not an array of strings is a broken
             // ladder: it localises nothing, so it reads as absent — the
             // line then claims no position rather than a wrong one
-            // (invariant 3). Invalid JSON already failed the read above.
+            // (spec: STORE#not-recorded-is-not-zero). Invalid JSON already failed the read above.
             system_ladder: string_array(ladder).ok().flatten(),
             system_tail: string_array(tail).ok().flatten(),
             system_change: change,
@@ -2125,7 +2125,7 @@ pub struct SessionCostGroup {
 
 /// The `/_toker/session` aggregate: one session's ledger rows read in
 /// one pass for the opencode sidebar/footer. Absence ≠ zero holds
-/// throughout (invariant 3): every token sum is `None` when no
+/// throughout (spec: STORE#not-recorded-is-not-zero): every token sum is `None` when no
 /// measurement row carried the metric, and the billed total is `None`
 /// when no row was billed — a real zero sum reads back as `Some(0.0)`.
 #[derive(Debug, Clone, PartialEq)]
@@ -2326,7 +2326,7 @@ fn session_summary_with(
 /// Read one row by column name, so the SELECT order can never misalign a
 /// field. Unknown `kind`/`cost_kind` strings are an error, not a silent
 /// `None` — a corrupted enum value must never reclassify a row as an API
-/// measurement (invariant 3).
+/// measurement (spec: STORE#not-recorded-is-not-zero).
 fn read_row(row: &rusqlite::Row<'_>) -> Result<RequestRow> {
     let kind = parse_stored(
         "kind",

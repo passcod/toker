@@ -11,7 +11,7 @@
 //! with `preserve_order`, replacing an existing key keeps its position and
 //! inserting a new one appends at the end, so the rest of the body never
 //! moves. That is what makes a middleware edit the deliberate,
-//! once-per-change byte event invariant 4 requires.
+//! once-per-change byte event spec: WCANON#rendering requires.
 
 use serde_json::Value;
 
@@ -71,7 +71,7 @@ impl<'a> ChatBody<'a> {
 
     /// The content-free request shape for the ledger and lanes
     /// (row parity): counts, lengths, and digests only, never content
-    /// (invariant 1).
+    /// (spec: SEC#no-prompt-or-completion-content-is-recorded).
     pub fn shape(&self) -> Shape {
         let value = &self.request.value;
         let messages = Messages::over(value);
@@ -115,7 +115,7 @@ impl<'a> ChatBody<'a> {
         Shape {
             req_bytes: self.request.req_bytes,
             // Row parity: null when `messages` is missing or not an array,
-            // not zero (absence ≠ zero, invariant 3).
+            // not zero (absence ≠ zero, spec: STORE#not-recorded-is-not-zero).
             req_messages: value
                 .get("messages")
                 .and_then(Value::as_array)
@@ -137,7 +137,7 @@ impl<'a> ChatBody<'a> {
 
 impl ChatBodyMut<'_> {
     /// Set the top-level `model`. With `preserve_order` this is the
-    /// deliberate once-per-change byte edit invariant 4 requires: an
+    /// deliberate once-per-change byte edit spec: WCANON#rendering requires: an
     /// existing key keeps its position (only its value's bytes change), an
     /// absent key is inserted at the end, and nothing else moves. A body
     /// whose top level is not an object is left untouched (the protocol
@@ -319,13 +319,13 @@ impl<'a> Tool<'a> {
 
 /// The content-free request shape for the ledger and lanes (row parity):
 /// counts, lengths, and digests only — never message, system, or tool text
-/// (invariant 1). The server unit copies these into the `requests` row.
+/// (spec: SEC#no-prompt-or-completion-content-is-recorded). The server unit copies these into the `requests` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shape {
     /// The original wire buffer's length, passed through from parse.
     pub req_bytes: u64,
     /// Message count; `None` when `messages` is missing or not an array
-    /// (absence ≠ zero, invariant 3).
+    /// (absence ≠ zero, spec: STORE#not-recorded-is-not-zero).
     pub req_messages: Option<u64>,
     /// Tool count (0 when `tools` is absent — row parity).
     pub req_tools: u64,
@@ -413,7 +413,7 @@ impl Shape {
     }
 }
 
-/// One system block's digest and length (no content — invariant 1).
+/// One system block's digest and length (no content — spec: SEC#no-prompt-or-completion-content-is-recorded).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockDigest {
     /// The block's length in characters (Unicode scalar values).

@@ -1,10 +1,10 @@
-//! The anthropic backends (plan: "Backend providers") — two providers, one
+//! The anthropic backends — two providers, one
 //! upstream, one protocol ([crate::ir::anthropic]).
 //!
 //! - [`AnthropicSub`]: the subscription. Native Claude brings its own OAuth
 //!   bearer; foreign frontends use a toker-held token or Claude's local
-//!   login, in that order. The sub is also today's only **meter source** (plan: quota
-//!   gate — "Anthropic sub is the only meter source today"): the
+//!   login, in that order. The sub is also today's only **meter source**:
+//!   the
 //!   `anthropic-ratelimit-*` response headers parse into the quota
 //!   snapshot the gate will read.
 //! - [`AnthropicApi`]: the plain API. Auth is `x-api-key` — NOT a bearer —
@@ -110,7 +110,7 @@ pub struct AnthropicApi {
     upstream: Url,
     /// The API key, resolved once at startup (env first, then the config
     /// literal — see [`crate::config::AnthropicApiConfig::api_key`]). Never
-    /// logged, never in the ledger (invariant 2).
+    /// logged, never in the ledger (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     api_key: Option<String>,
 }
 
@@ -552,7 +552,7 @@ mod tests {
         );
         assert!(
             api().meters(&headers).is_none(),
-            "the API's RPM limits are not quota meters (plan: the sub is the only meter source)"
+            "the API's RPM limits are not quota meters"
         );
         assert!(sub().is_meter_source());
         assert!(!api().is_meter_source());

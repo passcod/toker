@@ -19,7 +19,7 @@
 //!
 //! Malformed data — non-JSON payloads, known kinds whose fields do not
 //! fit the typed views — degrades to the raw [`serde_json::Value`] on
-//! [`ResponseEvent::Unknown`] rather than being dropped (invariant 6:
+//! [`ResponseEvent::Unknown`] rather than being dropped (spec: GATE#only-a-gate-stops-a-session:
 //! a parse failure loses the typing, never the bytes).
 //!
 //! [`TurnCapture`] is the observer half (the sibling of
@@ -209,7 +209,7 @@ fn error_of(value: &Value, pointer: &str) -> Option<ResponseError> {
 
 /// What one turn added up to — the observer half of the codex side
 /// parser (see the module docs). Fields are `Option`/empty-defaults
-/// where the wire's absence is a fact, never zero (invariant 3).
+/// where the wire's absence is a fact, never zero (spec: STORE#not-recorded-is-not-zero).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnCapture {
     /// The response id, from `response.created` and confirmed by
@@ -245,7 +245,7 @@ impl TurnCapture {
     }
 
     /// Fold one typed event into the capture. Never fails, never gates a
-    /// stream (invariant 6).
+    /// stream (spec: GATE#only-a-gate-stops-a-session).
     pub fn observe(&mut self, event: &ResponseEvent) {
         if self.ended {
             return;
@@ -774,7 +774,7 @@ data: {"type":"response.completed","response":{"id":"late","usage":{"input_token
         assert!(parser.finish().is_none(), "flush is once");
 
         // Cut in the middle of the completed event's data line: that
-        // event is lost (a measurement, never a request — invariant 6),
+        // event is lost (a measurement, never a request — spec: GATE#only-a-gate-stops-a-session),
         // and the turn never ends.
         let mut parser = ResponsesSse::new();
         let events = parser.feed(&bytes[..bytes.len() - 60]);

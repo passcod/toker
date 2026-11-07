@@ -136,7 +136,7 @@ mod tests {
         // An unpublished dated identity has no family, never a rewrite
         // target: a future model is not evidence about an earlier one.
         assert_eq!(family("claude-opus-4-9-20261225"), None);
-        // Unknown stays unknown, never guessed (invariant 3).
+        // Unknown stays unknown, never guessed (spec: STORE#not-recorded-is-not-zero).
         assert_eq!(family(""), None);
         assert_eq!(family("   "), None, "blank normalises to no identity");
     }

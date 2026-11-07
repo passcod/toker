@@ -1,4 +1,4 @@
-//! State tables (plan: "State as tables"): small, read-modify-write data
+//! State tables: small, read-modify-write data
 //! alongside the insert-only ledger — lanes, learned models, allowances,
 //! pings, the last meter snapshot, and the meta key/value table.
 //!
@@ -22,8 +22,8 @@ use serde_json::Value;
 use super::{Error, Result, row_of, rows_of};
 use rusqlite::{Connection, TransactionBehavior};
 
-/// One lane row: `key` is the composite `"sessionId|toolsHash"` (plan: Lane
-/// tracking + sleep lock). `ping` lanes never hold the sleep lock.
+/// One lane row: `key` is the composite `"sessionId|toolsHash"`. `ping` lanes
+/// never hold the sleep lock.
 ///
 /// The predecessor's lane record, in store form: `updated_ms` is its
 /// `at` (moved only
@@ -403,7 +403,7 @@ pub struct BindingLearningUpdate {
 
 /// One learned-model row: days served and max prompt observed for an exact
 /// model identity, plus its hand-verified context-window catalogue entry
-/// (plan: Model catalogues).
+/// .
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelEntry {
     pub model_id: String,
@@ -416,7 +416,7 @@ pub struct ModelEntry {
 }
 
 /// One allowance row: a quota window opened against a meter, keyed by the
-/// reset value that ends it (plan: allowances keyed by reset value). A row
+/// reset value that ends it. A row
 /// whose reset has passed is inert, since no live meter reports it, and
 /// [`prune_allowances`] deletes it on the server's state-prune tick.
 #[derive(Debug, Clone, PartialEq)]
@@ -436,7 +436,7 @@ fn release_name(release: Release) -> &'static str {
     }
 }
 
-/// One ping run (plan: ping windows). Every field but `ts_ms` is
+/// One ping run. Every field but `ts_ms` is
 /// `None` on a row written before migration v4 added it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PingRecord {
@@ -495,8 +495,8 @@ impl PingAction {
     }
 }
 
-/// The last meter snapshot for one meter-source backend (plan: Server
-/// core). Every response updates its own provider's slot when the
+/// The last meter snapshot for one meter-source backend. Every response updates
+/// its own provider's slot when the
 /// backend has meters, so a spent reading stops counting once its
 /// window's reset passes. Keyed by provider id (migration v3): the
 /// anthropic sub's quota shape and the codex sub's usage-limit shape

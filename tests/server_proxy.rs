@@ -1422,7 +1422,7 @@ async fn control_status_is_gated_and_secret_free() {
     let text = response.text().await.expect("status body");
     assert!(
         !text.contains(secret),
-        "invariant 2: no key value ever leaves"
+        "spec: SEC — no key value ever leaves"
     );
     let value: Value = serde_json::from_str(&text).expect("status is JSON");
     assert_eq!(
@@ -1838,7 +1838,7 @@ async fn a_summarising_request_on_a_cold_lane_forwards_without_a_notice() {
 async fn a_model_unknown_to_the_catalogue_fires_conservatively() {
     let (mock, upstream) = spawn_mock().await;
     // A catalogue that exists but does not carry the request's model:
-    // unknown is never free (absence ≠ zero, invariant 3), so the gate
+    // unknown is never free (absence ≠ zero, spec: STORE#not-recorded-is-not-zero), so the gate
     // applies exactly as it did before the exemption existed.
     let (addr, store) = spawn_toker_cataloged(
         keyed_config(upstream),

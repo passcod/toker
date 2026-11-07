@@ -1,4 +1,4 @@
-//! The codex translation branch (plan: Phases — "Codex").
+//! The codex translation branch.
 //!
 //! A request routed to the codex_sub backend never byte-forwards: the
 //! codex backend speaks the Responses dialect, so each supported frontend

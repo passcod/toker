@@ -10,7 +10,7 @@
 //! session id on every request, toker records it per ledger row, so the
 //! plugin asks for one session's aggregate and the answer is exact. The reply
 //! is counts, sums, and labels the rows already carry: no content, no
-//! credentials (invariants 1-2).
+//! credentials (spec: SEC#no-prompt-or-completion-content-is-recorded, spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 //!
 //! `/_toker/shutdown` is `toker restart`'s second step: the CLI waits
 //! for a quiet moment on `status`, then asks this instance, by the id
@@ -79,7 +79,7 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
             json!({
                 "upstream": api.upstream.as_str(),
                 "api_key_env": api.api_key_env,
-                // Key *sources* only — never values (invariant 2).
+                // Key *sources* only — never values (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
                 "api_key_env_set": sources.env_set,
                 "api_key_keyring_configured": sources.keyring_configured,
                 "api_key_literal_set": sources.literal_set,
@@ -147,12 +147,12 @@ pub(crate) async fn status(State(server): State<Server>, request: Request) -> Re
 /// the frontend's own session header per row), so there is no join to
 /// do and no unmatched remainder to guess about.
 ///
-/// Absence ≠ zero (invariant 3) in the reply body: a metric no row
+/// Absence ≠ zero (spec: STORE#not-recorded-is-not-zero) in the reply body: a metric no row
 /// carried is `null`, never 0, and `billed_total` is `null` when no row
 /// was billed. A session id with no rows at all answers `requests: 0`
 /// with `null`s — the endpoint cannot distinguish "absent session" from
 /// "session that measured nothing", and the plugin renders nothing
-/// either way. No content and no credentials leave (invariants 1-2).
+/// either way. No content and no credentials leave (spec: SEC#no-prompt-or-completion-content-is-recorded, spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 ///
 /// `lanes` is the session's rows from the lane table (exact session id,
 /// newest first), each with a state computed now (see `lane_body`). A
@@ -244,8 +244,8 @@ const TOOLS_ID_CHARS: usize = 6;
 
 /// One lane as the session reply shows it: the operational metadata the
 /// `lanes` row already keeps, plus a state computed at query time. Never
-/// content (invariant 1), and a field the lane never recorded is `null`,
-/// not zero (invariant 3's absence rule).
+/// content (spec: SEC#no-prompt-or-completion-content-is-recorded), and a field the lane never recorded is `null`,
+/// not zero (spec: STORE#not-recorded-is-not-zero's absence rule).
 ///
 /// - `state`: `ping` for a ping lane (its cache is not the conversation's,
 ///   so it is never called warm or cold), else `cold` once the idle time

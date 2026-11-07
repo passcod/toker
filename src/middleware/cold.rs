@@ -1,5 +1,5 @@
-//! The cold-cache gate and the compaction retarget (plan: Middleware —
-//! "Cold gate" + "Compaction retarget"), the second gate the predecessor
+//! The cold-cache gate and the compaction retarget, the second gate the
+//! predecessor
 //! grew and the only transform that changes model-visible prompt structure.
 //!
 //! A faithful port of the predecessor proxy's cold gate plus the two
@@ -42,14 +42,14 @@
 //! every function only decides. The one deliberate impurity in the
 //! predecessor — the
 //! notice names a wall-clock time — is an *input* here like the quota
-//! gate's port (invariant 4): the caller passes the timestamp and the
+//! gate's port (spec: GNOTE#a-notice-is-byte-stable): the caller passes the timestamp and the
 //! [`jiff::tz::TimeZone`].
 //!
 //! Units: `now` is **epoch milliseconds** (a `Date.now()`-style convention,
 //! kept so the vendored contract fixture's `now` values dispatch
 //! unchanged); meter resets are **epoch seconds** (the wire form).
 //!
-//! Absence ≠ zero (invariant 3): a lane with no recorded prompt is not a
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): a lane with no recorded prompt is not a
 //! zero-prompt lane, an unrecorded TTL tier reads as the LONG one (guessing
 //! short would fire on lanes whose cache is still live — a false alarm
 //! costs the user a turn; guessing long only ever delays a true one), and
@@ -471,7 +471,7 @@ pub enum Burn {
 impl Burn {
     /// The measured figure the decision rests on — the envelope's current
     /// utilisation for the live states, absent for no reading at all
-    /// (invariant 3: absence ≠ zero).
+    /// (spec: STORE#not-recorded-is-not-zero: absence ≠ zero).
     fn util(&self) -> Option<f64> {
         match self {
             Burn::None => None,
@@ -1837,7 +1837,7 @@ pub fn human_idle(ms: i64) -> String {
 /// needs: a bare clock within 20 h
 /// (a future 06:43 read at 20:45 can only be tomorrow), a weekday within
 /// 6 d, day + month beyond. The forms are pinned, not locale-derived
-/// (invariant 4): `%H:%M`, `%a %H:%M`, day-then-month.
+/// (spec: WCANON#rendering): `%H:%M`, `%a %H:%M`, day-then-month.
 pub(crate) fn at_scale(at_ms: f64, tz: &TimeZone, scale: usize) -> String {
     let Some(zoned) = zoned_of(at_ms, tz) else {
         return "?".to_owned();
@@ -1982,7 +1982,7 @@ impl ColdBlocking {
     /// one turn and historical for the rest of the conversation. The
     /// options arrive as a markdown list, not a run-on line.
     ///
-    /// Pure function of its inputs (invariant 4): the wall-clock stamp
+    /// Pure function of its inputs (spec: WCANON#rendering): the wall-clock stamp
     /// renders in the passed zone, and `target` is named only when the
     /// compaction retarget actually resolved a model — an unarmed proxy
     /// promising a cheap compaction would be the feature lying about its
@@ -2071,7 +2071,7 @@ impl ColdBlocking {
     /// tokens would be counted by every view that reads the ledger).
     ///
     /// Pure function of its inputs like [`ColdBlocking::notice`]
-    /// (invariant 4): `created` is the caller's clock, an input here for
+    /// (spec: GNOTE#a-notice-is-byte-stable): `created` is the caller's clock, an input here for
     /// the same reason the notice's stamp is — the outer envelope never
     /// enters replayed history (the client keeps the rendered content,
     /// not the wire bytes), but the bytes are still a function of the
@@ -2558,7 +2558,7 @@ mod tests {
         .expect("one token over the bar is cold");
         assert_eq!(measured.idle_ms, 2 * HOUR);
         assert_eq!(measured.prompt, 175_001);
-        // Absence never reads as a measurement (invariant 3).
+        // Absence never reads as a measurement (spec: STORE#not-recorded-is-not-zero).
         assert_eq!(coldness(None, DEFAULT_MIN_TOKENS, None, NOW), None);
         assert_eq!(
             coldness(
@@ -3729,7 +3729,7 @@ mod tests {
             NoticeStyle::Plain,
         );
         assert!(five.contains("(\u{d7}1.25 usage)"), "{five}");
-        // Purity (invariant 4): the same inputs render the same bytes,
+        // Purity (spec: WCANON#rendering): the same inputs render the same bytes,
         // every call, in every style.
         for _ in 0..3 {
             for style in [
@@ -4187,7 +4187,7 @@ mod tests {
             .expect("serialise expected body")
         );
         // The transform is pure: same input, same bytes, any number of
-        // fresh parses (invariant 4 — the prefix the upstream builds from
+        // fresh parses (spec: WCANON#rendering — the prefix the upstream builds from
         // these bytes must be reproducible).
         for _ in 0..3 {
             let mut again = Request::parse(&compaction_body()).expect("parse");
@@ -4371,7 +4371,7 @@ mod tests {
 
     #[test]
     fn the_retarget_keeps_the_untouched_prefix_stable() {
-        // Invariant 5's transformed-request clause: the transform is pure
+        // spec: WCANON#rendering's transformed-request clause: the transform is pure
         // and touches only the model region, the stripped breakpoints, and
         // the merge point — the rest of the conversation's bytes are
         // reproduced exactly, in place.
@@ -4406,7 +4406,7 @@ mod tests {
         // them.
         assert!(!String::from_utf8_lossy(&retargeted).contains("cache_control"));
         // The transform is deterministic: a fresh parse of the same body
-        // produces the identical bytes (invariant 4).
+        // produces the identical bytes (spec: WCANON#rendering).
         let mut again = Request::parse(&body).expect("parse");
         retarget_compaction(&mut again, Some("claude-sonnet-5"), true).expect("rewrites");
         assert_eq!(again.serialise(), retargeted);

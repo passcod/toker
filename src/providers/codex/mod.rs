@@ -1,4 +1,4 @@
-//! The codex subscription backend (plan: "Backend providers") — the
+//! The codex subscription backend — the
 //! OpenAI-Responses protocol against the ChatGPT backend API, the wire
 //! the official codex CLI speaks (`POST
 //! …/backend-api/codex/responses`, SSE responses).
@@ -9,8 +9,7 @@
 //! shared `~/.codex/auth.json` login (load, JWT claims, refresh), the
 //! request wire types, the responses-dialect SSE parser, and the
 //! `x-codex-*` usage-limit meters. The routing unit that serves
-//! `/v1/responses` onto this backend lands later (plan: the OpenAI
-//! Responses frontend adapter, [`crate::proto::openai_responses`]); HTTP
+//! `/v1/responses` onto this backend lands later; HTTP
 //! only for now — the CLI's websocket transport and zstd request
 //! compression are not replicated.
 //!
@@ -51,7 +50,7 @@
 //!   header snapshot (the plan names the codex sub as the meter source
 //!   the gate's open interface is waiting for).
 //!
-//! Invariant 2 (credentials): the codex tokens are the user's ChatGPT
+//! spec: SEC#a-credential-is-never-logged-stored-or-displayed (credentials): the codex tokens are the user's ChatGPT
 //! login. They never appear in the ledger, in a log line, or in an
 //! error message — `CodexAuth`'s `Debug` redacts them by hand.
 

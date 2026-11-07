@@ -1,4 +1,4 @@
-//! `toker setup` — the interactive wizard (plan: "Setup wizard"): the
+//! `toker setup` — the interactive wizard: the
 //! flow that composes the library half into the command.
 //!
 //! Every effect sits behind a seam, so the whole wizard runs as a
@@ -33,13 +33,13 @@
 //! ([`patchers`]). A fully-wired machine re-run detects everything,
 //! changes nothing, and says so.
 //!
-//! Credentials (invariant 2): a pasted key goes only into the OS keyring
+//! Credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed): a pasted key goes only into the OS keyring
 //! ([`SecretStore`] — tests inject a map) or, when there is none, the
 //! 0600 `toker.toml` — never into a prompt message, never into the
 //! wizard's output, never into a unit file. Tests pin the rule with a
 //! scripted key and an output scan.
 //!
-//! The wake/hold/ping timers (plan: "Sleep lock, wake, ping") are a
+//! The wake/hold/ping timers are a
 //! real offer in the toggles step: a yes/no defaulting to what is
 //! installed, then a free-form `hh:mm` slot list (strictly validated;
 //! the default is the installed slots, else [`DEFAULT_SLOTS`]), the hold
@@ -85,7 +85,7 @@ pub const SOCKET_UNIT: &str = "toker.socket";
 /// The socket-activated service unit.
 pub const SERVICE_UNIT: &str = "toker.service";
 
-/// The wake SYSTEM timer's name (plan: "Sleep lock, wake, ping") —
+/// The wake SYSTEM timer's name —
 /// the only root-level piece. Staged into the user units dir (the one
 /// place the wizard can write without root) and enabled by path into
 /// the system manager through sudo; `WakeSystem=true` needs
@@ -202,11 +202,11 @@ pub trait Prompt {
     /// when one is given (the wizard resolves empties itself, so the
     /// real UI and the fake agree). `secret: true` is key entry: the
     /// real UI renders a password prompt and never echoes the answer;
-    /// the wizard stores it but never prints it (invariant 2).
+    /// the wizard stores it but never prints it (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     fn text(&mut self, message: &str, default: Option<&str>, secret: bool) -> Result<String>;
 }
 
-/// The real prompt UI: inquire (plan: Dependencies).
+/// The real prompt UI: inquire.
 pub struct InquirePrompt;
 
 impl Prompt for InquirePrompt {
@@ -555,8 +555,8 @@ pub fn extra_writable(config: &Config) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `toker-wake.timer` — the SYSTEM unit (plan: "Sleep lock, wake,
-/// ping"): one `OnCalendar=` per user-chosen slot plus
+/// `toker-wake.timer` — the SYSTEM unit: one `OnCalendar=` per user-chosen slot
+/// plus
 /// `WakeSystem=true`, which wakes the machine **from suspend only**
 /// (a powered-off machine stays off). Root-level on purpose: the user
 /// manager lacks `CAP_WAKE_ALARM`, so this is the only unit toker
@@ -612,7 +612,7 @@ ExecStart=/bin/true
 }
 
 /// `toker-hold.timer` + `toker-hold.service` — the hold USER units
-/// (plan: "Sleep lock, wake, ping"): a timer at the wake slots running
+/// : a timer at the wake slots running
 /// the hold verb for the pinned 15 m. A timer that elapses while the
 /// machine is suspended fires on resume, and the hold then keeps the
 /// machine up those 15 minutes so the ping (11 m after the slot) can
@@ -717,7 +717,7 @@ pub struct PingUnits {
     pub service: String,
 }
 
-/// The ping USER units (plan: "Sleep lock, wake, ping") — **one
+/// The ping USER units — **one
 /// timer+service pair per slot**, the timer at slot+11 m and the
 /// service running the ping verb **for that slot**. Per-slot because
 /// the `--slot` argument must match its timer's clock time: a shared
@@ -971,8 +971,7 @@ fn read_rc_url(path: &Path) -> UrlRead {
 }
 
 /// Everything the detect step found. The state summary is printed
-/// from this before any question is asked (plan: the wizard reports
-/// the machine's state first), and the later steps re-use it — the
+/// from this before any question is asked, and the later steps re-use it — the
 /// frontend list and URL reads drive the offer-and-skip logic.
 #[derive(Debug)]
 struct Detected {
@@ -1033,7 +1032,7 @@ struct FrontendDetected {
 
 // ── the wizard's config choices ────────────────────────────────────────
 
-/// How one api-key backend authenticates (plan: Credentials).
+/// How one api-key backend authenticates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyChoice {
     /// Store nothing: the frontend sends its own key, which toker passes
@@ -1109,7 +1108,7 @@ const BACKENDS: &[(&str, &str)] = &[
 /// What one wizard run did — the finish summary's data, returned for
 /// tests and any future caller. Holds no secrets by construction:
 /// credential fields appear only as key *sources*, never values
-/// (invariant 2).
+/// (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunReport {
     /// The port this run configured (the written or kept config's).
@@ -1146,8 +1145,8 @@ pub struct RunReport {
     pub plugin_installed: Option<PathBuf>,
     /// The plugin was offered and declined.
     pub plugin_declined: bool,
-    /// The wake/hold/ping slots chosen this run (plan: "Sleep lock,
-    /// wake, ping"); empty means the timers were declined, in which
+    /// The wake/hold/ping slots chosen this run; empty means the timers were
+    /// declined, in which
     /// case nothing was installed and any an earlier run left were
     /// removed ([`RunReport::timers_removed`]).
     pub timer_slots: Vec<String>,
@@ -1805,7 +1804,7 @@ impl<'a> Wizard<'a> {
         bail!("no backend was picked")
     }
 
-    /// One api-key backend's source (plan: Credentials), in this order:
+    /// One api-key backend's source, in this order:
     /// the frontend brings its own (toker stores nothing), give it to
     /// toker (the OS keyring, else the 0600 `toker.toml`), or an env var
     /// in the systemd user environment. The existing config's choice is
@@ -1931,7 +1930,7 @@ impl<'a> Wizard<'a> {
         Ok(())
     }
 
-    /// The listener port (plan: "a new port, not 18082"): a text
+    /// The listener port: a text
     /// answer with the current-or-default value preselected; a
     /// non-number is complained about and re-asked, not fatal on the
     /// first typo.
@@ -2585,8 +2584,8 @@ impl<'a> Wizard<'a> {
         bail!("no valid slots were given")
     }
 
-    /// The timers proper, once slots are chosen (plan: "Sleep lock,
-    /// wake, ping"). The hold and per-slot ping units go through the
+    /// The timers proper, once slots are chosen. The hold and per-slot ping
+    /// units go through the
     /// ordinary user-manager path (`install_unit`, `daemon-reload`,
     /// `enable --now` per timer); the wake SYSTEM timer follows in
     /// [`Wizard::wake_step`]. The ping timers of slots an earlier run
@@ -3286,7 +3285,7 @@ fn toml_has_db_path(text: &str) -> bool {
 }
 
 /// A provider's key line for the config summary — sources only, never
-/// values (invariant 2).
+/// values (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 fn key_line(provider: &str, sources: crate::config::KeySources, env: &str) -> String {
     let stored = if sources.keyring_configured {
         ", else the OS keyring"

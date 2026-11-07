@@ -1,5 +1,5 @@
-//! Invariant 5's prefix-stability property (plan: Invariants 5, "Enforced
-//! by"). A hand-rolled quickcheck-style loop — 20 deterministic seeded
+//! spec: WCANON#rendering's prefix-stability property. A hand-rolled quickcheck-style loop
+//! — 20 deterministic seeded
 //! cases, no proptest dependency: each case builds a canonical conversation
 //! body, appends messages through the IR's typed mutator (a tail-only
 //! mutation), and asserts the serialised bytes are identical up to the

@@ -29,7 +29,7 @@
 //!   backend adapters render out of, engaged only on cross-protocol
 //!   routes.
 //!
-//! Invariant 4 (serialisation purity): [`Request::serialise`] is a pure
+//! spec: WCANON#rendering (serialisation purity): [`Request::serialise`] is a pure
 //! function of the parsed value. No serialisation decision depends on
 //! runtime state — meters, gates, clocks — because the type has none to
 //! consult: the wrapper holds the Value plus wire provenance only, no
@@ -80,7 +80,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Request::parse`] for the ledger's shape fields. It is *not* derived
 /// state — it is a fact about the wire input — and it is never consulted by
 /// [`Request::serialise`], so derived data can never affect serialisation
-/// (invariant 4). Protocol adapters validate the shape they need (a
+/// (spec: WCANON#rendering). Protocol adapters validate the shape they need (a
 /// chat-completions body is an object with a messages array); `parse` only
 /// requires well-formed JSON, so an unparseable body fails in one place.
 #[derive(Debug)]
@@ -102,7 +102,7 @@ impl Request {
         })
     }
 
-    /// Serialise back to bytes. **Invariant 4**: a pure function of the
+    /// Serialise back to bytes. **spec: WCANON#rendering**: a pure function of the
     /// parsed Value alone — no clock, no meters, no state, nothing cached —
     /// so the same parsed request always produces the same bytes.
     pub fn serialise(&self) -> Vec<u8> {
@@ -125,7 +125,7 @@ impl Request {
     /// first user). The transform is built over a copy and committed only
     /// on success, so a declined transform never touches the request.
     ///
-    /// **Invariant 4** is unaffected by construction: `serialise` remains
+    /// **spec: WCANON#rendering** is unaffected by construction: `serialise` remains
     /// a pure function of the value it holds — this only changes which
     /// value that is, as a deliberate, user-visible, once-per-change event
     /// (a middleware transform). `req_bytes` keeps the ORIGINAL wire
@@ -138,7 +138,7 @@ impl Request {
 
 /// `sha256(data)`, truncated to its first 12 hex chars — the row digest
 /// shape the ledger has always used.
-/// Digests and lengths only, never content (invariant 1).
+/// Digests and lengths only, never content (spec: SEC#no-prompt-or-completion-content-is-recorded).
 pub(crate) fn short_hash(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     let mut hex = String::with_capacity(12);

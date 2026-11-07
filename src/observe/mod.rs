@@ -24,18 +24,18 @@
 //!   latches model/stop reason/speed/geo, and captures `error` events for
 //!   error rows.
 //!
-//! Invariant 6 (accounting must never break a session): every parse path
+//! spec: GATE#only-a-gate-stops-a-session (accounting must never break a session): every parse path
 //! here is infallible at the stream level. Malformed JSON, non-JSON
 //! events, and invalid UTF-8 are skipped as unobservable — a parse
 //! failure loses a measurement, never a request. A stream with nothing
 //! usage-bearing on it (a client hangup, an all-keepalive stream)
 //! produces no capture and so no row.
 //!
-//! Invariant 3 (absence ≠ zero): every captured field is `Option`. An
+//! spec: STORE#not-recorded-is-not-zero (absence ≠ zero): every captured field is `Option`. An
 //! absent field and an explicit `null` both land as `None` — never `0`,
 //! never `""` — while a present `0` is a real `0`.
 //!
-//! Invariant 1 (no content stored): the observer keeps ids, model and
+//! spec: SEC#no-prompt-or-completion-content-is-recorded (no content stored): the observer keeps ids, model and
 //! provider names, and the usage object. Message deltas, tool-call
 //! arguments, and every other choice-bearing field are parsed past and
 //! dropped.

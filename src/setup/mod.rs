@@ -1,5 +1,5 @@
 //! `toker setup` — the wizard's library half plus the wizard itself
-//! (plan: "Setup wizard", phase 5).
+//! .
 //!
 //! `toker setup` is idempotent — re-run it to change anything — and its
 //! steps are fixed in [`plan`], which is also the documentation of WHY

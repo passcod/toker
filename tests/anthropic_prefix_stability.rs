@@ -1,4 +1,4 @@
-//! Invariant 5's prefix-stability property for the Anthropic Messages
+//! spec: WCANON#rendering's prefix-stability property for the Anthropic Messages
 //! frontend, in the same seeded style as the openai_chat one
 //! (tests/ir_prefix_stability.rs): 20 deterministic seeded cases, each a
 //! canonical conversation body with `messages` as the last key, appended

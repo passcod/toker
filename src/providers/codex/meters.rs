@@ -35,7 +35,7 @@
 //! ```
 //!
 //! Every named key is always present in a snapshot, `null` when the
-//! response did not carry it (absence is a fact — invariant 3). The
+//! response did not carry it (absence is a fact — spec: STORE#not-recorded-is-not-zero). The
 //! numbers keep the header's literal precision (parsed as
 //! [`serde_json::Number`], like the anthropic meters' `num`).
 //!

@@ -1,7 +1,5 @@
 //! `toker import`: ingest the predecessor proxy's `usage.jsonl` into the
-//! requests ledger (plan: Storage — "`toker import` ingests the
-//! predecessor's usage.jsonl (honoring its field-era
-//! notes) so learned model state and 7-day forecasting stay continuous
+//! requests ledger so learned model state and 7-day forecasting stay continuous
 //! from day one").
 //!
 //! Streaming and durability:
@@ -9,10 +7,10 @@
 //!   log is never slurped — and rows land one transaction per batch (a
 //!   few thousand), so an interrupted import exposes at most a
 //!   re-runnable prefix, never a partial batch;
-//! - a malformed line never aborts the import (invariant 6's spirit, and
+//! - a malformed line never aborts the import (spec: GATE#only-a-gate-stops-a-session, and
 //!   the schema's "always handle `undefined`"): it is skipped, counted,
 //!   and the count is reported;
-//! - idempotence (plan: Storage): after every committed batch the
+//! - idempotence: after every committed batch the
 //!   importer writes a checkpoint into the meta table — source path as
 //!   the key, plus size, mtime, line count, first/last line hashes, and
 //!   the id range this source's rows occupy. Re-running against an
@@ -31,11 +29,11 @@
 //! [map_row] is the explicit mapping. The field-era rule — a missing
 //! field means "not recorded then", never zero (the schema's own
 //! contract) — is preserved throughout:
-//! every field but `ts` is an `Option` that stays `None` (invariant 3).
+//! every field but `ts` is an `Option` that stays `None` (spec: STORE#not-recorded-is-not-zero).
 //! A field [CtpRow] does not map is not an error — the row still
 //! imports — but it is not silent either: every unmapped field name is
 //! tallied by the number of imported rows that carried it, and the report
-//! lists the tally (names only, never values: invariant 1), split into
+//! lists the tally (names only, never values: spec: SEC#no-prompt-or-completion-content-is-recorded), split into
 //! fields the importer leaves out on purpose ([IGNORED_BY_DESIGN]) and
 //! fields it has never heard of, which would mean the mapping is behind
 //! the source.
@@ -74,7 +72,7 @@ pub const DEFAULT_PROVIDER: &str = "anthropic_sub";
 
 /// The predecessor priced at API list rates on a subscription — the
 /// plan-equivalent
-/// semantics (plan: Storage) — so that is the default cost kind for an
+/// semantics — so that is the default cost kind for an
 /// imported `costUsd`. `--cost-kind` re-labels api-era logs.
 pub const DEFAULT_COST_KIND: CostKind = CostKind::PlanEquivalent;
 
@@ -426,7 +424,7 @@ fn mtime_ms(metadata: &Metadata) -> i64 {
 /// but `ts` is optional: fields were added over time and a row that
 /// predates one simply lacks it — absence means "not recorded then",
 /// never zero (the schema's own contract), and it stays `None`
-/// (invariant 3).
+/// (spec: STORE#not-recorded-is-not-zero).
 ///
 /// JSON `null` and an absent field both deserialize to `None` here,
 /// which is the right collapse everywhere the source format writes null
@@ -579,16 +577,16 @@ struct CtpRow {
 
     /// Every field not named above, by name. [IgnoredAny] skips the value
     /// without building it: the importer counts names and never keeps a
-    /// value (invariant 1).
+    /// value (spec: SEC#no-prompt-or-completion-content-is-recorded).
     #[serde(flatten)]
     unmapped: BTreeMap<String, IgnoredAny>,
 }
 
 /// Map one parsed imported row onto the ledger row. Errors are per-line
 /// reasons — the caller skips and counts the line, never aborts the
-/// import (invariant 6's spirit). An unknown `kind` is an error, not a
+/// import (spec: GATE#only-a-gate-stops-a-session). An unknown `kind` is an error, not a
 /// default: `kind IS NULL` is what marks a real API measurement, so an
-/// unmappable row must never silently become one (invariant 3).
+/// unmappable row must never silently become one (spec: GATE#only-a-gate-stops-a-session).
 fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
     let ts_ms = parse_ts_ms(&row.ts)?;
     let kind = match row.kind.as_deref() {
@@ -769,7 +767,7 @@ fn map_row(row: &CtpRow, cost_kind: CostKind) -> Result<RequestRow, String> {
 
 /// An ISO 8601 timestamp (the row's `ts`, and `awake`'s `until`) as epoch ms.
 /// Unparseable means the row's spine is broken: the caller skips the
-/// line, it never guesses a time (invariant 3).
+/// line, it never guesses a time (spec: STORE#not-recorded-is-not-zero).
 fn parse_ts_ms(ts: &str) -> Result<i64, String> {
     jiff::Timestamp::from_str(ts)
         .map(|t| t.as_millisecond())
@@ -778,7 +776,7 @@ fn parse_ts_ms(ts: &str) -> Result<i64, String> {
 
 /// A ladder column, in toker's own storage form: a JSON array of digests
 /// as text, `None` for an empty ladder — an empty ladder localises
-/// nothing, and absence stays absence (invariant 3).
+/// nothing, and absence stays absence (spec: STORE#not-recorded-is-not-zero).
 fn ladder_text(rungs: &Option<Vec<String>>) -> Option<String> {
     match rungs {
         Some(rungs) if !rungs.is_empty() => Some(json!(rungs).to_string()),
@@ -1151,7 +1149,7 @@ mod tests {
     #[test]
     fn unmappable_rows_error_never_default_to_measurements() {
         // Unknown kind: a row toker cannot classify must not become an
-        // API measurement by accident (invariant 3).
+        // API measurement by accident (spec: STORE#not-recorded-is-not-zero).
         let ctp: CtpRow =
             serde_json::from_str(r#"{"ts":"2026-09-26T16:49:18.414Z","kind":"mystery"}"#)
                 .expect("parse");

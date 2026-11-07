@@ -20,7 +20,7 @@
 //!
 //! [`AnthropicStream`] is pure: a function of the events it is fed
 //! and the model echo only — no clock, no counters, nothing else
-//! (invariant 4). The same events always render the same bytes,
+//! (spec: WCANON#rendering). The same events always render the same bytes,
 //! forever. The message id is the backend's own turn id, verbatim —
 //! never minted here (a stream that never named one renders with
 //! the frontend's constant placeholder).
@@ -70,7 +70,7 @@ impl AnthropicStream {
     /// with no canonical shape (an `output_item.added`, an unknown
     /// kind) produces nothing, and a `function_call` whose fields do
     /// not fit the typed view is skipped rather than corrupting the
-    /// stream (invariant 6).
+    /// stream (spec: GATE#only-a-gate-stops-a-session).
     pub fn feed(&mut self, event: &ResponseEvent) -> Vec<SseEvent> {
         self.feed_projected(event, ResponseProjection::default())
     }
@@ -315,7 +315,7 @@ mod tests {
                 r#"{"type":"content_block_stop","index":0}"#,
             ),
             // No usage key: the incomplete turn carried none (absence
-            // ≠ zero, invariant 3).
+            // ≠ zero, spec: STORE#not-recorded-is-not-zero).
             (
                 "message_delta",
                 r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null}}"#,

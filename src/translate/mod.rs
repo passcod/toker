@@ -15,7 +15,7 @@
 //!
 //! One rule over both directions: **pure**. A translation is a
 //! function of its explicit inputs only — no clock, no counters, no
-//! state beyond the event under translation. That is invariant 4
+//! state beyond the event under translation. That is spec: WTRANS#purity
 //! applied to every adapter, and it buys prefix stability: a rendered
 //! request reproduces byte-identically wherever the conversation did
 //! not change, so the upstream's cacheable prefix stays stable even
@@ -216,7 +216,7 @@
 //! | `input_tokens_details.cache_write_tokens` | `cache_write` | `cache_creation_input_tokens` |
 //! | `output_tokens` | `output` | `output_tokens` |
 //!
-//! Absent stays absent (invariant 3): a detail the upstream did not
+//! Absent stays absent (spec: STORE#not-recorded-is-not-zero): a detail the upstream did not
 //! carry is omitted, never zeroed. **Translation note on reasoning
 //! tokens**: both protocols count reasoning tokens inside
 //! `output_tokens`, so the reported total passes through unchanged;

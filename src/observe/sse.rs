@@ -4,7 +4,7 @@
 //! server unit feeds each chunk of a response body it is *already*
 //! forwarding through [`SseSplitter::feed`] and gets back the complete
 //! [`SseEvent`]s that chunk closed off. Splitting never fails and never
-//! gates the pass-through stream (invariant 6).
+//! gates the pass-through stream (spec: GATE#only-a-gate-stops-a-session).
 //!
 //! Wire-format scope, from SSE plus the plan's tolerance note:
 //!
@@ -21,7 +21,7 @@
 //!   see [crate::providers::codex::sse]; the openai/anthropic observers
 //!   ignore it, their dialects naming kinds inside the data JSON). A
 //!   `data:` line that is not valid UTF-8 is skipped as unobservable —
-//!   invariant 6: it loses a measurement, never a request. Comment
+//!   spec: GATE#only-a-gate-stops-a-session: it loses a measurement, never a request. Comment
 //!   lines (`:`-prefixed keep-alives) and other fields (`id:`,
 //!   `retry:`) are parsed and ignored; an event left with no data lines
 //!   is skipped, and so is the `[DONE]` sentinel.
@@ -88,7 +88,7 @@ impl SseSplitter {
     }
 
     /// Feed one chunk of the response body; every event the chunk closed
-    /// off, in arrival order. Never fails (invariant 6).
+    /// off, in arrival order. Never fails (spec: GATE#only-a-gate-stops-a-session).
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         let mut events = Vec::new();
         self.buffer.extend_from_slice(chunk);
@@ -144,7 +144,7 @@ impl SseSplitter {
 /// Comments (a `:`-leading keep-alive), other fields (`id:`, `retry:`),
 /// and a field line without a colon whose name does not match contribute
 /// nothing. A value that is not valid UTF-8 contributes nothing either —
-/// skipped as unobservable rather than lossily decoded (invariant 6: the
+/// skipped as unobservable rather than lossily decoded (spec: GATE#only-a-gate-stops-a-session: the
 /// skipped line can leave the event's data unparseable downstream, losing
 /// the measurement, never the request).
 fn field_line_of(line: &[u8], field: &[u8]) -> Option<String> {

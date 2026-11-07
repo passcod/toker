@@ -19,9 +19,9 @@
 //! slug is unit C's anthropic→codex mapping and the cache key is the
 //! session-id header value, and neither may be invented here. The
 //! same body and the same params always produce the same bytes,
-//! forever (invariant 4), which is what keeps an appended
+//! forever (spec: WCANON#rendering), which is what keeps an appended
 //! conversation turn byte-identical over its earlier input items
-//! (invariant 5 — the prefix-stability property test pins it).
+//! (spec: WCANON#rendering — the prefix-stability property test pins it).
 
 use serde_json::Value;
 

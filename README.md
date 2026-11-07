@@ -24,32 +24,55 @@ to see the dashboard.
 
 ## What to watch
 
-The name of the game is to optimise for cache hit rate; how that works out depends on your frontend (claude, opencode, codex...) and your backend (anthropic, openai, openrouter...). A "cache rebuilds" view explains how you lost your cache; you can then figure out how to optimise your tool loadout, your system prompt generation, etc.
+The name of the game is to optimise for cache hit rate; how that works out depends on your frontend (claude, opencode, codex...) and your backend (anthropic, openai, openrouter...).
+A "cache rebuilds" view explains how you lost your cache; you can then figure out how to optimise your tool loadout, your system prompt generation, etc.
 
-When you leave a context-heavy session for too long and cache goes cold, Toker knows. If you message a session with more than 175k tokens in its context, with a cache that's likely cold, and loading it into cache would make the window (if applicable) run out faster than normal, Toker first stops you; you can choose to start a new session, compact (see below), or keep going and eat the uncached writes. If cache writes are free at the backend, this doesn't apply.
+When you leave a context-heavy session for too long and cache goes cold, Toker knows.
+If you message a session with more than 175k tokens in its context, with a cache that's likely cold, and loading it into cache would make the window (if applicable) run out faster than normal, Toker first stops you; you can choose to start a new session, compact (see below), or keep going and eat the uncached writes.
+If cache writes are free at the backend, this doesn't apply.
 
-When using an Anthropic subscription (e.g. Pro, Max, Team), you also have 5-hour and weekly limits, after which you run into expensive overage. Toker shows where you're at, and prevents you from running out, so you can max out on concurrency and the proxy will stop your sessions before they cost money... unless you provide the release token (`$#$BURN$#$`), which lets you deliberately burn overage. When sessions have been released, they are marked with a `$` sign in the TUI. To use up the last of a window without going into overage, provide `$#$OVER$#$` instead: the session continues until the plan quota is spent, then stops again, and is marked with a `%` sign. A session that a notice has stopped, and that is still waiting on you, is marked with a red `!`.
+When using an Anthropic subscription (e.g. Pro, Max, Team), you also have 5-hour and weekly limits, after which you run into expensive overage.
+Toker shows where you're at, and prevents you from running out, so you can max out on concurrency and the proxy will stop your sessions before they cost money... unless you provide the release token (`$#$BURN$#$`), which lets you deliberately burn overage.
+When sessions have been released, they are marked with a `$` sign in the TUI.
+To use up the last of a window without going into overage, provide `$#$OVER$#$` instead: the session continues until the plan quota is spent, then stops again, and is marked with a `%` sign.
+A session that a notice has stopped, and that is still waiting on you, is marked with a red `!`.
 
-When enabled, you can also let Toker wake your computer from sleep just to start the 5-hour window early, when you're still sleeping. By default, it's set to open a window at 07:30 weekdays, which ends it at 12:30, and then re-open the next one at 12:31 (lasting until 17:31) if active sessions haven't already done it. That means you get a "free" 15% of the morning window (assuming you start at 09:00), which is plenty to load all of yesterday's work into cache / start new work, and then the afternoon session usually doesn't need to spend that, as the caches are already hot.
+When enabled, you can also let Toker wake your computer from sleep just to start the 5-hour window early, when you're still sleeping.
+By default, it's set to open a window at 07:30 weekdays, which ends it at 12:30, and then re-open the next one at 12:31 (lasting until 17:31) if active sessions haven't already done it.
+That means you get a "free" 15% of the morning window (assuming you start at 09:00), which is plenty to load all of yesterday's work into cache / start new work, and then the afternoon session usually doesn't need to spend that, as the caches are already hot.
 
-Compaction management is also important. If cache is hot, a compaction is basically free at the current model. But if cache is cold, loading your entire context into an expensive model just to get a summary out is costly. Toker detects that and rewrites cold-cache compactions to a lower-cost model, and also disables the cache writes where applicable.
+Compaction management is also important.
+If cache is hot, a compaction is basically free at the current model.
+But if cache is cold, loading your entire context into an expensive model just to get a summary out is costly.
+Toker detects that and rewrites cold-cache compactions to a lower-cost model, and also disables the cache writes where applicable.
 
-New models come out regularly, but harnesses don't always follow suit. Toker learns which model families you use, and transparently upgrades requests to newer versions of your models once you'vetried out the latest versions for a little while, and you can also promote a model version manually. A `↑ ` symbol in the TUI indicates sessions that have been transparently upgraded.
+New models come out regularly, but harnesses don't always follow suit.
+Toker learns which model families you use, and transparently upgrades requests to newer versions of your models once you'vetried out the latest versions for a little while, and you can also promote a model version manually.
+A `↑ ` symbol in the TUI indicates sessions that have been transparently upgraded.
 
 When using opencode, a custom sidebar and footer plugin augments the context and spend view with accurate cost information rather than opencost's default "multiply tokens by nominal $/token" which is often wildly out of whack, and shows the provider breakdown when using a router.
 
 ## Routing
 
-Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of toker's routing live in the database, not in `toker.toml`. Edit them in the routing page of `toker tui`: changes go into a draft, which you validate, preview and then activate, without restarting anything. `toker.toml` keeps the providers, their credentials, and the listener.
+Which backend serves a model, which models appear in Claude Code's `/model` picker, and the rest of Toker's routing live in the database, not in `toker.toml`.
+Edit them in the routing page of `toker tui`: changes go into a draft, which you validate, preview and then activate, without restarting anything.
+`toker.toml` keeps the providers, their credentials, and the listener.
 
-`toker setup` writes that file and, the first time, compiles your routing choices (and any routing fields an older `toker.toml` carried: protocol defaults, model maps, picker rules) into the first active revision. After that it never replaces the active routing. If you edit those fields in `toker.toml` by hand afterwards, use the routing page's status view to import them: `i` replaces the draft with the compiled file, and you activate it like any other draft.
+`toker setup` writes that file and, the first time, compiles your routing choices (and any routing fields an older `toker.toml` carried: protocol defaults, model maps, picker rules) into the first active revision.
+After that it never replaces the active routing.
+If you edit those fields in `toker.toml` by hand afterwards, use the routing page's status view to import them: `i` replaces the draft with the compiled file, and you activate it like any other draft.
 
-Claude Code's `/model` picker follows the active routing. Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each activation. Run `toker picker sync --dry-run` to see what it would offer. Rows for OpenRouter models route that session through OpenRouter on your OpenRouter key; everything else stays on your subscription. Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
+Claude Code's `/model` picker follows the active routing.
+Setup installs a daily timer that keeps the rows current, and the routing page syncs them after each activation.
+Run `toker picker sync --dry-run` to see what it would offer.
+Rows for OpenRouter models route that session through OpenRouter on your OpenRouter key; everything else stays on your subscription.
+Only models that take tools are offered, but OpenRouter only guarantees Claude Code's tool use on Anthropic's models, so others may stumble on its more advanced requests.
 
 ## Direct OpenAI API
 
 The setup wizard can enable `openai_api` and place its key in the OS keyring,
-read it from `OPENAI_API_KEY`, or leave authentication to the frontend. To
+read it from `OPENAI_API_KEY`, or leave authentication to the frontend.
+To
 configure it by hand, add the provider block:
 
 ```toml
@@ -62,19 +85,25 @@ the default whose scope is `openai_chat`, press `e`, set its route to
 with Ctrl+S.
 Setup writes a second default for the `unprefixed` profile, which is what a
 frontend without a `/f/<name>` prefix uses and which wins over the protocol
-default, so change that one the same way. If there is no default to change,
-`n` adds one. Then `V` validates and `a` activates. Bare Chat model names then
+default, so change that one the same way.
+If there is no default to change,
+`n` adds one.
+Then `V` validates and `a` activates.
+Bare Chat model names then
 use `https://api.openai.com/v1`; with several Chat backends enabled,
-`openai_api/<model>` selects it for one request. Toker asks
+`openai_api/<model>` selects it for one request.
+Toker asks
 streaming completions to include terminal usage and estimates cost only when
 the exact model, service tier, and every required token category are known.
-Unknown pricing evidence leaves the cost blank. `/v1/models` is authenticated
+Unknown pricing evidence leaves the cost blank.
+`/v1/models` is authenticated
 with the same key and feeds the shared model catalogue.
 
 ## Codex subscription from OpenAI Chat clients
 
 An OpenAI Chat frontend such as opencode can use the Codex subscription
-backend through the canonical mux. Enable the provider:
+backend through the canonical mux.
+Enable the provider:
 
 ```toml
 [providers.codex_sub]
@@ -83,9 +112,11 @@ backend through the canonical mux. Enable the provider:
 Then make it the Chat default in the routing page the same way as above, with
 `legacy-route-codex_sub-codex_responses` as the route (`e` on the
 `openai_chat` and `unprefixed/openai_chat` defaults, or `n` to add one).
-Bare Chat model names then route to the subscription. With several Chat
+Bare Chat model names then route to the subscription.
+With several Chat
 backends enabled, a single request can instead select it with a
-`codex_sub/<model>` model id. Streaming, tools, usage, errors and plain JSON
+`codex_sub/<model>` model id.
+Streaming, tools, usage, errors and plain JSON
 responses translate in both directions and are recorded under
 `openai_chat:codex_sub`.
 
@@ -142,4 +173,6 @@ last 60m · 10 sessions · 6 idle · 327 requests                               
 └────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Click a session in SESSIONS or CONTEXT to see it in full: its id and title, the model it asked for against the one it was sent on, its context and totals, and its quota gate. From there you can open the gate without typing a marker: `o` releases it to the end of the plan, `b` (pressed twice) releases it into overage, and `x` closes it again. A release from the TUI applies to the current 5-hour window even before the session is stopped.
+Click a session in SESSIONS or CONTEXT to see it in full: its id and title, the model it asked for against the one it was sent on, its context and totals, and its quota gate.
+From there you can open the gate without typing a marker: `o` releases it to the end of the plan, `b` (pressed twice) releases it into overage, and `x` closes it again.
+A release from the TUI applies to the current 5-hour window even before the session is stopped.

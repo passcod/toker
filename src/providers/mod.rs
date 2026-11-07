@@ -75,7 +75,7 @@ pub trait Provider: Send + Sync {
     fn endpoint(&self, path: &str) -> Url;
 
     /// Whether the incoming request already carries this provider's
-    /// credential — pass-through-when-present (plan: Credentials): a
+    /// credential — pass-through-when-present: a
     /// frontend that brings its own credential keeps it, verbatim. The
     /// server consults this before [`Provider::inject_auth`].
     ///
@@ -150,7 +150,7 @@ pub trait Provider: Send + Sync {
 
     /// Whether `model` on this backend accepts a mid-conversation effort
     /// change (`output_config` on a `role: "system"` message). Where it does
-    /// not, the server strips the field (invariant 6) rather than let the
+    /// not, the server strips the field (spec: GATE#only-a-gate-stops-a-session) rather than let the
     /// upstream 400 every turn of the session. `true` by default: the field
     /// is Anthropic's own.
     fn accepts_message_effort(&self, model: &str) -> bool {
@@ -159,9 +159,7 @@ pub trait Provider: Send + Sync {
     }
 
     /// Parse this provider's meter snapshot from one upstream response's
-    /// headers, when this provider is a **meter source** (plan: quota
-    /// gate — "Anthropic sub is the only meter source today. The meter
-    /// interface is open so codex sub's usage limits can become one").
+    /// headers, when this provider is a **meter source**.
     /// `None` — the default — for providers without meters: the snapshot
     /// the gate reads must never be overwritten by a backend that has no
     /// quota to report.

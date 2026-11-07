@@ -34,7 +34,7 @@
 //! page has room and ruled (`SESSIONS ────`, a row cheaper each) when it
 //! does not; [`plan_layout`] says what goes in which order.
 //!
-//! Invariant 3 in rendering: every unknown renders as an explicit string —
+//! spec: STORE#not-recorded-is-not-zero in rendering: every unknown renders as an explicit string —
 //! `?` for unknown models and token counts, "no billed cost data",
 //! "no cost data: N", "no requests in window", `estimating`/`window
 //! rolled over`/`no data` for the meters, `no data` for the header's
@@ -67,7 +67,7 @@ use crate::middleware::cold::Verdict;
 const SPEND_LINES: u16 = 7;
 
 /// The fewest lines SPEND renders in: the total and the "no cost data"
-/// counter, which invariant 3 keeps in view.
+/// counter, which spec: STORE#not-recorded-is-not-zero keeps in view.
 const SPEND_FLOOR: u16 = 2;
 
 /// The meter bar's width (22 cells), the widest
@@ -760,7 +760,7 @@ fn plan_layout(snap: &Snapshot, area: Rect) -> LayoutPlan {
     if (1..tokens_min + 1).contains(&middle[2]) {
         middle[3] += std::mem::take(&mut middle[2]);
     }
-    // Nor does SPEND clip its "no cost data" counter (invariant 3): a
+    // Nor does SPEND clip its "no cost data" counter (spec: STORE#not-recorded-is-not-zero): a
     // cut that would leave the row short of SPEND's floor takes it
     // whole, and the rows go back to SESSIONS, cut last.
     if spend > 0 && (1..rebuilds_min + 1).contains(&middle[3]) {
@@ -1274,7 +1274,7 @@ fn session_cells(session: &SessionAgg, now_ms: i64, fmt: &Fmt) -> [Line<'static>
 /// the same string and a row can be correlated across panels. `None`
 /// when there is no labelled form (then the caller shows the id): an
 /// absent label is the id, never an empty cell, and "unlabelled"
-/// stays visibly different from "absent" (invariant 3).
+/// stays visibly different from "absent" (spec: STORE#not-recorded-is-not-zero).
 fn session_name_spans(session: &SessionAgg) -> Option<Vec<Span<'static>>> {
     let label = session.label.as_ref()?;
     let dir = short_dir(label.cwd.as_deref());
@@ -2078,7 +2078,7 @@ fn fill_bar(frac: f64, width: usize, fill: &str, pad: &str) -> String {
 }
 
 /// SPEND: billed total, per-provider·model breakdown, and the never-dropped
-/// "no cost data" count (invariant 3: a request whose cost the provider
+/// "no cost data" count (spec: STORE#not-recorded-is-not-zero: a request whose cost the provider
 /// never reported is visible, not folded into the total). Rendered only
 /// when [`SpendAgg::carries_cost`](super::model::SpendAgg::carries_cost),
 /// so never over an empty window.
@@ -2301,7 +2301,7 @@ fn meter_line(
         Verdict::OnTrack => ("on track".to_owned(), Style::new().fg(Color::Green)),
         Verdict::Reached => ("spent".to_owned(), Style::new().fg(Color::Red)),
         // A rolled window and an unmeasurable one both say so in words
-        // — never a silent guess (invariant 3).
+        // — never a silent guess (spec: STORE#not-recorded-is-not-zero).
         Verdict::Stale => ("window rolled over".to_owned(), Style::new().dim()),
         Verdict::Unknown => ("estimating".to_owned(), Style::new().dim()),
     };
@@ -3732,7 +3732,7 @@ mod tests {
     #[test]
     fn a_short_page_keeps_spends_counter_or_drops_the_row_whole() {
         // SPEND moved off the pinned strip into the middle, which sheds:
-        // at every height its "no cost data" counter (invariant 3)
+        // at every height its "no cost data" counter (spec: STORE#not-recorded-is-not-zero)
         // either shows or the panel is gone, never a bare total.
         let snap = snapshot();
         for height in 4..=30u16 {

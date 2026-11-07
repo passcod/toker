@@ -8,7 +8,7 @@
 //! env overrides over it (`TOKER_PORT`, `TOKER_DB`, `TOKER_UPSTREAM`), and
 //! expose a [`Config`] the server and CLI can use.
 //!
-//! Invariant 2 (credentials): the resolved config holds the key sources
+//! spec: SEC#a-credential-is-never-logged-stored-or-displayed (credentials): the resolved config holds the key sources
 //! (env var name, whether the key is in the keyring, optional literal),
 //! and `toker status` reports only which sources are set — never the key
 //! values. The keyring itself is read only by the service
@@ -25,13 +25,11 @@ use crate::middleware::model_map::{self, ModelMap};
 use crate::middleware::notice::NoticeStyle;
 use crate::store;
 
-/// The default listener port (plan: a new port, not 18082 — the
-/// predecessor stays
-/// running at work during migration).
+/// The default listener port.
 pub const DEFAULT_PORT: u16 = 18_123;
 
 /// Default session-attribution header names, read by name only (plan:
-/// Attribution, headers-first; invariant 2 — request headers are never
+/// Attribution, headers-first; spec: SEC#a-credential-is-never-logged-stored-or-displayed — request headers are never
 /// captured wholesale). `x-claude-code-session-id` is claude's own
 /// header; `x-toker-session` is what setup injects into opencode.
 pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
@@ -40,11 +38,9 @@ pub const DEFAULT_SESSION_HEADERS: &[&str] = &[
     "x-session-id",
 ];
 
-/// The default ping-tagging header (plan: "Ping tagging — marks ping lanes
-/// so they never hold the sleep lock"; the predecessor's was
-/// `x-ctp-ping`). The window
+/// The default ping-tagging header. The window
 /// pinger injects it via `ANTHROPIC_CUSTOM_HEADERS`, read by name only
-/// (invariant 2).
+/// (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
 
 /// OpenRouter's upstream base, including the `/v1` prefix.
@@ -155,15 +151,14 @@ pub struct Config {
     /// their own — Workhorse does — whose transcripts this shell's
     /// environment cannot see. A leading `~/` expands at lookup time.
     /// Transcripts are only ever READ, at view time; nothing from them
-    /// reaches the ledger (invariant 1).
+    /// reaches the ledger (spec: SEC#no-prompt-or-completion-content-is-recorded).
     pub transcript_roots: Vec<PathBuf>,
 }
 
-/// The `[gates]` block, resolved (plan: Middleware — route-scoped toggles,
-/// enabled per route in config).
+/// The `[gates]` block, resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatesConfig {
-    /// The quota gate (plan: "Quota gate + release marker"). Arms only on
+    /// The quota gate. Arms only on
     /// the anthropic_sub backend — today's only meter source — where it
     /// blocks a request whose quota window is spent, answering with a
     /// synthetic assistant turn; every other backend is a no-op. The
@@ -172,7 +167,7 @@ pub struct GatesConfig {
     /// toggled strip would change the cached prefix of every conversation
     /// carrying a marker).
     pub quota_enabled: bool,
-    /// The cold gate (plan: "Cold gate"): a session
+    /// The cold gate: a session
     /// resumed after its prompt cache expired would re-read its whole
     /// prefix as fresh input, so the gate interrupts once per idle spell
     /// with a notice advising `/compact`. Advisory — it fires once,
@@ -232,8 +227,8 @@ impl Default for GatesConfig {
     }
 }
 
-/// The `[notices]` table, resolved (plan: "Native rendering for gate
-/// notices"): the notice style per frontend, the frontend being the name
+/// The `[notices]` table, resolved: the notice style per frontend, the frontend
+/// being the name
 /// in the `/f/<frontend>` prefix of the base URL it was pointed at. An
 /// unprefixed request, or a frontend the table does not name, gets the
 /// `default` style.
@@ -333,7 +328,7 @@ impl OpenRouterConfig {
         )
     }
 
-    /// Which key sources are set, for status reporting (invariant 2: never
+    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-stored-or-displayed: never
     /// the values).
     pub fn key_sources(&self) -> KeySources {
         self.key_sources_with_env(&ProcessEnvironment)
@@ -480,7 +475,7 @@ impl AnthropicApiConfig {
         )
     }
 
-    /// Which key sources are set, for status reporting (invariant 2).
+    /// Which key sources are set, for status reporting (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub fn key_sources(&self) -> KeySources {
         self.key_sources_with_env(&ProcessEnvironment)
     }
@@ -498,7 +493,7 @@ impl AnthropicApiConfig {
 /// The codex subscription provider block, resolved. No key sources:
 /// auth is the shared `auth.json` login (see [`crate::providers::codex`]
 /// — always toker-signed, never pass-through), reported by presence
-/// only (invariant 2: never the values).
+/// only (spec: SEC#a-credential-is-never-logged-stored-or-displayed: never the values).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexSubConfig {
     /// Upstream base — the codex backend root, no `/responses` suffix.
@@ -633,7 +628,7 @@ fn parse_model_map_table(
 
 /// The write-side inverse of [`parse_model_map_table`]: a parsed
 /// [`ModelMap`] back as the wire table — canonical selector → target,
-/// exact identities first then families, deterministic per invariant 4.
+/// exact identities first then families, deterministic per spec: WCANON#rendering.
 /// The round-trip is exact on canonical selectors (the parse side
 /// folds non-canonical ones); see [`Config::to_file`].
 fn model_map_table(map: &ModelMap) -> toml::Table {
@@ -683,7 +678,7 @@ fn resolve_api_key(
 }
 
 /// Which key sources are set — the whole of what status may report about
-/// credentials (invariant 2). The keyring is reported as configured, not
+/// credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed). The keyring is reported as configured, not
 /// read: only the service reads it.
 fn key_sources_of(
     environment: &impl Environment,

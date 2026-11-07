@@ -1,7 +1,7 @@
 //! The identities in toker's protocol/provider route graph.
 //!
 //! Protocol identities, implemented adapter paths, and the binding lookup
-//! described in `docs/internals/routing.md`. Protocol identities are data;
+//! lookup. Protocol identities are data;
 //! frontend and backend adapter behavior remains in typed modules. Which
 //! binding and model a request takes is policy's decision, not this module's.
 
