@@ -7,18 +7,13 @@ id: RMODEL
 Which version of a model family is current is decided from what each binding has served, rather than from a maintained list.
 This spec covers what is learned, how a family's target is elected, when a request may be moved to it, and which declared facts decide whether a model fits.
 
-## Three identities
+## Which identity may be read for what
 
-A row carries three model identities, and they MUST NOT be conflated.
+Only the served model MUST add a day's evidence, raise a learned prompt size, select a context ceiling, or choose a price.
 
-| identity | meaning |
-| --- | --- |
-| requested | the model the client named |
-| effective | the model Toker sent |
-| served | the model the response says served it |
+The effective model MUST be read only to decide which model a cache belongs to.
 
-Only the served identity MUST add a day's evidence, raise a learned prompt size, select a context ceiling, or choose a price.
-The effective identity MUST be read only to decide what a cache belongs to.
+The requested model MUST be read only as routing provenance.
 
 > [!NOTE]
 > A candidate's alias target is an opaque destination rather than evidence of capability or price, and the same separation covers a provider that quietly serves a model nobody asked for.
