@@ -7,8 +7,6 @@ id: GCOLD
 The cold-cache gate warns an operator before a request re-reads a prompt cache that has expired.
 This spec covers which requests it considers, when it stays quiet, how a recap is held, and the two clocks it keeps.
 
-Policy resolves a request's route before any gate sees it, so the gate MUST read the resolved binding and effective model and MUST NOT route.
-
 ## Only a request that could be the re-read
 
 A lane records how large a prefix was cached and how long ago it was touched.

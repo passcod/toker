@@ -44,6 +44,7 @@ Four destinations, decided per sentence rather than per file:
 ├── canonical.md         canonical rendering, what may alter a body
 ├── translation.md       Messages <-> Responses, purity, prefix stability
 ├── gates/
+│   ├── overview.md      what may stop a request, and what feeds a gate
 │   ├── quota.md         windows, weights, releases, allowances
 │   ├── cold.md          the cold-cache gate, two clocks, the recap
 │   ├── notices.md       notice styles per profile, byte stability
@@ -55,6 +56,7 @@ Four destinations, decided per sentence rather than per file:
 │   ├── models.md        learning, election, upgrades, context ceilings
 │   └── publication.md   what each profile lists, generations, Claude's settings
 ├── store/
+│   ├── overview.md      what the store holds, migrations, absent values
 │   ├── ledger.md        row kinds, fields, old rows, imported rows
 │   ├── migration.md     routing moving from the file into the store
 │   ├── lanes.md         lane identity, cache identity, pins
@@ -196,6 +198,7 @@ the whole project is a proxy.
 | `routing.md` | `ROUTE` |
 | `canonical.md` | `CANON` |
 | `translation.md` | `TRANS` |
+| `gates/overview.md` | `GATE` |
 | `gates/quota.md` | `GQUOTA` |
 | `gates/cold.md` | `GCOLD` |
 | `gates/notices.md` | `GNOTE` |
@@ -205,6 +208,7 @@ the whole project is a proxy.
 | `policy/overview.md` | `RPOL` |
 | `policy/models.md` | `RMODEL` |
 | `policy/publication.md` | `RPUB` |
+| `store/overview.md` | `STORE` |
 | `store/ledger.md` | `SROWS` |
 | `store/migration.md` | `SMIG` |
 | `store/lanes.md` | `SLANE` |

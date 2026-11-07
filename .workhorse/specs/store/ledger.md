@@ -4,45 +4,15 @@ id: SROWS
 
 # The ledger
 
-The store is the database Toker keeps its state in.
-The ledger is the append-only record of requests within it, one row per upstream attempt or proxy decision.
+The ledger is the append-only record of requests within the store, one row per upstream attempt or proxy decision.
+This spec covers how rows are written and what each kind records.
 
-This spec covers how rows are written, what each kind records, and what a reader owes a reader when a field did not always exist.
+The store around it, its migrations and the rule that an absent value is not a zero are specified by [STORE](overview.md).
 
-## The store and the ledger
+## Writing
 
 The ledger MUST be insert-only.
 Every row MUST be written through one function, so that no caller can assemble a row of its own shape.
-
-The store also holds the lanes, the policy revisions, the learned models, the allowances, the ping runs and the meter snapshots.
-That state is read-modify-write and is not part of the ledger.
-
-> [!NOTE]
-> Policy and configuration live in the store, not in the ledger.
-> Nothing is appended to the record of requests to enable a provider or activate a revision.
-
-Migrations MUST be an append-only list gated by a stored version.
-A migration MUST never be edited, reordered or deleted.
-
-> [!NOTE]
-> A database in the wild has had exactly the first several applied, by position, so changing an earlier entry changes what a later one operates on.
-
-## Not recorded is not zero
-
-Every column but the timestamp MUST be nullable, and an absent value MUST mean that the field was not recorded.
-
-A reader MUST NOT treat an absent value as a zero, a false or a negative.
-
-> [!NOTE]
-> An absent list of beta flags means none was captured, not that the request carried none.
-> An absent policy revision means the row predates policy routing, not revision zero.
-> An absent attempt group means the row predates attempt identity, not a request of one attempt.
-
-Fields are added over time, so earlier rows lack later fields.
-A view whose range reaches back past a field's introduction MUST say so rather than report the absence as a measurement.
-
-> [!NOTE]
-> Absence of instrumentation must never read as absence of the phenomenon.
 
 ## Row kinds
 
@@ -161,11 +131,6 @@ An importer MUST count every field of the source it did not map, by name, separa
 
 A field whose meaning changed in the source carries its eras across with the rows, so a count over such a range MUST be reported as a floor.
 
-## Opening the store
-
-A reader that does not write MUST open the store read-only.
-
-> [!NOTE]
-> A wrong path then fails instead of creating an empty store, and an older binary never migrates the live file.
+## Export
 
 How rows are exported is specified by [UREAD](../cli/readers.md).

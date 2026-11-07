@@ -72,11 +72,6 @@ Attempts are specified by [SATT](../store/attempts.md).
 
 ## Firing
 
-The gate MUST stop a session before its request is forwarded, and every gate decision MUST be taken at one place.
-
-Accounting MUST NOT stop a session.
-Only a gate may stop one.
-
 The gate's threshold leaves the last part of a window unspent unless the session releases past it.
 How the stop is delivered is specified by [GNOTE](notices.md), and how exhaustion is projected by [GCAST](forecasting.md).
 
