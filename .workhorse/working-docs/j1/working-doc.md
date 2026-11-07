@@ -141,6 +141,25 @@ does not. The six `//!` comments currently pointing at `docs/internals/` paths
 are deleted rather than converted, and citations are placed where a reader
 auditing a requirement would want them.
 
+### Sweeping the comments
+
+The citation pass is also a cleanup pass over every comment in the code, done
+in the same sweep.
+
+**Plan references go.** 143 lines mention a plan, mostly as `(plan: "…")` in a
+module header. A plan is deleted when its work lands, so a comment naming one
+points at nothing almost immediately. This is a standing rule and not specific
+to this card.
+
+**Numbered invariant references go.** 219 lines reference an invariant, most by
+number: `invariant 3` alone appears 81 times, `invariant 4` 36 times. The
+invariants dissolve into the specs that own their subjects, so the numbering
+stops existing and every one of these becomes a `// spec: ID#section` citation
+or is rewritten to say the thing directly.
+
+Where a comment records a specific bug that was paid for, the comment stays;
+only its reference to a plan or an invariant number changes.
+
 ### Sweeping names into code
 
 Code identifiers follow the settled terms, as their own commit, with
@@ -289,6 +308,15 @@ weekdays to send pings that open nothing. Filed as #K1.
 Scoping a spec to the provider behaviour it depends on is worth doing wherever
 a topic reads as general and is not. Window anchoring is the clearest case, and
 the meter and cost rules in `ROUTE` are already per-provider tables.
+
+### Cards filed from this work
+
+- #K1, the ping timers being offered where no provider anchors a window
+- #L1, removing the config file. The refactor behind toker's current shape
+  intended configuration to live in the ledger and be managed from the UI.
+  Routing made that move and nothing else did, so `toker.toml` is still 2642
+  lines of parsing over 63 fields. `DCONF` and `DLIFE` describe the file as it
+  stands today and will need revising when that card lands.
 
 ### Note density
 
