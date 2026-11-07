@@ -900,46 +900,186 @@ impl Config {
         })
     }
 
-    /// Load the resolved configuration: defaults ← `toker.toml` ← env.
-    /// A missing file is the defaults, not an error; a present file that
-    /// does not parse is an error — a hand-edited typo must not silently
-    /// read as default.
-    pub fn load() -> anyhow::Result<Config> {
-        Self::load_with_env(&ProcessEnvironment)
+    /// This configuration as store rows, for setup's import
+    /// (spec: RMIG#migrating-the-file-and-the-store-together).
+    ///
+    /// A value matching its built-in default is stored as "not set" rather
+    /// than written out, so an imported machine keeps following the default
+    /// as it moves, exactly as a machine that never had a file does. The
+    /// routing fields are not carried: they feed revision one and die with
+    /// the file (spec: RMIG#the-routing-fields).
+    pub fn to_configuration(&self) -> crate::store::Configuration {
+        use crate::store::{Configuration, ProviderConfigRow, SettingsConfigRow};
+
+        /// `Some(value)` only where it differs from the default.
+        fn set<T: PartialEq>(value: T, default: T) -> Option<T> {
+            (value != default).then_some(value)
+        }
+
+        let mut providers = Vec::new();
+        let mut push = |provider: &str, row: Option<ProviderConfigRow>| {
+            providers.push(row.unwrap_or_else(|| ProviderConfigRow {
+                provider: provider.to_owned(),
+                enabled: false,
+                ..ProviderConfigRow::default()
+            }));
+        };
+
+        push(
+            "openrouter",
+            self.openrouter.as_ref().map(|block| ProviderConfigRow {
+                provider: "openrouter".to_owned(),
+                enabled: true,
+                upstream: set(
+                    block.upstream.as_str().to_owned(),
+                    DEFAULT_OPENROUTER_UPSTREAM.to_owned(),
+                ),
+                cred_env: set(
+                    block.api_key_env.clone(),
+                    DEFAULT_OPENROUTER_API_KEY_ENV.to_owned(),
+                ),
+                cred_keyring: set(block.api_key_keyring, false),
+                cred_literal: block.api_key.clone(),
+                ..ProviderConfigRow::default()
+            }),
+        );
+        push(
+            "openai_api",
+            self.openai_api.as_ref().map(|block| ProviderConfigRow {
+                provider: "openai_api".to_owned(),
+                enabled: true,
+                upstream: set(
+                    block.upstream.as_str().to_owned(),
+                    DEFAULT_OPENAI_API_UPSTREAM.to_owned(),
+                ),
+                cred_env: set(
+                    block.api_key_env.clone(),
+                    DEFAULT_OPENAI_API_KEY_ENV.to_owned(),
+                ),
+                cred_keyring: set(block.api_key_keyring, false),
+                cred_literal: block.api_key.clone(),
+                ..ProviderConfigRow::default()
+            }),
+        );
+        push(
+            "anthropic_sub",
+            self.anthropic_sub.as_ref().map(|block| ProviderConfigRow {
+                provider: "anthropic_sub".to_owned(),
+                enabled: true,
+                upstream: set(
+                    block.upstream.as_str().to_owned(),
+                    DEFAULT_ANTHROPIC_UPSTREAM.to_owned(),
+                ),
+                cred_env: set(
+                    block.oauth_token_env.clone(),
+                    DEFAULT_ANTHROPIC_SUB_TOKEN_ENV.to_owned(),
+                ),
+                cred_keyring: set(block.oauth_token_keyring, false),
+                cred_literal: block.oauth_token.clone(),
+                ..ProviderConfigRow::default()
+            }),
+        );
+        push(
+            "anthropic_api",
+            self.anthropic_api.as_ref().map(|block| ProviderConfigRow {
+                provider: "anthropic_api".to_owned(),
+                enabled: true,
+                upstream: set(
+                    block.upstream.as_str().to_owned(),
+                    DEFAULT_ANTHROPIC_UPSTREAM.to_owned(),
+                ),
+                cred_env: set(
+                    block.api_key_env.clone(),
+                    DEFAULT_ANTHROPIC_API_KEY_ENV.to_owned(),
+                ),
+                cred_keyring: set(block.api_key_keyring, false),
+                cred_literal: block.api_key.clone(),
+                ..ProviderConfigRow::default()
+            }),
+        );
+        push(
+            "codex_sub",
+            self.codex_sub.as_ref().map(|block| ProviderConfigRow {
+                provider: "codex_sub".to_owned(),
+                enabled: true,
+                upstream: set(
+                    block.upstream.as_str().to_owned(),
+                    DEFAULT_CODEX_UPSTREAM.to_owned(),
+                ),
+                refresh_url: set(
+                    block.refresh_url.as_str().to_owned(),
+                    DEFAULT_CODEX_REFRESH_URL.to_owned(),
+                ),
+                client_version: block.client_version.clone(),
+                version_probe: set(block.version_probe, true),
+                ..ProviderConfigRow::default()
+            }),
+        );
+        providers.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        let defaults = GatesConfig::default();
+        let built_in_notices = NoticesConfig::default();
+        // All or nothing: a stored table replaces the built-in one, so a
+        // file that changed one entry has to carry every entry it kept.
+        let notices = if self.notices.frontends == built_in_notices.frontends {
+            Default::default()
+        } else {
+            self.notices
+                .frontends
+                .iter()
+                .map(|(profile, style)| (profile.clone(), style.name().to_owned()))
+                .collect()
+        };
+
+        Configuration {
+            providers,
+            settings: SettingsConfigRow {
+                session_headers: set(
+                    self.session_header_names.clone(),
+                    DEFAULT_SESSION_HEADERS
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect(),
+                ),
+                ping_header: set(
+                    self.ping_header_name.clone(),
+                    DEFAULT_PING_HEADER.to_owned(),
+                ),
+                awake: set(self.awake, true),
+                transcript_roots: set(
+                    self.transcript_roots
+                        .iter()
+                        .map(|root| root.display().to_string())
+                        .collect::<Vec<_>>(),
+                    Vec::new(),
+                ),
+                quota_enabled: set(self.gates.quota_enabled, defaults.quota_enabled),
+                cold_enabled: set(self.gates.cold_enabled, defaults.cold_enabled),
+                cold_outlook: set(self.gates.cold_outlook, defaults.cold_outlook),
+                cold_min_tokens: set(self.gates.cold_min_tokens, defaults.cold_min_tokens),
+                cold_idle_min: self.gates.cold_idle_min,
+                notice_default: set(
+                    self.notices.default.name().to_owned(),
+                    built_in_notices.default.name().to_owned(),
+                ),
+            },
+            notices,
+        }
     }
 
-    fn load_with_env(environment: &impl Environment) -> anyhow::Result<Config> {
-        let path = config_path_with_env(environment)?;
-        let mut config = Self::load_from(&path)?;
-
-        // Env overrides (config file loses).
-        if let Some(port) = environment.var_os("TOKER_PORT") {
-            let port = port
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("TOKER_PORT is not valid UTF-8"))?
-                .parse::<u16>()
-                .context("TOKER_PORT must be a port number")?;
-            config.port = port;
-        }
-        if let Some(db) = environment.var_os("TOKER_DB") {
-            config.db_path = PathBuf::from(db);
-        }
-        if let Some(upstream) = environment.var_os("TOKER_UPSTREAM") {
-            let upstream = upstream
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("TOKER_UPSTREAM is not valid UTF-8"))?;
-            let upstream = parse_upstream(&upstream).context("TOKER_UPSTREAM")?;
-            // The override moves an enabled backend; it never enables one.
-            // Failing the load instead would stop the service over a stray
-            // variable in the user manager's environment.
-            match config.openrouter.as_mut() {
-                Some(openrouter) => openrouter.upstream = upstream,
-                None => tracing::warn!(
-                    "TOKER_UPSTREAM is set but [providers.openrouter] is not: ignored"
-                ),
-            }
-        }
-
+    /// The machine's configuration, from its store (spec: DCONF#in-the-store).
+    ///
+    /// Opens the store at the path the environment resolves to, because the
+    /// store's own path is one of the two things that cannot be read from
+    /// it. Every command reaches configuration through here, and every
+    /// command but setup has already refused if a configuration file is
+    /// still present, so there is no second source to layer over.
+    pub fn load() -> anyhow::Result<Config> {
+        let environment = ProcessEnvironment;
+        let db_path = resolve_db_path(&environment)?;
+        let store = crate::store::Store::open(&db_path)
+            .with_context(|| format!("opening the store at {}", db_path.display()))?;
+        let config = Self::from_configuration(&store.load_configuration()?, &environment)?;
         config.validate_retained()?;
         Ok(config)
     }
@@ -1810,7 +1950,6 @@ mod tests {
         DEFAULT_PORT, DEFAULT_SESSION_HEADERS, KeySources, OpenRouterConfig,
     };
     use crate::middleware::notice::NoticeStyle;
-    use crate::store::Store;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
@@ -1890,6 +2029,150 @@ mod tests {
         std::fs::create_dir_all(&path).expect("mkdir");
         let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
         assert!(super::config_file_present_with_env(&environment).is_none());
+    }
+
+    /// What a file resolves to must survive becoming rows and being read
+    /// back: that round trip is the whole of setup's import.
+    fn round_trip(toml: &str) -> (super::Config, super::Config) {
+        let dir = test_dir("round-trip");
+        let path = dir.join("toker.toml");
+        fs::write(&path, toml).expect("write config");
+        let from_file = super::Config::load_from(&path).expect("the file loads");
+
+        let environment = TestEnvironment::default().with("TOKER_DB", "/tmp/toker-test.db");
+        let from_rows =
+            super::Config::from_configuration(&from_file.to_configuration(), &environment)
+                .expect("the rows resolve");
+        (from_file, from_rows)
+    }
+
+    #[test]
+    fn an_imported_file_resolves_back_to_what_it_configured() {
+        let (file, rows) = round_trip(
+            r#"
+ping_header_name = "x-mine"
+awake = false
+
+[providers.openrouter]
+upstream = "http://gateway.invalid/v1"
+api_key_env = "MY_OPENROUTER_KEY"
+api_key_keyring = true
+
+[providers.codex_sub]
+version_probe = false
+client_version = "9.9.9"
+
+[gates]
+quota_enabled = false
+cold_min_tokens = 42000
+cold_idle_min = 7.5
+"#,
+        );
+
+        assert_eq!(rows.ping_header_name, file.ping_header_name);
+        assert_eq!(rows.awake, file.awake);
+        assert_eq!(rows.gates.quota_enabled, file.gates.quota_enabled);
+        assert_eq!(rows.gates.cold_min_tokens, file.gates.cold_min_tokens);
+        assert_eq!(rows.gates.cold_idle_min, file.gates.cold_idle_min);
+        assert_eq!(rows.gates.cold_enabled, file.gates.cold_enabled);
+
+        let (file_or, rows_or) = (
+            file.openrouter.as_ref().expect("on"),
+            rows.openrouter.as_ref().expect("on"),
+        );
+        assert_eq!(rows_or.upstream, file_or.upstream);
+        assert_eq!(rows_or.api_key_env, file_or.api_key_env);
+        assert_eq!(rows_or.api_key_keyring, file_or.api_key_keyring);
+
+        let (file_cx, rows_cx) = (
+            file.codex_sub.as_ref().expect("on"),
+            rows.codex_sub.as_ref().expect("on"),
+        );
+        assert_eq!(rows_cx.version_probe, file_cx.version_probe);
+        assert_eq!(rows_cx.client_version, file_cx.client_version);
+
+        // Not configured in the file, and so not enabled by the import.
+        assert!(rows.anthropic_sub.is_none());
+        assert!(rows.openai_api.is_none());
+    }
+
+    #[test]
+    fn an_imported_default_is_stored_as_unset_rather_than_written_out() {
+        let dir = test_dir("import-defaults");
+        let path = dir.join("toker.toml");
+        // Spelling the built-in value out loud must not pin it: the row
+        // records that nothing was chosen, so a default that moves moves.
+        fs::write(
+            &path,
+            format!("[providers.openrouter]\nupstream = \"{DEFAULT_OPENROUTER_UPSTREAM}\"\n"),
+        )
+        .expect("write");
+        let configuration = super::Config::load_from(&path)
+            .expect("loads")
+            .to_configuration();
+
+        let row = configuration
+            .providers
+            .iter()
+            .find(|row| row.provider == "openrouter")
+            .expect("a row");
+        assert!(row.enabled);
+        assert_eq!(row.upstream, None, "the default is not written out");
+        assert_eq!(row.cred_env, None);
+    }
+
+    #[test]
+    fn every_known_provider_gets_a_row_even_when_the_file_named_none() {
+        let dir = test_dir("import-empty");
+        let path = dir.join("toker.toml");
+        fs::write(&path, "port = 19999\n").expect("write");
+        let configuration = super::Config::load_from(&path)
+            .expect("loads")
+            .to_configuration();
+
+        let names: Vec<&str> = configuration
+            .providers
+            .iter()
+            .map(|row| row.provider.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "anthropic_api",
+                "anthropic_sub",
+                "codex_sub",
+                "openai_api",
+                "openrouter"
+            ]
+        );
+        assert!(configuration.providers.iter().all(|row| !row.enabled));
+    }
+
+    #[test]
+    fn an_imported_notice_table_carries_every_entry_it_kept() {
+        let (file, rows) =
+            round_trip("[notices]\ndefault = \"plain\"\nclaude = \"block\"\nmine = \"toker\"\n");
+        assert_eq!(rows.notices.default, file.notices.default);
+        assert_eq!(
+            rows.notices.style_for(Some("claude")),
+            file.notices.style_for(Some("claude"))
+        );
+        assert_eq!(
+            rows.notices.style_for(Some("mine")),
+            file.notices.style_for(Some("mine"))
+        );
+    }
+
+    #[test]
+    fn an_untouched_notice_table_stores_no_rows_at_all() {
+        let dir = test_dir("import-notices-default");
+        let path = dir.join("toker.toml");
+        fs::write(&path, "port = 19999\n").expect("write");
+        let configuration = super::Config::load_from(&path)
+            .expect("loads")
+            .to_configuration();
+        assert!(configuration.notices.is_empty());
+        assert_eq!(configuration.settings.notice_default, None);
     }
 
     #[test]
@@ -2070,11 +2353,10 @@ mod tests {
         crate::test_support::tempdir(&format!("config-{name}-"))
     }
 
-    /// Load the scratch config without process-global mutation or ambient
-    /// `TOKER_*` overrides.
+    /// Parse the scratch file. Nothing layers over it: the file is only
+    /// ever read to import a machine off it.
     fn load_result(dir: &std::path::Path) -> anyhow::Result<super::Config> {
-        let environment = TestEnvironment::default().with("TOKER_CONFIG", dir.join("toker.toml"));
-        super::Config::load_with_env(&environment)
+        super::Config::load_from(&dir.join("toker.toml"))
     }
 
     fn load_from(dir: &std::path::Path) -> super::Config {
@@ -2917,8 +3199,7 @@ default_backend_anthropic = "codex_sub"
 "#,
         )
         .unwrap();
-        let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
-        let config = super::Config::load_with_env(&environment).unwrap();
+        let config = super::Config::load_from(&path).unwrap();
         assert!(config.openrouter.is_some());
         assert_eq!(
             config.default_backend_anthropic.as_deref(),
@@ -2928,80 +3209,23 @@ default_backend_anthropic = "codex_sub"
     }
 
     #[test]
-    fn load_from_reads_a_path_without_env_overrides() {
-        // The setup wizard's read-merge side: `load_from(path)` is
-        // env-free, so a `TOKER_*` override active in the wizard's own
-        // environment can never be read-merged and pinned into the file
-        // by a rewrite (see `crate::setup::config_writer`) — while
-        // `load()` still layers the env over the same file for the
-        // running daemon.
+    fn load_from_reads_exactly_what_the_file_says() {
+        // The file is only ever read to import a machine off it, so it
+        // reads exactly what is written there: nothing in the importing
+        // operator's environment may reach the rows that import writes.
         let dir = test_dir("load-from");
         fs::write(
             dir.join("toker.toml"),
             "port = 19999\n[providers.openrouter]\n",
         )
         .expect("write config");
-        let environment = TestEnvironment::default()
-            .with("TOKER_CONFIG", dir.join("toker.toml"))
-            .with("TOKER_PORT", "20000")
-            .with("TOKER_DB", dir.join("elsewhere.db"))
-            .with("TOKER_UPSTREAM", "http://from-env/v1");
 
         let config = super::Config::load_from(&dir.join("toker.toml")).expect("loads");
-        assert_eq!(config.port, 19_999, "no env override applies to load_from");
+        assert_eq!(config.port, 19_999);
         assert_eq!(
             config.db_path,
-            crate::store::default_db_path().expect("default db path"),
-            "the db path is the file-or-default one, not TOKER_DB"
+            crate::store::default_db_path().expect("default db path")
         );
-        assert_ne!(
-            config
-                .openrouter
-                .as_ref()
-                .expect("enabled")
-                .upstream
-                .as_str(),
-            "http://from-env/v1"
-        );
-
-        let loaded = super::Config::load_with_env(&environment).expect("loads");
-        assert_eq!(loaded.port, 20_000);
-        assert_eq!(loaded.db_path, dir.join("elsewhere.db"));
-        assert_eq!(
-            loaded
-                .openrouter
-                .as_ref()
-                .expect("enabled")
-                .upstream
-                .as_str(),
-            "http://from-env/v1"
-        );
-
-        // The upstream override moves an enabled backend and never
-        // enables a disabled one.
-        fs::write(dir.join("toker.toml"), "port = 19999\n").expect("rewrite config");
-        let loaded = super::Config::load_with_env(&environment)
-            .expect("a stray override does not fail the load");
-        assert_eq!(loaded.openrouter, None);
-    }
-
-    #[test]
-    fn env_overrides_the_file() {
-        let dir = test_dir("env");
-        fs::write(
-            dir.join("toker.toml"),
-            "port = 19999\n[providers.openrouter]\nupstream = \"http://from-file/v1\"\n",
-        )
-        .expect("write config");
-        let environment = TestEnvironment::default()
-            .with("TOKER_CONFIG", dir.join("toker.toml"))
-            .with("TOKER_PORT", "20000")
-            .with("TOKER_DB", dir.join("env.db"))
-            .with("TOKER_UPSTREAM", "http://from-env/v1");
-
-        let config = super::Config::load_with_env(&environment).expect("load config");
-        assert_eq!(config.port, 20000);
-        assert_eq!(config.db_path, dir.join("env.db"));
         assert_eq!(
             config
                 .openrouter
@@ -3009,21 +3233,8 @@ default_backend_anthropic = "codex_sub"
                 .expect("enabled")
                 .upstream
                 .as_str(),
-            "http://from-env/v1"
+            DEFAULT_OPENROUTER_UPSTREAM
         );
-
-        let _ = Store::open(&config.db_path).expect("the env db path is openable");
-    }
-
-    #[test]
-    fn bad_env_port_is_an_error() {
-        let dir = test_dir("bad-port");
-        let environment = TestEnvironment::default()
-            .with("TOKER_CONFIG", dir.join("toker.toml"))
-            .with("TOKER_PORT", "not-a-port");
-        let error =
-            super::Config::load_with_env(&environment).expect_err("TOKER_PORT must be numeric");
-        assert!(error.to_string().contains("TOKER_PORT"));
     }
 
     #[test]

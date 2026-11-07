@@ -7,12 +7,16 @@ use crate::config::Config;
 use crate::policy::{legacy, policy_bytes};
 use crate::routing::RouteRegistry;
 
-/// Reload `toker.toml` and compile its legacy routing fields (protocol
-/// defaults, model maps, picker rules, `force_newest`, `compact_model`) into a
-/// canonical policy document, ready to replace the draft. Any failure to load
-/// or compile the file is returned as it is, so the draft stays as it was.
-pub(super) fn legacy_policy() -> anyhow::Result<Value> {
-    let config = Config::load().context("loading toker.toml")?;
+/// Read `path` and compile its legacy routing fields (protocol defaults,
+/// model maps, picker rules, `force_newest`, `compact_model`) into a canonical
+/// policy document, ready to replace the draft. Any failure to load or compile
+/// the file is returned as it is, so the draft stays as it was.
+///
+/// An import names the file it reads: configuration lives in the store, so
+/// there is no machine configuration to take by default
+/// (spec: RMIG#importing-a-file-deliberately).
+pub(super) fn legacy_policy(path: &std::path::Path) -> anyhow::Result<Value> {
+    let config = Config::load_from(path).with_context(|| format!("loading {}", path.display()))?;
     document_for(&config)
 }
 

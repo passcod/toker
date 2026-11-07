@@ -31,9 +31,9 @@ Each phase compiles and keeps the suite green.
 - [x] `Config::from_store`, resolving the same view the file produced
 - [x] `PORT` and `TOKER_DB` resolve beside it, neither reachable from the store
 - [ ] Move the TOML types and parsing into their own module, reached only by setup's import
-- [ ] `Config::load` reads the store, not the file
-- [ ] `FileConfig::into_rows` for what the import writes
-- [ ] Retire `TOKER_PORT` and `TOKER_UPSTREAM`, both still read on the file path
+- [x] `Config::load` reads the store, not the file
+- [x] `FileConfig::into_rows` for what the import writes
+- [x] Retire `TOKER_PORT` and `TOKER_UPSTREAM`, both still read on the file path
 
 ### 3. The gate
 

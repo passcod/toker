@@ -121,7 +121,7 @@ pub(super) struct State {
     conflicted_edits: Vec<Value>,
     /// Compiles the legacy config into a policy document; replaceable so the
     /// page's tests need no config file.
-    legacy_policy: fn() -> anyhow::Result<Value>,
+    legacy_policy: fn(&std::path::Path) -> anyhow::Result<Value>,
 }
 
 impl Default for State {
@@ -966,7 +966,15 @@ impl State {
     /// not load or compile is reported and leaves the draft alone.
     fn import(&mut self) -> Option<Command> {
         let generation = self.generation?;
-        match (self.legacy_policy)() {
+        let path = match crate::config::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                self.modal = Modal::None;
+                self.error = Some(format!("import: {error:#}"));
+                return None;
+            }
+        };
+        match (self.legacy_policy)(&path) {
             Ok(policy) => {
                 self.in_flight = true;
                 Some(command(
@@ -1658,7 +1666,7 @@ mod tests {
     #[test]
     fn import_waits_for_confirmation_then_replaces_the_draft_at_the_loaded_generation() {
         let mut state = loaded(full_snapshot());
-        state.legacy_policy = || Ok(serde_json::json!({"format_version": 3, "marker": "legacy"}));
+        state.legacy_policy = |_| Ok(serde_json::json!({"format_version": 3, "marker": "legacy"}));
         state.set_view(View::Status);
         assert!(press(&mut state, KeyCode::Char('i')).is_none());
         assert!(matches!(state.modal(), Modal::Import));
@@ -1688,7 +1696,7 @@ mod tests {
     #[test]
     fn a_config_that_cannot_be_imported_leaves_the_draft_alone() {
         let mut state = loaded(full_snapshot());
-        state.legacy_policy = || Err(anyhow::anyhow!("toker.toml does not load"));
+        state.legacy_policy = |_| Err(anyhow::anyhow!("the named file does not load"));
         state.set_view(View::Status);
         press(&mut state, KeyCode::Char('i'));
         assert!(press(&mut state, KeyCode::Char('y')).is_none());
@@ -1697,7 +1705,7 @@ mod tests {
         assert!(
             state
                 .error()
-                .is_some_and(|error| error.contains("toker.toml does not load")),
+                .is_some_and(|error| error.contains("the named file does not load")),
             "{:?}",
             state.error()
         );
@@ -1707,7 +1715,7 @@ mod tests {
     #[test]
     fn an_import_against_a_stale_draft_takes_the_conflict_path() {
         let mut state = loaded(full_snapshot());
-        state.legacy_policy = || Ok(serde_json::json!({}));
+        state.legacy_policy = |_| Ok(serde_json::json!({}));
         state.set_view(View::Status);
         press(&mut state, KeyCode::Char('i'));
         press(&mut state, KeyCode::Char('y'));
