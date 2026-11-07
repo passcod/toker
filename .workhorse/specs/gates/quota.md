@@ -99,18 +99,21 @@ The markers are `$#$BURN$#$` and `$#$OVER$#$`.
 These strings are a published interface and MUST NOT change.
 They are stripped from every request, as [WCANON](../wire/canonical.md#licensed-transformations) requires.
 
-Where the operator grants a release directly, Toker MUST allow it ahead of exhaustion for the short window, and MUST allow it for the long window only once that window is exhausted.
+Where the operator grants a release directly, Toker MUST allow it ahead of exhaustion for the short window.
+Where the operator grants a release directly, Toker MUST allow it for the long window only once that window is exhausted.
 
 > [!NOTE]
 > A release meant for an afternoon would otherwise become one for the week.
 
 Revoking a session's releases MUST delete its allowances, so that the gate applies again from the next request.
 
-The gate MUST load a session's allowances on every request, and MUST NOT depend on being signalled that one was granted.
+The gate MUST load a session's allowances on every request.
+The gate MUST NOT depend on being signalled that one was granted.
 
 ### Allowances expire with their window
 
-An allowance MUST be keyed by the reset its meter reported, and MUST be honoured only while the meter still reports that reset.
+An allowance MUST be keyed by the reset its meter reported.
+An allowance MUST be honoured only while the meter still reports that reset.
 
 Once that reset passes the meter is no longer exhausted and the next window reports a new reset, so the row can never match again.
 Enforcement therefore needs no pruning, and Toker MUST prune only to bound the table.
@@ -125,7 +128,8 @@ Toker MUST log an event when a meter-bearing provider's reading crosses each of 
 Each event MUST fire once.
 A threshold MUST re-arm when the window's reset changes or when utilisation falls well below it.
 
-Toker MUST NOT enumerate the statuses it recognises, and MUST treat any status other than allowed as reportable.
+Toker MUST NOT enumerate the statuses it recognises.
+Toker MUST treat any status other than allowed as reportable.
 
 > [!NOTE]
 > The set of statuses a provider sends grows without notice, and statuses beyond the first known one have already appeared.

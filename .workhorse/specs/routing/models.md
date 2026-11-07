@@ -108,7 +108,8 @@ A promotion MUST change only that eligibility, leaving observed days and prompt 
 A request MUST be moved to the elected target only where the move cannot cost a cached prefix.
 
 A lane Toker has a record of MUST be eligible only where its cache is proven gone.
-This MUST ask whether the cache is gone, and MUST NOT ask whether the operator should be interrupted, as [GCOLD](../gates/cold.md#two-questions-not-one) requires.
+This MUST ask whether the cache is gone.
+This MUST NOT ask whether the operator should be interrupted, as [GCOLD](../gates/cold.md#two-questions-not-one) requires.
 
 A request with no lane evidence MUST be eligible only where the conversation is at most a few messages long, or where nothing has been sent on the requested model, on this binding, within a full cache lifetime.
 
@@ -177,7 +178,8 @@ The largest prompt Toker has watched that pair serve MUST decide only where no w
 > Learning undershoots by construction, being the largest prompt anyone happened to send, and has kept a large compaction on an expensive model against a listed window four times the learned figure.
 > Declining costs an upgrade; admitting costs a failed request at the worst moment.
 
-Where a lane has no measured size, the context check MUST be given an upper bound derived from the request itself, and MUST NOT be given zero.
+Where a lane has no measured size, the context check MUST be given an upper bound derived from the request itself.
+Where a lane has no measured size, the context check MUST NOT be given zero.
 
 ## Resolving a declared window
 

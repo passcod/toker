@@ -13,7 +13,8 @@ Toker MUST strip the prefix before matching the path, and MUST retain the name f
 A profile name MUST consist of lowercase ASCII letters, digits, `-` and `_`.
 A configured notice style whose name falls outside that set MUST be refused when the configuration is read.
 
-A request's profile name MUST select its gate notice style, which [GNOTE](../gates/notices.md) specifies, and MUST be recorded on the request's ledger row.
+A request's profile name MUST select its gate notice style, which [GNOTE](../gates/notices.md) specifies.
+A request's profile name MUST be recorded on the request's ledger row.
 The name MUST also scope policy, so that a presentation, rewrite or default scoped to one profile applies to that profile alone.
 
 A request that arrives without a prefix MUST be treated as the profile named `unprefixed`.

@@ -44,7 +44,8 @@ Before that, Toker MUST hold the provider's head and a bounded prefix of its bod
 
 After commitment there MUST be no retry, because the client holds bytes.
 
-A client disconnecting before commitment MUST cancel the attempt and record it, MUST NOT select another candidate, and MUST NOT pin the lane.
+A client disconnecting before commitment MUST cancel the attempt and record it, MUST NOT select another candidate.
+A client disconnecting before commitment MUST NOT pin the lane.
 
 ## One decision governs
 

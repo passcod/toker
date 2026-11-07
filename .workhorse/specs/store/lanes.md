@@ -73,7 +73,8 @@ A pin MUST carry the route fingerprint as well as the models.
 > [!NOTE]
 > The effective model alone cannot say whether a lane is still on the route it was resolved under.
 
-A pinned lane MUST start its candidate walk from its pinned candidate only while the route's fingerprint still matches, and MUST start from the first candidate otherwise.
+A pinned lane MUST start its candidate walk from its pinned candidate only while the route's fingerprint still matches.
+A pinned lane MUST start from the first candidate otherwise.
 
 ## The pin
 
@@ -104,7 +105,8 @@ A move to a revision older than the lane's MUST be refused.
 
 ### A lane with no pin
 
-A lane with no pin MUST resolve under the active revision exactly as a new lane does, whatever the activation scope, and MUST be pinned by its next response.
+A lane with no pin MUST resolve under the active revision exactly as a new lane does, whatever the activation scope.
+A lane with no pin MUST be pinned by its next response.
 
 Toker MUST NOT seed a pin from anything but a served response.
 
@@ -154,7 +156,8 @@ For a compaction, the resolver MUST be told the lane is cold only where that rec
 
 ### Activation consent
 
-Activation consent MUST count lanes by cache temperature, and MUST count a lane with no pin as warm or unknown.
+Activation consent MUST count lanes by cache temperature.
+Activation consent MUST count a lane with no pin as warm or unknown.
 
 A store that cannot be read MUST refuse the activation, and MUST NOT read as having no warm lanes.
 

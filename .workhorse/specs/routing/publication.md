@@ -24,7 +24,8 @@ A profile naming no protocol MUST receive the Chat shape.
 A listing MUST contain the revision's presentations for that scope.
 
 An exact or selected presentation MUST take its display data from the offer's own catalogue record.
-A virtual presentation has no provider record, so it MUST name itself, and MUST report no creation time rather than invent one.
+A virtual presentation has no provider record, so it MUST name itself.
+A virtual presentation has no provider record, so it MUST report no creation time rather than invent one.
 
 Entries MUST be ordered by slug, so that one revision and one inventory render the same bytes every time.
 
@@ -103,7 +104,8 @@ The desired pair MUST be committed atomically with the revision it names.
 > [!NOTE]
 > No committed revision then lacks a desired publication, and the listings the service serves never run ahead of or behind what the row says is wanted.
 
-Setting a new desired pair MUST reset the state to pending and clear the detail code, and MUST keep the applied pair and the owned identities.
+Setting a new desired pair MUST reset the state to pending and clear the detail code.
+Setting a new desired pair MUST keep the applied pair and the owned identities.
 
 > [!NOTE]
 > Ownership has to survive a handoff the adapter has not reconciled yet, because until it does the previously written rows are still there and still the adapter's to remove.
@@ -123,12 +125,14 @@ The service MUST NOT write it.
 > [!NOTE]
 > The service may write only its state directory, and the file belongs to the operator's own account.
 
-A user-side writer MUST perform that reconciliation, and MUST run at least on an activation and on a recurring schedule.
+A user-side writer MUST perform that reconciliation.
+A user-side writer MUST run at least on an activation and on a recurring schedule.
 Activation MUST NOT wait for it, and a failed write MUST leave the activation standing with the row recording the failure.
 
 ### Reconciling
 
-A reconciliation MUST load the row and the revision it names, and MUST recompute the inventory generation over the cached catalogues of the enabled providers.
+A reconciliation MUST load the row and the revision it names.
+A reconciliation MUST recompute the inventory generation over the cached catalogues of the enabled providers.
 Where that generation differs from the one recorded, it MUST fail before touching the file.
 
 It MUST compile that revision against that inventory and render the rows from the presentations that carry the metadata the client needs.

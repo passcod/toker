@@ -70,9 +70,11 @@ The quota notice MUST carry the caution level, and the cold notice the warning l
 
 The quota notice is the only place the operator learns that the gate fired, so it MUST state which meter was hit, when that meter clears, and how to resume.
 
-Where the reading carried no reset time, the notice MUST say the reset is unknown, and MUST NOT state a guessed time.
+Where the reading carried no reset time, the notice MUST say the reset is unknown.
+Where the reading carried no reset time, the notice MUST NOT state a guessed time.
 
-The notice MUST state the session's context size where the lane table holds it, and MUST omit it otherwise rather than state a zero.
+The notice MUST state the session's context size where the lane table holds it.
+The notice MUST omit it otherwise rather than state a zero.
 
 The quota gate is specified by [GQUOTA](quota.md).
 

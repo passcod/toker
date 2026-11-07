@@ -23,12 +23,14 @@ That formatting MUST NOT reach a gate notice, as [GNOTE](../gates/notices.md#a-n
 
 The dashboard MUST show the sessions active within its window, the cache rebuilds within it, spend, and the state of each meter.
 
-A session's row MUST take its model and the context ceiling derived from it from the [served model](../routing/models.md#served-model) of the latest row that named one, and MUST NOT take them from the requested model.
+A session's row MUST take its model and the context ceiling derived from it from the [served model](../routing/models.md#served-model) of the latest row that named one.
+A session's row MUST NOT take them from the requested model.
 
 > [!NOTE]
 > A context window belongs to the model that served, not to the one that was asked for.
 
-A session detail MUST show the requested, effective and served models separately, and MUST show the served one as absent where the response named no model.
+A session detail MUST show the requested, effective and served models separately.
+A session detail MUST show the served one as absent where the response named no model.
 
 > [!NOTE]
 > Showing all three is only useful because they can disagree, which is exactly what a fallback or an alias produces.
@@ -42,7 +44,8 @@ A session grouped with its children MUST follow [SLIN](../store/lineage.md#linea
 
 ## Gate controls
 
-The dashboard MUST be able to grant a session the same releases a marker grants, and MUST write them by the same path, as [GQUOTA](../gates/quota.md#granting-a-release) specifies.
+The dashboard MUST be able to grant a session the same releases a marker grants.
+The dashboard MUST write them by the same path, as [GQUOTA](../gates/quota.md#granting-a-release) specifies.
 
 Granting the wider release MUST require a second confirmation.
 
@@ -60,4 +63,5 @@ The page MAY import a configuration file into the draft, behind a confirmation, 
 
 ## Cost
 
-The dashboard MUST NOT sum costs of different kinds together, and MUST report rows with no recorded cost as such rather than as zero.
+The dashboard MUST NOT sum costs of different kinds together.
+The dashboard MUST report rows with no recorded cost as such rather than as zero.

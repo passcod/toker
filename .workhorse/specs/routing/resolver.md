@@ -20,7 +20,19 @@ A resolved route MUST keep the provider, the binding, the model the client reque
 
 ## Facts in
 
-The facts the resolver receives MUST be content-free: the profile and protocol, the requested model, the lane key, an upper bound on the prompt size, message and tool counts, the capabilities the request needs, a binding affinity, the request's class, and the present moment.
+The facts the resolver receives MUST be content-free.
+
+| fact |
+| --- |
+| the frontend profile and the protocol |
+| the requested model |
+| the lane key |
+| an upper bound on the prompt size |
+| the message and tool counts |
+| the capabilities the request needs |
+| a binding affinity |
+| the request's class |
+| the present moment |
 
 A request carrying provider-owned state, such as signed or redacted thinking or a provider's encrypted reasoning, MUST set a binding affinity, because only the binding that produced that state can replay it.
 Such a request on a lane with no pin MUST be refused.
@@ -28,7 +40,8 @@ Such a request on a lane with no pin MUST be refused.
 ## Provider prefixes
 
 Where a model identifier carries a provider prefix that policy recognises, the request MUST resolve to that provider.
-A prefixed identifier naming a disabled provider MUST be answered as having no available route, and MUST NOT be sent to a default binding with the prefix still attached.
+A prefixed identifier naming a disabled provider MUST be answered as having no available route.
+A prefixed identifier naming a disabled provider MUST NOT be sent to a default binding with the prefix still attached.
 A prefix policy does not recognise MUST be treated as part of the provider's own model identifier and MUST be left intact.
 
 ## Lookup order
@@ -41,7 +54,8 @@ The first of these to match MUST decide the route.
 
 A compaction on a lane proven cold, under a policy naming a route for compactions, MUST resolve to that route instead, as [GCOMP](../routing/compaction.md#choosing-the-target) specifies.
 
-A request carrying no model MUST resolve only through a default, MUST take that route's first candidate with no model, upgrade, alias or fallback, and MUST refuse a request that does carry a model.
+A request carrying no model MUST resolve only through a default, MUST take that route's first candidate with no model, upgrade, alias or fallback.
+A request carrying no model MUST refuse a request that does carry a model.
 
 ## Walking the route
 
@@ -91,7 +105,8 @@ The plan MUST keep every stage distinctly, together with whether the client's ow
 
 ## When nothing serves
 
-Each of these MUST produce an error in the shape of the protocol the client spoke, and MUST write a route-unavailable row to the ledger.
+Each of these MUST produce an error in the shape of the protocol the client spoke.
+Each of these MUST write a route-unavailable row to the ledger.
 
 | condition | status | row |
 | --- | --- | --- |

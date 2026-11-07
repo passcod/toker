@@ -294,6 +294,26 @@ stay as they are.
 Each was a correction to one sentence that turned out to be a rule about a
 class of them, and was swept across the corpus.
 
+### One sentence per line is not one sentence per paragraph
+
+Consecutive lines with no blank line between them are one paragraph in
+Markdown. A paragraph of four sentences is four lines and renders as one block.
+The line breaks are a diff convention and carry no meaning to a reader.
+
+Reading the rule as one sentence per paragraph produces two faults at once:
+every sentence stranded as its own paragraph, and sentences fused with commas
+and subordinate clauses to keep related ideas together on one line. The corpus
+had both. 56 sentences were of the form "X MUST A, and MUST B", which is two
+requirements in one sentence and splits cleanly. Six were enumerations written
+as prose, the worst at 465 characters, and became tables or numbered lists.
+
+A requirement with a purpose clause ("X MUST A, so that B") is ordinary prose
+and was left alone. The test is whether the sentence carries two requirements
+or a list, not its length.
+
+The rule as stated in the spec-voice skill was ambiguous enough to invite the
+misreading, and has been corrected there.
+
 ### Requirements bind the system, not the reader
 
 A requirement that the reader not misunderstand something is not a

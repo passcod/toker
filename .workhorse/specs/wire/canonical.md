@@ -10,11 +10,13 @@ Administrative paths keep the client's bytes instead, as [ROUTE](../routing/over
 
 ## Rendering
 
-Toker MUST parse each inference request into a canonical request, and MUST render the outgoing body from that canonical request.
+Toker MUST parse each inference request into a canonical request.
+Toker MUST render the outgoing body from that canonical request.
 Toker MUST render the body even where the client's protocol and the binding's protocol are the same.
 
 Rendering MUST be deterministic.
-A renderer MUST read no clock and no stored state, and MUST take the model identifier and the prompt cache key as inputs.
+A renderer MUST read no clock and no stored state.
+A renderer MUST take the model identifier and the prompt cache key as inputs.
 
 Because rendering is deterministic, a conversation that only appends reproduces its earlier bytes exactly.
 Toker MUST preserve that property: where the conversation up to a point has not changed, the rendered body up to that point MUST be byte-identical to the previous turn's.
@@ -45,7 +47,8 @@ Stripping release markers MUST happen on every Messages request regardless of wh
 > [!NOTE]
 > The marker strings are a published interface, and stripping them conditionally would change the cached prefix of every conversation that carries one.
 
-Stripping a message's reasoning effort MUST leave any other content of that message intact, and MUST remove the message only where effort was all it carried.
+Stripping a message's reasoning effort MUST leave any other content of that message intact.
+Stripping a message's reasoning effort MUST remove the message only where effort was all it carried.
 
 > [!NOTE]
 > A client replays a mid-conversation system message on every turn, so a model that refuses the effort it carries refuses every remaining turn of the session.
@@ -69,7 +72,8 @@ Retargeting a compaction MUST change its model, its cache breakpoints and its mi
 
 ## Thinking that cannot be turned off
 
-Where a Messages request that asked for thinking to be disabled is refused with a 400 whose message names the between-tools mode, Toker MUST send the request once more with that mode in place, and MUST forward whatever the second send returns.
+Where a Messages request that asked for thinking to be disabled is refused with a 400 whose message names the between-tools mode, Toker MUST send the request once more with that mode in place.
+Toker MUST forward whatever the second send returns.
 
 Toker MUST NOT apply that mode before a refusal.
 Toker MUST judge each turn afresh, leaving the client's transcript untouched, so that the next turn sends the disabled mode again.
@@ -96,7 +100,8 @@ A body that is not JSON cannot carry a stream preference, and MUST be refused wi
 A refusal before any attempt MUST leave an error row naming local preparation, carrying no attempt, provider, route or binding.
 Attempts and their rows are specified by [SATT](../store/attempts.md).
 
-A malformed body MUST retain a wire-shaped view for the quota decision and for presenting the error, and MUST NOT have that view used for inference or for extracting the request's shape.
+A malformed body MUST retain a wire-shaped view for the quota decision and for presenting the error.
+A malformed body MUST NOT have that view used for inference or for extracting the request's shape.
 
 Toker MUST observe a provider's response bytes before translating them, so that reported usage, billed cost and the serving provider remain the provider's own evidence.
 

@@ -28,7 +28,12 @@ Toker MUST read request headers by name, and MUST NOT capture them wholesale.
 > A client's bearer on a Messages request is the subscription's, so forwarding it to any upstream other than Anthropic would hand a third party the subscription credential.
 > Claude Code's own settings carry a placeholder bearer, so the presence of one proves nothing about its origin.
 
-Where `anthropic_sub` serves a request that did not bring a usable Claude bearer, Toker MUST resolve its own token from, in order: the configured environment variable, the keyring entry, a literal in the configuration file, and the Claude login file at its configured path.
+Where `anthropic_sub` serves a request that did not bring a usable Claude bearer, Toker MUST resolve its own token from the first of these that is set.
+
+1. the configured environment variable
+2. the keyring entry
+3. a literal in the configuration file
+4. the Claude login file at its configured path
 Toker MUST read that login file once per request rather than caching it, so that a refreshed or revoked login takes effect without a restart.
 Toker MUST NOT send a token it can see has expired.
 

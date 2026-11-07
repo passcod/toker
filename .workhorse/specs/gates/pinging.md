@@ -23,7 +23,8 @@ Every requirement below is about such a provider's windows.
 
 A five-hour window's reset falls at the fire time of the request that opened it, floored to a ten-minute grid, plus five hours.
 
-Toker MUST predict a boundary from the time the ping actually fired, and MUST NOT predict it from the slot the ping was scheduled for.
+Toker MUST predict a boundary from the time the ping actually fired.
+Toker MUST NOT predict it from the slot the ping was scheduled for.
 
 > [!NOTE]
 > A ping fires some minutes after its slot, so a prediction made from the slot is ten minutes early whenever the two straddle a grid line.

@@ -19,7 +19,8 @@ Toker MUST NOT let the marker text reach policy.
 
 Coldness MUST be proven from the lane's own record, being the time it was last updated against its recorded cache lifetime, with the configured minimum prompt size and idle floor applied.
 
-Coldness MUST be read from the same clock the cold notice uses, and MUST NOT depend on whether that notice is enabled.
+Coldness MUST be read from the same clock the cold notice uses.
+Coldness MUST NOT depend on whether that notice is enabled.
 
 > [!NOTE]
 > A user who runs a compaction after reading a cold notice must find the lane cold, or the notice recommended something the proxy then declines to do.
@@ -59,7 +60,8 @@ Once the target is chosen, Toker MUST strip the compaction's cache breakpoints a
 
 Toker MUST probe the transform on a copy of the body before resolving, so that a model is never moved for a body the transform would then decline.
 
-Toker MUST record that breakpoints were stripped and that system messages were merged, and MUST record the model moved from and to.
+Toker MUST record that breakpoints were stripped and that system messages were merged.
+Toker MUST record the model moved from and to.
 
 > [!NOTE]
 > By the time the transform runs the request is already on the new model, so the move cannot be read off the request itself.

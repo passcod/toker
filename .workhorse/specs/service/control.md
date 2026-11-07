@@ -33,7 +33,8 @@ Toker MUST NOT emit cross-origin resource sharing headers, and MUST NOT serve a 
 > Every route accepting every method means a preflight reaches the handler, fails the operation and method check, and is answered without those headers, so the browser never sends the real request.
 > A preflight route would be the hole this closes.
 
-A control path added later MUST take the same two checks, MUST carry an operation of its own, and MUST require a JSON body where it mutates.
+A control path added later MUST take the same two checks, MUST carry an operation of its own.
+A control path added later MUST require a JSON body where it mutates.
 
 ## The operations
 
@@ -60,7 +61,8 @@ The publication operation MUST record only a failure or a lack of support.
 > [!NOTE]
 > Only the adapter that wrote rows can state which identities it owns, so no caller may claim another's.
 
-Shutdown MUST name the instance that status reported, and MUST refuse with a conflict where the running instance differs.
+Shutdown MUST name the instance that status reported.
+Shutdown MUST refuse with a conflict where the running instance differs.
 
 > [!NOTE]
 > A restart racing another then never stops an instance it did not see.
@@ -71,7 +73,8 @@ Policy data and diagnostics MUST carry no credential, prompt, completion or prov
 
 ## The session view
 
-The session endpoint MUST read lanes from the lane table by exact session, and MUST NOT filter the whole table or read the ledger for them.
+The session endpoint MUST read lanes from the lane table by exact session.
+The session endpoint MUST NOT filter the whole table or read the ledger for them.
 
 Each lane MUST report its recorded metadata together with a state worked out at query time.
 
@@ -82,7 +85,8 @@ A ping lane MUST be reported as such, and MUST NOT be called warm or cold.
 
 A lane stamped in the future has no idle time, so its state MUST be absent.
 
-A countdown to a lane going cold MUST require a recorded cache lifetime, and MUST be absent where the lifetime was only assumed.
+A countdown to a lane going cold MUST require a recorded cache lifetime.
+A countdown to a lane going cold MUST be absent where the lifetime was only assumed.
 
 A session with no lanes, or whose lanes were pruned, MUST answer with an empty list.
 A field a lane never recorded MUST be absent rather than zero.

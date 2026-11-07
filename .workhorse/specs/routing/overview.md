@@ -61,7 +61,8 @@ A binding MUST carry:
 | capabilities | the semantics it can represent, each as supported, unsupported or unknown |
 | administrative operations | whether it serves token counting, and whether it serves batches |
 
-A binding MUST be a declaration verified against the provider, and MUST NOT be inferred from an endpoint's spelling.
+A binding MUST be a declaration verified against the provider.
+A binding MUST NOT be inferred from an endpoint's spelling.
 The set of bindings is fixed topology and MUST NOT depend on configuration or on policy.
 
 A capability MUST be read from the binding that will serve the request.

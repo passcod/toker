@@ -32,7 +32,8 @@ This MUST NOT be expressed as a test of whether the re-read tips the window over
 > A re-read is a small fraction of a window, so it could only tip a projection already landing within that fraction of the target, and none observed has.
 > It brings an existing wall forward by minutes, against walls hours out, and the notice states that effect.
 
-Where any input to the outlook is uncertain, the gate MUST behave as though the outlook did not exist, and MUST speak.
+Where any input to the outlook is uncertain, the gate MUST behave as though the outlook did not exist.
+Where any input to the outlook is uncertain, the gate MUST speak.
 An absent fit, an absent weight, a weight the data cannot separate from zero, a rolled window and too little history for a burn MUST all count as uncertain.
 
 > [!NOTE]
@@ -102,7 +103,8 @@ A cold notice MUST record the noticed clock and MUST NOT move the touched clock.
 > [!NOTE]
 > Coldness for retargeting is judged by the touched clock, so a notice that moved it would make the lane read as active, and the compaction the notice just recommended would no longer qualify.
 
-The notice MUST re-arm only when the lane becomes active and then goes idle again, and MUST NOT re-arm on a timer.
+The notice MUST re-arm only when the lane becomes active and then goes idle again.
+The notice MUST NOT re-arm on a timer.
 
 A withheld notice MUST move neither clock, so that a later request in the same spell is judged afresh against meters that may have tightened.
 
@@ -113,7 +115,8 @@ Whether the operator should be interrupted and whether the cache is gone are dif
 Anything deciding what to do with the cache MUST ask whether the cache is gone.
 Only the notice MUST ask whether to interrupt.
 
-Retargeting a compaction MUST be gated on the compaction test and the lane's coldness alone, and MUST NOT be gated on whether the notice is enabled or has already fired.
+Retargeting a compaction MUST be gated on the compaction test and the lane's coldness alone.
+Retargeting a compaction MUST NOT be gated on whether the notice is enabled or has already fired.
 
 > [!NOTE]
 > The licence to treat a conversation as cold belongs to the lane, not to the notice.

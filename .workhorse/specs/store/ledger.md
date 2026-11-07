@@ -21,7 +21,8 @@ Any other kind is a row Toker wrote about itself.
 
 That rule MUST be kept in one place, so that every consumer classifies identically.
 
-A reader MUST exclude Toker's own rows by the presence of a kind, and MUST NOT exclude them by listing the kinds it knows.
+A reader MUST exclude Toker's own rows by the presence of a kind.
+A reader MUST NOT exclude them by listing the kinds it knows.
 
 > [!NOTE]
 > Listing kinds is how a kind added later slips into a quota fit and into per-request averages.
@@ -43,7 +44,8 @@ Any measurement of a provider's own reports, and of when they arrived, MUST excl
 | error | an attempt failed, or a usage path answered other than success |
 | route-unavailable | policy would not route the request, so nothing was sent |
 
-A row recording a decision Toker took without reaching a provider MUST carry Toker's last-seen meter copy rather than a response's own snapshot, and MUST be distinguishable as such.
+A row recording a decision Toker took without reaching a provider MUST carry Toker's last-seen meter copy rather than a response's own snapshot.
+A row recording a decision Toker took without reaching a provider MUST be distinguishable as such.
 
 A row recording the sleep lock MUST carry no profile, provider or route.
 
@@ -98,7 +100,8 @@ An absent change record MUST NOT be read as the prompt having held.
 > It is also a lane's first row, a row with no session and so no lane, and a change whose baseline could not be read.
 > Only a matching prompt hash says the prompt held.
 
-A reader MUST prefer the stored location of a change, MAY re-derive it from the ladders where it is absent, and MUST report that the location is unknown where neither bounds anything.
+A reader MUST prefer the stored location of a change, MAY re-derive it from the ladders where it is absent.
+A reader MUST report that the location is unknown where neither bounds anything.
 
 ## Eras within one table
 

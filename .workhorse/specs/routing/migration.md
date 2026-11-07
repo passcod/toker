@@ -47,7 +47,16 @@ The migration that creates the policy tables MUST NOT touch the pointer.
 
 The first revision is generated from the file's routing fields, so that a machine's existing behaviour survives the move.
 
-It MUST generate a route per binding carrying that binding's model map as its alias policy, enabled only where the provider is configured; a default per protocol and for the unprefixed profile; a rewrite per provider prefix; presentation selectors for the configured picker rules; a classifier and an upgrade policy per binding, enabled only where the equivalent toggle was; and a compaction target.
+It MUST generate each of these.
+
+| generated | from |
+| --- | --- |
+| a route per binding, carrying that binding's model map as its alias policy | enabled only where the provider is configured |
+| a default per protocol, and one for the unprefixed profile | the configured default for that protocol |
+| a rewrite per provider prefix | the known providers |
+| presentation selectors | the configured picker rules |
+| a classifier and an upgrade policy per binding | enabled only where the equivalent toggle was |
+| a compaction target | the configured compaction model |
 
 Every known provider MUST own its prefix even while disabled.
 
@@ -74,14 +83,18 @@ A field no longer written MUST be kept in the document type.
 
 ### Creating it
 
-Creation MUST happen in one immediate transaction, which MUST return the active revision unchanged where a pointer already exists, and otherwise insert the revision, set the pointer, copy the document into the draft at its first generation, stamp the import marker, and set the desired publication handoff for every adapter.
+Creation MUST happen in one immediate transaction.
+
+Where a pointer already exists, that transaction MUST return the active revision unchanged.
+Otherwise it MUST insert the revision, set the pointer, copy the document into the draft at its first generation, stamp the import marker, and set the desired publication handoff for every adapter.
 
 A marker present without a pointer MUST refuse the transaction.
 
 > [!NOTE]
 > Nothing writes that state, and re-establishing from it would silently discard whatever produced it.
 
-Both the service at startup and the setup wizard MUST reach that transaction, and MUST converge because the first writer wins and the other reads what it wrote.
+Both the service at startup and the setup wizard MUST reach that transaction.
+Both the service at startup and the setup wizard MUST converge because the first writer wins and the other reads what it wrote.
 
 > [!NOTE]
 > A machine upgraded without running setup is then migrated by its first start.
@@ -127,7 +140,8 @@ Where the operator reconfigures, setup MUST rewrite the file without routing fie
 
 An import MUST load the file as the service would, read its routing fields as input, generate a document of the same shape as the first revision, and replace the draft at the generation the caller holds.
 
-An import MUST leave the active revision untouched, and MUST leave the draft as it was where the file fails to load or compile.
+An import MUST leave the active revision untouched.
+An import MUST leave the draft as it was where the file fails to load or compile.
 
 The result MUST be an ordinary draft, validated, previewed, edited and activated like any other.
 

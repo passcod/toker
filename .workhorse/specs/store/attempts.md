@@ -12,7 +12,8 @@ This spec covers how sends are grouped, what each is recorded as, and how a read
 A logical request is one thing the client asked for.
 An attempt is one send to one provider.
 
-Toker MUST mint a group identifier when it begins handling a request, and MUST give the first send index zero with the reason that it was the initial send.
+Toker MUST mint a group identifier when it begins handling a request.
+Toker MUST give the first send index zero with the reason that it was the initial send.
 Every further send MUST stay in that group at the next index, and MUST record the reason it exists.
 
 Two things add an attempt.

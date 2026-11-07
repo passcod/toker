@@ -45,7 +45,8 @@ A command that only records evidence MAY write the store directly without talkin
 > Promotion changes learned evidence rather than policy, so it needs no revision and no running service.
 > The equivalent control operation additionally refreshes the service's published learning snapshot.
 
-Promotion MUST infer the binding where exactly one has learned the exact identity, and MUST require the binding to be named otherwise.
+Promotion MUST infer the binding where exactly one has learned the exact identity.
+Promotion MUST require the binding to be named otherwise.
 
 Promotion MUST refuse a model that the active revision's upgrade policies do not classify, or that more than one classifies.
 

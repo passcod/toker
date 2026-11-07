@@ -33,7 +33,8 @@ Preview MUST use the snapshot's availability without per-request credential evid
 
 ## Activation
 
-Activation MUST take the draft generation it was shown, compile the draft, and then in one transaction insert a new revision, make it active, replace the draft with the activated document at the next generation, and hand every publication adapter the new desired revision and inventory generation.
+Activation MUST take the draft generation it was shown and compile the draft.
+It MUST then, in one transaction, insert a new revision, make it active, replace the draft with the activated document at the next generation, and hand every publication adapter the new desired revision and inventory generation.
 
 The runtime MUST install the [compiled policy](overview.md#the-compiled-policy) only after that transaction commits, so that a request in flight keeps the snapshot it captured.
 
@@ -47,7 +48,8 @@ An activation's scope decides what becomes of lanes already pinned to an earlier
 | new and cold lanes | a lane whose cache is provably cold moves to the new revision; the rest stay |
 | immediate | the next request resolves under the new revision |
 
-An immediate activation that would lose a warm cache MUST require explicit consent, and MUST be refused while any lane is warm or not provably cold and that consent is absent.
+An immediate activation that would lose a warm cache MUST require explicit consent.
+An immediate activation that would lose a warm cache MUST be refused while any lane is warm or not provably cold and that consent is absent.
 Without consent, a lane that became warm after the check MUST stay on its pinned revision.
 
 A revision a lane is pinned to MUST be kept and compiled on demand against current evidence.
@@ -76,6 +78,14 @@ What the generated first revision contains is specified by [RMIG](migration.md).
 
 ## Catalogue refresh
 
-Each catalogue refresh MUST recompile the active revision against the new inventory, bump a generation for each binding whose catalogue changed, clear that binding's open circuits, advance the publication handoff, and swap the runtime snapshot as one update.
+Each catalogue refresh MUST do all of these as one update.
+
+| on refresh |
+| --- |
+| recompile the active revision against the new inventory |
+| bump a generation for each binding whose catalogue changed |
+| clear that binding's open circuits |
+| advance the publication handoff |
+| swap the runtime snapshot |
 
 A refresh whose compilation fails MUST leave the previous snapshot in place.

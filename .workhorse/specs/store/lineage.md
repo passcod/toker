@@ -13,7 +13,8 @@ Toker MUST record such a relation only where the wire states it, and MUST NOT in
 
 A request's raw session is the identity it arrived with: the first of the configured session headers it carries, or, on a protocol that supplies one, the body's prompt cache key.
 
-The raw session MUST be stored whole, and MUST be the key the lane table, the allowances and the prompt cache use.
+The raw session MUST be stored whole.
+The raw session MUST be the key the lane table, the allowances and the prompt cache use.
 
 > [!NOTE]
 > A cache belongs to one conversation's prefix, and two sessions never share one. [SLANE](lanes.md) has the consequences.
@@ -66,7 +67,8 @@ A header naming a request's class MAY label a role, and MUST NOT establish a par
 
 ### Routing never reads the role
 
-Policy MUST resolve a request from content-free facts alone, and MUST NOT recognise a request by its role or by its prompt's contents.
+Policy MUST resolve a request from content-free facts alone.
+Policy MUST NOT recognise a request by its role or by its prompt's contents.
 
 > [!NOTE]
 > A client's classifier, title and helper calls are therefore routed exactly as any other request naming the same model is.
@@ -87,7 +89,8 @@ Lanes MUST stay keyed by raw session even where rows are grouped.
 > [!NOTE]
 > A child's large prompt would otherwise become the parent's context size.
 
-A display session MUST read its main lane from its own raw session where it has one, and MUST fall back to a child's lane only where the parent has none.
+A display session MUST read its main lane from its own raw session where it has one.
+A display session MUST fall back to a child's lane only where the parent has none.
 
 A child's title and working directory MUST be resolved through the parent's identity.
 

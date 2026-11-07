@@ -47,7 +47,9 @@ The drain MUST have no deadline of its own.
 > [!NOTE]
 > Its whole purpose is never to cut a stream, so the forced stop bounds a drain that does not end.
 
-Where the next instance has not answered within the wait, Toker MUST ask again with a force flag, which MUST stop waiting for connections and return as though the drain had completed, so that the lock is released the same way and destructors run.
+Where the next instance has not answered within the wait, Toker MUST ask again with a force flag.
+A forced stop MUST stop waiting for connections and return as though the drain had completed.
+The lock is then released the same way, and destructors run.
 Responses still under way are then cut, and clients retry them.
 
 After a second failure Toker MUST report rather than force again.

@@ -79,7 +79,8 @@ Where no earlier reading exists, Toker MUST use the period's own start as the ba
 Otherwise the total MUST be reported as a floor, and MUST say so.
 
 A span total MUST exclude every row carrying a row kind.
-Toker MUST exclude such rows by the presence of a kind, and MUST NOT exclude them by listing the kinds it knows.
+Toker MUST exclude such rows by the presence of a kind.
+Toker MUST NOT exclude them by listing the kinds it knows.
 
 > [!NOTE]
 > A blocked row carries an old meter figure under a fresh timestamp, which is harmless as the newest reading of a rate and ruinous as the baseline of a total.

@@ -64,7 +64,19 @@ Validation compiles a draft against one captured inventory and returns diagnosti
 
 A diagnostic's path MUST be built only from static field names and bounded indices, so that a request or a model string can never appear in one.
 
-Validation MUST check that every reference resolves, that route arguments match declared parameters exactly, that a regex capture's source exists, that each candidate's binding is routable from the scope it is used in, that classifier and upgrade bindings agree, that rewrite priorities are unique within a scope, that defaults are unique within a scope, that required capabilities are within the binding's declared capabilities, and that shadowing is consented to.
+Validation MUST check each of these.
+
+| check |
+| --- |
+| every reference resolves |
+| route arguments match the declared parameters exactly |
+| a regex capture's source exists |
+| each candidate's binding is routable from the scope it is used in |
+| a classifier's binding and its upgrade policy's binding agree |
+| rewrite priorities are unique within a scope |
+| defaults are unique within a scope |
+| required capabilities are within the binding's declared capabilities |
+| shadowing a native model is consented to |
 
 An error MUST block activation.
 
