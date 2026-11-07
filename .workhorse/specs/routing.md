@@ -61,9 +61,6 @@ A dialect is a provider's concrete rendering and interpretation rules within a p
 A dialect MUST NOT be inferred from a protocol.
 A renderer MUST select its rendering and interpretation rules from the binding's dialect alone.
 
-> [!NOTE]
-> Two providers serving the same nominal protocol diverge in what they accept and what they return, so a renderer that reads the protocol and guesses the rest produces a body one of them refuses.
-
 ## Bindings
 
 A binding declares that one provider serves one protocol in one dialect.
