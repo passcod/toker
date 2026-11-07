@@ -15,7 +15,7 @@ A command taking a duration or a timestamp MUST parse it strictly and MUST rejec
 
 ## Before anything runs
 
-Every command except setup MUST refuse to run while a configuration file exists.
+Every command except `setup` MUST refuse to run while a configuration file exists.
 
 ## The commands
 
