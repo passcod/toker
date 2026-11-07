@@ -25,9 +25,9 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## The file gate
 
-- [ ] Every command except setup refuses to run while a configuration file exists, naming setup (verifies spec: UCLI, DCONF)
-- [ ] The service refuses to start while a configuration file exists (verifies spec: DLIFE)
-- [ ] The refusal exits so the supervisor does not retry it (verifies spec: DLIFE)
+- [x] Every command except setup refuses to run while a configuration file exists, naming setup (verifies spec: UCLI, DCONF)
+- [x] The service refuses to start while a configuration file exists (verifies spec: DLIFE)
+- [x] The refusal exits so the supervisor does not retry it (verifies spec: DLIFE)
 - [x] The file is looked for where the environment names it, and otherwise in the user configuration directory (verifies spec: DCONF)
 
 ## Importing a file
@@ -50,7 +50,7 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Setup on a fresh machine
 
-- [ ] Setup asks for one provider and its credential and nothing further (verifies spec: USETUP)
+- [ ] Setup asks only what the dashboard cannot change: the port, the schedule slots, and the providers with their credential sources (verifies spec: USETUP)
 - [x] Setup writes rows and no configuration file (verifies spec: USETUP)
 - [x] Setup ends by replacing itself with the dashboard (verifies spec: USETUP)
 - [x] Setup on an owned machine reports routing is owned by the store and does not ask for a protocol default (verifies spec: RMIG)
@@ -72,6 +72,6 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 ## Credentials
 
 - [x] A literal is stored and never displayed afterwards (verifies spec: SEC, DCONF)
-- [ ] The resolution order is the environment, then the keyring, then the literal, then the Claude login file (verifies spec: WCRED)
-- [ ] Exporting the ledger carries no credential (verifies spec: DCONF)
+- [x] The resolution order is the environment, then the keyring, then the literal, then the Claude login file (verifies spec: WCRED)
+- [x] Exporting the ledger carries no credential (verifies spec: DCONF)
 - [ ] A debug rendering of a credential-bearing value redacts it (verifies spec: SEC)

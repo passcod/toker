@@ -128,6 +128,30 @@ mod tests {
     /// 2026-10-05T00:00:00Z.
     const T0: i64 = 1_791_158_400_000;
 
+    #[test]
+    fn the_export_is_the_ledger_and_carries_no_credential() {
+        // The store holds credential literals now, so the export's bound —
+        // the ledger's own columns and nothing beside them — is what keeps
+        // one out of it (spec: DCONF#credentials).
+        const KEY: &str = "sk-this-must-never-be-exported";
+        let store = Store::open(":memory:").expect("open");
+        store
+            .put_config_provider(&crate::store::ProviderConfigRow {
+                provider: "openrouter".to_owned(),
+                enabled: true,
+                cred_literal: Some(KEY.to_owned()),
+                ..Default::default()
+            })
+            .expect("store a literal");
+        store.record_request(&bare(T0)).expect("a row to export");
+
+        let mut out = Vec::new();
+        write_jsonl(&store, &RequestFilter::default(), &mut out).expect("export");
+        let exported = String::from_utf8(out).expect("utf8");
+        assert!(!exported.is_empty(), "there is a row to have carried it");
+        assert!(!exported.contains(KEY), "{exported}");
+    }
+
     fn store_with_revision(path: impl AsRef<std::path::Path>) -> Store {
         let store = Store::open(path).expect("open");
         let document = PolicyDocument {
