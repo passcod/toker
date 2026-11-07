@@ -1706,6 +1706,46 @@ pub(crate) struct FileCodexSub {
 
 /// `$TOKER_CONFIG`, else `$XDG_CONFIG_HOME/toker/toker.toml`, else
 /// `~/.config/toker/toker.toml`.
+/// The exit status a refusal over the configuration file leaves. Distinct so
+/// the service unit can name it and the supervisor stop retrying: nothing
+/// can change until the operator runs setup (spec: DLIFE#starting).
+pub const EXIT_CONFIG_FILE_PRESENT: i32 = 78;
+
+/// The configuration file, if a machine still has one.
+///
+/// Looked for where the environment names it and otherwise in the user
+/// configuration directory (spec: DCONF#moving-a-machine-off-the-file). A
+/// config home that cannot be worked out is not a file: there is nothing to
+/// refuse over, and setup will say so in its own words.
+pub fn config_file_present() -> Option<PathBuf> {
+    config_file_present_with_env(&ProcessEnvironment)
+}
+
+fn config_file_present_with_env(environment: &impl Environment) -> Option<PathBuf> {
+    config_path_with_env(environment)
+        .ok()
+        .filter(|path| path.is_file())
+}
+
+/// Refuse to run while a configuration file exists, naming it and saying
+/// what moves the machine off it.
+///
+/// Every command except setup goes through here (spec: UCLI#before-anything-runs).
+/// Refusing is what makes the move safe to interrupt: nothing can read the
+/// store's configuration while the file is there, so no row can have been
+/// edited between setup's import and the file's removal.
+pub fn refuse_while_config_file_exists() -> anyhow::Result<()> {
+    let Some(path) = config_file_present() else {
+        return Ok(());
+    };
+    eprintln!(
+        "toker: {} is still here, and configuration now lives in the store.\n\
+         Run `toker setup` to import it; every other command waits until then.",
+        path.display()
+    );
+    std::process::exit(EXIT_CONFIG_FILE_PRESENT);
+}
+
 pub fn config_path() -> anyhow::Result<PathBuf> {
     config_path_with_env(&ProcessEnvironment)
 }
@@ -1809,6 +1849,47 @@ mod tests {
             enabled: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_configuration_file_is_found_where_the_environment_names_it() {
+        let dir = crate::test_support::tempdir("gate-named-");
+        let path = dir.join("elsewhere.toml");
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
+
+        assert!(
+            super::config_file_present_with_env(&environment).is_none(),
+            "nothing to refuse over before the file exists"
+        );
+        std::fs::write(&path, b"port = 1\n").expect("write");
+        assert_eq!(
+            super::config_file_present_with_env(&environment),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn a_configuration_file_is_otherwise_found_in_the_config_home() {
+        let dir = crate::test_support::tempdir("gate-home-");
+        let environment = TestEnvironment::default().with("XDG_CONFIG_HOME", &*dir);
+        assert!(super::config_file_present_with_env(&environment).is_none());
+
+        let path = dir.join("toker").join("toker.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, b"port = 1\n").expect("write");
+        assert_eq!(
+            super::config_file_present_with_env(&environment),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn a_directory_at_the_config_path_is_not_a_file_to_refuse_over() {
+        let dir = crate::test_support::tempdir("gate-dir-");
+        let path = dir.join("toker.toml");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        let environment = TestEnvironment::default().with("TOKER_CONFIG", &path);
+        assert!(super::config_file_present_with_env(&environment).is_none());
     }
 
     #[test]

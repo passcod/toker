@@ -193,6 +193,12 @@ enum PickerCommand {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Setup is the only command that may run while a configuration file
+    // exists, because setup is what moves the machine off it
+    // (spec: UCLI#before-anything-runs).
+    if !matches!(cli.command, Command::Setup) {
+        toker::config::refuse_while_config_file_exists()?;
+    }
     match cli.command {
         Command::Serve => {
             let runtime = tokio::runtime::Builder::new_multi_thread()

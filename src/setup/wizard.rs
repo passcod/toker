@@ -515,6 +515,10 @@ After=toker.socket
 Type=exec
 ExecStart="{exe}" serve
 Restart=always
+# A refusal over a configuration file still being here cannot resolve
+# itself: only `toker setup` moves the machine off it, so retrying
+# only fills the journal (spec: DLIFE#starting).
+RestartPreventExitStatus={refusal}
 RestartSec=1
 SyslogIdentifier=toker
 
@@ -540,6 +544,7 @@ MemoryDenyWriteExecute=true
 "#,
         exe = exe.display(),
         state_dir = state_dir.display(),
+        refusal = crate::config::EXIT_CONFIG_FILE_PRESENT,
     )
 }
 
@@ -3965,6 +3970,10 @@ default_backend_anthropic = "codex_sub"
             "After=toker.socket",
             "Type=exec",
             "Restart=always",
+            &format!(
+                "RestartPreventExitStatus={}",
+                crate::config::EXIT_CONFIG_FILE_PRESENT
+            ),
             "RestartSec=1",
             "SyslogIdentifier=toker",
             "NoNewPrivileges=true",
