@@ -100,6 +100,7 @@ mod tests {
             &inventory,
             crate::catalog::fetched::snapshot_generation(&catalogs),
             1,
+            None,
         )
         .unwrap();
         (dir, SettingsSync { config, settings })

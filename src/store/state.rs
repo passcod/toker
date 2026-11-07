@@ -849,12 +849,20 @@ pub(super) fn insert_policy_revision(
         .ok_or_else(|| Error::InvalidRoutingState("inserted policy revision disappeared".into()))
 }
 
+/// Activate revision one, optionally importing a configuration alongside it.
+///
+/// `configuration` is the file's settings as rows. It is written inside this
+/// transaction so a machine moving off its file does both or neither
+/// (spec: RMIG#migrating-the-file-and-the-store-together), and it is written
+/// on the already-active path too: a machine whose routing moved earlier
+/// still has a file full of providers to import.
 pub(super) fn activate_revision_one(
     conn: &mut Connection,
     document: &ValidatedPolicyDocument,
     activated_ms: i64,
     desired_inventory_generation: i64,
     publications: &[InitialPublication],
+    configuration: Option<&super::Configuration>,
 ) -> Result<RevisionOneActivation> {
     if desired_inventory_generation < 0 {
         return Err(Error::InvalidRoutingState(
@@ -870,6 +878,9 @@ pub(super) fn activate_revision_one(
             ))
         })?;
         let publications = load_publications(&tx)?;
+        if let Some(configuration) = configuration {
+            super::config::write_configuration(&tx, configuration)?;
+        }
         tx.commit()?;
         return Ok(RevisionOneActivation::AlreadyActive {
             revision,
@@ -881,6 +892,10 @@ pub(super) fn activate_revision_one(
         return Err(Error::InvalidRoutingState(
             "legacy import marker exists without an active revision".into(),
         ));
+    }
+
+    if let Some(configuration) = configuration {
+        super::config::write_configuration(&tx, configuration)?;
     }
 
     let revision = insert_policy_revision(

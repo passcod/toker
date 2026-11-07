@@ -564,6 +564,9 @@ impl Server {
                 &inventory,
                 publication_generation,
                 now_ms(),
+                // The service never imports: it refuses to start while a
+                // configuration file exists, so setup is the only importer.
+                None,
             )?,
         };
         let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new(

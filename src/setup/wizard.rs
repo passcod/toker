@@ -3094,6 +3094,7 @@ fn activate_revision_one(config: &Config, paths: &Paths) -> Result<i64> {
         &inventory,
         fetched::snapshot_generation(&catalogs),
         jiff::Timestamp::now().as_millisecond(),
+        None,
     )
     .context("activating the routing policy from the wizard's choices")?;
     Ok(revision.revision_id)

@@ -855,6 +855,58 @@ pub(super) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE learned_models_by_binding DROP COLUMN context_window_json;
     "#,
+    // v18 — configuration leaves the file for the store (spec: DCONF#in-the-store).
+    // A nullable column means "the built-in default", never today's value
+    // frozen into a row, so a default that moves moves for a machine that
+    // never set it. A fresh machine has no rows at all and is every default
+    // with every provider disabled.
+    r#"
+    -- One row per provider toker knows, present whether or not it is on, so
+    -- switching a provider off keeps the endpoint and credential source it
+    -- was configured with (spec: DCONF#in-the-store).
+    CREATE TABLE config_providers (
+        provider       TEXT PRIMARY KEY,
+        enabled        INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        -- The endpoint. Configurable for every provider, subscriptions
+        -- included: toker is a proxy, so another may sit in front of it.
+        upstream       TEXT,
+        -- Where the credential comes from. These are sources, not an
+        -- exclusive choice: WCRED resolves env, then keyring, then literal.
+        cred_env       TEXT,
+        cred_keyring   INTEGER CHECK (cred_keyring IS NULL OR cred_keyring IN (0, 1)),
+        cred_literal   TEXT,
+        -- Codex only, NULL on every other provider.
+        refresh_url    TEXT,
+        client_version TEXT,
+        version_probe  INTEGER CHECK (version_probe IS NULL OR version_probe IN (0, 1))
+    );
+
+    -- Everything that is not per-provider and not per-profile. One row, so a
+    -- read is a single lookup and there is no key namespace to typo.
+    CREATE TABLE config_settings (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        session_headers  TEXT,
+        ping_header      TEXT,
+        awake            INTEGER CHECK (awake IS NULL OR awake IN (0, 1)),
+        transcript_roots TEXT,
+        quota_enabled    INTEGER CHECK (quota_enabled IS NULL OR quota_enabled IN (0, 1)),
+        cold_enabled     INTEGER CHECK (cold_enabled IS NULL OR cold_enabled IN (0, 1)),
+        cold_outlook     INTEGER CHECK (cold_outlook IS NULL OR cold_outlook IN (0, 1)),
+        cold_min_tokens  INTEGER CHECK (cold_min_tokens IS NULL OR cold_min_tokens >= 0),
+        cold_idle_min    REAL CHECK (cold_idle_min IS NULL OR cold_idle_min >= 0),
+        notice_default   TEXT
+    );
+
+    -- Per-frontend-profile notice styles; a profile with no row takes the
+    -- default above. The name check is the router's own set (spec: FPROF),
+    -- so a row that could never match a request cannot be written.
+    CREATE TABLE config_notices (
+        profile TEXT PRIMARY KEY
+            CHECK (length(profile) BETWEEN 1 AND 64
+                   AND profile NOT GLOB '*[^a-z0-9_-]*'),
+        style   TEXT NOT NULL CHECK (style IN ('gfm', 'toker', 'block', 'plain'))
+    );
+    "#,
 ];
 
 fn validate_v10_history(conn: &Connection) -> Result<()> {

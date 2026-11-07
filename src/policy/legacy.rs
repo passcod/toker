@@ -66,6 +66,7 @@ pub fn establish_revision_one(
     inventory: &OfferInventory,
     publication_generation: i64,
     activated_ms: i64,
+    configuration: Option<&crate::store::Configuration>,
 ) -> anyhow::Result<(crate::store::PolicyRevision, super::CompiledPolicy)> {
     config.validate()?;
     let document = validated(config, topology)?;
@@ -77,11 +78,12 @@ pub fn establish_revision_one(
                 diagnostics.len()
             )
         })?;
-    let activation = store.activate_revision_one(
+    let activation = store.activate_revision_one_importing(
         &document,
         activated_ms,
         publication_generation,
         &crate::store::publication_targets()?,
+        configuration,
     )?;
     match activation {
         crate::store::RevisionOneActivation::Activated { revision, .. } => {

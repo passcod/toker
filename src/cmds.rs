@@ -1110,6 +1110,7 @@ mod tests {
             &crate::catalog::offers::OfferInventory::default(),
             0,
             1,
+            None,
         )
         .unwrap();
     }
