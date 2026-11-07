@@ -95,10 +95,11 @@ pub const DEFAULT_CODEX_AUTH_PATH: &str = "~/.codex/auth.json";
 /// The OAuth refresh endpoint (the codex CLI's `REFRESH_TOKEN_URL`).
 pub const DEFAULT_CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// Resolved runtime configuration: file defaults ← `toker.toml` ← env.
-/// `PartialEq` is the setup wizard's re-load-compare: a rewritten
-/// `toker.toml` must resolve back to exactly the config that was meant
-/// (see [`crate::setup::config_writer`]).
+/// The machine's resolved configuration, from its store and the two
+/// settings that cannot live there (spec: DCONF).
+///
+/// The file-only routing fields are empty unless this was parsed from a
+/// file for setup's import; nothing at request time reads them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// The loopback listener port.
@@ -631,6 +632,7 @@ fn parse_model_map_table(
 /// exact identities first then families, deterministic per spec: WCANON#rendering.
 /// The round-trip is exact on canonical selectors (the parse side
 /// folds non-canonical ones); see [`Config::to_file`].
+#[cfg(test)]
 fn model_map_table(map: &ModelMap) -> toml::Table {
     let mut table = toml::Table::new();
     for (selector, target) in map.entries() {
@@ -1112,11 +1114,10 @@ impl Config {
     }
 
     /// Load the resolved configuration from an explicit file, defaults
-    /// ← file, with **no env overrides**: the read side the setup
-    /// wizard's read-merge-rewrite runs on (see
-    /// [`crate::setup::config_writer`]), so a `TOKER_*` override
-    /// active in the wizard's environment can never be pinned into the
-    /// file by a rewrite. A missing file is the defaults; a present
+    /// ← file, with **no env overrides**: the read side of setup's
+    /// import, so nothing in the importing operator's environment can
+    /// reach the rows the import writes. A missing file is the
+    /// defaults; a present
     /// file that does not parse or validate is an error — a
     /// hand-edited typo must not be silently clobbered.
     ///
@@ -1141,8 +1142,8 @@ impl Config {
 
     /// The write-side wire mapping — the inverse of
     /// [`Config::resolve_file`]: this resolved config as the
-    /// `toker.toml` shape, for the setup wizard's read-merge-rewrite
-    /// (see [`crate::setup::config_writer`]). Every key the reader
+    /// `toker.toml` shape. Only the file reader's own round-trip
+    /// assertions use it, nothing writes a file. Every key the reader
     /// understands is written explicitly — the wizard writes the file
     /// it fully understands, defaults included. Round-trip
     /// normalisations, deliberate and asserted there: upstream URLs in
@@ -1155,10 +1156,7 @@ impl Config {
         self.to_file_with_routing(true)
     }
 
-    pub(crate) fn to_owned_file(&self) -> FileConfig {
-        self.to_file_with_routing(false)
-    }
-
+    #[cfg(test)]
     fn to_file_with_routing(&self, include_routing: bool) -> FileConfig {
         FileConfig {
             port: Some(self.port),
@@ -1470,8 +1468,8 @@ impl Config {
     }
 
     /// Cross-field validation the individual pieces cannot see. Also
-    /// the wizard's gate: [`crate::setup::config_writer`] re-runs it
-    /// over the wizard's changes before anything is written.
+    /// the wizard's gate: setup re-runs it over the wizard's changes
+    /// before anything is written.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.validate_retained()?;
         self.validate_routing()

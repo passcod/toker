@@ -49,7 +49,7 @@ Each phase compiles and keeps the suite green.
 
 ### 5. Setup
 
-- [ ] Import: rows and revision one in one transaction, then delete the file
+- [x] Import: rows and revision one in one transaction, then delete the file
 - [ ] Fresh machine: ask one provider and its credential, nothing more
 - [ ] Discover the Claude and codex directories their own way, carry them into the unit
 - [ ] Re-exec into the dashboard at the end

@@ -70,7 +70,6 @@ use crate::import::{self, ImportOpts};
 use crate::routing::ProtocolId;
 use crate::secrets::SecretStore;
 use crate::setup::atomic::atomic_write_bytes;
-use crate::setup::config_writer::{legacy_routing_fields, write_config};
 use crate::setup::patchers::{self, Frontend};
 use crate::setup::plugin;
 use crate::setup::verify::{self, ServiceReady};
@@ -1182,6 +1181,8 @@ pub struct RunReport {
     /// The legacy routing fields an owned rewrite dropped from the
     /// config.
     pub legacy_fields_dropped: Vec<String>,
+    /// The configuration file this run imported and removed.
+    pub config_file_removed: bool,
 }
 
 // ── the wizard ──────────────────────────────────────────────────────────
@@ -1321,7 +1322,16 @@ impl<'a> Wizard<'a> {
                     Ok(config) => (Some(config), None, toml_has_db_path(&text)),
                     Err(error) => (None, Some(format!("{error:#}")), false),
                 },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None, false),
+                // No file: the machine is already across, so what it is
+                // configured with is in the store. A machine with no
+                // provider rows has never been configured at all, and is
+                // asked everything.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match stored_configuration(self.paths) {
+                        Ok(config) => (config, None, false),
+                        Err(error) => (None, Some(format!("{error:#}")), false),
+                    }
+                }
                 Err(error) => (
                     None,
                     Some(format!(
@@ -1604,11 +1614,13 @@ impl<'a> Wizard<'a> {
         let existing = detected.config.as_ref();
         if existing.is_some() {
             let options = ["keep it as is", "reconfigure"];
+            let found = if self.paths.config_toml.is_file() {
+                self.paths.config_toml.display().to_string()
+            } else {
+                format!("the configuration in {}", self.paths.db_path().display())
+            };
             let keep = self.prompt.select(
-                &format!(
-                    "Found {} — what should the wizard do?",
-                    self.paths.config_toml.display()
-                ),
+                &format!("Found {found} — what should the wizard do?"),
                 &options,
                 Some(0),
             )? == 0;
@@ -1955,11 +1967,15 @@ impl<'a> Wizard<'a> {
         bail!("no valid port was given")
     }
 
-    // ── step 2: write toker.toml ──────────────────────────────────
+    // ── step 2: write the configuration into the store ───────────
 
-    /// [`Step::WriteConfig`] — the library's read-merge-rewrite, then
-    /// a summary of the resolved config. A kept config writes nothing
-    /// (the operator chose to change nothing in it).
+    /// [`Step::WriteConfig`] — write the configuration as rows, activate
+    /// revision one from it, then remove the file (spec: USETUP#writing).
+    ///
+    /// Keeping the configuration as it is still imports it: configuration
+    /// lives in the store now, so there is no "leave the file alone" that
+    /// leaves a working machine. What is kept is the operator's settings,
+    /// not the file.
     fn write_step(
         &mut self,
         choices: Option<&Choices>,
@@ -1967,42 +1983,59 @@ impl<'a> Wizard<'a> {
         report: &mut RunReport,
     ) -> Result<Config> {
         self.step(Step::WriteConfig)?;
-        let Some(choices) = choices else {
-            let config = detected
-                .config
-                .clone()
-                .expect("kept means an existing config");
-            self.say(&format!(
-                "kept {} as is (choose reconfigure to change anything in it)",
-                self.paths.config_toml.display()
-            ))?;
-            report.config_kept = true;
-            report.routing_owned = detected.routing.map(|routing| routing.revision_id);
-            return Ok(config);
-        };
-        let mut choices = choices.clone();
-        self.place_keys(&mut choices)?;
-        let db_explicit = detected.db_explicit;
-        let before = std::fs::read_to_string(&self.paths.config_toml).unwrap_or_default();
-        let owned = detected.routing;
         let paths = self.paths;
-        let mut written: Option<Config> = None;
-        let mut activated: Option<i64> = None;
-        // The activation runs inside the writer's changes, so it happens
-        // after the choices are applied and validated against the existing
-        // file and before the file is replaced. A failure in either stops
-        // before the write. A failed write after it leaves a database-owned
-        // machine, and the next run writes the owned config.
-        write_config(&self.paths.config_toml, |config| {
-            apply_choices(config, &choices, paths, db_explicit)?;
-            if owned.is_none() {
-                activated = Some(activate_revision_one(config, paths)?);
+        let owned = detected.routing;
+        let file = self.paths.config_toml.clone();
+        let had_file = file.is_file();
+
+        // A fresh machine has no file and so nothing detected: the defaults
+        // are what it starts from. An unreadable file stopped the run well
+        // before here, so this cannot be papering over one.
+        let mut config = match detected.config.clone() {
+            Some(config) => config,
+            None => Config::load_from(&file)
+                .context("the defaults for a machine with no configuration")?,
+        };
+        // The store this run writes is the one the wizard manages, not
+        // whatever a resolved default points at. Without this a scratch run
+        // writes into the real machine's store, and a keep run — which never
+        // reaches `apply_choices` — would do it on every path.
+        if !detected.db_explicit {
+            config.db_path = paths.db_path();
+        }
+        match choices {
+            None if !had_file => {
+                // Already across, and nothing to change: writing the same
+                // rows back would be a no-op with a chance of going wrong.
+                report.config_kept = true;
+                report.routing_owned = owned.map(|routing| routing.revision_id);
+                self.say("keeping the configuration in the store as it is")?;
+                return Ok(config);
             }
-            written = Some(config.clone());
-            Ok(())
-        })?;
-        let config = written.expect("the write ran");
-        self.say(&format!("wrote {}", self.paths.config_toml.display()))?;
+            None => {
+                report.config_kept = true;
+                self.say(&format!(
+                    "keeping what {} configured, and moving it into the store",
+                    file.display()
+                ))?;
+            }
+            Some(choices) => {
+                let mut choices = choices.clone();
+                self.place_keys(&mut choices)?;
+                apply_choices(&mut config, &choices, paths, detected.db_explicit)?;
+            }
+        }
+        config
+            .validate_retained()
+            .context("the wizard's config changes do not validate")?;
+
+        if had_file {
+            self.say(&format!("read {}", file.display()))?;
+        }
+
+        // Rows and revision one commit together; the file goes only after.
+        let activated = commit_configuration(&config, paths)?;
+        self.say("wrote the configuration into the store")?;
         self.say(&format!(
             "  port {}, awake {}, backends {}",
             config.port,
@@ -2013,7 +2046,7 @@ impl<'a> Wizard<'a> {
             (Some(routing), _) => {
                 report.routing_owned = Some(routing.revision_id);
                 self.say(&format!(
-                    "  routing: database-owned, {} — left as it is; edit it in `toker tui`",
+                    "  routing: store-owned, {} — left as it is; edit it in `toker tui`",
                     routing.describe()
                 ))?;
             }
@@ -2024,16 +2057,20 @@ impl<'a> Wizard<'a> {
                      edit it in `toker tui`"
                 ))?;
             }
-            (None, None) => unreachable!("an unowned machine activates before the write"),
+            (None, None) => {
+                report.routing_owned = active_revision_id(&config.db_path);
+            }
         }
-        let dropped = legacy_routing_fields(&before);
-        if !dropped.is_empty() {
+
+        if had_file {
+            std::fs::remove_file(&file).with_context(|| format!("removing {}", file.display()))?;
             self.say(&format!(
-                "  routing fields no longer in the file (the database holds them): {}",
-                dropped.join(", ")
+                "  removed {} — configuration is edited in `toker tui` now",
+                file.display()
             ))?;
+            report.config_file_removed = true;
         }
-        report.legacy_fields_dropped = dropped;
+
         if let Some(api) = &config.anthropic_api {
             self.say(&key_line(
                 "anthropic_api",
@@ -3078,14 +3115,84 @@ impl<'a> Wizard<'a> {
 
 // ── the wizard's free helpers ───────────────────────────────────────────
 
-/// Compile revision one from the config and activate it in the ledger the
-/// config names, exactly as the service would at its first start. Returns the
-/// revision now active.
-fn activate_revision_one(config: &Config, paths: &Paths) -> Result<i64> {
+/// Write the configuration as rows and activate revision one from it, in one
+/// store transaction (spec: RMIG#migrating-the-file-and-the-store-together).
+///
+/// Both happen together, and the file is removed only once this has
+/// committed, so an interrupted move leaves an owned store and a file still
+/// in place — which running setup again repairs by importing the same values
+/// over themselves. Nothing but setup runs while the file is there, so no row
+/// can have been edited in between.
+///
+/// On a machine whose routing moved earlier the revision is already active
+/// and is left alone, but the configuration rows are still written: that
+/// machine still has a file full of providers.
+/// What a machine with no configuration file is configured with: its store.
+///
+/// `None` where the store has no provider rows, which is a machine that has
+/// never been configured — it gets asked everything rather than offered its
+/// own defaults back.
+fn stored_configuration(paths: &Paths) -> Result<Option<Config>> {
+    let db_path = paths.db_path();
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let store = Store::open(&db_path)
+        .with_context(|| format!("opening the store at {}", db_path.display()))?;
+    if store.load_configuration()?.providers.is_empty() {
+        return Ok(None);
+    }
+    let mut config = Config::from_store(&store)?;
+    // The port is not configuration, so the store does not carry it: the
+    // socket unit is what listens, and is where a port this machine was set
+    // up with survives (spec: DCONF#before-the-store).
+    if let Some(port) = installed_socket_port(paths) {
+        config.port = port;
+    }
+    Ok(Some(config))
+}
+
+/// The port the installed socket unit listens on, where one is installed.
+fn installed_socket_port(paths: &Paths) -> Option<u16> {
+    let text = std::fs::read_to_string(paths.units_dir.join(SOCKET_UNIT)).ok()?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("ListenStream=127.0.0.1:"))
+        .and_then(|port| port.trim().parse().ok())
+}
+
+/// The revision a store is on, where it can be read at all. Only for the
+/// report: a failure here must not fail a run that already committed.
+fn active_revision_id(db_path: &std::path::Path) -> Option<i64> {
+    Store::open(db_path)
+        .ok()?
+        .load_routing_policy_state()
+        .ok()?
+        .active_revision_id
+}
+
+fn commit_configuration(config: &Config, paths: &Paths) -> Result<Option<i64>> {
     use crate::catalog::{fetched, offers};
 
     let store = Store::open(&config.db_path)
-        .with_context(|| format!("opening the ledger at {}", config.db_path.display()))?;
+        .with_context(|| format!("opening the store at {}", config.db_path.display()))?;
+    let configuration = config.to_configuration();
+
+    // A machine whose routing already moved keeps its revision, and the
+    // file's routing fields are not read at all: the store owns routing and
+    // there is nothing to generate (spec: RMIG#setup-on-an-owned-machine).
+    // The rows are then the whole transaction.
+    if store
+        .load_routing_policy_state()
+        .context("reading the routing state")?
+        .active_revision_id
+        .is_some()
+    {
+        store
+            .write_configuration(&configuration)
+            .context("writing the configuration")?;
+        return Ok(None);
+    }
+
     let registry = crate::routing::RouteRegistry::configured_bindings(
         crate::picker::configured_bindings(config),
     );
@@ -3099,10 +3206,10 @@ fn activate_revision_one(config: &Config, paths: &Paths) -> Result<i64> {
         &inventory,
         fetched::snapshot_generation(&catalogs),
         jiff::Timestamp::now().as_millisecond(),
-        None,
+        Some(&configuration),
     )
-    .context("activating the routing policy from the wizard's choices")?;
-    Ok(revision.revision_id)
+    .context("writing the configuration and activating its routing policy")?;
+    Ok(Some(revision.revision_id))
 }
 
 /// Apply the wizard's choices to the config the config writer read
@@ -3708,6 +3815,22 @@ mod tests {
         fn toml_path(&self) -> PathBuf {
             self.paths().config_toml
         }
+
+        /// The configuration as the store now holds it. Setup writes rows
+        /// and removes the file, so this is what a run left behind.
+        fn stored(&self) -> Config {
+            let store = Store::open(self.paths().db_path()).expect("open the store");
+            Config::from_store(&store).expect("resolve the stored configuration")
+        }
+
+        /// The configuration rows themselves, for asserting on what was and
+        /// was not written out.
+        fn stored_rows(&self) -> crate::store::Configuration {
+            Store::open(self.paths().db_path())
+                .expect("open the store")
+                .load_configuration()
+                .expect("load the configuration")
+        }
     }
 
     /// A scratch upstream stand-in answering both usage paths with
@@ -4122,30 +4245,32 @@ default_backend_anthropic = "codex_sub"
             .await
             .expect("the fresh run completes");
 
-        // The config: every choice applied, the db pinned under the
-        // wizard's own root (the raw file had no db_path), 0600,
-        // and no literal key.
-        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
-        assert!(text.contains(&format!("port = {port}")));
-        assert!(
-            !text.contains("default_backend_"),
-            "routing is in the database"
-        );
+        // The configuration: every choice applied, and in the store, with
+        // no file left behind.
+        assert!(!rig.toml_path().exists(), "setup writes rows, not a file");
+        let config = rig.stored();
+        // The port reaches the socket unit, not the store: it has to be
+        // known before the store can be opened (spec: DCONF#before-the-store).
+        assert_eq!(report.port, port);
+        assert!(config.awake);
         assert_eq!(report.routing_activated, Some(1));
         assert!(active_document(&rig.paths()).contains("openrouter"));
-        assert!(text.contains("awake = true"));
-        assert!(text.contains(&format!(
-            "db_path = \"{}\"",
-            rig.paths().db_path().display()
-        )));
-        assert!(text.contains("api_key_env = \"OPENROUTER_API_KEY\""));
-        assert!(!text.contains("api_key ="), "no literal key was stored");
+        assert!(
+            rig.paths().db_path().is_file(),
+            "the wizard wrote into the store under its own root"
+        );
+        let openrouter = config.openrouter.as_ref().expect("ticked");
+        assert_eq!(openrouter.api_key_env, "OPENROUTER_API_KEY");
+        assert!(openrouter.api_key.is_none(), "no literal key was stored");
+
+        // The store holds credential literals now, so its directory is the
+        // thing that must be closed (spec: DCONF#state).
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(rig.toml_path())
+        let mode = std::fs::metadata(rig.paths().db_path().parent().expect("the state dir"))
             .expect("metadata")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o077, 0);
 
         // The opencode plugin: installed from the embedded set, byte
         // for byte, into the scratch plugins dir.
@@ -4324,7 +4449,7 @@ default_backend_anthropic = "codex_sub"
             .await
             .expect("the first run completes");
 
-        let toml_once = std::fs::read(rig.toml_path()).expect("read the toml");
+        let stored_once = rig.stored_rows();
         let claude_once = std::fs::read(root.join(".claude/settings.json")).expect("read claude");
         let opencode_once =
             std::fs::read(root.join(".config/opencode/opencode.json")).expect("read opencode");
@@ -4349,12 +4474,12 @@ default_backend_anthropic = "codex_sub"
             .await
             .expect("the re-run completes");
 
-        // Nothing changed on disk: no config rewrite, no frontend
-        // byte moved.
+        // Nothing changed: the configuration is what it was, and no
+        // frontend byte moved.
         assert_eq!(
-            std::fs::read(rig.toml_path()).expect("read the toml"),
-            toml_once,
-            "a kept config is not even rewritten"
+            rig.stored_rows(),
+            stored_once,
+            "a kept configuration is left exactly as it was"
         );
         assert_eq!(
             std::fs::read(root.join(".claude/settings.json")).expect("read claude"),
@@ -4546,7 +4671,7 @@ default_backend_anthropic = "codex_sub"
 
         // Everything BEFORE verify did happen (the steps are
         // sequential, not all-or-nothing): the config and the units.
-        assert!(rig.toml_path().exists());
+        assert!(!rig.stored_rows().providers.is_empty());
         assert_eq!(rig.runner.installed().len(), 2);
         // And nothing was asked past the port.
         assert_eq!(rig.prompt.asked().len(), 6);
@@ -4581,21 +4706,17 @@ default_backend_anthropic = "codex_sub"
             .expect("the reconfigure run completes");
 
         // The reconfigured choices applied…
-        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
-        assert!(text.contains(&format!("port = {port}")));
-        assert!(text.contains("awake = true"));
-        // …and the hand-set routing moved into the database: revision one
-        // compiled the model map before the file stopped carrying it.
-        assert!(!text.contains("model_map") && !text.contains("default_backend_"));
+        let config = rig.stored();
+        assert_eq!(report.port, port);
+        assert!(config.awake);
+        // …and the hand-set routing moved into the store: revision one
+        // compiled the model map from the file before the file went.
+        assert!(!rig.toml_path().exists(), "the file went with the import");
         let revision = active_revision(&rig.paths()).expect("revision one is active");
         assert_eq!(revision.revision_id, 1);
         assert_eq!(revision.source, PolicyRevisionSource::Legacy);
         assert!(active_document(&rig.paths()).contains("gpt-5.6-sol"));
         assert_eq!(report.routing_activated, Some(1));
-        assert_eq!(
-            report.legacy_fields_dropped,
-            ["default_backend_anthropic", "providers.codex_sub.model_map"]
-        );
 
         // The existing config's enabled set was pre-ticked (codex_sub
         // alone, though claude's settings exist: the config wins over
@@ -4603,10 +4724,7 @@ default_backend_anthropic = "codex_sub"
         // was printed.
         assert_eq!(rig.prompt.asked()[1].kind, "multi_select");
         assert_eq!(rig.prompt.asked()[1].default.as_deref(), Some("[2]"));
-        assert!(
-            !text.contains("[providers.openrouter]"),
-            "not ticked, not enabled"
-        );
+        assert!(rig.stored().openrouter.is_none(), "not ticked, not enabled");
         let out = rig.out();
         assert!(
             out.contains("a deliberate operator edit in `toker tui`"),
@@ -4617,9 +4735,7 @@ default_backend_anthropic = "codex_sub"
             "{out}"
         );
         assert!(
-            out.contains(
-                "no longer in the file (the database holds them): default_backend_anthropic"
-            ),
+            out.contains("configuration is edited in `toker tui` now"),
             "{out}"
         );
 
@@ -4655,9 +4771,11 @@ default_backend_anthropic = "codex_sub"
     fn seed_owned(rig: &Rig, text: &str) -> crate::store::PolicyRevision {
         std::fs::create_dir_all(rig.root.join(".config/toker")).expect("create the config dir");
         std::fs::write(rig.toml_path(), text).expect("seed the toml");
+        // The seed is the FILE: this stands in for a machine whose routing
+        // moved before its configuration did, so the store starts empty.
         let mut config = Config::load_from(&rig.toml_path()).expect("the seed loads");
         config.db_path = rig.paths().db_path();
-        activate_revision_one(&config, &rig.paths()).expect("activate revision one");
+        commit_configuration(&config, &rig.paths()).expect("commit the configuration");
         active_revision(&rig.paths()).expect("revision one is active")
     }
 
@@ -4691,22 +4809,19 @@ default_backend_anthropic = "codex_sub"
         assert_eq!(after.fingerprint, before.fingerprint);
         assert_eq!(report.routing_owned, Some(before.revision_id));
         assert_eq!(report.routing_activated, None);
-        assert_eq!(
-            report.legacy_fields_dropped,
-            ["default_backend_anthropic", "providers.codex_sub.model_map"]
-        );
-        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
-        assert!(!text.contains("model_map") && !text.contains("default_backend_"));
-        assert!(
-            text.contains("[providers.anthropic_sub]") && text.contains("[providers.codex_sub]")
-        );
+        // The file is imported and removed whole, so there is no longer a
+        // set of fields "dropped" from a rewrite.
+        assert!(report.config_file_removed);
+        assert!(!rig.toml_path().exists());
+        let config = rig.stored();
+        assert!(config.anthropic_sub.is_some() && config.codex_sub.is_some());
         let out = rig.out();
         assert!(
             out.contains("routing     : database-owned, revision 1"),
             "{out}"
         );
         assert!(
-            out.contains("routing fields no longer in the file"),
+            out.contains("configuration is edited in `toker tui` now"),
             "{out}"
         );
     }
@@ -4724,11 +4839,11 @@ default_backend_anthropic = "codex_sub"
 
         let report = rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        assert!(report.config_kept && !report.config_written);
-        assert_eq!(
-            std::fs::read_to_string(rig.toml_path()).expect("read the toml"),
-            seeded
-        );
+        // Keeping the settings still moves them: there is no "leave the
+        // file alone" that leaves a working machine.
+        assert!(report.config_kept && report.config_written);
+        assert!(report.config_file_removed);
+        assert!(!rig.toml_path().exists());
         assert_eq!(report.routing_owned, Some(1));
         assert!(rig.out().contains("routing     : database-owned"));
     }
@@ -4807,8 +4922,7 @@ default_backend_anthropic = "codex_sub"
         );
         let report = next.run(VERIFY_TIMEOUT).await.expect("the recovery run");
         assert_eq!(report.routing_owned, Some(1));
-        let text = std::fs::read_to_string(next.toml_path()).expect("read the toml");
-        assert!(!text.contains("model_map"));
+        assert!(!next.toml_path().exists(), "the recovery run removed it");
     }
 
     #[tokio::test]
@@ -4871,9 +4985,7 @@ default_backend_anthropic = "codex_sub"
         // Its transcripts are under its own config directory, so the
         // dashboard can only name its sessions with that root listed.
         assert_eq!(
-            Config::load_from(&with.toml_path())
-                .expect("the written config loads")
-                .transcript_roots,
+            with.stored().transcript_roots,
             vec![with_dir.join(".workhorse/repos/.claude")],
         );
 
@@ -4900,12 +5012,7 @@ default_backend_anthropic = "codex_sub"
             without.prompt.asked()
         );
         assert!(!report.patched.iter().any(|name| name.contains("Workhorse")),);
-        assert!(
-            Config::load_from(&without.toml_path())
-                .expect("the written config loads")
-                .transcript_roots
-                .is_empty(),
-        );
+        assert!(without.stored().transcript_roots.is_empty(),);
         assert!(
             without
                 .out()
@@ -4965,10 +5072,9 @@ default_backend_anthropic = "codex_sub"
                 .expect("count"),
             1
         );
-        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
         assert!(
-            text.contains(&format!("db_path = \"{}\"", db.display())),
-            "the config names this run's ledger: {text}"
+            db.is_file(),
+            "the run's own store is where the rows and the imported ledger went"
         );
     }
 
@@ -5012,11 +5118,14 @@ default_backend_anthropic = "codex_sub"
             assert!(!contents.contains(KEY), "the key leaked into a unit");
         }
 
-        // The key IS stored — its one sanctioned home — in a 0600 file.
-        let text = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
+        // The key IS stored — its one sanctioned home is now the row, in a
+        // store whose directory setup closed to everyone else.
+        let rows = rig.stored_rows();
         assert!(
-            text.contains(&format!("api_key = \"{KEY}\"")),
-            "the key is stored in the 0600 toker.toml: {text}"
+            rows.providers
+                .iter()
+                .any(|row| row.cred_literal.as_deref() == Some(KEY)),
+            "the key is stored as a literal in the store"
         );
         // And it was asked as a SECRET question — the seam masks the
         // answer in the real UI, which is half of the never-echo rule.
@@ -5032,11 +5141,11 @@ default_backend_anthropic = "codex_sub"
         );
         assert_eq!(key_question.kind, "text");
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(rig.toml_path())
+        let mode = std::fs::metadata(rig.paths().db_path().parent().expect("the state dir"))
             .expect("metadata")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o077, 0, "the store's directory is closed");
 
         // And the summary named only the SOURCE, never the value, and
         // said why the key is not in the keyring.
@@ -5067,10 +5176,12 @@ default_backend_anthropic = "codex_sub"
         // The key is in the (fake) keyring and nowhere else.
         assert_eq!(rig.secrets.peek("anthropic_api").as_deref(), Some(KEY));
         assert_eq!(rig.secrets.peek("openrouter"), None);
-        let toml = std::fs::read_to_string(rig.toml_path()).expect("read the toml");
-        assert!(!toml.contains(KEY), "{toml}");
-        assert!(!toml.contains("api_key ="), "no literal: {toml}");
-        let config = Config::load_from(&rig.toml_path()).expect("loads");
+        let rows = rig.stored_rows();
+        assert!(
+            rows.providers.iter().all(|row| row.cred_literal.is_none()),
+            "choosing the keyring stores no literal"
+        );
+        let config = rig.stored();
         let api = config.anthropic_api.as_ref().expect("enabled");
         assert!(api.api_key_keyring);
         let openrouter = config.openrouter.as_ref().expect("enabled");
@@ -5110,7 +5221,7 @@ default_backend_anthropic = "codex_sub"
             .await
             .expect("the rerun completes");
         assert_eq!(rerun.prompt.asked()[2].default.as_deref(), Some("1"));
-        let config = Config::load_from(&rerun.toml_path()).expect("loads");
+        let config = rerun.stored();
         assert!(
             config
                 .anthropic_api
@@ -5138,7 +5249,7 @@ default_backend_anthropic = "codex_sub"
 
         rig.run(VERIFY_TIMEOUT).await.expect("the run completes");
 
-        let config = Config::load_from(&rig.toml_path()).expect("the written config loads");
+        let config = rig.stored();
         assert_eq!(config.enabled_backends(), ["openai_api"]);
         assert_eq!(config.default_backend_anthropic, None);
         assert_eq!(
@@ -5203,24 +5314,21 @@ default_backend_anthropic = "codex_sub"
                 .any(|asked| asked.message.contains("openrouter"))
         );
 
-        let config = Config::load_from(&rig.toml_path()).expect("the written config loads");
+        let config = rig.stored();
         assert_eq!(
             config.enabled_backends(),
             vec!["anthropic_sub", "codex_sub"]
         );
-        // The defaults went to the database, not the file.
-        assert!(
-            !std::fs::read_to_string(rig.toml_path())
-                .expect("read the toml")
-                .contains("default_backend_")
-        );
+        // The defaults went to the store's revision, and the rows carry no
+        // routing at all (spec: RMIG#the-routing-fields).
+        assert!(!rig.toml_path().exists(), "the file went with the import");
         assert!(active_document(&rig.paths()).contains("codex_sub"));
         // codex_sub ticked without a login: said so.
         assert!(rig.out().contains("no codex login"), "{}", rig.out());
     }
 
     #[tokio::test]
-    async fn a_state_dir_that_cannot_be_created_is_reported_with_manual_commands() {
+    async fn a_state_dir_that_cannot_be_created_stops_setup_at_the_configuration_write() {
         let (port, _server) = serve(StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED).await;
         let mut rig = Rig::new(
             "state-dir-fail",
@@ -5244,40 +5352,33 @@ default_backend_anthropic = "codex_sub"
             .expect("create the data dir");
         std::fs::write(&state_dir, "").expect("block the state dir");
 
-        let report = rig
+        // Configuration lives in the store, and the store lives in the
+        // state dir, so a state dir that cannot exist is nowhere to put the
+        // configuration: the run stops at the write, naming the store, and
+        // touches no frontend.
+        let error = rig
             .run(Duration::from_millis(300))
             .await
-            .expect("a failed state dir is reported, not an error");
-
-        assert!(!report.units_ok);
-        assert_eq!(report.units_installed.len(), 2, "the files installed fine");
-        assert_eq!(report.verified, None, "verify was never attempted");
-        assert_eq!(report.patched.len(), 0, "no frontend was touched");
+            .expect_err("there is nowhere to write the configuration");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("opening the store at"),
+            "the failure names the store: {rendered}"
+        );
+        assert!(
+            rendered.contains(&state_dir.display().to_string()),
+            "and the path it could not open: {rendered}"
+        );
         assert_eq!(
             std::fs::read(rig.root.join(".claude/settings.json")).expect("read claude"),
-            before_claude
+            before_claude,
+            "no frontend was touched"
         );
         assert_eq!(
             rig.runner.calls(),
             vec![vec!["is-active".to_owned(), SOCKET_UNIT.to_owned()]],
-            "no systemctl step ran after the state dir failed"
+            "no systemctl step ran after the configuration write failed"
         );
-        let mkdir = format!("mkdir -p {}", state_dir.display());
-        assert_eq!(
-            report.units_manual.first(),
-            Some(&mkdir),
-            "the state dir comes first in the manual commands"
-        );
-        let out = rig.out();
-        assert!(
-            out.contains(&format!(
-                "creating the state dir {} failed",
-                state_dir.display()
-            )),
-            "{out}"
-        );
-        assert!(out.contains(&format!("  {mkdir}")), "{out}");
-        assert!(out.contains("no frontend was touched"), "{out}");
     }
 
     #[tokio::test]
@@ -5304,7 +5405,7 @@ default_backend_anthropic = "codex_sub"
             .await
             .expect_err("activation cannot succeed");
         assert!(
-            format!("{error:#}").contains("opening the ledger"),
+            format!("{error:#}").contains("opening the store"),
             "{error:#}"
         );
         assert!(!rig.toml_path().exists(), "no config was written");

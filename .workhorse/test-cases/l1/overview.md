@@ -32,11 +32,11 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Importing a file
 
-- [ ] Setup imports a file's settings as rows, and activates revision one from its routing fields, in one transaction (verifies spec: RMIG, USETUP)
-- [ ] The file is removed only after that transaction commits (verifies spec: RMIG)
+- [x] Setup imports a file's settings as rows, and activates revision one from its routing fields, in one transaction (verifies spec: RMIG, USETUP)
+- [x] The file is removed only after that transaction commits (verifies spec: RMIG)
 - [ ] An import interrupted before the removal is repaired by running setup again, to the same rows (verifies spec: RMIG, DCONF)
 - [ ] An import whose routing fields do not validate writes nothing and removes nothing (verifies spec: RMIG)
-- [ ] The file's routing fields are not stored as configuration (verifies spec: RMIG)
+- [x] The file's routing fields are not stored as configuration (verifies spec: RMIG)
 - [ ] Setup reports what it read from the file before importing it (verifies spec: USETUP)
 
 ## Editing live
@@ -51,9 +51,9 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 ## Setup on a fresh machine
 
 - [ ] Setup asks for one provider and its credential and nothing further (verifies spec: USETUP)
-- [ ] Setup writes rows and no configuration file (verifies spec: USETUP)
+- [x] Setup writes rows and no configuration file (verifies spec: USETUP)
 - [ ] Setup ends by replacing itself with the dashboard (verifies spec: USETUP)
-- [ ] Setup on an owned machine reports routing is owned by the store and does not ask for a protocol default (verifies spec: RMIG)
+- [x] Setup on an owned machine reports routing is owned by the store and does not ask for a protocol default (verifies spec: RMIG)
 
 ## Discovery instead of configured paths
 
@@ -71,7 +71,7 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 
 ## Credentials
 
-- [ ] A literal is stored and never displayed afterwards (verifies spec: SEC, DCONF)
+- [x] A literal is stored and never displayed afterwards (verifies spec: SEC, DCONF)
 - [ ] The resolution order is the environment, then the keyring, then the literal, then the Claude login file (verifies spec: WCRED)
 - [ ] Exporting the ledger carries no credential (verifies spec: DCONF)
 - [ ] A debug rendering of a credential-bearing value redacts it (verifies spec: SEC)

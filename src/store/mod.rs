@@ -520,6 +520,20 @@ impl Store {
         config::load_configuration(&*self.conn()?)
     }
 
+    /// Write a whole configuration, replacing what is there. The import's
+    /// path for a machine whose routing already moved: there is no revision
+    /// to activate, so the rows are the whole transaction.
+    pub fn write_configuration(&self, configuration: &Configuration) -> Result<()> {
+        let mut conn = self.conn()?;
+        // Immediate, not deferred: a deferred transaction that upgrades to a
+        // write can come back BUSY without waiting out the busy timeout,
+        // because SQLite will not retry an upgrade that could deadlock.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        config::write_configuration(&tx, configuration)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Write one provider's row.
     pub fn put_config_provider(&self, row: &ProviderConfigRow) -> Result<()> {
         config::put_provider(&*self.conn()?, row)

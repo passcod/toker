@@ -9,7 +9,6 @@
 //!   temp-write in the same directory, fsync, re-parse, compare, rename
 //!   (the opencode.json lesson), symlink-resolving, refusing to touch
 //!   anything it does not understand.
-//! - [`config_writer`] — `toker.toml`: read-merge, change, rewrite.
 //! - [`patchers`] — one pure-file patch per frontend (claude user +
 //!   Workhorse settings, opencode, the generic shell rc), plus the
 //!   [`patchers::Frontend`] enum the wizard composes.
@@ -24,7 +23,6 @@
 //!   the only place the seams meet the real world.
 
 pub mod atomic;
-pub mod config_writer;
 pub mod patchers;
 pub mod plugin;
 pub mod verify;
@@ -39,7 +37,7 @@ pub enum Step {
     /// can be verified without a backend wired.
     ChooseBackends,
     /// Write `toker.toml`
-    /// ([`config_writer::write_config`]) — the resolved config with
+    /// — the resolved configuration with
     /// the wizard's choices applied, atomically, once the database owns
     /// routing: a machine that does not yet gets revision one activated
     /// from the same choices first.
@@ -71,7 +69,7 @@ impl Step {
     pub fn label(self) -> &'static str {
         match self {
             Step::ChooseBackends => "choose backends",
-            Step::WriteConfig => "write toker.toml",
+            Step::WriteConfig => "write the configuration",
             Step::InstallUnits => "install + start the units",
             Step::VerifyService => "verify the service answers",
             Step::PatchFrontends => "wire the frontends",
@@ -94,7 +92,7 @@ impl Step {
 /// **Every step is re-runnable** (the plan's idempotence rule):
 /// `toker setup` is re-enterable at any point and converges. Each
 /// config write is an atomic merge-in-place ([`atomic`],
-/// [`config_writer`]), each frontend patch is an update-in-place that
+/// the store), each frontend patch is an update-in-place that
 /// never stacks duplicates ([`patchers`]), and the unit install is
 /// declarative — re-running a step applies "the same intent" again,
 /// not "the same edit" again.
