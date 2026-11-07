@@ -21,7 +21,7 @@ The model identity Toker sent upstream.
 
 The model identity a provider's response reports as having served it.
 
-## Which identity is authoritative
+## Identity authority
 
 Only the served model MUST add a day's evidence, raise a learned prompt size, select a context ceiling, or choose a price.
 
@@ -162,7 +162,7 @@ A cold lane MUST be decided afresh, having nothing to lose either way.
 
 The record of the move MUST be rebuilt from the ledger on restart.
 
-## Whether a model fits
+## Context fit
 
 Two facts bear on whether a prompt fits a model, and they MUST be consulted in this order.
 

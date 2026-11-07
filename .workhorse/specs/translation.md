@@ -8,7 +8,7 @@ A translated route carries a request to a provider that speaks a different proto
 This spec covers which routes translate, what a translation may and may not depend on, and how a capability the target lacks is resolved.
 The canonical request every translation reads from is specified by [CANON](canonical.md).
 
-## Which routes translate
+## Routes that translate
 
 A route whose binding's protocol differs from the client's MUST translate between the two.
 

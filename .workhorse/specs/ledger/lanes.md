@@ -117,7 +117,7 @@ A request carrying provider-owned state on a lane with no pin MUST be refused, s
 
 A pin MUST live in the lane row, so that pruning a lane drops its pin.
 
-## Which revision a lane resolves under
+## Revision selection
 
 | pinned revision | resolves under |
 | --- | --- |
@@ -162,9 +162,9 @@ The upgrade's own sticky record is separate from the pin, and is specified by [R
 
 ## Coldness evidence
 
-Three questions get asked about coldness, and they MUST NOT share a source.
+Coldness is asked about in three ways, and they MUST NOT share a source.
 
-### Whether a move would lose a live cache
+### Cache temperature
 
 This MUST be answered for the lane's pinned binding, as warm, cold or unknown.
 
@@ -183,11 +183,11 @@ Every consumer MUST treat unknown as warm.
 > [!NOTE]
 > A wrong verdict of cold rebuilds a whole prefix; a wrong verdict of warm costs one upgrade, or one move that waits for the next idle spell.
 
-### Whether the cache is already gone
+### Lane coldness
 
-The cold gate and the compaction retarget MUST read the lane's own record instead, as [GCOLD](../gates/cold.md#a-lanes-cache-lifetime) specifies, where an unrecorded lifetime reads as the longest.
+The cold gate and the compaction retarget MUST read the lane's own record rather than its cache temperature, as [GCOLD](../gates/cold.md#a-lanes-cache-lifetime) specifies, where an unrecorded lifetime reads as the longest.
 
-That default is deliberately the opposite of the one above.
+That default is deliberately the opposite of cache temperature's.
 
 > [!NOTE]
 > A notice interrupts the operator, so guessing that the cache is live costs less than guessing it is gone.
@@ -195,9 +195,9 @@ That default is deliberately the opposite of the one above.
 
 For a compaction, the resolver MUST be told the lane is cold only where that record says so, whatever the pin and the binding's lifetime would say.
 
-### Whether an activation may proceed
+### Activation consent
 
-Activation consent MUST count lanes by the first question above, and MUST count a lane with no pin as warm or unknown.
+Activation consent MUST count lanes by cache temperature, and MUST count a lane with no pin as warm or unknown.
 
 A ledger that cannot be read MUST refuse the activation, and MUST NOT read as having no warm lanes.
 

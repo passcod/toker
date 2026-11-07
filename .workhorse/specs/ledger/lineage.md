@@ -53,7 +53,7 @@ A parent with no row of its own MUST be accepted.
 A relation MUST ride only the rows of requests that carried it.
 A row Toker writes about itself, such as a notice or a release, MUST NOT carry one.
 
-### Why nothing else counts
+### Inadmissible evidence
 
 None of these MUST be treated as evidence of a relation: when a request arrived, which model it named, how many messages or tools it carried, whether a transcript exists for it, which connection it used, or its body's contents.
 

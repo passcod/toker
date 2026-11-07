@@ -35,7 +35,7 @@ A verb that a platform owns elsewhere MUST remain as a documented no-op rather t
 > [!NOTE]
 > A unit installed by an earlier version still invokes it.
 
-## Which store a command speaks to
+## Store access
 
 A command that changes the running service's behaviour MUST go through the control endpoints, which [DCTRL](../service/control.md) specifies.
 
