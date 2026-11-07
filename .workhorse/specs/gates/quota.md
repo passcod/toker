@@ -5,7 +5,7 @@ id: GQUOTA
 # The quota gate
 
 The quota gate stops a session that would spend past a subscription's rate limit window.
-This spec covers what a window meters, how that is fitted from the ledger, when the gate fires, and how a session releases past it.
+This spec covers a window's metered consumption, how it is fitted from the ledger, when the gate fires, and how a session releases past it.
 
 ## Borrowed terms
 
