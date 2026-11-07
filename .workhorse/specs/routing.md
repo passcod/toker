@@ -130,7 +130,7 @@ Lane pins are specified by [LLANE](ledger/lanes.md).
 
 A request that brings its own credential for the provider it reaches keeps it.
 A credential meant for one provider MUST be removed before the request reaches a different one.
-Toker MUST NOT log a credential value, and MUST NOT write one to the ledger.
+Toker MUST NOT log a credential value, and MUST NOT write one to the store.
 Toker MUST read request headers by name, and MUST NOT capture them wholesale.
 
 | provider | what Toker does |

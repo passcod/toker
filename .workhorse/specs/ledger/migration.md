@@ -2,15 +2,15 @@
 id: LMIG
 ---
 
-# Migrating routing into the ledger
+# Migrating routing into the store
 
-Routing was once configuration interpreted per request, and is now a series of revisions in the ledger.
+Routing was once configuration interpreted per request, and is now a series of revisions in the store.
 This spec covers the seam between the two: how a machine whose routing was in its file gets a revision, what survives an interrupted migration, and how a file may be read deliberately afterwards.
 
 ## The file
 
 The configuration file is bootstrap.
-It holds the listener, the ledger's path, which providers are enabled and where they are reached, where each credential comes from, the header names, and the toggles and styles that are not routing.
+It holds the listener, the store's path, which providers are enabled and where they are reached, where each credential comes from, the header names, and the toggles and styles that are not routing.
 
 None of those is a per-request decision.
 
@@ -31,10 +31,10 @@ A file this version writes MUST NOT contain them, and a rewrite MUST name the fi
 
 ## Ownership
 
-A machine's routing is owned by the ledger once an active revision exists.
+A machine's routing is owned by the store once an active revision exists.
 That pointer MUST be the whole ownership marker, and the file MUST carry no flag of its own.
 
-There MUST be no state in which both the file and the ledger decide.
+There MUST be no state in which both the file and the store decide.
 Where a revision is active, the file's routing fields MUST be ignored whether or not they were edited.
 
 The only way the file may affect routing again is a deliberate import.
@@ -93,26 +93,26 @@ Both the service at startup and the setup wizard MUST reach that transaction, an
 Both MUST validate the file's routing fields first.
 An ambiguous default, being several enabled bindings for one protocol with nothing naming one, MUST be an error naming the field, raised before anything is written.
 
-## Migrating the file and the ledger together
+## Migrating the file and the store together
 
 A machine not yet owned needs two stores changed that cannot share a transaction.
 The order MUST be:
 
 1. read the existing file and apply the operator's choices to it in memory
-2. activate the first revision in the ledger from that result
+2. activate the first revision in the store from that result
 3. atomically replace the file with one carrying no routing fields
 
 Activation MUST run after the choices are validated and before the file is replaced, so that a failure to validate or activate stops before anything is written.
 
-An interruption between the second and third steps leaves an owned ledger and a file that still carries routing fields.
+An interruption between the second and third steps leaves an owned store and a file that still carries routing fields.
 That MUST be a consistent state needing no repair, because the service ignores those fields once a revision is active.
 
 > [!NOTE]
 > The reverse order does not recover: a file rewritten first, with a crash before activation, leaves a machine with neither the old rules nor a revision, and the first revision would then be built from a file that no longer says what the rules were.
 
-Setup MUST read the ledger read-only before asking anything.
-An absent ledger, or one predating the policy tables, is not owned.
-A ledger that exists but cannot be read MUST stop setup before it changes anything.
+Setup MUST read the store read-only before asking anything.
+An absent store, or one predating the policy tables, is not owned.
+A store that exists but cannot be read MUST stop setup before it changes anything.
 
 > [!NOTE]
 > Writing a configuration over a database in an unknown state could strand the machine.

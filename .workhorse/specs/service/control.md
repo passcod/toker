@@ -39,7 +39,7 @@ A control path added later MUST take the same two checks, MUST carry an operatio
 
 | operation | what it does |
 | --- | --- |
-| status | the resolved configuration without secrets, the ledger's size, uptime, the in-flight count, the active revision and this process's instance identity |
+| status | the resolved configuration without secrets, the store's size, uptime, the in-flight count, the active revision and this process's instance identity |
 | session | one session's attribution aggregate and its lane view |
 | shutdown | drain and exit |
 | routing snapshot | everything the routing view shows |

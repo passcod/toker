@@ -67,6 +67,16 @@ Defined in [ROUTE](routing.md#resolving-a-route).
 The representation a request is parsed into, from which the outgoing body is rendered.
 Defined in [CANON](canonical.md).
 
+### Store
+
+The database Toker keeps its state in, holding the ledger alongside the lanes, the policy revisions, the learned models, the allowances, the ping runs and the meter snapshots.
+Defined in [LROWS](ledger/schema.md).
+
+### Ledger
+
+The append-only record of requests within the store, one row per attempt or proxy decision.
+Defined in [LROWS](ledger/schema.md).
+
 ### Offer
 
 A model a provider serves, as a provider identifier paired with what Toker knows of its window and pricing.

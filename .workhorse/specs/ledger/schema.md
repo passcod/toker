@@ -4,15 +4,22 @@ id: LROWS
 
 # The ledger
 
-The ledger holds one row per upstream attempt or proxy decision.
+The store is the database Toker keeps its state in.
+The ledger is the append-only record of requests within it, one row per upstream attempt or proxy decision.
+
 This spec covers how rows are written, what each kind records, and what a reader owes a reader when a field did not always exist.
 
-## Writing
+## The store and the ledger
 
 The ledger MUST be insert-only.
 Every row MUST be written through one function, so that no caller can assemble a row of its own shape.
 
-The state held beside the ledger, being lanes, the routing tables, learned models, allowances, ping runs and meter snapshots, is read-modify-write and is not part of the record.
+The store also holds the lanes, the policy revisions, the learned models, the allowances, the ping runs and the meter snapshots.
+That state is read-modify-write and is not part of the ledger.
+
+> [!NOTE]
+> Policy and configuration live in the store, not in the ledger.
+> Nothing is appended to the record of requests to enable a provider or activate a revision.
 
 Migrations MUST be an append-only list gated by a stored version.
 A migration MUST never be edited, reordered or deleted.
@@ -154,11 +161,11 @@ An importer MUST count every field of the source it did not map, by name, separa
 
 A field whose meaning changed in the source carries its eras across with the rows, so a count over such a range MUST be reported as a floor.
 
-## Reading the ledger
+## Opening the store
 
-A reader that does not write MUST open the ledger read-only.
+A reader that does not write MUST open the store read-only.
 
 > [!NOTE]
-> A wrong path then fails instead of creating an empty ledger, and an older binary never migrates the live file.
+> A wrong path then fails instead of creating an empty store, and an older binary never migrates the live file.
 
 How rows are exported is specified by [UREAD](../cli/readers.md).

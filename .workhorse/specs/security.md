@@ -20,7 +20,7 @@ A detection marker MUST be a string chosen in advance, and only whether it match
 > Whether a known string matched is a derived fact, as a hash is.
 > Recording where it sat and which roles surrounded it carries positions and flags, never text.
 
-A label a display reads from a client's own files MUST be read when the display renders and MUST NOT reach the ledger.
+A label a display reads from a client's own files MUST be read when the display renders and MUST NOT reach the store.
 
 An import MUST report the names of fields it did not map and MUST NOT report their values, as [LROWS](ledger/schema.md#imported-rows) specifies.
 
@@ -32,7 +32,7 @@ Policy data and diagnostics MUST carry no prompt, completion or provider error b
 
 ## A credential is never logged, stored or displayed
 
-Toker MUST NOT write a credential's value to a log, to the ledger, or to any output.
+Toker MUST NOT write a credential's value to a log, to the store, or to any output.
 
 Toker MUST report which source supplies a credential and MUST NOT report the value, as [UCLI](cli/commands.md#status) specifies.
 

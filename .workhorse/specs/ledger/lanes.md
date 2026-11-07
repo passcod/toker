@@ -199,7 +199,7 @@ For a compaction, the resolver MUST be told the lane is cold only where that rec
 
 Activation consent MUST count lanes by cache temperature, and MUST count a lane with no pin as warm or unknown.
 
-A ledger that cannot be read MUST refuse the activation, and MUST NOT read as having no warm lanes.
+A store that cannot be read MUST refuse the activation, and MUST NOT read as having no warm lanes.
 
 ## Fallback and the pin
 

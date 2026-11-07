@@ -4,7 +4,7 @@ id: RPOL
 
 # The routing policy
 
-Every inference request is routed by the active revision of the routing policy, a versioned document held in the ledger.
+Every inference request is routed by the active revision of the routing policy, a versioned document held in the store.
 This spec covers the document, how a revision is drafted and activated, and how a request is resolved against one.
 
 There MUST be no other router.
@@ -97,7 +97,7 @@ An edge crossing a cache identity MUST NOT declare that it preserves a warm cach
 
 ### Draft
 
-There MUST be exactly one draft, held in the ledger so that two editors share it.
+There MUST be exactly one draft, held in the store so that two editors share it.
 
 Every write to the draft MUST carry the generation it read and MUST be applied by compare-and-swap.
 A stale write MUST change nothing and MUST return the current state.

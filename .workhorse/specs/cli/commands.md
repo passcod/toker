@@ -39,7 +39,7 @@ A verb that a platform owns elsewhere MUST remain as a documented no-op rather t
 
 A command that changes the running service's behaviour MUST go through the control endpoints, which [DCTRL](../service/control.md) specifies.
 
-A command that only records evidence MAY write the ledger directly without talking to the service.
+A command that only records evidence MAY write the store directly without talking to the service.
 
 > [!NOTE]
 > Promotion changes learned evidence rather than policy, so it needs no revision and no running service.

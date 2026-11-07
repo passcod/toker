@@ -7,7 +7,7 @@ id: UREAD
 Three commands read the ledger without serving traffic: one ingests a predecessor's log, one emits rows, and one reports proof of a context window.
 This spec covers what each guarantees.
 
-A command that does not write MUST open the ledger read-only, as [LROWS](../ledger/schema.md#reading-the-ledger) requires.
+A command that does not write MUST open the store read-only, as [LROWS](../ledger/schema.md#opening-the-store) requires.
 
 ## Export
 

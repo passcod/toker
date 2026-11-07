@@ -9,11 +9,11 @@ This spec covers what it establishes before it asks anything, what it verifies b
 
 ## Before asking
 
-Setup MUST read the ledger read-only before it asks anything.
+Setup MUST read the store read-only before it asks anything.
 
-A ledger that exists but cannot be read MUST stop setup before it changes anything, as [LMIG](../ledger/migration.md#migrating-the-file-and-the-ledger-together) requires.
+A store that exists but cannot be read MUST stop setup before it changes anything, as [LMIG](../ledger/migration.md#migrating-the-file-and-the-store-together) requires.
 
-Setup MUST report the machine's current state, including whether its routing is owned by the ledger, before offering to change it.
+Setup MUST report the machine's current state, including whether its routing is owned by the store, before offering to change it.
 
 ## Verifying before patching
 
@@ -38,7 +38,7 @@ Setup MUST write the file without routing fields, and MUST name any it dropped.
 
 Where the operator keeps the configuration as it is, setup MUST leave the file byte for byte alone.
 
-The order in which setup writes the ledger and the file is specified by [LMIG](../ledger/migration.md#migrating-the-file-and-the-ledger-together).
+The order in which setup writes the store and the file is specified by [LMIG](../ledger/migration.md#migrating-the-file-and-the-store-together).
 
 Where setup found an active listener on the configured port, it MUST replace the running instance by the path [DLIFE](../service/lifecycle.md#replacing-the-running-instance) specifies.
 
