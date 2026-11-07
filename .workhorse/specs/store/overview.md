@@ -5,7 +5,7 @@ id: STORE
 # The store
 
 The store is the database Toker keeps its state in.
-This spec covers what it holds, how it is migrated, and the rules every one of its tables answers to.
+This spec covers its contents, how it is migrated, and the rules every one of its tables answers to.
 
 ## Contents
 

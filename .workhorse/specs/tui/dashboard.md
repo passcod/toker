@@ -5,7 +5,7 @@ id: UTUI
 # The dashboard
 
 The dashboard is where an operator reads what Toker has recorded and edits the policy.
-This spec covers what it shows, the controls it offers, and the rules its readings follow.
+This spec covers the views it renders, the controls it offers, and the rules its readings follow.
 
 ## Rendering
 

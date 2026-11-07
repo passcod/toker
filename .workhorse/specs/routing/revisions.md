@@ -74,7 +74,7 @@ The operation that produced a revision and the meaning of its document are separ
 A revision MUST record its compiler origin, and a revision derived from another MUST inherit it.
 Semantics marked as generated MUST be refused in an authored document.
 
-What the generated first revision contains is specified by [RMIG](migration.md).
+The contents of the generated first revision are specified by [RMIG](migration.md).
 
 ## Catalogue refresh
 

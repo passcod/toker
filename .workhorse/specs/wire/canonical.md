@@ -5,7 +5,7 @@ id: WCANON
 # Canonical rendering
 
 Toker parses every inference request into a canonical request and renders the outgoing body from it, rather than forwarding the client's bytes.
-This spec covers what rendering guarantees, which transformations may change a request's meaning, and how a body that cannot cross the canonical boundary is answered.
+This spec covers the guarantees rendering makes, which transformations may change a request's meaning, and how a body that cannot cross the canonical boundary is answered.
 Administrative paths keep the client's bytes instead, as [ROUTE](../routing/overview.md) specifies.
 
 ## Rendering
@@ -62,7 +62,7 @@ Toker MAY drop cache breakpoints where the caller has asserted that the request'
 Where neither holds, retargeting MUST leave the breakpoints in place.
 
 > [!NOTE]
-> On a warm lane those breakpoints are what earn the free read, so dropping them without one of these two licences converts a cached read into a full one.
+> On a warm lane those breakpoints earn the free read, so dropping them without one of these two licences converts a cached read into a full one.
 
 Retargeting a compaction MUST change its model, its cache breakpoints and its mid-conversation system messages together, or change none of them.
 

@@ -4,8 +4,8 @@ id: DCONF
 
 # Configuration and state
 
-Toker reads a configuration file for what it needs before it can reach its store, and keeps everything else in the store.
-This spec covers what the file holds, where a credential may live, and which directories the service may write.
+Toker reads a configuration file for the settings it needs before it can reach its store, and keeps everything else in the store.
+This spec covers the file's contents, where a credential may live, and which directories the service may write.
 
 Routing is not configuration.
 It lives in the store as policy revisions, as [RREV](../routing/revisions.md) specifies, and how a machine's routing moved there is specified by [RMIG](../routing/migration.md).

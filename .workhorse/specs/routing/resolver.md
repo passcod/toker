@@ -5,9 +5,9 @@ id: RSOLV
 # Resolving a request
 
 The resolver turns a request and a [compiled policy](overview.md#the-compiled-policy) into the route that will serve it.
-This spec covers what the resolver reads, how a route is looked up and walked, and how a request that nothing can serve is answered.
+This spec covers the facts the resolver reads, how a route is looked up and walked, and how a request that nothing can serve is answered.
 
-What happens when a candidate fails after its request was sent is specified by [RFALL](fallback.md).
+A candidate failing after its request was sent is specified by [RFALL](fallback.md).
 
 The resolver MUST be pure.
 It MUST read no clock, no store, no provider and no request body, taking the present moment as one of its inputs, so that the control surface can run the same function the request path does.
@@ -112,7 +112,7 @@ Each of these MUST write a route-unavailable row to the ledger.
 | --- | --- | --- |
 | no binding is presented, rewritten or defaulted to for this protocol | a not-configured error carrying the `x-toker-not-configured` header | carries no route |
 | the lane's pin refuses the move to the resolved route | 502 | names the route refused |
-| every candidate is unavailable, through an absent provider block, a missing credential or an open circuit | 503 | carries the trace of what was tried |
+| every candidate is unavailable, through an absent provider block, a missing credential or an open circuit | 503 | carries the trace of the candidates tried |
 
 A request answered in any of these ways MUST NOT reach an upstream.
 

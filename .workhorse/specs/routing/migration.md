@@ -9,7 +9,7 @@ This spec covers the seam between the two: how a machine whose routing was in it
 
 ## The routing fields
 
-What the configuration file holds is specified by [DCONF](../service/config.md#the-file).
+The configuration file's contents are specified by [DCONF](../service/config.md#the-file).
 Enabling a provider stays there, being the one fact policy cannot supply.
 
 > [!NOTE]
@@ -94,7 +94,7 @@ A marker present without a pointer MUST refuse the transaction.
 > Nothing writes that state, and re-establishing from it would silently discard whatever produced it.
 
 Both the service at startup and the setup wizard MUST reach that transaction.
-Both the service at startup and the setup wizard MUST converge because the first writer wins and the other reads what it wrote.
+Both the service at startup and the setup wizard MUST converge because the first writer wins and the other reads the revision it wrote.
 
 > [!NOTE]
 > A machine upgraded without running setup is then migrated by its first start.
@@ -117,7 +117,7 @@ An interruption between the second and third steps leaves an owned store and a f
 That MUST be a consistent state needing no repair, because the service ignores those fields once a revision is active.
 
 > [!NOTE]
-> The reverse order does not recover: a file rewritten first, with a crash before activation, leaves a machine with neither the old rules nor a revision, and the first revision would then be built from a file that no longer says what the rules were.
+> The reverse order does not recover: a file rewritten first, with a crash before activation, leaves a machine with neither the old rules nor a revision, and the first revision would then be built from a file that no longer carries those rules.
 
 Setup MUST read the store read-only before asking anything.
 An absent store, or one predating the policy tables, is not owned.

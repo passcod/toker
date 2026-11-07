@@ -5,7 +5,7 @@ id: RPROV
 # Routing provenance
 
 Every policy-routed row records how its request was routed.
-This spec covers what each row carries and the trace beside it.
+This spec covers each row's contents and the trace beside it.
 
 Where those rows live is specified by [SLEDGR](../store/ledger.md).
 

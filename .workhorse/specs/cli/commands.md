@@ -5,7 +5,7 @@ id: UCLI
 # The command surface
 
 Toker is one binary offering the service, the dashboard, the setup wizard and several one-shot verbs.
-This spec covers what each command is for and which store it speaks to.
+This spec covers each command's purpose and the store it speaks to.
 
 ## Parsing
 

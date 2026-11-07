@@ -76,7 +76,7 @@ The gate MUST hold a recap on a cold lane rather than forward it.
 This MUST be decided before the once-per-spell rule, before the outlook, and before the free-writes exemption.
 
 > [!NOTE]
-> Forwarding a recap is never the operator choosing to pay for the re-read, and a recap's worth does not depend on what the re-read costs.
+> Forwarding a recap is never the operator choosing to pay for the re-read, and a recap's worth does not depend on the re-read's cost.
 > A client decides whether to send a recap on its own clock, which the end of any turn resets, including a turn carrying a notice.
 
 A held recap MUST be answered as plain text without a notice frame, since it is not a transcript turn.

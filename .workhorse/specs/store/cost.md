@@ -7,7 +7,7 @@ id: SCOST
 A provider reports what a rate limit window has left, and what its answer cost.
 This spec covers which providers report each, and how the kinds of cost are kept apart.
 
-A meter is a provider's own report of what a rate limit window has left.
+A meter is a provider's own report of a rate limit window's remaining allowance.
 
 Toker MUST feed meters from every response a meter-bearing provider returns, including errors and requests Toker made for itself.
 

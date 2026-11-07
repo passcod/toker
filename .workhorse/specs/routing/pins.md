@@ -7,7 +7,7 @@ id: RPIN
 A lane remembers the route its cache was built on, and every move of that pin goes through one decision.
 This spec covers which revision a pinned lane resolves under, what consents a move needs, and what a fallback does to a pin.
 
-What a lane is, and what its pin records, are specified by [SLANE](../store/lanes.md).
+A lane, and the fields its pin records, are specified by [SLANE](../store/lanes.md).
 
 ## Revision selection
 
@@ -48,7 +48,7 @@ A denied request MUST NOT be sent.
 Where no consent is recorded, the decision MUST be to keep the pin.
 
 The source of a transition MUST decide whether the activation fence applies, and MUST NOT be stored.
-What the ledger keeps of a move is the row's identities.
+The ledger keeps a move as the row's identities.
 
 The upgrade's own sticky record is separate from the pin, and is specified by [RMODEL](models.md#an-upgrade-is-decided-once-and-then-kept).
 

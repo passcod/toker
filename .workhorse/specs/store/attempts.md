@@ -24,7 +24,7 @@ Two things add an attempt.
 | falling back to the next candidate | the failure class that caused the fall |
 
 The refusal that prompts a renegotiation MUST be recorded as an error row at its own index, with the provider's own error type, and the retry MUST be the next index.
-What that retry may change is specified by [WCANON](../wire/canonical.md#thinking-that-cannot-be-turned-off).
+The one value that retry may change is specified by [WCANON](../wire/canonical.md#thinking-that-cannot-be-turned-off).
 
 A refusal prompting a renegotiation MUST NOT open a health circuit.
 

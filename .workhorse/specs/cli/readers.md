@@ -5,7 +5,7 @@ id: UREAD
 # Reading the ledger
 
 Three commands read the ledger without serving traffic: one ingests a predecessor's log, one emits rows, and one reports proof of a context window.
-This spec covers what each guarantees.
+This spec covers the guarantees each makes.
 
 A command that does not write MUST open the store read-only, as [STORE](../store/overview.md#opening-the-store) requires.
 
@@ -53,7 +53,7 @@ The command MUST read only rows after the bound it was given, or after the point
 > [!NOTE]
 > Without a bound the whole ledger replays as news on every run.
 
-The command MUST keep a record of what it has already reported, so that each proof prints once.
+The command MUST keep a record of the proofs it has already reported, so that each prints once.
 
 The command MUST make one pass per run, so that a monitor can re-run it.
 

@@ -5,7 +5,7 @@ id: GATE
 # Gates
 
 A gate stops a request Toker would otherwise forward.
-This spec covers what may stop a request, what a gate reads, and how the gates relate to the measurement and detection that feed them.
+This spec covers the things that may stop a request, the evidence a gate reads, and the measurement and detection feeding them.
 
 ## Only a gate stops a session
 

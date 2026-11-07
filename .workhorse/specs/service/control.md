@@ -54,7 +54,7 @@ A control path added later MUST require a JSON body where it mutates.
 | routing promote | mark a learned model eligible for upgrades |
 | routing publication | record a failed or unsupported publication |
 
-What each routing operation means is specified by [RREV](../routing/revisions.md), and the publication handoff by [RPUB](../routing/publication.md#publication-state).
+The meaning of each routing operation is specified by [RREV](../routing/revisions.md), and the publication handoff by [RPUB](../routing/publication.md#publication-state).
 
 The publication operation MUST record only a failure or a lack of support.
 

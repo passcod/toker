@@ -5,7 +5,7 @@ id: USETUP
 # The setup wizard
 
 The wizard is the one place that writes Toker's configuration, installs its units, and points a client at the proxy.
-This spec covers what it establishes before it asks anything, what it verifies before it changes anything, and what it installs.
+This spec covers the state it establishes before asking anything, the checks it makes before changing anything, and the units it installs.
 
 ## Before asking
 
