@@ -1,7 +1,7 @@
 //! Session labels: what a session is about, from each frontend's own
 //! local session metadata.
 //!
-//! The ledger never records content (invariant 1), so it can say how big
+//! The ledger never records content (spec: SEC#no-prompt-or-completion-content-is-recorded), so it can say how big
 //! a session is but not which one it is. Claude Code already keeps a
 //! transcript per session under its config directory, named by the same
 //! id the proxy logs from the session header, and appends the working
@@ -31,7 +31,7 @@
 //!
 //! Failure is always "no label": a missing transcript, an unreadable
 //! one, a tail with nothing usable — the view falls back to the session
-//! id, never a panic (invariant 6's spirit).
+//! id, never a panic (spec: GATE#only-a-gate-stops-a-session).
 
 use std::collections::HashMap;
 use std::env;
@@ -65,7 +65,7 @@ pub(crate) const HEAD_BYTES: u64 = 256 * 1024;
 /// clean(title)`).
 ///
 /// Nothing here is ever written anywhere: labels exist at view time
-/// only (invariant 1), which is also why this type has no serialisation
+/// only (spec: SEC#no-prompt-or-completion-content-is-recorded), which is also why this type has no serialisation
 /// — it never crosses a wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Label {
@@ -214,7 +214,7 @@ pub(crate) fn session_label(sid: &str, roots: &[PathBuf], tail_bytes: u64) -> Op
 /// a `session_v2` table with `id`, `title`, and `directory` — the same
 /// facts the claude transcripts provide, in a queryable table, no tail
 /// scanning at all. Read-only and lock-tolerant: a busy or missing
-/// store is no-label, never an error (invariant 6's spirit — the
+/// store is no-label, never an error (spec: GATE#only-a-gate-stops-a-session — the
 /// label machinery must never fail a dashboard).
 pub(crate) fn opencode_label(sid: &str, db: &Path) -> Option<Label> {
     use rusqlite::OpenFlags;
@@ -265,7 +265,7 @@ pub(crate) fn codex_home_default() -> Option<PathBuf> {
 /// Codex's title and cwd for one thread, read from its own index and the
 /// first `session_meta` line of its rollout. The prompt is deliberately not
 /// read: labels stay metadata-only, and nothing returned here enters the
-/// ledger (invariant 1).
+/// ledger (spec: SEC#no-prompt-or-completion-content-is-recorded).
 #[cfg(test)]
 pub(crate) fn codex_label(sid: &str, home: &Path) -> Option<Label> {
     if !safe_session_id(sid) {

@@ -47,7 +47,7 @@
 //! | `response.reasoning_summary_text.delta` | [`ThinkingDelta`](CanonEvent::ThinkingDelta) — `part` is the summary index, the backend's own part identity |
 //! | `output_item.done` of a `message` | [`TextEnded`](CanonEvent::TextEnded) — the text part completed |
 //! | `output_item.done` of a `reasoning` item | [`ThinkingEnded`](CanonEvent::ThinkingEnded) — the reasoning part completed |
-//! | `output_item.done` of a `function_call` | [`ToolCall`](CanonEvent::ToolCall), COMPLETE — the done item carries the whole arguments; a call whose fields do not fit the typed view is skipped, never corrupted into the stream (invariant 6) |
+//! | `output_item.done` of a `function_call` | [`ToolCall`](CanonEvent::ToolCall), COMPLETE — the done item carries the whole arguments; a call whose fields do not fit the typed view is skipped, never corrupted into the stream (spec: GATE#only-a-gate-stops-a-session) |
 //! | output events for a provider-owned item kind | [`ProviderEvent`](CanonEvent::ProviderEvent), opaque and tagged with the Responses dialect so only a compatible frontend replays it |
 //! | `response.completed` | [`TurnEnded`](CanonEvent::TurnEnded) — explicit `end_turn` wins; only an absent flag falls back to whether a function call completed; the usage → [`CanonicalUsage`] |
 //! | `response.incomplete` | [`TurnEnded`](CanonEvent::TurnEnded) — `content_filter` reads as the refusal, anything else as the incomplete stop reason (verbatim) |
@@ -97,8 +97,8 @@ use crate::translate::{
 /// CALLER-derived, both explicit parameters (purity: the canonical
 /// carries the request, never the routing facts). The same canonical
 /// and the same params always produce the same bytes, forever
-/// (invariant 4), which is what keeps an appended conversation turn
-/// byte-identical over its earlier input items (invariant 5 — the
+/// (spec: WCANON#rendering), which is what keeps an appended conversation turn
+/// byte-identical over its earlier input items (spec: WCANON#rendering — the
 /// prefix-stability property test pins it).
 pub fn codex_from_canonical(
     canonical: &CanonicalRequest,
@@ -646,7 +646,7 @@ fn wire_role(role: CanonRole) -> &'static str {
 /// the identities of provider-owned output items whose incremental events a
 /// compatible Responses frontend may replay.
 /// Everything else is a pure function of the event under
-/// interpretation (invariant 4).
+/// interpretation (spec: WCANON#rendering).
 #[derive(Debug, Clone, Default)]
 pub struct CanonStream {
     /// Whether any `function_call` item completed with a typed view
@@ -666,7 +666,7 @@ impl CanonStream {
     /// arrival order. Never fails — an event with no canonical shape
     /// (an `output_item.added`, an unknown kind, a `function_call`
     /// whose fields do not fit the typed view) produces nothing
-    /// rather than corrupting the stream (invariant 6).
+    /// rather than corrupting the stream (spec: GATE#only-a-gate-stops-a-session).
     pub fn feed(&mut self, event: &ResponseEvent) -> Vec<CanonEvent> {
         let mut out = Vec::new();
         match event {

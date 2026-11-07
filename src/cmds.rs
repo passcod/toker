@@ -1,7 +1,7 @@
 //! Subcommand implementations, wired from the CLI surface in main.rs.
 //!
-//! The timer verbs serve the systemd wake/hold/ping units (plan: "Sleep
-//! lock, wake, ping") and are registered as hidden subcommands so they are
+//! The timer verbs serve the systemd wake/hold/ping units and are registered as
+//! hidden subcommands so they are
 //! reachable by the units but not part of the everyday CLI surface. The
 //! verbs' logic lives in [`crate::timers`] behind seams (the spawner, the
 //! claude client, the readback pacing); everything here is wiring — this
@@ -9,8 +9,7 @@
 //! `setup` is the wizard's.
 //! `serve`, `setup`, `status`, and `tui` are the wired commands: config →
 //! store → server; the interactive wizard; the resolved-config/ledger
-//! summary (plan: Credentials — status reports which key sources are in
-//! use, never the values); and the ratatui dashboard (plan: TUI).
+//! summary; and the ratatui dashboard.
 //! `restart` drives the running service's `/_toker/status` and
 //! `/_toker/shutdown` to restart it without cutting a response.
 
@@ -31,7 +30,7 @@ pub async fn serve() -> anyhow::Result<()> {
     Server::new(config, store)?.serve().await
 }
 
-/// `setup`: the interactive wizard (plan: "Setup wizard") — the ONLY
+/// `setup`: the interactive wizard — the ONLY
 /// place the wizard's seams meet the real world: the inquire prompt,
 /// the process systemctl runner, and this user's HOME-derived paths
 /// ([`crate::setup::wizard::Paths::real`]). Everything with logic runs
@@ -154,7 +153,7 @@ pub fn status() -> anyhow::Result<()> {
 }
 
 /// One api-key backend's key sources for `status`: which are set,
-/// never a value (invariant 2).
+/// never a value (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
 ///
 /// The env verdict is this shell's environment, which the service does
 /// not share (it sees the systemd user manager's), so the line says so.
@@ -200,7 +199,7 @@ pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tui`: the ratatui dashboard over the ledger (plan: TUI). `--db`
+/// `tui`: the ratatui dashboard over the ledger. `--db`
 /// overrides the path; otherwise `TOKER_DB` and the config default apply
 /// (Config::load already layered env over file).
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
@@ -225,7 +224,7 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// `import`: ingest the predecessor proxy's usage.jsonl into the ledger
-/// (plan: Storage).
+/// .
 /// `--db` overrides the path; otherwise `TOKER_DB` and the config default
 /// apply (Config::load already layered env over file).
 pub fn import(

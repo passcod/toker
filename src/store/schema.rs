@@ -22,11 +22,11 @@ use rusqlite::Connection;
 pub(super) const MIGRATIONS: &[&str] = &[
     // v1 — initial schema: the requests ledger, state tables, and meta.
     r#"
-    -- requests: the insert-only ledger, one row per request (plan: Storage).
+    --requests: the insert-only ledger, one row per request.
     -- kind IS NULL marks a real API measurement; every other kind is
-    -- proxy-written (invariant 3: proxy rows are never API measurements).
-    -- No content columns — digests, counts, lengths only (invariant 1).
-    -- Absence is stored as NULL, never as a default (invariant 3); ts_ms is
+    -- proxy-written (spec: STORE#not-recorded-is-not-zero: proxy rows are never API measurements).
+    -- No content columns — digests, counts, lengths only (spec: SEC#no-prompt-or-completion-content-is-recorded).
+    -- Absence is stored as NULL, never as a default (spec: STORE#not-recorded-is-not-zero); ts_ms is
     -- the only required column besides the rowid.
     CREATE TABLE requests (
         id                  INTEGER PRIMARY KEY,
@@ -95,10 +95,9 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX requests_ts_ms_idx ON requests (ts_ms);
     CREATE INDEX requests_session_id_idx ON requests (session_id);
 
-    -- State tables (plan: "State as tables"): small, read-modify-write
+    --State tables: small, read-modify-write
     -- data, upserted by the caller. Lanes are keyed by the composite
-    -- "sessionId|toolsHash" (plan: Lane tracking; the 30-day prune is the
-    -- caller's job, not the schema's).
+    --"sessionId|toolsHash".
     CREATE TABLE lanes (
         key           TEXT PRIMARY KEY,
         session_id    TEXT,
@@ -120,7 +119,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
 
     -- Allowances opened against a quota window, keyed by reset value so a
     -- new window starts clean while old rows self-expire at load time
-    -- (plan: allowances keyed by reset value, self-expiring).
+    --.
     CREATE TABLE allowances (
         session_id  TEXT NOT NULL,
         meter       TEXT NOT NULL,
@@ -128,7 +127,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (session_id, meter, reset_value)
     );
 
-    -- Ping runs: one insert per `claude -p` probe (plan: ping windows).
+    --Ping runs: one insert per `claude -p` probe.
     CREATE TABLE pings (
         id          INTEGER PRIMARY KEY,
         ts_ms       INTEGER NOT NULL,
@@ -138,7 +137,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     );
 
     -- Last meter snapshot, single row: every response updates it when the
-    -- backend has meters (plan: Server core). The JSON shape is
+    --backend has meters. The JSON shape is
     -- meter-source-dependent (anthropic sub today, codex maybe later), so
     -- it is stored whole rather than in typed columns.
     CREATE TABLE meters_state (

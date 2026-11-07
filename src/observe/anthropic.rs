@@ -19,7 +19,7 @@
 //! total is present with no split at all, the same rule applies: the whole
 //! write charges to 1h, split unknown.
 //!
-//! Invariant 3 (absence ≠ zero): every bucket is `Option`. An absent field
+//! spec: STORE#not-recorded-is-not-zero (absence ≠ zero): every bucket is `Option`. An absent field
 //! and an explicit `null` are `None`, never `0`; a present `0` is a real
 //! `0`. The [`UsagePresence`] map records which metrics the response
 //! actually carried, so a reader can tell a reported zero from an
@@ -31,11 +31,11 @@
 //! ledger needs while presence stays `false`: a value without presence is
 //! an estimate, not a measurement.
 //!
-//! Invariant 1 (no content stored): text deltas, tool-input fragments,
+//! spec: SEC#no-prompt-or-completion-content-is-recorded (no content stored): text deltas, tool-input fragments,
 //! and content blocks are parsed past and dropped; the capture keeps
 //! model, stop reason, speed/geo, the error pair, and token counts only.
 //!
-//! Invariant 6 (accounting must never break a session): every path here is
+//! spec: GATE#only-a-gate-stops-a-session (accounting must never break a session): every path here is
 //! infallible. Malformed JSON, non-JSON events, and invalid UTF-8 are
 //! skipped as unobservable. [`AnthropicObserver::finish`] returns `None`
 //! when nothing usage-bearing or error-bearing was seen — a client hangup
@@ -128,7 +128,7 @@ pub fn measurement(value: Option<u64>, reported: bool) -> Measurement {
 
 /// What one Anthropic response's observation captured: the folded usage
 /// buckets plus the response facts the row needs. All optional fields are
-/// absent when absent, never zero (invariant 3).
+/// absent when absent, never zero (spec: STORE#not-recorded-is-not-zero).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AnthropicCapture {
     model: Option<String>,
@@ -288,7 +288,7 @@ impl AnthropicCapture {
 /// [`AnthropicObserver::finish`].
 ///
 /// One observer per response. Every observe method is infallible: input
-/// the observer cannot understand is skipped as unobservable (invariant 6)
+/// the observer cannot understand is skipped as unobservable (spec: GATE#only-a-gate-stops-a-session)
 /// — a lost measurement, never a lost response. The start and delta usage
 /// objects latch whole (later `message_delta` events replace earlier ones,
 /// since `output_tokens` arrives cumulative); the fold happens once, at
@@ -375,7 +375,7 @@ impl AnthropicObserver {
 
     /// The shared latch path over one JSON document's text.
     fn observe_text(&mut self, text: &str) {
-        // Invariant 6: malformed JSON is unobservable, never an error.
+        // spec: GATE#only-a-gate-stops-a-session: malformed JSON is unobservable, never an error.
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(capture.input(), Some(4));
         assert_eq!(capture.output(), Some(65));
         assert_eq!(capture.reasoning(), Some(22));
-        // Invariant 1: neither the text nor the tool-input fragments (the
+        // spec: SEC#no-prompt-or-completion-content-is-recorded: neither the text nor the tool-input fragments (the
         // content the stream carried) surface anywhere in the capture.
         let debug = format!("{capture:?}");
         assert!(!debug.contains("Wellington"));
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(capture.output(), Some(1), "provisional start output");
         assert_eq!(capture.stop_reason(), None);
         assert!(!capture.message_stop_observed());
-        // Invariant 1 again: the partial reply text is not in the capture.
+        // spec: SEC#no-prompt-or-completion-content-is-recorded again: the partial reply text is not in the capture.
         assert!(!debug_has(&capture, "Searching"));
     }
 
@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(capture.input(), None);
 
         // Bodies the observer cannot read lose the measurement, never the
-        // response (invariant 6).
+        // response (spec: GATE#only-a-gate-stops-a-session).
         let mut observer = AnthropicObserver::new();
         observer.observe_json(&[0xff, 0xfe]);
         observer.observe_json(b"not json at all");

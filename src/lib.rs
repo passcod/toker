@@ -1,6 +1,6 @@
 //! toker — unified local proxy toolsuite: the library crate.
 //!
-//! The implemented design is documented under docs/internals/. Three layers:
+//! The requirements are in `.workhorse/specs/`. Three layers:
 //! frontend protocol adapters ([proto]) → middleware chain ([middleware]) →
 //! backend providers ([providers]), with [ir] as the canonical request model
 //! they share,

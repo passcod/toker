@@ -10,8 +10,8 @@
 //!   kinds never conflated ([`CostKind`]); see the `ledger` submodule.
 //! - State (lanes, learned models, allowances, pings, last meters, meta)
 //!   lives in read-modify-write tables; see the `state` submodule.
-//! - No content is ever stored (invariant 1): digests, counts, lengths only.
-//! - Absence ≠ zero (invariant 3): every non-key column is nullable and the
+//! - No content is ever stored (spec: SEC#no-prompt-or-completion-content-is-recorded): digests, counts, lengths only.
+//! - Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): every non-key column is nullable and the
 //!   row model uses `Option` throughout — `None` round-trips as NULL, never
 //!   as `0` or `""`.
 //!
@@ -81,7 +81,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// `$XDG_DATA_HOME/toker/toker.db`, falling back to
-/// `~/.local/share/toker/toker.db` when XDG is unset (plan: Storage).
+/// `~/.local/share/toker/toker.db` when XDG is unset.
 /// Callers may pass any path to [`Store::open`] instead.
 pub fn default_db_path() -> Result<PathBuf> {
     let data_home = match env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
@@ -1128,7 +1128,7 @@ mod tests {
         got.id = None;
         assert_eq!(got, row, "absence stays absence on every column");
 
-        // Spot-check the invariant 3 property where a silent zero would be
+        // Spot-check the spec: STORE#not-recorded-is-not-zero property where a silent zero would be
         // most damaging: a measurement the provider did not report.
         assert_eq!(got.input, None);
         assert_eq!(got.cost_usd, None);
@@ -1320,7 +1320,7 @@ mod tests {
             "oldest first, boundary inclusive"
         );
         // The gate-only rows keep their absence: no snapshot was
-        // invented for them (invariant 3).
+        // invented for them (spec: STORE#not-recorded-is-not-zero).
         assert_eq!(rows[0].rate_limits, None);
         assert_eq!(rows[0].gate_on, Some(false));
         assert_eq!(rows[1].rate_limits, Some(json!({"util5h": 0.4})));

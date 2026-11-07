@@ -6,7 +6,7 @@
 //! The keys are the ledger's own column names (`cache_read`, not ctp's
 //! `cacheRead`). The export is a view of the ledger, so it uses the
 //! ledger's vocabulary: a key means exactly what the column means in
-//! `docs/internals/ledger-schema.md`, and a query written against the
+//! the ledger, and a query written against the
 //! export reads the same against the SQL. Renaming to ctp's camelCase
 //! would make the rows look like ctp's while meaning toker's, which is
 //! worse than looking different: an imported row and a ctp row would
@@ -17,7 +17,7 @@
 //! [`Store::for_each_export`](crate::store::Store::for_each_export) for
 //! the value rules, and the one derived key, `ts`).
 //!
-//! Content and credentials: the ledger holds neither (invariants 1 and
+//! Content and credentials: the ledger holds neither (spec: SEC#no-prompt-or-completion-content-is-recorded and
 //! 2), and the export adds nothing that is not a column. `usage_raw` is
 //! exported because it is the provider's `usage` object, counts and
 //! costs only; the recorders store that object and nothing around it.

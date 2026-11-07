@@ -1,6 +1,6 @@
 //! toker — unified local proxy toolsuite: the binary/CLI surface.
 //!
-//! The implemented design is documented under docs/internals/. Three layers:
+//! The requirements are in `.workhorse/specs/`. Three layers:
 //! frontend protocol adapters ([`toker::proto`]) → middleware chain
 //! ([`toker::middleware`]) → backend providers ([`toker::providers`]), with
 //! [`toker::ir`] as the canonical request model they share, [`toker::store`] as the SQLite
@@ -26,7 +26,7 @@ struct Cli {
 /// invoked by the systemd wake/hold/ping timer units (see [cmds]).
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the proxy server (plan: Server core).
+    /// Run the proxy server.
     Serve,
     /// Mark a served backend model eligible for policy-managed upgrades.
     Promote {
@@ -60,7 +60,7 @@ enum Command {
         #[arg(long = "now", conflicts_with = "max_wait")]
         now: bool,
     },
-    /// Run the ratatui dashboard (plan: TUI).
+    /// Run the ratatui dashboard.
     Tui {
         /// Dashboard window length in minutes. Default 60: the
         /// anthropic cache's longest TTL is one hour, so the window
@@ -77,9 +77,9 @@ enum Command {
         #[arg(long = "db", value_name = "PATH")]
         db: Option<PathBuf>,
     },
-    /// Run the interactive setup wizard (plan: Setup wizard).
+    /// Run the interactive setup wizard.
     Setup,
-    /// Show configuration and backend status (plan: Credentials).
+    /// Show configuration and backend status.
     Status,
     /// Claude Code's `/model` rows for openrouter models.
     Picker {
@@ -95,7 +95,7 @@ enum Command {
         /// Ledger path; TOKER_DB env or the config default when omitted.
         #[arg(long = "db", value_name = "PATH")]
         db: Option<PathBuf>,
-        /// Cost semantics for imported costUsd (plan: Storage); the
+        /// Cost semantics for imported costUsd; the
         /// predecessor priced
         /// at list rates on a subscription, so plan-equivalent is the
         /// default and api-era logs want `estimated`.
@@ -154,7 +154,7 @@ enum Command {
     },
 
     /// A documented no-op: wake is owned by the systemd system timer
-    /// (plan: Sleep lock, wake, ping). The predecessor's one-shot
+    /// . The predecessor's one-shot
     /// `pmset` arm was macOS-only.
     #[command(hide = true)]
     WakeArm,
@@ -169,7 +169,7 @@ enum Command {
     },
     /// Open a ping quota window with one tiny client request (the ping
     /// timers' verb); refuses a slot more than 10 minutes past its
-    /// fire time (plan: Sleep lock, wake, ping).
+    /// fire time.
     #[command(hide = true)]
     PingWindow {
         /// The slot whose window this ping opens, `hh:mm`.

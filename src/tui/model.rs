@@ -1,7 +1,7 @@
 //! The dashboard's aggregation model: display rows in, snapshot out.
 //!
 //! Pure over [`DisplayRow`]s — the store's narrow display-window
-//! projection (invariant 7), no terminal types, no clocks, no store —
+//! projection (spec: GQUOTA#fitting-a-weight), no terminal types, no clocks, no store —
 //! so every panel number is testable against synthetic row sets. The
 //! loop in the parent module owns time and I/O; [`aggregate`] receives
 //! `now_ms`, the window length, the meter lookback (a superset of the
@@ -9,7 +9,7 @@
 //! and the local day's start as data, and the quota section is
 //! [super::quota]'s aggregation of that lookback.
 //!
-//! Invariant 3 (absence ≠ zero) is the design rule here: a NULL column is
+//! spec: STORE#not-recorded-is-not-zero (absence ≠ zero) is the design rule here: a NULL column is
 //! never read as zero. Sums that would need a missing operand stay `None`
 //! (`input + cache_read` needs both present), a session's model stays
 //! `None` until a row actually reports one, the billed total stays
@@ -85,13 +85,13 @@ pub(crate) struct Snapshot {
     /// attempt) is an `error` or a `route-unavailable`. A failure a fallback
     /// recovered from is in `errors` and not here.
     pub failed_requests: usize,
-    /// `kind = fidelity-drift` rows in the window (invariant 5: drift is a
+    /// `kind = fidelity-drift` rows in the window (spec: WCANON#rendering: drift is a
     /// visible metric, not a hoped-for absence).
     pub drift: usize,
     /// The rate & quota section, from the meter lookback (rows beyond
     /// the display window — a burn needs a span a display window cannot
     /// provide). `None` when no row carries a meter snapshot: the panel
-    /// renders nothing, never zeros (invariant 3's per-backend rule).
+    /// renders nothing, never zeros (spec: STORE#not-recorded-is-not-zero's per-backend rule).
     pub quota: Option<QuotaAgg>,
 }
 
@@ -193,7 +193,7 @@ pub(crate) struct SessionAgg {
     pub ctx: ContextWindow,
     /// The display session's name from its transcript (see [super::labels]).
     /// A linked child reads the explicit parent's label, never its own raw
-    /// lane id; this is read-only at view time and never stored (invariant 1).
+    /// lane id; this is read-only at view time and never stored (spec: SEC#no-prompt-or-completion-content-is-recorded).
     /// `None` makes the view fall back to the display session id.
     pub label: Option<Label>,
     /// The main lane's newest row timestamp (epoch ms) — the idle clock

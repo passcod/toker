@@ -1,4 +1,4 @@
-//! Wire-preserving IR corpus tests (plan: Invariants 4 and 5).
+//! Wire-preserving IR corpus tests.
 //!
 //! - [`fixtures_corpus_round_trips_byte_exactly`] and
 //!   [`generated_bodies_round_trip_byte_exactly`]:

@@ -8,7 +8,7 @@
 //! Keep identities exact. A future model that happens to share a family
 //! name is not evidence that it inherited an earlier version's context
 //! ceiling: unknown stays `Unknown` rather than confidently wrong
-//! (invariant 3). `phases` describe time-bounded request metadata that
+//! (spec: STORE#not-recorded-is-not-zero). `phases` describe time-bounded request metadata that
 //! selected a different limit for historical rows; they are source
 //! capability, not persisted observation data.
 

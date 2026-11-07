@@ -1,0 +1,92 @@
+---
+id: ROUTE
+---
+
+# Routing
+
+Routing decides which provider serves a request and on which model.
+This spec covers the topology every routing decision is made over, and the terms the rest of the family shares.
+
+The protocols a client speaks are specified by [FRONT](../frontend/overview.md), and the document that decides a route by [RDOC](document.md).
+
+There MUST be no router other than the active revision of the routing policy.
+A change to the policy MUST reach live traffic by activation, without restarting the service.
+
+## Providers
+
+A provider is a configured upstream account, its credential and its endpoint.
+
+| provider | upstream |
+| --- | --- |
+| `anthropic_sub` | Anthropic, on a Claude subscription |
+| `anthropic_api` | Anthropic, on an API key |
+| `openrouter` | OpenRouter |
+| `openai_api` | OpenAI directly |
+| `codex_sub` | ChatGPT, on a codex subscription |
+
+A provider is enabled by the presence of its `[providers.<name>]` block in the configuration file, and is disabled by its absence.
+Configuration is specified by [DCONF](../service/config.md).
+
+A backend adapter renders a canonical request onto a provider's wire and interprets what comes back.
+Several providers MAY share one adapter, and one provider MAY be served by several adapters.
+
+## Dialects
+
+A dialect is a provider's concrete rendering and interpretation rules within a protocol.
+
+| dialect | protocol |
+| --- | --- |
+| `anthropic_messages` | `anthropic` |
+| `openrouter_messages` | `anthropic` |
+| `openai_chat_completions` | `openai_chat` |
+| `openrouter_chat_completions` | `openai_chat` |
+| `codex_responses` | `openai_responses` |
+| `openrouter_responses` | `openai_responses` |
+
+A dialect MUST NOT be inferred from a protocol.
+A renderer MUST select its rendering and interpretation rules from the binding's dialect alone.
+
+## Bindings
+
+A binding declares that one provider serves one protocol in one dialect.
+A binding MUST carry:
+
+| member | meaning |
+| --- | --- |
+| provider | the provider this binding reaches |
+| protocol | the protocol a client speaks to reach it |
+| dialect | the rendering and interpretation rules to use |
+| cost class | which of the cost kinds its rows carry |
+| cache domain | the prompt cache its requests share, where it has one |
+| capabilities | the semantics it can represent, each as supported, unsupported or unknown |
+| administrative operations | whether it serves token counting, and whether it serves batches |
+
+A binding MUST be a declaration verified against the provider.
+A binding MUST NOT be inferred from an endpoint's spelling.
+The set of bindings is fixed topology and MUST NOT depend on configuration or on policy.
+
+A capability MUST be read from the binding that will serve the request.
+A frontend MUST NOT decide at parse time which semantics a provider will refuse.
+
+
+## Frontend scope
+
+A frontend scope is a protocol, or a frontend profile together with a protocol.
+
+A profile entry MUST take precedence over a protocol entry of the same kind.
+
+## Naming a binding
+
+A binding is named by its provider and dialect together.
+
+Renaming one MUST be treated as a migration rather than a change of display.
+
+## The compiled policy
+
+Compilation closes a validated document against the route topology and one immutable offer inventory, and the result MUST be immutable.
+
+A document MUST NOT carry an inventory winner.
+A winner MUST be looked up when the policy is compiled, for a presentation, or when a request is resolved, for a candidate selector.
+
+> [!NOTE]
+> The same revision then follows the catalogue instead of freezing a model list at the moment it was authored.

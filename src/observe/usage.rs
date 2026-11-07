@@ -5,12 +5,12 @@
 //! one response — plus the whole body on the non-streaming path — and
 //! finishes with the [`UsageCapture`] the ledger row needs.
 //!
-//! Latching (plan: Server core): `id`, `model`, and `provider` latch from
+//! Latching: `id`, `model`, and `provider` latch from
 //! every chunk that carries them, so earlier chunks are the fallback and
 //! the final usage-bearing chunk wins when it repeats them. The `usage`
 //! object latches wholesale from the final chunk that bears one — an
 //! earlier snapshot is never mixed into a later one, since a blend of two
-//! snapshots would fabricate a measurement (invariant 3).
+//! snapshots would fabricate a measurement (spec: STORE#not-recorded-is-not-zero).
 //!
 //! Verbatim capture: `usage_raw` and `cost_details` hold the original
 //! data-line bytes of those objects — borrowed out of the event text via
@@ -20,7 +20,7 @@
 //! read through the `arbitrary_precision` Value, so `cost` keeps the
 //! provider's literal precision on its way to f64.
 //!
-//! Invariant 3 (absence ≠ zero): every field below is `Option`. An absent
+//! spec: STORE#not-recorded-is-not-zero (absence ≠ zero): every field below is `Option`. An absent
 //! field and an explicit `null` both land as `None` and are never
 //! fabricated as `0`; a present `0` is a real `0`. The `total_tokens` and
 //! `cost_details` siblings the ledger does not model are not latched at
@@ -50,9 +50,9 @@ struct CostDetailsText<'a> {
 }
 
 /// What one response's usage observation captured: exactly the fields the
-/// ledger row needs, all optional, no content (invariant 1).
+/// ledger row needs, all optional, no content (spec: SEC#no-prompt-or-completion-content-is-recorded).
 ///
-/// Absence semantics (invariant 3): every accessor returns `None` for an
+/// Absence semantics (spec: STORE#not-recorded-is-not-zero): every accessor returns `None` for an
 /// absent field *and* for an explicit `null` — the two are not
 /// distinguished, and neither is ever reported as `0`. A present `0` is a
 /// real `0` and comes back as `Some(0)`.
@@ -151,7 +151,7 @@ impl UsageCapture {
 ///
 /// One observer per response. Every `observe_*` method is infallible:
 /// input the observer cannot understand is skipped as unobservable
-/// (invariant 6) — a lost measurement, never a lost response.
+/// (spec: GATE#only-a-gate-stops-a-session) — a lost measurement, never a lost response.
 #[derive(Debug, Default)]
 pub struct UsageObserver {
     capture: UsageCapture,
@@ -199,7 +199,7 @@ impl UsageObserver {
     /// The shared latch path over one JSON document's text (an event's
     /// joined data, or a non-streaming body).
     fn observe_text(&mut self, text: &str) {
-        // Invariant 6: malformed JSON is unobservable, never an error.
+        // spec: GATE#only-a-gate-stops-a-session: malformed JSON is unobservable, never an error.
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -230,7 +230,7 @@ impl UsageObserver {
 
         // The whole usage latch is replaced, not merged: fields the final
         // usage-bearing object omits reset to None rather than surviving
-        // from an earlier snapshot (invariant 3 — a blend of snapshots
+        // from an earlier snapshot (spec: STORE#not-recorded-is-not-zero — a blend of snapshots
         // would fabricate a measurement).
         self.capture.prompt_tokens = u64_at(usage, "prompt_tokens");
         self.capture.completion_tokens = u64_at(usage, "completion_tokens");
@@ -323,7 +323,7 @@ mod tests {
             ))
         );
 
-        // Invariant 1: the deltas' content never surfaces anywhere in the
+        // spec: SEC#no-prompt-or-completion-content-is-recorded: the deltas' content never surfaces anywhere in the
         // capture.
         assert!(!format!("{capture:?}").contains("Hello"));
     }
@@ -462,7 +462,7 @@ mod tests {
     fn later_usage_replaces_earlier_usage_wholesale() {
         // The interim usage has cached_tokens; the final one does not.
         // The final object replaces the latch wholesale — cached_tokens
-        // resets to None rather than blending snapshots (invariant 3).
+        // resets to None rather than blending snapshots (spec: STORE#not-recorded-is-not-zero).
         let stream = concat!(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":9},\"cost\":0.5}}\n\n",
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20}}\n\n",
@@ -534,7 +534,7 @@ mod tests {
         );
 
         // Bodies the observer cannot read lose the measurement, never the
-        // response (invariant 6): invalid UTF-8 and non-JSON are skipped.
+        // response (spec: GATE#only-a-gate-stops-a-session): invalid UTF-8 and non-JSON are skipped.
         let mut observer = UsageObserver::new();
         observer.observe_json(&[0xff, 0xfe]);
         observer.observe_json(b"not json at all");

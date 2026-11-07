@@ -1,9 +1,8 @@
 //! `toker.toml` writing — the wizard's config half: read-merge, change,
 //! rewrite, all atomic.
 //!
-//! **The decision this module implements** (plan: "Setup wizard" — "No
-//! config files written by hand unless wanted; `toker.toml` exists for
-//! hand-editing later"): the wizard writes the file toker fully
+//! **The decision this module implements**: the wizard writes the file toker
+//! fully
 //! understands. [`Config::load_from`](crate::config::Config::load_from)
 //! reads and **validates** the existing file first, the wizard's chosen
 //! changes are applied to that resolved `Config`, and the whole config

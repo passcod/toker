@@ -195,7 +195,7 @@ impl ModelMap {
     /// canonical `model:<id>` / `family:<name>` form — the shape the
     /// config's `[providers.<id>.model_map]` tables serialise back to
     /// (the write side of the wire mapping, see
-    /// `crate::config::Config::to_file`). Deterministic, per invariant 4.
+    /// `crate::config::Config::to_file`). Deterministic, per spec: WCANON#rendering.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
         self.exact
             .values()

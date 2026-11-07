@@ -3,7 +3,7 @@
 //!
 //! Not a correctness gate — a re-run of the steady-state CPU story
 //! after the display tick's read was narrowed to the ten-column
-//! projection (invariant 7): the loop must spend its 2 s ticks mostly
+//! projection (spec: GQUOTA#fitting-a-weight): the loop must spend its 2 s ticks mostly
 //! blocked on the event poll, never spinning. The pre-fix quota-tick
 //! spin measured 80% of a core; the quota fix took steady state to
 //! ~1.4%. This probe pins that the display tick holds that line even

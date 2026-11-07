@@ -21,7 +21,7 @@
 //! crosses exactly as the wire said it.
 //!
 //! [`from_anthropic`] is pure: a function of `body` only. The same
-//! body always produces the same canonical, forever (invariant 4) —
+//! body always produces the same canonical, forever (spec: WCANON#rendering) —
 //! and the error-selection order is fixed: messages, then system,
 //! then tools, then tool choice, then thinking, the order the pair
 //! module read them in (see [`tool_choice_of`] for the one
@@ -34,7 +34,7 @@
 //! block is open (thinking or text, at which index), the next block
 //! index, whether the turn ended. Everything it emits is a pure
 //! function of the events it has been fed and the model echo — no
-//! clock, no counters, nothing else (invariant 4). Claude Code's
+//! clock, no counters, nothing else (spec: WCANON#rendering). Claude Code's
 //! event names, exactly: `message_start`, `content_block_start`,
 //! `content_block_delta`, `content_block_stop`, `message_delta`,
 //! `message_stop`, `error` — no `ping` (claude tolerates its absence;
@@ -941,7 +941,7 @@ impl AnthropicRenderer {
 
     /// Feed one canonical turn event; every Anthropic SSE event it
     /// produced, in anthropic event order. Never fails — an event
-    /// with no anthropic shape produces nothing (invariant 6).
+    /// with no anthropic shape produces nothing (spec: GATE#only-a-gate-stops-a-session).
     pub fn feed(&mut self, event: &CanonEvent) -> Vec<SseEvent> {
         if self.ended {
             return Vec::new();
@@ -1246,7 +1246,7 @@ fn stop_reason_of(reason: &CanonStopReason) -> &'static str {
 }
 
 /// The canonical usage buckets → the anthropic field names (the usage
-/// table). Absent stays absent (invariant 3); reasoning tokens ride
+/// table). Absent stays absent (spec: STORE#not-recorded-is-not-zero); reasoning tokens ride
 /// inside `output_tokens` on both protocols and are not broken out
 /// (the pair module's translation note).
 fn usage_json(usage: &CanonicalUsage) -> Value {
@@ -2700,7 +2700,7 @@ mod tests {
     #[test]
     fn the_canonical_usage_renders_the_anthropic_fields_in_order() {
         // The buckets → the anthropic field names, in the table's
-        // order; absent stays absent (invariant 3); the reasoning
+        // order; absent stays absent (spec: STORE#not-recorded-is-not-zero); the reasoning
         // bucket rides inside output_tokens and is never broken out.
         let usage = CanonicalUsage {
             input: Some(1234),

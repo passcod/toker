@@ -1,4 +1,4 @@
-//! Native rendering for gate notices (see docs/internals/notices.md). A
+//! Native rendering for gate notices. A
 //! blocked request is
 //! answered with a synthetic assistant turn, and the client renders that
 //! turn's text however it renders any assistant text — so a frontend with
@@ -16,7 +16,7 @@
 //! [`NoticeLevel::Warning`], decided where each notice is written.
 //!
 //! [`render`] is a pure function of (style, level, content), like every
-//! byte the gate emits (invariant 8 in AGENTS.md): a
+//! byte the gate emits (spec: GNOTE#a-notice-is-byte-stable): a
 //! rendered notice enters replayed history, and the block's width is
 //! FROZEN for exactly that reason — a width that varied with anything
 //! (the content, the terminal, the version) would invalidate cache
@@ -34,7 +34,7 @@ pub const TOKER_LINK: &str = "[toker](https://github.com/passcod/toker)";
 /// insight lines as inline code — the backticks are what make this one
 /// look like those rather than like a line of prose dashes.
 ///
-/// The width is FROZEN for byte-stability (invariant 4): the block
+/// The width is FROZEN for byte-stability (spec: WCANON#rendering): the block
 /// enters replayed history, and a width that varied with anything would
 /// invalidate cache prefixes / replay. Do not compute it, trim it, or
 /// fit it to content — it is a constant, byte-pinned by the tests below.
@@ -134,7 +134,7 @@ impl serde::Serialize for NoticeStyle {
 
 /// Render `content` in the style at the level. Pure: the same (style,
 /// level, content) renders the same bytes on every call, forever
-/// (invariant 4 — a gate notice enters replayed history).
+/// (spec: GNOTE#a-notice-is-byte-stable — a gate notice enters replayed history).
 ///
 /// Multi-line content passes through verbatim between the block's header
 /// and footer, and line by line under the alert prefixes.
@@ -188,7 +188,7 @@ mod tests {
     fn the_block_constants_are_frozen_at_50_columns_in_backticks() {
         // The exact strings, pinned — and their widths, stated: 8 columns
         // of label ("★ Toker ") + 42 of dashes = 50 inside the backticks;
-        // the footer is 50 of dashes. FROZEN (invariant 4): the block
+        // the footer is 50 of dashes. FROZEN (spec: WCANON#rendering): the block
         // enters replayed history, so a width that varied with anything
         // would invalidate cache prefixes / replay.
         assert_eq!(
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn render_is_pure() {
-        // Invariant 4: same (style, level, content) → same bytes, every
+        // spec: WCANON#rendering: same (style, level, content) → same bytes, every
         // call.
         for _ in 0..3 {
             for style in STYLES {

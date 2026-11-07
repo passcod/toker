@@ -215,7 +215,7 @@ fn tools_shape_matches_the_reference_name_extraction_and_join() {
 
 #[test]
 fn batches_body_shapes_without_a_top_level_messages() {
-    // Absence ≠ zero (invariant 3): the params-nested messages must not
+    // Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): the params-nested messages must not
     // be read, and the shape must still extract.
     assert_eq!(
         shape_of("04_batches.json"),

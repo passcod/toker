@@ -1,4 +1,4 @@
-//! The wake/hold/ping timer subsystem (plan: "Sleep lock, wake, ping")
+//! The wake/hold/ping timer subsystem
 //! — the last parity gap with the predecessor proxy, as its Linux
 //! shapes. The pieces:
 //!

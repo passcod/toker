@@ -309,7 +309,7 @@ pub struct FunctionTool {
 
 // ── usage ────────────────────────────────────────────────────────────
 
-/// The usage object of `response.completed` (invariant 3: the detail
+/// The usage object of `response.completed` (spec: STORE#not-recorded-is-not-zero: the detail
 /// fields are `Option` — an absent or `null` detail is `None`, never a
 /// fabricated `0`).
 ///
@@ -743,7 +743,7 @@ mod tests {
             Some(96)
         );
 
-        // Explicit null details — not zero, never fabricated (invariant 3).
+        // Explicit null details — not zero, never fabricated (spec: STORE#not-recorded-is-not-zero).
         let usage: Usage = serde_json::from_value(json!({
             "input_tokens": 10,
             "input_tokens_details": null,

@@ -12,7 +12,7 @@
 //! - **Cost is always catalog-priced** ([`crate::catalog::price`] over the
 //!   normalised response model, fast mode from `usage.speed`, the
 //!   US-geo 1.1× multiplier from `usage.inference_geo`) — with the kind
-//!   carrying the semantics per backend (plan: Storage): `estimated` for
+//!   carrying the semantics per backend: `estimated` for
 //!   anthropic_api (the API bills it), `plan_equivalent` for anthropic_sub
 //!   (list-price "what the plan is worth" — never billed). An unknown
 //!   model prices to NULL with a one-time warning per model,
@@ -33,8 +33,8 @@
 //!   flags, stored as a JSON array; `None` when the header is absent —
 //!   absent ≠ empty.
 //!
-//! The clock feeds row fields only — never bytes (invariant 4) — and
-//! store errors lose the row, never the request (invariant 6).
+//! The clock feeds row fields only — never bytes (spec: WCANON#rendering) — and
+//! store errors lose the row, never the request (spec: GATE#only-a-gate-stops-a-session).
 //!
 //! [`record`]: super::record
 //! [`UsageCapture`]: crate::observe::UsageCapture
@@ -68,11 +68,11 @@ use super::record::{elapsed_ms, i64_of, now_ms, persist_lane_pin, with_frontend}
 pub(crate) struct AnthropicRecordCtx {
     /// The server (for the store).
     pub(crate) server: Server,
-    /// Request start, for `duration_ms` — the only clock use (invariant 4).
+    /// Request start, for `duration_ms` — the only clock use (spec: WCANON#rendering).
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (invariant 2).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub(crate) session_id: Option<String>,
     /// Verified frontend-derived lineage; never inferred from backend routing.
     pub(crate) lineage: Option<SessionLineage>,
@@ -98,7 +98,7 @@ pub(crate) struct AnthropicRecordCtx {
     /// The content-free request shape ([`AnthropicShape`]).
     pub(crate) shape: Option<AnthropicShape>,
     /// The request carried the ping header: its lane is recorded but
-    /// excluded from liveness (plan: Ping tagging).
+    /// excluded from liveness.
     pub(crate) ping: bool,
     /// The compaction retarget's provenance, when it rewrote this request:
     /// the models moved between, and whether
@@ -208,7 +208,7 @@ pub(crate) fn record_anthropic_measurement(
     ctx.server.evaluate_awake();
 }
 
-/// Record a non-2xx anthropic usage-path response (plan: Server core): an
+/// Record a non-2xx anthropic usage-path response: an
 /// error row with status, the error pair, retry-after, and the response's
 /// own `rate_limits` — never priced, no usage buckets. The meters ride the row
 /// because a failure carries no usage but is the only evidence of
@@ -263,7 +263,7 @@ fn frontend_protocol_of(ctx: &AnthropicRecordCtx) -> &'static str {
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 3) — it is logged as the visible breakage it is.
+/// (spec: STORE#not-recorded-is-not-zero) — it is logged as the visible breakage it is.
 fn insert(ctx: &AnthropicRecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
@@ -308,7 +308,7 @@ pub(super) fn persist_successful_pin(ctx: &AnthropicRecordCtx, ts_ms: i64) {
 /// prefix, however it was billed this time. The TTL tier comes from where
 /// the writes actually landed, sticky across the lane ([`lanes::lane_ttl`]).
 ///
-/// Accounting must never break a session (invariant 6): a store error here
+/// Accounting must never break a session (spec: GATE#only-a-gate-stops-a-session): a store error here
 /// is logged and lost — the measurement row is already in.
 fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_ms: i64) {
     // The held total: fresh input + cache read + cache writes, missing
@@ -370,12 +370,12 @@ fn note_lane_and_model(ctx: &AnthropicRecordCtx, capture: &AnthropicCapture, ts_
     }
 }
 
-/// The cost kind the backend's semantics pick (plan: Storage): the same
+/// The cost kind the backend's semantics pick: the same
 /// list-price arithmetic, different meaning — the API bills it, the
 /// subscription never does. `None` for openrouter: the catalogue prices
 /// Anthropic's own API, not openrouter's providers or the other labs'
 /// models it serves there, so an estimate from it would be a guessed
-/// price (invariant 5). Its rows carry the `usage.cost` openrouter
+/// price (spec: WCANON#rendering). Its rows carry the `usage.cost` openrouter
 /// bills, or no cost when it reports none.
 fn cost_kind_of(backend_id: &str) -> Option<CostKind> {
     match backend_id {
@@ -429,7 +429,7 @@ fn warn_unpriced_once(model: &str) {
 
 /// A ladder column: JSON array of digests. `None` when there are no rungs
 /// — an empty ladder localises nothing, and absence stays absence
-/// (invariant 3).
+/// (spec: STORE#not-recorded-is-not-zero).
 fn ladder_json(rungs: &[String]) -> Option<String> {
     (!rungs.is_empty()).then(|| json!(rungs).to_string())
 }
@@ -591,7 +591,7 @@ fn shape_ladders<'a>(
     shape.filter(|_| system.is_none_or(|system| system.keep_ladders))
 }
 
-/// The error row (plan: non-2xx on a usage path): status, the error pair,
+/// The error row: status, the error pair,
 /// retry-after, and the response's own meters; never priced, no usage
 /// (see the module docs for why the meters stay). The request's shape is not
 /// re-measured on the way
@@ -747,7 +747,7 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (invariant 2).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached (the gate's own).
     pub(crate) backend_id: &'a str,
@@ -758,7 +758,7 @@ pub(crate) struct QuotaBlockedRecord<'a> {
     /// When that meter's window resets, epoch seconds.
     pub(crate) resets_at: Option<i64>,
     /// The session's largest-lane prompt, when the lane table knows it —
-    /// a count or `None`, never content (invariant 1).
+    /// a count or `None`, never content (spec: SEC#no-prompt-or-completion-content-is-recorded).
     pub(crate) context_tokens: Option<u64>,
     /// The snapshot the block was decided on — the stale copy.
     pub(crate) stale_meters: Option<&'a Value>,
@@ -1022,7 +1022,7 @@ pub(crate) struct ColdRecord<'a> {
     pub(crate) started: Instant,
     /// The frontend path, for the per-request log line.
     pub(crate) path: &'static str,
-    /// Session identity, read by header name only (invariant 2).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The backend the request would have reached.
     pub(crate) backend_id: &'a str,
@@ -1176,7 +1176,7 @@ pub(crate) fn record_anthropic_cold_quiet(record: ColdRecord<'_>) {
 
 /// Parse the error pair from a buffered non-2xx body via the observer
 /// (its JSON path latches `error.type`/`error.message`); a body it cannot
-/// read loses the detail, never the request (invariant 6).
+/// read loses the detail, never the request (spec: GATE#only-a-gate-stops-a-session).
 pub(crate) fn error_pair(body: &[u8]) -> (Option<String>, Option<String>) {
     let mut observer = crate::observe::AnthropicObserver::new();
     observer.observe_json(body);
@@ -1242,7 +1242,7 @@ pub(crate) fn record_responses_measurement(
     };
 
     // The presence map: which metrics the usage object actually carried
-    // (invariant 3 — reported zero ≠ absent).
+    // (spec: STORE#not-recorded-is-not-zero — reported zero ≠ absent).
     let mut presence = serde_json::Map::new();
     if usage.is_some() {
         presence.insert("input".to_owned(), json!(true));

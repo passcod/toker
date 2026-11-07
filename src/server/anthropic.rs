@@ -1,4 +1,4 @@
-//! The Anthropic Messages frontend (plan: frontend adapters).
+//! The Anthropic Messages frontend.
 //!
 //! Routes, all served by the anthropic backends ([`crate::providers`]):
 //!
@@ -216,10 +216,10 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
     let (parts, body) = request.into_parts();
 
     // Session identity and betas, read by name only — request headers are
-    // never captured wholesale: they carry credentials (invariant 2).
+    // never captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     let session_id = session_id(&server.config.session_header_names, &parts.headers);
     let betas = request_betas(&parts.headers);
-    // Ping tagging (plan: Middleware): a lane whose request carried the
+    // Ping tagging: a lane whose request carried the
     // ping header is recorded but excluded from liveness — the window
     // pinger's probe must never hold the sleep lock.
     let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
@@ -770,7 +770,7 @@ async fn usage_path(server: Server, request: Request, path: &'static str) -> Res
             // backend and regardless of the gate's toggle, because the
             // marker rule is a frozen public API and a toggled strip would
             // change the cached prefix of every conversation carrying a
-            // marker (invariant 4; the marker rule's own contract). Record
+            // marker (spec: WCANON#rendering; the marker rule's own contract). Record
             // nothing for the strip itself: the released row is the
             // user-visible event, and the strip is the API's own rule.
             let pre_strip = ir.serialise();
@@ -1650,7 +1650,7 @@ fn cold_idle_ms(gates: &GatesConfig) -> Option<i64> {
 /// be sent, as policy resolved it, which is the identity the upstream
 /// bills. Only a POSITIVE verdict
 /// exempts; unknown — no catalogue, no entry, a pricing-less entry —
-/// never does (invariant 3: a gate fires on ignorance).
+/// never does (spec: STORE#not-recorded-is-not-zero: a gate fires on ignorance).
 fn writes_free_of(server: &Server, backend: &dyn Provider, model: Option<&str>) -> bool {
     let Some(model) = model.filter(|model| !model.is_empty()) else {
         return false;
@@ -1752,10 +1752,10 @@ async fn transparent_to(server: Server, request: Request, target: ModelTarget) -
 
 /// The `anthropic-beta` request header, split into its flags:
 /// a comma-separated list of feature flags and nothing
-/// else, read by name only (invariant 2). Worth recording because flags
+/// else, read by name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed). Worth recording because flags
 /// change what a request costs and how it is bounded. `None` when the
 /// header is absent — absent ≠ empty; a present-but-empty header is a
-/// real empty list. Invariant 1: the flags are fixed feature names
+/// real empty list. spec: SEC#no-prompt-or-completion-content-is-recorded: the flags are fixed feature names
 /// (`fast-mode-…`, `context-1m-…`), not content.
 fn request_betas(headers: &HeaderMap) -> Option<serde_json::Value> {
     let raw = headers.get_all("anthropic-beta");
@@ -2255,7 +2255,7 @@ async fn forward_administrative_response(
 /// The SSE response stream with the anthropic observation riding alongside:
 /// bytes pass through verbatim, each chunk *also* feeds the
 /// splitter/observer. Observation is a side effect that can never fail the
-/// stream (invariant 6): the observe APIs are infallible by construction,
+/// stream (spec: GATE#only-a-gate-stops-a-session): the observe APIs are infallible by construction,
 /// and the calls additionally run under [`std::panic::catch_unwind`] so no
 /// observation bug can take a live session down — the measurement is lost,
 /// not the response. A dropped body (client hangup) aborts the upstream
@@ -2339,7 +2339,7 @@ impl Stream for AnthropicObservedStream {
             std::task::Poll::Ready(None) => {
                 // Natural completion: flush the splitter's tail, finish the
                 // observation, record. Recording failures log, never
-                // propagate (invariant 6).
+                // propagate (spec: GATE#only-a-gate-stops-a-session).
                 if let Some(ctx) = this.ctx.take() {
                     let splitter = &mut this.splitter;
                     let observer = &mut this.observer;
@@ -2376,7 +2376,7 @@ impl Drop for AnthropicObservedStream {
     }
 }
 
-/// Feed one chunk to the side observation, panic-guarded (invariant 6:
+/// Feed one chunk to the side observation, panic-guarded (spec: GATE#only-a-gate-stops-a-session:
 /// accounting must never break a session — a lost measurement is the worst
 /// outcome, never a lost response).
 fn observe_chunk(splitter: &mut SseSplitter, observer: &mut AnthropicObserver, chunk: &[u8]) {

@@ -1,6 +1,4 @@
-//! The lane table: per `sessionId|toolsHash` cache state (plan: Middleware —
-//! "Lane tracking + sleep lock"; the lane rule,
-//! as the predecessor proxy's internal docs stated it).
+//! The lane table: per `sessionId|toolsHash` cache state.
 //!
 //! **A session is not a cache entry.** One session interleaves the main
 //! agent, its subagents, and small utility calls, each with its own cached
@@ -41,7 +39,7 @@
 //! schema fixed — and `600_000` = the openai lane's provider window,
 //! openrouter's sticky session).
 //!
-//! Absence ≠ zero (invariant 3): `prompt_tokens` and `ttl` are `None` until
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): `prompt_tokens` and `ttl` are `None` until
 //! a lane has been observed carrying them, and `ping` is `Some(true)` only
 //! for a ping lane — never `Some(false)`.
 
@@ -84,7 +82,7 @@ pub const OPENAI_LANE_TTL_MS: i64 = 600_000;
 /// "Ping tagging — marks ping lanes so they never hold the sleep lock";
 /// the predecessor's header was `x-ctp-ping`, read by name like every
 /// request header —
-/// invariant 2). Setup can rename it via config.
+/// spec: SEC#a-credential-is-never-logged-stored-or-displayed). Setup can rename it via config.
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
 
 /// The cache TTL tier a lane's cached prefix survives on (the two
@@ -201,7 +199,7 @@ pub fn lane_ttl(prev: Option<Ttl>, write_5m: u64, write_1h: u64) -> Option<Ttl> 
 
 /// Does this request carry the ping header?
 /// (`"<ping header>" === "1"`, read by name only: request headers are
-/// never captured wholesale, they carry credentials — invariant 2.) The
+/// never captured wholesale, they carry credentials — spec: SEC#a-credential-is-never-logged-stored-or-displayed.) The
 /// exact literal `"1"` is the frozen wire form, kept verbatim.
 pub fn is_ping(headers: &HeaderMap, name: &str) -> bool {
     headers

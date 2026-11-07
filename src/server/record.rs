@@ -20,16 +20,16 @@
 //! - `cache_read = cached_tokens`, `reasoning = reasoning_tokens` —
 //!   unclamped in the join, unclamped here.
 //!
-//! Absence ≠ zero (invariant 3): a bucket derived from an absent source
+//! Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): a bucket derived from an absent source
 //! metric stays `None` (input needs `prompt_tokens`, output needs
 //! `completion_tokens`); a bucket that *is* its source metric (cache_read,
 //! reasoning) is absent when the metric is. Which metrics the provider
 //! actually reported lands in `usage_presence`.
 //!
 //! The clock ([`now_ms`], [`RecordCtx::started`]) feeds row fields only —
-//! ts and duration — never any byte decision (invariant 4).
+//! ts and duration — never any byte decision (spec: WCANON#rendering).
 //!
-//! The recording path must never fail a request (invariant 6): store
+//! The recording path must never fail a request (spec: GATE#only-a-gate-stops-a-session): store
 //! errors are logged and swallowed; the insert is a single-row local
 //! SQLite write, brief enough to run inline at stream completion.
 
@@ -68,9 +68,9 @@ pub(crate) struct RecordCtx {
     pub(crate) policy_routing: Option<PolicyRouteProvenance>,
     /// One successful attempt's already-decided lane-pin transition.
     pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
-    /// Request start, for `duration_ms` — the only clock use (invariant 4).
+    /// Request start, for `duration_ms` — the only clock use (spec: WCANON#rendering).
     pub(crate) started: Instant,
-    /// Session identity, read by header name only (invariant 2).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub(crate) session_id: Option<String>,
     /// The request carried the ping header: its lane is recorded but
     /// excluded from liveness (a ping lane never holds the sleep lock).
@@ -152,7 +152,7 @@ pub(crate) fn record_measurement(
         // verified sticky window. Other Chat bindings do not inherit that
         // provider-specific clock; they remain unlaned until their cache
         // semantics can be represented without guessing.
-        // Accounting must never break a session (invariant 6): a store
+        // Accounting must never break a session (spec: GATE#only-a-gate-stops-a-session): a store
         // error is logged and lost — the measurement row is already in.
         let buckets = token_buckets(capture);
         let held = buckets
@@ -777,7 +777,7 @@ pub(crate) struct ColdOpenaiRecord<'a> {
     pub(crate) server: &'a Server,
     /// Request start, for `duration_ms`.
     pub(crate) started: Instant,
-    /// Session identity, read by header name only (invariant 2).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The lane's tools-hash — the cold gate is a per-lane decision.
     pub(crate) tools_hash: Option<&'a str>,
@@ -896,7 +896,7 @@ pub(crate) fn record_awake(server: &Server, transition: &awake::AwakeTransition,
 }
 
 /// Insert one row; a store failure loses the row, never the request
-/// (invariant 3) — it is logged as the visible breakage it is.
+/// (spec: STORE#not-recorded-is-not-zero) — it is logged as the visible breakage it is.
 fn insert(ctx: &RecordCtx, row: RequestRow) {
     let row = with_frontend(row, ctx.frontend.as_deref());
     if let Err(error) = ctx.server.store.record_request(&row) {
@@ -1073,7 +1073,7 @@ fn measurement_row(
     }
 }
 
-/// The error row (plan: non-2xx on a usage path): status, error type, and
+/// The error row: status, error type, and
 /// retry-after; never priced, no usage. Deliberately lean — the request's
 /// shape is not re-measured on the way to a failure the provider already
 /// summarised.
@@ -1156,7 +1156,7 @@ fn error_row(
 /// The error type from a provider error body: the OpenAI/OpenRouter shape
 /// `{"error": {"type": …, "code": …}}` — `type` when present, else `code`
 /// (openrouter sends a numeric code, e.g. 401). `None` for anything the
-/// observer cannot understand (invariant 6: unparseable loses the detail,
+/// observer cannot understand (spec: GATE#only-a-gate-stops-a-session: unparseable loses the detail,
 /// not the request).
 pub(crate) fn parse_error_type(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn absent_source_metrics_keep_buckets_absent() {
-        // Absence ≠ zero (invariant 3): no prompt_tokens → no input, even
+        // Absence ≠ zero (spec: STORE#not-recorded-is-not-zero): no prompt_tokens → no input, even
         // with cached present; a present 0 is a real 0.
         let b = buckets(json!({
             "completion_tokens": 4,

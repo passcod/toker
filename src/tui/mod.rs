@@ -1,4 +1,4 @@
-//! Ratatui dashboard (plan: "TUI").
+//! Ratatui dashboard.
 //!
 //! A long-running terminal view over the SQLite ledger, ticking every
 //! second and re-reading only when the ledger changed — the replacement
@@ -13,7 +13,7 @@
 //!
 //! - [model]: narrow display rows in, dashboard snapshot out. No
 //!   terminal types — testable against synthetic [`crate::store::DisplayRow`]
-//!   sets alone (the store's display-window projection, invariant 7).
+//!   sets alone (the store's display-window projection, spec: GQUOTA#fitting-a-weight).
 //! - [labels]: session names from Claude Code's own transcripts — the
 //!   predecessor's transcript reader, ported. Read-only, tail-only,
 //!   newest-wins; a session
@@ -36,7 +36,7 @@
 //!   concurrently-writing daemon — WAL plus the store's busy timeout
 //!   already cover it (see `store` module docs).
 //!
-//! Invariant 3 (absence ≠ zero) runs through the whole dashboard: the
+//! spec: STORE#not-recorded-is-not-zero (absence ≠ zero) runs through the whole dashboard: the
 //! aggregation keeps `None` for anything the ledger does not know (no
 //! billed cost, unknown token counts) and the view renders those as
 //! explicit "no … data" / `?` strings, never as zero.
@@ -643,7 +643,7 @@ struct DisplayWindow {
 /// projection ([`Store::display_rows_since`]): the eighteen columns the
 /// aggregation consumes, no JSON parse per row — the full-row read
 /// this path used to pay cast 59 columns and parsed six JSON values
-/// per row (invariant 7). Errors propagate — with WAL and the store's
+/// per row (spec: GQUOTA#fitting-a-weight). Errors propagate — with WAL and the store's
 /// 5 s busy timeout a read failure is real trouble, not a blip worth
 /// hiding behind a stale frame.
 ///
@@ -745,7 +745,7 @@ impl DisplayWindow {
 /// atomic replace always moves it, and an untouched file is free. A
 /// file that vanishes or stops parsing leaves whatever was last loaded
 /// (a stale ceiling beats none); a source never seen simply stays
-/// absent — absence, never zeros (invariant 3).
+/// absent — absence, never zeros (spec: STORE#not-recorded-is-not-zero).
 struct ModelCaches {
     /// [`fetched::cache_dir`], or `None` when no data home resolves —
     /// every refresh is then a no-op.

@@ -1,5 +1,5 @@
 //! The translated route's prefix-stability property
-//! (docs/internals/routing.md): for a conversation that only
+//! for a conversation that only
 //! appends, the codex request reproduces byte-identically wherever the
 //! conversation did not change — even though the upstream bytes never
 //! existed in the frontend's wire format. 20 deterministic seeded
