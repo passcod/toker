@@ -10,7 +10,7 @@ This spec covers which providers that applies to, how a boundary is predicted, w
 ## Scope
 
 Pinging applies only to a provider that anchors a rate limit window to the request opening it.
-Among the providers [ROUTE](../routing.md#providers) specifies, the Anthropic subscription alone meters windows this way.
+Among the providers [ROUTE](../routing/overview.md#providers) specifies, the Anthropic subscription alone meters windows this way.
 
 Toker MUST NOT schedule a ping where no configured provider anchors a window to its opening request.
 

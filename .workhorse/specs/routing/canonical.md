@@ -6,7 +6,7 @@ id: CANON
 
 Toker parses every inference request into a canonical request and renders the outgoing body from it, rather than forwarding the client's bytes.
 This spec covers what rendering guarantees, which transformations may change a request's meaning, and how a body that cannot cross the canonical boundary is answered.
-Administrative paths keep the client's bytes instead, as [ROUTE](routing.md#administrative-paths) specifies.
+Administrative paths keep the client's bytes instead, as [ROUTE](administrative.md) specifies.
 
 ## Rendering
 
@@ -38,7 +38,7 @@ These are the only transformations that may change a canonical request's meaning
 
 Changing any other position of the body is a defect.
 
-Release markers are specified by [GQUOTA](gates/quota.md), compaction by [GCOMP](gates/compaction.md), and model selection by [RSOLV](policy/resolver.md#shaping-the-model).
+Release markers are specified by [GQUOTA](../gates/quota.md), compaction by [GCOMP](../gates/compaction.md), and model selection by [RSOLV](../policy/resolver.md#shaping-the-model).
 
 Stripping release markers MUST happen on every Messages request regardless of whether the gate is enabled.
 
@@ -54,7 +54,7 @@ Stripping a message's reasoning effort MUST leave any other content of that mess
 
 Removing a request's cache breakpoints requires a licence beyond the transformation that rewrites the body, and there are two.
 
-Toker MAY drop cache breakpoints where the model has changed, since a cache identity includes the model sent, as [SLANE](store/lanes.md#cache-identity) specifies, leaving none for the new model to lose.
+Toker MAY drop cache breakpoints where the model has changed, since a cache identity includes the model sent, as [SLANE](../store/lanes.md#cache-identity) specifies, leaving none for the new model to lose.
 Toker MAY drop cache breakpoints where the caller has asserted that the request's cache is already cold.
 Where neither holds, retargeting MUST leave the breakpoints in place.
 
@@ -94,7 +94,7 @@ A refusal of a request that asked to stream MUST be delivered in that protocol's
 A body that is not JSON cannot carry a stream preference, and MUST be refused with the protocol's plain error instead.
 
 A refusal before any attempt MUST leave an error row naming local preparation, carrying no attempt, provider, route or binding.
-Attempts and their rows are specified by [SATT](store/attempts.md).
+Attempts and their rows are specified by [SATT](../store/attempts.md).
 
 A malformed body MUST retain a wire-shaped view for the quota decision and for presenting the error, and MUST NOT have that view used for inference or for extracting the request's shape.
 

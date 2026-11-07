@@ -38,7 +38,7 @@ Toker MUST report which source supplies a credential and MUST NOT report the val
 
 A debug rendering of a credential-bearing value MUST redact it, as [DCONF](service/config.md#credentials) specifies.
 
-Toker MUST read request headers by name and MUST NOT capture them wholesale, as [ROUTE](routing.md#credentials) specifies.
+Toker MUST read request headers by name and MUST NOT capture them wholesale, as [ROUTE](routing/credentials.md) specifies.
 
 > [!NOTE]
 > Headers carry the client's bearer, so a wholesale capture puts it wherever the capture goes.
@@ -47,7 +47,7 @@ A credential Toker holds MUST live in the operating system's keyring, in an envi
 
 ## A credential reaches only the party it was meant for
 
-A credential a client supplied for one provider MUST be removed before the request reaches a different one, as [ROUTE](routing.md#credentials) specifies.
+A credential a client supplied for one provider MUST be removed before the request reaches a different one, as [ROUTE](routing/credentials.md) specifies.
 
 A provider that signs its own requests MUST strip whatever the client sent first.
 

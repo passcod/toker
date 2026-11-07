@@ -82,7 +82,7 @@ The plan MUST keep every stage distinctly, together with whether the client's ow
 A route with no surviving candidate MUST be answered as having no available route, carrying the trace.
 A revision with no default for the protocol MUST be answered as not configured, since no binding was ever a candidate.
 
-Both MUST leave a route-unavailable row, as [ROUTE](../routing.md#when-no-route-is-available) specifies.
+Both MUST leave a route-unavailable row, as [ROUTE](../routing/addressing.md#when-no-route-is-available) specifies.
 
 ## Resolving a single candidate
 

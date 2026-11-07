@@ -28,7 +28,7 @@ A provider MUST be enabled by the presence of its block and disabled by its abse
 
 The file MUST be parsed strictly, refusing a value it does not recognise rather than ignoring it.
 
-A notice style naming a profile outside the permitted character set MUST be refused when the file is read, as [ROUTE](../routing.md#frontend-profiles) requires.
+A notice style naming a profile outside the permitted character set MUST be refused when the file is read, as [ROUTE](../routing/addressing.md#frontend-profiles) requires.
 
 Where a setting may also be given by environment variable, naming both MUST be a configuration error rather than a silent precedence.
 
@@ -42,7 +42,7 @@ Toker MUST report which source supplies a credential and MUST NOT report its val
 
 A debug rendering of a credential-bearing value MUST redact it.
 
-Which credential reaches which provider is specified by [ROUTE](../routing.md#credentials).
+Which credential reaches which provider is specified by [ROUTE](../routing/credentials.md).
 
 ## State
 

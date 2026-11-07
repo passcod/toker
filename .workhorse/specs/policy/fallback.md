@@ -59,5 +59,5 @@ Fallback MUST NOT make a provider's encrypted reasoning portable.
 An affinity keeps such a request on its binding, which may leave nothing to fall to.
 
 The retry that renegotiates a refused thinking mode is not fallback.
-It is a second send to the same target within one attempt, as [CANON](../canonical.md#thinking-that-cannot-be-turned-off) specifies.
+It is a second send to the same target within one attempt, as [CANON](../routing/canonical.md#thinking-that-cannot-be-turned-off) specifies.
 

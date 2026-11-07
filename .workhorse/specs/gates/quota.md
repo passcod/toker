@@ -97,7 +97,7 @@ A release MUST be granted either by a marker the session sends or by the operato
 
 The markers are `$#$BURN$#$` and `$#$OVER$#$`.
 These strings are a published interface and MUST NOT change.
-They are stripped from every request, as [CANON](../canonical.md#licensed-transformations) requires.
+They are stripped from every request, as [CANON](../routing/canonical.md#licensed-transformations) requires.
 
 Where the operator grants a release directly, Toker MUST allow it ahead of exhaustion for the short window, and MUST allow it for the long window only once that window is exhausted.
 

@@ -40,12 +40,17 @@ Four destinations, decided per sentence rather than per file:
 .workhorse/specs/
 ├── overview.md          notation, external documents, terminology
 ├── security.md          the properties, each naming its upholding mechanism
-├── routing.md           protocols, providers, bindings, the /f/<name> prefix
-├── canonical.md         canonical rendering, what may alter a body
-├── translation.md       Messages <-> Responses, purity, prefix stability
+├── routing/
+│   ├── overview.md      protocols, providers, dialects, bindings
+│   ├── addressing.md    profiles, the /f/ prefix, model prefixes, no route
+│   ├── credentials.md   what is kept, removed and added on the wire
+│   ├── cost.md          meters per provider, and the cost kinds
+│   ├── administrative.md  model listings, token counting, batches
+│   ├── canonical.md     canonical rendering, what may alter a body
+│   └── translation.md   Messages <-> Responses, purity, prefix stability
 ├── gates/
 │   ├── overview.md      what may stop a request, and what feeds a gate
-│   ├── quota.md, cold.md, notices.md, compaction.md, forecasting.md, pinging.md
+│   └── quota.md, cold.md, notices.md, compaction.md, forecasting.md, pinging.md
 ├── policy/
 │   ├── overview.md      frontend scope, binding naming, the compiled policy
 │   ├── document.md      the collections, parsing, fingerprints, validity
@@ -53,12 +58,11 @@ Four destinations, decided per sentence rather than per file:
 │   ├── resolver.md      facts, lookup, the route walk, circuits
 │   ├── fallback.md      which failures fall back, and commitment
 │   ├── provenance.md    what a policy-routed row records
-│   ├── models.md        learning, election, upgrades, context fit
-│   └── publication.md   what each profile lists, generations, settings
+│   └── models.md, publication.md
 ├── store/
 │   ├── overview.md      what the store holds, migrations, absent values
 │   ├── ledger.md        row kinds, fields, eras, imported rows
-│   ├── lanes.md, attempts.md, lineage.md, migration.md
+│   └── lanes.md, attempts.md, lineage.md, migration.md
 ├── service/
 │   └── lifecycle.md, config.md, control.md
 ├── cli/
@@ -177,7 +181,7 @@ the whole project is a proxy.
 
 | Family | Prefix |
 | --- | --- |
-| What toker is | none |
+| What toker is, routing included | none |
 | Gates | `G` |
 | Routing policy | `R` |
 | The store | `S` |
@@ -188,9 +192,13 @@ the whole project is a proxy.
 | --- | --- |
 | `overview.md` | `TOK` |
 | `security.md` | `SEC` |
-| `routing.md` | `ROUTE` |
-| `canonical.md` | `CANON` |
-| `translation.md` | `TRANS` |
+| `routing/overview.md` | `ROUTE` |
+| `routing/addressing.md` | `ADDR` |
+| `routing/credentials.md` | `CRED` |
+| `routing/cost.md` | `COST` |
+| `routing/administrative.md` | `ADMIN` |
+| `routing/canonical.md` | `CANON` |
+| `routing/translation.md` | `TRANS` |
 | `gates/overview.md` | `GATE` |
 | `gates/quota.md` | `GQUOTA` |
 | `gates/cold.md` | `GCOLD` |

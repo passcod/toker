@@ -40,7 +40,7 @@ Where the target binding declares a semantic unsupported, the translation MUST r
 | sampling parameters | drop them |
 | another provider's reasoning blocks | drop them |
 
-Which semantics a binding can represent is declared by the binding, as [ROUTE](routing.md#bindings) specifies.
+Which semantics a binding can represent is declared by the binding, as [ROUTE](overview.md#bindings) specifies.
 
 ## Opaque replay
 
