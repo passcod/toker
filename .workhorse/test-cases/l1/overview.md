@@ -28,7 +28,7 @@ Scenarios that verify configuration lives in the store, is edited live from the 
 - [ ] Every command except setup refuses to run while a configuration file exists, naming setup (verifies spec: UCLI, DCONF)
 - [ ] The service refuses to start while a configuration file exists (verifies spec: DLIFE)
 - [ ] The refusal exits so the supervisor does not retry it (verifies spec: DLIFE)
-- [ ] The file is looked for where the environment names it, and otherwise in the user configuration directory (verifies spec: DCONF)
+- [x] The file is looked for where the environment names it, and otherwise in the user configuration directory (verifies spec: DCONF)
 
 ## Importing a file
 

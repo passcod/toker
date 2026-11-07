@@ -23,20 +23,22 @@ Each phase compiles and keeps the suite green.
 
 - [x] Migration appending `config_providers`, `config_settings`, `config_notices`
 - [x] `store::config` read and write for each table
-- [ ] `Config::from_store`, and the env resolution beside it
 - [x] State directory forced to owner-only on open
+- [x] `activate_revision_one_importing`, writing rows inside the revision-one transaction
 
 ### 2. The file becomes import-only
 
+- [x] `Config::from_store`, resolving the same view the file produced
+- [x] `PORT` and `TOKER_DB` resolve beside it, neither reachable from the store
 - [ ] Move the TOML types and parsing into their own module, reached only by setup's import
 - [ ] `Config::load` reads the store, not the file
 - [ ] `FileConfig::into_rows` for what the import writes
-- [ ] `TOKER_PORT` becomes `PORT`; drop `TOKER_UPSTREAM`, which the providers page now covers
+- [ ] Retire `TOKER_PORT` and `TOKER_UPSTREAM`, both still read on the file path
 
 ### 3. The gate
 
-- [ ] Every command except setup refuses while a configuration file exists
-- [ ] The service refuses the same way, exiting so the supervisor does not retry
+- [x] Every command except setup refuses while a configuration file exists
+- [x] The service refuses the same way, exiting so the supervisor does not retry
 
 ### 4. Live edits
 
@@ -74,3 +76,9 @@ Every command except setup refusing while it exists means no row can be edited b
 
 Endpoints stay configurable, subscription providers included, because Toker is itself a proxy and another may reasonably sit in front of it.
 Values that identify Toker to a provider do not, being facts about the provider rather than preferences.
+
+
+## Known gap
+
+A service unit written before `RestartPreventExitStatus` existed still restarts into the refusal.
+Systemd's own start limit bounds the loop, and setup rewrites the unit, so the window is "until setup is run" — which is the thing the refusal is telling the operator to do.
