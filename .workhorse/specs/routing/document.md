@@ -26,6 +26,13 @@ A policy holds eight collections.
 
 A collection scoped to a frontend follows the precedence [ROUTE](overview.md#frontend-scope) specifies, and names a binding as [ROUTE](overview.md#naming-a-binding) specifies.
 
+Every reference a collection makes MUST resolve within the document.
+
+A rewrite's priority MUST be unique within its scope.
+A default MUST be unique within its scope.
+
+A classifier and an upgrade policy that work together MUST name the same binding.
+
 ## Parsing
 
 The parser MUST refuse unknown fields, duplicate keys and non-integer numbers before typed parsing.
@@ -44,6 +51,21 @@ Labels, descriptions and the offer an inventory happens to select MUST NOT take 
 
 > [!NOTE]
 > A catalogue refresh must not change a route fingerprint, because lane pins carry it and every pinned lane would otherwise be invalidated whenever a provider published a model.
+
+## Routes and candidates
+
+A route declares its parameters, a first candidate, and steps that each pair an edge with the candidate it leads to.
+One parameter name is reserved for the model the client requested.
+
+Every reference to a route MUST supply one value for each declared parameter, being a literal, the requested model, or a capture from the matcher that selected the route.
+A capture MUST be supplied only by a rewrite whose matcher can produce one.
+
+A candidate's model MUST be an exact identifier, the requested model, a template over the route's parameters, or a selector that keeps exactly one winner.
+
+A candidate MAY declare an upgrade policy, an alias policy applied after the upgrade, the capabilities it requires, whether it is enabled, and the failures that open a circuit against it.
+
+A candidate's required capabilities MUST be within those its binding declares.
+A candidate's binding MUST be reachable from every scope the route is used in.
 
 ## Presentations
 
@@ -64,19 +86,7 @@ Validation compiles a draft against one captured inventory and returns diagnosti
 
 A diagnostic's path MUST be built only from static field names and bounded indices, so that a request or a model string can never appear in one.
 
-Validation MUST check each of these.
-
-| check |
-| --- |
-| every reference resolves |
-| route arguments match the declared parameters exactly |
-| a regex capture's source exists |
-| each candidate's binding is routable from the scope it is used in |
-| a classifier's binding and its upgrade policy's binding agree |
-| rewrite priorities are unique within a scope |
-| defaults are unique within a scope |
-| required capabilities are within the binding's declared capabilities |
-| shadowing a native model is consented to |
+Validation MUST report every requirement of this spec the document fails to meet.
 
 An error MUST block activation.
 

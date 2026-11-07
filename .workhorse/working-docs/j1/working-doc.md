@@ -294,6 +294,37 @@ stay as they are.
 Each was a correction to one sentence that turned out to be a rule about a
 class of them, and was swept across the corpus.
 
+### Do not enumerate what describes itself
+
+A parent that lists its children restates what each child already says, and
+grows every time one is added. The directory is the list.
+
+`RDOC`'s validation section named all nine checks it performs. One of them,
+that shadowing a native model is consented to, was already a MUST twelve lines
+above in the same spec, which is the proof: a check is a requirement stated
+where its subject is. The section now says validation reports every
+requirement of the spec the document fails to meet, and names none. New
+requirements are covered the day they are written.
+
+The checks that had no home only lacked one because the split dropped the
+routes-and-candidates section. Restored, it carries its own constraints: a
+route reference supplies a value per declared parameter, a candidate's required
+capabilities are within its binding's declared ones, and so on.
+
+`GATE` had a table of which sibling supplies what evidence, which is an index
+of its own folder, and which was redundant with "only a gate stops a session"
+at the top of the same spec. `STORE` enumerated the tables beside the ledger,
+when the point is that everything other than the ledger is read-modify-write.
+
+Enumerate only where the list is the requirement: where the order is
+load-bearing, where closing the set is the contract, or where nothing else
+describes the items. `RSOLV`'s content-free facts and `RPROV`'s row contents
+stay listed for that reason; `UCLI`'s commands stay because no spec describes
+them individually.
+
+This is the correction to the previous entry's fix. Turning a 465-character
+sentence into a table removed the long line and kept the enumeration.
+
 ### One sentence per line is not one sentence per paragraph
 
 Consecutive lines with no blank line between them are one paragraph in

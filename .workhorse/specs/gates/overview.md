@@ -46,13 +46,8 @@ A notice enters the conversation and is replayed on every later turn, so its byt
 
 ## Evidence a gate reads
 
-Three specs supply evidence rather than stopping anything themselves.
-
-| spec | supplies |
-| --- | --- |
-| [GCAST](forecasting.md) | when a meter runs out, and what a span cost |
-| [GCOMP](compaction.md) | whether a request is a compaction, and where a cold one is retargeted |
-| [GPING](pinging.md) | where a rate limit window's boundary falls |
+A gate decides from evidence produced elsewhere.
+A spec that supplies such evidence MUST NOT stop a request itself.
 
 ## Arming
 

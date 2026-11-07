@@ -11,8 +11,7 @@ This spec covers what it holds, how it is migrated, and the rules every one of i
 
 The store holds the ledger, being the append-only record of requests, which [SLEDGR](ledger.md) specifies.
 
-It also holds the lanes, the policy revisions and their publications, the learned models, the allowances, the ping runs and the meter snapshots.
-That state is read-modify-write and is not part of the ledger.
+Everything else the store holds is read-modify-write and is not part of the ledger.
 
 > [!NOTE]
 > Policy and configuration live in the store, not in the ledger.
