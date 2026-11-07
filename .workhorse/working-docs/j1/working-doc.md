@@ -263,24 +263,31 @@ mentions), AGENTS.md (20), the module doc comments, and any TUI display string.
 Binary names and paths in code, such as `reexec.rs`'s `toker` and `toker.new`,
 stay as they are.
 
-## Pilot
+## Rollout
 
-`overview.md` (`TOK`) and `routing.md` (`ROUTE`) are written, 195 lines for the
-pilot against 433 of internals prose. Awaiting sign-off on the voice before
-anything else is drafted.
+The pilot (`TOK`, `ROUTE`) was signed off on the voice. Ten of the 26 specs are
+written: the unprefixed core and the whole gates family.
 
-Carved out of internals' `routing.md` and left for their own specs: canonical
-rendering and the thinking-disabled retry (`CANON`), the codex and OpenRouter
-translation paths (`TRANS`), the drain-and-restart sequence (`DLIFE`), the
-`/model` picker (`RPUB`), and the live routing controls (`DCTRL`).
+Cut rather than carried, throughout: the ctp comparisons, the dated live-probe
+narratives (a probe is evidence for a capability claim, and the claim is what
+the spec states; the date belongs with the code's `VERIFIED_ON`), and the
+maintainer guidance about which optimisations not to attempt.
 
-Cut rather than carried: the ctp comparisons, the dated live-probe narratives
-(a probe is evidence for a capability claim, and the claim is what the spec
-states; the date belongs with the code's `VERIFIED_ON`), and the reasoning
-about why Claude Code's three picker mechanisms do not work.
+The glossary grows as each spec is written, since a term is defined by the spec
+that owns it.
 
-The glossary defines eleven terms so far. It grows as each spec is written,
-since a term is defined by the spec that owns it.
+### Note density
+
+The gates specs carry far more `> [!NOTE]` blocks than the core: `GCOLD` twelve
+in 135 lines against `ROUTE`'s one in 190. That is the source material rather
+than laxity. The gate topics are almost entirely a record of traps, and each
+note names the specific wrong implementation a reader would otherwise build.
+Worth a second opinion all the same, since the test is meant to be strict.
+
+Audited on conversion, two kinds were cut: a note restating the consequence of
+the requirement above it, and a note repeating a claim another spec owns.
+`GCOLD` lost a closing section that cross-referenced `GNOTE` and then restated
+`GNOTE`'s own past-tense requirement.
 
 ## Open questions
 
