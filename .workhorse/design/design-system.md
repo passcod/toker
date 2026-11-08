@@ -21,8 +21,9 @@ Read them before drawing anything; [mockups.md](mockups.md) says how.
 ## The ground
 
 Toker is developed against Ghostty with no theme override, so the reference ground is Ghostty's stock palette: `#282c34` background, `#ffffff` foreground, `faint-opacity = 0.5`, `minimum-contrast = 1`.
-The font is Iosevka, which is narrower per cell than most monospace faces.
-A mockup that does not name Iosevka misrepresents every width judgement, and width judgements are most of this layout's design.
+The font is Iosevka Term, which is narrower per cell than most monospace faces.
+A mockup that does not name it misrepresents every width judgement, and width judgements are most of this layout's design.
+The Term variant specifically: plain Iosevka leaves the arrows, the proportion bar's mark and the em dash at their natural two-cell width, which tears the grid in a browser though never in a terminal.
 
 The TUI sets no RGB colour anywhere.
 It uses the ANSI sixteen by name, so the actual pixels are whatever the operator's terminal theme says.
