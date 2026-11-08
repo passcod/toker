@@ -95,6 +95,12 @@ The dashboard MUST show the meters of each account that served traffic within it
 Meters MUST be laid out across the width available, showing as many accounts as fit.
 The accounts that do not fit MUST be reachable by cycling through them.
 
+One meter's readings MUST be comparable by eye across the accounts shown together.
+
+> [!NOTE]
+> Showing accounts side by side is for reading one window across them, which a reading drawn at a size answering to its own line's spare room rather than to the quantity defeats.
+> Which dimension carries the comparison is a design decision, recorded in [the design guide](../../design/design-system.md).
+
 Accounts MUST be ordered by how much of the window each served, the busiest first.
 
 That order MUST resist changing while two accounts are close, and MUST NOT be recomputed into a new order on every refresh.
