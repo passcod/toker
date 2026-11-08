@@ -10,7 +10,7 @@ A guide that has drifted is worse than none, because it is believed.
 - [x] The reference frame's text is character-for-character the 120×40 snapshot, once spans are stripped
 - [x] No frame names plain `Iosevka`, which advances the arrows, the proportion mark and the em dash by two cells each
 - [x] Every row of every frame advances the same number of *cells* in the family the stack selects, not merely the same number of characters
-- [ ] Both files render in a browser, every panel border meeting the content beside it, no row wrapping
+- [ ] Both files render in a browser with every row ending in the same column, and no row wrapping
 - [ ] The reference frame, viewed side by side with `toker tui` at 120×40, matches in colour as well as shape
 
 ## The guide matches the code
