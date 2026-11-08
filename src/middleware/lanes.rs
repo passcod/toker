@@ -82,7 +82,7 @@ pub const OPENAI_LANE_TTL_MS: i64 = 600_000;
 /// "Ping tagging — marks ping lanes so they never hold the sleep lock";
 /// the predecessor's header was `x-ctp-ping`, read by name like every
 /// request header —
-/// spec: SEC#a-credential-is-never-logged-stored-or-displayed). Setup can rename it via config.
+/// spec: SEC#a-credential-is-never-logged-or-displayed). Setup can rename it via config.
 pub const DEFAULT_PING_HEADER: &str = "x-toker-ping";
 
 /// The cache TTL tier a lane's cached prefix survives on (the two
@@ -199,7 +199,7 @@ pub fn lane_ttl(prev: Option<Ttl>, write_5m: u64, write_1h: u64) -> Option<Ttl> 
 
 /// Does this request carry the ping header?
 /// (`"<ping header>" === "1"`, read by name only: request headers are
-/// never captured wholesale, they carry credentials — spec: SEC#a-credential-is-never-logged-stored-or-displayed.) The
+/// never captured wholesale, they carry credentials — spec: SEC#a-credential-is-never-logged-or-displayed.) The
 /// exact literal `"1"` is the frozen wire form, kept verbatim.
 pub fn is_ping(headers: &HeaderMap, name: &str) -> bool {
     headers

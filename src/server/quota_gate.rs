@@ -23,7 +23,7 @@ pub(crate) struct QuotaBlock {
 }
 
 pub(crate) fn armed(server: &Server, backend_id: &str) -> bool {
-    server.config.gates.quota_enabled && backend_id == crate::release::GATED_BACKEND
+    server.config().gates.quota_enabled && backend_id == crate::release::GATED_BACKEND
 }
 
 pub(crate) fn load_meters(server: &Server, backend_id: &str) -> Option<Value> {
@@ -96,7 +96,7 @@ pub(crate) fn decide_block(
         plan_left,
         context_tokens,
         &jiff::tz::TimeZone::system(),
-        server.config.notices.style_for(frontend),
+        server.config().notices.style_for(frontend),
     );
     Some(QuotaBlock {
         text,

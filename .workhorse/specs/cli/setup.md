@@ -9,11 +9,13 @@ This spec covers the state it establishes before asking anything, the checks it 
 
 ## Before asking
 
+Setup MUST be the only command that may run while a configuration file exists.
+
 Setup MUST read the store read-only before it asks anything.
 
 A store that exists but cannot be read MUST stop setup before it changes anything, as [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together) requires.
 
-Setup MUST report the machine's current state, including whether its routing is owned by the store, before offering to change it.
+Setup MUST report the machine's current state, including whether a configuration file is present and whether its routing is owned by the store, before offering to change it.
 
 ## Verifying before patching
 
@@ -32,13 +34,19 @@ Setup MUST NOT point a client's base address at a listener that is not answering
 
 ## Writing
 
-Setup MUST replace the configuration file atomically.
+Setup MUST write configuration as store rows, and MUST NOT write a configuration file.
 
-Setup MUST write the file without routing fields, and MUST name any it dropped.
+Where a configuration file exists, setup MUST report what it read from that file before importing it.
 
-Where the operator keeps the configuration as it is, setup MUST leave the file byte for byte alone.
+The order in which setup writes the store and removes the file is specified by [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together).
 
-The order in which setup writes the store and the file is specified by [RMIG](../routing/migration.md#migrating-the-file-and-the-store-together).
+Setup MUST ask only what the dashboard cannot later change, and what the machine needs in order to serve.
+
+That is the listener port and the schedule slots, which reach the units rather than the store, and the providers the machine serves with where each one's credential comes from.
+
+> [!NOTE]
+> A setting the dashboard can change is a setting setup asking for is a second surface to keep agreeing with the first.
+> The port is not one of those: the socket unit is what listens, so a port the dashboard could change would disagree with the unit it was installed with.
 
 Where setup found an active listener on the configured port, it MUST replace the running instance by the path [DLIFE](../service/lifecycle.md#replacing-the-running-instance) specifies.
 
@@ -59,3 +67,10 @@ Setup MUST run the settings reconciliation once itself, through the unit the sch
 > Setup then exercises the sandboxed path rather than a path only it takes.
 
 Setup MUST retire the units of any schedule slot the operator dropped.
+
+## Handing off
+
+Setup MUST end by replacing itself with the dashboard.
+
+> [!NOTE]
+> The machine is serving by then, and everything still to configure is edited there, so the wizard ends at the next step rather than describing it.

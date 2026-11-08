@@ -43,7 +43,7 @@
 //! rename so a crash mid-write never leaves a half-written login for
 //! the CLI to trip over.
 //!
-//! spec: SEC#a-credential-is-never-logged-stored-or-displayed: token values never appear in logs or errors — the
+//! spec: SEC#a-credential-is-never-logged-or-displayed: token values never appear in logs or errors — the
 //! `Debug` impl below redacts by hand, and error messages carry status
 //! codes and paths only.
 
@@ -149,7 +149,7 @@ pub struct CodexAuth {
 
 impl std::fmt::Debug for CodexAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // spec: SEC#a-credential-is-never-logged-stored-or-displayed: token values never appear in Debug output.
+        // spec: SEC#a-credential-is-never-logged-or-displayed: token values never appear in Debug output.
         f.debug_struct("CodexAuth")
             .field("path", &self.path)
             .field("account_id", &self.account_id())
@@ -243,7 +243,7 @@ impl CodexAuth {
         &self.path
     }
 
-    /// The access token — the bearer. Never logged (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// The access token — the bearer. Never logged (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub fn access_token(&self) -> Option<&str> {
         self.tokens
             .as_ref()

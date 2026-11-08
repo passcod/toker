@@ -7,6 +7,17 @@ id: DLIFE
 Toker runs as a long-lived service behind a socket its supervisor holds.
 This spec covers how it starts, how it is replaced without cutting a response, and the lock it holds to keep a machine awake while sessions are live.
 
+## Starting
+
+Toker MUST refuse to start while a configuration file exists, as [DCONF](config.md#moving-a-machine-off-the-file) specifies.
+
+The supervisor MUST NOT retry that refusal.
+
+> [!NOTE]
+> Nothing can change while the operator has not run setup, so retrying only fills the journal.
+
+A stored setting Toker cannot use MUST NOT prevent it from starting, as [DCONF](config.md#configuration-never-refuses-a-start) requires.
+
 ## Binding
 
 Toker MUST bind loopback only.

@@ -9,21 +9,20 @@ This spec covers the seam between the two: how a machine whose routing was in it
 
 ## The routing fields
 
-The configuration file's contents are specified by [DCONF](../service/config.md#the-file).
-Enabling a provider stays there, being the one fact policy cannot supply.
+Enabling a provider is configuration, held in the store as [DCONF](../service/config.md#in-the-store) specifies, being the one fact policy cannot supply.
 
 > [!NOTE]
-> A revision may route to a provider the configuration has since switched off, and the candidate then answers that it is not configured, rather than the revision failing to load.
+> A revision may route to a provider that has since been switched off, and the candidate then answers that it is not configured, rather than the revision failing to load.
 
-A file carrying the routing fields of an earlier version MUST still load.
+A file carrying the routing fields of an earlier version MUST still parse.
 
 > [!NOTE]
-> A file written by an earlier version has to be readable by a later one.
+> Setup reads such a file to move a machine off it, and an import reads one deliberately, so those fields must still be understood long after nothing writes them.
 
 Nothing at request time MUST read those fields.
 They MUST be read only when the first revision is created, and when a file is imported deliberately.
 
-A file this version writes MUST NOT contain them, and a rewrite MUST name the fields it dropped.
+Toker MUST NOT write a configuration file.
 
 ## Ownership
 
@@ -93,28 +92,30 @@ A marker present without a pointer MUST refuse the transaction.
 > [!NOTE]
 > Nothing writes that state, and re-establishing from it would silently discard whatever produced it.
 
-Both the service at startup and the setup wizard MUST reach that transaction.
-Both the service at startup and the setup wizard MUST converge because the first writer wins and the other reads the revision it wrote.
+Both the service at startup and setup MUST reach that transaction, and MUST converge because the first writer wins and the other reads the revision it wrote.
 
 > [!NOTE]
-> A machine upgraded without running setup is then migrated by its first start.
+> A machine with no file to read establishes its first revision from the providers it has enabled, whichever of the two starts first.
 
-Both MUST validate the file's routing fields first.
+Where setup reads a file, it MUST validate that file's routing fields first.
 An ambiguous default, being several enabled bindings for one protocol with nothing naming one, MUST be an error naming the field, raised before anything is written.
 
 ## Migrating the file and the store together
 
-A machine not yet owned needs two stores changed that cannot share a transaction.
+A machine not yet owned needs its store and its file changed, and the two cannot share a transaction.
 The order MUST be:
 
 1. read the existing file and apply the operator's choices to it in memory
-2. activate the first revision in the store from that result
-3. atomically replace the file with one carrying no routing fields
+2. in one store transaction, write the configuration rows and activate the first revision from that result
+3. remove the file
 
-Activation MUST run after the choices are validated and before the file is replaced, so that a failure to validate or activate stops before anything is written.
+Activation MUST run after the choices are validated and before the file is removed, so that a failure to validate or activate stops before anything is written.
 
-An interruption between the second and third steps leaves an owned store and a file that still carries routing fields.
-That MUST be a consistent state needing no repair, because the service ignores those fields once a revision is active.
+An interruption between the second and third steps leaves an owned store and a file still in place.
+Running setup again MUST repair it, by importing the same values over themselves, as [DCONF](../service/config.md#moving-a-machine-off-the-file) specifies.
+
+> [!NOTE]
+> Nothing but setup runs while the file is there, so no row can have been edited between the transaction and the removal, and importing twice cannot overwrite a later choice.
 
 > [!NOTE]
 > The reverse order does not recover: a file rewritten first, with a crash before activation, leaves a machine with neither the old rules nor a revision, and the first revision would then be built from a file that no longer carries those rules.
@@ -130,15 +131,14 @@ A store that exists but cannot be read MUST stop setup before it changes anythin
 
 Setup MUST NOT replace or edit an active revision.
 
-It MUST report that routing is owned by the database and name the active revision.
+It MUST report that routing is owned by the store and name the active revision.
 It MUST NOT ask which binding is a protocol's default, that question having no effect.
-
-Where the operator keeps the configuration as it is, setup MUST leave the file byte for byte alone, routing fields included.
-Where the operator reconfigures, setup MUST rewrite the file without routing fields and name any it dropped.
 
 ## Importing a file deliberately
 
-An import MUST load the file as the service would, read its routing fields as input, generate a document of the same shape as the first revision, and replace the draft at the generation the caller holds.
+An import MUST name the file it reads, there being no configuration file to take by default.
+
+An import MUST load that file, read its routing fields as input, generate a document of the same shape as the first revision, and replace the draft at the generation the caller holds.
 
 An import MUST leave the active revision untouched.
 An import MUST leave the draft as it was where the file fails to load or compile.
@@ -146,8 +146,8 @@ An import MUST leave the draft as it was where the file fails to load or compile
 The result MUST be an ordinary draft, validated, previewed, edited and activated like any other.
 
 > [!NOTE]
-> Import is for a file that still carries routing.
-> A file setup has rewritten carries none, so importing it yields a document built from the enabled providers alone, which is the first revision for a fresh machine rather than the operator's edited policy.
+> Import is for a file that carries routing.
+> One that carries none yields a document built from the enabled providers alone, which is the first revision for a fresh machine rather than the operator's edited policy.
 
 ## Adopting rows written before ownership was recorded
 

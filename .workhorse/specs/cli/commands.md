@@ -13,6 +13,10 @@ Every flag MUST be parsed strictly, so that a mistyped flag fails rather than be
 
 A command taking a duration or a timestamp MUST parse it strictly and MUST reject a value it cannot interpret, rather than substitute a default.
 
+## Before anything runs
+
+Every command except `setup` MUST refuse to run while a configuration file exists.
+
 ## The commands
 
 | command | what it does |

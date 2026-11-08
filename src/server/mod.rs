@@ -348,12 +348,44 @@ fn upstream_client(idle: Duration) -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
+/// The live configuration, swapped under a write lock when an edit lands
+/// and read as an immutable snapshot by everything else.
+///
+/// An edit takes effect without a restart because the service is the only
+/// writer: it performs the row change and this swap in the same operation
+/// (spec: DCONF#editing). Shared across every `Server` clone, so a handler
+/// cloned before an edit still reads the configuration after it.
+#[derive(Debug)]
+pub(crate) struct ConfigCell(std::sync::RwLock<Arc<Config>>);
+
+impl ConfigCell {
+    fn new(config: Config) -> ConfigCell {
+        ConfigCell(std::sync::RwLock::new(Arc::new(config)))
+    }
+
+    fn get(&self) -> Arc<Config> {
+        Arc::clone(
+            &self
+                .0
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn replace(&self, config: Config) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(config);
+    }
+}
+
 /// The running proxy: config, ledger, upstream client, backend providers,
 /// and the learned model store, cloned cheaply into every request handler.
 #[derive(Clone)]
 pub struct Server {
     pub(crate) store: Arc<Store>,
-    pub(crate) config: Arc<Config>,
+    config: Arc<ConfigCell>,
     /// Binding-attributed observations and recently-sent targets: the
     /// learning evidence policy resolves against.
     pub(crate) binding_learning: Arc<crate::policy::BindingLearningView>,
@@ -564,6 +596,9 @@ impl Server {
                 &inventory,
                 publication_generation,
                 now_ms(),
+                // The service never imports: it refuses to start while a
+                // configuration file exists, so setup is the only importer.
+                None,
             )?,
         };
         let policy_runtime = Arc::new(crate::policy::PolicyRuntime::new(
@@ -580,7 +615,7 @@ impl Server {
         }
         Ok(Server {
             store,
-            config: Arc::new(config),
+            config: Arc::new(ConfigCell::new(config)),
             http,
             registry,
             codex_turn,
@@ -692,6 +727,18 @@ impl Server {
     /// Capture the active runtime policy and all evidence derived from one
     /// catalogue snapshot. Control handlers use this to compile, persist and
     /// swap a revision without mixing inventory generations.
+    /// The configuration as it stands, an immutable snapshot a request can
+    /// hold for its whole life without blocking an edit.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.get()
+    }
+
+    /// Adopt an edited configuration. Called by the control surface inside
+    /// the operation that wrote the row (spec: DCONF#editing).
+    pub(crate) fn replace_config(&self, config: Config) {
+        self.config.replace(config);
+    }
+
     pub(crate) fn routing_snapshot(&self) -> anyhow::Result<RoutingControlSnapshot> {
         let _control = self
             .routing_control
@@ -1653,8 +1700,8 @@ impl Server {
         let compaction_cold = compaction
             && crate::middleware::cold::lane_is_cold(
                 Some(lane),
-                self.config.gates.cold_min_tokens,
-                self.config
+                self.config().gates.cold_min_tokens,
+                self.config()
                     .gates
                     .cold_idle_min
                     .map(|minutes| (minutes * 60_000.0) as i64),
@@ -1789,6 +1836,14 @@ impl Server {
             .route("/_toker/status", get(control::status))
             .route("/_toker/session", get(control::session))
             .route("/_toker/shutdown", post(control::shutdown))
+            .route("/_toker/config/snapshot", any(control::config::snapshot))
+            .route("/_toker/config/provider", any(control::config::provider))
+            .route("/_toker/config/settings", any(control::config::settings))
+            .route("/_toker/config/notice", any(control::config::notice))
+            .route(
+                "/_toker/config/credential",
+                any(control::config::credential),
+            )
             .route("/_toker/routing/snapshot", any(control::routing::snapshot))
             .route("/_toker/routing/draft", any(control::routing::draft))
             .route(
@@ -1828,7 +1883,7 @@ impl Server {
                 std_listener.set_nonblocking(true)?;
                 tokio::net::TcpListener::from_std(std_listener)?
             }
-            None => tokio::net::TcpListener::bind(("127.0.0.1", self.config.port)).await?,
+            None => tokio::net::TcpListener::bind(("127.0.0.1", self.config().port)).await?,
         };
         let address = listener.local_addr()?;
         tracing::info!("toker listening on http://{address}");
@@ -3011,7 +3066,7 @@ api_key = "sk-test"
                  UPDATE routing_policy_state SET active_revision_id = 999 WHERE id = 1;",
             )
             .unwrap();
-        let config = (*server.config).clone();
+        let config = (*server.config()).clone();
         let store = server.store.clone();
         drop(server);
         let error = Server::with_seams(config, store, Seams::isolated())
@@ -3146,7 +3201,7 @@ api_key = "sk-test"
             Seams::isolated(),
         )
         .expect("scratch server builds");
-        crate::policy::legacy::document(&scratch.config, &scratch.registry)
+        crate::policy::legacy::document(&scratch.config(), &scratch.registry)
             .expect("legacy document")
     }
 
@@ -3362,7 +3417,7 @@ api_key = "sk-proj-test"
         forced_cache_transition: bool,
         model: &str,
     ) -> i64 {
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+        let mut document = crate::policy::legacy::document(&server.config(), &server.registry)
             .expect("legacy document");
         let route_id =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
@@ -3454,7 +3509,7 @@ api_key = "sk-proj-test"
         let snapshot = runtime.capture();
         let route_id =
             crate::policy::RouteId::new("legacy-route-openai_api-openai_chat_completions").unwrap();
-        let mut document = crate::policy::legacy::document(&server.config, &server.registry)
+        let mut document = crate::policy::legacy::document(&server.config(), &server.registry)
             .expect("legacy document");
         for default in &mut document.defaults {
             if matches!(

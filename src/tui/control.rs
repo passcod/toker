@@ -1,7 +1,10 @@
-//! Bounded, asynchronous access to the daemon's routing control surface.
+//! Bounded, asynchronous access to one of the daemon's control namespaces.
 //!
 //! The worker owns the HTTP client.  Terminal input only ever fills a tiny
 //! queue, so an unavailable or restarting daemon cannot stall redraws.
+//!
+//! One worker serves one namespace (`routing`, `config`), named when the
+//! client is built, so a page's commands can only reach its own endpoints.
 
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
@@ -21,31 +24,23 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A named control operation, kept with its reply so state can distinguish an
 /// old snapshot from a draft edit or confirmation action.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct Command {
-    pub(super) name: &'static str,
-    pub(super) method: Method,
-    pub(super) path: &'static str,
-    pub(super) control: &'static str,
-    pub(super) body: Option<Value>,
+pub(crate) struct Command {
+    pub(crate) name: &'static str,
+    pub(crate) method: Method,
+    pub(crate) path: &'static str,
+    pub(crate) control: &'static str,
+    pub(crate) body: Option<Value>,
 }
 
 impl Command {
-    pub(super) fn snapshot() -> Self {
+    /// A namespace's snapshot read. `control` is the operation header the
+    /// endpoint expects, which differs per namespace.
+    pub(crate) fn snapshot(control: &'static str) -> Self {
         Self {
             name: "snapshot",
             method: Method::GET,
             path: "snapshot",
-            control: "routing-snapshot",
-            body: None,
-        }
-    }
-
-    pub(super) fn revisions() -> Self {
-        Self {
-            name: "revisions",
-            method: Method::GET,
-            path: "revisions",
-            control: "routing-revisions",
+            control,
             body: None,
         }
     }
@@ -58,53 +53,57 @@ enum Request {
 
 /// HTTP status and JSON body returned by a routing control operation.
 #[derive(Debug)]
-pub(super) struct Response {
-    pub(super) status: u16,
-    pub(super) body: Value,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 /// A reply from the routing control endpoint.
 #[derive(Debug)]
-pub(super) enum Reply {
+pub(crate) enum Reply {
     Command(Command, Result<Response, String>),
 }
 
 /// Whether a reply is a successful activation or reactivation, after which
 /// the user's Claude settings should follow the new active policy.
-pub(super) fn activated(reply: &Reply) -> bool {
-    match reply {
-        Reply::Command(command, Ok(response)) => {
-            matches!(command.name, "activate" | "reactivate") && response.status / 100 == 2
-        }
-        Reply::Command(_, Err(_)) => false,
-    }
-}
-
-/// The terminal-side half of the routing control worker.
-pub(super) struct Client {
+/// The terminal-side half of one namespace's control worker.
+pub(crate) struct Client {
     requests: SyncSender<Request>,
     replies: Receiver<Reply>,
+    /// The operation header this namespace's snapshot read expects.
+    snapshot: &'static str,
 }
 
 impl Client {
     /// Start a worker against the configured loopback listener.
-    pub(super) fn new(port: u16) -> Client {
+    pub(crate) fn new(port: u16, namespace: &'static str, snapshot: &'static str) -> Client {
         let (requests, request_rx) = sync_channel(REQUEST_QUEUE);
         let (reply_tx, replies) = sync_channel(REPLY_QUEUE);
         thread::Builder::new()
-            .name("toker-routing-control".to_owned())
-            .spawn(move || worker(base_endpoint(port), request_rx, reply_tx))
-            .expect("spawn routing control worker");
-        Client { requests, replies }
+            .name(format!("toker-{namespace}-control"))
+            .spawn(move || {
+                worker(
+                    base_endpoint(port, namespace),
+                    snapshot,
+                    request_rx,
+                    reply_tx,
+                )
+            })
+            .expect("spawn the control worker");
+        Client {
+            requests,
+            replies,
+            snapshot,
+        }
     }
 
     /// Ask for a fresh snapshot without waiting for either queue.
-    pub(super) fn refresh(&self) -> bool {
-        self.send(Command::snapshot())
+    pub(crate) fn refresh(&self) -> bool {
+        self.send(Command::snapshot(self.snapshot))
     }
 
     /// Submit an operation without waiting for either queue.
-    pub(super) fn send(&self, command: Command) -> bool {
+    pub(crate) fn send(&self, command: Command) -> bool {
         match self.requests.try_send(Request::Run(command)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
@@ -112,26 +111,30 @@ impl Client {
     }
 
     /// Drain one reply, if the worker has one ready.
-    pub(super) fn poll(&self) -> Option<Reply> {
+    pub(crate) fn poll(&self) -> Option<Reply> {
         self.replies.try_recv().ok()
     }
 }
 
-fn base_endpoint(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/_toker/routing")
+fn base_endpoint(port: u16, namespace: &str) -> String {
+    format!("http://127.0.0.1:{port}/_toker/{namespace}")
 }
 
-fn worker(base: String, requests: Receiver<Request>, replies: SyncSender<Reply>) {
+fn worker(
+    base: String,
+    snapshot: &'static str,
+    requests: Receiver<Request>,
+    replies: SyncSender<Reply>,
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let command = Command::snapshot();
             let _ = replies.try_send(Reply::Command(
-                command,
-                Err(format!("routing worker unavailable ({error})")),
+                Command::snapshot(snapshot),
+                Err(format!("the control worker is unavailable ({error})")),
             ));
             return;
         }
@@ -139,10 +142,9 @@ fn worker(base: String, requests: Receiver<Request>, replies: SyncSender<Reply>)
     let client = match reqwest::Client::builder().build() {
         Ok(client) => client,
         Err(error) => {
-            let command = Command::snapshot();
             let _ = replies.try_send(Reply::Command(
-                command,
-                Err(format!("routing client unavailable ({error})")),
+                Command::snapshot(snapshot),
+                Err(format!("the control client is unavailable ({error})")),
             ));
             return;
         }
@@ -185,39 +187,21 @@ async fn request(
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Reply, Response, activated, base_endpoint};
+    use super::{Command, base_endpoint};
 
     #[test]
-    fn control_requests_are_pinned_to_loopback_and_their_verb() {
+    fn control_requests_are_pinned_to_loopback_and_their_namespace() {
         assert_eq!(
-            base_endpoint(18123),
+            base_endpoint(18123, "routing"),
             "http://127.0.0.1:18123/_toker/routing"
         );
-        assert_eq!(Command::snapshot().control, "routing-snapshot");
-        assert_eq!(Command::revisions().path, "revisions");
-    }
-
-    fn reply(name: &'static str, status: u16) -> Reply {
-        let mut command = Command::snapshot();
-        command.name = name;
-        Reply::Command(
-            command,
-            Ok(Response {
-                status,
-                body: serde_json::Value::Null,
-            }),
-        )
-    }
-
-    #[test]
-    fn only_a_successful_activation_triggers_the_settings_sync() {
-        assert!(activated(&reply("activate", 200)));
-        assert!(activated(&reply("reactivate", 200)));
-        assert!(!activated(&reply("activate", 409)));
-        assert!(!activated(&reply("draft-edit", 200)));
-        assert!(!activated(&Reply::Command(
-            Command::snapshot(),
-            Err("down".to_owned())
-        )));
+        assert_eq!(
+            base_endpoint(18123, "config"),
+            "http://127.0.0.1:18123/_toker/config"
+        );
+        assert_eq!(
+            Command::snapshot("config-snapshot").control,
+            "config-snapshot"
+        );
     }
 }

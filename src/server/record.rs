@@ -70,7 +70,7 @@ pub(crate) struct RecordCtx {
     pub(crate) pin_transition: Option<crate::policy::LaneTransitionDecision>,
     /// Request start, for `duration_ms` — the only clock use (spec: WCANON#rendering).
     pub(crate) started: Instant,
-    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub(crate) session_id: Option<String>,
     /// The request carried the ping header: its lane is recorded but
     /// excluded from liveness (a ping lane never holds the sleep lock).
@@ -777,7 +777,7 @@ pub(crate) struct ColdOpenaiRecord<'a> {
     pub(crate) server: &'a Server,
     /// Request start, for `duration_ms`.
     pub(crate) started: Instant,
-    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// Session identity, read by header name only (spec: SEC#a-credential-is-never-logged-or-displayed).
     pub(crate) session_id: Option<&'a str>,
     /// The lane's tools-hash — the cold gate is a per-lane decision.
     pub(crate) tools_hash: Option<&'a str>,

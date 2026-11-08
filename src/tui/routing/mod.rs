@@ -1,6 +1,5 @@
 //! Routing policy page with draft-led controls.
 
-mod client;
 mod detail;
 mod form;
 mod import;
@@ -9,11 +8,33 @@ mod reconcile;
 mod template;
 mod view;
 
-use client::{Client, Command};
+use crate::tui::control::{Client, Command, Reply};
 use crossterm::event::KeyEvent;
 use model::State;
 use reconcile::Reconciler;
 pub use reconcile::SettingsSync;
+
+/// The revision history read: independent data the page loads eagerly.
+fn revisions() -> Command {
+    Command {
+        name: "revisions",
+        method: reqwest::Method::GET,
+        path: "revisions",
+        control: "routing-revisions",
+        body: None,
+    }
+}
+
+/// Whether `reply` was an activation that landed, which is what makes the
+/// page reconcile a client's settings afterwards.
+fn activated(reply: &Reply) -> bool {
+    match reply {
+        Reply::Command(command, Ok(response)) => {
+            matches!(command.name, "activate" | "reactivate") && response.status / 100 == 2
+        }
+        Reply::Command(_, Err(_)) => false,
+    }
+}
 
 /// The keys the routing page acts on itself, outside a modal. The dashboard
 /// loop forwards exactly these, so a key the page handles but this list lacks
@@ -38,7 +59,7 @@ pub(super) struct Page {
 
 impl Page {
     pub(super) fn new(port: u16, settings: Option<SettingsSync>) -> Page {
-        let client = Client::new(port);
+        let client = Client::new(port, "routing", "routing-snapshot");
         let mut page = Page {
             client,
             reconciler: Reconciler::new(settings),
@@ -48,7 +69,7 @@ impl Page {
         page.refresh();
         // Revisions are independent data: load them eagerly, but never make an
         // unavailable new endpoint stop the established read-only snapshot.
-        page.send(Command::revisions());
+        page.send(revisions());
         page
     }
 
@@ -60,7 +81,7 @@ impl Page {
 
     pub(super) fn poll(&mut self) {
         while let Some(reply) = self.client.poll() {
-            let activated = client::activated(&reply);
+            let activated = activated(&reply);
             self.state.receive(reply);
             if activated && let Some(note) = self.reconciler.start() {
                 self.state.set_settings_note(note);
@@ -159,7 +180,32 @@ impl Page {
 mod tests {
     use crossterm::event::KeyCode;
 
-    use super::owns_key;
+    use super::{activated, owns_key};
+    use crate::tui::control::{Command, Reply, Response};
+
+    fn reply(name: &'static str, status: u16) -> Reply {
+        let mut command = Command::snapshot("routing-snapshot");
+        command.name = name;
+        Reply::Command(
+            command,
+            Ok(Response {
+                status,
+                body: serde_json::Value::Null,
+            }),
+        )
+    }
+
+    #[test]
+    fn only_a_successful_activation_triggers_the_settings_sync() {
+        assert!(activated(&reply("activate", 200)));
+        assert!(activated(&reply("reactivate", 200)));
+        assert!(!activated(&reply("activate", 409)));
+        assert!(!activated(&reply("draft-edit", 200)));
+        assert!(!activated(&Reply::Command(
+            Command::snapshot("routing-snapshot"),
+            Err("down".to_owned())
+        )));
+    }
 
     #[test]
     fn every_key_the_legend_documents_reaches_the_page() {

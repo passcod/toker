@@ -132,7 +132,7 @@ impl ReadyAttempt {
             self.backend.as_ref(),
             &self.parts,
             self.body.clone(),
-            &server.config.session_header_names,
+            &server.config().session_header_names,
             self.frontend.protocol(),
             "/v1/messages",
         )

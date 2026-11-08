@@ -53,7 +53,7 @@
 //! fresh curl) and the same parse functions run at load: a parse-rule
 //! fix applies to cached data with no migration.
 //!
-//! ## Auth per source (spec: SEC#a-credential-is-never-logged-stored-or-displayed)
+//! ## Auth per source (spec: SEC#a-credential-is-never-logged-or-displayed)
 //!
 //! - openrouter's `/models` is public — fetched with no credential.
 //! - anthropic's `/v1/models` requires auth. With an `anthropic_api`

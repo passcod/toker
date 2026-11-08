@@ -91,13 +91,13 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     let (parts, body) = request.into_parts();
 
     // Session identity, read by name only — request headers are never
-    // captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
-    let session_id = session_id(&server.config.session_header_names, &parts.headers);
+    // captured wholesale: they carry credentials (spec: SEC#a-credential-is-never-logged-or-displayed).
+    let session_id = session_id(&server.config().session_header_names, &parts.headers);
     // Ping tagging: a lane whose request carried the
     // ping header is recorded but excluded from liveness — the window
     // pinger's probe must never hold the sleep lock, on this path like
     // the anthropic one.
-    let ping = lanes::is_ping(&parts.headers, &server.config.ping_header_name);
+    let ping = lanes::is_ping(&parts.headers, &server.config().ping_header_name);
     // The frontend's name from its base-URL prefix: picks the notice's
     // style, nothing else.
     let frontend = super::frontend_of(&parts.extensions).map(str::to_owned);
@@ -391,9 +391,9 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
     // to direct OpenAI, Codex, or Anthropic would turn missing evidence into
     // a false cold notice. Binding-scoped lane state in the live-routing
     // plan generalises this once each binding has a supported clock.
-    let cold_armed = server.config.gates.cold_enabled && backend.id() == "openrouter";
+    let cold_armed = server.config().gates.cold_enabled && backend.id() == "openrouter";
     if cold_armed {
-        let gates = &server.config.gates;
+        let gates = &server.config().gates;
         let now = now_ms();
         // The openai lane's clock is openrouter's own: sticky sessions
         // expire after 10 minutes of inactivity — not the anthropic
@@ -472,7 +472,7 @@ pub(crate) async fn chat_completions(State(server): State<Server>, request: Requ
                     None,
                     now,
                     &jiff::tz::TimeZone::system(),
-                    server.config.notices.style_for(frontend.as_deref()),
+                    server.config().notices.style_for(frontend.as_deref()),
                 );
                 let body = cold::ColdBlocking::openai_turn(
                     &text,
@@ -1036,7 +1036,7 @@ pub(crate) fn chat_cross_record(ctx: RecordCtx, backend: Arc<dyn Provider>) -> A
 }
 
 /// The session identity from the configured header names, in priority
-/// order, read by name only (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// order, read by name only (spec: SEC#a-credential-is-never-logged-or-displayed).
 pub(crate) fn session_id(names: &[String], headers: &HeaderMap) -> Option<String> {
     for name in names {
         if let Some(value) = headers
@@ -1266,7 +1266,7 @@ pub(crate) fn error_response(
 /// The 502 for a request that never got an upstream response (a refused
 /// connection, the read timeout before the headers). The transport's own
 /// error names what failed; it carries the URL but no credential, which
-/// travels in headers (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// travels in headers (spec: SEC#a-credential-is-never-logged-or-displayed).
 pub(crate) fn transport_failure(wire: ErrorWire, error: &dyn std::fmt::Display) -> Response {
     upstream_failure(wire, &format!("toker upstream error: {error}"))
 }

@@ -25,10 +25,12 @@
 //! Migrations: the `schema` submodule holds a numbered, append-only list
 //! gated by `PRAGMA user_version` — no external migration files.
 
+mod config;
 mod ledger;
 mod schema;
 mod state;
 
+pub use config::{Configuration, ProviderConfigRow, SettingsConfigRow};
 pub use ledger::{
     AttemptGroupId, AttemptIndex, AttemptProvenance, AttemptReason, ChildRole, CostKind,
     DisplayRow, JSON_TEXT_COLUMNS, KindFilter, LaneSystemRow, LocalisationRow,
@@ -108,11 +110,19 @@ impl Store {
     /// on first open. `":memory:"` opens a private in-memory database — the
     /// tests rely on that, and the pragmas no-op gracefully there.
     pub fn open(path: impl AsRef<Path>) -> Result<Store> {
+        // The state directory, not just the database file: a credential
+        // literal written here passes through the -wal and -shm sidecars
+        // beside it, so closing the file alone would leave it readable
+        // (spec: DCONF#state). Enforced on every open rather than at setup,
+        // because a directory created before toker kept a credential in its
+        // store was made under the umask.
+
         let path = path.as_ref();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
+            close_state_dir(parent)?;
         }
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -447,6 +457,26 @@ impl Store {
         desired_inventory_generation: i64,
         publications: &[InitialPublication],
     ) -> Result<RevisionOneActivation> {
+        self.activate_revision_one_importing(
+            document,
+            activated_ms,
+            desired_inventory_generation,
+            publications,
+            None,
+        )
+    }
+
+    /// Activate revision one and import a configuration in the same
+    /// transaction, so a machine moving off its file does both or neither
+    /// (spec: RMIG#migrating-the-file-and-the-store-together).
+    pub fn activate_revision_one_importing(
+        &self,
+        document: &crate::policy::ValidatedPolicyDocument,
+        activated_ms: i64,
+        desired_inventory_generation: i64,
+        publications: &[InitialPublication],
+        configuration: Option<&Configuration>,
+    ) -> Result<RevisionOneActivation> {
         let mut conn = self.conn()?;
         state::activate_revision_one(
             &mut conn,
@@ -454,6 +484,7 @@ impl Store {
             activated_ms,
             desired_inventory_generation,
             publications,
+            configuration,
         )
     }
 
@@ -482,6 +513,48 @@ impl Store {
             .conn()?
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
         Ok(version >= schema::MIGRATIONS.len() as i64)
+    }
+
+    /// Configuration whole, as the store holds it (spec: DCONF#in-the-store).
+    pub fn load_configuration(&self) -> Result<Configuration> {
+        config::load_configuration(&*self.conn()?)
+    }
+
+    /// Write a whole configuration, replacing what is there. The import's
+    /// path for a machine whose routing already moved: there is no revision
+    /// to activate, so the rows are the whole transaction.
+    pub fn write_configuration(&self, configuration: &Configuration) -> Result<()> {
+        let mut conn = self.conn()?;
+        // Immediate, not deferred: a deferred transaction that upgrades to a
+        // write can come back BUSY without waiting out the busy timeout,
+        // because SQLite will not retry an upgrade that could deadlock.
+        // The long waits that first showed this up were a scratch setup run
+        // opening the real machine's store, not a holder inside the wizard:
+        // with each run on its own store the lock is taken in microseconds.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        config::write_configuration(&tx, configuration)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Write one provider's row.
+    pub fn put_config_provider(&self, row: &ProviderConfigRow) -> Result<()> {
+        config::put_provider(&*self.conn()?, row)
+    }
+
+    /// Write the settings row.
+    pub fn put_config_settings(&self, row: &SettingsConfigRow) -> Result<()> {
+        config::put_settings(&*self.conn()?, row)
+    }
+
+    /// Set one profile's notice style.
+    pub fn put_config_notice(&self, profile: &str, style: &str) -> Result<()> {
+        config::put_notice(&*self.conn()?, profile, style)
+    }
+
+    /// Return one profile to the default notice style.
+    pub fn delete_config_notice(&self, profile: &str) -> Result<()> {
+        config::delete_notice(&*self.conn()?, profile)
     }
 
     pub fn load_routing_policy_state(&self) -> Result<RoutingPolicyState> {
@@ -715,6 +788,24 @@ fn opt_json_from_text(text: Option<String>) -> Result<Option<Value>> {
 /// Run `read` over at most the first row `sql` yields. Shared by the
 /// submodules so row readers return [`Result`] (our error type), letting
 /// JSON and enum parsing inside them report uniformly.
+/// Make `dir` readable only by its owner. A directory that already is costs
+/// nothing; one that is not is tightened in place.
+#[cfg(unix)]
+fn close_state_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(dir)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn close_state_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn row_of<T, P>(
     conn: &Connection,
     sql: &str,
@@ -786,6 +877,28 @@ mod tests {
     /// never collide.
     fn test_dir(name: &str) -> crate::test_support::TestDir {
         crate::test_support::tempdir(&format!("store-{name}-"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_the_store_closes_its_directory_to_everyone_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("state-perms");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("create");
+        // A directory made before toker kept a credential in its store was
+        // made under the umask, so opening has to tighten it in place
+        // (spec: DCONF#state).
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let _store = Store::open(state.join("toker.db")).expect("open");
+
+        let mode = std::fs::metadata(&state)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "group and other bits are cleared");
     }
 
     fn user_version(store: &Store) -> i64 {

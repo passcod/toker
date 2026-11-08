@@ -457,13 +457,13 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{State, modal_text, render};
-    use crate::tui::routing::client::{Command, Reply, Response};
+    use crate::tui::control::{Command, Reply, Response};
 
     #[test]
     fn page_names_edit_and_activation_controls() {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
@@ -495,7 +495,7 @@ mod tests {
     fn the_activation_form_shows_its_impact_and_the_last_refusal() {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
@@ -521,7 +521,7 @@ mod tests {
             crossterm::event::KeyCode::Char('a'),
             crossterm::event::KeyModifiers::NONE,
         ));
-        let mut command = Command::snapshot();
+        let mut command = Command::snapshot("routing-snapshot");
         command.name = "activate";
         state.receive(Reply::Command(
             command,
@@ -596,7 +596,7 @@ mod tests {
     fn the_add_forms_say_what_they_do() {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: serde_json::json!({
@@ -734,7 +734,7 @@ mod tests {
     fn page_in(view: super::View) -> State {
         let mut state = State::default();
         state.receive(Reply::Command(
-            Command::snapshot(),
+            Command::snapshot("routing-snapshot"),
             Ok(Response {
                 status: 200,
                 body: page_snapshot(),
@@ -916,7 +916,7 @@ mod tests {
         for character in "codex".chars() {
             press_in(&mut state, crossterm::event::KeyCode::Char(character));
         }
-        let mut command = Command::snapshot();
+        let mut command = Command::snapshot("routing-snapshot");
         command.name = "draft-edit";
         state.receive(Reply::Command(
             command,

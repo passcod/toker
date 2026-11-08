@@ -32,8 +32,8 @@ Where `anthropic_sub` serves a request that did not bring a usable Claude bearer
 
 1. the configured environment variable
 2. the keyring entry
-3. a literal in the configuration file
-4. the Claude login file at its configured path
+3. a literal in the store
+4. the Claude login file, found where [DCONF](../service/config.md#in-the-store) specifies
 Toker MUST read that login file once per request rather than caching it, so that a refreshed or revoked login takes effect without a restart.
 Toker MUST NOT send a token it can see has expired.
 

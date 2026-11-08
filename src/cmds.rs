@@ -61,6 +61,23 @@ pub fn setup() -> anyhow::Result<()> {
             )
             .run(),
         )?;
+
+    // The machine is serving by now, and everything still to configure is
+    // edited in the dashboard, so the wizard ends at the next step rather
+    // than describing it (spec: USETUP#handing-off).
+    hand_off_to_dashboard()
+}
+
+/// Replace setup with `toker tui`. A failure to exec is reported and is not
+/// a failed setup: the run itself is complete either way.
+fn hand_off_to_dashboard() -> anyhow::Result<()> {
+    let Ok(exe) = std::env::current_exe() else {
+        println!("\nrun `toker tui` to configure the rest");
+        return Ok(());
+    };
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new(exe).arg("tui").exec();
+    println!("\ncould not start the dashboard ({error}) — run `toker tui`");
     Ok(())
 }
 
@@ -153,7 +170,7 @@ pub fn status() -> anyhow::Result<()> {
 }
 
 /// One api-key backend's key sources for `status`: which are set,
-/// never a value (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+/// never a value (spec: SEC#a-credential-is-never-logged-or-displayed).
 ///
 /// The env verdict is this shell's environment, which the service does
 /// not share (it sees the systemd user manager's), so the line says so.
@@ -199,9 +216,9 @@ pub fn picker_sync(dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `tui`: the ratatui dashboard over the ledger. `--db`
-/// overrides the path; otherwise `TOKER_DB` and the config default apply
-/// (Config::load already layered env over file).
+/// `tui`: the ratatui dashboard over the ledger. `--db` overrides which
+/// ledger is read; otherwise it is the one `TOKER_DB` or the user data
+/// directory resolves, which is also where the configuration came from.
 pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load()?;
     // Without a resolvable home the routing page still edits and activates;
@@ -225,8 +242,8 @@ pub fn tui(window_mins: u64, db: Option<PathBuf>) -> anyhow::Result<()> {
 
 /// `import`: ingest the predecessor proxy's usage.jsonl into the ledger
 /// .
-/// `--db` overrides the path; otherwise `TOKER_DB` and the config default
-/// apply (Config::load already layered env over file).
+/// `--db` overrides the path; otherwise it is the one `TOKER_DB` or the
+/// user data directory resolves.
 pub fn import(
     from: PathBuf,
     db: Option<PathBuf>,
@@ -1110,6 +1127,7 @@ mod tests {
             &crate::catalog::offers::OfferInventory::default(),
             0,
             1,
+            None,
         )
         .unwrap();
     }

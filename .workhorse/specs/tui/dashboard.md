@@ -61,6 +61,38 @@ An activation MUST NOT wait on reconciling a client's settings, and a slow or fa
 
 The page MAY import a configuration file into the draft, behind a confirmation, as [RMIG](../routing/migration.md#importing-a-file-deliberately) specifies.
 
+## The configuration pages
+
+Configuration is edited on two pages, providers and settings.
+
+Both MUST write through the control operations [DCTRL](../service/control.md#the-operations) specifies, and an edit MUST take effect without a restart.
+
+A refused value MUST be reported on the page, leaving the stored value as it was.
+
+Where the service is not answering, both pages MUST report that rather than offer values to edit.
+
+> [!NOTE]
+> The service is the only writer, so a form the operator can fill in while it is down is a form whose edits go nowhere.
+
+### Providers
+
+The providers page MUST show every provider Toker knows, enabled or not, with the endpoint it is reached at and which source supplies its credential.
+
+The page MUST be able to enable and disable a provider, set its endpoint, choose where its credential comes from, and set the settings particular to that provider.
+
+The page MUST show whether a credential is set and MUST NOT show what it is, as [SEC](../security.md#a-credential-is-never-logged-or-displayed) requires.
+
+The page MUST show a provider whose credential does not resolve as not configured, naming the source that did not supply one.
+
+> [!NOTE]
+> That is the answer a request reaching the provider gets, so a page showing anything else would disagree with what the proxy does.
+
+### Settings
+
+The settings page MUST show and edit the gate settings, the notice style of each frontend profile, the session and ping header names, whether the idle-sleep lock is held, and the extra transcript roots.
+
+The page MUST show where the store is and which port the listener answers on, and MUST NOT offer to edit either, those being settled before the store is opened as [DCONF](../service/config.md#before-the-store) specifies.
+
 ## Cost
 
 The dashboard MUST NOT sum costs of different kinds together.

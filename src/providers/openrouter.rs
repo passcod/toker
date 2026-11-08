@@ -44,7 +44,7 @@ pub struct OpenRouter {
     upstream: Url,
     /// The API key, resolved once at startup (env first, then the config
     /// literal — see [`crate::config::OpenRouterConfig::api_key`]). Never
-    /// logged, never in the ledger (spec: SEC#a-credential-is-never-logged-stored-or-displayed).
+    /// logged, never in the ledger (spec: SEC#a-credential-is-never-logged-or-displayed).
     api_key: Option<String>,
 }
 

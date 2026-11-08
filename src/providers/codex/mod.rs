@@ -50,7 +50,7 @@
 //!   header snapshot (the plan names the codex sub as the meter source
 //!   the gate's open interface is waiting for).
 //!
-//! spec: SEC#a-credential-is-never-logged-stored-or-displayed (credentials): the codex tokens are the user's ChatGPT
+//! spec: SEC#a-credential-is-never-logged-or-displayed (credentials): the codex tokens are the user's ChatGPT
 //! login. They never appear in the ledger, in a log line, or in an
 //! error message — `CodexAuth`'s `Debug` redacts them by hand.
 
